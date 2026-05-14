@@ -608,5 +608,181 @@ class TestSolverFBAExtremeConfigs(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(q)))
 
 
+class TestSolverFBAExternalForces(unittest.TestCase):
+    """Robustness tests covering external force application and state buffer
+    ping-pong behaviour."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _build_4x4_cloth(self):
+        """Return a 4x4 cloth model with the top-left corner pinned."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=1.0e2,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
+            fix_left=True,
+        )
+        return builder.finalize()
+
+    def test_external_force_displaces_particle(self):
+        """A strong external force on a free particle must produce a measurably
+        different position after 1 step compared to the no-force case.
+
+        With ``fix_left=True`` on a 4x4 cloth, the left column (indices 0, 5,
+        10, 15, 20) is pinned.  Particle 7 is a free interior particle.
+
+        Catches: is ``state_in.particle_f`` actually fed into
+        ``compute_inertial_kernel``?
+        """
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._build_4x4_cloth()
+        solver = SolverFBA(model, iterations=5)
+        dt = 1.0 / 60.0
+
+        # Verify particle 7 is free (not pinned).
+        self.assertGreater(model.particle_inv_mass.numpy()[7], 0.0, "particle 7 should be free")
+
+        # --- No-force baseline ---
+        s_in = model.state()
+        s_out = model.state()
+        s_in.clear_forces()
+        solver.step(s_in, s_out, None, None, dt)
+        q_no_force = s_out.particle_q.numpy().copy()
+
+        # --- With external force on particle 7 (push in +z) ---
+        s_in2 = model.state()
+        s_out2 = model.state()
+        forces_np = np.zeros((model.particle_count, 3), dtype=np.float32)
+        forces_np[7] = [0.0, 0.0, 100.0]
+        s_in2.particle_f.assign(forces_np)
+        solver.step(s_in2, s_out2, None, None, dt)
+        q_with_force = s_out2.particle_q.numpy().copy()
+
+        displacement = np.linalg.norm(q_with_force[7] - q_no_force[7])
+        self.assertGreater(
+            displacement,
+            1e-3,
+            f"Force on particle 7 produced no measurable displacement: {displacement:.2e} m",
+        )
+
+    def test_state_ping_pong_no_leak(self):
+        """100-step ping-pong must produce finite, changed positions.
+
+        Catches: in-place mutation of ``state_in`` or buffer aliasing.
+        """
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._build_4x4_cloth()
+        solver = SolverFBA(model, iterations=5)
+        dt = 1.0 / 60.0
+
+        s_in, s_out = model.state(), model.state()
+        initial_q = s_in.particle_q.numpy().copy()
+
+        for _ in range(100):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+
+        q_final = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q_final)), "non-finite positions after 100-step ping-pong")
+        # Cloth should have fallen (gravity), so at least one particle moved.
+        self.assertFalse(
+            np.allclose(q_final, initial_q, atol=1e-6),
+            "Positions unchanged after 100 steps — cloth did not move",
+        )
+
+    def test_clear_forces_resets_between_steps(self):
+        """Applying a one-time impulse then clearing forces must not let the
+        particle keep accelerating; elastic restoring forces should brake it.
+
+        Catches: force accumulation when ``clear_forces`` is omitted.
+        """
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._build_4x4_cloth()
+        solver = SolverFBA(model, iterations=5)
+        dt = 1.0 / 60.0
+
+        s_in, s_out = model.state(), model.state()
+
+        # Step 0: apply impulse force on particle 3.
+        forces_np = np.zeros((model.particle_count, 3), dtype=np.float32)
+        forces_np[3] = [5.0, 0.0, 0.0]
+        s_in.particle_f.assign(forces_np)
+        solver.step(s_in, s_out, None, None, dt)
+        s_in, s_out = s_out, s_in
+        v_after_impulse = np.linalg.norm(s_in.particle_qd.numpy()[3])
+
+        # Steps 1..50: clear forces, let cloth relax.
+        for _ in range(50):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+
+        q_final = s_in.particle_q.numpy()
+        v_final = np.linalg.norm(s_in.particle_qd.numpy()[3])
+
+        self.assertTrue(np.all(np.isfinite(q_final)), "non-finite positions after impulse + relaxation")
+        self.assertLess(
+            v_final,
+            v_after_impulse,
+            f"Particle 3 did not decelerate: v_final={v_final:.4f} >= v_after_impulse={v_after_impulse:.4f}",
+        )
+
+    def test_alternating_ping_pong_buffer_ids(self):
+        """``step()`` must not write to ``state_in``; only ``state_out`` changes.
+
+        Catches: accidental in-place writes to the input buffer.
+        """
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=1.0e2,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
+            fix_left=True,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=5)
+        s_a = model.state()
+        s_b = model.state()
+        initial_q = s_a.particle_q.numpy().copy()
+        s_a.clear_forces()
+        solver.step(s_a, s_b, None, None, 1.0 / 60.0)
+        # state_in (s_a) should be unchanged.
+        np.testing.assert_array_equal(s_a.particle_q.numpy(), initial_q)
+        # state_out (s_b) should differ from initial.
+        self.assertFalse(
+            np.array_equal(s_b.particle_q.numpy(), initial_q),
+            "state_out (s_b) was not updated after step()",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
