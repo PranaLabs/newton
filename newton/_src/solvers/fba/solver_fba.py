@@ -127,7 +127,98 @@ class SolverFBA(SolverBase):
         contacts: Contacts | None,
         dt: float,
     ) -> None:
-        raise NotImplementedError("SolverFBA.step pending Task 11")
+        from .kernels import (  # noqa: PLC0415
+            add_inertia_to_rhs_kernel,
+            compute_inertial_kernel,
+            project_bending_kernel,
+            project_pin_kernel,
+            project_stretching_arap_kernel,
+            write_velocity_kernel,
+            zero_vec3_kernel,
+        )
+
+        if self._linear_solver is None or self._dt_setup is None or abs(self._dt_setup - dt) > 1e-12:
+            self._setup_pd_system(dt)
+
+        model = self.model
+        N = model.particle_count
+        device = self._device
+
+        # 1) Compute inertial prediction x_inertia.
+        wp.launch(
+            compute_inertial_kernel, dim=N,
+            inputs=[
+                state_in.particle_q,
+                state_in.particle_qd,
+                state_in.particle_f,
+                model.particle_inv_mass,
+                model.particle_world,
+                model.gravity,
+                dt,
+            ],
+            outputs=[self._x_inertia],
+            device=device,
+        )
+        # Initialize current iterate x_cur = x_inertia (copy).
+        wp.copy(self._x_cur, self._x_inertia)
+
+        # 2) PD outer iterations.
+        for _k in range(self.iterations):
+            # Zero RHS.
+            wp.launch(zero_vec3_kernel, dim=N, inputs=[self._rhs], device=device)
+            # Inertia term.
+            wp.launch(
+                add_inertia_to_rhs_kernel, dim=N,
+                inputs=[self._x_inertia, model.particle_mass, dt],
+                outputs=[self._rhs],
+                device=device,
+            )
+            # Pin projection.
+            if self._pin_indices_d is not None:
+                wp.launch(
+                    project_pin_kernel, dim=self._pin_indices_d.shape[0],
+                    inputs=[self._pin_indices_d, self._x_ref, self.pin_stiffness],
+                    outputs=[self._rhs],
+                    device=device,
+                )
+            # Stretching projection.
+            wp.launch(
+                project_stretching_arap_kernel, dim=model.tri_count,
+                inputs=[
+                    self._x_cur, self._tri_indices_d, self._tri_rest_inv_d, self._tri_weight_d,
+                ],
+                outputs=[self._rhs],
+                device=device,
+            )
+            # Bending projection.
+            if self._edge_indices_d is not None:
+                wp.launch(
+                    project_bending_kernel, dim=self._edge_indices_d.shape[0],
+                    inputs=[
+                        self._x_cur, self._x_ref, self._edge_indices_d,
+                        self._edge_quad_q_d, self._edge_weight_d,
+                    ],
+                    outputs=[self._rhs],
+                    device=device,
+                )
+            # Global linear solve: x_cur = A^-1 . rhs.
+            self._linear_solver.solve(self._rhs, self._x_cur)
+
+        # 3) Write velocity and update state_out.
+        wp.copy(state_out.particle_q, self._x_cur)
+        wp.launch(
+            write_velocity_kernel, dim=N,
+            inputs=[state_in.particle_q, self._x_cur, model.particle_inv_mass, dt],
+            outputs=[state_out.particle_qd],
+            device=device,
+        )
+
+    def notify_model_changed(self, flags: int) -> None:
+        # On any geometry/inertial change, force a full re-setup at the next step.
+        from ..flags import SolverNotifyFlags  # noqa: PLC0415
+        if flags & (SolverNotifyFlags.SHAPE_PROPERTIES | SolverNotifyFlags.BODY_INERTIAL_PROPERTIES):
+            self._linear_solver = None
+            self._dt_setup = None
 
     def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
         raise NotImplementedError("Contact-aware FBA solver TBD; SolverFBA MVP supports gravity + pin only")
