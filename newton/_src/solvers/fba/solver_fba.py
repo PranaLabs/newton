@@ -29,10 +29,16 @@ class SolverFBA(SolverBase):
         - Float32 ``particle_q`` output: the interior linear solver
           operates in float64, but ``state_out.particle_q`` (vec3) is
           float32. This caps achievable position precision at ~1e-7 m.
-        - Large cloth grids (>=32x32) can become unstable after ~100
-          frames at the MVP default of 10 PD iterations; either reduce
-          dt, increase iterations, or stay at smaller grids (<=16x16
-          tested stable).
+        - **Stability boundary (empirical, 500-step sweep):** grids up to
+          16x16 are unconditionally stable across all tested configurations
+          (iter in {5,10,20,40}, dt in {1/60,1/120,1/240}).  Grids of 24x24
+          or larger diverge regardless of iteration count: NaN appears around
+          step 150 at dt=1/60, step 250-275 at dt=1/120, and step 450-500 at
+          dt=1/240.  Increasing PD iterations does **not** prevent divergence
+          -- the instability is mesh-size-driven, not iteration-driven.  Use
+          grids of <=16x16 for production runs; larger grids require a
+          different formulation (e.g. damping, smaller stiffness, or a
+          different solver).
 
     See also:
         :class:`~newton.solvers.SolverStyle3D` — Newton's other PD cloth

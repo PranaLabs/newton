@@ -817,10 +817,19 @@ class TestSolverFBAReconfigure(unittest.TestCase):
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
         builder.add_cloth_grid(
-            pos=wp.vec3(0, 1, 0), rot=wp.quat_identity(), vel=wp.vec3(0, 0, 0),
-            dim_x=4, dim_y=4, cell_x=0.1, cell_y=0.1, mass=0.01,
-            tri_ke=1.0e2, tri_ka=0.0, tri_kd=0.0,
-            edge_ke=1.0e-1, edge_kd=0.0,
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=1.0e2,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
             fix_left=True,
         )
         model = builder.finalize()
@@ -847,10 +856,19 @@ class TestSolverFBAReconfigure(unittest.TestCase):
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
         builder.add_cloth_grid(
-            pos=wp.vec3(0, 1, 0), rot=wp.quat_identity(), vel=wp.vec3(0, 0, 0),
-            dim_x=4, dim_y=4, cell_x=0.1, cell_y=0.1, mass=0.01,
-            tri_ke=1.0e2, tri_ka=0.0, tri_kd=0.0,
-            edge_ke=1.0e-1, edge_kd=0.0,
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=1.0e2,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
             fix_left=True,
         )
         model = builder.finalize()
@@ -871,10 +889,19 @@ class TestSolverFBAReconfigure(unittest.TestCase):
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
         builder.add_cloth_grid(
-            pos=wp.vec3(0, 1, 0), rot=wp.quat_identity(), vel=wp.vec3(0, 0, 0),
-            dim_x=4, dim_y=4, cell_x=0.1, cell_y=0.1, mass=0.01,
-            tri_ke=1.0e2, tri_ka=0.0, tri_kd=0.0,
-            edge_ke=1.0e-1, edge_kd=0.0,
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=1.0e2,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
             fix_left=True,
         )
         model = builder.finalize()
@@ -903,10 +930,19 @@ class TestSolverFBAReconfigure(unittest.TestCase):
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
         builder.add_cloth_grid(
-            pos=wp.vec3(0, 1, 0), rot=wp.quat_identity(), vel=wp.vec3(0, 0, 0),
-            dim_x=4, dim_y=4, cell_x=0.1, cell_y=0.1, mass=0.01,
-            tri_ke=1.0e2, tri_ka=0.0, tri_kd=0.0,
-            edge_ke=1.0e-1, edge_kd=0.0,
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=1.0e2,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
             fix_left=True,
         )
         model = builder.finalize()
@@ -919,6 +955,46 @@ class TestSolverFBAReconfigure(unittest.TestCase):
         # JOINT_PROPERTIES shouldn't affect FBA cloth.
         solver.notify_model_changed(SolverNotifyFlags.JOINT_PROPERTIES)
         self.assertIs(solver._linear_solver, linsolver_a, "FBA should ignore JOINT_PROPERTIES")
+
+
+class TestSolverFBAStability(unittest.TestCase):
+    """Stability regression: verify the documented "safe zone" stays finite."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_safe_zone_dim16_iter10_dt60_finite_500_steps(self):
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 2, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=16,
+            dim_y=16,
+            cell_x=0.05,
+            cell_y=0.05,
+            mass=0.005,
+            tri_ke=1.0e3,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
+            fix_left=False,
+        )
+        builder.particle_mass[0] = 0.0
+        builder.particle_mass[16] = 0.0
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=10)
+        s_in, s_out = model.state(), model.state()
+        for _ in range(500):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "documented-safe configuration went NaN")
 
 
 if __name__ == "__main__":
