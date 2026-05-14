@@ -1013,6 +1013,13 @@ def _csc_to_bsr_1x1(M: sp.csc_matrix, device: wp.Device | str) -> wps.BsrMatrix:
 
 > **Engineer note:** `warp.sparse.BsrMatrix` with `block_type=wp.float32` is a 1×1 (scalar) BSR. If `warp.sparse.bsr_zeros` API differs in the version pinned by `uv.lock`, consult `warp.sparse` source for the exact signature. The semantic is "build BSR from row/col/value triplets, sum duplicates if any".
 
+> **SpMV execution semantics (read before debugging the solve):**
+>
+> - `warp.sparse.bsr_mv(A, x, y)` launches `bsr_mv_kernel` (`warp/_src/sparse.py:2418`) with grid `dim = (num_block_rows, block_rows)`. For our 1×1 BSR + N rows: one thread per matrix row, sequential scan over that row's non-zeros. Standard row-parallel CSR-style SpMV; matches cloth Hessian degree (6–10 nnz/row).
+> - **Do not pass `transpose=True`**. The Warp docstring explicitly notes the transposed path uses scatter-based accumulation and is non-deterministic. We precompute `Sᵀ` as a separate `BsrMatrix` (`factor.ST` in Task 4) and call `bsr_mv(self._ST_bsr, ...)` with the default `transpose=False` — fully deterministic.
+> - **Do not alias `x` and `y` across calls**. Per the docstring, aliasing requires passing an explicit `work_buffer`. We use distinct scratch buffers (`_b_perm`, `_Sb`, `_DSb`, `_SDSb`, `_x_scalar`), so aliasing never happens and `work_buffer=None` is fine.
+> - Per linear solve: 7 kernel launches × 3 components = 21 launches. With 10 PD iterations per step, plus 5 element kernels per iteration and a few outer launches, expect ~263 launches/step. At ~3 µs launch overhead on RTX 5090 this is ~0.8 ms/step in launch latency — well within frame budget. SpMV itself for N≈10K cloth is bandwidth-bound at ~0.7 µs/call (matrix data ≈ 1.2 MB on a 1.8 TB/s GPU). If you later see SpMV dominating, that's the signal to fuse the 21 launches into one vec3-aware kernel — not for MVP.
+
 - [ ] **Step 5: Run tests, expect pass**
 
 ```bash
