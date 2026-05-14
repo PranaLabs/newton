@@ -201,6 +201,145 @@ def _compute_rest_inv_from_positions(model: Model) -> np.ndarray:
     return out
 
 
+def _splu_extract_factors(
+    A,
+) -> tuple:
+    """Wrap scipy.sparse.linalg.splu and return (L_csc, U_csc, Dinv, perm_r, perm_c).
+
+    For SPD A, splu effectively produces LU = L · U with U ≈ Dᵀ Lᵀ; we extract
+    the lower factor L (with unit diagonal), the diagonal D = diag(U), and the
+    permutation arrays. The factor satisfies P_r · A · P_cᵀ = L · D · Lᵀ
+    (modulo numerical asymmetry of SuperLU's pivoting for non-symmetric input,
+    which is unobservable on SPD input).
+
+    Args:
+        A: Sparse SPD matrix (CSC or CSR).
+
+    Returns:
+        Tuple (L_csc, U_csc, Dinv, perm_r, perm_c).
+    """
+    import scipy.sparse.linalg as spla
+
+    lu = spla.splu(A.tocsc(), permc_spec="COLAMD")
+    L = lu.L.tocsc()  # lower-tri with unit diagonal
+    U = lu.U.tocsc()
+    Dinv = 1.0 / U.diagonal()
+    perm_r = lu.perm_r.astype(np.int32)
+    perm_c = lu.perm_c.astype(np.int32)
+    return L, U, Dinv, perm_r, perm_c
+
+
+def _elimination_tree(L) -> np.ndarray:
+    """Build elimination tree parent[] from L's sparsity structure.
+
+    parent[j] = smallest row index > j with L[parent[j], j] != 0, else -1.
+
+    Args:
+        L: Lower-triangular CSC sparse matrix.
+
+    Returns:
+        Integer array of length n with parent pointers.
+    """
+    n = L.shape[0]
+    parent = -np.ones(n, dtype=np.int32)
+    indptr = L.indptr
+    indices = L.indices
+    for j in range(n):
+        for ptr in range(indptr[j], indptr[j + 1]):
+            i = indices[ptr]
+            if i > j:
+                parent[j] = i
+                break
+    return parent
+
+
+def compute_lower_inverse(
+    L,
+    parent: np.ndarray | None = None,
+    invperm: np.ndarray | None = None,
+):
+    """Compute S = L⁻¹ as a sparse CSC matrix.
+
+    Ports RealSim ``LDLT_computeLowerInverse`` (SparseLDLT.cpp:225-347).
+    Sparsity pattern of S is derived from L's elimination tree; this gives
+    the exact sparse inverse (no thresholding, no fill-in).
+
+    Args:
+        L: Lower-triangular CSC matrix with unit diagonal.
+        parent: Elimination tree parent array; computed from L if None.
+        invperm: Inverse permutation (identity if None).
+
+    Returns:
+        S as CSC; S · L ≈ I in the permuted basis.
+    """
+    import scipy.sparse as _sp
+
+    n = L.shape[0]
+    if parent is None:
+        parent = _elimination_tree(L)
+    if invperm is None:
+        invperm = np.arange(n, dtype=np.int32)
+    perm = np.argsort(invperm).astype(np.int32)
+
+    # --- 1. Count nnz of S (LDLT_computeLowerInverseNNZ) ---
+    S_nnz = 0
+    for i in range(n):
+        index = int(invperm[i])
+        innercount = 1
+        while parent[index] != -1:
+            innercount += 1
+            index = int(parent[index])
+        S_nnz += innercount
+
+    # --- 2. Build S's CSC pattern (LDLT_computeLowerInversePattern) ---
+    S_outerPtr = np.zeros(n + 1, dtype=np.int32)
+    S_innerInd = np.zeros(S_nnz, dtype=np.int32)
+    count = 0
+    S_outerPtr[0] = 0
+    for i in range(n):
+        index = int(invperm[i])
+        innercount = 1
+        S_innerInd[count] = index
+        while parent[index] != -1:
+            S_innerInd[count + innercount] = int(parent[index])
+            innercount += 1
+            index = int(parent[index])
+        count += innercount
+        S_outerPtr[i + 1] = count
+
+    # --- 3. Compute aligned L values (LDLT_computeAlignedLower) ---
+    aL = np.zeros(S_nnz, dtype=np.float64)
+    L_outerPtr = L.indptr
+    L_innerInd = L.indices
+    L_values = L.data
+    for row in range(n):
+        invr = int(invperm[row])
+        ptrS = int(S_outerPtr[row])
+        for ptrL in range(L_outerPtr[invr], L_outerPtr[invr + 1]):
+            while ptrS < S_outerPtr[row + 1]:
+                if S_innerInd[ptrS] == L_innerInd[ptrL]:
+                    aL[ptrS] = L_values[ptrL]
+                    break
+                ptrS += 1
+
+    # --- 4. Solve for S column-by-column (LDLT_computeLowerInverse_line) ---
+    S_values = np.zeros(S_nnz, dtype=np.float64)
+    for index in range(n):
+        S_values[S_outerPtr[index]] = 1.0
+        for i in range(S_outerPtr[index] + 1, S_outerPtr[index + 1]):
+            col = int(perm[S_innerInd[i - 1]])
+            j = i
+            k = int(S_outerPtr[col]) + 1
+            while (j < S_outerPtr[index + 1]) or (k < S_outerPtr[col + 1]):
+                S_values[j] -= aL[k] * S_values[i - 1]
+                j += 1
+                k += 1
+                if j >= S_outerPtr[index + 1] or k >= S_outerPtr[col + 1]:
+                    break
+
+    return _sp.csc_matrix((S_values, S_innerInd, S_outerPtr), shape=(n, n))
+
+
 def _compute_isometric_bending_q(edge_indices: np.ndarray, positions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Per-edge length-4 vector q and per-edge scale ``3 / (A0 + A1)``.
 

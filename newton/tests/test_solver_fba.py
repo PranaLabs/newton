@@ -174,5 +174,41 @@ class TestBendingQMatchesReference(unittest.TestCase):
         )
 
 
+class TestSparseInverse(unittest.TestCase):
+    """T2: compute_lower_inverse matches dense np.linalg.inv on small SPD."""
+
+    def test_random_spd_8x8(self):
+        import scipy.sparse as _sp
+
+        from newton._src.solvers.fba.linear_solver import (  # noqa: PLC0415
+            _elimination_tree,
+            _splu_extract_factors,
+            compute_lower_inverse,
+        )
+
+        rng = np.random.default_rng(0)
+        # Build a small SPD matrix via tridiagonal + jitter.
+        n = 8
+        diag = rng.uniform(10.0, 20.0, n)
+        off = rng.uniform(-1.0, 1.0, n - 1)
+        A = _sp.diags([off, diag, off], [-1, 0, 1], shape=(n, n), format="csc").astype(np.float64)
+
+        Ainv_dense = np.linalg.inv(A.toarray())
+
+        # splu decomposes P_r @ A @ P_c^T = L @ D @ L^T for SPD A.
+        # L is already in the permuted coordinate system, so compute S = L^{-1}
+        # directly (invperm=None means identity ordering for L's internal space).
+        L_csc, _U_csc, Dinv, perm_r, perm_c = _splu_extract_factors(A)
+        S = compute_lower_inverse(L_csc, parent=_elimination_tree(L_csc))
+
+        # Reconstruct A^{-1} = P_c^T @ S^T @ diag(Dinv) @ S @ P_r
+        # (from P_r A P_c^T = L D L^T => A^{-1} = P_c^T L^{-T} D^{-1} L^{-1} P_r)
+        S_arr = S.toarray()
+        P_r = np.eye(n)[perm_r]
+        P_c = np.eye(n)[perm_c]
+        Ainv_reconstructed = P_c.T @ S_arr.T @ np.diag(Dinv) @ S_arr @ P_r
+        self.assertLess(np.abs(Ainv_reconstructed - Ainv_dense).max(), 1e-8)
+
+
 if __name__ == "__main__":
     unittest.main()
