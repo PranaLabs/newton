@@ -1125,7 +1125,7 @@ git commit -m "Add trivial vec3 kernels for SolverFBA"
 - Modify: `newton/tests/test_solver_fba.py`
 
 **Algorithm:**
-The 3×2 SVD can be computed by reducing to a 2×2 problem: `FᵀF` is 2×2 symmetric PSD whose eigendecomposition gives `V` and `Σ²`. Then `U₁ = F·V·Σ⁻¹` (3×2), extended to 3×3 by Gram-Schmidt or any orthonormal completion. ARAP projection clamps singular values to 1: `P = U₁·Vᵀ` (3×2).
+The 3×2 SVD reduces to a 2×2 eigenproblem. `FᵀF` is 2×2 symmetric PSD; use **Warp's built-in `wp.svd2`** (Warp 1.14+ ships `svd2`, `svd3`, `qr3` — confirmed at the plan-author time by `dir(warp)` containing these symbols, and used by Newton's MPM solver `newton/_src/solvers/implicit_mpm/implicit_mpm_solver_kernels.py:395`). For a symmetric PSD input, `wp.svd2(FtF)` returns `(U2, σ², V2)` with `U2 = V2` up to sign; we treat `V2` as the right singular vectors of F and recover U columns as `u_i = F·v_i / σ_i`. ARAP projection clamps singular values to 1: `P = U·Vᵀ` (3×2). No hand-rolled 2×2 eigen needed.
 
 - [ ] **Step 1: Write test T4 — ARAP projection on canonical inputs**
 
@@ -1187,48 +1187,30 @@ In `newton/_src/solvers/fba/kernels.py` append:
 def svd_3x2(F: wp.mat32) -> wp.mat32:
     """ARAP projection: SVD-clamp 3×2 deformation gradient to nearest rotation.
 
-    Reduces to 2×2 symmetric eigenproblem on FᵀF.
+    Reduces 3×2 SVD to a 2×2 symmetric eigenproblem on FᵀF and uses Warp's
+    built-in `wp.svd2`. ARAP clamps singular values to 1, yielding the
+    nearest rigid map `P = U·Vᵀ` (3×2).
     """
-    # FᵀF  (2×2)
-    FtF = wp.transpose(F) * F
-    a = FtF[0, 0]
-    b = FtF[0, 1]
-    d = FtF[1, 1]
+    FtF = wp.transpose(F) * F            # 2×2 symmetric PSD
+    U2, sigma_sq, V2 = wp.svd2(FtF)      # symmetric input ⇒ V2 are eigenvectors
 
-    # 2×2 symmetric eigen via closed form
-    tr = a + d
-    det = a * d - b * b
-    disc = wp.max(tr * tr * 0.25 - det, 0.0)
-    sq = wp.sqrt(disc)
-    lam0 = tr * 0.5 + sq          # σ²₀
-    lam1 = wp.max(tr * 0.5 - sq, 0.0)  # σ²₁
+    s0 = wp.sqrt(wp.max(sigma_sq[0], 1.0e-20))
+    s1 = wp.sqrt(wp.max(sigma_sq[1], 1.0e-20))
 
-    # eigenvectors of FtF
-    if wp.abs(b) > 1.0e-20:
-        v0 = wp.normalize(wp.vec2(lam0 - d, b))
-        v1 = wp.vec2(-v0[1], v0[0])
-    else:
-        v0 = wp.vec2(1.0, 0.0) if a >= d else wp.vec2(0.0, 1.0)
-        v1 = wp.vec2(-v0[1], v0[0])
+    # U columns of the 3×2 SVD: u_i = F·v_i / σ_i
+    v0 = wp.vec2(V2[0, 0], V2[1, 0])
+    v1 = wp.vec2(V2[0, 1], V2[1, 1])
+    u0 = (F * v0) / s0                   # 3-vector
+    u1 = (F * v1) / s1                   # 3-vector
 
-    sigma0 = wp.sqrt(wp.max(lam0, 1.0e-20))
-    sigma1 = wp.sqrt(wp.max(lam1, 1.0e-20))
-
-    # U columns: u_i = F·v_i / σ_i
-    Fv0 = F * v0
-    Fv1 = F * v1
-    u0 = Fv0 / sigma0
-    u1 = Fv1 / sigma1
-
-    # ARAP: clamp Σ to identity → P = U · I · Vᵀ
-    # P = [u0 | u1] · [v0 v1]ᵀ
-    p00 = u0[0] * v0[0] + u1[0] * v1[0]
-    p01 = u0[0] * v0[1] + u1[0] * v1[1]
-    p10 = u0[1] * v0[0] + u1[1] * v1[0]
-    p11 = u0[1] * v0[1] + u1[1] * v1[1]
-    p20 = u0[2] * v0[0] + u1[2] * v1[0]
-    p21 = u0[2] * v0[1] + u1[2] * v1[1]
-    return wp.mat32(p00, p01, p10, p11, p20, p21)
+    # ARAP projection: P = U · Vᵀ (3×2)
+    p_col0 = u0 * V2[0, 0] + u1 * V2[0, 1]
+    p_col1 = u0 * V2[1, 0] + u1 * V2[1, 1]
+    return wp.mat32(
+        p_col0[0], p_col1[0],
+        p_col0[1], p_col1[1],
+        p_col0[2], p_col1[2],
+    )
 
 
 @wp.kernel
