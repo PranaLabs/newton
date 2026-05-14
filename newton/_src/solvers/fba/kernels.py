@@ -287,3 +287,27 @@ def project_bending_kernel(
     wp.atomic_add(rhs, i1, w * q[1] * qTxref)
     wp.atomic_add(rhs, i2, w * q[2] * qTxref)
     wp.atomic_add(rhs, i3, w * q[3] * qTxref)
+
+
+@wp.kernel
+def project_pin_kernel(
+    pin_indices: wp.array[wp.int32],
+    x_ref: wp.array[wp.vec3],            # full vec3 array indexed by particle index
+    pin_stiffness: float,
+    rhs: wp.array[wp.vec3],
+):
+    """Per-pin PD soft-constraint scatter.
+
+    For each pinned particle, contributes ``w_pin * x_ref[i]`` to the RHS.
+    The matching `w_pin` diagonal term is already in the prefactored ``A``
+    (added by ``build_pd_system`` at the pinned particle's diagonal).
+
+    Args:
+        pin_indices: Packed indices of pinned particles, shape ``[pin_count]``.
+        x_ref: Reference positions [m] for each particle, indexed by particle index.
+        pin_stiffness: PD soft-pin weight ``w_pin``.
+        rhs: Output RHS accumulator; receives atomic-add contributions.
+    """
+    k = wp.tid()
+    i = pin_indices[k]
+    wp.atomic_add(rhs, i, pin_stiffness * x_ref[i])
