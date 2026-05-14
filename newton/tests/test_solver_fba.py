@@ -469,5 +469,144 @@ class TestSolverFBAIntegration(unittest.TestCase):
         self.assertGreater(q[center_idx, 1], 0.5, "cloth fell past plausible drape")
 
 
+class TestSolverFBAExtremeConfigs(unittest.TestCase):
+    """Robustness tests covering extreme configurations not exercised by the
+    existing 13 tests: fully-free cloth, all-pinned cloth, single triangle,
+    and zero edge stiffness."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_no_pin_free_cloth_remains_finite(self):
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 2, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=8,
+            dim_y=8,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.1,
+            tri_ke=1.0e2,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
+            fix_left=False,
+        )
+        # NO pinning.
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=10)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+        for _ in range(100):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite values appeared in free-cloth simulation")
+
+    def test_all_pinned_cloth_stays_put(self):
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=1.0e2,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
+            fix_left=False,
+        )
+        for i in range(len(builder.particle_mass)):
+            builder.particle_mass[i] = 0.0
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=10)
+        s_in, s_out = model.state(), model.state()
+        x_initial = s_in.particle_q.numpy().copy()
+        dt = 1.0 / 60.0
+        for _ in range(50):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        x_final = s_in.particle_q.numpy()
+        drift = np.abs(x_final - x_initial).max()
+        self.assertLess(drift, 1e-4, f"all-pinned cloth drifted {drift:.3e} m")
+
+    def test_single_triangle_runs(self):
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0, 0, 0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0, 0, 0),
+            vertices=[wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0, 0, 1)],
+            indices=[0, 1, 2],
+            density=1.0,
+            tri_ke=1.0e2,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+        )
+        builder.particle_mass[0] = 0.0  # pin vertex 0
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=10)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+        for _ in range(50):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)))
+        np.testing.assert_allclose(q[0], [0, 0, 0], atol=1e-4)
+
+    def test_zero_edge_stiffness_still_works(self):
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=1.0e2,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,  # no bending
+            fix_left=True,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=10)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+        for _ in range(50):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)))
+
+
 if __name__ == "__main__":
     unittest.main()
