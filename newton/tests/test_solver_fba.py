@@ -276,38 +276,71 @@ class TestARAPProjection(unittest.TestCase):
     def setUpClass(cls):
         wp.init()
 
-    def test_identity_F_gives_identity_P(self):
+    def test_identity_F_zero_after_assembly_bias(self):
+        """Rest configuration ⇒ P=identity; verify scatter values match the
+        formula (Dm_inv @ P^T) with Dm_inv = I₂ analytically.
+
+        For rest=current=(0,0,0),(1,0,0),(0,0,1), P (3×2) maps reference axes to
+        the embedded triangle's axes; the kernel scatters w·Dm_inv·P^T:
+            row0 = (1,0,0); row1 = (0,0,1)  (since P = embedding)
+        Therefore:
+            rhs[0] = -(row0+row1) = (-1, 0, -1)
+            rhs[1] = (1, 0, 0)
+            rhs[2] = (0, 0, 1)
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_arap_kernel
+
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
-        # One triangle at the rest configuration → F = identity column-augmented.
-        # rest pos: (0,0,0), (1,0,0), (0,0,1); current pos = rest → F·Dm = identity.
         positions = wp.array(
             [wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0, 0, 1)],
-            dtype=wp.vec3,
-            device=device,
+            dtype=wp.vec3, device=device,
         )
         tri_indices = wp.array([0, 1, 2], dtype=wp.int32, device=device)
-        Dm_inv = wp.array(
-            [wp.mat22(1.0, 0.0, 0.0, 1.0)],  # 2x2 identity
-            dtype=wp.mat22,
-            device=device,
-        )
+        Dm_inv = wp.array([wp.mat22(1.0, 0.0, 0.0, 1.0)], dtype=wp.mat22, device=device)
         weight = wp.array([1.0], dtype=wp.float32, device=device)
         rhs = wp.zeros(3, dtype=wp.vec3, device=device)
 
-        wp.launch(
-            project_stretching_arap_kernel,
-            dim=1,
-            inputs=[positions, tri_indices, Dm_inv, weight],
-            outputs=[rhs],
-            device=device,
+        wp.launch(project_stretching_arap_kernel, dim=1,
+                  inputs=[positions, tri_indices, Dm_inv, weight],
+                  outputs=[rhs], device=device)
+        r = rhs.numpy()
+        np.testing.assert_allclose(r[1], [1.0, 0.0, 0.0], atol=1e-6)
+        np.testing.assert_allclose(r[2], [0.0, 0.0, 1.0], atol=1e-6)
+        np.testing.assert_allclose(r[0], -(r[1] + r[2]), atol=1e-6)
+
+    def test_non_symmetric_Dm_inv_exposes_transpose_bug(self):
+        """Non-symmetric Dm_inv (= skewed triangle's rest inverse) must be
+        applied as Dm_inv, not Dm_inv^T. Wrong orientation gave ~20% error.
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_arap_kernel
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        # Current configuration = rest, so P = embedding; w·Dm_inv·P^T scatter exact.
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(2, 0, 0), wp.vec3(1, 0, 1)],
+            dtype=wp.vec3, device=device,
         )
-        rhs_np = rhs.numpy()
-        # When F is the rest configuration, ARAP projects to identity rotation;
-        # the scatter contribution is the "rest" stencil — caller will balance
-        # it with the Hessian. Verify scatter pattern matches Aᵀ·proj where
-        # proj is the rest configuration mapped through Dm_inv·Pᵀ.
-        # Concretely: rhs[1] - rhs[2] should be along e12 direction; rhs[0] = -rhs[1] - rhs[2].
-        np.testing.assert_allclose(rhs_np[0], -(rhs_np[1] + rhs_np[2]), atol=1e-6)
+        tri_indices = wp.array([0, 1, 2], dtype=wp.int32, device=device)
+        # For this triangle: e12=(2,0,0), e13=(1,0,1); the orthonormal basis is
+        # n1=(1,0,0), n2=(0,0,1); Dm = basis^T·edges = [[2,1],[0,1]];
+        # Dm_inv = [[0.5,-0.5],[0,1]].
+        Dm_inv = wp.array(
+            [wp.mat22(0.5, -0.5, 0.0, 1.0)], dtype=wp.mat22, device=device,
+        )
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+        rhs = wp.zeros(3, dtype=wp.vec3, device=device)
+        wp.launch(project_stretching_arap_kernel, dim=1,
+                  inputs=[positions, tri_indices, Dm_inv, weight],
+                  outputs=[rhs], device=device)
+        r = rhs.numpy()
+
+        # Analytical: with current=rest and Dm_inv as above, P = embedding [[1,0],[0,0],[0,1]] (3x2);
+        # P^T = [[1,0,0],[0,0,1]] (2x3). Dm_inv @ P^T = [[0.5, 0, -0.5],[0, 0, 1]].
+        # So row0 (vertex 1's contribution) = (0.5, 0, -0.5), row1 (vertex 2) = (0, 0, 1).
+        # rhs[1] = row0, rhs[2] = row1, rhs[0] = -(row0+row1).
+        np.testing.assert_allclose(r[1], [0.5, 0.0, -0.5], atol=1e-5)
+        np.testing.assert_allclose(r[2], [0.0, 0.0, 1.0], atol=1e-5)
+        np.testing.assert_allclose(r[0], -(r[1] + r[2]), atol=1e-6)
 
 
 if __name__ == "__main__":

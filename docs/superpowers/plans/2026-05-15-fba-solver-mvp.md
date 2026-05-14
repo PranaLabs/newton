@@ -1251,22 +1251,21 @@ def project_stretching_arap_kernel(
 
     P = svd_3x2(F)
 
-    # Local contribution to RHS: proj = w · Dm⁻ᵀ · Pᵀ  (2×3)
+    # Local contribution to RHS: proj = w · Dm⁻¹ · Pᵀ  (2×3)
     w = tri_weight[t]
-    Dm_invT = wp.transpose(Dm_inv)
-    # proj = w · Dm_invT · Pᵀ (rows are length-3 vectors)
+    # proj = w · Dm_inv · Pᵀ (rows are length-3 vectors)
     PT00 = P[0, 0]; PT01 = P[1, 0]; PT02 = P[2, 0]   # column 0 of P
     PT10 = P[0, 1]; PT11 = P[1, 1]; PT12 = P[2, 1]   # column 1 of P
 
     row0 = wp.vec3(
-        w * (Dm_invT[0, 0] * PT00 + Dm_invT[0, 1] * PT10),
-        w * (Dm_invT[0, 0] * PT01 + Dm_invT[0, 1] * PT11),
-        w * (Dm_invT[0, 0] * PT02 + Dm_invT[0, 1] * PT12),
+        w * (Dm_inv[0, 0] * PT00 + Dm_inv[0, 1] * PT10),
+        w * (Dm_inv[0, 0] * PT01 + Dm_inv[0, 1] * PT11),
+        w * (Dm_inv[0, 0] * PT02 + Dm_inv[0, 1] * PT12),
     )
     row1 = wp.vec3(
-        w * (Dm_invT[1, 0] * PT00 + Dm_invT[1, 1] * PT10),
-        w * (Dm_invT[1, 0] * PT01 + Dm_invT[1, 1] * PT11),
-        w * (Dm_invT[1, 0] * PT02 + Dm_invT[1, 1] * PT12),
+        w * (Dm_inv[1, 0] * PT00 + Dm_inv[1, 1] * PT10),
+        w * (Dm_inv[1, 0] * PT01 + Dm_inv[1, 1] * PT11),
+        w * (Dm_inv[1, 0] * PT02 + Dm_inv[1, 1] * PT12),
     )
 
     # Scatter: rhs[i0] += -row0 - row1; rhs[i1] += row0; rhs[i2] += row1

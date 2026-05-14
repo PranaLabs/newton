@@ -137,12 +137,11 @@ def svd_3x2(F: mat32) -> mat32:
     """
     FtF = wp.transpose(F) * F  # 2x2 symmetric PSD
 
-    # svd2(FtF): singular values of FtF = squared singular values of F.
-    # For symmetric PSD input, V2 are the right singular vectors of F.
+    # wp.svd2 of symmetric PSD: U == V (up to sign); use V as right singular vectors of F
     _U2, sigma_sq, V2 = wp.svd2(FtF)
 
-    s0 = wp.sqrt(wp.max(sigma_sq[0], float(1.0e-20)))
-    s1 = wp.sqrt(wp.max(sigma_sq[1], float(1.0e-20)))
+    s0 = wp.sqrt(wp.max(sigma_sq[0], 1.0e-20))
+    s1 = wp.sqrt(wp.max(sigma_sq[1], 1.0e-20))
 
     # U columns of the 3x2 SVD: u_i = F v_i / s_i
     v0 = wp.vec2(V2[0, 0], V2[1, 0])
@@ -172,7 +171,19 @@ def project_stretching_arap_kernel(
     # output (atomic accumulator)
     rhs: wp.array[wp.vec3],
 ):
-    """Per-triangle ARAP stretching projection; scatter-adds to rhs."""
+    """Per-triangle ARAP local projection scatter for PD cloth.
+
+    Computes the deformation gradient `F = Ds · Dm_inv` (3×2), projects to the
+    nearest rotation `P` via SVD-clamp, and scatters the per-particle
+    contribution `w · Dm_inv · P^T` into the RHS vector via atomic_add.
+
+    Args:
+        positions: Current particle positions [m], shape ``[particle_count]``.
+        tri_indices: Flat triangle indices, shape ``[3 * tri_count]``.
+        tri_rest_inv: Per-triangle 2×2 rest-pose inverse (``Dm_inv``).
+        tri_weight: Per-triangle stretching weight (`ke · area`).
+        rhs: Output RHS accumulator; receives atomic-add contributions.
+    """
     t = wp.tid()
     i0 = tri_indices[3 * t + 0]
     i1 = tri_indices[3 * t + 1]
@@ -198,9 +209,8 @@ def project_stretching_arap_kernel(
 
     P = svd_3x2(F)
 
-    # Local contribution to RHS: proj = w . Dm_inv^T . P^T  (2x3)
+    # Local contribution to RHS: proj = w * Dm_inv * P^T  (2x3)
     w = tri_weight[t]
-    Dm_invT = wp.transpose(Dm_inv)
     PT00 = P[0, 0]
     PT01 = P[1, 0]
     PT02 = P[2, 0]  # column 0 of P as a row of P^T
@@ -209,14 +219,14 @@ def project_stretching_arap_kernel(
     PT12 = P[2, 1]  # column 1 of P as a row of P^T
 
     row0 = wp.vec3(
-        w * (Dm_invT[0, 0] * PT00 + Dm_invT[0, 1] * PT10),
-        w * (Dm_invT[0, 0] * PT01 + Dm_invT[0, 1] * PT11),
-        w * (Dm_invT[0, 0] * PT02 + Dm_invT[0, 1] * PT12),
+        w * (Dm_inv[0, 0] * PT00 + Dm_inv[0, 1] * PT10),
+        w * (Dm_inv[0, 0] * PT01 + Dm_inv[0, 1] * PT11),
+        w * (Dm_inv[0, 0] * PT02 + Dm_inv[0, 1] * PT12),
     )
     row1 = wp.vec3(
-        w * (Dm_invT[1, 0] * PT00 + Dm_invT[1, 1] * PT10),
-        w * (Dm_invT[1, 0] * PT01 + Dm_invT[1, 1] * PT11),
-        w * (Dm_invT[1, 0] * PT02 + Dm_invT[1, 1] * PT12),
+        w * (Dm_inv[1, 0] * PT00 + Dm_inv[1, 1] * PT10),
+        w * (Dm_inv[1, 0] * PT01 + Dm_inv[1, 1] * PT11),
+        w * (Dm_inv[1, 0] * PT02 + Dm_inv[1, 1] * PT12),
     )
 
     # Scatter: rhs[i0] += -row0 - row1; rhs[i1] += row0; rhs[i2] += row1
