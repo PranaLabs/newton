@@ -279,7 +279,7 @@ class TestARAPProjection(unittest.TestCase):
         """Rest configuration ⇒ P=identity; verify scatter values match the
         formula (Dm_inv @ P^T) with Dm_inv = I₂ analytically.
 
-        For rest=current=(0,0,0),(1,0,0),(0,0,1), P (3×2) maps reference axes to
+        For rest=current=(0,0,0),(1,0,0),(0,0,1), P (3x2) maps reference axes to
         the embedded triangle's axes; the kernel scatters w·Dm_inv·P^T:
             row0 = (1,0,0); row1 = (0,0,1)  (since P = embedding)
         Therefore:
@@ -287,7 +287,7 @@ class TestARAPProjection(unittest.TestCase):
             rhs[1] = (1, 0, 0)
             rhs[2] = (0, 0, 1)
         """
-        from newton._src.solvers.fba.kernels import project_stretching_arap_kernel
+        from newton._src.solvers.fba.kernels import project_stretching_arap_kernel  # noqa: PLC0415
 
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
         positions = wp.array(
@@ -316,7 +316,7 @@ class TestARAPProjection(unittest.TestCase):
         """Non-symmetric Dm_inv (= skewed triangle's rest inverse) must be
         applied as Dm_inv, not Dm_inv^T. Wrong orientation gave ~20% error.
         """
-        from newton._src.solvers.fba.kernels import project_stretching_arap_kernel
+        from newton._src.solvers.fba.kernels import project_stretching_arap_kernel  # noqa: PLC0415
 
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
         # Current configuration = rest, so P = embedding; w·Dm_inv·P^T scatter exact.
@@ -362,7 +362,7 @@ class TestBendingProjection(unittest.TestCase):
         wp.init()
 
     def test_flat_rest_zero_rhs(self):
-        from newton._src.solvers.fba.kernels import project_bending_kernel
+        from newton._src.solvers.fba.kernels import project_bending_kernel  # noqa: PLC0415
 
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
         # Flat 4-vertex stencil: 2 triangles sharing edge (0,1).
@@ -395,7 +395,7 @@ class TestBendingProjection(unittest.TestCase):
 
 class TestPublicAPI(unittest.TestCase):
     def test_solver_fba_in_newton_solvers(self):
-        from newton import solvers
+        from newton import solvers  # noqa: PLC0415
 
         self.assertTrue(hasattr(solvers, "SolverFBA"))
         self.assertIn("SolverFBA", solvers.__all__)

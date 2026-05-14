@@ -13,7 +13,31 @@ from ..solver import SolverBase
 
 
 class SolverFBA(SolverBase):
-    """Fast But Accurate projective-dynamics cloth solver (MVP stub)."""
+    """Fast But Accurate projective-dynamics cloth solver.
+
+    Implements a Projective Dynamics (PD) local-global iteration for cloth
+    with isotropic ARAP stretching, isometric bending, and soft Pin
+    constraints. The PD Hessian is prefactored once via scipy SuperLU
+    (COLAMD ordering); the sparse inverse `S = L⁻¹` is computed exactly
+    using the elimination tree (ported from RealSim
+    `LDLT_computeLowerInverse`) and uploaded to Warp BSR matrices. The
+    runtime linear solve evaluates ``A⁻¹·b = Sᵀ · D⁻¹ · S · b`` via two
+    GPU SpMVs per coordinate component, avoiding the inherently
+    sequential GPU triangular solve.
+
+    Notes:
+        - Float32 ``particle_q`` output: the interior linear solver
+          operates in float64, but ``state_out.particle_q`` (vec3) is
+          float32. This caps achievable position precision at ~1e-7 m.
+        - Large cloth grids (>=32x32) can become unstable after ~100
+          frames at the MVP default of 10 PD iterations; either reduce
+          dt, increase iterations, or stay at smaller grids (<=16x16
+          tested stable).
+
+    See also:
+        :class:`~newton.solvers.SolverStyle3D` — Newton's other PD cloth
+        solver with different sparse-matrix layout (ELL + PCG).
+    """
 
     def __init__(
         self,
@@ -127,6 +151,19 @@ class SolverFBA(SolverBase):
         contacts: Contacts | None,
         dt: float,
     ) -> None:
+        """Advance the cloth state by one implicit Euler step using PD.
+
+        Args:
+            state_in: Input simulation state. ``particle_q`` and
+                ``particle_qd`` are read; ``particle_f`` provides external
+                per-particle forces [N].
+            state_out: Output simulation state. ``particle_q`` and
+                ``particle_qd`` are written; other fields are untouched.
+            control: Unused in MVP (cloth has no actuated joints).
+            contacts: Unused in MVP (contact-aware FBA is future work).
+            dt: Time step [s]. Triggers `_setup_pd_system` rebuild on first
+                step or when changed (PD Hessian depends on dt).
+        """
         from .kernels import (  # noqa: PLC0415
             add_inertia_to_rhs_kernel,
             compute_inertial_kernel,

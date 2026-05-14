@@ -56,6 +56,14 @@ Supported Features
      - 🟨 no self-collision
      - ✅
      - 🟨 basic :sup:`2`
+   * - :class:`~newton.solvers.SolverFBA`
+     - Implicit (PD)
+     - ❌
+     - ❌
+     - ❌
+     - ✅
+     - ❌
+     - ❌
    * - :class:`~newton.solvers.SolverImplicitMPM`
      - Implicit
      - ❌

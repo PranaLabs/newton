@@ -173,14 +173,14 @@ def project_stretching_arap_kernel(
 ):
     """Per-triangle ARAP local projection scatter for PD cloth.
 
-    Computes the deformation gradient `F = Ds · Dm_inv` (3×2), projects to the
+    Computes the deformation gradient `F = Ds · Dm_inv` (3x2), projects to the
     nearest rotation `P` via SVD-clamp, and scatters the per-particle
     contribution `w · Dm_inv · P^T` into the RHS vector via atomic_add.
 
     Args:
         positions: Current particle positions [m], shape ``[particle_count]``.
         tri_indices: Flat triangle indices, shape ``[3 * tri_count]``.
-        tri_rest_inv: Per-triangle 2×2 rest-pose inverse (``Dm_inv``).
+        tri_rest_inv: Per-triangle 2x2 rest-pose inverse (``Dm_inv``).
         tri_weight: Per-triangle stretching weight (`ke · area`).
         rhs: Output RHS accumulator; receives atomic-add contributions.
     """
