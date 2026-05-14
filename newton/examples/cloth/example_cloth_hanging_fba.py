@@ -28,7 +28,7 @@ class Example:
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
 
-        dim = 16
+        dim = 32
 
         # Y-up world: cloth grid spans y from 2.0 (bottom row) to 2+dim*cell_y (top row).
         # Pin the two TOP corners so the cloth hangs under gravity (-Y).
@@ -42,7 +42,7 @@ class Example:
             cell_x=0.05,
             cell_y=0.05,
             mass=0.1,
-            tri_ke=1.0e2,
+            tri_ke=1.0e4,
             tri_ka=0.0,
             tri_kd=0.0,
             edge_ke=1.0e-1,
@@ -82,7 +82,7 @@ class Example:
         # should have descended well below the initial height of 2.8 m.
         assert q[:, 1].min() < 2.0, "cloth did not descend under gravity"
         # The cloth should not have exploded — bounded within [-10, 10] in y.
-        assert q[:, 1].min() > -10.0, f"cloth exploded: min y={q[:,1].min():.4f}"
+        assert q[:, 1].min() > -10.0, f"cloth exploded: min y={q[:, 1].min():.4f}"
 
 
 if __name__ == "__main__":
