@@ -146,7 +146,8 @@ class SolverFBA(SolverBase):
 
         # 1) Compute inertial prediction x_inertia.
         wp.launch(
-            compute_inertial_kernel, dim=N,
+            compute_inertial_kernel,
+            dim=N,
             inputs=[
                 state_in.particle_q,
                 state_in.particle_qd,
@@ -168,7 +169,8 @@ class SolverFBA(SolverBase):
             wp.launch(zero_vec3_kernel, dim=N, inputs=[self._rhs], device=device)
             # Inertia term.
             wp.launch(
-                add_inertia_to_rhs_kernel, dim=N,
+                add_inertia_to_rhs_kernel,
+                dim=N,
                 inputs=[self._x_inertia, model.particle_mass, dt],
                 outputs=[self._rhs],
                 device=device,
@@ -176,16 +178,21 @@ class SolverFBA(SolverBase):
             # Pin projection.
             if self._pin_indices_d is not None:
                 wp.launch(
-                    project_pin_kernel, dim=self._pin_indices_d.shape[0],
+                    project_pin_kernel,
+                    dim=self._pin_indices_d.shape[0],
                     inputs=[self._pin_indices_d, self._x_ref, self.pin_stiffness],
                     outputs=[self._rhs],
                     device=device,
                 )
             # Stretching projection.
             wp.launch(
-                project_stretching_arap_kernel, dim=model.tri_count,
+                project_stretching_arap_kernel,
+                dim=model.tri_count,
                 inputs=[
-                    self._x_cur, self._tri_indices_d, self._tri_rest_inv_d, self._tri_weight_d,
+                    self._x_cur,
+                    self._tri_indices_d,
+                    self._tri_rest_inv_d,
+                    self._tri_weight_d,
                 ],
                 outputs=[self._rhs],
                 device=device,
@@ -193,10 +200,14 @@ class SolverFBA(SolverBase):
             # Bending projection.
             if self._edge_indices_d is not None:
                 wp.launch(
-                    project_bending_kernel, dim=self._edge_indices_d.shape[0],
+                    project_bending_kernel,
+                    dim=self._edge_indices_d.shape[0],
                     inputs=[
-                        self._x_cur, self._x_ref, self._edge_indices_d,
-                        self._edge_quad_q_d, self._edge_weight_d,
+                        self._x_cur,
+                        self._x_ref,
+                        self._edge_indices_d,
+                        self._edge_quad_q_d,
+                        self._edge_weight_d,
                     ],
                     outputs=[self._rhs],
                     device=device,
@@ -207,7 +218,8 @@ class SolverFBA(SolverBase):
         # 3) Write velocity and update state_out.
         wp.copy(state_out.particle_q, self._x_cur)
         wp.launch(
-            write_velocity_kernel, dim=N,
+            write_velocity_kernel,
+            dim=N,
             inputs=[state_in.particle_q, self._x_cur, model.particle_inv_mass, dt],
             outputs=[state_out.particle_qd],
             device=device,
@@ -216,6 +228,7 @@ class SolverFBA(SolverBase):
     def notify_model_changed(self, flags: int) -> None:
         # On any geometry/inertial change, force a full re-setup at the next step.
         from ..flags import SolverNotifyFlags  # noqa: PLC0415
+
         if flags & (SolverNotifyFlags.SHAPE_PROPERTIES | SolverNotifyFlags.BODY_INERTIAL_PROPERTIES):
             self._linear_solver = None
             self._dt_setup = None

@@ -88,7 +88,7 @@ def compute_inertial_kernel(
     w_idx = wp.max(particle_world[tid], 0)
     g = gravity[w_idx]
     im = inv_mass[tid]
-    a = f_ext[tid] * im + g * wp.step(-im)  # gravity active only for free particles
+    a = f_ext[tid] * im + g * wp.step(-im)  # gravity active only for free particles (im>0)
     x_inertia[tid] = x_prev[tid] + v_prev[tid] * dt + a * (dt * dt)
 
 

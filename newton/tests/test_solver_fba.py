@@ -396,8 +396,77 @@ class TestBendingProjection(unittest.TestCase):
 class TestPublicAPI(unittest.TestCase):
     def test_solver_fba_in_newton_solvers(self):
         from newton import solvers
+
         self.assertTrue(hasattr(solvers, "SolverFBA"))
         self.assertIn("SolverFBA", solvers.__all__)
+
+
+class TestSolverFBAIntegration(unittest.TestCase):
+    """T7: smoke; T8: steady-state of hanging cloth."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _build_hanging_cloth(self, dim: int = 32):
+        # Y-up world: cloth grid spans y from 2.0 (bottom row, index 0..dim)
+        # to 2+dim*cell_y (top row, index dim*(dim+1)..dim*(dim+1)+dim).
+        # Pin the two TOP corners so the cloth hangs under gravity (-Y).
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 2, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=dim,
+            dim_y=dim,
+            cell_x=0.05,
+            cell_y=0.05,
+            mass=0.1,
+            tri_ke=1.0e2,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
+            fix_left=False,
+        )
+        # Top-row corners in the (dim+1)x(dim+1) grid: y-index=dim.
+        top_left = dim * (dim + 1)
+        top_right = dim * (dim + 1) + dim
+        builder.particle_mass[top_left] = 0.0
+        builder.particle_mass[top_right] = 0.0
+        return builder.finalize()
+
+    def test_t7_smoke_no_nan(self):
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._build_hanging_cloth(dim=16)
+        solver = SolverFBA(model, iterations=8)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+        for _ in range(50):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite values appeared")
+
+    def test_t8_steady_state_settles(self):
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._build_hanging_cloth(dim=16)
+        solver = SolverFBA(model, iterations=10)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+        for _ in range(500):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        # Center vertex (approximate index dim*dim/2 + dim/2) should have
+        # descended well below the pinned-corner height (~2 m).
+        center_idx = (16 // 2) * (16 + 1) + (16 // 2)
+        self.assertLess(q[center_idx, 1], 1.5, "cloth did not fall under gravity")
+        self.assertGreater(q[center_idx, 1], 0.5, "cloth fell past plausible drape")
 
 
 if __name__ == "__main__":
