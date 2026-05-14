@@ -233,3 +233,57 @@ def project_stretching_arap_kernel(
     wp.atomic_add(rhs, i0, -(row0 + row1))
     wp.atomic_add(rhs, i1, row0)
     wp.atomic_add(rhs, i2, row1)
+
+
+@wp.kernel
+def project_bending_kernel(
+    positions: wp.array[wp.vec3],        # x_cur (unused in MVP scatter; reserved)
+    x_ref: wp.array[wp.vec3],            # rest positions (defines rest curvature)
+    edge_indices: wp.array2d[wp.int32],  # shape (E, 4)
+    edge_quad_q: wp.array[wp.vec4],      # length-4 vector q per edge; Q = q*q^T
+    edge_weight: wp.array[wp.float32],
+    rhs: wp.array[wp.vec3],
+):
+    """Per-edge isometric bending scatter for PD cloth.
+
+    RealSim `PDIsometricBendingEnergy::localProjection` scatters
+    `w * q[a] * (q^T * x_ref)` into each of the 4 stencil vertices via atomic_add.
+    For flat rest (where the cotangent q satisfies q^T * x_ref = 0), the scatter
+    is zero. The Hessian's matching `-w * q*q^T * x_cur` term is absorbed into
+    the prefactored A in build_pd_system.
+
+    Note: ``positions`` (x_cur) is reserved for future contact / non-flat-rest
+    variants and is not read in the MVP implementation.
+
+    Args:
+        positions: Current particle positions [m], shape ``[particle_count]``.
+        x_ref: Reference particle positions [m] (defines rest curvature).
+        edge_indices: 4-vertex bending stencil, shape ``[edge_count, 4]``.
+        edge_quad_q: Per-edge length-4 cotangent vector ``q``.
+        edge_weight: Per-edge bending stiffness ``w``.
+        rhs: Output RHS accumulator; receives atomic-add contributions.
+    """
+    e = wp.tid()
+    q = edge_quad_q[e]
+    w = edge_weight[e]
+    if w == 0.0:
+        return
+
+    i0 = edge_indices[e, 0]
+    i1 = edge_indices[e, 1]
+    i2 = edge_indices[e, 2]
+    i3 = edge_indices[e, 3]
+
+    # Compute q^T * x_ref (a vec3 because positions are vec3).
+    qTxref = (
+        x_ref[i0] * q[0]
+        + x_ref[i1] * q[1]
+        + x_ref[i2] * q[2]
+        + x_ref[i3] * q[3]
+    )
+
+    # Scatter w * q[a] * (q^T * x_ref) to each row.
+    wp.atomic_add(rhs, i0, w * q[0] * qTxref)
+    wp.atomic_add(rhs, i1, w * q[1] * qTxref)
+    wp.atomic_add(rhs, i2, w * q[2] * qTxref)
+    wp.atomic_add(rhs, i3, w * q[3] * qTxref)

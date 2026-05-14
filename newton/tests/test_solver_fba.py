@@ -343,5 +343,42 @@ class TestARAPProjection(unittest.TestCase):
         np.testing.assert_allclose(r[0], -(r[1] + r[2]), atol=1e-6)
 
 
+class TestBendingProjection(unittest.TestCase):
+    """T5: isometric bending projection — flat rest gives zero RHS contribution."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_flat_rest_zero_rhs(self):
+        from newton._src.solvers.fba.kernels import project_bending_kernel
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        # Flat 4-vertex stencil: 2 triangles sharing edge (0,1).
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0.5, 0, 1), wp.vec3(0.5, 0, -1)],
+            dtype=wp.vec3, device=device,
+        )
+        edge_indices = wp.array([[0, 1, 2, 3]], dtype=wp.int32, device=device)
+        # For this flat-rest test, set x_ref = positions; with a translation-invariant
+        # q (sum to zero), qᵀ·x_ref = 0 ⇒ scatter contribution is zero.
+        x_ref = wp.array(positions.numpy(), dtype=wp.vec3, device=device)
+        # q = [1,1,-1,-1] satisfies sum-to-zero.
+        edge_quad_q = wp.array([wp.vec4(1.0, 1.0, -1.0, -1.0)], dtype=wp.vec4, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+        rhs = wp.zeros(4, dtype=wp.vec3, device=device)
+
+        wp.launch(
+            project_bending_kernel, dim=1,
+            inputs=[positions, x_ref, edge_indices, edge_quad_q, weight],
+            outputs=[rhs],
+            device=device,
+        )
+        # qᵀ·x_ref = x_ref[0] + x_ref[1] - x_ref[2] - x_ref[3]
+        #          = (0,0,0)+(1,0,0)-(0.5,0,1)-(0.5,0,-1) = (0,0,0)
+        # So scatter is zero.
+        np.testing.assert_allclose(rhs.numpy(), np.zeros((4, 3)), atol=1e-6)
+
+
 if __name__ == "__main__":
     unittest.main()
