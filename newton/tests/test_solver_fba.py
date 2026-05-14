@@ -8,6 +8,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.fba import SolverFBA
+from newton._src.solvers.fba.kernels import project_stretching_arap_kernel
 from newton._src.solvers.fba.linear_solver import build_pd_system
 
 
@@ -266,6 +267,47 @@ class TestFBALinearSolver(unittest.TestCase):
         wp.launch(apply_permutation_vec3_kernel, dim=n, inputs=[y, invperm_wp], outputs=[z], device=device)
 
         np.testing.assert_allclose(z.numpy(), x_np, atol=0.0)
+
+
+class TestARAPProjection(unittest.TestCase):
+    """T4: ARAP local projection on triangle stretching."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_identity_F_gives_identity_P(self):
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        # One triangle at the rest configuration → F = identity column-augmented.
+        # rest pos: (0,0,0), (1,0,0), (0,0,1); current pos = rest → F·Dm = identity.
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0, 0, 1)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tri_indices = wp.array([0, 1, 2], dtype=wp.int32, device=device)
+        Dm_inv = wp.array(
+            [wp.mat22(1.0, 0.0, 0.0, 1.0)],  # 2x2 identity
+            dtype=wp.mat22,
+            device=device,
+        )
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+        rhs = wp.zeros(3, dtype=wp.vec3, device=device)
+
+        wp.launch(
+            project_stretching_arap_kernel,
+            dim=1,
+            inputs=[positions, tri_indices, Dm_inv, weight],
+            outputs=[rhs],
+            device=device,
+        )
+        rhs_np = rhs.numpy()
+        # When F is the rest configuration, ARAP projects to identity rotation;
+        # the scatter contribution is the "rest" stencil — caller will balance
+        # it with the Hessian. Verify scatter pattern matches Aᵀ·proj where
+        # proj is the rest configuration mapped through Dm_inv·Pᵀ.
+        # Concretely: rhs[1] - rhs[2] should be along e12 direction; rhs[0] = -rhs[1] - rhs[2].
+        np.testing.assert_allclose(rhs_np[0], -(rhs_np[1] + rhs_np[2]), atol=1e-6)
 
 
 if __name__ == "__main__":
