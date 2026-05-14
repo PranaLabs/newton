@@ -207,7 +207,7 @@ class TestSparseInverse(unittest.TestCase):
         P_r = np.eye(n)[perm_r]
         P_c = np.eye(n)[perm_c]
         Ainv_reconstructed = P_c.T @ S_arr.T @ np.diag(Dinv) @ S_arr @ P_r
-        self.assertLess(np.abs(Ainv_reconstructed - Ainv_dense).max(), 1e-8)
+        self.assertLess(np.abs(Ainv_reconstructed - Ainv_dense).max(), 1e-12)
 
 
 if __name__ == "__main__":
