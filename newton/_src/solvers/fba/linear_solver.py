@@ -16,6 +16,7 @@ Runtime (GPU):
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -390,3 +391,31 @@ def _compute_isometric_bending_q(edge_indices: np.ndarray, positions: np.ndarray
         q[e] = np.array([cot02 + cot03, cot12 + cot13, -(cot02 + cot12), -(cot03 + cot13)])
         scale[e] = 3.0 / max(A0 + A1, 1e-20)
     return q, scale
+
+
+@dataclass
+class FactorizedSystem:
+    """Output of factorize_and_sparse_inverse."""
+
+    S: "sp.csc_matrix"          # n×n, lower-tri inverse with elimination-tree sparsity
+    ST: "sp.csc_matrix"         # transpose, runtime-uploaded separately
+    Dinv: np.ndarray            # length n
+    perm_r: np.ndarray          # length n, int32
+    invperm_r: np.ndarray       # length n, int32
+
+
+def factorize_and_sparse_inverse(A) -> FactorizedSystem:
+    """Run COLAMD ordering + LU factor + sparse inverse on an SPD matrix.
+
+    Args:
+        A: scalar N×N PD Hessian (csr or csc, will be converted internally).
+
+    Returns:
+        FactorizedSystem with all data needed to construct an FBALinearSolver.
+    """
+    L, _U, Dinv, perm_r, _perm_c = _splu_extract_factors(A)
+    parent = _elimination_tree(L)
+    invperm_r = np.argsort(perm_r).astype(np.int32)
+    S = compute_lower_inverse(L, parent=parent)
+    ST = S.T.tocsc()
+    return FactorizedSystem(S=S, ST=ST, Dinv=Dinv, perm_r=perm_r, invperm_r=invperm_r)
