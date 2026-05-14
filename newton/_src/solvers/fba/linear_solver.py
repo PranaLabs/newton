@@ -100,9 +100,6 @@ def build_pd_system(
         tri_area = model.tri_areas.numpy().astype(np.float64)
         # tri_materials column 0 is ke (area-weighted stretching stiffness).
         tri_materials = model.tri_materials.numpy().astype(np.float64)
-        if tri_materials.ndim == 1:
-            # Flat storage: 5 values per triangle.
-            tri_materials = tri_materials.reshape(-1, 5)
         ke = tri_materials[:, 0]
         tri_weight = ke * tri_area
 
@@ -142,8 +139,6 @@ def build_pd_system(
 
         if model.edge_bending_properties is not None:
             bend_props = model.edge_bending_properties.numpy().astype(np.float64)
-            if bend_props.ndim == 1:
-                bend_props = bend_props.reshape(-1, 2)
             edge_weight = bend_props[interior_mask, 0]
         else:
             edge_weight = np.zeros(edge_indices.shape[0], dtype=np.float64)
