@@ -95,5 +95,84 @@ class TestBuildPDSystem(unittest.TestCase):
         self.assertGreaterEqual(A[0, 0], 1e12 - 1e-3)
 
 
+class TestBendingQMatchesReference(unittest.TestCase):
+    """T3: Verify _compute_isometric_bending_q against a hand-computed reference
+    on an asymmetric quad where the old 2-cotangent formula would give wrong results.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_bending_q_matches_reference(self):
+        # Asymmetric quad: triangles (0,1,2) and (1,3,2) sharing edge (1,2).
+        builder = newton.ModelBuilder()
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=[
+                wp.vec3(0.0, 0.0, 0.0),  # v0
+                wp.vec3(2.0, 0.0, 0.0),  # v1
+                wp.vec3(0.1, 0.0, 1.0),  # v2 (skewed)
+                wp.vec3(1.9, 0.0, -1.0),  # v3 (different skew)
+            ],
+            indices=[0, 1, 2, 1, 3, 2],
+            density=1.0,
+            tri_ke=1.0e2,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0,
+            edge_kd=0.0,
+        )
+        model = builder.finalize(device="cpu")
+
+        # Inspect Newton's edge layout to find the interior edge and its stencil
+        # permutation.  Newton stores [o0, o1, v1, v2]; reordering to
+        # [v1, v2, o0, o1] gives the (v0, v1, v2, v3) stencil used internally.
+        ei = model.edge_indices.numpy().reshape(-1, 4)
+        interior_mask = (ei[:, 0] >= 0) & (ei[:, 1] >= 0)
+        ei_interior = ei[interior_mask]
+        # There must be exactly one interior edge for this two-triangle mesh.
+        self.assertEqual(ei_interior.shape[0], 1)
+        # After reorder: stencil = [v1=1, v2=2, o0=0, o1=3] -> (v0=1,v1=2,v2=0,v3=3)
+        stencil = ei_interior[0, [2, 3, 0, 1]]  # [v1, v2, o0, o1]
+        self.assertListEqual(list(stencil), [1, 2, 0, 3])
+
+        _A, meta = build_pd_system(model, dt=1.0 / 60.0, pin_stiffness=1e12)
+
+        # Hand-computed reference for stencil (v0=1,v1=2,v2=0,v3=3):
+        #   x0=(2,0,0), x1=(0.1,0,1), x2=(0,0,0), x3=(1.9,0,-1)
+        x0 = np.array([2.0, 0.0, 0.0])
+        x1 = np.array([0.1, 0.0, 1.0])
+        x2 = np.array([0.0, 0.0, 0.0])
+        x3 = np.array([1.9, 0.0, -1.0])
+        l01 = np.linalg.norm(x1 - x0)
+        l02 = np.linalg.norm(x2 - x0)
+        l12 = np.linalg.norm(x2 - x1)
+        l03 = np.linalg.norm(x3 - x0)
+        l13 = np.linalg.norm(x3 - x1)
+        r0 = 0.5 * (l01 + l02 + l12)
+        A0 = np.sqrt(max(r0 * (r0 - l01) * (r0 - l02) * (r0 - l12), 0.0))
+        r1 = 0.5 * (l01 + l03 + l13)
+        A1 = np.sqrt(max(r1 * (r1 - l01) * (r1 - l03) * (r1 - l13), 0.0))
+        cot02 = (l01 * l01 - l02 * l02 + l12 * l12) / (4.0 * max(A0, 1e-20))
+        cot12 = (l01 * l01 + l02 * l02 - l12 * l12) / (4.0 * max(A0, 1e-20))
+        cot03 = (l01 * l01 - l03 * l03 + l13 * l13) / (4.0 * max(A1, 1e-20))
+        cot13 = (l01 * l01 + l03 * l03 - l13 * l13) / (4.0 * max(A1, 1e-20))
+        q_ref = np.array([cot02 + cot03, cot12 + cot13, -(cot02 + cot12), -(cot03 + cot13)])
+        scale_ref = 3.0 / max(A0 + A1, 1e-20)
+
+        self.assertTrue(
+            np.allclose(meta["edge_quad_q"][0], q_ref, atol=1e-10),
+            f"q mismatch: got {meta['edge_quad_q'][0]}, expected {q_ref}",
+        )
+        self.assertTrue(
+            np.allclose(meta["edge_quad_scale"][0], scale_ref, atol=1e-10),
+            f"scale mismatch: got {meta['edge_quad_scale'][0]}, expected {scale_ref}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

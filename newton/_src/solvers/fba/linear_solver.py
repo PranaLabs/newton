@@ -4,14 +4,14 @@
 """Cholesky + sparse-inverse linear solver for SolverFBA.
 
 Setup phase (CPU):
-    1. assemble scalar NxN PD Hessian `A` (caller-supplied).
-    2. factor with `scipy.sparse.linalg.splu` (COLAMD ordering).
-    3. compute `S = L^-1` keeping elimination-tree sparsity (ported from
-       RealSim `LDLT_computeLowerInverse`, SparseLDLT.cpp:225-347).
+    1. assemble scalar N*N PD Hessian ``A`` (caller-supplied).
+    2. factor with ``scipy.sparse.linalg.splu`` (COLAMD ordering).
+    3. compute ``S = L⁻¹`` keeping elimination-tree sparsity (ported from
+       RealSim ``LDLT_computeLowerInverse``, SparseLDLT.cpp:225-347).
     4. upload to device as Warp BSR matrices.
 
 Runtime (GPU):
-    `A^-1 b = S^T * D^-1 * (S * b)` -- two `bsr_mv` calls plus diagonal scaling.
+    ``A⁻¹ b = Sᵀ · D⁻¹ · (S · b)`` — two ``bsr_mv`` calls plus diagonal scaling.
 """
 
 from __future__ import annotations
@@ -51,6 +51,7 @@ def build_pd_system(
         - ``meta["tri_weight"]`` : ``np.ndarray[float64]`` shape (T,)  (= ke * area)
         - ``meta["edge_indices"]`` : ``np.ndarray[int32]`` shape (E, 4)
         - ``meta["edge_quad_q"]`` : ``np.ndarray[float64]`` shape (E, 4)  (k-coefs)
+        - ``meta["edge_quad_scale"]`` : ``np.ndarray[float64]`` shape (E,)  (3/(A0+A1))
         - ``meta["edge_weight"]`` : ``np.ndarray[float64]`` shape (E,)
         - ``meta["pin_indices"]`` : ``np.ndarray[int32]`` (packed pinned indices)
         - ``meta["pin_weight"]`` : float
@@ -92,11 +93,7 @@ def build_pd_system(
         # tri_poses stores the 2x2 rest-pose inverse per triangle.
         if model.tri_poses is not None:
             tri_rest_inv = model.tri_poses.numpy().astype(np.float64)
-            # tri_poses is stored as wp.mat22; .numpy() may return shape (T, 2, 2)
-            # or a flat array -- normalise to (T, 2, 2).
-            if tri_rest_inv.ndim == 1:
-                T = tri_indices.shape[0]
-                tri_rest_inv = tri_rest_inv.reshape(T, 2, 2)
+            # tri_poses is stored as wp.mat22; .numpy() returns shape (T, 2, 2).
         else:
             tri_rest_inv = _compute_rest_inv_from_positions(model)
 
@@ -126,6 +123,7 @@ def build_pd_system(
     # ---- Bending edge contribution (4-vertex isometric stencil) ----
     edge_indices = np.zeros((0, 4), dtype=np.int32)
     edge_quad_q = np.zeros((0, 4), dtype=np.float64)
+    edge_quad_scale = np.zeros((0,), dtype=np.float64)
     edge_weight = np.zeros((0,), dtype=np.float64)
     if model.edge_indices is not None:
         # Newton layout: [o0, o1, v1, v2] per row (o = opposite, v = shared edge).
@@ -140,7 +138,7 @@ def build_pd_system(
 
         # Compute cotangent k-coefficients from initial geometry.
         positions = model.particle_q.numpy().astype(np.float64)
-        edge_quad_q = _compute_isometric_bending_q(edge_indices, positions)
+        edge_quad_q, edge_quad_scale = _compute_isometric_bending_q(edge_indices, positions)
 
         if model.edge_bending_properties is not None:
             bend_props = model.edge_bending_properties.numpy().astype(np.float64)
@@ -152,7 +150,7 @@ def build_pd_system(
 
         for e in range(edge_indices.shape[0]):
             q = edge_quad_q[e]  # length 4
-            w = edge_weight[e]
+            w = edge_weight[e] * edge_quad_scale[e]  # combine user weight + isometric scale
             if w == 0.0:
                 continue
             for a in range(4):
@@ -178,6 +176,7 @@ def build_pd_system(
         "tri_weight": tri_weight,
         "edge_indices": edge_indices,
         "edge_quad_q": edge_quad_q,
+        "edge_quad_scale": edge_quad_scale,
         "edge_weight": edge_weight,
         "pin_indices": pin_indices,
         "pin_weight": pin_stiffness,
@@ -207,45 +206,44 @@ def _compute_rest_inv_from_positions(model: Model) -> np.ndarray:
     return out
 
 
-def _compute_isometric_bending_q(edge_indices: np.ndarray, positions: np.ndarray) -> np.ndarray:
-    """Per-edge length-4 vector q such that bending Hessian ~ q*q^T.
+def _compute_isometric_bending_q(edge_indices: np.ndarray, positions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per-edge length-4 vector q and per-edge scale ``3 / (A0 + A1)``.
 
-    Bergou et al. 2006 isometric bending: for stencil (v0, v1, v2, v3)
-    where (v0, v1) is the shared edge and (v2, v3) the opposite vertices
-    of the two adjacent triangles, the per-edge bending energy is
-    0.5 * k * (q^T x)^2 where q is determined by cotangents at the two
-    opposite angles.
+    Bergou et al. 2006 isometric bending: for stencil (v0, v1, v2, v3) where
+    (v0, v1) is the shared edge and (v2, v3) the opposite vertices of the two
+    adjacent triangles, the per-edge bending Hessian contribution is
+    ``(3 / (A0 + A1)) · q·qᵀ`` with q given by cotangents at all four
+    edge-endpoint angles. See PDIsometricBendingEnergy.cpp::init().
 
     Args:
         edge_indices: Shape (E, 4), columns are (v0, v1, v2, v3).
         positions: Shape (N, 3) particle rest positions.
 
     Returns:
-        Shape (E, 4) array of cotangent-weighted coefficients.
+        A tuple ``(q, scale)`` where ``q`` has shape (E, 4) and ``scale`` has
+        shape (E,) with per-edge values ``3 / (A0 + A1)``.
     """
     E = edge_indices.shape[0]
-    q_out = np.zeros((E, 4), dtype=np.float64)
+    q = np.zeros((E, 4), dtype=np.float64)
+    scale = np.zeros((E,), dtype=np.float64)
     for e in range(E):
         v0, v1, v2, v3 = edge_indices[e]
         x0, x1, x2, x3 = positions[v0], positions[v1], positions[v2], positions[v3]
-        e01 = x1 - x0
-        c2_a = x0 - x2
-        c2_b = x1 - x2
-        c3_a = x0 - x3
-        c3_b = x1 - x3
-        cot2 = np.dot(c2_a, c2_b) / max(np.linalg.norm(np.cross(c2_a, c2_b)), 1e-20)
-        cot3 = np.dot(c3_a, c3_b) / max(np.linalg.norm(np.cross(c3_a, c3_b)), 1e-20)
-        # Stencil weights (Bergou 06 isometric bending Hessian).
-        a0 = cot2 + cot3
-        a1 = cot2 + cot3
-        a2 = -cot2
-        a3 = -cot3
-        # Enforce translation invariance (sum to zero).
-        s = a0 + a1 + a2 + a3
-        a0 -= s / 4
-        a1 -= s / 4
-        a2 -= s / 4
-        a3 -= s / 4
-        scale = np.sqrt(3.0 / max(np.linalg.norm(e01) ** 2, 1e-20))
-        q_out[e] = scale * np.array([a0, a1, a2, a3])
-    return q_out
+        l01 = np.linalg.norm(x1 - x0)
+        l02 = np.linalg.norm(x2 - x0)
+        l12 = np.linalg.norm(x2 - x1)
+        l03 = np.linalg.norm(x3 - x0)
+        l13 = np.linalg.norm(x3 - x1)
+        # Heron's formula for triangle areas.
+        r0 = 0.5 * (l01 + l02 + l12)
+        A0 = np.sqrt(max(r0 * (r0 - l01) * (r0 - l02) * (r0 - l12), 0.0))
+        r1 = 0.5 * (l01 + l03 + l13)
+        A1 = np.sqrt(max(r1 * (r1 - l01) * (r1 - l03) * (r1 - l13), 0.0))
+        # Four cotangents at the edge-endpoint angles.
+        cot02 = (l01 * l01 - l02 * l02 + l12 * l12) / (4.0 * max(A0, 1e-20))
+        cot12 = (l01 * l01 + l02 * l02 - l12 * l12) / (4.0 * max(A0, 1e-20))
+        cot03 = (l01 * l01 - l03 * l03 + l13 * l13) / (4.0 * max(A1, 1e-20))
+        cot13 = (l01 * l01 + l03 * l03 - l13 * l13) / (4.0 * max(A1, 1e-20))
+        q[e] = np.array([cot02 + cot03, cot12 + cot13, -(cot02 + cot12), -(cot03 + cot13)])
+        scale[e] = 3.0 / max(A0 + A1, 1e-20)
+    return q, scale
