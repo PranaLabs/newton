@@ -784,5 +784,142 @@ class TestSolverFBAExternalForces(unittest.TestCase):
         )
 
 
+class TestSolverFBAReconfigure(unittest.TestCase):
+    """Robustness tests covering dt-change re-setup and notify_model_changed."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _build_4x4_cloth(self):
+        """Return a 4x4 cloth model with the left column pinned."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=1.0e2,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
+            fix_left=True,
+        )
+        return builder.finalize()
+
+    def test_dt_change_triggers_resetup(self):
+        from newton.solvers import SolverFBA
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0), rot=wp.quat_identity(), vel=wp.vec3(0, 0, 0),
+            dim_x=4, dim_y=4, cell_x=0.1, cell_y=0.1, mass=0.01,
+            tri_ke=1.0e2, tri_ka=0.0, tri_kd=0.0,
+            edge_ke=1.0e-1, edge_kd=0.0,
+            fix_left=True,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=5)
+        s_in, s_out = model.state(), model.state()
+
+        s_in.clear_forces()
+        solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+        self.assertAlmostEqual(solver._dt_setup, 1.0 / 60.0, places=10)
+        linsolver_a = solver._linear_solver
+
+        s_in, s_out = s_out, s_in
+        s_in.clear_forces()
+        solver.step(s_in, s_out, None, None, 1.0 / 120.0)
+        self.assertAlmostEqual(solver._dt_setup, 1.0 / 120.0, places=10)
+        linsolver_b = solver._linear_solver
+        self.assertIsNot(linsolver_a, linsolver_b, "linear solver should have been rebuilt on dt change")
+
+        q = s_out.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)))
+
+    def test_same_dt_no_resetup(self):
+        from newton.solvers import SolverFBA
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0), rot=wp.quat_identity(), vel=wp.vec3(0, 0, 0),
+            dim_x=4, dim_y=4, cell_x=0.1, cell_y=0.1, mass=0.01,
+            tri_ke=1.0e2, tri_ka=0.0, tri_kd=0.0,
+            edge_ke=1.0e-1, edge_kd=0.0,
+            fix_left=True,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=5)
+        s_in, s_out = model.state(), model.state()
+        s_in.clear_forces()
+        solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+        linsolver_a = solver._linear_solver
+        s_in, s_out = s_out, s_in
+        s_in.clear_forces()
+        solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+        linsolver_b = solver._linear_solver
+        self.assertIs(linsolver_a, linsolver_b, "linear solver should not rebuild when dt unchanged")
+
+    def test_notify_shape_properties_forces_resetup(self):
+        from newton._src.solvers import SolverNotifyFlags
+        from newton.solvers import SolverFBA
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0), rot=wp.quat_identity(), vel=wp.vec3(0, 0, 0),
+            dim_x=4, dim_y=4, cell_x=0.1, cell_y=0.1, mass=0.01,
+            tri_ke=1.0e2, tri_ka=0.0, tri_kd=0.0,
+            edge_ke=1.0e-1, edge_kd=0.0,
+            fix_left=True,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=5)
+        s_in, s_out = model.state(), model.state()
+        s_in.clear_forces()
+        solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+        linsolver_a = solver._linear_solver
+        self.assertIsNotNone(linsolver_a)
+
+        solver.notify_model_changed(SolverNotifyFlags.SHAPE_PROPERTIES)
+        self.assertIsNone(solver._linear_solver, "notify_model_changed should clear _linear_solver")
+        self.assertIsNone(solver._dt_setup, "notify_model_changed should clear _dt_setup")
+
+        s_in, s_out = s_out, s_in
+        s_in.clear_forces()
+        solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+        self.assertIsNotNone(solver._linear_solver)
+        self.assertIsNot(solver._linear_solver, linsolver_a)
+        q = s_out.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)))
+
+    def test_notify_unrelated_flag_no_resetup(self):
+        from newton._src.solvers import SolverNotifyFlags
+        from newton.solvers import SolverFBA
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0), rot=wp.quat_identity(), vel=wp.vec3(0, 0, 0),
+            dim_x=4, dim_y=4, cell_x=0.1, cell_y=0.1, mass=0.01,
+            tri_ke=1.0e2, tri_ka=0.0, tri_kd=0.0,
+            edge_ke=1.0e-1, edge_kd=0.0,
+            fix_left=True,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=5)
+        s_in, s_out = model.state(), model.state()
+        s_in.clear_forces()
+        solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+        linsolver_a = solver._linear_solver
+
+        # JOINT_PROPERTIES shouldn't affect FBA cloth.
+        solver.notify_model_changed(SolverNotifyFlags.JOINT_PROPERTIES)
+        self.assertIs(solver._linear_solver, linsolver_a, "FBA should ignore JOINT_PROPERTIES")
+
+
 if __name__ == "__main__":
     unittest.main()
