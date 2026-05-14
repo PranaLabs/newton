@@ -24,31 +24,31 @@ def apply_permutation_vec3_kernel(
 def extract_component_kernel(
     src: wp.array[wp.vec3],
     component: int,
-    dst: wp.array[wp.float32],
+    dst: wp.array[wp.float64],
 ):
-    """dst[i] = src[i][component]."""
+    """dst[i] = src[i][component] — extracts one vec3 component into a float64 array."""
     tid = wp.tid()
-    dst[tid] = src[tid][component]
+    dst[tid] = wp.float64(src[tid][component])
 
 
 @wp.kernel
 def insert_component_kernel(
-    src: wp.array[wp.float32],
+    src: wp.array[wp.float64],
     component: int,
     dst: wp.array[wp.vec3],
 ):
-    """dst[i][component] = src[i]."""
+    """dst[i][component] = src[i] — inserts a float64 scalar back into a vec3 component."""
     tid = wp.tid()
     v = dst[tid]
-    v[component] = src[tid]
+    v[component] = wp.float32(src[tid])
     dst[tid] = v
 
 
 @wp.kernel
 def scale_by_diag_kernel(
-    src: wp.array[wp.float32],
-    diag: wp.array[wp.float32],
-    dst: wp.array[wp.float32],
+    src: wp.array[wp.float64],
+    diag: wp.array[wp.float64],
+    dst: wp.array[wp.float64],
 ):
     """dst[i] = diag[i] * src[i] — used for D-inverse scaling in the linear solve."""
     tid = wp.tid()
@@ -57,9 +57,9 @@ def scale_by_diag_kernel(
 
 @wp.kernel
 def apply_permutation_scalar_kernel(
-    src: wp.array[wp.float32],
+    src: wp.array[wp.float64],
     perm: wp.array[wp.int32],
-    dst: wp.array[wp.float32],
+    dst: wp.array[wp.float64],
 ):
     """dst[i] = src[perm[i]] — scalar gather variant."""
     tid = wp.tid()
@@ -237,10 +237,10 @@ def project_stretching_arap_kernel(
 
 @wp.kernel
 def project_bending_kernel(
-    positions: wp.array[wp.vec3],        # x_cur (unused in MVP scatter; reserved)
-    x_ref: wp.array[wp.vec3],            # rest positions (defines rest curvature)
+    positions: wp.array[wp.vec3],  # x_cur (unused in MVP scatter; reserved)
+    x_ref: wp.array[wp.vec3],  # rest positions (defines rest curvature)
     edge_indices: wp.array2d[wp.int32],  # shape (E, 4)
-    edge_quad_q: wp.array[wp.vec4],      # length-4 vector q per edge; Q = q*q^T
+    edge_quad_q: wp.array[wp.vec4],  # length-4 vector q per edge; Q = q*q^T
     edge_weight: wp.array[wp.float32],
     rhs: wp.array[wp.vec3],
 ):
@@ -275,12 +275,7 @@ def project_bending_kernel(
     i3 = edge_indices[e, 3]
 
     # Compute q^T * x_ref (a vec3 because positions are vec3).
-    qTxref = (
-        x_ref[i0] * q[0]
-        + x_ref[i1] * q[1]
-        + x_ref[i2] * q[2]
-        + x_ref[i3] * q[3]
-    )
+    qTxref = x_ref[i0] * q[0] + x_ref[i1] * q[1] + x_ref[i2] * q[2] + x_ref[i3] * q[3]
 
     # Scatter w * q[a] * (q^T * x_ref) to each row.
     wp.atomic_add(rhs, i0, w * q[0] * qTxref)
@@ -292,7 +287,7 @@ def project_bending_kernel(
 @wp.kernel
 def project_pin_kernel(
     pin_indices: wp.array[wp.int32],
-    x_ref: wp.array[wp.vec3],            # full vec3 array indexed by particle index
+    x_ref: wp.array[wp.vec3],  # full vec3 array indexed by particle index
     pin_stiffness: float,
     rhs: wp.array[wp.vec3],
 ):

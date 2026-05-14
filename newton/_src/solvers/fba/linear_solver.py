@@ -231,6 +231,7 @@ def _splu_extract_factors(
 
     lu = spla.splu(A.tocsc(), permc_spec="COLAMD")
     L = lu.L.tocsc()  # lower-tri with unit diagonal
+    L.sort_indices()  # SuperLU may return unsorted column indices; sort for alignment
     U = lu.U.tocsc()
     Dinv = 1.0 / U.diagonal()
     perm_r = lu.perm_r.astype(np.int32)
@@ -430,21 +431,21 @@ def factorize_and_sparse_inverse(A) -> FactorizedSystem:
 
 
 def _csc_to_bsr_1x1(M, device):
-    """Build a Warp 1x1 BSR matrix from a SciPy CSC/CSR matrix.
+    """Build a Warp 1x1 BSR matrix (float64) from a SciPy CSC/CSR matrix.
 
     Args:
         M: SciPy sparse matrix (any format, converted to CSR internally).
         device: Warp device to place the BSR matrix on.
 
     Returns:
-        A :class:`warp.sparse.BsrMatrix` with ``block_type=wp.float32``.
+        A :class:`warp.sparse.BsrMatrix` with ``block_type=wp.float64``.
     """
     M_csr = M.tocsr()
-    rows_np, cols_np = M_csr.nonzero()
-    vals_np = np.asarray(M_csr[rows_np, cols_np]).ravel().astype(np.float32)
-    rows_wp = wp.array(rows_np.astype(np.int32), dtype=wp.int32, device=device)
-    cols_wp = wp.array(cols_np.astype(np.int32), dtype=wp.int32, device=device)
-    vals_wp = wp.array(vals_np, dtype=wp.float32, device=device)
+    rows, cols = M_csr.nonzero()
+    vals = M_csr.data.astype(np.float64)
+    rows_wp = wp.array(rows.astype(np.int32), dtype=wp.int32, device=device)
+    cols_wp = wp.array(cols.astype(np.int32), dtype=wp.int32, device=device)
+    vals_wp = wp.array(vals, dtype=wp.float64, device=device)
     return wps.bsr_from_triplets(M.shape[0], M.shape[1], rows_wp, cols_wp, vals_wp)
 
 
@@ -469,17 +470,17 @@ class FBALinearSolver:
         # Build 1x1 BSR matrices from SciPy sparse factors.
         self._S_bsr = _csc_to_bsr_1x1(factor.S, self.device)
         self._ST_bsr = _csc_to_bsr_1x1(factor.ST, self.device)
-        self._Dinv = wp.array(factor.Dinv.astype(np.float32), dtype=wp.float32, device=self.device)
+        self._Dinv = wp.array(factor.Dinv.astype(np.float64), dtype=wp.float64, device=self.device)
         self._perm = wp.array(factor.perm_r.astype(np.int32), dtype=wp.int32, device=self.device)
         self._invperm = wp.array(factor.invperm_r.astype(np.int32), dtype=wp.int32, device=self.device)
 
         # Scalar scratch buffers — reused across components to avoid allocation.
-        self._b_scalar = wp.empty(n, dtype=wp.float32, device=self.device)
-        self._b_perm = wp.empty(n, dtype=wp.float32, device=self.device)
-        self._Sb = wp.empty(n, dtype=wp.float32, device=self.device)
-        self._DSb = wp.empty(n, dtype=wp.float32, device=self.device)
-        self._SDSb = wp.empty(n, dtype=wp.float32, device=self.device)
-        self._x_scalar = wp.empty(n, dtype=wp.float32, device=self.device)
+        self._b_scalar = wp.empty(n, dtype=wp.float64, device=self.device)
+        self._b_perm = wp.empty(n, dtype=wp.float64, device=self.device)
+        self._Sb = wp.empty(n, dtype=wp.float64, device=self.device)
+        self._DSb = wp.empty(n, dtype=wp.float64, device=self.device)
+        self._SDSb = wp.empty(n, dtype=wp.float64, device=self.device)
+        self._x_scalar = wp.empty(n, dtype=wp.float64, device=self.device)
 
     def solve(self, b: wp.array[wp.vec3], x: wp.array[wp.vec3]) -> None:
         """Compute ``x[i] = A⁻¹ · b[i]`` component-wise.
@@ -493,11 +494,13 @@ class FBALinearSolver:
         for c in range(3):
             # 1. Extract scalar component c from b.
             wp.launch(extract_component_kernel, dim=n, inputs=[b, c], outputs=[self._b_scalar], device=dev)
-            # 2. Apply row permutation: b_perm[i] = b_scalar[perm[i]].
+            # 2. Apply inverse row permutation: b_perm[i] = b_scalar[invperm[i]].
+            #    The formula is A⁻¹ b = P_r⁻¹ · Sᵀ · D⁻¹ · S · P_r · b (see docstring).
+            #    The first permutation gathers b by invperm (un-applies the row reordering).
             wp.launch(
                 apply_permutation_scalar_kernel,
                 dim=n,
-                inputs=[self._b_scalar, self._perm],
+                inputs=[self._b_scalar, self._invperm],
                 outputs=[self._b_perm],
                 device=dev,
             )
@@ -507,11 +510,12 @@ class FBALinearSolver:
             wp.launch(scale_by_diag_kernel, dim=n, inputs=[self._Sb, self._Dinv], outputs=[self._DSb], device=dev)
             # 5. Multiply by Sᵀ: SDSb = Sᵀ * DSb.
             wps.bsr_mv(self._ST_bsr, self._DSb, self._SDSb)
-            # 6. Apply inverse permutation: x_scalar[i] = SDSb[invperm[i]].
+            # 6. Apply row permutation: x_scalar[i] = SDSb[perm[i]].
+            #    The second permutation gathers by perm_r (re-applies the row ordering).
             wp.launch(
                 apply_permutation_scalar_kernel,
                 dim=n,
-                inputs=[self._SDSb, self._invperm],
+                inputs=[self._SDSb, self._perm],
                 outputs=[self._x_scalar],
                 device=dev,
             )

@@ -8,7 +8,6 @@ import warp as wp
 
 import newton
 from newton._src.solvers.fba import SolverFBA
-from newton._src.solvers.fba.kernels import project_stretching_arap_kernel
 from newton._src.solvers.fba.linear_solver import build_pd_system
 
 
@@ -293,16 +292,21 @@ class TestARAPProjection(unittest.TestCase):
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
         positions = wp.array(
             [wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0, 0, 1)],
-            dtype=wp.vec3, device=device,
+            dtype=wp.vec3,
+            device=device,
         )
         tri_indices = wp.array([0, 1, 2], dtype=wp.int32, device=device)
         Dm_inv = wp.array([wp.mat22(1.0, 0.0, 0.0, 1.0)], dtype=wp.mat22, device=device)
         weight = wp.array([1.0], dtype=wp.float32, device=device)
         rhs = wp.zeros(3, dtype=wp.vec3, device=device)
 
-        wp.launch(project_stretching_arap_kernel, dim=1,
-                  inputs=[positions, tri_indices, Dm_inv, weight],
-                  outputs=[rhs], device=device)
+        wp.launch(
+            project_stretching_arap_kernel,
+            dim=1,
+            inputs=[positions, tri_indices, Dm_inv, weight],
+            outputs=[rhs],
+            device=device,
+        )
         r = rhs.numpy()
         np.testing.assert_allclose(r[1], [1.0, 0.0, 0.0], atol=1e-6)
         np.testing.assert_allclose(r[2], [0.0, 0.0, 1.0], atol=1e-6)
@@ -318,20 +322,27 @@ class TestARAPProjection(unittest.TestCase):
         # Current configuration = rest, so P = embedding; w·Dm_inv·P^T scatter exact.
         positions = wp.array(
             [wp.vec3(0, 0, 0), wp.vec3(2, 0, 0), wp.vec3(1, 0, 1)],
-            dtype=wp.vec3, device=device,
+            dtype=wp.vec3,
+            device=device,
         )
         tri_indices = wp.array([0, 1, 2], dtype=wp.int32, device=device)
         # For this triangle: e12=(2,0,0), e13=(1,0,1); the orthonormal basis is
         # n1=(1,0,0), n2=(0,0,1); Dm = basis^T·edges = [[2,1],[0,1]];
         # Dm_inv = [[0.5,-0.5],[0,1]].
         Dm_inv = wp.array(
-            [wp.mat22(0.5, -0.5, 0.0, 1.0)], dtype=wp.mat22, device=device,
+            [wp.mat22(0.5, -0.5, 0.0, 1.0)],
+            dtype=wp.mat22,
+            device=device,
         )
         weight = wp.array([1.0], dtype=wp.float32, device=device)
         rhs = wp.zeros(3, dtype=wp.vec3, device=device)
-        wp.launch(project_stretching_arap_kernel, dim=1,
-                  inputs=[positions, tri_indices, Dm_inv, weight],
-                  outputs=[rhs], device=device)
+        wp.launch(
+            project_stretching_arap_kernel,
+            dim=1,
+            inputs=[positions, tri_indices, Dm_inv, weight],
+            outputs=[rhs],
+            device=device,
+        )
         r = rhs.numpy()
 
         # Analytical: with current=rest and Dm_inv as above, P = embedding [[1,0],[0,0],[0,1]] (3x2);
@@ -357,7 +368,8 @@ class TestBendingProjection(unittest.TestCase):
         # Flat 4-vertex stencil: 2 triangles sharing edge (0,1).
         positions = wp.array(
             [wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0.5, 0, 1), wp.vec3(0.5, 0, -1)],
-            dtype=wp.vec3, device=device,
+            dtype=wp.vec3,
+            device=device,
         )
         edge_indices = wp.array([[0, 1, 2, 3]], dtype=wp.int32, device=device)
         # For this flat-rest test, set x_ref = positions; with a translation-invariant
@@ -369,7 +381,8 @@ class TestBendingProjection(unittest.TestCase):
         rhs = wp.zeros(4, dtype=wp.vec3, device=device)
 
         wp.launch(
-            project_bending_kernel, dim=1,
+            project_bending_kernel,
+            dim=1,
             inputs=[positions, x_ref, edge_indices, edge_quad_q, weight],
             outputs=[rhs],
             device=device,
