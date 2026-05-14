@@ -210,5 +210,63 @@ class TestSparseInverse(unittest.TestCase):
         self.assertLess(np.abs(Ainv_reconstructed - Ainv_dense).max(), 1e-12)
 
 
+class TestFBALinearSolver(unittest.TestCase):
+    """T3 end-to-end linear solve + T6 permutation roundtrip."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_solve_random_spd(self):
+        import scipy.sparse as sp
+
+        from newton._src.solvers.fba.linear_solver import (  # noqa: PLC0415
+            FBALinearSolver,
+            factorize_and_sparse_inverse,
+        )
+
+        rng = np.random.default_rng(42)
+        n = 64
+        diag = rng.uniform(10.0, 20.0, n)
+        off = rng.uniform(-0.5, 0.5, n - 1)
+        A = sp.diags([off, diag, off], [-1, 0, 1], shape=(n, n), format="csr").astype(np.float64)
+
+        fs = factorize_and_sparse_inverse(A)
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        solver = FBALinearSolver(fs, device=device)
+
+        b_np = rng.standard_normal((n, 3))
+        b = wp.array(b_np, dtype=wp.vec3, device=device)
+        x = wp.empty(n, dtype=wp.vec3, device=device)
+
+        solver.solve(b, x)
+        x_np = x.numpy()
+
+        # Verify A · x ≈ b for each component.
+        for c in range(3):
+            r = A.dot(x_np[:, c]) - b_np[:, c]
+            self.assertLess(np.linalg.norm(r) / max(np.linalg.norm(b_np[:, c]), 1e-12), 1e-6)
+
+    def test_permutation_roundtrip(self):
+        from newton._src.solvers.fba.kernels import apply_permutation_vec3_kernel  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        n = 32
+        perm = np.random.default_rng(1).permutation(n).astype(np.int32)
+        invperm = np.argsort(perm).astype(np.int32)
+
+        x_np = np.random.default_rng(2).standard_normal((n, 3))
+        x = wp.array(x_np, dtype=wp.vec3, device=device)
+        y = wp.empty(n, dtype=wp.vec3, device=device)
+        z = wp.empty(n, dtype=wp.vec3, device=device)
+        perm_wp = wp.array(perm, dtype=wp.int32, device=device)
+        invperm_wp = wp.array(invperm, dtype=wp.int32, device=device)
+
+        wp.launch(apply_permutation_vec3_kernel, dim=n, inputs=[x, perm_wp], outputs=[y], device=device)
+        wp.launch(apply_permutation_vec3_kernel, dim=n, inputs=[y, invperm_wp], outputs=[z], device=device)
+
+        np.testing.assert_allclose(z.numpy(), x_np, atol=0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -20,11 +20,19 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import warp as wp
+import warp.sparse as wps
 
 if TYPE_CHECKING:
     import scipy.sparse as sp
 
 from ...sim import Model
+from .kernels import (
+    apply_permutation_scalar_kernel,
+    extract_component_kernel,
+    insert_component_kernel,
+    scale_by_diag_kernel,
+)
 
 
 def build_pd_system(
@@ -397,18 +405,18 @@ def _compute_isometric_bending_q(edge_indices: np.ndarray, positions: np.ndarray
 class FactorizedSystem:
     """Output of factorize_and_sparse_inverse."""
 
-    S: "sp.csc_matrix"          # n×n, lower-tri inverse with elimination-tree sparsity
-    ST: "sp.csc_matrix"         # transpose, runtime-uploaded separately
-    Dinv: np.ndarray            # length n
-    perm_r: np.ndarray          # length n, int32
-    invperm_r: np.ndarray       # length n, int32
+    S: sp.csc_matrix  # n x n, lower-tri inverse with elimination-tree sparsity
+    ST: sp.csc_matrix  # transpose, runtime-uploaded separately
+    Dinv: np.ndarray  # length n
+    perm_r: np.ndarray  # length n, int32
+    invperm_r: np.ndarray  # length n, int32
 
 
 def factorize_and_sparse_inverse(A) -> FactorizedSystem:
     """Run COLAMD ordering + LU factor + sparse inverse on an SPD matrix.
 
     Args:
-        A: scalar N×N PD Hessian (csr or csc, will be converted internally).
+        A: scalar N x N PD Hessian (csr or csc, will be converted internally).
 
     Returns:
         FactorizedSystem with all data needed to construct an FBALinearSolver.
@@ -419,3 +427,93 @@ def factorize_and_sparse_inverse(A) -> FactorizedSystem:
     S = compute_lower_inverse(L, parent=parent)
     ST = S.T.tocsc()
     return FactorizedSystem(S=S, ST=ST, Dinv=Dinv, perm_r=perm_r, invperm_r=invperm_r)
+
+
+def _csc_to_bsr_1x1(M, device):
+    """Build a Warp 1x1 BSR matrix from a SciPy CSC/CSR matrix.
+
+    Args:
+        M: SciPy sparse matrix (any format, converted to CSR internally).
+        device: Warp device to place the BSR matrix on.
+
+    Returns:
+        A :class:`warp.sparse.BsrMatrix` with ``block_type=wp.float32``.
+    """
+    M_csr = M.tocsr()
+    rows_np, cols_np = M_csr.nonzero()
+    vals_np = np.asarray(M_csr[rows_np, cols_np]).ravel().astype(np.float32)
+    rows_wp = wp.array(rows_np.astype(np.int32), dtype=wp.int32, device=device)
+    cols_wp = wp.array(cols_np.astype(np.int32), dtype=wp.int32, device=device)
+    vals_wp = wp.array(vals_np, dtype=wp.float32, device=device)
+    return wps.bsr_from_triplets(M.shape[0], M.shape[1], rows_wp, cols_wp, vals_wp)
+
+
+class FBALinearSolver:
+    """Runtime sparse-inverse solver ``x = A⁻¹ b`` via two BSR SpMVs per component.
+
+    Implements ``A⁻¹ b = P_cᵀ · Sᵀ · D⁻¹ · S · P_r · b`` where ``S`` is the
+    sparse lower-triangular inverse and ``P_r`` is the row permutation from
+    :func:`factorize_and_sparse_inverse`.
+
+    Args:
+        factor: Output of :func:`factorize_and_sparse_inverse`.
+        device: Warp device string or device object for GPU execution.
+    """
+
+    def __init__(self, factor: FactorizedSystem, device) -> None:
+
+        self.device = wp.get_device(device) if isinstance(device, str) else device
+        n = factor.S.shape[0]
+        self.n = n
+
+        # Build 1x1 BSR matrices from SciPy sparse factors.
+        self._S_bsr = _csc_to_bsr_1x1(factor.S, self.device)
+        self._ST_bsr = _csc_to_bsr_1x1(factor.ST, self.device)
+        self._Dinv = wp.array(factor.Dinv.astype(np.float32), dtype=wp.float32, device=self.device)
+        self._perm = wp.array(factor.perm_r.astype(np.int32), dtype=wp.int32, device=self.device)
+        self._invperm = wp.array(factor.invperm_r.astype(np.int32), dtype=wp.int32, device=self.device)
+
+        # Scalar scratch buffers — reused across components to avoid allocation.
+        self._b_scalar = wp.empty(n, dtype=wp.float32, device=self.device)
+        self._b_perm = wp.empty(n, dtype=wp.float32, device=self.device)
+        self._Sb = wp.empty(n, dtype=wp.float32, device=self.device)
+        self._DSb = wp.empty(n, dtype=wp.float32, device=self.device)
+        self._SDSb = wp.empty(n, dtype=wp.float32, device=self.device)
+        self._x_scalar = wp.empty(n, dtype=wp.float32, device=self.device)
+
+    def solve(self, b: wp.array[wp.vec3], x: wp.array[wp.vec3]) -> None:
+        """Compute ``x[i] = A⁻¹ · b[i]`` component-wise.
+
+        Args:
+            b: Input right-hand side, shape ``[n]``, dtype ``wp.vec3``.
+            x: Output solution, shape ``[n]``, dtype ``wp.vec3``.
+        """
+        n = self.n
+        dev = self.device
+        for c in range(3):
+            # 1. Extract scalar component c from b.
+            wp.launch(extract_component_kernel, dim=n, inputs=[b, c], outputs=[self._b_scalar], device=dev)
+            # 2. Apply row permutation: b_perm[i] = b_scalar[perm[i]].
+            wp.launch(
+                apply_permutation_scalar_kernel,
+                dim=n,
+                inputs=[self._b_scalar, self._perm],
+                outputs=[self._b_perm],
+                device=dev,
+            )
+            # 3. Multiply by S (lower-triangular inverse): Sb = S * b_perm.
+            wps.bsr_mv(self._S_bsr, self._b_perm, self._Sb)
+            # 4. Scale by D⁻¹: DSb[i] = Dinv[i] * Sb[i].
+            wp.launch(scale_by_diag_kernel, dim=n, inputs=[self._Sb, self._Dinv], outputs=[self._DSb], device=dev)
+            # 5. Multiply by Sᵀ: SDSb = Sᵀ * DSb.
+            wps.bsr_mv(self._ST_bsr, self._DSb, self._SDSb)
+            # 6. Apply inverse permutation: x_scalar[i] = SDSb[invperm[i]].
+            wp.launch(
+                apply_permutation_scalar_kernel,
+                dim=n,
+                inputs=[self._SDSb, self._invperm],
+                outputs=[self._x_scalar],
+                device=dev,
+            )
+            # 7. Insert result into component c of output x.
+            wp.launch(insert_component_kernel, dim=n, inputs=[self._x_scalar, c], outputs=[x], device=dev)
