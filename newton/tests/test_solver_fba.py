@@ -393,5 +393,12 @@ class TestBendingProjection(unittest.TestCase):
         np.testing.assert_allclose(rhs.numpy(), np.zeros((4, 3)), atol=1e-6)
 
 
+class TestPublicAPI(unittest.TestCase):
+    def test_solver_fba_in_newton_solvers(self):
+        from newton import solvers
+        self.assertTrue(hasattr(solvers, "SolverFBA"))
+        self.assertIn("SolverFBA", solvers.__all__)
+
+
 if __name__ == "__main__":
     unittest.main()
