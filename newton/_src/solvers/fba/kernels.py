@@ -256,7 +256,23 @@ def project_corotational_sigma(sigma_sq: wp.vec2, mu: float, lam: float) -> wp.v
 
     Minimises E(s) = mu*||s-I||^2 + (lam/2)*tr(s-I)^2  subject to PD's
     quadratic penalty (k/2)*||s-s0||^2 with k = 2*mu.  The resulting 2x2
-    linear system has the closed-form solution below.
+    linear system has the closed-form solution below.  Both singular
+    values share the same energy-form term (symmetric trace), which is
+    the standard corotational formulation in elasticity references
+    (Sifakis 2012, Bouaziz 2014, etc.).
+
+    Note - mismatch with RealSim reference:
+        RealSim's ``CorotProjectionProblem2D::energy_density`` evaluates
+        ``(x - I).trace()`` on an ``Eigen::Vector2d``; Eigen's ``trace()``
+        on a non-square matrix returns the sum over indices [0, min(rows,
+        cols)), i.e. ``x[0]`` only for a 2x1 vector - not ``x[0] + x[1]``
+        (verified empirically). RealSim therefore implements an
+        anisotropic energy that only penalises ``(sigma_0 - 1)`` in the
+        trace term. Newton's implementation here is the standard symmetric
+        formulation. Trajectory-level cross-check vs RealSim Corotational
+        is therefore expected to differ at the order of mm on stretched
+        cloth (see docs/superpowers/specs cross-check write-ups). ARAP
+        and Neo-Hookean cross-checks against RealSim agree to <10 microns.
 
     Args:
         sigma_sq: Squared singular values from ``wp.svd2(FtF)``.

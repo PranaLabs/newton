@@ -17,7 +17,7 @@ Live tracker for the Newton port of RealSim's "Fast But Accurate" projective-dyn
 | **Numerical RealSim cross-check** | ✅ Done | Root cause: gravity-pin skip in `compute_inertial_kernel`; fix + fixture + test committed; max L2 residual 5.99 µm at step 48 |
 | Contact / collision (plane / primitives + CCD/DCD) | ⬜ Not started | Largest remaining feature gap |
 | Softbody (PDTetrahedronEnergy) | ⬜ Not started | Builder + new project_tet kernel |
-| Material model extensions (Corotational / Neo-Hookean / StVK) | ✅ Done | Corot + NH done; max L2 residual 9.46 µm at frame 48 for NH cross-check |
+| Material model extensions (Corotational / Neo-Hookean / StVK) | ✅ Done | Corot + NH done. ARAP/NH cross-check < 10 µm vs RealSim. Corot uses standard symmetric formula; RealSim Corot has Eigen `.trace()` bug → trajectory delta ~14 mm by design, see `docs/superpowers/specs/2026-05-15-fba-corot-realsim-discrepancy.md`. StVK not started. |
 | Differentiability via `wp.Tape()` | ⬜ Not started | Forward path probably already grad-friendly |
 | Performance: `compute_lower_inverse` accel | ✅ Done | Warp per-column kernel + vectorized pattern build; N=10K setup: ~16 min → 1.0 s (RTX 5090) |
 | Upstream PR prep (split, squash, strip docs/superpowers/) | ⬜ Not started | After feature parity |
