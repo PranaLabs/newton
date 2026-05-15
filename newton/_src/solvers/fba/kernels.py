@@ -1133,6 +1133,37 @@ def build_contact_jacobian_vec3_kernel(
 
 
 @wp.kernel
+def build_contact_jacobian_dir_kernel(
+    particle_count: int,
+    contact_idx: int,
+    j_indices: wp.array[wp.int32],
+    j_alpha: wp.array[wp.float32],
+    direction: wp.vec3,
+    out: wp.array[wp.vec3],
+):
+    """Set out[j_indices[contact_idx]] = j_alpha[contact_idx] * direction.
+
+    General-direction variant of :func:`build_contact_jacobian_vec3_kernel`.
+    Used by Stage B friction to set tangent-direction Jacobian columns (t1, t2)
+    without storing them in a per-contact array.
+
+    Called with ``dim=1`` (single thread).  Caller must zero ``out`` before launch.
+
+    Args:
+        particle_count: Total particle count (bounds guard).
+        contact_idx: Contact row index (0-based).
+        j_indices: Particle index per contact, shape ``[M]``.
+        j_alpha: Jacobian coefficient per contact (1.0 for particle-shape), shape ``[M]``.
+        direction: The unit direction vector (normal, t1, or t2).
+        out: Output vec3 array of length ``particle_count``.
+    """
+    _tid = wp.tid()
+    idx = j_indices[contact_idx]
+    if idx >= 0 and idx < particle_count:
+        out[idx] = wp.float32(j_alpha[contact_idx]) * direction
+
+
+@wp.kernel
 def set_lambda_jacobian_vec3_kernel(
     contact_idx: int,
     j_indices: wp.array[wp.int32],
