@@ -2254,5 +2254,258 @@ class TestTetNeoHookean(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(q)), "non-finite positions after 50 tet NH steps")
 
 
+class TestPhase4StageAContact(unittest.TestCase):
+    """Phase 4 Stage A: unilateral plane contact via Schur complement.
+
+    Tests the hard-constraint contact path in SolverFBA — no friction,
+    λ ≥ 0 only.  Each test constructs a :class:`~newton.Contacts` object
+    manually (bypassing the broad/narrow phase pipeline) to isolate the
+    Schur-complement solver.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    # ------------------------------------------------------------------ helpers
+
+    def _build_single_particle_model(self, y: float = -0.5):
+        """Return a one-triangle cloth model with one free particle.
+
+        The cloth is a single equilateral triangle; particle 0 is placed at
+        ``(0, y, 0)`` so it is below the y=0 plane when ``y < 0``.
+        Particle 1 and 2 are placed at their usual rest positions but pinned
+        so only particle 0 is free.
+        """
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=[
+                wp.vec3(0.0, y, 0.0),  # particle 0 — free, below plane
+                wp.vec3(1.0, 0.0, 0.0),  # particle 1 — pinned
+                wp.vec3(0.0, 0.0, 1.0),  # particle 2 — pinned
+            ],
+            indices=[0, 1, 2],
+            density=1.0,
+            tri_ke=1.0e4,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+        )
+        builder.particle_mass[1] = 0.0  # pin
+        builder.particle_mass[2] = 0.0  # pin
+        return builder.finalize()
+
+    def _make_contacts(self, device, count: int, particle_indices, normals, body_pos_world):
+        """Manually populate a :class:`~newton.Contacts` object.
+
+        Args:
+            device: Warp device.
+            count: Number of contacts ``M``.
+            particle_indices: list[int] — particle index per contact.
+            normals: list[tuple] — world-frame contact normal per contact.
+            body_pos_world: list[tuple] — world anchor point per contact
+                (stored as-is in ``soft_contact_body_pos``; for Stage A tests
+                with static shapes this equals the world-frame anchor).
+
+        Returns:
+            :class:`~newton.Contacts` with ``soft_contact_count`` = ``count``.
+        """
+        contacts = newton.Contacts(rigid_contact_max=0, soft_contact_max=max(count, 1), device=device)
+        # Set count via the counter slice.
+        contacts.soft_contact_count.assign(np.array([count], dtype=np.int32))
+        if count > 0:
+            p_arr = np.array(particle_indices, dtype=np.int32)
+            n_arr = np.array(normals, dtype=np.float32)
+            bp_arr = np.array(body_pos_world, dtype=np.float32)
+            contacts.soft_contact_particle.assign(p_arr)
+            contacts.soft_contact_normal.assign(n_arr)
+            contacts.soft_contact_body_pos.assign(bp_arr)
+            # shape indices (-1 = static/no-body shape)
+            s_arr = np.full(count, -1, dtype=np.int32)
+            contacts.soft_contact_shape.assign(s_arr)
+        return contacts
+
+    # ------------------------------------------------------------------ tests
+
+    def test_no_contact_passes_through(self):
+        """Empty contacts object must produce the same output as contacts=None."""
+        model = self._build_single_particle_model(y=0.5)
+        device = model.device
+        solver = SolverFBA(model, iterations=5)
+        s_in_a, s_out_a = model.state(), model.state()
+        s_in_b, s_out_b = model.state(), model.state()
+        dt = 1.0 / 60.0
+
+        # Baseline: no contacts.
+        s_in_a.clear_forces()
+        solver.step(s_in_a, s_out_a, None, None, dt)
+        q_no_contact = s_out_a.particle_q.numpy().copy()
+
+        # With empty contacts object (count == 0).
+        empty_contacts = self._make_contacts(device, 0, [], [], [])
+        s_in_b.clear_forces()
+        solver.step(s_in_b, s_out_b, None, empty_contacts, dt)
+        q_empty_contact = s_out_b.particle_q.numpy().copy()
+
+        np.testing.assert_allclose(q_empty_contact, q_no_contact, atol=1e-6,
+                                   err_msg="Empty contacts path diverged from contacts=None path")
+
+    def test_single_plane_contact_pushes_particle_away(self):
+        """Single particle below y=0 plane should be pushed to y≥0 after step.
+
+        Constraint: n=(0,1,0), anchor=(0,0,0) → offset = dot((0,1,0),(0,0,0)) = 0.
+        After correction, particle[0].y should satisfy y ≥ -1e-4 m.
+        """
+        model = self._build_single_particle_model(y=-0.5)
+        device = model.device
+        solver = SolverFBA(model, iterations=10)
+
+        contacts = self._make_contacts(
+            device,
+            count=1,
+            particle_indices=[0],
+            normals=[(0.0, 1.0, 0.0)],      # outward normal pointing +y
+            body_pos_world=[(0.0, 0.0, 0.0)],  # anchor on the y=0 plane
+        )
+
+        s_in, s_out = model.state(), model.state()
+        s_in.clear_forces()
+        dt = 1.0 / 60.0
+        solver.step(s_in, s_out, None, contacts, dt)
+
+        q = s_out.particle_q.numpy()
+        particle_y = float(q[0, 1])
+        self.assertGreaterEqual(particle_y, -1e-4,
+                                f"Particle y={particle_y:.6f} should be >= 0 after plane contact correction")
+
+    def test_multiple_plane_contacts_no_interpenetration(self):
+        """Four particles, each below the y=0 plane, each with a separate contact.
+
+        After one step with contacts active, all free particles should have y ≥ -1e-4.
+        """
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        # Build a 2x2 grid so we get 4 free particles in a row below y=0.
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0, -0.5, 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=2,
+            dim_y=2,
+            cell_x=0.5,
+            cell_y=0.5,
+            mass=0.1,
+            tri_ke=1.0e4,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-2,
+            edge_kd=0.0,
+            fix_left=False,
+        )
+        # Pin one corner so the model is determinate.
+        builder.particle_mass[0] = 0.0
+        model = builder.finalize()
+        device = model.device
+        N = model.particle_count
+
+        solver = SolverFBA(model, iterations=10)
+
+        # All particles start at y = -0.5; identify the free ones.
+        pos_np = model.particle_q.numpy()  # (N, 3)
+        inv_mass = model.particle_inv_mass.numpy()
+        free_indices = [i for i in range(N) if inv_mass[i] > 0]
+
+        # Create one contact per free particle, all on y=0 plane.
+        M = len(free_indices)
+        normals = [(0.0, 1.0, 0.0)] * M
+        anchors = [(0.0, 0.0, 0.0)] * M
+
+        contacts = self._make_contacts(device, M, free_indices, normals, anchors)
+
+        s_in, s_out = model.state(), model.state()
+        s_in.clear_forces()
+        dt = 1.0 / 60.0
+        solver.step(s_in, s_out, None, contacts, dt)
+
+        q = s_out.particle_q.numpy()
+        for fi in free_indices:
+            y = float(q[fi, 1])
+            self.assertGreaterEqual(y, -1e-4,
+                                    f"Particle {fi} y={y:.6f} should be >= 0 after plane contact correction")
+
+    def test_schur_W_is_positive_definite_for_active_contacts(self):
+        """W = J A⁻¹ Jᵀ must be symmetric positive definite for active contacts.
+
+        Uses the FBALinearSolver directly with a known SPD system and verifies:
+        1. All eigenvalues of W are positive.
+        2. W is symmetric (W == Wᵀ up to float64 precision).
+        3. For a single contact, W[0,0] == dot(n, A⁻¹ n_at_p) (scalar check).
+        """
+        import scipy.sparse as sp
+
+        from newton._src.solvers.fba.linear_solver import FBALinearSolver, factorize_and_sparse_inverse
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        rng = np.random.default_rng(7)
+        n = 32
+
+        # Build a small SPD A.
+        diag = rng.uniform(5.0, 15.0, n)
+        off = rng.uniform(-0.5, 0.5, n - 1)
+        A = sp.diags([off, diag, off], [-1, 0, 1], shape=(n, n), format="csr").astype(np.float64)
+
+        fs = factorize_and_sparse_inverse(A)
+        solver = FBALinearSolver(fs, device=device)
+
+        # 5 contacts: different particles, different normals.
+        M = 5
+        # Pick 5 distinct particle indices.
+        particles = np.array([0, 5, 10, 15, 20], dtype=np.int32)
+        normals_np = np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.707, 0.707, 0.0],
+            [0.0, 0.577, 0.816],
+        ], dtype=np.float32)
+        # Normalise.
+        for i in range(M):
+            normals_np[i] /= np.linalg.norm(normals_np[i])
+        alpha_np = np.ones(M, dtype=np.float32)
+
+        j_indices = wp.array(particles, dtype=wp.int32, device=device)
+        j_normals = wp.array(normals_np, dtype=wp.vec3, device=device)
+        j_alpha = wp.array(alpha_np, dtype=wp.float32, device=device)
+
+        W = solver.build_schur_complement(M, j_indices, j_normals, j_alpha)
+
+        # 1. Symmetry.
+        np.testing.assert_allclose(W, W.T, atol=1e-12,
+                                   err_msg="W is not symmetric")
+
+        # 2. All eigenvalues positive.
+        eigvals = np.linalg.eigvalsh(W)
+        min_eig = float(eigvals.min())
+        self.assertGreater(min_eig, 0.0,
+                           f"W has non-positive eigenvalue: {min_eig:.3e}. eigvals={eigvals}")
+
+        # 3. Scalar check for first contact: W[0,0] = n^T A^{-1}_{pp} n
+        #    where A^{-1}_{pp} is the 1x1 scalar block at particle 0.
+        #    Since A is scalar (not vec3), A^{-1}_{pp} = Ainv[p0, p0].
+        Ainv_dense = np.linalg.inv(A.toarray())
+        p0 = int(particles[0])
+        n0 = normals_np[0].astype(np.float64)
+        # For a scalar A and a scalar n (1D per component), W[0,0] = sum_i n[i]^2 * Ainv[p0,p0]
+        # because the FBA solve does each component independently.
+        W00_expected = float(np.dot(n0, n0)) * float(Ainv_dense[p0, p0])
+        # Tolerance accounts for float32 → float64 round-trip in solve().
+        self.assertAlmostEqual(W[0, 0], W00_expected, delta=1e-7,
+                               msg=f"W[0,0]={W[0,0]:.8f} != expected {W00_expected:.8f}")
+
+
 if __name__ == "__main__":
     unittest.main()
