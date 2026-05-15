@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Benchmark: SolverFBA ARAP vs Corotational step time on a 32x32 cloth.
+"""Benchmark: SolverFBA ARAP vs Corotational vs Neo-Hookean step time on a 32x32 cloth.
 
 Usage:
     uv run scripts/fba_arap_vs_corot_bench.py
 
-Reports mean/median per-step time (ms) for each model, plus Corot/ARAP ratio.
+Reports mean/median per-step time (ms) for each model, plus ratio vs ARAP.
 """
 
 import time
@@ -35,7 +35,7 @@ def build_cloth(dim: int = DIM) -> newton.Model:
         dim_y=dim,
         cell_x=0.05,
         cell_y=0.05,
-        mass=0.1,
+        mass=0.005,
         tri_ke=2.0 * MU,  # tri_ke = 2μ for fair comparison
         tri_ka=0.0,
         tri_kd=0.0,
@@ -96,14 +96,18 @@ def main() -> None:
     print("Building cloth models and factorizing PD systems...")
     model_arap = build_cloth()
     model_corot = build_cloth()
+    model_nh = build_cloth()
+
+    NH_LAM = 14286.0  # E*nu / ((1+nu)(1-2nu)) for E=1e4, nu=0.4
 
     solver_arap = SolverFBA(model_arap, iterations=10, stretching_model="arap")
     solver_corot = SolverFBA(model_corot, iterations=10, stretching_model="corotational", mu=MU, lam=LAM)
+    solver_nh = SolverFBA(model_nh, iterations=10, stretching_model="neohookean", mu=MU, lam=NH_LAM)
 
     # Trigger _setup_pd_system eagerly.
     print("Priming solvers (first step to trigger setup)...")
     dt = 1.0 / 60.0
-    for solver, model in [(solver_arap, model_arap), (solver_corot, model_corot)]:
+    for solver, model in [(solver_arap, model_arap), (solver_corot, model_corot), (solver_nh, model_nh)]:
         s_in, s_out = model.state(), model.state()
         s_in.clear_forces()
         solver.step(s_in, s_out, None, None, dt)
@@ -117,13 +121,18 @@ def main() -> None:
     times_corot = run_bench(model_corot, solver_corot, "Corot")
     print()
 
+    print("--- Neo-Hookean ---")
+    times_nh = run_bench(model_nh, solver_nh, "NH")
+    print()
+
     # Convert to ms.
     ms_arap = times_arap * 1000.0
     ms_corot = times_corot * 1000.0
+    ms_nh = times_nh * 1000.0
 
     def stats(arr: np.ndarray, label: str) -> None:
         print(
-            f"  {label:12s}  mean={arr.mean():.3f} ms  median={np.median(arr):.3f} ms"
+            f"  {label:14s}  mean={arr.mean():.3f} ms  median={np.median(arr):.3f} ms"
             f"  p95={np.percentile(arr, 95):.3f} ms  min={arr.min():.3f} ms  max={arr.max():.3f} ms"
         )
 
@@ -132,9 +141,12 @@ def main() -> None:
     print("=" * 70)
     stats(ms_arap, "ARAP")
     stats(ms_corot, "Corotational")
-    ratio = ms_corot.mean() / ms_arap.mean()
-    overhead_pct = (ratio - 1.0) * 100.0
-    print(f"\n  Corot / ARAP ratio: {ratio:.3f}x  ({overhead_pct:+.1f}% overhead)")
+    stats(ms_nh, "Neo-Hookean")
+    print()
+    for label, ms in [("Corot", ms_corot), ("NH", ms_nh)]:
+        ratio = ms.mean() / ms_arap.mean()
+        overhead_pct = (ratio - 1.0) * 100.0
+        print(f"  {label:6s} / ARAP ratio: {ratio:.3f}x  ({overhead_pct:+.1f}% overhead)")
     print("=" * 70)
 
 
