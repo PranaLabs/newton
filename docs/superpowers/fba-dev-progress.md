@@ -17,7 +17,7 @@ Live tracker for the Newton port of RealSim's "Fast But Accurate" projective-dyn
 | **Numerical RealSim cross-check** | ✅ Done | Root cause: gravity-pin skip in `compute_inertial_kernel`; fix + fixture + test committed; max L2 residual 5.99 µm at step 48 |
 | Contact / collision (plane / primitives + CCD/DCD) | ⬜ Not started | Largest remaining feature gap |
 | Softbody (PDTetrahedronEnergy) | ⬜ Not started | Builder + new project_tet kernel |
-| Material model extensions (Corotational / Neo-Hookean / StVK) | ⬜ Not started | Dispatch hook already in place |
+| Material model extensions (Corotational / Neo-Hookean / StVK) | 🚧 In progress | Corot done; NH next |
 | Differentiability via `wp.Tape()` | ⬜ Not started | Forward path probably already grad-friendly |
 | Performance: `compute_lower_inverse` accel | ✅ Done | Warp per-column kernel + vectorized pattern build; N=10K setup: ~16 min → 1.0 s (RTX 5090) |
 | Upstream PR prep (split, squash, strip docs/superpowers/) | ⬜ Not started | After feature parity |
@@ -59,10 +59,11 @@ Live tracker for the Newton port of RealSim's "Fast But Accurate" projective-dyn
 | `bc3ff0a6` | Add FBA x RealSim trajectory cross-check test (fixture + TestFBARealSimAgreement) |
 | `94a9ec04` | Fix pre-commit lint warnings (PLW2901, RUF012, typos allowlist) |
 | `c89c85aa` | Accelerate FBA setup: Warp per-column kernel + vectorized NumPy assembly |
+| `67eec2ed` | (perf-optimization commit — HEAD before Corot work) |
 
 ## In progress
 
-_(nothing currently blocked)_
+- **Material models** — Corotational stretching kernel + SolverFBA dispatch + tests committed; Neo-Hookean next.
 
 ## Backlog (ordered)
 
