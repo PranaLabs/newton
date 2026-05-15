@@ -1720,5 +1720,45 @@ class TestDynamicPin(unittest.TestCase):
         )
 
 
+class TestTetHessianAssembly(unittest.TestCase):
+    """Verify tet Hessian block assembly in build_pd_system."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _build_single_tet_model(self):
+        """Single tetrahedron: (0,0,0),(1,0,0),(0,1,0),(0,0,1). Pin vertex 0."""
+        builder = newton.ModelBuilder()
+        p0 = builder.add_particle(pos=wp.vec3(0.0, 0.0, 0.0), vel=wp.vec3(0.0, 0.0, 0.0), mass=1.0)
+        p1 = builder.add_particle(pos=wp.vec3(1.0, 0.0, 0.0), vel=wp.vec3(0.0, 0.0, 0.0), mass=1.0)
+        p2 = builder.add_particle(pos=wp.vec3(0.0, 1.0, 0.0), vel=wp.vec3(0.0, 0.0, 0.0), mass=1.0)
+        p3 = builder.add_particle(pos=wp.vec3(0.0, 0.0, 1.0), vel=wp.vec3(0.0, 0.0, 0.0), mass=1.0)
+        builder.add_tetrahedron(p0, p1, p2, p3, k_mu=1.0e3, k_lambda=1.0e3)
+        builder.particle_mass[p0] = 0.0
+        return builder.finalize(device="cpu")
+
+    def test_tet_meta_populated(self):
+        model = self._build_single_tet_model()
+        _A, meta = build_pd_system(model, dt=1.0 / 60.0, pin_stiffness=1e12)
+        self.assertEqual(meta["tet_indices"].shape, (1, 4))
+        self.assertEqual(meta["tet_rest_inv"].shape, (1, 3, 3))
+        self.assertEqual(meta["tet_weight"].shape, (1,))
+        # volume of canonical tet = 1/6
+        np.testing.assert_allclose(meta["tet_volume"][0], 1.0 / 6.0, rtol=1e-5)
+
+    def test_tet_hessian_symmetric(self):
+        model = self._build_single_tet_model()
+        A, _meta = build_pd_system(model, dt=1.0 / 60.0, pin_stiffness=1e12)
+        diff = A - A.T
+        self.assertLess(np.abs(diff).max(), 1e-10, "tet Hessian is not symmetric")
+
+    def test_tet_hessian_psd(self):
+        model = self._build_single_tet_model()
+        A, _meta = build_pd_system(model, dt=1.0 / 60.0, pin_stiffness=1e12)
+        eigenvalues = np.linalg.eigvalsh(A.toarray())
+        self.assertGreater(eigenvalues.min(), -1e-8, "tet Hessian has negative eigenvalue")
+
+
 if __name__ == "__main__":
     unittest.main()

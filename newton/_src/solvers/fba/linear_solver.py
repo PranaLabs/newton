@@ -173,6 +173,61 @@ def build_pd_system(
             # since CSR builder duplicates-sum, and they don't change A.
             coo_parts.append((rows_e.astype(np.int32), cols_e.astype(np.int32), vals_e))
 
+    # ---- Tetrahedral stretching contribution ----
+    tet_indices = np.zeros((0, 4), dtype=np.int32)
+    tet_rest_inv = np.zeros((0, 3, 3), dtype=np.float64)
+    tet_volume = np.zeros((0,), dtype=np.float64)
+    tet_weight = np.zeros((0,), dtype=np.float64)
+    mu_tet = np.zeros((0,), dtype=np.float64)
+    if hasattr(model, "tet_count") and model.tet_count > 0:
+        tet_indices_flat = model.tet_indices.numpy().astype(np.int32)
+        tet_indices = tet_indices_flat.reshape(-1, 4)
+        tet_rest_inv = model.tet_poses.numpy().astype(np.float64)
+        # Volume from Dm_inv: det(Dm_inv) = 1/(6*V) => V = 1/(6*|det(Dm_inv)|)
+        det_dm_inv = np.linalg.det(tet_rest_inv)
+        tet_volume = 1.0 / (6.0 * np.abs(det_dm_inv) + 1.0e-30)
+        tet_materials = model.tet_materials.numpy().astype(np.float64)
+        mu_tet = tet_materials[:, 0]
+        # PD weight: w = 2*mu * volume  (ARAP: singular values project to 1)
+        tet_weight = 2.0 * mu_tet * tet_volume
+
+        # Stencil selector ST is 4x3 (row = which edge coefficient for each tet vertex).
+        ST_tet = np.array(
+            [
+                [-1.0, -1.0, -1.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )  # (4, 3)
+        # G_all[T, 4, 3] = ST @ Dm_inv per tet
+        G_all = np.einsum("ab,tbc->tac", ST_tet, tet_rest_inv)  # (T, 4, 3)
+        # K_all[T, 4, 4] = G @ G^T per tet (symmetric PSD)
+        K_all = np.einsum("tac,tbc->tab", G_all, G_all)  # (T, 4, 4)
+        wK_all = tet_weight[:, None, None] * K_all  # (T, 4, 4)
+
+        # Vectorized scatter: for each (a,b) in 4x4, contribute wK[t,a,b] to A[tet[t,a], tet[t,b]]
+        a_idx, b_idx = np.meshgrid(np.arange(4), np.arange(4), indexing="ij")
+        a_flat = a_idx.flatten()  # 16
+        b_flat = b_idx.flatten()  # 16
+        # Gather all 16 (row, col, val) arrays, then concatenate once.
+        tet_rows_parts = []
+        tet_cols_parts = []
+        tet_vals_parts = []
+        for a, b in zip(a_flat, b_flat, strict=True):
+            tet_rows_parts.append(tet_indices[:, a])
+            tet_cols_parts.append(tet_indices[:, b])
+            tet_vals_parts.append(wK_all[:, a, b])
+        if len(tet_rows_parts) > 0:
+            coo_parts.append(
+                (
+                    np.concatenate(tet_rows_parts).astype(np.int32),
+                    np.concatenate(tet_cols_parts).astype(np.int32),
+                    np.concatenate(tet_vals_parts),
+                )
+            )
+
     if coo_parts:
         rows = np.concatenate([p[0] for p in coo_parts])
         cols = np.concatenate([p[1] for p in coo_parts])
@@ -201,6 +256,11 @@ def build_pd_system(
         "edge_weight": edge_weight,
         "pin_indices": pin_indices,
         "pin_weight": pin_stiffness,
+        "tet_indices": tet_indices,
+        "tet_rest_inv": tet_rest_inv,
+        "tet_volume": tet_volume,
+        "tet_weight": tet_weight,
+        "tet_mu": mu_tet,
     }
     return A, meta
 
