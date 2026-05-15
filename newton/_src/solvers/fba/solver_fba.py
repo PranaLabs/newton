@@ -156,6 +156,8 @@ class SolverFBA(SolverBase):
         stretching_model: Literal["arap", "corotational", "neohookean"] = "arap",
         mu: float | None = None,
         lam: float | None = None,
+        friction: bool = True,
+        mu_per_pair_override: np.ndarray | None = None,
     ) -> None:
         super().__init__(model)
 
@@ -188,6 +190,12 @@ class SolverFBA(SolverBase):
         self.stretching_model = stretching_model
         self._mu = float(mu) if mu is not None else None
         self._lam = float(lam) if lam is not None else None
+        self.friction = bool(friction)
+        self._mu_per_pair_override = (
+            np.asarray(mu_per_pair_override, dtype=np.float64)
+            if mu_per_pair_override is not None
+            else None
+        )
 
         # PD setup is dt-dependent; we cache the assembly at a reference dt and
         # rebuild lazily inside `step` if the dt changes.
@@ -500,32 +508,48 @@ class SolverFBA(SolverBase):
                 M = self._contact_count
                 ls = self._linear_solver
 
-                # 1. Build W = J A^{-1} J^T  (M x M dense).
-                W = ls.build_schur_complement(
-                    M,
-                    self._contact_particle_d,
-                    self._contact_normal_d,
-                    self._contact_alpha_d,
-                )
-
-                # 2. Compute residual r = c_offset - J·x_unc  (positive = penetrating).
-                x_unc_np = self._x_cur.numpy()  # (N, 3) float32
-                r = self._compute_contact_residual(x_unc_np)
-
-                # 3. Solve W λ = r with projected Gauss-Seidel (λ ≥ 0).
-                lam = self._solve_nsn_unilateral(W, r, max_iters=20)
-
-                # 4. Apply correction: x_cur = x_unc + A^{-1} J^T λ.
-                #    (x* = A^{-1}(b + J^T λ) = x_unc + A^{-1} J^T λ)
-                if np.any(lam > 1e-15):
-                    correction = self._apply_lambda_correction(lam)
-                    wp.launch(
-                        accumulate_vec3_kernel,
-                        dim=N,
-                        inputs=[correction],
-                        outputs=[self._x_cur],
-                        device=device,
+                if self.friction and hasattr(self, "_contact_tangent1_d"):
+                    # Stage B: 3M Schur complement with Coulomb cone projection.
+                    W = ls.build_schur_complement(
+                        M,
+                        self._contact_particle_d,
+                        self._contact_normal_d,
+                        self._contact_alpha_d,
+                        self._contact_tangent1_d,
+                        self._contact_tangent2_d,
                     )
+                    x_unc_np = self._x_cur.numpy()  # (N, 3) float32
+                    r = self._compute_contact_residual_friction(x_unc_np)
+                    lam = self._solve_nsn_coulomb(W, r, self._contact_mu_h[:M], max_iters=20)
+                    if np.any(np.abs(lam) > 1e-15):
+                        correction = self._apply_lambda_correction_friction(lam)
+                        wp.launch(
+                            accumulate_vec3_kernel,
+                            dim=N,
+                            inputs=[correction],
+                            outputs=[self._x_cur],
+                            device=device,
+                        )
+                else:
+                    # Stage A: M Schur complement, unilateral (λ ≥ 0) only.
+                    W = ls.build_schur_complement(
+                        M,
+                        self._contact_particle_d,
+                        self._contact_normal_d,
+                        self._contact_alpha_d,
+                    )
+                    x_unc_np = self._x_cur.numpy()  # (N, 3) float32
+                    r = self._compute_contact_residual(x_unc_np)
+                    lam = self._solve_nsn_unilateral(W, r, max_iters=20)
+                    if np.any(lam > 1e-15):
+                        correction = self._apply_lambda_correction(lam)
+                        wp.launch(
+                            accumulate_vec3_kernel,
+                            dim=N,
+                            inputs=[correction],
+                            outputs=[self._x_cur],
+                            device=device,
+                        )
 
         # 3) Write velocity and update state_out.
         wp.copy(state_out.particle_q, self._x_cur)
@@ -577,6 +601,10 @@ class SolverFBA(SolverBase):
         self._contact_normal_d = wp.empty(cap, dtype=wp.vec3, device=device)
         self._contact_alpha_d = wp.empty(cap, dtype=wp.float32, device=device)
         self._contact_offset_d = wp.empty(cap, dtype=wp.float64, device=device)
+        # Stage B: tangent directions and per-contact friction mu.
+        self._contact_tangent1_d = wp.empty(cap, dtype=wp.vec3, device=device)
+        self._contact_tangent2_d = wp.empty(cap, dtype=wp.vec3, device=device)
+        self._contact_mu_h = np.zeros(cap, dtype=np.float64)  # host-side mu array
 
     def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
         """Ingest the active particle-vs-shape contact set for the next step.
@@ -670,9 +698,75 @@ class SolverFBA(SolverBase):
         self._contact_offset_h = offset_h[:M]
         self._contact_count = M
 
+        # Stage B: compute tangent basis and friction μ for each contact.
+        if self.friction:
+            t1_h = np.zeros((M, 3), dtype=np.float32)
+            t2_h = np.zeros((M, 3), dtype=np.float32)
+            for c in range(M):
+                t1, t2 = compute_tangent_basis(normal_h[c])
+                t1_h[c] = t1.astype(np.float32)
+                t2_h[c] = t2.astype(np.float32)
+            self._contact_tangent1_d.assign(t1_h)
+            self._contact_tangent2_d.assign(t2_h)
+            self._contact_tangent1_h = t1_h
+            self._contact_tangent2_h = t2_h
+
+            # Compute per-contact friction μ via VBD-style sqrt mixing.
+            particle_mu = float(getattr(model, "particle_mu", 0.5))
+            mu_h = np.zeros(M, dtype=np.float64)
+            if self._mu_per_pair_override is not None:
+                for c in range(M):
+                    mu_h[c] = float(self._mu_per_pair_override[c])
+            else:
+                shape_mat_mu = (
+                    model.shape_material_mu.numpy()
+                    if hasattr(model, "shape_material_mu")
+                    else None
+                )
+                for c in range(M):
+                    s_idx = int(shape_h[c])
+                    if shape_mat_mu is not None and s_idx >= 0 and s_idx < len(shape_mat_mu):
+                        mu_h[c] = float(np.sqrt(particle_mu * float(shape_mat_mu[s_idx])))
+                    else:
+                        mu_h[c] = particle_mu
+            self._contact_mu_h = mu_h[:M]
+
     # ------------------------------------------------------------------
     # Phase 4 Stage A — Schur-complement NSN helpers
     # ------------------------------------------------------------------
+
+    def _compute_contact_residual_friction(self, x_np: np.ndarray) -> np.ndarray:
+        """Compute the 3M-vector residual ``r = [r_n, r_t1, r_t2]`` for each contact.
+
+        For each contact c:
+
+        - ``r_n[c]  = offset[c] - alpha[c] * dot(n[c],  x_np[p[c]])``
+        - ``r_t1[c] =           - alpha[c] * dot(t1[c], x_np[p[c]])``
+        - ``r_t2[c] =           - alpha[c] * dot(t2[c], x_np[p[c]])``
+
+        Tangent residuals target zero tangential displacement relative to the
+        contact anchor (PD-position friction).
+
+        Args:
+            x_np: Unconstrained solution, shape ``(N, 3)``, float32.
+
+        Returns:
+            Residual vector of shape ``(3M,)``, float64, ordered
+            ``[r_n_0, r_t1_0, r_t2_0, r_n_1, ...]``.
+        """
+        M = self._contact_count
+        r = np.zeros(3 * M, dtype=np.float64)
+        for c in range(M):
+            ip = int(self._contact_particle_h[c])
+            xp = x_np[ip].astype(np.float64)
+            alpha = float(self._contact_alpha_h[c])
+            n = self._contact_normal_h[c].astype(np.float64)
+            t1 = self._contact_tangent1_h[c].astype(np.float64)
+            t2 = self._contact_tangent2_h[c].astype(np.float64)
+            r[3 * c + 0] = float(self._contact_offset_h[c]) - alpha * float(np.dot(n, xp))
+            r[3 * c + 1] = -alpha * float(np.dot(t1, xp))
+            r[3 * c + 2] = -alpha * float(np.dot(t2, xp))
+        return r
 
     def _compute_contact_residual(self, x_np: np.ndarray) -> np.ndarray:
         """Compute ``r[c] = alpha[c] * dot(n[c], x_np[p[c]]) - offset[c]``.
@@ -721,6 +815,118 @@ class SolverFBA(SolverBase):
             if np.linalg.norm(lam - lam_old, np.inf) < 1e-8:
                 break
         return lam
+
+    def _solve_nsn_coulomb(
+        self, W: np.ndarray, r: np.ndarray, mu: np.ndarray, max_iters: int = 20
+    ) -> np.ndarray:
+        """Solve the frictional LCP via blocked projected Gauss-Seidel.
+
+        Operates on 3-blocks ``[λ_n, λ_t1, λ_t2]`` per contact.  Each block
+        is updated by solving the local 3×3 system (``W_cc``), then projecting
+        onto the Coulomb cone.
+
+        Args:
+            W: Dense ``(3M, 3M)`` Schur complement matrix.
+            r: Residual vector of shape ``(3M,)``.
+            mu: Per-contact friction coefficient, shape ``(M,)``.
+            max_iters: Maximum blocked Gauss-Seidel iterations.
+
+        Returns:
+            Contact impulse vector ``λ``, shape ``(3M,)``, float64, ordered
+            ``[λ_n_0, λ_t1_0, λ_t2_0, λ_n_1, ...]``.
+        """
+        M = len(mu)
+        lam = np.zeros(3 * M, dtype=np.float64)
+        for _ in range(max_iters):
+            lam_old = lam.copy()
+            for c in range(M):
+                s = slice(3 * c, 3 * c + 3)
+                W_cc = W[s, s]
+                # Effective RHS: r_eff = r[s] - sum_{c' != c} W[s, s'] lam[s']
+                off_diag = W[s, :] @ lam - W_cc @ lam[s]
+                r_eff = r[s] - off_diag
+                # Solve 3x3: lam_unc = W_cc^{-1} r_eff
+                if np.linalg.det(W_cc) < 1e-20:
+                    continue
+                lam_unc = np.linalg.solve(W_cc, r_eff)
+                # Project onto Coulomb cone.
+                s_unc = float(lam_unc[0])
+                v_unc = lam_unc[1:3]
+                s_proj, v_proj = project_coulomb_cone(s_unc, v_unc, float(mu[c]))
+                lam[3 * c + 0] = s_proj
+                lam[3 * c + 1] = v_proj[0]
+                lam[3 * c + 2] = v_proj[1]
+            if np.linalg.norm(lam - lam_old, np.inf) < 1e-8:
+                break
+        return lam
+
+    def _apply_lambda_correction_friction(self, lam: np.ndarray) -> wp.array:
+        """Compute ``correction = A⁻¹ · Jᵀ · λ`` for Stage B (3M λ).
+
+        Uses the cached ``_y_cache`` from
+        :meth:`~newton._src.solvers.fba.linear_solver.FBALinearSolver.build_schur_complement`
+        which contains one (N, 3) array per row (3M total entries for friction).
+
+        Each row r corresponds to contact ``c = r // 3``, axis ``a = r % 3``:
+
+        - a=0: normal contribution
+        - a=1: t1 contribution
+        - a=2: t2 contribution
+
+        Args:
+            lam: Contact impulse vector, shape ``(3M,)``, float64.
+
+        Returns:
+            Correction vec3 Warp array of length N.
+        """
+        from .kernels import accumulate_vec3_kernel  # noqa: PLC0415
+
+        M = self._contact_count
+        total_rows = 3 * M
+        N = self.model.particle_count
+        dev = self._device
+        ls = self._linear_solver
+
+        correction_np = np.zeros((N, 3), dtype=np.float64)
+
+        if hasattr(ls, "_y_cache") and len(ls._y_cache) == total_rows:
+            for row in range(total_rows):
+                if abs(lam[row]) < 1e-15:
+                    continue
+                correction_np += lam[row] * ls._y_cache[row]
+        else:
+            # Fallback: re-solve for each row.
+            from .kernels import build_contact_jacobian_dir_kernel, zero_vec3_kernel  # noqa: PLC0415
+
+            tmp = wp.empty(N, dtype=wp.vec3, device=dev)
+            work = wp.empty(N, dtype=wp.vec3, device=dev)
+            for c in range(M):
+                if not hasattr(self, "_contact_tangent1_h"):
+                    continue
+                n = self._contact_normal_h[c].astype(np.float64)
+                t1 = self._contact_tangent1_h[c].astype(np.float64)
+                t2 = self._contact_tangent2_h[c].astype(np.float64)
+                directions = [n, t1, t2]
+                for a, direction in enumerate(directions):
+                    row = 3 * c + a
+                    if abs(lam[row]) < 1e-15:
+                        continue
+                    wp.launch(zero_vec3_kernel, dim=N, inputs=[work], device=dev)
+                    wp.launch(
+                        build_contact_jacobian_dir_kernel,
+                        dim=1,
+                        inputs=[N, c, self._contact_particle_d, self._contact_alpha_d,
+                                 wp.vec3(float(direction[0]), float(direction[1]), float(direction[2]))],
+                        outputs=[work],
+                        device=dev,
+                    )
+                    ls.solve(work, tmp)
+                    tmp_np = tmp.numpy().astype(np.float64)
+                    correction_np += lam[row] * tmp_np
+
+        correction = wp.zeros(N, dtype=wp.vec3, device=dev)
+        correction.assign(correction_np.astype(np.float32))
+        return correction
 
     def _apply_lambda_correction(self, lam: np.ndarray) -> wp.array:
         """Compute ``correction = A⁻¹ · Jᵀ · λ`` (vec3 array of length N).

@@ -2549,6 +2549,62 @@ class TestPhase4StageBFriction(unittest.TestCase):
         np.testing.assert_allclose(v4, [0.0, 0.0], atol=1e-12)
 
 
+    def test_friction_disabled_matches_stage_a(self):
+        """SolverFBA(friction=False) must produce bit-identical results to Stage A."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=[
+                wp.vec3(0.0, -0.5, 0.0),  # particle 0 — free, below plane
+                wp.vec3(1.0, 0.0, 0.0),   # pinned
+                wp.vec3(0.0, 0.0, 1.0),   # pinned
+            ],
+            indices=[0, 1, 2],
+            density=1.0,
+            tri_ke=1.0e4,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+        )
+        builder.particle_mass[1] = 0.0
+        builder.particle_mass[2] = 0.0
+        model = builder.finalize()
+        device = model.device
+
+        contacts = newton.Contacts(rigid_contact_max=0, soft_contact_max=1, device=device)
+        contacts.soft_contact_count.assign(np.array([1], dtype=np.int32))
+        contacts.soft_contact_particle.assign(np.array([0], dtype=np.int32))
+        contacts.soft_contact_normal.assign(np.array([[0.0, 1.0, 0.0]], dtype=np.float32))
+        contacts.soft_contact_body_pos.assign(np.array([[0.0, 0.0, 0.0]], dtype=np.float32))
+        contacts.soft_contact_shape.assign(np.array([-1], dtype=np.int32))
+
+        dt = 1.0 / 60.0
+
+        # Two identical friction=False solvers must agree exactly.
+        solver_a = SolverFBA(model, iterations=5, friction=False)
+        solver_b = SolverFBA(model, iterations=5, friction=False)
+
+        s_in_a, s_out_a = model.state(), model.state()
+        s_in_b, s_out_b = model.state(), model.state()
+        s_in_a.clear_forces()
+        s_in_b.clear_forces()
+
+        solver_a.step(s_in_a, s_out_a, None, contacts, dt)
+        solver_b.step(s_in_b, s_out_b, None, contacts, dt)
+
+        qa = s_out_a.particle_q.numpy()
+        qb = s_out_b.particle_q.numpy()
+        # Two identical solvers must agree exactly.
+        np.testing.assert_array_equal(qa, qb,
+            err_msg="Two friction=False solvers diverged from each other")
+        # Particle 0 should be above the plane.
+        self.assertGreaterEqual(float(qa[0, 1]), -1e-4,
+            f"Particle still below plane: y={float(qa[0, 1]):.6f}")
+
     def test_friction_W_block_structure(self):
         """build_schur_complement with tangents returns 6x6 symmetric W for 2 contacts."""
         import scipy.sparse as sp
