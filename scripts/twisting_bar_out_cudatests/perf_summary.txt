@@ -1,0 +1,47 @@
+Newton FBA CudaTests params: E=1e9, nu=0.45, 810 frames, dt=0.01, PD_iter=5
+Mesh: cube_volume_11340P.mesh (11340 verts, ~58956 tets)
+Device: cuda:0 (NVIDIA GeForce RTX 5090)
+
+Newton run details:
+  Solver: SolverFBA (Newton), iterations=5, pin_stiffness=1e12
+  Setup+first-step: 5861.0 ms (CUDA kernel compilation + sparse inverse factorization)
+  Run: 810 frames, all stable, no NaN detected
+
+RealSim run details:
+  Solver: LocalGlobalSolver with CUDA SparseInverse, LocalGlobal_CUDA=5
+  Sparse inverse compute: ~1353 ms (factorization ~570 ms)
+  Run: 810 frames (maxFrame=810), all stable
+  ABC output: simulation/output_abc/TwistingBarNH/output_obj_0.abc (106 MB)
+  Note: destructor crash "free(): invalid pointer" after completion — known RealSim bug, ABC fully written
+
+================================================================================
+COMPARISON TABLE: RealSim NH vs Newton NH (CudaTests params, E=1e9)
+================================================================================
+                               frames    stable      mean(ms)  median(ms)    p95(ms)
+------------------------------------------------------------------------------------
+  RealSim NH (CUDA SparseInv)    810/810   YES          50.23      50.68      55.92
+  Newton  NH (FBA SolverFBA)     810/810   YES           7.22       7.10       8.27
+------------------------------------------------------------------------------------
+  Speedup (Newton vs RealSim)                            6.96x      7.13x      6.76x
+
+RealSim breakdown (avg per 50-frame window):
+  Local (PD) cost:   mean=4.36 ms, median=4.41 ms
+  Linear solve cost: mean=0.50 ms, median=0.50 ms
+  Total frame cost:  mean=50.23 ms, median=50.68 ms
+  Note: total >> local+linear, suggesting significant overhead in pin update/memory transfer
+
+Newton FBA breakdown:
+  Per-step cost includes: local (PD) + global (linear solve) + pin update
+  mean=7.22 ms, median=7.10 ms, p95=8.27 ms
+
+================================================================================
+INTERPRETATION
+================================================================================
+1. Both RealSim NH and Newton NH complete all 810 frames stably at E=1e9.
+   The high stiffness (1000x vs Demos's 1e6) keeps tets near rest pose,
+   preventing log(J) divergence in NH energy — hypothesis confirmed.
+
+2. Newton FBA is ~7x faster per step (7.1 ms vs 50.7 ms median).
+   RealSim's overhead is largely non-solver: ~45 ms unaccounted by local+linear,
+   likely including GPU->CPU sync, pin kinematics, and ABC writing overhead.
+   Newton's FBA step is purely GPU-resident with minimal CPU interaction.
