@@ -2549,5 +2549,59 @@ class TestPhase4StageBFriction(unittest.TestCase):
         np.testing.assert_allclose(v4, [0.0, 0.0], atol=1e-12)
 
 
+    def test_friction_W_block_structure(self):
+        """build_schur_complement with tangents returns 6x6 symmetric W for 2 contacts."""
+        import scipy.sparse as sp
+
+        from newton._src.solvers.fba.linear_solver import FBALinearSolver, factorize_and_sparse_inverse
+        from newton._src.solvers.fba.solver_fba import compute_tangent_basis
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        rng = np.random.default_rng(42)
+        n = 20
+
+        # Small SPD A.
+        diag = rng.uniform(5.0, 15.0, n)
+        off = rng.uniform(-0.3, 0.3, n - 1)
+        A = sp.diags([off, diag, off], [-1, 0, 1], shape=(n, n), format="csr").astype(np.float64)
+        fs = factorize_and_sparse_inverse(A)
+        solver = FBALinearSolver(fs, device=device)
+
+        # 2 contacts.
+        M = 2
+        particles = np.array([2, 7], dtype=np.int32)
+        normals = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+        alpha = np.ones(M, dtype=np.float32)
+
+        # Compute tangent bases.
+        t1_arr = np.zeros((M, 3), dtype=np.float32)
+        t2_arr = np.zeros((M, 3), dtype=np.float32)
+        for i in range(M):
+            t1, t2 = compute_tangent_basis(normals[i])
+            t1_arr[i] = t1.astype(np.float32)
+            t2_arr[i] = t2.astype(np.float32)
+
+        j_indices = wp.array(particles, dtype=wp.int32, device=device)
+        j_normals = wp.array(normals, dtype=wp.vec3, device=device)
+        j_alpha = wp.array(alpha, dtype=wp.float32, device=device)
+        j_t1 = wp.array(t1_arr, dtype=wp.vec3, device=device)
+        j_t2 = wp.array(t2_arr, dtype=wp.vec3, device=device)
+
+        W = solver.build_schur_complement(M, j_indices, j_normals, j_alpha, j_t1, j_t2)
+
+        # Shape must be 6x6 (3 rows per contact × 2 contacts).
+        self.assertEqual(W.shape, (6, 6), f"Expected (6,6), got {W.shape}")
+
+        # Symmetry.
+        np.testing.assert_allclose(W, W.T, atol=1e-10,
+                                    err_msg="Friction W is not symmetric")
+
+        # All eigenvalues positive (SPD since the contacts are at distinct particles
+        # and the directions are orthonormal).
+        eigvals = np.linalg.eigvalsh(W)
+        self.assertGreater(float(eigvals.min()), 0.0,
+                            f"W has non-positive eigenvalue: {eigvals.min():.3e}")
+
+
 if __name__ == "__main__":
     unittest.main()

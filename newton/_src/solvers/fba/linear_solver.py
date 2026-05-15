@@ -794,61 +794,102 @@ class FBALinearSolver:
         j_indices: wp.array,
         j_normals: wp.array,
         j_alpha: wp.array,
+        j_tangent1: wp.array | None = None,
+        j_tangent2: wp.array | None = None,
     ) -> np.ndarray:
-        """Build ``W = J · A⁻¹ · Jᵀ`` as a dense ``(M, M)`` NumPy array.
+        """Build ``W = J · A⁻¹ · Jᵀ`` as a dense NumPy array.
 
-        For each contact row ``c``, computes ``y_c = A⁻¹ · J_cᵀ`` (a vec3 array
-        of length N with the contact-normal response at particle ``j_indices[c]``),
-        then assembles ``W[c', c] = J_{c'} · y_c``.  The columns ``y_c`` are
-        cached in a list to halve the solve count needed by
-        :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA._apply_lambda_correction`.
+        Stage A (``j_tangent1`` and ``j_tangent2`` are ``None``): emits an ``(M, M)``
+        matrix with one row per contact (normal direction only).
+
+        Stage B (both tangent arrays provided): emits a ``(3M, 3M)`` matrix with
+        three rows per contact ordered ``[n_c, t1_c, t2_c]`` for c = 0..M-1.
+        Off-diagonal coupling between contacts is fully included.
+
+        The ``_y_cache`` attribute is updated to contain one entry per row (M entries
+        in Stage A; 3M entries in Stage B); each entry is the corresponding ``A⁻¹ · J_row^T``
+        column as a (N, 3) float64 NumPy array.  Used by
+        :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA._apply_lambda_correction_friction`.
 
         Args:
             num_contacts: Number of active contacts ``M``.
-            j_indices: Particle index per contact row, shape ``[M]``, dtype int32.
-            j_normals: World-frame contact normal per row, shape ``[M]``, dtype vec3.
-            j_alpha: Jacobian coefficient per row, shape ``[M]``, dtype float32.
+            j_indices: Particle index per contact, shape ``[M]``, dtype int32.
+            j_normals: World-frame contact normal per contact, shape ``[M]``, dtype vec3.
+            j_alpha: Jacobian coefficient per contact, shape ``[M]``, dtype float32.
+            j_tangent1: First tangent direction per contact, shape ``[M]``, dtype vec3.
+                When ``None``, Stage A behavior (M×M W).
+            j_tangent2: Second tangent direction per contact, shape ``[M]``, dtype vec3.
+                Must be provided together with ``j_tangent1``.
 
         Returns:
-            Dense ``(M, M)`` float64 NumPy array ``W``.
+            Dense float64 NumPy array of shape ``(M, M)`` (Stage A) or ``(3M, 3M)`` (Stage B).
         """
+        from .kernels import (  # noqa: PLC0415
+            build_contact_jacobian_dir_kernel,
+            zero_vec3_kernel,
+        )
+
+        has_friction = j_tangent1 is not None and j_tangent2 is not None
+        rows_per_contact = 3 if has_friction else 1
         M = num_contacts
+        total_rows = M * rows_per_contact
         n = self.n
         dev = self.device
-        W = np.zeros((M, M), dtype=np.float64)
 
-        # Allocate scratch for Jacobian column and its inverse-application result.
+        W = np.zeros((total_rows, total_rows), dtype=np.float64)
+
+        # Allocate scratch for one Jacobian column (sparse vec3, length N).
         jcol = wp.zeros(n, dtype=wp.vec3, device=dev)
         y_out = wp.empty(n, dtype=wp.vec3, device=dev)
 
-        # Pull contact arrays to host for the reduction loop (small M).
-        idx_np = j_indices.numpy()          # (M,) int
-        n_np = j_normals.numpy()            # (M, 3)
-        a_np = j_alpha.numpy()              # (M,)
+        # Pull contact metadata to host (small M).
+        idx_np = j_indices.numpy()   # (M,) int32
+        n_np = j_normals.numpy()     # (M, 3) float32
+        a_np = j_alpha.numpy()       # (M,) float32
+        if has_friction:
+            t1_np = j_tangent1.numpy()   # (M, 3) float32
+            t2_np = j_tangent2.numpy()   # (M, 3) float32
 
-        # Cache y_c columns for reuse in _apply_lambda_correction.
+        # Cache y columns for reuse in correction step.
         self._y_cache: list[np.ndarray] = []
 
+        # For each (contact c, axis a) row in J, compute y_{c,a} = A⁻¹ J_{c,a}^T
+        # then fill one column of W.
         for c in range(M):
-            # Zero the column RHS.
-            wp.launch(zero_vec3_kernel, dim=n, inputs=[jcol], device=dev)
-            # Set jcol[j_indices[c]] = j_alpha[c] * j_normals[c].
-            wp.launch(
-                build_contact_jacobian_vec3_kernel,
-                dim=1,
-                inputs=[n, c, j_indices, j_normals, j_alpha],
-                outputs=[jcol],
-                device=dev,
-            )
-            # Apply A⁻¹: y_out = A⁻¹ · jcol.
-            self.solve(jcol, y_out)
-            # Pull to host for W assembly and caching.
-            y_np = y_out.numpy()  # (N, 3)
-            self._y_cache.append(y_np.copy())
+            if has_friction:
+                directions: list[np.ndarray] = [n_np[c], t1_np[c], t2_np[c]]
+            else:
+                directions = [n_np[c]]
 
-            # Fill column c of W: W[c', c] = a[c'] * dot(n[c'], y_np[idx[c']]).
-            for cp in range(M):
-                ip = idx_np[cp]
-                W[cp, c] = float(a_np[cp]) * float(np.dot(n_np[cp], y_np[ip]))
+            for a, direction in enumerate(directions):
+                row = c * rows_per_contact + a
+                # Zero the sparse column.
+                wp.launch(zero_vec3_kernel, dim=n, inputs=[jcol], device=dev)
+                # Set jcol[idx] = alpha * direction.
+                wp.launch(
+                    build_contact_jacobian_dir_kernel,
+                    dim=1,
+                    inputs=[n, c, j_indices, j_alpha,
+                             wp.vec3(float(direction[0]), float(direction[1]), float(direction[2]))],
+                    outputs=[jcol],
+                    device=dev,
+                )
+                # Solve: y_{c,a} = A⁻¹ · jcol.
+                self.solve(jcol, y_out)
+                y_np = y_out.numpy()   # (N, 3)
+                self._y_cache.append(y_np.copy())
+
+                # Fill column `row` of W:
+                # W[row', row] = J_{row'} · y_{c,a}
+                #   = alpha[c'] * dot(dir_{c',a'}, y_np[idx[c']])
+                for cp in range(M):
+                    if has_friction:
+                        dirs_cp: list[np.ndarray] = [n_np[cp], t1_np[cp], t2_np[cp]]
+                    else:
+                        dirs_cp = [n_np[cp]]
+                    ip = idx_np[cp]
+                    for ap, dir_cp in enumerate(dirs_cp):
+                        rowp = cp * rows_per_contact + ap
+                        W[rowp, row] = float(a_np[cp]) * float(np.dot(dir_cp, y_np[ip]))
 
         return W
