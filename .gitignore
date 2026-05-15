@@ -76,3 +76,6 @@ docs/_static/viser/
 
 # Cloth extension demo outputs (regenerable, too large for git)
 scripts/cloth_extension_out/
+
+# Twisting bar demo outputs (regenerable, too large for git)
+scripts/twisting_bar_out/
