@@ -101,7 +101,9 @@ def compute_inertial_kernel(
     w_idx = wp.max(particle_world[tid], 0)
     g = gravity[w_idx]
     im = inv_mass[tid]
-    a = f_ext[tid] * im + g  # apply gravity unconditionally; pin softness is enforced elsewhere via large diagonal + x_ref RHS scatter
+    a = (
+        f_ext[tid] * im + g
+    )  # apply gravity unconditionally; pin softness is enforced elsewhere via large diagonal + x_ref RHS scatter
     x_inertia[tid] = x_prev[tid] + v_prev[tid] * dt + a * (dt * dt)
 
 
@@ -230,6 +232,145 @@ def project_stretching_arap_kernel(
     PT10 = P[0, 1]
     PT11 = P[1, 1]
     PT12 = P[2, 1]  # column 1 of P as a row of P^T
+
+    row0 = wp.vec3(
+        w * (Dm_inv[0, 0] * PT00 + Dm_inv[0, 1] * PT10),
+        w * (Dm_inv[0, 0] * PT01 + Dm_inv[0, 1] * PT11),
+        w * (Dm_inv[0, 0] * PT02 + Dm_inv[0, 1] * PT12),
+    )
+    row1 = wp.vec3(
+        w * (Dm_inv[1, 0] * PT00 + Dm_inv[1, 1] * PT10),
+        w * (Dm_inv[1, 0] * PT01 + Dm_inv[1, 1] * PT11),
+        w * (Dm_inv[1, 0] * PT02 + Dm_inv[1, 1] * PT12),
+    )
+
+    # Scatter: rhs[i0] += -row0 - row1; rhs[i1] += row0; rhs[i2] += row1
+    wp.atomic_add(rhs, i0, -(row0 + row1))
+    wp.atomic_add(rhs, i1, row0)
+    wp.atomic_add(rhs, i2, row1)
+
+
+@wp.func
+def project_corotational_sigma(sigma_sq: wp.vec2, mu: float, lam: float) -> wp.vec2:
+    """Closed-form 2D corotational local projection on singular values.
+
+    Minimises E(s) = mu*||s-I||^2 + (lam/2)*tr(s-I)^2  subject to PD's
+    quadratic penalty (k/2)*||s-s0||^2 with k = 2*mu.  The resulting 2x2
+    linear system has the closed-form solution below.
+
+    Args:
+        sigma_sq: Squared singular values from ``wp.svd2(FtF)``.
+        mu: First Lame parameter (shear modulus) [Pa].
+        lam: Second Lame parameter [Pa].
+
+    Returns:
+        Projected singular-value pair ``(sigma_proj_0, sigma_proj_1)``.
+    """
+    s0 = wp.sqrt(wp.max(sigma_sq[0], 1.0e-20))
+    s1 = wp.sqrt(wp.max(sigma_sq[1], 1.0e-20))
+
+    k = 2.0 * mu  # PD penalty weight
+    # 2x2 system: diagonal M, off-diagonal lam.
+    M = 2.0 * mu + lam + k  # = 4*mu + lam
+    det = M * M - lam * lam
+
+    b0 = 2.0 * (mu + lam) + k * s0
+    b1 = 2.0 * (mu + lam) + k * s1
+
+    proj0 = (M * b0 - lam * b1) / det
+    proj1 = (M * b1 - lam * b0) / det
+    return wp.vec2(proj0, proj1)
+
+
+@wp.kernel
+def project_stretching_corotational_kernel(
+    positions: wp.array[wp.vec3],
+    tri_indices: wp.array[wp.int32],  # flat shape (3*T,)
+    tri_rest_inv: wp.array[wp.mat22],
+    tri_weight: wp.array[wp.float32],
+    mu: float,
+    lam: float,
+    # output (atomic accumulator)
+    rhs: wp.array[wp.vec3],
+):
+    """Per-triangle corotational local projection scatter for PD cloth.
+
+    Computes the deformation gradient ``F = Ds * Dm_inv`` (3x2), extracts
+    singular values via ``wp.svd2(FtF)``, applies the closed-form corotational
+    projection to get ``sigma_proj``, reconstructs ``P = U * diag(sigma_proj) * Vt``,
+    and scatters ``w * Dm_inv * Pt`` into the RHS vector via atomic_add.
+
+    Args:
+        positions: Current particle positions [m], shape ``[particle_count]``.
+        tri_indices: Flat triangle indices, shape ``[3 * tri_count]``.
+        tri_rest_inv: Per-triangle 2x2 rest-pose inverse (``Dm_inv``).
+        tri_weight: Per-triangle stretching weight (``ke * area``).
+        mu: First Lame parameter [Pa].
+        lam: Second Lame parameter [Pa].
+        rhs: Output RHS accumulator; receives atomic-add contributions.
+    """
+    t = wp.tid()
+    i0 = tri_indices[3 * t + 0]
+    i1 = tri_indices[3 * t + 1]
+    i2 = tri_indices[3 * t + 2]
+
+    p0 = positions[i0]
+    p1 = positions[i1]
+    p2 = positions[i2]
+
+    # Deformation gradient F = [p1-p0 | p2-p0] . Dm_inv  (3x2)
+    Ds_col0 = p1 - p0
+    Ds_col1 = p2 - p0
+    Ds = mat32(
+        Ds_col0[0],
+        Ds_col1[0],
+        Ds_col0[1],
+        Ds_col1[1],
+        Ds_col0[2],
+        Ds_col1[2],
+    )
+    Dm_inv = tri_rest_inv[t]
+    F = Ds * Dm_inv
+
+    # 3x2 SVD via 2x2 symmetric eigenproblem on FtF.
+    FtF = wp.transpose(F) * F
+    _U2, sigma_sq, V2 = wp.svd2(FtF)
+
+    # Real singular values of F (sqrt of eigenvalues of FᵀF).
+    s0_real = wp.sqrt(wp.max(sigma_sq[0], 1.0e-20))
+    s1_real = wp.sqrt(wp.max(sigma_sq[1], 1.0e-20))
+
+    # Left singular vectors of F: u_i = F v_i / s_i.
+    v0 = wp.vec2(V2[0, 0], V2[1, 0])
+    v1 = wp.vec2(V2[0, 1], V2[1, 1])
+    u0 = (F * v0) / s0_real  # 3-vector
+    u1 = (F * v1) / s1_real  # 3-vector
+
+    # Corotational projection: sigma_proj via closed-form 2x2 solve.
+    sigma_proj = project_corotational_sigma(sigma_sq, mu, lam)
+
+    # Reconstruct P = U * diag(sigma_proj) * Vt  (3x2).
+    # P[:, j] = sum_i u_i * sigma_proj[i] * V2[j, i]
+    p_col0 = u0 * (sigma_proj[0] * V2[0, 0]) + u1 * (sigma_proj[1] * V2[0, 1])
+    p_col1 = u0 * (sigma_proj[0] * V2[1, 0]) + u1 * (sigma_proj[1] * V2[1, 1])
+
+    P = mat32(
+        p_col0[0],
+        p_col1[0],
+        p_col0[1],
+        p_col1[1],
+        p_col0[2],
+        p_col1[2],
+    )
+
+    # Local contribution to RHS: proj = w * Dm_inv * Pt  (2x3)
+    w = tri_weight[t]
+    PT00 = P[0, 0]
+    PT01 = P[1, 0]
+    PT02 = P[2, 0]
+    PT10 = P[0, 1]
+    PT11 = P[1, 1]
+    PT12 = P[2, 1]
 
     row0 = wp.vec3(
         w * (Dm_inv[0, 0] * PT00 + Dm_inv[0, 1] * PT10),
