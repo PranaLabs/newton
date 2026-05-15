@@ -83,12 +83,25 @@ def compute_inertial_kernel(
     dt: float,
     x_inertia: wp.array[wp.vec3],
 ):
-    """x_inertia = x_prev + dt·v_prev + (dt²/m)·(f_ext + g·m)."""
+    """x_inertia = x_prev + dt·v_prev + dt²·(f_ext·im + g).
+
+    Gravity is applied unconditionally to all particles, including pinned ones
+    (inv_mass == 0). ``x_inertia`` is used as the warm-start ``x_cur`` for the
+    PD outer iteration; the local projection kernels (ARAP / bending) read
+    ``x_cur`` to compute deformation gradients. Wrong pinned positions bias the
+    deformation gradient at triangles touching the pin, compounding to large
+    errors over many steps. The pin constraint is enforced via the large
+    ``pin_stiffness`` diagonal entry in ``A`` and the matching
+    ``pin_stiffness * x_ref`` scatter to the RHS — NOT by gating gravity here.
+    For pinned particles (im == 0) ``f_ext * im == 0``, so only gravity
+    contributes; the resulting ``x_inertia`` is never fed into the inertia RHS
+    term (``add_inertia_to_rhs`` weights by mass, which is 0 for pins).
+    """
     tid = wp.tid()
     w_idx = wp.max(particle_world[tid], 0)
     g = gravity[w_idx]
     im = inv_mass[tid]
-    a = f_ext[tid] * im + g * wp.step(-im)  # gravity active only for free particles (im>0)
+    a = f_ext[tid] * im + g  # apply gravity unconditionally; pin softness is enforced elsewhere via large diagonal + x_ref RHS scatter
     x_inertia[tid] = x_prev[tid] + v_prev[tid] * dt + a * (dt * dt)
 
 
