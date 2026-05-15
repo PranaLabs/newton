@@ -55,6 +55,9 @@ Live tracker for the Newton port of RealSim's "Fast But Accurate" projective-dyn
 | `8826d728` | Robustness D — stability boundary + regression test |
 | `d14fdb75` | Use realistic tri_ke=1e4 in examples/tests |
 | `a8405f87` | Clean pre-commit warnings + commit diagnosis doc |
+| `890874f6` | Fix compute_inertial_kernel: apply gravity unconditionally (gravity-pin bug) |
+| `bc3ff0a6` | Add FBA x RealSim trajectory cross-check test (fixture + TestFBARealSimAgreement) |
+| `94a9ec04` | Fix pre-commit lint warnings (PLW2901, RUF012, typos allowlist) |
 
 ## In progress
 
