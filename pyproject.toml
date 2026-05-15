@@ -313,6 +313,10 @@ IIT = "IIT"
 iit = "iit"
 PN = "PN"
 pnd = "pnd"
+# RealSim: proper noun (physics simulator brand name)
+realsim = "realsim"
+RealSim = "RealSim"
+REALSIM = "REALSIM"
 
 [tool.typos.default.extend-identifiers]
 PNGs = "PNGs"

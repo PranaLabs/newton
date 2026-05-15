@@ -1063,10 +1063,10 @@ class TestFBARealSimAgreement(unittest.TestCase):
     EDGE_KE = 0.1
     PIN_STIFFNESS = 1e10  # RealSim init.h:1023
     # Pin bounding boxes (xmin, ymin, zmin, xmax, ymax, zmax) — top two corners
-    PIN_BOXES = [
+    PIN_BOXES = (
         (-1.1, 0.9, -0.1, -0.9, 1.1, 0.1),
         (0.9, 0.9, -0.1, 1.1, 1.1, 0.1),
-    ]
+    )
 
     @classmethod
     def setUpClass(cls):
@@ -1080,13 +1080,13 @@ class TestFBARealSimAgreement(unittest.TestCase):
         vertices: list[wp.vec3] = []
         indices: list[int] = []
         with open(_Path(path)) as fh:
-            for line in fh:
-                line = line.strip()
-                if line.startswith("v "):
-                    parts = line.split()
+            for raw_line in fh:
+                tok = raw_line.strip()
+                if tok.startswith("v "):
+                    parts = tok.split()
                     vertices.append(wp.vec3(float(parts[1]), float(parts[2]), float(parts[3])))
-                elif line.startswith("f "):
-                    parts = line.split()[1:]
+                elif tok.startswith("f "):
+                    parts = tok.split()[1:]
                     face_idx = [int(p.split("/")[0]) - 1 for p in parts]
                     for i in range(1, len(face_idx) - 1):
                         indices.extend([face_idx[0], face_idx[i], face_idx[i + 1]])
@@ -1143,7 +1143,6 @@ class TestFBARealSimAgreement(unittest.TestCase):
 
     def test_drape_trajectory_matches_realsim(self):
         """50-step drape on 113-vertex cloth: max position delta < 5e-5 m at every frame."""
-        from pathlib import Path  # noqa: PLC0415
 
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
@@ -1151,12 +1150,11 @@ class TestFBARealSimAgreement(unittest.TestCase):
         vertices, indices = self._load_obj(self.OBJ_PATH)
         self.assertEqual(len(vertices), 113)
 
-        # Load RealSim reference trajectory (shape: 50 frames × 113 verts × 3).
+        # Load RealSim reference trajectory (shape: 50 frames x 113 verts x 3).
         realsim_traj = np.load(str(self.TRAJ_PATH))
         self.assertEqual(realsim_traj.shape, (50, 113, 3))
 
         # Build model and solver.
-        device = "cuda:0" if wp.is_cuda_available() else "cpu"
         model = self._build_model(vertices, indices)
         solver = SolverFBA(model, iterations=self.N_ITER, pin_stiffness=self.PIN_STIFFNESS)
 

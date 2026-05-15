@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-"""Newton-side harness for the FBA × RealSim trajectory cross-check.
+"""Newton-side harness for the FBA x RealSim trajectory cross-check.
 
 Loads the same scene used by RealSim's FBACrossCheck (square_113P.obj cloth,
 two pinned corners, gravity [0,0,-10], dt=0.01, 5 PD iterations, 50 frames),
@@ -19,7 +19,6 @@ Outputs:
 from __future__ import annotations
 
 import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -33,9 +32,7 @@ from newton.solvers import SolverFBA
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).parent
 OBJ_PATH = Path("/home/ziqiu/work/RealSim_py/realsim_py/resources/mesh/cloth/square_113P.obj")
-ABC_PATH = Path(
-    "/home/ziqiu/work/RealSim_py/realsim_py/simulation/output_abc/FBACrossCheck/output_obj_0.abc"
-)
+ABC_PATH = Path("/home/ziqiu/work/RealSim_py/realsim_py/simulation/output_abc/FBACrossCheck/output_obj_0.abc")
 DUMP_ABC = Path("/tmp/dump_abc_traj")
 NEWTON_TRAJ_PATH = SCRIPT_DIR / "fba_newton_trajectory.npy"
 REALSIM_TRAJ_PATH = SCRIPT_DIR / "fba_realsim_trajectory.npy"
@@ -48,9 +45,9 @@ N_FRAMES = 50
 N_ITER = 5
 GRAVITY = np.array([0.0, 0.0, -10.0], dtype=np.float32)
 
-# Young=1e4, Poisson=0.4 → μ = E / (2(1+ν)) = 1e4 / 2.8 ≈ 3571.43
-# RealSim ARAP weight = 2μ per area; Newton tri_ke passed to build_pd_system
-# as tri_weight = ke * area, so ke = 2μ = 7142.857 to match RealSim's "2*mu*area" factor.
+# Young=1e4, Poisson=0.4 => mu = E / (2*(1+nu)) = 1e4 / 2.8 ~= 3571.43
+# RealSim ARAP weight = 2*mu per area; Newton tri_ke passed to build_pd_system
+# as tri_weight = ke * area, so ke = 2*mu = 7142.857 to match RealSim's "2*mu*area" factor.
 TRI_KE = 7142.857
 EDGE_KE = 0.1
 # RealSim init.h:1023: w_pin = 1e10 (not Newton's default 1e12)
@@ -71,14 +68,14 @@ def load_obj(path: Path) -> tuple[list[wp.vec3], list[int]]:
     vertices: list[wp.vec3] = []
     indices: list[int] = []
     with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if line.startswith("v "):
-                parts = line.split()
+        for raw_line in fh:
+            tok = raw_line.strip()
+            if tok.startswith("v "):
+                parts = tok.split()
                 x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
                 vertices.append(wp.vec3(x, y, z))
-            elif line.startswith("f "):
-                parts = line.split()[1:]
+            elif tok.startswith("f "):
+                parts = tok.split()[1:]
                 # Each part may be "v", "v/vt", or "v/vt/vn" — take first int.
                 face_indices = [int(p.split("/")[0]) - 1 for p in parts]
                 # Triangulate fans if needed (all faces should already be triangles).
@@ -199,8 +196,7 @@ def read_realsim_trajectory() -> np.ndarray:
     if not DUMP_ABC.exists():
         # Compile if missing (should not happen in normal CI)
         raise FileNotFoundError(
-            f"dump_abc_traj binary not found at {DUMP_ABC}. "
-            "Please compile it with the instructions in the spec."
+            f"dump_abc_traj binary not found at {DUMP_ABC}. Please compile it with the instructions in the spec."
         )
 
     result = subprocess.run(
@@ -233,7 +229,7 @@ def read_realsim_trajectory() -> np.ndarray:
 def main() -> None:
     wp.init()
 
-    print("=== FBA × RealSim Cross-Check ===\n")
+    print("=== FBA x RealSim Cross-Check ===\n")
 
     # --- Load mesh ---
     print(f"Loading mesh from {OBJ_PATH} ...")
@@ -252,7 +248,7 @@ def main() -> None:
 
     # Capture initial positions (frame 0 = before any step)
     initial_q = model.particle_q.numpy().copy()
-    print(f"\n  Initial positions of pin candidates:")
+    print("\n  Initial positions of pin candidates:")
     for idx in find_pin_indices(vertices, PIN_BOXES):
         p = initial_q[idx]
         print(f"    index {idx}: ({p[0]:.6f}, {p[1]:.6f}, {p[2]:.6f})")
@@ -292,7 +288,7 @@ def main() -> None:
 
     # Spot-check pinned vertices stability in Newton (must not move)
     pin_indices = find_pin_indices(vertices, PIN_BOXES)
-    print(f"\nPinned vertex positions at frame 49 (Newton):")
+    print("\nPinned vertex positions at frame 49 (Newton):")
     for idx in pin_indices:
         p = newton_traj[49, idx]
         print(f"  [{idx}] = ({p[0]:.6f}, {p[1]:.6f}, {p[2]:.6f})")
