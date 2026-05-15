@@ -1,0 +1,45 @@
+{
+    "mesh":"resources/mesh/cloth/square_10225P.obj",
+
+    "element_type": "TRIANGLE",
+    "transformation": {
+        "trans": [0.0, 0.0, -3.0],
+        "rotation": [90.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0],
+        "center": [0.0, 0.0, 0.0]
+    },
+    "mechanical_props": {
+        "obj_mass": 1000,
+        "young": 1E+8,
+        "poisson": 0.45,
+        "constitutive":"TRI_COROTATION",
+        "bending": 0.0,
+        "bending_type":"BEND_ISOMETRIC"
+    },
+    "pin": {
+        "0":
+        {
+            "box": [0.99, -0.1, -4.1, 1.1, 0.1, -1.9],
+            "dynamic":{
+                "0": {
+                    "action": "PULLING",
+                    "direction": [1.0, 0.0, 0.0],
+                    "vel": 0.1,
+                    "maxlength": 1.0
+                }
+            }
+        },
+        "1":
+        {
+            "box": [-1.1, -0.1, -4.1, -0.99, 0.1, -1.9],
+            "dynamic":{
+                "0": {
+                    "action": "PULLING",
+                    "direction": [-1.0, 0.0, 0.0],
+                    "vel": 0.1,
+                    "maxlength": 1.0
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,15 @@
+{
+    "offline": true,
+    "maxFrame": 802,
+    "stop": 802,
+    "timestep": 0.01,
+    "gravity": [0.0, 0.0, 0.0],
+    "LocalGlobal" : 5,
+    "output_abc": "simulation/output_abc/ExtensionOfflineCorot",
+    "linearsolver": {
+        "type": "SPARSE_INVERSE_CUDA"
+    },
+    "objects": {
+        "object_0": "simulation/config/ExtensionOfflineCorot/cloth.json"
+    }
+}
