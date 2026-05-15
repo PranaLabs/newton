@@ -177,6 +177,115 @@ def svd_3x2(F: mat32) -> mat32:
     )
 
 
+@wp.func
+def project_arap_3x3(F: wp.mat33) -> wp.mat33:
+    """ARAP 3D projection: F -> nearest proper rotation R.
+
+    Uses Warp's ``wp.svd3`` then handles the reflection case:
+    if ``det(U) * det(V) < 0``, flip the last column of U so that
+    ``R = U' * V^T`` has ``det(R) = +1``.
+
+    Args:
+        F: 3x3 deformation gradient.
+
+    Returns:
+        R: 3x3 proper rotation (nearest rotation to F).
+    """
+    U, _sigma, V = wp.svd3(F)
+
+    # Detect reflection: det(U) * det(V) < 0 means R = U*V^T would have det = -1.
+    # Fix by flipping the column of U corresponding to the smallest singular value.
+    # wp.svd3 returns sigma in descending order, so index 2 is the smallest.
+    detUV = wp.determinant(U) * wp.determinant(V)
+    if detUV < 0.0:
+        # Flip column 2 of U. wp.mat33 is row-major: U[row, col].
+        # To flip col 2: negate U[0,2], U[1,2], U[2,2].
+        U = wp.mat33(
+            U[0, 0],
+            U[0, 1],
+            -U[0, 2],
+            U[1, 0],
+            U[1, 1],
+            -U[1, 2],
+            U[2, 0],
+            U[2, 1],
+            -U[2, 2],
+        )
+    return U * wp.transpose(V)
+
+
+@wp.kernel
+def project_stretching_arap_tet_kernel(
+    positions: wp.array[wp.vec3],
+    tet_indices: wp.array[wp.int32],  # flat shape (4*T,)
+    tet_rest_inv: wp.array[wp.mat33],
+    tet_weight: wp.array[wp.float32],
+    # output (atomic accumulator)
+    rhs: wp.array[wp.vec3],
+):
+    """Per-tet ARAP local projection scatter for PD softbody.
+
+    Computes F = Ds * Dm_inv (3x3), projects to nearest rotation R via SVD
+    with reflection handling, and scatters ``w * Dm_inv * R^T`` into the four
+    stencil vertices via atomic_add.
+
+    Args:
+        positions: Current particle positions [m], shape ``[particle_count]``.
+        tet_indices: Flat tet indices, shape ``[4 * tet_count]``.
+        tet_rest_inv: Per-tet 3x3 rest-pose inverse (Dm_inv), shape ``[tet_count]``.
+        tet_weight: Per-tet weight (2*mu * volume), shape ``[tet_count]``.
+        rhs: Output RHS accumulator (atomic-add target), shape ``[particle_count]``.
+    """
+    t = wp.tid()
+    i0 = tet_indices[4 * t + 0]
+    i1 = tet_indices[4 * t + 1]
+    i2 = tet_indices[4 * t + 2]
+    i3 = tet_indices[4 * t + 3]
+
+    p0 = positions[i0]
+    p1 = positions[i1]
+    p2 = positions[i2]
+    p3 = positions[i3]
+
+    # Ds = [p1-p0 | p2-p0 | p3-p0]  (column-stack 3 edge vectors -> 3x3)
+    e1 = p1 - p0
+    e2 = p2 - p0
+    e3 = p3 - p0
+    Ds = wp.mat33(
+        e1[0],
+        e2[0],
+        e3[0],
+        e1[1],
+        e2[1],
+        e3[1],
+        e1[2],
+        e2[2],
+        e3[2],
+    )
+    Dm_inv = tet_rest_inv[t]
+    F = Ds * Dm_inv
+
+    R = project_arap_3x3(F)
+
+    # proj = w * Dm_inv * R^T  (3x3)
+    w = tet_weight[t]
+    RT = wp.transpose(R)
+    proj = w * (Dm_inv * RT)
+
+    # Scatter stencil (RealSim PDTetrahedronEnergy.cpp:191-194):
+    #   rhs[t[0]] += -proj.row(0) - proj.row(1) - proj.row(2)
+    #   rhs[t[1]] += proj.row(0)
+    #   rhs[t[2]] += proj.row(1)
+    #   rhs[t[3]] += proj.row(2)
+    row0 = wp.vec3(proj[0, 0], proj[0, 1], proj[0, 2])
+    row1 = wp.vec3(proj[1, 0], proj[1, 1], proj[1, 2])
+    row2 = wp.vec3(proj[2, 0], proj[2, 1], proj[2, 2])
+    wp.atomic_add(rhs, i0, -(row0 + row1 + row2))
+    wp.atomic_add(rhs, i1, row0)
+    wp.atomic_add(rhs, i2, row1)
+    wp.atomic_add(rhs, i3, row2)
+
+
 @wp.kernel
 def project_stretching_arap_kernel(
     positions: wp.array[wp.vec3],

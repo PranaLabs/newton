@@ -1760,5 +1760,109 @@ class TestTetHessianAssembly(unittest.TestCase):
         self.assertGreater(eigenvalues.min(), -1e-8, "tet Hessian has negative eigenvalue")
 
 
+class TestTetARAP(unittest.TestCase):
+    """Tests for tet ARAP kernel: project_stretching_arap_tet_kernel."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_rest_tet_projects_to_identity(self):
+        """Rest configuration (F=I) should scatter correctly.
+
+        For canonical tet (0,0,0),(1,0,0),(0,1,0),(0,0,1):
+        Ds = I, Dm_inv = I (since Dm = I), F = I, R = I.
+        proj = w * I * I^T = w * I.
+        row0=(1,0,0)*w, row1=(0,1,0)*w, row2=(0,0,1)*w
+        rhs[0] = -(row0+row1+row2) = -(1,1,1)*w
+        rhs[1] = (1,0,0)*w; rhs[2] = (0,1,0)*w; rhs[3] = (0,0,1)*w
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_arap_tet_kernel  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0, 1, 0), wp.vec3(0, 0, 1)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tet_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
+        # Dm_inv = I for canonical tet
+        Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+        rhs = wp.zeros(4, dtype=wp.vec3, device=device)
+
+        wp.launch(
+            project_stretching_arap_tet_kernel,
+            dim=1,
+            inputs=[positions, tet_indices, Dm_inv, weight],
+            outputs=[rhs],
+            device=device,
+        )
+        r = rhs.numpy()
+        np.testing.assert_allclose(r[1], [1.0, 0.0, 0.0], atol=1e-6)
+        np.testing.assert_allclose(r[2], [0.0, 1.0, 0.0], atol=1e-6)
+        np.testing.assert_allclose(r[3], [0.0, 0.0, 1.0], atol=1e-6)
+        np.testing.assert_allclose(r[0], -(r[1] + r[2] + r[3]), atol=1e-6)
+
+    def test_rotation_invariance(self):
+        """F = R0 (pure rotation) must project to exactly R0 and scatter consistently."""
+        from newton._src.solvers.fba.kernels import project_stretching_arap_tet_kernel  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        # 30-degree rotation about z-axis
+        angle = np.pi / 6.0
+        c, s = np.cos(angle), np.sin(angle)
+        R0 = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float32)
+        # Rotated tet: apply R0 to canonical vertices
+        verts = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
+        verts_rot = verts @ R0.T  # (4,3)
+
+        positions = wp.array([wp.vec3(*v) for v in verts_rot], dtype=wp.vec3, device=device)
+        tet_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
+        # Dm_inv = I for canonical tet
+        Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+        rhs = wp.zeros(4, dtype=wp.vec3, device=device)
+
+        wp.launch(
+            project_stretching_arap_tet_kernel,
+            dim=1,
+            inputs=[positions, tet_indices, Dm_inv, weight],
+            outputs=[rhs],
+            device=device,
+        )
+        r = rhs.numpy()
+        # Momentum conservation: rhs[0] + rhs[1] + rhs[2] + rhs[3] = 0
+        total = r[0] + r[1] + r[2] + r[3]
+        np.testing.assert_allclose(total, [0.0, 0.0, 0.0], atol=1e-5)
+
+    def test_momentum_conservation_arbitrary_deformation(self):
+        """For any deformation, sum of rhs must be zero (momentum conservation)."""
+        from newton._src.solvers.fba.kernels import project_stretching_arap_tet_kernel  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        # Arbitrary (non-rest, non-rotated) positions
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1.3, 0.1, 0), wp.vec3(0.2, 1.2, 0.1), wp.vec3(0.1, 0.2, 1.1)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tet_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
+        weight = wp.array([2.0], dtype=wp.float32, device=device)
+        rhs = wp.zeros(4, dtype=wp.vec3, device=device)
+
+        wp.launch(
+            project_stretching_arap_tet_kernel,
+            dim=1,
+            inputs=[positions, tet_indices, Dm_inv, weight],
+            outputs=[rhs],
+            device=device,
+        )
+        r = rhs.numpy()
+        total = r[0] + r[1] + r[2] + r[3]
+        np.testing.assert_allclose(total, [0.0, 0.0, 0.0], atol=1e-5)
+
+
 if __name__ == "__main__":
     unittest.main()
