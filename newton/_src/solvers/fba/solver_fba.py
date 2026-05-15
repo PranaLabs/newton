@@ -16,14 +16,23 @@ class SolverFBA(SolverBase):
     """Fast But Accurate projective-dynamics cloth solver.
 
     Implements a Projective Dynamics (PD) local-global iteration for cloth
-    with isotropic ARAP stretching, isometric bending, and soft Pin
-    constraints. The PD Hessian is prefactored once via scipy SuperLU
-    (COLAMD ordering); the sparse inverse `S = L⁻¹` is computed exactly
-    using the elimination tree (ported from RealSim
+    with isotropic stretching (ARAP or corotational), isometric bending,
+    and soft Pin constraints. The PD Hessian is prefactored once via scipy
+    SuperLU (COLAMD ordering); the sparse inverse `S = L⁻¹` is computed
+    exactly using the elimination tree (ported from RealSim
     `LDLT_computeLowerInverse`) and uploaded to Warp BSR matrices. The
     runtime linear solve evaluates ``A⁻¹·b = Sᵀ · D⁻¹ · S · b`` via two
     GPU SpMVs per coordinate component, avoiding the inherently
     sequential GPU triangular solve.
+
+    Stretching models:
+
+    - ``"arap"`` — As-Rigid-As-Possible: projects deformation gradient to
+      the nearest rotation (singular values clamped to 1).  No Lamé
+      parameters needed; stiffness is fully encoded in ``tri_ke``.
+    - ``"corotational"`` — Corotational linear elasticity: closed-form 2x2
+      solve on singular values of F.  Requires ``mu`` and ``lam`` (first and
+      second Lame parameters [Pa]).
 
     Notes:
         - Float32 ``particle_q`` output: the interior linear solver
@@ -52,7 +61,9 @@ class SolverFBA(SolverBase):
         model: Model,
         iterations: int = 10,
         pin_stiffness: float = 1e12,
-        stretching_model: Literal["arap"] = "arap",
+        stretching_model: Literal["arap", "corotational"] = "arap",
+        mu: float | None = None,
+        lam: float | None = None,
     ) -> None:
         super().__init__(model)
 
@@ -61,8 +72,19 @@ class SolverFBA(SolverBase):
             raise ValueError("SolverFBA requires at least one particle")
         if model.tri_count == 0:
             raise ValueError("SolverFBA requires at least one cloth triangle")
-        if stretching_model != "arap":
-            raise NotImplementedError(f"stretching_model={stretching_model!r} not yet implemented (MVP: arap only)")
+        if stretching_model not in ("arap", "corotational"):
+            raise NotImplementedError(
+                f"stretching_model={stretching_model!r} not yet implemented; supported: 'arap', 'corotational'"
+            )
+        if stretching_model == "corotational":
+            if mu is None or lam is None:
+                raise ValueError(
+                    "stretching_model='corotational' requires both mu and lam (first and second Lamé parameters)"
+                )
+            if mu <= 0:
+                raise ValueError("mu must be positive")
+            if lam <= 0:
+                raise ValueError("lam must be positive")
         if pin_stiffness <= 0:
             raise ValueError("pin_stiffness must be positive")
         if iterations < 1:
@@ -71,6 +93,8 @@ class SolverFBA(SolverBase):
         self.iterations = int(iterations)
         self.pin_stiffness = float(pin_stiffness)
         self.stretching_model = stretching_model
+        self._mu = float(mu) if mu is not None else None
+        self._lam = float(lam) if lam is not None else None
 
         # PD setup is dt-dependent; we cache the assembly at a reference dt and
         # rebuild lazily inside `step` if the dt changes.
@@ -178,6 +202,7 @@ class SolverFBA(SolverBase):
             project_bending_kernel,
             project_pin_kernel,
             project_stretching_arap_kernel,
+            project_stretching_corotational_kernel,
             write_velocity_kernel,
             zero_vec3_kernel,
         )
@@ -230,18 +255,34 @@ class SolverFBA(SolverBase):
                     device=device,
                 )
             # Stretching projection.
-            wp.launch(
-                project_stretching_arap_kernel,
-                dim=model.tri_count,
-                inputs=[
-                    self._x_cur,
-                    self._tri_indices_d,
-                    self._tri_rest_inv_d,
-                    self._tri_weight_d,
-                ],
-                outputs=[self._rhs],
-                device=device,
-            )
+            if self.stretching_model == "arap":
+                wp.launch(
+                    project_stretching_arap_kernel,
+                    dim=model.tri_count,
+                    inputs=[
+                        self._x_cur,
+                        self._tri_indices_d,
+                        self._tri_rest_inv_d,
+                        self._tri_weight_d,
+                    ],
+                    outputs=[self._rhs],
+                    device=device,
+                )
+            elif self.stretching_model == "corotational":
+                wp.launch(
+                    project_stretching_corotational_kernel,
+                    dim=model.tri_count,
+                    inputs=[
+                        self._x_cur,
+                        self._tri_indices_d,
+                        self._tri_rest_inv_d,
+                        self._tri_weight_d,
+                        self._mu,
+                        self._lam,
+                    ],
+                    outputs=[self._rhs],
+                    device=device,
+                )
             # Bending projection.
             if self._edge_indices_d is not None:
                 wp.launch(
