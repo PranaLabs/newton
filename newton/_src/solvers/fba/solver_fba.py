@@ -30,12 +30,12 @@ class SolverFBA(SolverBase):
     - ``"arap"`` — As-Rigid-As-Possible: projects deformation gradient to
       the nearest rotation (singular values clamped to 1).  No Lamé
       parameters needed; stiffness is fully encoded in ``tri_ke``.
-    - ``"corotational"`` — Corotational linear elasticity: closed-form 2x2
-      solve on singular values of F.  Requires ``mu`` and ``lam`` (first and
-      second Lame parameters [Pa]).
+    - ``"corotational"`` — Corotational linear elasticity: closed-form solve
+      on singular values of F (2x2 for cloth, 3x3 Sherman-Morrison for tets).
+      Requires ``mu`` and ``lam`` (first and second Lame parameters [Pa]).
     - ``"neohookean"`` — Neo-Hookean hyperelasticity: 5-iteration Newton solve
-      on singular values of F.  Requires ``mu`` and ``lam`` (first and second
-      Lame parameters [Pa]).
+      on singular values of F (2x2 for cloth, 3x3 cofactor inverse for tets).
+      Requires ``mu`` and ``lam`` (first and second Lame parameters [Pa]).
 
     Notes:
         - Float32 ``particle_q`` output: the interior linear solver
@@ -229,7 +229,9 @@ class SolverFBA(SolverBase):
             project_stretching_arap_kernel,
             project_stretching_arap_tet_kernel,
             project_stretching_corotational_kernel,
+            project_stretching_corotational_tet_kernel,
             project_stretching_neohookean_kernel,
+            project_stretching_neohookean_tet_kernel,
             write_velocity_kernel,
             zero_vec3_kernel,
         )
@@ -355,10 +357,35 @@ class SolverFBA(SolverBase):
                         outputs=[self._rhs],
                         device=device,
                     )
-                elif self.stretching_model in ("corotational", "neohookean"):
-                    raise NotImplementedError(
-                        f"stretching_model={self.stretching_model!r} is not yet implemented for tets. "
-                        "Only 'arap' is supported for tetrahedral elements."
+                elif self.stretching_model == "corotational":
+                    wp.launch(
+                        project_stretching_corotational_tet_kernel,
+                        dim=model.tet_count,
+                        inputs=[
+                            self._x_cur,
+                            self._tet_indices_d,
+                            self._tet_rest_inv_d,
+                            self._tet_weight_d,
+                            self._mu,
+                            self._lam,
+                        ],
+                        outputs=[self._rhs],
+                        device=device,
+                    )
+                elif self.stretching_model == "neohookean":
+                    wp.launch(
+                        project_stretching_neohookean_tet_kernel,
+                        dim=model.tet_count,
+                        inputs=[
+                            self._x_cur,
+                            self._tet_indices_d,
+                            self._tet_rest_inv_d,
+                            self._tet_weight_d,
+                            self._mu,
+                            self._lam,
+                        ],
+                        outputs=[self._rhs],
+                        device=device,
                     )
             # Global linear solve: x_cur = A^-1 . rhs.
             self._linear_solver.solve(self._rhs, self._x_cur)

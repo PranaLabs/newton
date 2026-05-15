@@ -286,6 +286,347 @@ def project_stretching_arap_tet_kernel(
     wp.atomic_add(rhs, i3, row2)
 
 
+@wp.func
+def project_corotational_sigma3d(sigma: wp.vec3, mu: float, lam: float) -> wp.vec3:
+    """Closed-form 3D corotational local projection on SVD singular values.
+
+    Minimises E(s) = mu*||s-I||^2 + (lam/2)*tr(s-I)^2 + (k/2)*||s-s0||^2
+    with k = 2*mu (PD penalty weight), I = (1,1,1) identity singular values.
+
+    Setting grad_E = 0 yields the 3x3 linear system (4*mu*I + lam*11^T)*s = b,
+    solved in closed form via Sherman-Morrison:
+
+        alpha = 4*mu,  beta = lam,  n = 3
+        inv(alpha*I + beta*11^T) = (1/alpha)*I - beta/(alpha*(alpha + n*beta))*11^T
+        b_i = 2*mu + 3*lam + 2*mu*s0_i
+        sum_b = 6*mu + 9*lam + 2*mu*(s0[0]+s0[1]+s0[2])
+        s_proj[i] = b_i/alpha - beta*sum_b / (alpha*(alpha + 3*beta))
+
+    Note: uses the standard symmetric trace formula (NOT mimicking RealSim's
+    Eigen .trace() bug on Vector2d which only reads index 0). The 2D cloth
+    Corot in this codebase uses the same standard formulation; this 3D tet
+    Corot is the natural 3D extension of the same energy.
+
+    See ``docs/superpowers/specs/2026-05-15-fba-corot-realsim-discrepancy.md``
+    for details on the RealSim Eigen .trace() discrepancy (applies to both 2D
+    cloth and 3D tet corotational).
+
+    Args:
+        sigma: Singular values from ``wp.svd3(F)``, shape (3,), in descending order.
+        mu: First Lame parameter (shear modulus) [Pa].
+        lam: Second Lame parameter [Pa].
+
+    Returns:
+        Projected singular-value triple ``(s_proj_0, s_proj_1, s_proj_2)``.
+    """
+    k = 2.0 * mu  # PD penalty weight
+    alpha = 4.0 * mu  # diagonal of system matrix (2*mu + lam + k = 4*mu + lam) minus lam*11^T rank-1 part
+    beta = lam
+    n = 3.0
+
+    b0 = 2.0 * mu + 3.0 * lam + k * sigma[0]
+    b1 = 2.0 * mu + 3.0 * lam + k * sigma[1]
+    b2 = 2.0 * mu + 3.0 * lam + k * sigma[2]
+    sum_b = b0 + b1 + b2
+
+    scale = beta * sum_b / (alpha * (alpha + n * beta))
+    proj0 = b0 / alpha - scale
+    proj1 = b1 / alpha - scale
+    proj2 = b2 / alpha - scale
+    return wp.vec3(proj0, proj1, proj2)
+
+
+@wp.kernel
+def project_stretching_corotational_tet_kernel(
+    positions: wp.array[wp.vec3],
+    tet_indices: wp.array[wp.int32],  # flat shape (4*T,)
+    tet_rest_inv: wp.array[wp.mat33],
+    tet_weight: wp.array[wp.float32],
+    mu: float,
+    lam: float,
+    # output (atomic accumulator)
+    rhs: wp.array[wp.vec3],
+):
+    """Per-tet corotational local projection scatter for PD softbody.
+
+    Computes F = Ds * Dm_inv (3x3), extracts singular values via ``wp.svd3``,
+    applies the closed-form 3D corotational projection to get ``sigma_proj``,
+    reconstructs ``P = U * diag(sigma_proj) * Vt``, and scatters
+    ``w * Dm_inv * P^T`` into the four stencil vertices via atomic_add.
+
+    No reflection handling is needed: ``wp.svd3`` returns non-negative singular
+    values and the corotational projection preserves positivity; the
+    reconstructed P naturally has the correct orientation.
+
+    Args:
+        positions: Current particle positions [m], shape ``[particle_count]``.
+        tet_indices: Flat tet indices, shape ``[4 * tet_count]``.
+        tet_rest_inv: Per-tet 3x3 rest-pose inverse (Dm_inv), shape ``[tet_count]``.
+        tet_weight: Per-tet weight (2*mu * volume), shape ``[tet_count]``.
+        mu: First Lamé parameter [Pa].
+        lam: Second Lamé parameter [Pa].
+        rhs: Output RHS accumulator (atomic-add target), shape ``[particle_count]``.
+    """
+    t = wp.tid()
+    i0 = tet_indices[4 * t + 0]
+    i1 = tet_indices[4 * t + 1]
+    i2 = tet_indices[4 * t + 2]
+    i3 = tet_indices[4 * t + 3]
+
+    p0 = positions[i0]
+    p1 = positions[i1]
+    p2 = positions[i2]
+    p3 = positions[i3]
+
+    # Ds = [p1-p0 | p2-p0 | p3-p0]  (column-stack 3 edge vectors -> 3x3)
+    e1 = p1 - p0
+    e2 = p2 - p0
+    e3 = p3 - p0
+    Ds = wp.mat33(
+        e1[0],
+        e2[0],
+        e3[0],
+        e1[1],
+        e2[1],
+        e3[1],
+        e1[2],
+        e2[2],
+        e3[2],
+    )
+    Dm_inv = tet_rest_inv[t]
+    F = Ds * Dm_inv
+
+    U, sigma, V = wp.svd3(F)
+
+    # Corotational projection: closed-form 3D solve on singular values.
+    sigma_proj = project_corotational_sigma3d(wp.vec3(sigma[0], sigma[1], sigma[2]), mu, lam)
+
+    # Reconstruct P = U * diag(sigma_proj) * V^T  (3x3).
+    # P = (U * diag(s)) * V^T
+    s0 = sigma_proj[0]
+    s1 = sigma_proj[1]
+    s2 = sigma_proj[2]
+    US = wp.mat33(
+        U[0, 0] * s0,
+        U[0, 1] * s1,
+        U[0, 2] * s2,
+        U[1, 0] * s0,
+        U[1, 1] * s1,
+        U[1, 2] * s2,
+        U[2, 0] * s0,
+        U[2, 1] * s1,
+        U[2, 2] * s2,
+    )
+    P = US * wp.transpose(V)
+
+    # proj = w * Dm_inv * P^T  (3x3)
+    w = tet_weight[t]
+    PT = wp.transpose(P)
+    proj = w * (Dm_inv * PT)
+
+    # Scatter stencil (RealSim PDTetrahedronEnergy.cpp:191-194):
+    #   rhs[t[0]] += -proj.row(0) - proj.row(1) - proj.row(2)
+    #   rhs[t[1]] += proj.row(0)
+    #   rhs[t[2]] += proj.row(1)
+    #   rhs[t[3]] += proj.row(2)
+    row0 = wp.vec3(proj[0, 0], proj[0, 1], proj[0, 2])
+    row1 = wp.vec3(proj[1, 0], proj[1, 1], proj[1, 2])
+    row2 = wp.vec3(proj[2, 0], proj[2, 1], proj[2, 2])
+    wp.atomic_add(rhs, i0, -(row0 + row1 + row2))
+    wp.atomic_add(rhs, i1, row0)
+    wp.atomic_add(rhs, i2, row1)
+    wp.atomic_add(rhs, i3, row2)
+
+
+@wp.func
+def project_neohookean_sigma3d(sigma: wp.vec3, mu: float, lam: float) -> wp.vec3:
+    """Project SVD singular values to 3D Neo-Hookean PD equilibrium via 5 Newton iterations.
+
+    Solves: min_{s}  E_NH(s) + (k/2)*||s - s0||^2
+    where k = 2*mu (PD penalty weight) and
+    E_NH(s) = (mu/2)*(I1 - 2*log(J) - 3) + (lam/2)*log(J)^2
+    with I1 = s0^2 + s1^2 + s2^2, J = s0*s1*s2.
+
+    Matches RealSim NHProjectionProblem3D::energy_density (using log_I3 = 2*log(J),
+    so 0.125*lam*log_I3^2 = (lam/2)*log^2(J)). Sign verified against RealSim reference.
+
+    Gradient:
+        grad_i = mu*(s_i - 1/s_i) + lam*log(J)/s_i + k*(s_i - s0_i)
+
+    Hessian (symmetric 3x3):
+        diag_factor = mu + lam - lam*log(J)
+        H_ii = mu + diag_factor/s_i^2 + k
+        H_ij = lam/(s_i*s_j)  for i != j
+
+    Solved via closed-form 3x3 inverse (cofactor matrix / determinant).
+    5 fixed Newton iterations. Clamp s > 1e-6 each iteration.
+
+    Args:
+        sigma: Singular values from ``wp.svd3(F)``, shape (3,), in descending order.
+        mu: First Lame parameter (shear modulus) [Pa].
+        lam: Second Lame parameter [Pa].
+
+    Returns:
+        Projected sigma triple suitable for reconstructing P = U diag(sigma) V^T.
+    """
+    eps = 1.0e-6
+    k = 2.0 * mu
+
+    # Initialize Newton iterate from SVD singular values; store initial sigma_0 for penalty.
+    s0 = wp.max(sigma[0], eps)
+    s1 = wp.max(sigma[1], eps)
+    s2 = wp.max(sigma[2], eps)
+    sigma0_0 = s0
+    sigma0_1 = s1
+    sigma0_2 = s2
+
+    for _i in range(5):
+        # Clamp before computing log/inv.
+        s0 = wp.max(s0, eps)
+        s1 = wp.max(s1, eps)
+        s2 = wp.max(s2, eps)
+
+        J = s0 * s1 * s2
+        log_J = wp.log(J)
+        inv0 = 1.0 / s0
+        inv1 = 1.0 / s1
+        inv2 = 1.0 / s2
+
+        # Gradient.
+        g0 = mu * (s0 - inv0) + lam * log_J * inv0 + k * (s0 - sigma0_0)
+        g1 = mu * (s1 - inv1) + lam * log_J * inv1 + k * (s1 - sigma0_1)
+        g2 = mu * (s2 - inv2) + lam * log_J * inv2 + k * (s2 - sigma0_2)
+
+        # Hessian diagonal factor.
+        diag_factor = mu + lam - lam * log_J
+        H00 = mu + diag_factor * inv0 * inv0 + k
+        H11 = mu + diag_factor * inv1 * inv1 + k
+        H22 = mu + diag_factor * inv2 * inv2 + k
+        H01 = lam * inv0 * inv1
+        H02 = lam * inv0 * inv2
+        H12 = lam * inv1 * inv2
+
+        # Closed-form 3x3 inverse via cofactors.
+        C00 = H11 * H22 - H12 * H12
+        C11 = H00 * H22 - H02 * H02
+        C22 = H00 * H11 - H01 * H01
+        C01 = -(H01 * H22 - H12 * H02)
+        C02 = H01 * H12 - H11 * H02
+        C12 = -(H00 * H12 - H01 * H02)
+
+        det_H = H00 * C00 + H01 * C01 + H02 * C02
+
+        dx0 = (C00 * g0 + C01 * g1 + C02 * g2) / det_H
+        dx1 = (C01 * g0 + C11 * g1 + C12 * g2) / det_H
+        dx2 = (C02 * g0 + C12 * g1 + C22 * g2) / det_H
+
+        s0 = s0 - dx0
+        s1 = s1 - dx1
+        s2 = s2 - dx2
+
+    s0 = wp.max(s0, eps)
+    s1 = wp.max(s1, eps)
+    s2 = wp.max(s2, eps)
+    return wp.vec3(s0, s1, s2)
+
+
+@wp.kernel
+def project_stretching_neohookean_tet_kernel(
+    positions: wp.array[wp.vec3],
+    tet_indices: wp.array[wp.int32],  # flat shape (4*T,)
+    tet_rest_inv: wp.array[wp.mat33],
+    tet_weight: wp.array[wp.float32],
+    mu: float,
+    lam: float,
+    # output (atomic accumulator)
+    rhs: wp.array[wp.vec3],
+):
+    """Per-tet Neo-Hookean local projection scatter for PD softbody.
+
+    Computes F = Ds * Dm_inv (3x3), extracts singular values via ``wp.svd3``,
+    applies 5-iteration Newton solve of the 3D Neo-Hookean PD projection to get
+    ``sigma_proj``, reconstructs ``P = U * diag(sigma_proj) * Vt``, and scatters
+    ``w * Dm_inv * P^T`` into the four stencil vertices via atomic_add.
+
+    No reflection handling is needed: ``wp.svd3`` returns non-negative singular
+    values and the NH projection preserves positivity; the reconstructed P
+    naturally has the correct orientation.
+
+    Args:
+        positions: Current particle positions [m], shape ``[particle_count]``.
+        tet_indices: Flat tet indices, shape ``[4 * tet_count]``.
+        tet_rest_inv: Per-tet 3x3 rest-pose inverse (Dm_inv), shape ``[tet_count]``.
+        tet_weight: Per-tet weight (2*mu * volume), shape ``[tet_count]``.
+        mu: First Lamé parameter [Pa].
+        lam: Second Lamé parameter [Pa].
+        rhs: Output RHS accumulator (atomic-add target), shape ``[particle_count]``.
+    """
+    t = wp.tid()
+    i0 = tet_indices[4 * t + 0]
+    i1 = tet_indices[4 * t + 1]
+    i2 = tet_indices[4 * t + 2]
+    i3 = tet_indices[4 * t + 3]
+
+    p0 = positions[i0]
+    p1 = positions[i1]
+    p2 = positions[i2]
+    p3 = positions[i3]
+
+    # Ds = [p1-p0 | p2-p0 | p3-p0]  (column-stack 3 edge vectors -> 3x3)
+    e1 = p1 - p0
+    e2 = p2 - p0
+    e3 = p3 - p0
+    Ds = wp.mat33(
+        e1[0],
+        e2[0],
+        e3[0],
+        e1[1],
+        e2[1],
+        e3[1],
+        e1[2],
+        e2[2],
+        e3[2],
+    )
+    Dm_inv = tet_rest_inv[t]
+    F = Ds * Dm_inv
+
+    U, sigma, V = wp.svd3(F)
+
+    # Neo-Hookean projection: 5-iter Newton solve on singular values.
+    sigma_proj = project_neohookean_sigma3d(wp.vec3(sigma[0], sigma[1], sigma[2]), mu, lam)
+
+    # Reconstruct P = U * diag(sigma_proj) * V^T  (3x3).
+    s0 = sigma_proj[0]
+    s1 = sigma_proj[1]
+    s2 = sigma_proj[2]
+    US = wp.mat33(
+        U[0, 0] * s0,
+        U[0, 1] * s1,
+        U[0, 2] * s2,
+        U[1, 0] * s0,
+        U[1, 1] * s1,
+        U[1, 2] * s2,
+        U[2, 0] * s0,
+        U[2, 1] * s1,
+        U[2, 2] * s2,
+    )
+    P = US * wp.transpose(V)
+
+    # proj = w * Dm_inv * P^T  (3x3)
+    w = tet_weight[t]
+    PT = wp.transpose(P)
+    proj = w * (Dm_inv * PT)
+
+    # Scatter stencil.
+    row0 = wp.vec3(proj[0, 0], proj[0, 1], proj[0, 2])
+    row1 = wp.vec3(proj[1, 0], proj[1, 1], proj[1, 2])
+    row2 = wp.vec3(proj[2, 0], proj[2, 1], proj[2, 2])
+    wp.atomic_add(rhs, i0, -(row0 + row1 + row2))
+    wp.atomic_add(rhs, i1, row0)
+    wp.atomic_add(rhs, i2, row1)
+    wp.atomic_add(rhs, i3, row2)
+
+
 @wp.kernel
 def project_stretching_arap_kernel(
     positions: wp.array[wp.vec3],
