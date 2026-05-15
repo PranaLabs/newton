@@ -1185,5 +1185,163 @@ class TestFBARealSimAgreement(unittest.TestCase):
         )
 
 
+class TestCorotationalProjection(unittest.TestCase):
+    """Tests for the corotational stretching local projection kernel."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _make_unit_triangle(self):
+        """Return positions, Dm_inv=I₂, weight=1 for an axis-aligned triangle at rest."""
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0, 0, 1)],
+            dtype=wp.vec3,
+            device="cuda:0" if wp.is_cuda_available() else "cpu",
+        )
+        tri_indices = wp.array([0, 1, 2], dtype=wp.int32, device=positions.device)
+        Dm_inv = wp.array([wp.mat22(1.0, 0.0, 0.0, 1.0)], dtype=wp.mat22, device=positions.device)
+        weight = wp.array([1.0], dtype=wp.float32, device=positions.device)
+        return positions, tri_indices, Dm_inv, weight
+
+    def test_rest_configuration_F_equals_I_projects_to_I(self):
+        """At rest (F~=I in the local frame), sigma=1 and the corot projection should
+        return sigma_proj=1 as well -- the gradient of the energy is zero there.
+
+        Verify scatter output matches the ARAP-at-identity case:
+            rhs[1] == (1, 0, 0); rhs[2] == (0, 0, 1); rhs[0] == -(rhs[1]+rhs[2]).
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_corotational_kernel  # noqa: PLC0415
+
+        positions, tri_indices, Dm_inv, weight = self._make_unit_triangle()
+        device = positions.device
+        rhs = wp.zeros(3, dtype=wp.vec3, device=device)
+
+        mu, lam = 1.0, 0.5
+        wp.launch(
+            project_stretching_corotational_kernel,
+            dim=1,
+            inputs=[positions, tri_indices, Dm_inv, weight, mu, lam],
+            outputs=[rhs],
+            device=device,
+        )
+        r = rhs.numpy()
+        # At rest sigma=1: corot energy has zero gradient, projection maps to 1.
+        # P = U*diag(1,1)*Vt = I (embedding), identical to ARAP at rest.
+        np.testing.assert_allclose(r[1], [1.0, 0.0, 0.0], atol=1e-5)
+        np.testing.assert_allclose(r[2], [0.0, 0.0, 1.0], atol=1e-5)
+        np.testing.assert_allclose(r[0], -(r[1] + r[2]), atol=1e-5)
+
+    def test_isotropic_stretch_pulls_sigma_back(self):
+        """s0 = (1.5, 1.5) with mu=1, lam=0.5: closed-form gives sigma_proj = (1.2, 1.2).
+
+        Analytical derivation:
+            k = 2*mu = 2, M = 4*mu+lam = 4.5, det = M^2-lam^2 = 20.
+            b = 2*(mu+lam) + k*s0 = 3 + 3 = 6 (same for both).
+            sigma_proj = (M*b - lam*b)/det = (4.5*6 - 0.5*6)/20 = 24/20 = 1.2.
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_corotational_kernel  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        # Scale current positions by 1.5 to get isotropic stretch F = 1.5·I.
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1.5, 0, 0), wp.vec3(0, 0, 1.5)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tri_indices = wp.array([0, 1, 2], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat22(1.0, 0.0, 0.0, 1.0)], dtype=wp.mat22, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+        rhs = wp.zeros(3, dtype=wp.vec3, device=device)
+
+        mu, lam = 1.0, 0.5
+        wp.launch(
+            project_stretching_corotational_kernel,
+            dim=1,
+            inputs=[positions, tri_indices, Dm_inv, weight, mu, lam],
+            outputs=[rhs],
+            device=device,
+        )
+        r = rhs.numpy()
+
+        # For isotropic stretch by 1.5 with Dm_inv=I: F=1.5*I, U=V=I.
+        # P = U*diag(1.2,1.2)*Vt = 1.2*I (the 3x2 embedding scaled by 1.2).
+        # Scatter: row0 = Dm_inv[0,:]*Pt*w = (1.2, 0, 0); row1 = (0, 0, 1.2).
+        np.testing.assert_allclose(r[1], [1.2, 0.0, 0.0], atol=1e-5)
+        np.testing.assert_allclose(r[2], [0.0, 0.0, 1.2], atol=1e-5)
+        np.testing.assert_allclose(r[0], -(r[1] + r[2]), atol=1e-5)
+
+    def test_solver_corotational_runs_no_nan(self):
+        """Full SolverFBA step with stretching_model='corotational', small cloth, 50 steps."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 2, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=8,
+            dim_y=8,
+            cell_x=0.05,
+            cell_y=0.05,
+            mass=0.1,
+            tri_ke=7142.857,  # 2μ with μ≈3571
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.1,
+            edge_kd=0.0,
+            fix_left=False,
+        )
+        # Pin top-left and top-right corners.
+        top_left = 8 * (8 + 1)
+        top_right = 8 * (8 + 1) + 8
+        builder.particle_mass[top_left] = 0.0
+        builder.particle_mass[top_right] = 0.0
+        model = builder.finalize()
+
+        mu, lam = 3571.0, 4286.0
+        solver = SolverFBA(model, iterations=8, stretching_model="corotational", mu=mu, lam=lam)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+        for _ in range(50):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite values in corotational simulation")
+
+    def test_solver_init_requires_mu_lam_for_corot(self):
+        """SolverFBA with stretching_model='corotational' and no mu/lam raises ValueError."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=1.0e2,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+            fix_left=True,
+        )
+        model = builder.finalize()
+
+        with self.assertRaises(ValueError):
+            SolverFBA(model, stretching_model="corotational")  # missing mu and lam
+
+        with self.assertRaises(ValueError):
+            SolverFBA(model, stretching_model="corotational", mu=1000.0)  # missing lam
+
+        with self.assertRaises(ValueError):
+            SolverFBA(model, stretching_model="corotational", lam=1000.0)  # missing mu
+
+
 if __name__ == "__main__":
     unittest.main()
