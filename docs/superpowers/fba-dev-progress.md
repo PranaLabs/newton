@@ -17,7 +17,7 @@ Live tracker for the Newton port of RealSim's "Fast But Accurate" projective-dyn
 | **Numerical RealSim cross-check** | ✅ Done | Root cause: gravity-pin skip in `compute_inertial_kernel`; fix + fixture + test committed; max L2 residual 5.99 µm at step 48 |
 | Contact / collision (plane / primitives + CCD/DCD) | ⬜ Not started | Largest remaining feature gap |
 | Softbody (PDTetrahedronEnergy) | ⬜ Not started | Builder + new project_tet kernel |
-| Material model extensions (Corotational / Neo-Hookean / StVK) | 🚧 In progress | Corot done; NH next |
+| Material model extensions (Corotational / Neo-Hookean / StVK) | ✅ Done | Corot + NH done; max L2 residual 9.46 µm at frame 48 for NH cross-check |
 | Differentiability via `wp.Tape()` | ⬜ Not started | Forward path probably already grad-friendly |
 | Performance: `compute_lower_inverse` accel | ✅ Done | Warp per-column kernel + vectorized pattern build; N=10K setup: ~16 min → 1.0 s (RTX 5090) |
 | Upstream PR prep (split, squash, strip docs/superpowers/) | ⬜ Not started | After feature parity |
@@ -60,10 +60,13 @@ Live tracker for the Newton port of RealSim's "Fast But Accurate" projective-dyn
 | `94a9ec04` | Fix pre-commit lint warnings (PLW2901, RUF012, typos allowlist) |
 | `c89c85aa` | Accelerate FBA setup: Warp per-column kernel + vectorized NumPy assembly |
 | `67eec2ed` | (perf-optimization commit — HEAD before Corot work) |
+| `6d7b13cf` | Add project_neohookean_sigma + project_stretching_neohookean_kernel |
+| `0bd6b078` | Wire neohookean dispatch in SolverFBA |
+| `c9e50b74` | Add Neo-Hookean tests and RealSim NH cross-check fixture |
 
 ## In progress
 
-- **Material models** — Corotational stretching kernel + SolverFBA dispatch + tests committed; Neo-Hookean next.
+- **Contact + collision** — next priority after material model parity.
 
 ## Backlog (ordered)
 
@@ -78,7 +81,7 @@ Live tracker for the Newton port of RealSim's "Fast But Accurate" projective-dyn
 
 - ~~`compute_lower_inverse`: ~6 s for N=2.5K, ~40 s for N=10K (pure Python).~~ Fixed: now <1.5 s up to N=10K via Warp per-column kernel.
 - Position output is float32 (vec3 type); interior solve is float64. Precision floor ~1e-7 m. Documented.
-- `stretching_model` must be `"arap"`; other values raise `NotImplementedError`. By design — extension hook ready.
+- ~~`stretching_model` must be `"arap"`.~~ Now supports `"arap"`, `"corotational"`, and `"neohookean"`.
 - `update_contacts` raises. No contact yet.
 - Free cloth (no pinned particles) works numerically but may produce COLAMD orderings with reduced numerical conditioning; flagged in code reviews, no observed failure on tested sizes.
 
