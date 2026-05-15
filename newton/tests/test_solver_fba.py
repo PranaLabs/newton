@@ -816,7 +816,7 @@ class TestSolverFBAReconfigure(unittest.TestCase):
         return builder.finalize()
 
     def test_dt_change_triggers_resetup(self):
-        from newton.solvers import SolverFBA
+        from newton.solvers import SolverFBA  # noqa: PLC0415
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
         builder.add_cloth_grid(
@@ -855,7 +855,7 @@ class TestSolverFBAReconfigure(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(q)))
 
     def test_same_dt_no_resetup(self):
-        from newton.solvers import SolverFBA
+        from newton.solvers import SolverFBA  # noqa: PLC0415
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
         builder.add_cloth_grid(
@@ -887,8 +887,8 @@ class TestSolverFBAReconfigure(unittest.TestCase):
         self.assertIs(linsolver_a, linsolver_b, "linear solver should not rebuild when dt unchanged")
 
     def test_notify_shape_properties_forces_resetup(self):
-        from newton._src.solvers import SolverNotifyFlags
-        from newton.solvers import SolverFBA
+        from newton._src.solvers import SolverNotifyFlags  # noqa: PLC0415
+        from newton.solvers import SolverFBA  # noqa: PLC0415
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
         builder.add_cloth_grid(
@@ -928,8 +928,8 @@ class TestSolverFBAReconfigure(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(q)))
 
     def test_notify_unrelated_flag_no_resetup(self):
-        from newton._src.solvers import SolverNotifyFlags
-        from newton.solvers import SolverFBA
+        from newton._src.solvers import SolverNotifyFlags  # noqa: PLC0415
+        from newton.solvers import SolverFBA  # noqa: PLC0415
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
         builder.add_cloth_grid(
