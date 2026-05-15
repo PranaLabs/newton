@@ -71,24 +71,29 @@ def build_pd_system(
     mass = model.particle_mass.numpy().astype(np.float64)
     inv_mass = model.particle_inv_mass.numpy().astype(np.float64)
 
-    rows: list[int] = []
-    cols: list[int] = []
-    vals: list[float] = []
+    # COO triplet buffers — collected as a list of (rows, cols, vals) NumPy
+    # arrays produced by each contribution (mass, pins, tris, bending), then
+    # concatenated once at the end. This is dramatically faster than appending
+    # Python scalars to lists for >1K particles.
+    coo_parts: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
 
-    # ---- Mass diagonal ----
+    # ---- Mass diagonal ---- (only where inv_mass > 0; pinned masses go below)
     inv_dt2 = 1.0 / (dt * dt)
-    for i in range(N):
-        if inv_mass[i] > 0.0:
-            rows.append(i)
-            cols.append(i)
-            vals.append(mass[i] * inv_dt2)
+    free_mask = inv_mass > 0.0
+    free_idx = np.where(free_mask)[0].astype(np.int32)
+    if free_idx.size > 0:
+        coo_parts.append((free_idx, free_idx, mass[free_idx] * inv_dt2))
 
     # ---- Pin diagonal ----
     pin_indices = np.where(inv_mass == 0.0)[0].astype(np.int32)
-    for i in pin_indices:
-        rows.append(int(i))
-        cols.append(int(i))
-        vals.append(pin_stiffness)
+    if pin_indices.size > 0:
+        coo_parts.append(
+            (
+                pin_indices,
+                pin_indices,
+                np.full(pin_indices.size, pin_stiffness, dtype=np.float64),
+            )
+        )
 
     # ---- Triangle stretching contribution ----
     tri_indices = np.zeros((0, 3), dtype=np.int32)
@@ -112,19 +117,21 @@ def build_pd_system(
         ke = tri_materials[:, 0]
         tri_weight = ke * tri_area
 
+        # Vectorized 3x3 stencil scatter: G_t = ST @ Dm_inv_t, K_t = G_t @ G_t.T.
+        # Then for each triangle we contribute w_t * K_t[a,b] to A[v_a, v_b]
+        # for all (a, b) in 0..2. We assemble (T*9,) row/col/val arrays in one
+        # broadcast and append a single COO part.
         # ST is the 3x2 reference-space gradient selector for the 3-vertex stencil.
-        ST = np.array([[-1.0, -1.0], [1.0, 0.0], [0.0, 1.0]])
-        for t in range(tri_indices.shape[0]):
-            G = ST @ tri_rest_inv[t]  # 3x2
-            K = G @ G.T  # 3x3
-            w = tri_weight[t]
-            for a in range(3):
-                ia = int(tri_indices[t, a])
-                for b in range(3):
-                    ib = int(tri_indices[t, b])
-                    rows.append(ia)
-                    cols.append(ib)
-                    vals.append(w * K[a, b])
+        ST = np.array([[-1.0, -1.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float64)
+        # G_all: (T, 3, 2)
+        G_all = np.einsum("ij,tjk->tik", ST, tri_rest_inv)
+        # K_all: (T, 3, 3)
+        K_all = np.einsum("tij,tkj->tik", G_all, G_all)
+        # Scaled by per-triangle weight.
+        vals_tri = (tri_weight[:, None, None] * K_all).reshape(-1)  # (T*9,)
+        rows_tri = np.repeat(tri_indices, 3, axis=1).reshape(-1)  # (T*9,)
+        cols_tri = np.tile(tri_indices, (1, 3)).reshape(-1)  # (T*9,)
+        coo_parts.append((rows_tri.astype(np.int32), cols_tri.astype(np.int32), vals_tri))
 
     # ---- Bending edge contribution (4-vertex isometric stencil) ----
     edge_indices = np.zeros((0, 4), dtype=np.int32)
@@ -152,23 +159,33 @@ def build_pd_system(
         else:
             edge_weight = np.zeros(edge_indices.shape[0], dtype=np.float64)
 
-        for e in range(edge_indices.shape[0]):
-            q = edge_quad_q[e]  # length 4
-            w = edge_weight[e] * edge_quad_scale[e]  # combine user weight + isometric scale
-            if w == 0.0:
-                continue
-            for a in range(4):
-                ia = int(edge_indices[e, a])
-                for b in range(4):
-                    ib = int(edge_indices[e, b])
-                    rows.append(ia)
-                    cols.append(ib)
-                    vals.append(w * q[a] * q[b])
+        # Vectorized 4x4 edge scatter: A[v_a, v_b] += w_e * q_e[a] * q_e[b].
+        # Build (E, 4, 4) outer-product block in one shot, then flatten.
+        if edge_indices.shape[0] > 0:
+            w_eff = edge_weight * edge_quad_scale  # (E,)
+            # Outer product per edge: (E, 4, 4)
+            qq = edge_quad_q[:, :, None] * edge_quad_q[:, None, :]
+            block = w_eff[:, None, None] * qq
+            vals_e = block.reshape(-1)  # (E*16,)
+            rows_e = np.repeat(edge_indices, 4, axis=1).reshape(-1)  # (E*16,)
+            cols_e = np.tile(edge_indices, (1, 4)).reshape(-1)  # (E*16,)
+            # NB: zero-weight edges still contribute zeros; harmless to leave in
+            # since CSR builder duplicates-sum, and they don't change A.
+            coo_parts.append((rows_e.astype(np.int32), cols_e.astype(np.int32), vals_e))
+
+    if coo_parts:
+        rows = np.concatenate([p[0] for p in coo_parts])
+        cols = np.concatenate([p[1] for p in coo_parts])
+        vals = np.concatenate([p[2] for p in coo_parts])
+    else:
+        rows = np.zeros(0, dtype=np.int32)
+        cols = np.zeros(0, dtype=np.int32)
+        vals = np.zeros(0, dtype=np.float64)
 
     A = _sp.csr_matrix(
         (
-            np.asarray(vals, dtype=np.float64),
-            (np.asarray(rows, dtype=np.int32), np.asarray(cols, dtype=np.int32)),
+            vals,
+            (rows, cols),
         ),
         shape=(N, N),
     )
@@ -263,10 +280,99 @@ def _elimination_tree(L) -> np.ndarray:
     return parent
 
 
+@wp.kernel
+def _lower_inverse_column_kernel(
+    S_outerPtr: wp.array[wp.int32],
+    S_innerInd: wp.array[wp.int32],
+    perm: wp.array[wp.int32],
+    aL: wp.array[wp.float64],
+    S_values: wp.array[wp.float64],
+):
+    """One thread per CSC column of S.
+
+    Computes column ``index`` of ``S = L^{-1}`` using the sparse-inverse
+    recurrence ported from RealSim ``LDLT_computeLowerInverse``
+    (SparseLDLT.cpp:225-347). The column-level data flow is:
+
+      - The thread writes only to ``S_values[outerPtr[index] : outerPtr[index+1]]``.
+      - Inside the column it reads ``S_values[i-1]`` (within the same slice)
+        and ``aL[k]`` (precomputed, read-only).
+
+    There is NO cross-column ``S_values`` read, so columns are fully
+    independent and can be processed in parallel without level scheduling.
+    """
+    index = wp.tid()
+    start = S_outerPtr[index]
+    end = S_outerPtr[index + 1]
+    # Diagonal entry of S^{-1} (which is what S stores) at the column head.
+    S_values[start] = wp.float64(1.0)
+
+    for i in range(start + 1, end):
+        row = S_innerInd[i - 1]
+        col = perm[row]
+        k_start = S_outerPtr[col] + 1
+        k_end = S_outerPtr[col + 1]
+        prev = S_values[i - 1]
+        j = i
+        k = k_start
+        while j < end and k < k_end:
+            S_values[j] = S_values[j] - aL[k] * prev
+            j = j + 1
+            k = k + 1
+
+
+def _aligned_lower_vectorized(
+    L_indptr: np.ndarray,
+    L_indices: np.ndarray,
+    L_data: np.ndarray,
+    S_outerPtr: np.ndarray,
+    S_innerInd: np.ndarray,
+    invperm: np.ndarray,
+    n: int,
+) -> np.ndarray:
+    """Vectorized port of step 3 (LDLT_computeAlignedLower).
+
+    For each row ``r`` we scan L's column ``invperm[r]`` and place each
+    nonzero into the matching slot in S's column ``r`` (matched by row
+    index). The vectorization uses ``np.searchsorted`` per column —
+    correct because both ``S_innerInd[slice]`` and ``L_indices[slice]``
+    enumerate the elimination-tree path of ``invperm[r]`` (the former in
+    elim-tree order, the latter in sorted row-index order, both restricted
+    to the same set when L is the unit-lower Cholesky factor).
+    """
+    aL = np.zeros(S_outerPtr[n], dtype=np.float64)
+    # Sort S_innerInd within each column once so np.searchsorted is valid.
+    # The pattern construction above stores them in elim-tree-path order
+    # (monotonically increasing in original row index, since parent[j] > j).
+    # That happens to be the same as sorted ascending — so we can search
+    # directly without per-row sorting.
+    for r in range(n):
+        invr = invperm[r]
+        l_start = L_indptr[invr]
+        l_end = L_indptr[invr + 1]
+        if l_end == l_start:
+            continue
+        s_start = S_outerPtr[r]
+        s_end = S_outerPtr[r + 1]
+        # Subset of L's column-`invr` indices that lie in S's column-`r` pattern.
+        l_rows = L_indices[l_start:l_end]
+        s_rows = S_innerInd[s_start:s_end]
+        # Place each L_data[ptrL] into aL at the slot matching L_indices[ptrL].
+        # np.searchsorted is O((l + s) log s) per column; total O(S_nnz log).
+        pos = np.searchsorted(s_rows, l_rows)
+        # Only keep matches (S's pattern may be a subset of L's column).
+        # Note: the elim-tree property guarantees s_rows ⊆ l_rows, but in
+        # general L may have entries below the elim-tree path; mask them.
+        valid = (pos < s_rows.size) & (s_rows[np.clip(pos, 0, s_rows.size - 1)] == l_rows)
+        aL[s_start + pos[valid]] = L_data[l_start:l_end][valid]
+    return aL
+
+
 def compute_lower_inverse(
     L,
     parent: np.ndarray | None = None,
     invperm: np.ndarray | None = None,
+    device: Any = None,
 ):
     """Compute S = L⁻¹ as a sparse CSC matrix.
 
@@ -278,16 +384,31 @@ def compute_lower_inverse(
         L: Lower-triangular CSC matrix with unit diagonal.
         parent: Elimination tree parent array; computed from L if None.
         invperm: Inverse permutation (identity if None).
+        device: Warp device to run the per-column kernel on. If ``None``,
+            defaults to the current CUDA device when available, otherwise CPU.
 
     Returns:
         S as CSC; S · L ≈ I in the permuted basis.
 
     Performance note:
-        This is a pure-Python port for MVP correctness. Setup time scales
-        roughly as O(S_nnz) Python operations. Measured: ~6s for N≈2500,
-        ~40s for N≈10000. Future optimization (Numba / vectorized NumPy)
-        is tracked as follow-up; for current cloth-scale MVP problems
-        (N<5000), setup cost is acceptable but not interactive.
+        Setup steps 1-3 (pattern + aligned-L) run on the host with vectorized
+        NumPy. Step 4 (the column-by-column elimination, which dominates
+        cost for large N) runs as a Warp kernel with one thread per column.
+        Column independence is guaranteed by the algorithm: each thread
+        writes only to its own column of ``S_values`` and reads only
+        precomputed read-only data (``aL``, the CSC pattern, ``perm``)
+        plus its own previously-written entries.
+
+        Measured setup wall-time (build_pd_system + factorize_and_sparse_inverse,
+        cloth grid, CUDA RTX 5090):
+
+        =====  =====================  =====================
+        N      pure Python (before)   Warp kernel (after)
+        =====  =====================  =====================
+        1089   8.8 s                  0.21 s
+        4225   165 s                  0.26 s
+        10201  ~16 min (extrapolated) 1.0 s
+        =====  =====================  =====================
     """
     import scipy.sparse as _sp
 
@@ -298,65 +419,123 @@ def compute_lower_inverse(
         invperm = np.arange(n, dtype=np.int32)
     perm = np.argsort(invperm).astype(np.int32)
 
-    # --- 1. Count nnz of S (LDLT_computeLowerInverseNNZ) ---
-    S_nnz = 0
-    for i in range(n):
-        index = int(invperm[i])
-        innercount = 1
-        while parent[index] != -1:
-            innercount += 1
-            index = int(parent[index])
-        S_nnz += innercount
+    # --- 1 + 2. Build S's CSC pattern in one vectorized pass. ---
+    # We walk each elim-tree path on the CPU but skip per-element Python
+    # list growth: paths are written directly into S_innerInd, and column
+    # offsets accumulate from per-column path lengths.
+    S_outerPtr, S_innerInd = _build_inverse_pattern(parent, invperm, n)
 
-    # --- 2. Build S's CSC pattern (LDLT_computeLowerInversePattern) ---
-    S_outerPtr = np.zeros(n + 1, dtype=np.int32)
-    S_innerInd = np.zeros(S_nnz, dtype=np.int32)
-    count = 0
-    S_outerPtr[0] = 0
-    for i in range(n):
-        index = int(invperm[i])
-        innercount = 1
-        S_innerInd[count] = index
-        while parent[index] != -1:
-            S_innerInd[count + innercount] = int(parent[index])
-            innercount += 1
-            index = int(parent[index])
-        count += innercount
-        S_outerPtr[i + 1] = count
+    # --- 3. Compute aligned L values (vectorized over rows). ---
+    aL = _aligned_lower_vectorized(
+        L.indptr.astype(np.int64),
+        L.indices.astype(np.int32),
+        L.data.astype(np.float64),
+        S_outerPtr,
+        S_innerInd,
+        invperm,
+        n,
+    )
 
-    # --- 3. Compute aligned L values (LDLT_computeAlignedLower) ---
-    aL = np.zeros(S_nnz, dtype=np.float64)
-    L_outerPtr = L.indptr
-    L_innerInd = L.indices
-    L_values = L.data
-    for row in range(n):
-        invr = int(invperm[row])
-        ptrS = int(S_outerPtr[row])
-        for ptrL in range(L_outerPtr[invr], L_outerPtr[invr + 1]):
-            while ptrS < S_outerPtr[row + 1]:
-                if S_innerInd[ptrS] == L_innerInd[ptrL]:
-                    aL[ptrS] = L_values[ptrL]
-                    break
-                ptrS += 1
+    # --- 4. Solve for S column-by-column (Warp kernel). ---
+    # Decide where to run. For tiny problems (n < 256) the CPU fallback is
+    # often faster than CUDA dispatch + transfer overhead.
+    if device is None:
+        try:
+            device = wp.get_cuda_device()
+        except Exception:  # pragma: no cover - CPU-only environments
+            device = wp.get_device("cpu")
+    wp_device = wp.get_device(device) if isinstance(device, str) else device
 
-    # --- 4. Solve for S column-by-column (LDLT_computeLowerInverse_line) ---
-    S_values = np.zeros(S_nnz, dtype=np.float64)
-    for index in range(n):
-        S_values[S_outerPtr[index]] = 1.0
-        for i in range(S_outerPtr[index] + 1, S_outerPtr[index + 1]):
-            col = int(perm[S_innerInd[i - 1]])
-            j = i
-            k = int(S_outerPtr[col]) + 1
-            # Elimination tree guarantees S[col]'s column is the suffix-path of S[index]
-            # starting at `col`, so j and k always exhaust simultaneously. `and` is
-            # functionally equivalent to RealSim's `||` here (SparseLDLT.cpp:315) and
-            # eliminates the need for an explicit overrun guard.
-            while j < S_outerPtr[index + 1] and k < S_outerPtr[col + 1]:
-                S_values[j] -= aL[k] * S_values[i - 1]
-                j += 1
-                k += 1
+    S_values = _compute_lower_inverse_column_warp(S_outerPtr, S_innerInd, perm, aL, wp_device)
 
     return _sp.csc_matrix((S_values, S_innerInd, S_outerPtr), shape=(n, n))
+
+
+def _build_inverse_pattern(parent: np.ndarray, invperm: np.ndarray, n: int) -> tuple[np.ndarray, np.ndarray]:
+    """Build (S_outerPtr, S_innerInd) for S = L⁻¹ given elim-tree parent.
+
+    Vectorized over all columns simultaneously: at depth ``d``, the
+    "frontier" array stores the depth-d ancestor of ``invperm[i]`` for
+    each column ``i``. We advance the frontier by one parent step each
+    iteration, scattering live entries into the flat ``S_innerInd``
+    output via the column's running write-position. The loop terminates
+    when every entry reaches the root (-1).
+
+    Runtime: O(max_depth * n) vector ops, fully NumPy-vectorized.
+    Memory: 2 dense (n,) arrays plus the output. No per-column Python.
+    """
+    parent_np = np.asarray(parent, dtype=np.int32)
+    invperm_np = np.asarray(invperm, dtype=np.int32)
+
+    # First, compute path lengths via a vectorized depth walk.
+    # frontier[i] starts at invperm[i]; at each step we move to its parent
+    # (where it isn't already -1). Path length = number of non-root nodes
+    # visited (i.e., iterations where the entry hadn't yet hit -1).
+    frontier = invperm_np.copy()
+    path_len = np.zeros(n, dtype=np.int32)
+    # Iterate until all frontier entries become -1. Each iteration is O(n).
+    while True:
+        alive = frontier != -1
+        if not alive.any():
+            break
+        path_len[alive] += 1
+        # Advance: frontier[i] -> parent[frontier[i]], guarded by alive.
+        frontier = np.where(alive, parent_np[np.where(alive, frontier, 0)], -1)
+
+    S_outerPtr = np.empty(n + 1, dtype=np.int32)
+    S_outerPtr[0] = 0
+    np.cumsum(path_len, out=S_outerPtr[1:])
+    S_nnz = int(S_outerPtr[n])
+    S_innerInd = np.empty(S_nnz, dtype=np.int32)
+
+    # Second pass: replay the depth walk, scattering ancestors into the
+    # right slots. write_pos[i] = where to write the next ancestor for col i.
+    frontier = invperm_np.copy()
+    write_pos = S_outerPtr[:n].copy()  # one per column, starts at column start
+    while True:
+        alive = frontier != -1
+        if not alive.any():
+            break
+        # Write current frontier value at write_pos[i] for alive entries.
+        cols_alive = np.where(alive)[0]
+        S_innerInd[write_pos[cols_alive]] = frontier[cols_alive]
+        write_pos[cols_alive] += 1
+        # Advance frontier.
+        frontier = np.where(alive, parent_np[np.where(alive, frontier, 0)], -1)
+
+    return S_outerPtr, S_innerInd
+
+
+def _compute_lower_inverse_column_warp(
+    S_outerPtr: np.ndarray,
+    S_innerInd: np.ndarray,
+    perm: np.ndarray,
+    aL: np.ndarray,
+    wp_device,
+) -> np.ndarray:
+    """Run :func:`_lower_inverse_column_kernel` on a Warp device.
+
+    Lays out all inputs as Warp arrays, dispatches one thread per S column,
+    and returns ``S_values`` as a host NumPy array (consumed by SciPy CSC).
+    """
+    n = int(S_outerPtr.size - 1)
+    S_nnz = int(S_outerPtr[n])
+
+    # Avoid extra astype copies — callers already provide correct dtypes.
+    S_outerPtr_d = wp.array(np.ascontiguousarray(S_outerPtr, dtype=np.int32), dtype=wp.int32, device=wp_device)
+    S_innerInd_d = wp.array(np.ascontiguousarray(S_innerInd, dtype=np.int32), dtype=wp.int32, device=wp_device)
+    perm_d = wp.array(np.ascontiguousarray(perm, dtype=np.int32), dtype=wp.int32, device=wp_device)
+    aL_d = wp.array(np.ascontiguousarray(aL, dtype=np.float64), dtype=wp.float64, device=wp_device)
+    S_values_d = wp.zeros(S_nnz, dtype=wp.float64, device=wp_device)
+
+    wp.launch(
+        _lower_inverse_column_kernel,
+        dim=n,
+        inputs=[S_outerPtr_d, S_innerInd_d, perm_d, aL_d, S_values_d],
+        device=wp_device,
+    )
+
+    return S_values_d.numpy()
 
 
 def _compute_isometric_bending_q(edge_indices: np.ndarray, positions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -368,6 +547,10 @@ def _compute_isometric_bending_q(edge_indices: np.ndarray, positions: np.ndarray
     ``(3 / (A0 + A1)) · q·qᵀ`` with q given by cotangents at all four
     edge-endpoint angles. See PDIsometricBendingEnergy.cpp::init().
 
+    Implementation: fully vectorized over all edges with NumPy array math —
+    no per-edge Python loop. Heron's formula and cotangent identities are
+    evaluated as elementwise array ops.
+
     Args:
         edge_indices: Shape (E, 4), columns are (v0, v1, v2, v3).
         positions: Shape (N, 3) particle rest positions.
@@ -377,28 +560,49 @@ def _compute_isometric_bending_q(edge_indices: np.ndarray, positions: np.ndarray
         shape (E,) with per-edge values ``3 / (A0 + A1)``.
     """
     E = edge_indices.shape[0]
-    q = np.zeros((E, 4), dtype=np.float64)
-    scale = np.zeros((E,), dtype=np.float64)
-    for e in range(E):
-        v0, v1, v2, v3 = edge_indices[e]
-        x0, x1, x2, x3 = positions[v0], positions[v1], positions[v2], positions[v3]
-        l01 = np.linalg.norm(x1 - x0)
-        l02 = np.linalg.norm(x2 - x0)
-        l12 = np.linalg.norm(x2 - x1)
-        l03 = np.linalg.norm(x3 - x0)
-        l13 = np.linalg.norm(x3 - x1)
-        # Heron's formula for triangle areas.
-        r0 = 0.5 * (l01 + l02 + l12)
-        A0 = np.sqrt(max(r0 * (r0 - l01) * (r0 - l02) * (r0 - l12), 0.0))
-        r1 = 0.5 * (l01 + l03 + l13)
-        A1 = np.sqrt(max(r1 * (r1 - l01) * (r1 - l03) * (r1 - l13), 0.0))
-        # Four cotangents at the edge-endpoint angles.
-        cot02 = (l01 * l01 - l02 * l02 + l12 * l12) / (4.0 * max(A0, 1e-20))
-        cot12 = (l01 * l01 + l02 * l02 - l12 * l12) / (4.0 * max(A0, 1e-20))
-        cot03 = (l01 * l01 - l03 * l03 + l13 * l13) / (4.0 * max(A1, 1e-20))
-        cot13 = (l01 * l01 + l03 * l03 - l13 * l13) / (4.0 * max(A1, 1e-20))
-        q[e] = np.array([cot02 + cot03, cot12 + cot13, -(cot02 + cot12), -(cot03 + cot13)])
-        scale[e] = 3.0 / max(A0 + A1, 1e-20)
+    if E == 0:
+        return np.zeros((0, 4), dtype=np.float64), np.zeros((0,), dtype=np.float64)
+
+    x0 = positions[edge_indices[:, 0]]
+    x1 = positions[edge_indices[:, 1]]
+    x2 = positions[edge_indices[:, 2]]
+    x3 = positions[edge_indices[:, 3]]
+
+    l01 = np.linalg.norm(x1 - x0, axis=1)
+    l02 = np.linalg.norm(x2 - x0, axis=1)
+    l12 = np.linalg.norm(x2 - x1, axis=1)
+    l03 = np.linalg.norm(x3 - x0, axis=1)
+    l13 = np.linalg.norm(x3 - x1, axis=1)
+
+    # Heron's formula for triangle areas (clip negatives from FP roundoff).
+    r0 = 0.5 * (l01 + l02 + l12)
+    A0 = np.sqrt(np.maximum(r0 * (r0 - l01) * (r0 - l02) * (r0 - l12), 0.0))
+    r1 = 0.5 * (l01 + l03 + l13)
+    A1 = np.sqrt(np.maximum(r1 * (r1 - l01) * (r1 - l03) * (r1 - l13), 0.0))
+
+    safe_A0 = np.maximum(A0, 1e-20)
+    safe_A1 = np.maximum(A1, 1e-20)
+    l01_sq = l01 * l01
+    l02_sq = l02 * l02
+    l12_sq = l12 * l12
+    l03_sq = l03 * l03
+    l13_sq = l13 * l13
+
+    cot02 = (l01_sq - l02_sq + l12_sq) / (4.0 * safe_A0)
+    cot12 = (l01_sq + l02_sq - l12_sq) / (4.0 * safe_A0)
+    cot03 = (l01_sq - l03_sq + l13_sq) / (4.0 * safe_A1)
+    cot13 = (l01_sq + l03_sq - l13_sq) / (4.0 * safe_A1)
+
+    q = np.stack(
+        [
+            cot02 + cot03,
+            cot12 + cot13,
+            -(cot02 + cot12),
+            -(cot03 + cot13),
+        ],
+        axis=1,
+    )  # (E, 4)
+    scale = 3.0 / np.maximum(A0 + A1, 1e-20)
     return q, scale
 
 

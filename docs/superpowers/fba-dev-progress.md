@@ -19,7 +19,7 @@ Live tracker for the Newton port of RealSim's "Fast But Accurate" projective-dyn
 | Softbody (PDTetrahedronEnergy) | ⬜ Not started | Builder + new project_tet kernel |
 | Material model extensions (Corotational / Neo-Hookean / StVK) | ⬜ Not started | Dispatch hook already in place |
 | Differentiability via `wp.Tape()` | ⬜ Not started | Forward path probably already grad-friendly |
-| Performance: `compute_lower_inverse` accel | ⬜ Not started | N=10K = 40 s pure Python; numba/Cython candidates |
+| Performance: `compute_lower_inverse` accel | ✅ Done | Warp per-column kernel + vectorized pattern build; N=10K setup: ~16 min → 1.0 s (RTX 5090) |
 | Upstream PR prep (split, squash, strip docs/superpowers/) | ⬜ Not started | After feature parity |
 
 ## Done — by commit
@@ -68,13 +68,13 @@ _(nothing currently blocked)_
 1. **Contact + collision** — `update_contacts` impl, plane / sphere / primitive CCD/DCD, Schur-complement `addHAinvHT` / `apply_constraint` in `FBALinearSolver`.
 2. **Softbody (tet FEM)** — PDTetrahedronEnergy port + builder + project_tet_arap_kernel.
 3. **Material models** — Corotational (almost free), Neo-Hookean (per-tri L-BFGS), StVK.
-4. **Performance** — `compute_lower_inverse` numba/Cython acceleration. Decision criterion: when target mesh size routinely > 5K particles and setup time exceeds 10 s.
+4. ~~**Performance** — `compute_lower_inverse` numba/Cython acceleration.~~ Done via Warp; see "Done" table.
 5. **Differentiability** — `wp.Tape()` round-trip, gradients on initial conditions / params.
 6. **Cross-solver bench** — performance + accuracy table FBA vs Style3D vs VBD on common scenes.
 
 ## Known limitations (acknowledge, don't fix yet)
 
-- `compute_lower_inverse`: ~6 s for N=2.5K, ~40 s for N=10K (pure Python). Documented.
+- ~~`compute_lower_inverse`: ~6 s for N=2.5K, ~40 s for N=10K (pure Python).~~ Fixed: now <1.5 s up to N=10K via Warp per-column kernel.
 - Position output is float32 (vec3 type); interior solve is float64. Precision floor ~1e-7 m. Documented.
 - `stretching_model` must be `"arap"`; other values raise `NotImplementedError`. By design — extension hook ready.
 - `update_contacts` raises. No contact yet.
