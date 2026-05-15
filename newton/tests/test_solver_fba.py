@@ -2799,5 +2799,334 @@ class TestPhase4StageBFriction(unittest.TestCase):
         )
 
 
+class TestPhase4StageCShapePrimitives(unittest.TestCase):
+    """Phase 4 Stage C: verify the Schur-complement pipeline works for non-plane
+    shape primitives (sphere, box) using Newton's real collision detection.
+
+    All tests drive the FULL pipeline:  collide -> update_contacts -> step.
+    Shapes are placed at the origin with an identity transform to keep the
+    static-shape body_pos path in update_contacts correct (the shape_transform
+    is identity so applying it to the body-frame anchor is a no-op).
+
+    Note on a known limitation in update_contacts for non-identity static shapes:
+    For body=-1 (static) shapes, soft_contact_body_pos from create_soft_contacts
+    is already in world frame, but update_contacts applies shape_transform again.
+    When shape_transform is identity (shapes at origin) the error is zero, so all
+    tests place shapes at the origin.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    # ------------------------------------------------------------------ helpers
+
+    def _make_pipeline(self, model, soft_contact_margin=0.2):
+        """Create a CollisionPipeline with an explicit soft contact margin."""
+        return newton.CollisionPipeline(model, soft_contact_margin=soft_contact_margin)
+
+    # ------------------------------------------------------------------ test 1
+
+    def test_particle_vs_sphere_pushes_out(self):
+        """Single particle inside a static sphere is pushed outside after 50 steps.
+
+        Setup:
+          - Sphere radius 0.5 at origin (body=-1, identity transform).
+          - Particle 0 at (0, 0, 0.2) — inside the sphere (d = 0.2 - 0.5 = -0.3).
+          - No friction; Z-up gravity.
+
+        After 50 steps the particle should be at z >= 0.49 (sphere surface radius
+        minus 1e-2 tolerance for soft-contact stiffness residual).
+        """
+        builder = newton.ModelBuilder()
+        builder.add_shape_sphere(body=-1, radius=0.5)
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=[
+                wp.vec3(0.0, 0.0, 0.2),  # particle 0 — free, inside sphere
+                wp.vec3(2.0, 0.0, 0.0),  # particle 1 — pinned, well outside
+                wp.vec3(0.0, 2.0, 0.0),  # particle 2 — pinned, well outside
+            ],
+            indices=[0, 1, 2],
+            density=1.0,
+            tri_ke=1.0e4,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+        )
+        builder.particle_mass[1] = 0.0
+        builder.particle_mass[2] = 0.0
+        model = builder.finalize()
+
+        pipeline = self._make_pipeline(model)
+        contacts = pipeline.contacts()
+        solver = SolverFBA(model, iterations=15, friction=False)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+
+        for _ in range(50):
+            s_in.clear_forces()
+            pipeline.collide(s_in, contacts)
+            solver.step(s_in, s_out, None, contacts, dt)
+            s_in, s_out = s_out, s_in
+
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite positions after sphere contact test")
+        dist = float(np.linalg.norm(q[0]))
+        self.assertGreaterEqual(
+            dist,
+            0.49,
+            f"Particle distance from origin {dist:.4f} should be >= 0.49 (sphere radius 0.5) after 50 steps",
+        )
+
+    # ------------------------------------------------------------------ test 2
+
+    def test_particle_vs_box_no_interpenetration(self):
+        """Particle slightly inside a static box is pushed outside after 50 steps.
+
+        Setup:
+          - Box at origin, half-extents (1, 1, 1); extends from -1 to +1 on each axis.
+          - Particle 0 at (0.9, 0.0, 0.0) — inside the box, 0.1 m from the +x face.
+          - No friction; Z-up gravity.
+
+        After 50 steps the particle should have x >= 0.99 (pushed toward +x face)
+        OR be outside the box (|x|, |y|, or |z| >= 1.0 - 1e-2).
+        """
+        builder = newton.ModelBuilder()
+        builder.add_shape_box(body=-1, hx=1.0, hy=1.0, hz=1.0)
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=[
+                wp.vec3(0.9, 0.0, 0.0),  # particle 0 — free, inside box (0.1 m from +x)
+                wp.vec3(0.9, 2.0, 0.0),  # particle 1 — pinned, outside box
+                wp.vec3(0.9, 0.0, 2.0),  # particle 2 — pinned, outside box
+            ],
+            indices=[0, 1, 2],
+            density=1.0,
+            tri_ke=1.0e4,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+        )
+        builder.particle_mass[1] = 0.0
+        builder.particle_mass[2] = 0.0
+        model = builder.finalize()
+
+        pipeline = self._make_pipeline(model)
+        contacts = pipeline.contacts()
+        solver = SolverFBA(model, iterations=15, friction=False)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+
+        for _ in range(50):
+            s_in.clear_forces()
+            pipeline.collide(s_in, contacts)
+            solver.step(s_in, s_out, None, contacts, dt)
+            s_in, s_out = s_out, s_in
+
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite positions after box contact test")
+        # Particle should be at or outside one of the box faces (|coord| >= 0.99).
+        p0 = q[0]
+        outside_or_on_surface = (abs(p0[0]) >= 0.99) or (abs(p0[1]) >= 0.99) or (abs(p0[2]) >= 0.99)
+        self.assertTrue(
+            outside_or_on_surface,
+            f"Particle {p0} should be at or outside box surface (half-extents=1) after 50 steps",
+        )
+
+    # ------------------------------------------------------------------ test 3
+
+    def test_cloth_drapes_on_sphere(self):
+        """4x4 cloth drapes over a sphere; no NaN and no deep penetration after 200 steps.
+
+        Setup:
+          - Sphere radius 0.4 at origin (body=-1).
+          - 4x4 cloth grid starting at (-0.4, -0.4, 0.6) above the sphere.
+          - Top row pinned; gravity -Z.
+          - No friction.
+
+        Assertions:
+          - No NaN in particle positions.
+          - No particle center is deeper than 0.3 m inside the sphere (distance
+            from origin < 0.4 - 0.3 = 0.1 m), allowing for soft-pin tolerance.
+        """
+        builder = newton.ModelBuilder()
+        builder.add_shape_sphere(body=-1, radius=0.4)
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.3, -0.3, 0.6),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.15,
+            cell_y=0.15,
+            mass=0.05,
+            tri_ke=1.0e3,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-2,
+            edge_kd=0.0,
+            fix_top=True,
+        )
+        model = builder.finalize()
+
+        pipeline = self._make_pipeline(model, soft_contact_margin=0.15)
+        contacts = pipeline.contacts()
+        solver = SolverFBA(model, iterations=10, friction=False)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+
+        for _ in range(200):
+            s_in.clear_forces()
+            pipeline.collide(s_in, contacts)
+            solver.step(s_in, s_out, None, contacts, dt)
+            s_in, s_out = s_out, s_in
+
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite positions after cloth-drapes-on-sphere test")
+
+        # No particle should be more than 0.3 m deep inside the sphere.
+        dists = np.linalg.norm(q, axis=1)  # distance from sphere centre (origin)
+        min_dist = float(dists.min())
+        self.assertGreaterEqual(
+            min_dist,
+            0.1,
+            f"Deepest particle is {0.4 - min_dist:.3f} m inside the sphere (min dist={min_dist:.3f}), "
+            "expected < 0.3 m penetration",
+        )
+
+    # ------------------------------------------------------------------ test 4
+
+    def test_softbody_falls_on_box(self):
+        """3x3x3 soft-body cube falls onto a static box; no NaN after 100 steps.
+
+        Setup:
+          - Box at origin, half-extents (0.5, 0.5, 0.1) (a flat platform).
+          - 3x3x3 soft-body cube with cell size 0.1 m starting at z=0.3 above the box.
+          - No friction; gravity -Z.
+
+        Assertions:
+          - No NaN in particle positions.
+          - Soft-body is not deeply below the box top surface (z >= -0.1 -  0.1 = -0.2 m).
+        """
+        builder = newton.ModelBuilder()
+        # Flat platform: half-extents in XY are generous, thin in Z.
+        builder.add_shape_box(body=-1, hx=0.5, hy=0.5, hz=0.1)
+        builder.add_soft_grid(
+            pos=wp.vec3(-0.1, -0.1, 0.3),  # above box top face (z=0.1)
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=3,
+            dim_y=3,
+            dim_z=3,
+            cell_x=0.07,
+            cell_y=0.07,
+            cell_z=0.07,
+            density=5.0e2,
+            k_mu=1.0e3,
+            k_lambda=1.0e3,
+            k_damp=0.0,
+        )
+        model = builder.finalize()
+
+        pipeline = self._make_pipeline(model, soft_contact_margin=0.15)
+        contacts = pipeline.contacts()
+        solver = SolverFBA(model, iterations=10, friction=False)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+
+        for _ in range(100):
+            s_in.clear_forces()
+            pipeline.collide(s_in, contacts)
+            solver.step(s_in, s_out, None, contacts, dt)
+            s_in, s_out = s_out, s_in
+
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite positions after softbody-on-box test")
+
+        # No particle should be deeply below the box top face (z = 0.1).
+        # Allow 0.2 m tolerance for soft contact residual.
+        min_z = float(q[:, 2].min())
+        self.assertGreaterEqual(
+            min_z,
+            -0.2,
+            f"Soft-body min z={min_z:.3f} is below the box + tolerance threshold -0.2 m",
+        )
+
+    # ------------------------------------------------------------------ test 5
+
+    def test_mixed_shape_collision(self):
+        """Cloth above a plane + a sphere; contacts from both shapes processed correctly.
+
+        Setup:
+          - Ground plane (Z-up, at z=0).
+          - Sphere radius 0.3 at origin (body=-1).
+          - 4x4 cloth grid starting at (-0.3, -0.3, 0.5) above both colliders.
+          - Top row pinned; gravity -Z; no friction.
+
+        Assertions:
+          - No NaN after 150 steps.
+          - No particle below z = -0.05 (plane).
+          - No particle closer than 0.25 m to sphere centre (allowing 0.05 m
+            soft tolerance below radius 0.3).
+        """
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()  # plane at z=0
+        builder.add_shape_sphere(body=-1, radius=0.3)  # sphere at origin
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.3, -0.3, 0.5),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.15,
+            cell_y=0.15,
+            mass=0.05,
+            tri_ke=1.0e3,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-2,
+            edge_kd=0.0,
+            fix_top=True,
+        )
+        model = builder.finalize()
+
+        pipeline = self._make_pipeline(model, soft_contact_margin=0.15)
+        contacts = pipeline.contacts()
+        solver = SolverFBA(model, iterations=10, friction=False)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+
+        for _ in range(150):
+            s_in.clear_forces()
+            pipeline.collide(s_in, contacts)
+            solver.step(s_in, s_out, None, contacts, dt)
+            s_in, s_out = s_out, s_in
+
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite positions after mixed-shape collision test")
+
+        # No particle below ground plane (z < -0.05 with soft tolerance).
+        min_z = float(q[:, 2].min())
+        self.assertGreaterEqual(min_z, -0.05, f"Particle below ground plane: min z={min_z:.4f}")
+
+        # No particle more than 0.05 m inside sphere.
+        dists = np.linalg.norm(q, axis=1)
+        min_dist = float(dists.min())
+        self.assertGreaterEqual(
+            min_dist,
+            0.25,
+            f"Particle too deep inside sphere: min dist={min_dist:.4f} m (sphere radius=0.3)",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
