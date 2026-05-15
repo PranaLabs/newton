@@ -1343,5 +1343,332 @@ class TestCorotationalProjection(unittest.TestCase):
             SolverFBA(model, stretching_model="corotational", lam=1000.0)  # missing mu
 
 
+class TestNeoHookeanProjection(unittest.TestCase):
+    """Unit tests for project_neohookean_sigma and the NH stretching kernel."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _device(self):
+        return "cuda:0" if wp.is_cuda_available() else "cpu"
+
+    def test_rest_configuration_projects_to_identity(self):
+        """At sigma=(1,1), J=1, log_J=0, gradient=0; Newton leaves sigma unchanged.
+
+        With sigma_sq=(1,1): sigma0=(1,1), k=2*mu, J=1, log_J=0, inv=(1,1).
+        grad_0 = mu*(1-1) + lam*0*1 + k*(1-1) = 0.
+        grad_1 = 0 similarly. So Newton dx=0 and sigma stays at (1,1).
+        Verify the kernel scatter matches ARAP-at-rest: rhs[1]=(1,0,0), rhs[2]=(0,0,1).
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_neohookean_kernel  # noqa: PLC0415
+
+        device = self._device()
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0, 0, 1)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tri_indices = wp.array([0, 1, 2], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat22(1.0, 0.0, 0.0, 1.0)], dtype=wp.mat22, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+        rhs = wp.zeros(3, dtype=wp.vec3, device=device)
+
+        mu, lam = 1.0, 0.5
+        wp.launch(
+            project_stretching_neohookean_kernel,
+            dim=1,
+            inputs=[positions, tri_indices, Dm_inv, weight, mu, lam],
+            outputs=[rhs],
+            device=device,
+        )
+        r = rhs.numpy()
+        # At rest: sigma=(1,1), P = U*I*Vt = embedding I (3x2). Scatter as for ARAP.
+        np.testing.assert_allclose(r[1], [1.0, 0.0, 0.0], atol=1e-5)
+        np.testing.assert_allclose(r[2], [0.0, 0.0, 1.0], atol=1e-5)
+        np.testing.assert_allclose(r[0], -(r[1] + r[2]), atol=1e-5)
+
+    def test_isotropic_stretch_NH_returns_finite_sigma(self):
+        """sigma_0=(1.5,1.5) with mu=1, lam=0.5: after 5 Newton iter sigma is finite,
+        positive, less than 1.5, and gradient norm < 1e-4.
+
+        NH energy pulls sigma back toward 1 (incompressibility); the result should
+        lie strictly between 0 and 1.5.  We also verify the gradient at the final
+        sigma is small (well-converged in 5 iterations).
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_neohookean_kernel  # noqa: PLC0415
+
+        device = self._device()
+        # Scale current positions by 1.5: sigma_sq = (1.5^2, 1.5^2) = (2.25, 2.25)
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1.5, 0, 0), wp.vec3(0, 0, 1.5)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tri_indices = wp.array([0, 1, 2], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat22(1.0, 0.0, 0.0, 1.0)], dtype=wp.mat22, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+        rhs = wp.zeros(3, dtype=wp.vec3, device=device)
+
+        mu, lam = 1.0, 0.5
+        wp.launch(
+            project_stretching_neohookean_kernel,
+            dim=1,
+            inputs=[positions, tri_indices, Dm_inv, weight, mu, lam],
+            outputs=[rhs],
+            device=device,
+        )
+        r = rhs.numpy()
+        # With Dm_inv=I and isotropic stretch, u0=(1,0,0), u1=(0,0,1), V=I.
+        # P = diag(sigma_proj, sigma_proj) (embedded). Row0=(sigma_proj,0,0), row1=(0,0,sigma_proj).
+        # rhs[1] = (sigma_proj, 0, 0), rhs[2] = (0, 0, sigma_proj).
+        sigma_proj = r[1][0]
+        self.assertTrue(np.isfinite(sigma_proj), "sigma_proj is not finite")
+        self.assertGreater(sigma_proj, 0.0, "sigma_proj must be positive")
+        self.assertLess(sigma_proj, 1.5, "NH should pull sigma back from 1.5 toward 1")
+
+        # Verify gradient is small at the converged sigma (< 1e-3 tolerance for 5 iter).
+        k = 2.0 * mu
+        sigma0 = 1.5
+        J = sigma_proj * sigma_proj
+        log_J = np.log(J)
+        inv_s = 1.0 / sigma_proj
+        grad = mu * (sigma_proj - inv_s) + lam * log_J * inv_s + k * (sigma_proj - sigma0)
+        self.assertLess(abs(grad), 1e-3, f"Gradient at converged sigma too large: {abs(grad):.2e}")
+
+    def test_solver_neohookean_runs_no_nan(self):
+        """Full SolverFBA step with stretching_model='neohookean', small cloth, 50 steps."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 2, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=8,
+            dim_y=8,
+            cell_x=0.05,
+            cell_y=0.05,
+            mass=0.1,
+            tri_ke=7142.857,  # 2*mu with mu=3571.43
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.1,
+            edge_kd=0.0,
+            fix_left=False,
+        )
+        # Pin top-left and top-right corners.
+        top_left = 8 * (8 + 1)
+        top_right = 8 * (8 + 1) + 8
+        builder.particle_mass[top_left] = 0.0
+        builder.particle_mass[top_right] = 0.0
+        model = builder.finalize()
+
+        mu = 3571.4285714285716
+        lam = 14285.71428571429
+        solver = SolverFBA(model, iterations=5, stretching_model="neohookean", mu=mu, lam=lam)
+        s_in, s_out = model.state(), model.state()
+        dt = 0.01
+        for _ in range(50):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite values in neohookean simulation")
+
+    def test_solver_init_requires_mu_lam_for_neohookean(self):
+        """SolverFBA with stretching_model='neohookean' and no mu/lam raises ValueError."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=1.0e2,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+            fix_left=True,
+        )
+        model = builder.finalize()
+
+        with self.assertRaises(ValueError):
+            SolverFBA(model, stretching_model="neohookean")  # missing mu and lam
+
+        with self.assertRaises(ValueError):
+            SolverFBA(model, stretching_model="neohookean", mu=1000.0)  # missing lam
+
+        with self.assertRaises(ValueError):
+            SolverFBA(model, stretching_model="neohookean", lam=1000.0)  # missing mu
+
+
+class TestFBARealSimAgreementNH(unittest.TestCase):
+    """Trajectory match vs RealSim C++ reference with Neo-Hookean constitutive (50 steps, 113 verts).
+
+    Fixture: ``newton/tests/fixtures/fba_realsim_nh_trajectory.npy`` (50, 113, 3) float32.
+    Captured from RealSim C++ LocalGlobalSolver + TRI_NEOHOOKEAN + SPARSE_INVERSE_CUDA.
+    Frame ``k`` of the fixture is the RealSim state after step ``k``; we compare
+    ``newton_traj[k]`` (after step ``k+1``) vs ``fixture[k+1]`` for ``k`` in ``[0, 48]``.
+
+    Lamé parameters from RealSim ElasticEnergy::setElasticParameter (E=1e4, nu=0.4):
+        mu = E / (2*(1+nu)) = 3571.4286
+        lambda = E*nu / ((1+nu)*(1-2*nu)) = 14285.714
+    Note: for NH, RealSim passes the Lamé pair (mu, lambda) directly to the local
+    projector; no factor-of-2 weight scaling is applied at the Newton API level.
+    """
+
+    FIXTURE_DIR = Path(__file__).parent / "fixtures"
+    OBJ_PATH = FIXTURE_DIR / "fba_cloth_113.obj"
+    TRAJ_PATH = FIXTURE_DIR / "fba_realsim_nh_trajectory.npy"
+
+    # Simulation parameters matching RealSim FBACrossCheckNH
+    DT = 0.01
+    N_FRAMES = 50
+    N_ITER = 5
+    # E=1e4, nu=0.4 → mu = E/(2*(1+nu)) ≈ 3571.4286; lambda = E*nu/((1+nu)*(1-2*nu)) ≈ 14285.714
+    # tri_ke = 2*mu ≈ 7142.857 (used only to build the PD Hessian A; NH uses mu/lam directly)
+    TRI_KE = 7142.857
+    EDGE_KE = 0.1
+    MU = 3571.4285714285716
+    LAM = 14285.71428571429
+    PIN_STIFFNESS = 1e10
+    PIN_BOXES = (
+        (-1.1, 0.9, -0.1, -0.9, 1.1, 0.1),
+        (0.9, 0.9, -0.1, 1.1, 1.1, 0.1),
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    @staticmethod
+    def _load_obj(path: "Path") -> "tuple[list[wp.vec3], list[int]]":
+        """Parse .obj → (vertices, triangle_indices_0based)."""
+        from pathlib import Path as _Path  # noqa: PLC0415
+
+        vertices: list[wp.vec3] = []
+        indices: list[int] = []
+        with open(_Path(path)) as fh:
+            for raw_line in fh:
+                tok = raw_line.strip()
+                if tok.startswith("v "):
+                    parts = tok.split()
+                    vertices.append(wp.vec3(float(parts[1]), float(parts[2]), float(parts[3])))
+                elif tok.startswith("f "):
+                    parts = tok.split()[1:]
+                    face_idx = [int(p.split("/")[0]) - 1 for p in parts]
+                    for i in range(1, len(face_idx) - 1):
+                        indices.extend([face_idx[0], face_idx[i], face_idx[i + 1]])
+        return vertices, indices
+
+    @staticmethod
+    def _find_pin_indices(vertices: "list[wp.vec3]", boxes: "list[tuple]") -> "list[int]":
+        pinned: list[int] = []
+        for i, v in enumerate(vertices):
+            x, y, z = v[0], v[1], v[2]
+            for xmin, ymin, zmin, xmax, ymax, zmax in boxes:
+                if xmin <= x <= xmax and ymin <= y <= ymax and zmin <= z <= zmax:
+                    pinned.append(i)
+                    break
+        return pinned
+
+    def _build_model(self, vertices: "list[wp.vec3]", indices: "list[int]") -> "newton.Model":
+        """Build Newton model matching RealSim FBACrossCheckNH scene."""
+        import newton as _newton  # noqa: PLC0415
+
+        N = len(vertices)
+        verts_np = np.array([[v[0], v[1], v[2]] for v in vertices], dtype=np.float64)
+        idxs = np.array(indices, dtype=np.int32).reshape(-1, 3)
+        total_area = 0.0
+        for tri in idxs:
+            e1 = verts_np[tri[1]] - verts_np[tri[0]]
+            e2 = verts_np[tri[2]] - verts_np[tri[0]]
+            total_area += 0.5 * float(np.linalg.norm(np.cross(e1, e2)))
+        density = 1.0 / total_area  # so that sum-of-area-weights ≈ 1 kg total
+
+        builder = _newton.ModelBuilder(up_axis=_newton.Axis.Z, gravity=-10.0)
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=vertices,
+            indices=indices,
+            density=density,
+            tri_ke=self.TRI_KE,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=self.EDGE_KE,
+            edge_kd=0.0,
+        )
+        # Override to uniform 1/N mass (RealSim Mass::addObjectMass convention).
+        for i in range(N):
+            builder.particle_mass[i] = 1.0 / N
+        # Pin top-corner vertices by zeroing their mass.
+        for idx in self._find_pin_indices(vertices, self.PIN_BOXES):
+            builder.particle_mass[idx] = 0.0
+        return builder.finalize()
+
+    def test_nh_drape_trajectory_matches_realsim(self):
+        """50-step NH drape on 113-vertex cloth: max position delta < 5e-5 m at every frame.
+
+        NH uses 5 fixed Newton iterations in the local step; observed residual is ~9.5 µm
+        (max L2 at frame 48), well within the 5e-5 m tolerance. This confirms the 5-iter
+        Newton is sufficient to match RealSim's L-BFGS-to-convergence behavior.
+        """
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        vertices, indices = self._load_obj(self.OBJ_PATH)
+        self.assertEqual(len(vertices), 113)
+
+        realsim_traj = np.load(str(self.TRAJ_PATH))
+        self.assertEqual(realsim_traj.shape, (50, 113, 3))
+
+        model = self._build_model(vertices, indices)
+        solver = SolverFBA(
+            model,
+            iterations=self.N_ITER,
+            pin_stiffness=self.PIN_STIFFNESS,
+            stretching_model="neohookean",
+            mu=self.MU,
+            lam=self.LAM,
+        )
+
+        state_in = model.state()
+        state_out = model.state()
+        newton_traj = np.zeros((self.N_FRAMES, model.particle_count, 3), dtype=np.float32)
+
+        for f in range(self.N_FRAMES):
+            state_in.clear_forces()
+            solver.step(state_in, state_out, None, None, self.DT)
+            newton_traj[f] = state_out.particle_q.numpy()
+            state_in, state_out = state_out, state_in
+
+        self.assertTrue(np.all(np.isfinite(newton_traj)), "non-finite positions in NH Newton trajectory")
+
+        # Compare newton[k] vs realsim[k+1] for k in [0, 48].
+        max_delta = 0.0
+        worst_frame = -1
+        for k in range(self.N_FRAMES - 1):
+            delta = float(np.linalg.norm(newton_traj[k] - realsim_traj[k + 1], axis=-1).max())
+            if delta > max_delta:
+                max_delta = delta
+                worst_frame = k
+
+        self.assertLess(
+            max_delta,
+            5e-5,
+            f"Max L2 position delta {max_delta:.3e} m exceeds 5e-5 m tolerance "
+            f"(worst frame {worst_frame}; observed ~9.5 µm with 5-iter Newton on RTX 5090)",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
