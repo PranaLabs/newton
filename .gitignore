@@ -73,3 +73,6 @@ docs/_static/viser/
 
 # Notebook checkpoints
 **/*.ipynb_checkpoints/
+
+# Cloth extension demo outputs (regenerable, too large for git)
+scripts/cloth_extension_out/
