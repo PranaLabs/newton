@@ -1089,3 +1089,95 @@ def project_pin_kernel(
     k = wp.tid()
     i = pin_indices[k]
     wp.atomic_add(rhs, i, pin_stiffness * x_ref[i])
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 Stage A — contact Jacobian kernels
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def zero_scalar_kernel(arr: wp.array[wp.float64]):
+    """arr[i] = 0.0 — zeroes a float64 scalar array."""
+    tid = wp.tid()
+    arr[tid] = wp.float64(0.0)
+
+
+@wp.kernel
+def build_contact_jacobian_vec3_kernel(
+    particle_count: int,
+    contact_idx: int,
+    j_indices: wp.array[wp.int32],
+    j_normals: wp.array[wp.vec3],
+    j_alpha: wp.array[wp.float32],
+    out: wp.array[wp.vec3],
+):
+    """Set out[j_indices[contact_idx]] = j_alpha[contact_idx] * j_normals[contact_idx].
+
+    Called with ``dim=1`` (single thread).  All other slots are left as-is
+    (caller is responsible for zeroing ``out`` before launch).
+
+    Args:
+        particle_count: Total particle count (unused at runtime, guards bounds).
+        contact_idx: Index of the contact to materialise.
+        j_indices: Particle index per contact row, shape ``[M]``.
+        j_normals: World-frame contact normal per contact row, shape ``[M]``.
+        j_alpha: Jacobian coefficient per contact row (1.0 for particle-shape).
+        out: Output vec3 array of length ``particle_count``; only the slot at
+            ``j_indices[contact_idx]`` is written.
+    """
+    _tid = wp.tid()
+    idx = j_indices[contact_idx]
+    if idx >= 0 and idx < particle_count:
+        out[idx] = wp.float32(j_alpha[contact_idx]) * j_normals[contact_idx]
+
+
+@wp.kernel
+def set_lambda_jacobian_vec3_kernel(
+    contact_idx: int,
+    j_indices: wp.array[wp.int32],
+    j_normals: wp.array[wp.vec3],
+    j_alpha: wp.array[wp.float32],
+    lam_c: float,
+    particle_count: int,
+    out: wp.array[wp.vec3],
+):
+    """Scatter ``lam_c * j_alpha[c] * j_normals[c]`` to ``out[j_indices[c]]``.
+
+    Called with ``dim=1``.  Caller must zero ``out`` before launch if
+    accumulation from previous contacts is not desired.
+
+    Args:
+        contact_idx: Contact row index ``c``.
+        j_indices: Particle index per contact row, shape ``[M]``.
+        j_normals: Contact normal per row, shape ``[M]``.
+        j_alpha: Coefficient per row (1.0 for particle-shape contacts).
+        lam_c: Scalar multiplier (lambda for contact ``c``).
+        particle_count: Guard for bounds checking.
+        out: Output vec3 array of length ``particle_count``.
+    """
+    _tid = wp.tid()
+    idx = j_indices[contact_idx]
+    if idx >= 0 and idx < particle_count:
+        out[idx] = lam_c * wp.float32(j_alpha[contact_idx]) * j_normals[contact_idx]
+
+
+@wp.kernel
+def accumulate_vec3_kernel(
+    src: wp.array[wp.vec3],
+    dst: wp.array[wp.vec3],
+):
+    """dst[i] += src[i] — accumulate one vec3 array into another."""
+    tid = wp.tid()
+    dst[tid] = dst[tid] + src[tid]
+
+
+@wp.kernel
+def subtract_vec3_kernel(
+    a: wp.array[wp.vec3],
+    b: wp.array[wp.vec3],
+    out: wp.array[wp.vec3],
+):
+    """out[i] = a[i] - b[i]."""
+    tid = wp.tid()
+    out[tid] = a[tid] - b[tid]

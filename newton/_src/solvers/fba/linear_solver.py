@@ -29,9 +29,11 @@ if TYPE_CHECKING:
 from ...sim import Model
 from .kernels import (
     apply_permutation_scalar_kernel,
+    build_contact_jacobian_vec3_kernel,
     extract_component_kernel,
     insert_component_kernel,
     scale_by_diag_kernel,
+    zero_vec3_kernel,
 )
 
 
@@ -785,3 +787,68 @@ class FBALinearSolver:
             )
             # 7. Insert result into component c of output x.
             wp.launch(insert_component_kernel, dim=n, inputs=[self._x_scalar, c], outputs=[x], device=dev)
+
+    def build_schur_complement(
+        self,
+        num_contacts: int,
+        j_indices: wp.array,
+        j_normals: wp.array,
+        j_alpha: wp.array,
+    ) -> np.ndarray:
+        """Build ``W = J · A⁻¹ · Jᵀ`` as a dense ``(M, M)`` NumPy array.
+
+        For each contact row ``c``, computes ``y_c = A⁻¹ · J_cᵀ`` (a vec3 array
+        of length N with the contact-normal response at particle ``j_indices[c]``),
+        then assembles ``W[c', c] = J_{c'} · y_c``.  The columns ``y_c`` are
+        cached in a list to halve the solve count needed by
+        :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA._apply_lambda_correction`.
+
+        Args:
+            num_contacts: Number of active contacts ``M``.
+            j_indices: Particle index per contact row, shape ``[M]``, dtype int32.
+            j_normals: World-frame contact normal per row, shape ``[M]``, dtype vec3.
+            j_alpha: Jacobian coefficient per row, shape ``[M]``, dtype float32.
+
+        Returns:
+            Dense ``(M, M)`` float64 NumPy array ``W``.
+        """
+        M = num_contacts
+        n = self.n
+        dev = self.device
+        W = np.zeros((M, M), dtype=np.float64)
+
+        # Allocate scratch for Jacobian column and its inverse-application result.
+        jcol = wp.zeros(n, dtype=wp.vec3, device=dev)
+        y_out = wp.empty(n, dtype=wp.vec3, device=dev)
+
+        # Pull contact arrays to host for the reduction loop (small M).
+        idx_np = j_indices.numpy()          # (M,) int
+        n_np = j_normals.numpy()            # (M, 3)
+        a_np = j_alpha.numpy()              # (M,)
+
+        # Cache y_c columns for reuse in _apply_lambda_correction.
+        self._y_cache: list[np.ndarray] = []
+
+        for c in range(M):
+            # Zero the column RHS.
+            wp.launch(zero_vec3_kernel, dim=n, inputs=[jcol], device=dev)
+            # Set jcol[j_indices[c]] = j_alpha[c] * j_normals[c].
+            wp.launch(
+                build_contact_jacobian_vec3_kernel,
+                dim=1,
+                inputs=[n, c, j_indices, j_normals, j_alpha],
+                outputs=[jcol],
+                device=dev,
+            )
+            # Apply A⁻¹: y_out = A⁻¹ · jcol.
+            self.solve(jcol, y_out)
+            # Pull to host for W assembly and caching.
+            y_np = y_out.numpy()  # (N, 3)
+            self._y_cache.append(y_np.copy())
+
+            # Fill column c of W: W[c', c] = a[c'] * dot(n[c'], y_np[idx[c']]).
+            for cp in range(M):
+                ip = idx_np[cp]
+                W[cp, c] = float(a_np[cp]) * float(np.dot(n_np[cp], y_np[ip]))
+
+        return W
