@@ -58,6 +58,7 @@ Live tracker for the Newton port of RealSim's "Fast But Accurate" projective-dyn
 | `890874f6` | Fix compute_inertial_kernel: apply gravity unconditionally (gravity-pin bug) |
 | `bc3ff0a6` | Add FBA x RealSim trajectory cross-check test (fixture + TestFBARealSimAgreement) |
 | `94a9ec04` | Fix pre-commit lint warnings (PLW2901, RUF012, typos allowlist) |
+| `c89c85aa` | Accelerate FBA setup: Warp per-column kernel + vectorized NumPy assembly |
 
 ## In progress
 
