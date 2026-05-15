@@ -12,6 +12,68 @@ from ...sim import Contacts, Control, Model, State
 from ..solver import SolverBase
 
 
+def project_coulomb_cone(
+    s: float, v: np.ndarray, mu: float
+) -> tuple[float, np.ndarray]:
+    """Project ``(s, v)`` onto the Coulomb friction cone K = {s' >= 0, |v'| <= mu * s'}.
+
+    Three cases:
+
+    1. Already in K: return ``(s, v)`` unchanged.
+    2. In polar cone ``mu * |v| <= -s``: project to origin ``(0, 0, 0)``.
+    3. Otherwise: project to cone surface ``|v'| = mu * s'``.
+
+    Args:
+        s: Normal component (λ_n scalar).
+        v: Tangent components ``(λ_t1, λ_t2)``, shape ``(2,)``.
+        mu: Coulomb friction coefficient (>= 0).
+
+    Returns:
+        Tuple ``(s_new, v_new)`` on or inside the cone.
+    """
+    v_norm = float(np.sqrt(v[0] ** 2 + v[1] ** 2))
+    # Case 1: already inside cone.
+    if v_norm <= mu * s and s >= 0.0:
+        return s, v
+    # Case 2: in polar cone → project to origin.
+    if mu * v_norm <= -s:
+        return 0.0, np.zeros(2, dtype=np.float64)
+    # Case 3: project to cone surface.
+    factor = (s + mu * v_norm) / (1.0 + mu * mu)
+    s_new = factor
+    if v_norm < 1e-15:
+        v_new = np.zeros(2, dtype=np.float64)
+    else:
+        v_new = (mu * factor / v_norm) * v
+    return s_new, v_new
+
+
+def compute_tangent_basis(n: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Compute two orthonormal tangent vectors ``(t1, t2)`` from a unit normal.
+
+    Convention mirrors RealSim's ``BaseCollision::generateTangentDirections``:
+    pick a reference direction (world X, or world Y if normal is nearly X),
+    cross with normal to get t1, then cross normal with t1 to get t2.
+
+    Args:
+        n: Unit normal vector, shape ``(3,)``.
+
+    Returns:
+        Tuple ``(t1, t2)`` each of shape ``(3,)``, float64 unit vectors
+        orthogonal to ``n`` and to each other.
+    """
+    n = np.asarray(n, dtype=np.float64)
+    if abs(n[0]) > 0.9:
+        ref = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    else:
+        ref = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    t1 = np.cross(n, ref)
+    t1 /= np.linalg.norm(t1) + 1e-30
+    t2 = np.cross(n, t1)
+    t2 /= np.linalg.norm(t2) + 1e-30
+    return t1, t2
+
+
 def _transform_point(pos: np.ndarray, quat: np.ndarray, p: np.ndarray) -> np.ndarray:
     """Apply a rigid transform ``T = (pos, quat)`` to point ``p``.
 
