@@ -609,9 +609,14 @@ class SolverFBA(SolverBase):
         that the Schur-complement path inside :meth:`step` will consume.
 
         For Stage A all contacts are particle-vs-static-shape so ``alpha = 1.0``.
-        The signed-distance offset is ``dot(normal, body_pos_world)`` where
-        ``body_pos_world = wp.transform_point(body_transform, body_pos)``
-        (or ``body_pos`` directly when the shape has no body — body index ``-1``).
+        The signed-distance offset is ``dot(normal, world_anchor)`` where
+        ``world_anchor`` is:
+
+        - For dynamic bodies (``body_index >= 0``): ``wp.transform_point(body_q, body_pos)``,
+          since ``soft_contact_body_pos`` is in body-local frame.
+        - For static shapes (``body_index < 0``): ``body_pos`` directly, since
+          ``soft_contact_body_pos`` is already in world frame (``X_wb = identity`` so
+          ``X_ws = X_bs``, and the kernel stores ``wp.transform_point(X_bs, x_local)``).
 
         Args:
             contacts: :class:`~newton.Contacts` populated by a prior
@@ -627,13 +632,16 @@ class SolverFBA(SolverBase):
         # Pull contact data to host for filtering (M is small in Stage A).
         particle_h = contacts.soft_contact_particle.numpy()[:M_raw]
         shape_h = contacts.soft_contact_shape.numpy()[:M_raw]
-        body_pos_h = contacts.soft_contact_body_pos.numpy()[:M_raw]  # shape-local
+        # soft_contact_body_pos convention (from create_soft_contacts kernel):
+        #   - body_index >= 0 (dynamic body): contact point in body-local frame.
+        #   - body_index  < 0 (static shape): contact point already in world frame
+        #     (because X_wb = identity so X_ws = X_bs, and body_pos = X_bs * x_local).
+        body_pos_h = contacts.soft_contact_body_pos.numpy()[:M_raw]
         normal_h = contacts.soft_contact_normal.numpy()[:M_raw]  # world frame
 
         # Access model fields needed for world-frame body_pos conversion.
         model = self.model
         shape_body_np = model.shape_body.numpy() if hasattr(model, "shape_body") else None
-        shape_transform_np = model.shape_transform.numpy() if hasattr(model, "shape_transform") else None
 
         # Filter out sentinel entries (particle == -1).
         valid_mask = particle_h >= 0
@@ -650,32 +658,30 @@ class SolverFBA(SolverBase):
         self._ensure_contact_buffers(M)
 
         # Build offset: pene0[c] = dot(normal, world_anchor)
-        # world_anchor = transform_point(body_transform, body_pos)
+        # world_anchor is the contact-point position in world frame.
         offset_h = np.zeros(M, dtype=np.float64)
         alpha_h = np.ones(M, dtype=np.float32)
 
+        body_q_np = model.body_q.numpy() if hasattr(model, "body_q") and model.body_q is not None else None
+
         for c in range(M):
             s_idx = int(shape_h[c])
-            bpos = body_pos_h[c]  # shape-local (vec3)
+            bpos = body_pos_h[c]  # contact anchor (coordinate frame depends on body_index; see note above)
 
             # Compute world anchor.
+            # For dynamic bodies: bpos is in body-local frame → apply body_q to get world.
+            # For static shapes: bpos is already in world frame (body_index=-1, X_wb=identity).
+            # Do NOT apply shape_transform to static shapes — that would be a double-transform.
             world_anchor = bpos.copy()
-            if shape_body_np is not None and shape_transform_np is not None and s_idx >= 0:
+            if shape_body_np is not None and s_idx >= 0:
                 b_idx = int(shape_body_np[s_idx])
-                if b_idx >= 0:
-                    # Shape attached to a moving body — read body_q.
-                    # body_q is a wp.transform (pos + quat).
-                    body_q_np = model.body_q.numpy()
+                if b_idx >= 0 and body_q_np is not None:
+                    # Shape attached to a moving body — transform body-local → world.
                     bq = body_q_np[b_idx]  # (7,): [px, py, pz, qx, qy, qz, qw]
                     pos_b = bq[:3]
                     quat_b = bq[3:]  # [qx, qy, qz, qw]
                     world_anchor = _transform_point(pos_b, quat_b, bpos)
-                else:
-                    # Static shape (body -1): shape_transform gives the world pose.
-                    st = shape_transform_np[s_idx]  # (7,): [px, py, pz, qx, qy, qz, qw]
-                    pos_s = st[:3]
-                    quat_s = st[3:]
-                    world_anchor = _transform_point(pos_s, quat_s, bpos)
+                # else: body_index < 0 → bpos is already world frame; keep world_anchor = bpos
 
             n = normal_h[c]
             offset_h[c] = float(np.dot(n, world_anchor))

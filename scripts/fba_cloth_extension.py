@@ -220,7 +220,7 @@ def run_one(
     # Snapshot frame 0 (initial state)
     if 0 in SNAPSHOT_FRAMES:
         render_frame(vertices_init, indices.flatten(), 0, model_name, out_dir)
-        print(f"  frame 0: initial cloth x ∈ [{vertices_init[:,0].min():.3f}, {vertices_init[:,0].max():.3f}]")
+        print(f"  frame 0: initial cloth x ∈ [{vertices_init[:, 0].min():.3f}, {vertices_init[:, 0].max():.3f}]")
 
     trajectory_snaps: dict = {}
 
@@ -246,8 +246,7 @@ def run_one(
             trajectory_snaps[frame_num] = q.copy()
             render_frame(q, indices.flatten(), frame_num, model_name, out_dir)
             print(
-                f"  frame {frame_num:3d}: pin_disp={displacement:.3f}m  "
-                f"x ∈ [{q[:,0].min():.3f}, {q[:,0].max():.3f}]"
+                f"  frame {frame_num:3d}: pin_disp={displacement:.3f}m  x ∈ [{q[:, 0].min():.3f}, {q[:, 0].max():.3f}]"
             )
 
     elapsed = time.time() - t0
@@ -270,10 +269,7 @@ def load_abc_trajectory(abc_path: Path) -> dict[int, np.ndarray]:
     selecting only frames that match SNAPSHOT_FRAMES.
     """
     if not DUMP_ABC.exists():
-        raise FileNotFoundError(
-            f"dump_abc_traj binary not found at {DUMP_ABC}. "
-            "Recompile from /tmp/dump_abc_traj.cpp."
-        )
+        raise FileNotFoundError(f"dump_abc_traj binary not found at {DUMP_ABC}. Recompile from /tmp/dump_abc_traj.cpp.")
     if not abc_path.exists():
         raise FileNotFoundError(f"Alembic file not found: {abc_path}")
 
@@ -372,9 +368,7 @@ def build_summary_v2(results: dict, realsim_results: dict, indices: np.ndarray):
 
     ncols = len(all_models)
     nrows = len(all_frames)
-    fig, axes = plt.subplots(
-        nrows, ncols, figsize=(6 * ncols, 4 * nrows), subplot_kw={"projection": "3d"}
-    )
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4 * nrows), subplot_kw={"projection": "3d"})
     if nrows == 1:
         axes = [axes]
     if ncols == 1:
@@ -560,9 +554,7 @@ def _build_summary_3col(results: dict, indices: np.ndarray):
 
     ncols = len(models)
     nrows = len(all_frames)
-    fig, axes = plt.subplots(
-        nrows, ncols, figsize=(6 * ncols, 4 * nrows), subplot_kw={"projection": "3d"}
-    )
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4 * nrows), subplot_kw={"projection": "3d"})
     if nrows == 1:
         axes = [axes]
     if ncols == 1:

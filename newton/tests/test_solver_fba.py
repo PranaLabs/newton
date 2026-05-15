@@ -2804,15 +2804,6 @@ class TestPhase4StageCShapePrimitives(unittest.TestCase):
     shape primitives (sphere, box) using Newton's real collision detection.
 
     All tests drive the FULL pipeline:  collide -> update_contacts -> step.
-    Shapes are placed at the origin with an identity transform to keep the
-    static-shape body_pos path in update_contacts correct (the shape_transform
-    is identity so applying it to the body-frame anchor is a no-op).
-
-    Note on a known limitation in update_contacts for non-identity static shapes:
-    For body=-1 (static) shapes, soft_contact_body_pos from create_soft_contacts
-    is already in world frame, but update_contacts applies shape_transform again.
-    When shape_transform is identity (shapes at origin) the error is zero, so all
-    tests place shapes at the origin.
     """
 
     @classmethod
@@ -3125,6 +3116,83 @@ class TestPhase4StageCShapePrimitives(unittest.TestCase):
             min_dist,
             0.25,
             f"Particle too deep inside sphere: min dist={min_dist:.4f} m (sphere radius=0.3)",
+        )
+
+    # ------------------------------------------------------------------ test 6
+
+    def test_non_origin_sphere_contact_no_double_transform(self):
+        """Regression test: sphere placed at a non-origin position should not
+        double-apply shape_transform when computing the contact world anchor.
+
+        If the double-transform bug is reintroduced the computed contact offset
+        will be wrong (the anchor will be placed far from the true contact surface)
+        and the particle will not be pushed out correctly.
+
+        Setup:
+          - Static sphere, radius 0.5, centre at (5, 0, 0).
+          - Single free particle at (5, 0, 0.2) — inside the sphere (d ≈ -0.3).
+          - No gravity, no friction; particle should be pushed radially outward.
+
+        After 80 steps the particle must be at distance >= 0.48 from (5, 0, 0)
+        (sphere radius 0.5 minus 0.02 soft-contact residual tolerance).
+        """
+        builder = newton.ModelBuilder()
+        # Sphere at (5, 0, 0) — non-origin position exercises the
+        # static-shape path in update_contacts that previously double-applied
+        # the shape_transform.
+        builder.add_shape_sphere(
+            body=-1,
+            xform=wp.transform(wp.vec3(5.0, 0.0, 0.0), wp.quat_identity()),
+            radius=0.5,
+        )
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=[
+                wp.vec3(5.0, 0.0, 0.2),  # particle 0 — free, inside sphere
+                wp.vec3(10.0, 0.0, 0.0),  # particle 1 — pinned, well outside
+                wp.vec3(5.0, 10.0, 0.0),  # particle 2 — pinned, well outside
+            ],
+            indices=[0, 1, 2],
+            density=1.0,
+            tri_ke=1.0e4,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+        )
+        builder.particle_mass[1] = 0.0
+        builder.particle_mass[2] = 0.0
+        model = builder.finalize()
+        # Override gravity to zero so the particle does not drift downward under
+        # gravity while being pushed out of the sphere.
+        model.gravity.assign(wp.zeros(1, dtype=wp.vec3))
+
+        pipeline = self._make_pipeline(model, soft_contact_margin=0.2)
+        contacts = pipeline.contacts()
+        solver = SolverFBA(model, iterations=15, friction=False)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+
+        for _ in range(80):
+            s_in.clear_forces()
+            pipeline.collide(s_in, contacts)
+            solver.step(s_in, s_out, None, contacts, dt)
+            s_in, s_out = s_out, s_in
+
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite positions in non-origin sphere test")
+
+        sphere_centre = np.array([5.0, 0.0, 0.0], dtype=np.float64)
+        dist = float(np.linalg.norm(q[0].astype(np.float64) - sphere_centre))
+        self.assertGreaterEqual(
+            dist,
+            0.48,
+            f"Particle distance from sphere centre {dist:.4f} m should be >= 0.48 "
+            "(sphere radius=0.5). If the double-transform bug is present the "
+            "contact anchor is miscomputed and the particle stays inside.",
         )
 
 

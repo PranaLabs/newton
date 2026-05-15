@@ -48,10 +48,7 @@ OUT_DIR = SCRIPT_DIR / "twisting_bar_out_cudatests"
 MESH_PATH = Path("/home/ziqiu/work/RealSim_py/realsim_py/resources/mesh/volume/cube_volume_11340P.mesh")
 
 # RealSim NH .abc trajectory path (pre-run, 810 frames)
-ABC_PATH = Path(
-    "/home/ziqiu/work/RealSim_py/realsim_py/simulation/output_abc"
-    "/TwistingBarNH/output_obj_0.abc"
-)
+ABC_PATH = Path("/home/ziqiu/work/RealSim_py/realsim_py/simulation/output_abc/TwistingBarNH/output_obj_0.abc")
 DUMP_ABC_BIN = Path("/tmp/dump_abc_traj")
 
 # Hardcoded RealSim NH stats from the completed run
@@ -306,10 +303,10 @@ def render_realsim_nh(out_subdir: Path) -> None:
 # 4c. Build 4-column summary montage
 # ---------------------------------------------------------------------------
 MONTAGE_COLS = [
-    ("arap",         "Newton ARAP"),
+    ("arap", "Newton ARAP"),
     ("corotational", "Newton Corot"),
-    ("neohookean",   "Newton NH"),
-    ("realsim",      "RealSim NH"),
+    ("neohookean", "Newton NH"),
+    ("realsim", "RealSim NH"),
 ]
 
 
@@ -334,7 +331,8 @@ def build_montage() -> Path:
     h, w = sample.shape[:2]
 
     fig, axes = plt.subplots(
-        nrows, ncols,
+        nrows,
+        ncols,
         figsize=(ncols * w / 80, nrows * h / 80),
         dpi=80,
     )
@@ -373,9 +371,9 @@ def write_full_perf_summary(device: str) -> Path:
     data = load_perf_json()
 
     energies_newton = [
-        ("arap",         "Newton ARAP"),
+        ("arap", "Newton ARAP"),
         ("corotational", "Newton Corot"),
-        ("neohookean",   "Newton NH"),
+        ("neohookean", "Newton NH"),
     ]
 
     header_note = (
@@ -628,7 +626,7 @@ def main() -> None:
     print(f"  Tets:     {T} (expect ~58956)")
 
     # Build model
-    print(f"\n=== Building model ===")
+    print("\n=== Building model ===")
     t_build0 = time.perf_counter()
     model, top_pins, bot_pins = build_model(verts, tets, MU, LAM)
     t_build1 = time.perf_counter()
@@ -656,7 +654,9 @@ def main() -> None:
     stable_str = f"NaN@{nan_f}" if nan_f is not None else "stable (all 810)"
     completed = stats.get("n_steps", 0)
 
-    header = f"{'':30s} {'setup(ms)':>10} {'mean(ms)':>10} {'median(ms)':>10} {'p95(ms)':>10} {'frames':>8} {'stable':>16}"
+    header = (
+        f"{'':30s} {'setup(ms)':>10} {'mean(ms)':>10} {'median(ms)':>10} {'p95(ms)':>10} {'frames':>8} {'stable':>16}"
+    )
     sep = "-" * len(header)
     row = (
         f"  Newton {label:22s}"
