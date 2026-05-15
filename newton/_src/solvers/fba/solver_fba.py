@@ -33,6 +33,9 @@ class SolverFBA(SolverBase):
     - ``"corotational"`` — Corotational linear elasticity: closed-form 2x2
       solve on singular values of F.  Requires ``mu`` and ``lam`` (first and
       second Lame parameters [Pa]).
+    - ``"neohookean"`` — Neo-Hookean hyperelasticity: 5-iteration Newton solve
+      on singular values of F.  Requires ``mu`` and ``lam`` (first and second
+      Lame parameters [Pa]).
 
     Notes:
         - Float32 ``particle_q`` output: the interior linear solver
@@ -61,7 +64,7 @@ class SolverFBA(SolverBase):
         model: Model,
         iterations: int = 10,
         pin_stiffness: float = 1e12,
-        stretching_model: Literal["arap", "corotational"] = "arap",
+        stretching_model: Literal["arap", "corotational", "neohookean"] = "arap",
         mu: float | None = None,
         lam: float | None = None,
     ) -> None:
@@ -72,14 +75,15 @@ class SolverFBA(SolverBase):
             raise ValueError("SolverFBA requires at least one particle")
         if model.tri_count == 0:
             raise ValueError("SolverFBA requires at least one cloth triangle")
-        if stretching_model not in ("arap", "corotational"):
+        if stretching_model not in ("arap", "corotational", "neohookean"):
             raise NotImplementedError(
-                f"stretching_model={stretching_model!r} not yet implemented; supported: 'arap', 'corotational'"
+                f"stretching_model={stretching_model!r} not yet implemented; "
+                "supported: 'arap', 'corotational', 'neohookean'"
             )
-        if stretching_model == "corotational":
+        if stretching_model in ("corotational", "neohookean"):
             if mu is None or lam is None:
                 raise ValueError(
-                    "stretching_model='corotational' requires both mu and lam (first and second Lamé parameters)"
+                    f"stretching_model={stretching_model!r} requires both mu and lam (first and second Lamé parameters)"
                 )
             if mu <= 0:
                 raise ValueError("mu must be positive")
@@ -203,6 +207,7 @@ class SolverFBA(SolverBase):
             project_pin_kernel,
             project_stretching_arap_kernel,
             project_stretching_corotational_kernel,
+            project_stretching_neohookean_kernel,
             write_velocity_kernel,
             zero_vec3_kernel,
         )
@@ -271,6 +276,21 @@ class SolverFBA(SolverBase):
             elif self.stretching_model == "corotational":
                 wp.launch(
                     project_stretching_corotational_kernel,
+                    dim=model.tri_count,
+                    inputs=[
+                        self._x_cur,
+                        self._tri_indices_d,
+                        self._tri_rest_inv_d,
+                        self._tri_weight_d,
+                        self._mu,
+                        self._lam,
+                    ],
+                    outputs=[self._rhs],
+                    device=device,
+                )
+            elif self.stretching_model == "neohookean":
+                wp.launch(
+                    project_stretching_neohookean_kernel,
                     dim=model.tri_count,
                     inputs=[
                         self._x_cur,

@@ -88,7 +88,7 @@ def main() -> None:
     wp.init()
     device = "cuda:0" if wp.is_cuda_available() else "cpu"
     print(f"Device: {device}")
-    print(f"Cloth: {DIM}x{DIM} grid ({(DIM+1)*(DIM+1)} particles, {2*DIM*DIM} triangles)")
+    print(f"Cloth: {DIM}x{DIM} grid ({(DIM + 1) * (DIM + 1)} particles, {2 * DIM * DIM} triangles)")
     print(f"Lame params: mu={MU}, lam={LAM}")
     print()
 
