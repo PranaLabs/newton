@@ -73,8 +73,8 @@ class SolverFBA(SolverBase):
         # ---- Validate ----
         if model.particle_count == 0:
             raise ValueError("SolverFBA requires at least one particle")
-        if model.tri_count == 0:
-            raise ValueError("SolverFBA requires at least one cloth triangle")
+        if model.tri_count == 0 and (not hasattr(model, "tet_count") or model.tet_count == 0):
+            raise ValueError("SolverFBA requires at least one cloth triangle or tetrahedral element")
         if stretching_model not in ("arap", "corotational", "neohookean"):
             raise NotImplementedError(
                 f"stretching_model={stretching_model!r} not yet implemented; "
@@ -123,6 +123,11 @@ class SolverFBA(SolverBase):
         self._edge_quad_q_d = None
         self._edge_weight_d = None
         self._pin_indices_d = None
+
+        # Tet device data (filled by _setup_pd_system).
+        self._tet_indices_d = None
+        self._tet_rest_inv_d = None
+        self._tet_weight_d = None
 
     def _setup_pd_system(self, dt: float) -> None:
         """Build / rebuild the PD Hessian, factor it, and upload device data."""
@@ -178,6 +183,22 @@ class SolverFBA(SolverBase):
                 dtype=wp.int32,
                 device=device,
             )
+        if meta["tet_indices"].shape[0] > 0:
+            self._tet_indices_d = wp.array(
+                meta["tet_indices"].flatten().astype(np.int32),
+                dtype=wp.int32,
+                device=device,
+            )
+            self._tet_rest_inv_d = wp.array(
+                meta["tet_rest_inv"].astype(np.float32),
+                dtype=wp.mat33,
+                device=device,
+            )
+            self._tet_weight_d = wp.array(
+                meta["tet_weight"].astype(np.float32),
+                dtype=wp.float32,
+                device=device,
+            )
 
     def step(
         self,
@@ -206,6 +227,7 @@ class SolverFBA(SolverBase):
             project_bending_kernel,
             project_pin_kernel,
             project_stretching_arap_kernel,
+            project_stretching_arap_tet_kernel,
             project_stretching_corotational_kernel,
             project_stretching_neohookean_kernel,
             write_velocity_kernel,
@@ -318,6 +340,26 @@ class SolverFBA(SolverBase):
                     outputs=[self._rhs],
                     device=device,
                 )
+            # Tet ARAP projection.
+            if self._tet_indices_d is not None and model.tet_count > 0:
+                if self.stretching_model == "arap":
+                    wp.launch(
+                        project_stretching_arap_tet_kernel,
+                        dim=model.tet_count,
+                        inputs=[
+                            self._x_cur,
+                            self._tet_indices_d,
+                            self._tet_rest_inv_d,
+                            self._tet_weight_d,
+                        ],
+                        outputs=[self._rhs],
+                        device=device,
+                    )
+                elif self.stretching_model in ("corotational", "neohookean"):
+                    raise NotImplementedError(
+                        f"stretching_model={self.stretching_model!r} is not yet implemented for tets. "
+                        "Only 'arap' is supported for tetrahedral elements."
+                    )
             # Global linear solve: x_cur = A^-1 . rhs.
             self._linear_solver.solve(self._rhs, self._x_cur)
 

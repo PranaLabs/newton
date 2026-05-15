@@ -1864,5 +1864,78 @@ class TestTetARAP(unittest.TestCase):
         np.testing.assert_allclose(total, [0.0, 0.0, 0.0], atol=1e-5)
 
 
+class TestTetARAPIntegration(unittest.TestCase):
+    """Smoke and integration tests for SolverFBA with tet softbody."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _build_tet_grid(self, dim: int = 4):
+        """Build a dim x dim x dim tet grid, pinning the left face via fix_left=True."""
+        builder = newton.ModelBuilder()
+        builder.add_soft_grid(
+            pos=wp.vec3(0.0, 0.0, 0.1),  # lift off ground
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=dim,
+            dim_y=dim,
+            dim_z=dim,
+            cell_x=0.1,
+            cell_y=0.1,
+            cell_z=0.1,
+            density=1.0e3,
+            k_mu=1.0e4,
+            k_lambda=1.0e4,
+            k_damp=0.0,
+            fix_left=True,
+        )
+        return builder.finalize()
+
+    def test_softbody_cube_smoke_no_nan(self):
+        """Run 100 steps on a 4x4x4 tet grid; verify no NaN."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._build_tet_grid(dim=4)
+        self.assertGreater(model.tet_count, 0, "model should have tets")
+        solver = SolverFBA(model, iterations=10)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+        for _ in range(100):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite positions after 100 tet steps")
+
+    def test_solver_init_rejects_no_geometry(self):
+        """Model with no triangles and no tets must raise ValueError."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder()
+        builder.add_particle(pos=wp.vec3(0.0, 0.0, 0.0), vel=wp.vec3(0.0, 0.0, 0.0), mass=1.0)
+        model = builder.finalize()
+        with self.assertRaises(ValueError):
+            SolverFBA(model, iterations=1)
+
+    def test_softbody_gravity_sag(self):
+        """Pinned-left tet grid must deform under gravity."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._build_tet_grid(dim=4)
+        solver = SolverFBA(model, iterations=10)
+        s_in, s_out = model.state(), model.state()
+        q_initial = s_in.particle_q.numpy().copy()
+        dt = 1.0 / 60.0
+        for _ in range(200):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q_final = s_in.particle_q.numpy()
+        # At least some free particles should have moved under gravity.
+        max_displacement = np.abs(q_final - q_initial).max()
+        self.assertGreater(max_displacement, 1e-3, "tet softbody did not deform under gravity")
+
+
 if __name__ == "__main__":
     unittest.main()
