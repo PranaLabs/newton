@@ -49,10 +49,12 @@ N_ITER = 5
 GRAVITY = np.array([0.0, 0.0, -10.0], dtype=np.float32)
 
 # Young=1e4, Poisson=0.4 → μ = E / (2(1+ν)) = 1e4 / 2.8 ≈ 3571.43
-# RealSim ARAP weight = 2μ per area; Newton tri_ke = 2μ = 7142.86
-# But following the task spec: tri_ke = 3571 (= 2μ as PD weight, area-scaled later)
-TRI_KE = 3571.0
+# RealSim ARAP weight = 2μ per area; Newton tri_ke passed to build_pd_system
+# as tri_weight = ke * area, so ke = 2μ = 7142.857 to match RealSim's "2*mu*area" factor.
+TRI_KE = 7142.857
 EDGE_KE = 0.1
+# RealSim init.h:1023: w_pin = 1e10 (not Newton's default 1e12)
+PIN_STIFFNESS = 1e10
 
 # Pin boxes from cloth.json (xmin, ymin, zmin, xmax, ymax, zmax)
 PIN_BOXES = [
@@ -118,11 +120,13 @@ def find_pin_indices(vertices: list[wp.vec3], boxes: list[tuple]) -> list[int]:
 # 4. Build Newton model
 # ---------------------------------------------------------------------------
 def build_model(vertices: list[wp.vec3], indices: list[int]) -> newton.Model:
+    N = len(vertices)
     total_area = compute_total_area(vertices, indices)
     # density such that sum of (density * area/3) over all triangle-vertex
-    # contributions = 1.0 kg total mass for free particles
+    # contributions = 1.0 kg total mass — used only to satisfy API, then overridden
+    # to uniform 1/N per-particle (matching RealSim's Mass::addObjectMass convention).
     density = 1.0 / total_area
-    print(f"  total_area = {total_area:.6f} m², density = {density:.6f} kg/m²")
+    print(f"  total_area = {total_area:.6f} m², density = {density:.6f} kg/m² (overridden to uniform 1/N)")
 
     # Z-up world (mesh is in XY plane, gravity is [0,0,-10])
     builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=-10.0)
@@ -141,6 +145,11 @@ def build_model(vertices: list[wp.vec3], indices: list[int]) -> newton.Model:
         edge_ke=EDGE_KE,
         edge_kd=0.0,
     )
+
+    # Override to uniform 1/N mass (RealSim uses Mass::addObjectMass which distributes
+    # total mass uniformly across all N vertices, not area-weighted).
+    for i in range(N):
+        builder.particle_mass[i] = 1.0 / N
 
     # Pin the two top corners.
     pin_indices = find_pin_indices(vertices, PIN_BOXES)
@@ -167,7 +176,7 @@ def build_model(vertices: list[wp.vec3], indices: list[int]) -> newton.Model:
 # 5. Run Newton SolverFBA for N_FRAMES steps
 # ---------------------------------------------------------------------------
 def run_newton(model: newton.Model) -> np.ndarray:
-    solver = SolverFBA(model, iterations=N_ITER)
+    solver = SolverFBA(model, iterations=N_ITER, pin_stiffness=PIN_STIFFNESS)
     state_in = model.state()
     state_out = model.state()
 
@@ -268,14 +277,17 @@ def main() -> None:
     print(f"\nNewton trajectory:    {NEWTON_TRAJ_PATH}   shape={newton_traj.shape}")
     print(f"RealSim trajectory:   {REALSIM_TRAJ_PATH}  shape={realsim_traj.shape}")
 
-    print("\nPer-frame max L2 deltas (frames 0, 10, 20, 30, 40, 49):")
-    for f in [0, 10, 20, 30, 40, 49]:
-        delta = np.linalg.norm(newton_traj[f] - realsim_traj[f], axis=-1).max()
+    # Newton trajectory[f] corresponds to RealSim trajectory[f+1] because the
+    # RealSim ABC file starts at frame 0 (initial config) while Newton saves
+    # positions after each step (frame 0 = after step 1, ...).
+    print("\nPer-frame max L2 deltas (frames 0, 10, 20, 30, 40, 48) [newton[f] vs realsim[f+1]]:")
+    for f in [0, 10, 20, 30, 40, 48]:
+        delta = np.linalg.norm(newton_traj[f] - realsim_traj[f + 1], axis=-1).max()
         print(f"  frame {f:2d}:  {delta:.3e}")
 
-    print("\nPer-frame max L2 deltas (all frames):")
-    for f in range(N_FRAMES):
-        delta = np.linalg.norm(newton_traj[f] - realsim_traj[f], axis=-1).max()
+    print("\nPer-frame max L2 deltas (all frames) [newton[f] vs realsim[f+1]]:")
+    for f in range(N_FRAMES - 1):
+        delta = np.linalg.norm(newton_traj[f] - realsim_traj[f + 1], axis=-1).max()
         print(f"  frame {f:2d}:  {delta:.3e}")
 
     # Spot-check pinned vertices stability in Newton (must not move)

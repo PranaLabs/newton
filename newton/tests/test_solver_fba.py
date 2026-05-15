@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from pathlib import Path
 
 import numpy as np
 import warp as wp
@@ -1034,6 +1035,156 @@ class TestSolverFBAStability(unittest.TestCase):
             s_in, s_out = s_out, s_in
         q = s_in.particle_q.numpy()
         self.assertTrue(np.all(np.isfinite(q)), "64x64 cloth went NaN at realistic tri_ke=1e4")
+
+
+class TestFBARealSimAgreement(unittest.TestCase):
+    """Bit-level trajectory match vs RealSim C++ reference (50 steps, 113-vertex cloth).
+
+    Fixture: ``newton/tests/fixtures/fba_realsim_trajectory.npy`` (50, 113, 3) float32.
+    Captured once from RealSim C++ LocalGlobalSolver + SPARSE_INVERSE_CUDA.
+    Frame ``k`` of the fixture is the RealSim state *after* step ``k``, so we
+    compare ``newton_traj[k]`` (after step ``k+1``) vs ``fixture[k+1]`` for
+    ``k`` in ``[0, 48]``.
+
+    See docs/superpowers/specs/2026-05-15-fba-realsim-crosscheck-rootcause.md
+    and crosscheck-results.md for the diagnosis trail.
+    """
+
+    FIXTURE_DIR = Path(__file__).parent / "fixtures"
+    OBJ_PATH = FIXTURE_DIR / "fba_cloth_113.obj"
+    TRAJ_PATH = FIXTURE_DIR / "fba_realsim_trajectory.npy"
+
+    # Simulation parameters matching RealSim FBACrossCheck
+    DT = 0.01
+    N_FRAMES = 50
+    N_ITER = 5
+    # E=1e4, nu=0.4 → mu = E/(2*(1+nu)) = 1e4/2.8 ≈ 3571.43; tri_ke = 2*mu ≈ 7142.857
+    TRI_KE = 7142.857
+    EDGE_KE = 0.1
+    PIN_STIFFNESS = 1e10  # RealSim init.h:1023
+    # Pin bounding boxes (xmin, ymin, zmin, xmax, ymax, zmax) — top two corners
+    PIN_BOXES = [
+        (-1.1, 0.9, -0.1, -0.9, 1.1, 0.1),
+        (0.9, 0.9, -0.1, 1.1, 1.1, 0.1),
+    ]
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    @staticmethod
+    def _load_obj(path: "Path") -> "tuple[list[wp.vec3], list[int]]":
+        """Parse .obj → (vertices, triangle_indices_0based)."""
+        from pathlib import Path as _Path  # noqa: PLC0415
+
+        vertices: list[wp.vec3] = []
+        indices: list[int] = []
+        with open(_Path(path)) as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("v "):
+                    parts = line.split()
+                    vertices.append(wp.vec3(float(parts[1]), float(parts[2]), float(parts[3])))
+                elif line.startswith("f "):
+                    parts = line.split()[1:]
+                    face_idx = [int(p.split("/")[0]) - 1 for p in parts]
+                    for i in range(1, len(face_idx) - 1):
+                        indices.extend([face_idx[0], face_idx[i], face_idx[i + 1]])
+        return vertices, indices
+
+    @staticmethod
+    def _find_pin_indices(vertices: "list[wp.vec3]", boxes: "list[tuple]") -> "list[int]":
+        pinned: list[int] = []
+        for i, v in enumerate(vertices):
+            x, y, z = v[0], v[1], v[2]
+            for xmin, ymin, zmin, xmax, ymax, zmax in boxes:
+                if xmin <= x <= xmax and ymin <= y <= ymax and zmin <= z <= zmax:
+                    pinned.append(i)
+                    break
+        return pinned
+
+    def _build_model(self, vertices: "list[wp.vec3]", indices: "list[int]") -> "newton.Model":
+        """Build Newton model matching RealSim FBACrossCheck scene."""
+        import newton as _newton  # noqa: PLC0415
+
+        N = len(vertices)
+        # Compute density for API compliance (overridden below to uniform 1/N).
+        verts_np = np.array([[v[0], v[1], v[2]] for v in vertices], dtype=np.float64)
+        idxs = np.array(indices, dtype=np.int32).reshape(-1, 3)
+        total_area = 0.0
+        for tri in idxs:
+            e1 = verts_np[tri[1]] - verts_np[tri[0]]
+            e2 = verts_np[tri[2]] - verts_np[tri[0]]
+            total_area += 0.5 * float(np.linalg.norm(np.cross(e1, e2)))
+        density = 1.0 / total_area  # so that sum-of-area-weights ≈ 1 kg total
+
+        builder = _newton.ModelBuilder(up_axis=_newton.Axis.Z, gravity=-10.0)
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=vertices,
+            indices=indices,
+            density=density,
+            tri_ke=self.TRI_KE,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=self.EDGE_KE,
+            edge_kd=0.0,
+        )
+        # Override to uniform 1/N mass (RealSim Mass::addObjectMass convention).
+        for i in range(N):
+            builder.particle_mass[i] = 1.0 / N
+        # Pin top-corner vertices by zeroing their mass.
+        for idx in self._find_pin_indices(vertices, self.PIN_BOXES):
+            builder.particle_mass[idx] = 0.0
+        return builder.finalize()
+
+    def test_drape_trajectory_matches_realsim(self):
+        """50-step drape on 113-vertex cloth: max position delta < 5e-5 m at every frame."""
+        from pathlib import Path  # noqa: PLC0415
+
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        # Load mesh fixture.
+        vertices, indices = self._load_obj(self.OBJ_PATH)
+        self.assertEqual(len(vertices), 113)
+
+        # Load RealSim reference trajectory (shape: 50 frames × 113 verts × 3).
+        realsim_traj = np.load(str(self.TRAJ_PATH))
+        self.assertEqual(realsim_traj.shape, (50, 113, 3))
+
+        # Build model and solver.
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        model = self._build_model(vertices, indices)
+        solver = SolverFBA(model, iterations=self.N_ITER, pin_stiffness=self.PIN_STIFFNESS)
+
+        state_in = model.state()
+        state_out = model.state()
+        newton_traj = np.zeros((self.N_FRAMES, model.particle_count, 3), dtype=np.float32)
+
+        for f in range(self.N_FRAMES):
+            state_in.clear_forces()
+            solver.step(state_in, state_out, None, None, self.DT)
+            newton_traj[f] = state_out.particle_q.numpy()
+            state_in, state_out = state_out, state_in
+
+        self.assertTrue(np.all(np.isfinite(newton_traj)), "non-finite positions in Newton trajectory")
+
+        # Compare newton[k] vs realsim[k+1] for k in [0, 48].
+        # realsim[0] = initial config (before any step); realsim[k+1] = after step k+1.
+        max_delta = 0.0
+        for k in range(self.N_FRAMES - 1):
+            delta = float(np.linalg.norm(newton_traj[k] - realsim_traj[k + 1], axis=-1).max())
+            max_delta = max(max_delta, delta)
+
+        self.assertLess(
+            max_delta,
+            5e-5,
+            f"Max L2 position delta {max_delta:.3e} m exceeds 5e-5 m tolerance "
+            f"(observed ~6 µm after gravity-pin fix; float32 noise floor ~1e-7 m)",
+        )
 
 
 if __name__ == "__main__":

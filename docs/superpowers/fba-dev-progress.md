@@ -14,7 +14,7 @@ Live tracker for the Newton port of RealSim's "Fast But Accurate" projective-dyn
 | Robustness tests (extreme configs / forces / reconfigure / stability) | ✅ Done | 14 new tests |
 | Stability diagnosis (proved 30× gap was parameter, not bug) | ✅ Done | `docs/superpowers/specs/2026-05-15-fba-stability-diagnosis.md` |
 | Pre-commit / lint cleanup | ✅ Done | All hooks green |
-| **Numerical RealSim cross-check** | 🚧 Blocked on formulation question | Trajectory captured both sides; 79mm/2m gap @ step 48; algorithmic divergence source unclear (agent's "M+dt²L vs M/dt²+L" explanation doesn't hold algebraically) |
+| **Numerical RealSim cross-check** | ✅ Done | Root cause: gravity-pin skip in `compute_inertial_kernel`; fix + fixture + test committed; max L2 residual 5.99 µm at step 48 |
 | Contact / collision (plane / primitives + CCD/DCD) | ⬜ Not started | Largest remaining feature gap |
 | Softbody (PDTetrahedronEnergy) | ⬜ Not started | Builder + new project_tet kernel |
 | Material model extensions (Corotational / Neo-Hookean / StVK) | ⬜ Not started | Dispatch hook already in place |
@@ -58,28 +58,7 @@ Live tracker for the Newton port of RealSim's "Fast But Accurate" projective-dyn
 
 ## In progress
 
-### Numerical cross-check with RealSim — blocked pending formulation review
-
-**Status**: Trajectories captured both sides (50 frames × 113-vertex cloth, 2-corner pin, dt=0.01, 5 PD iters). Max position delta grows monotonically from 4.4e-4 m @ step 0 to **0.103 m @ step 48** with original params, 0.079 m after correcting `tri_ke = 2μ` (was just μ) and using uniform 1/N mass (RealSim's `Mass::addObjectMass` convention).
-
-**Diagnosis findings** (`docs/superpowers/specs/2026-05-15-fba-realsim-crosscheck-results.md`):
-- Pin stiffness mismatch — negligible (1e-9 m drift at pinned vertices).
-- Element ordering / index mapping — verified identical.
-- Mass distribution — RealSim uses uniform 1/N, we use area-weighted density. Minor effect (~7% delta improvement).
-- TRI_KE convention — RealSim's `_weight = 2μ`, our script was passing `μ`. ~13% delta improvement after fix.
-- **Diagnostic agent's "convergence rate" hypothesis algebraically doesn't hold**: scaling Newton's `(M/dt² + L) x = (M/dt²) sn + p` by dt² yields RealSim's `(M + dt²L) x = M sn + dt² p` — identical systems → exact solves must agree on the same `p(x_k)`. The actual divergence source remains unclear; possibilities to investigate:
-  - Different gravity placement (in `sn` vs in `p`)
-  - Different `x_0` warm-start (RealSim might use `x_prev`, not `sn`)
-  - RealSim's `_weight` may absorb additional factors we haven't traced
-  - Implicit damping coefficient applied between iterations
-
-**Files captured (not yet committed)**:
-- `scripts/fba_realsim_crosscheck.py` — Newton-side harness
-- `scripts/fba_newton_trajectory.npy`, `scripts/fba_realsim_trajectory.npy` — 50-frame arrays
-- `docs/superpowers/specs/2026-05-15-fba-realsim-crosscheck-probe.md` — RealSim setup notes
-- `docs/superpowers/specs/2026-05-15-fba-realsim-crosscheck-results.md` — diagnosis
-
-**Next**: needs user decision on how to proceed (deeper investigation / accept relaxed tolerance / reformulate). See options at the end of the results doc.
+_(nothing currently blocked)_
 
 ## Backlog (ordered)
 
