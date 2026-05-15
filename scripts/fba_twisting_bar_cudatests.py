@@ -23,7 +23,9 @@ Outputs (all in scripts/twisting_bar_out_cudatests/):
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import subprocess
 import time
 from pathlib import Path
 
@@ -44,6 +46,41 @@ from newton.solvers import SolverFBA
 SCRIPT_DIR = Path(__file__).parent
 OUT_DIR = SCRIPT_DIR / "twisting_bar_out_cudatests"
 MESH_PATH = Path("/home/ziqiu/work/RealSim_py/realsim_py/resources/mesh/volume/cube_volume_11340P.mesh")
+
+# RealSim NH .abc trajectory path (pre-run, 810 frames)
+ABC_PATH = Path(
+    "/home/ziqiu/work/RealSim_py/realsim_py/simulation/output_abc"
+    "/TwistingBarNH/output_obj_0.abc"
+)
+DUMP_ABC_BIN = Path("/tmp/dump_abc_traj")
+
+# Hardcoded RealSim NH stats from the completed run
+REALSIM_NH_STATS = {
+    "frames": 810,
+    "stable": True,
+    "mean_ms": 50.23,
+    "median_ms": 50.68,
+    "p95_ms": 55.92,
+}
+
+# JSON sidecar that accumulates per-energy Newton perf stats across runs
+PERF_JSON = OUT_DIR / "perf_stats.json"
+
+
+def load_perf_json() -> dict:
+    if PERF_JSON.exists():
+        with open(str(PERF_JSON)) as fh:
+            return json.load(fh)
+    return {}
+
+
+def save_perf_json(energy: str, stats: dict) -> None:
+    data = load_perf_json()
+    data[energy] = stats
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    with open(str(PERF_JSON), "w") as fh:
+        json.dump(data, fp=fh, indent=2)
+
 
 # ---------------------------------------------------------------------------
 # CudaTests simulation parameters (match CudaTests/TwistingBarNH exactly)
@@ -66,7 +103,7 @@ PIN_Y_TOP = 1.99
 PIN_Y_BOT = -1.99
 
 # Snapshot frames (subset of 810)
-SNAPSHOT_FRAMES = [0, 8, 16, 50, 100, 400, 800, 809]
+SNAPSHOT_FRAMES = [0, 8, 16, 24, 50, 100, 200, 400, 600, 809]
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +261,197 @@ def render_frame(q: np.ndarray, frame_idx: int, out_path: Path, label: str) -> N
 
 
 # ---------------------------------------------------------------------------
+# 4b. Extract and render RealSim NH .abc trajectory
+# ---------------------------------------------------------------------------
+def render_realsim_nh(out_subdir: Path) -> None:
+    """Stream RealSim NH .abc via dump_abc_traj, render SNAPSHOT_FRAMES."""
+    snapshot_set = set(SNAPSHOT_FRAMES)
+    out_subdir.mkdir(parents=True, exist_ok=True)
+
+    print(f"  [RealSim NH] Streaming {ABC_PATH.name} via {DUMP_ABC_BIN} ...", flush=True)
+    proc = subprocess.Popen(
+        [str(DUMP_ABC_BIN), str(ABC_PATH)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdout is not None
+
+    num_samples = int(proc.stdout.readline().strip())
+    print(f"  [RealSim NH] {num_samples} frames in .abc", flush=True)
+
+    for f in range(num_samples):
+        n_verts = int(proc.stdout.readline().strip())
+        verts = np.empty((n_verts, 3), dtype=np.float32)
+        for i in range(n_verts):
+            parts = proc.stdout.readline().split()
+            verts[i, 0] = float(parts[0])
+            verts[i, 1] = float(parts[1])
+            verts[i, 2] = float(parts[2])
+
+        if f in snapshot_set:
+            img_path = out_subdir / f"frame_{f:04d}.png"
+            render_frame(verts, f, img_path, "RealSim NH")
+            print(f"  [RealSim NH] frame {f} rendered -> {img_path.name}", flush=True)
+
+        if f % 100 == 0 and f > 0:
+            print(f"  [RealSim NH] parsed frame {f}/{num_samples}", flush=True)
+
+    proc.wait()
+    if proc.returncode != 0:
+        print(f"  [RealSim NH] WARNING: dump_abc_traj exited with code {proc.returncode}", flush=True)
+    print("  [RealSim NH] Done.", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# 4c. Build 4-column summary montage
+# ---------------------------------------------------------------------------
+MONTAGE_COLS = [
+    ("arap",         "Newton ARAP"),
+    ("corotational", "Newton Corot"),
+    ("neohookean",   "Newton NH"),
+    ("realsim",      "RealSim NH"),
+]
+
+
+def build_montage() -> Path:
+    """Assemble 10-row × 4-col montage from per-energy frame PNGs."""
+    rows = SNAPSHOT_FRAMES
+    ncols = len(MONTAGE_COLS)
+    nrows = len(rows)
+
+    # Load all images to get pixel shape
+    cells: dict[tuple[int, int], np.ndarray] = {}
+    for c, (energy_dir, _) in enumerate(MONTAGE_COLS):
+        for r, frame_idx in enumerate(rows):
+            p = OUT_DIR / energy_dir / f"frame_{frame_idx:04d}.png"
+            if p.exists():
+                cells[(r, c)] = plt.imread(str(p))
+            else:
+                print(f"  [montage] WARNING: missing {p}", flush=True)
+
+    # Infer cell size from first available image
+    sample = next(iter(cells.values()))
+    h, w = sample.shape[:2]
+
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(ncols * w / 80, nrows * h / 80),
+        dpi=80,
+    )
+    # Normalise to 2-D if only 1 row
+    if nrows == 1:
+        axes = axes[np.newaxis, :]
+
+    col_labels = [label for _, label in MONTAGE_COLS]
+    for c, col_label in enumerate(col_labels):
+        axes[0, c].set_title(col_label, fontsize=8, fontweight="bold")
+
+    for r, frame_idx in enumerate(rows):
+        axes[r, 0].set_ylabel(f"f={frame_idx}", fontsize=7, rotation=0, labelpad=28)
+        for c in range(ncols):
+            ax = axes[r, c]
+            if (r, c) in cells:
+                ax.imshow(cells[(r, c)])
+            else:
+                ax.set_facecolor("lightgrey")
+                ax.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax.transAxes)
+            ax.axis("off")
+
+    fig.tight_layout(pad=0.3)
+    out_path = OUT_DIR / "summary.png"
+    plt.savefig(str(out_path), dpi=80, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [montage] Saved {out_path}", flush=True)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# 4d. Write combined perf summary (all Newton energies + RealSim NH)
+# ---------------------------------------------------------------------------
+def write_full_perf_summary(device: str) -> Path:
+    """Write combined Newton + RealSim perf table to perf_summary.txt."""
+    data = load_perf_json()
+
+    energies_newton = [
+        ("arap",         "Newton ARAP"),
+        ("corotational", "Newton Corot"),
+        ("neohookean",   "Newton NH"),
+    ]
+
+    header_note = (
+        "Newton FBA CudaTests params: E=1e9, nu=0.45, 810 frames, dt=0.01, PD_iter=5\n"
+        "Mesh: cube_volume_11340P.mesh (11340 verts, ~58956 tets)\n"
+        f"Device: {device}\n\n"
+    )
+
+    col_w = 28
+    num_w = 10
+
+    header = (
+        f"{'':>{col_w}}"
+        f"{'setup(ms)':>{num_w}}"
+        f"{'mean(ms)':>{num_w}}"
+        f"{'median(ms)':>{num_w}}"
+        f"{'p95(ms)':>{num_w}}"
+        f"{'frames':>{num_w}}"
+        f"{'stable':>16}"
+    )
+    sep = "-" * len(header)
+
+    lines = [header_note, header, sep]
+
+    for key, label in energies_newton:
+        s = data.get(key, {})
+        if s:
+            nan_f = s.get("nan_frame")
+            stable_str = f"NaN@{nan_f}" if nan_f is not None else "YES"
+            row = (
+                f"  {label:<{col_w - 2}}"
+                f"{s.get('setup_ms', 0):>{num_w}.1f}"
+                f"{s.get('mean_ms', 0):>{num_w}.2f}"
+                f"{s.get('median_ms', 0):>{num_w}.2f}"
+                f"{s.get('p95_ms', 0):>{num_w}.2f}"
+                f"{s.get('n_steps', 0):>{num_w}}"
+                f"{stable_str:>16}"
+            )
+        else:
+            row = f"  {label:<{col_w - 2}}{'(not yet run)':>{num_w}}"
+        lines.append(row)
+
+    lines.append(sep)
+
+    # RealSim NH row (no setup time reported by RealSim)
+    rs = REALSIM_NH_STATS
+    stable_rs = "YES" if rs["stable"] else "NO"
+    rs_row = (
+        f"  {'RealSim NH':<{col_w - 2}}"
+        f"{'N/A':>{num_w}}"
+        f"{rs['mean_ms']:>{num_w}.2f}"
+        f"{rs['median_ms']:>{num_w}.2f}"
+        f"{rs['p95_ms']:>{num_w}.2f}"
+        f"{rs['frames']:>{num_w}}"
+        f"{stable_rs:>16}"
+    )
+    lines.append(rs_row)
+    lines.append(sep)
+
+    # Speedup rows vs RealSim NH median
+    lines.append("")
+    lines.append("Speedup (RealSim NH median / Newton median):")
+    for key, label in energies_newton:
+        s = data.get(key, {})
+        if s and s.get("median_ms", 0) > 0:
+            spd = rs["median_ms"] / s["median_ms"]
+            lines.append(f"  {label}: {spd:.2f}x")
+
+    out_path = OUT_DIR / "perf_summary.txt"
+    with open(str(out_path), "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    print(f"  Perf summary written: {out_path}", flush=True)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
 # 5. Run Newton simulation
 # ---------------------------------------------------------------------------
 def run_newton_energy(
@@ -359,6 +587,21 @@ def main() -> None:
         default="neohookean",
         help="Stretching energy model to use (default: neohookean)",
     )
+    parser.add_argument(
+        "--realsim",
+        action="store_true",
+        help="Render RealSim NH .abc trajectory to PNGs (requires /tmp/dump_abc_traj)",
+    )
+    parser.add_argument(
+        "--montage",
+        action="store_true",
+        help="Build 4-column summary montage from existing per-energy frames",
+    )
+    parser.add_argument(
+        "--perf-update",
+        action="store_true",
+        help="Rewrite perf_summary.txt with all accumulated Newton + RealSim stats",
+    )
     args = parser.parse_args()
 
     wall_start = time.perf_counter()
@@ -428,31 +671,23 @@ def main() -> None:
     print(sep)
     print(row)
 
-    # Save perf summary
-    perf_path = OUT_DIR / "perf_summary.txt"
-    note = (
-        "Newton FBA CudaTests params: E=1e9, nu=0.45, 810 frames, dt=0.01, PD_iter=5\n"
-        f"Mesh: cube_volume_11340P.mesh (11340 verts, ~58956 tets)\n"
-        f"Device: {device}\n\n"
-    )
-    with open(str(perf_path), "w") as fh:
-        fh.write(note)
-        fh.write(header + "\n")
-        fh.write(sep + "\n")
-        fh.write(row + "\n")
-        fh.write("\n")
-        fh.write(f"RealSim NH (CudaTests, E=1e9): see /tmp/realsim_twistbar_nh.log\n")
-        fh.write(f"Comparison table (fill in after RealSim run):\n\n")
-        fh.write(f"{'':30s} {'frames':>8} {'stable':>16} {'mean(ms)':>10} {'median(ms)':>10} {'p95(ms)':>10}\n")
-        fh.write(f"{'-'*90}\n")
-        fh.write(
-            f"  Newton NH (CudaTests, E=1e9)  {completed:>8} {stable_str:>16} "
-            f"{stats.get('mean_ms', 0):>10.2f} {stats.get('median_ms', 0):>10.2f} "
-            f"{stats.get('p95_ms', 0):>10.2f}\n"
-        )
-        fh.write(f"  RealSim NH (CudaTests, E=1e9) {'?':>8} {'?':>16} {'?':>10} {'?':>10} {'?':>10}\n")
+    # Accumulate Newton stats into JSON sidecar
+    save_perf_json(args.energy, stats)
 
-    print(f"\n  Perf summary: {perf_path}")
+    if args.realsim:
+        print("\n=== Rendering RealSim NH .abc trajectory ===")
+        realsim_out = OUT_DIR / "realsim"
+        render_realsim_nh(realsim_out)
+
+    if args.montage:
+        print("\n=== Building 4-column montage ===")
+        montage_path = build_montage()
+        print(f"  Montage: {montage_path}")
+
+    if args.perf_update:
+        print("\n=== Writing full perf summary ===")
+        write_full_perf_summary(device)
+
     wall_total = time.perf_counter() - wall_start
     print(f"=== Total wall time: {wall_total:.1f}s ({wall_total / 60:.1f} min) ===")
 
