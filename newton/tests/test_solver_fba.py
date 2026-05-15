@@ -1670,5 +1670,55 @@ class TestFBARealSimAgreementNH(unittest.TestCase):
         )
 
 
+class TestDynamicPin(unittest.TestCase):
+    """Verify SolverFBA.set_pin_targets moves pinned particle to new targets."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_pin_follows_target(self):
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=1.0e4,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
+            fix_left=True,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=5)
+
+        # Move pin 0 by 0.5 m in X over 10 steps.
+        s_in, s_out = model.state(), model.state()
+        x_ref = s_in.particle_q.numpy().copy()
+        for _step in range(10):
+            x_ref[0, 0] += 0.05  # 5 cm per step
+            solver.set_pin_targets(x_ref)
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+
+        # Pinned particle 0 should be close to its target.
+        final = s_in.particle_q.numpy()[0]
+        target = x_ref[0]
+        self.assertLess(
+            np.linalg.norm(final - target),
+            1e-3,
+            f"Pin should follow target; final={final}, target={target}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

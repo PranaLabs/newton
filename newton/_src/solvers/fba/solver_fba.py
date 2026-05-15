@@ -331,6 +331,23 @@ class SolverFBA(SolverBase):
             device=device,
         )
 
+    def set_pin_targets(self, target_positions) -> None:
+        """Update reference positions for pinned particles (dynamic pin).
+
+        For pinned particles (``inv_mass == 0``), the soft Pin energy pulls them
+        toward ``target_positions[i]``.  For free particles the value is unused
+        but the array must cover all particles.
+
+        Args:
+            target_positions: Per-particle target positions [particle_count, 3].
+                Accepts either a :class:`warp.array` (``dtype=wp.vec3``) or a
+                NumPy array of shape ``(particle_count, 3)`` in float32.
+        """
+        if isinstance(target_positions, wp.array):
+            self._x_ref.assign(target_positions)
+        else:
+            self._x_ref.assign(np.asarray(target_positions, dtype=np.float32))
+
     def notify_model_changed(self, flags: int) -> None:
         # On any geometry/inertial change, force a full re-setup at the next step.
         from ..flags import SolverNotifyFlags  # noqa: PLC0415
