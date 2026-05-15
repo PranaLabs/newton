@@ -79,3 +79,7 @@ scripts/cloth_extension_out/
 
 # Twisting bar demo outputs (regenerable, too large for git)
 scripts/twisting_bar_out/
+
+# Contact demos outputs (regenerable, too large for git)
+scripts/contact_demos_out/*
+!scripts/contact_demos_out/README.md
