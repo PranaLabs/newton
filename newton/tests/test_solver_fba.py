@@ -2352,8 +2352,9 @@ class TestPhase4StageAContact(unittest.TestCase):
         solver.step(s_in_b, s_out_b, None, empty_contacts, dt)
         q_empty_contact = s_out_b.particle_q.numpy().copy()
 
-        np.testing.assert_allclose(q_empty_contact, q_no_contact, atol=1e-6,
-                                   err_msg="Empty contacts path diverged from contacts=None path")
+        np.testing.assert_allclose(
+            q_empty_contact, q_no_contact, atol=1e-6, err_msg="Empty contacts path diverged from contacts=None path"
+        )
 
     def test_single_plane_contact_pushes_particle_away(self):
         """Single particle below y=0 plane should be pushed to y≥0 after step.
@@ -2369,7 +2370,7 @@ class TestPhase4StageAContact(unittest.TestCase):
             device,
             count=1,
             particle_indices=[0],
-            normals=[(0.0, 1.0, 0.0)],      # outward normal pointing +y
+            normals=[(0.0, 1.0, 0.0)],  # outward normal pointing +y
             body_pos_world=[(0.0, 0.0, 0.0)],  # anchor on the y=0 plane
         )
 
@@ -2380,8 +2381,9 @@ class TestPhase4StageAContact(unittest.TestCase):
 
         q = s_out.particle_q.numpy()
         particle_y = float(q[0, 1])
-        self.assertGreaterEqual(particle_y, -1e-4,
-                                f"Particle y={particle_y:.6f} should be >= 0 after plane contact correction")
+        self.assertGreaterEqual(
+            particle_y, -1e-4, f"Particle y={particle_y:.6f} should be >= 0 after plane contact correction"
+        )
 
     def test_multiple_plane_contacts_no_interpenetration(self):
         """Four particles, each below the y=0 plane, each with a separate contact.
@@ -2415,7 +2417,7 @@ class TestPhase4StageAContact(unittest.TestCase):
         solver = SolverFBA(model, iterations=10)
 
         # All particles start at y = -0.5; identify the free ones.
-        pos_np = model.particle_q.numpy()  # (N, 3)
+        pos_np = model.particle_q.numpy()  # (N, 3)  # noqa: F841
         inv_mass = model.particle_inv_mass.numpy()
         free_indices = [i for i in range(N) if inv_mass[i] > 0]
 
@@ -2434,8 +2436,7 @@ class TestPhase4StageAContact(unittest.TestCase):
         q = s_out.particle_q.numpy()
         for fi in free_indices:
             y = float(q[fi, 1])
-            self.assertGreaterEqual(y, -1e-4,
-                                    f"Particle {fi} y={y:.6f} should be >= 0 after plane contact correction")
+            self.assertGreaterEqual(y, -1e-4, f"Particle {fi} y={y:.6f} should be >= 0 after plane contact correction")
 
     def test_schur_W_is_positive_definite_for_active_contacts(self):
         """W = J A⁻¹ Jᵀ must be symmetric positive definite for active contacts.
@@ -2447,7 +2448,10 @@ class TestPhase4StageAContact(unittest.TestCase):
         """
         import scipy.sparse as sp
 
-        from newton._src.solvers.fba.linear_solver import FBALinearSolver, factorize_and_sparse_inverse
+        from newton._src.solvers.fba.linear_solver import (  # noqa: PLC0415
+            FBALinearSolver,
+            factorize_and_sparse_inverse,
+        )
 
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
         rng = np.random.default_rng(7)
@@ -2465,13 +2469,16 @@ class TestPhase4StageAContact(unittest.TestCase):
         M = 5
         # Pick 5 distinct particle indices.
         particles = np.array([0, 5, 10, 15, 20], dtype=np.int32)
-        normals_np = np.array([
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-            [0.707, 0.707, 0.0],
-            [0.0, 0.577, 0.816],
-        ], dtype=np.float32)
+        normals_np = np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [0.707, 0.707, 0.0],
+                [0.0, 0.577, 0.816],
+            ],
+            dtype=np.float32,
+        )
         # Normalise.
         for i in range(M):
             normals_np[i] /= np.linalg.norm(normals_np[i])
@@ -2484,14 +2491,12 @@ class TestPhase4StageAContact(unittest.TestCase):
         W = solver.build_schur_complement(M, j_indices, j_normals, j_alpha)
 
         # 1. Symmetry.
-        np.testing.assert_allclose(W, W.T, atol=1e-12,
-                                   err_msg="W is not symmetric")
+        np.testing.assert_allclose(W, W.T, atol=1e-12, err_msg="W is not symmetric")
 
         # 2. All eigenvalues positive.
         eigvals = np.linalg.eigvalsh(W)
         min_eig = float(eigvals.min())
-        self.assertGreater(min_eig, 0.0,
-                           f"W has non-positive eigenvalue: {min_eig:.3e}. eigvals={eigvals}")
+        self.assertGreater(min_eig, 0.0, f"W has non-positive eigenvalue: {min_eig:.3e}. eigvals={eigvals}")
 
         # 3. Scalar check for first contact: W[0,0] = n^T A^{-1}_{pp} n
         #    where A^{-1}_{pp} is the 1x1 scalar block at particle 0.
@@ -2503,8 +2508,9 @@ class TestPhase4StageAContact(unittest.TestCase):
         # because the FBA solve does each component independently.
         W00_expected = float(np.dot(n0, n0)) * float(Ainv_dense[p0, p0])
         # Tolerance accounts for float32 → float64 round-trip in solve().
-        self.assertAlmostEqual(W[0, 0], W00_expected, delta=1e-7,
-                               msg=f"W[0,0]={W[0,0]:.8f} != expected {W00_expected:.8f}")
+        self.assertAlmostEqual(
+            W[0, 0], W00_expected, delta=1e-7, msg=f"W[0,0]={W[0, 0]:.8f} != expected {W00_expected:.8f}"
+        )
 
 
 class TestPhase4StageBFriction(unittest.TestCase):
@@ -2516,7 +2522,7 @@ class TestPhase4StageBFriction(unittest.TestCase):
 
     def test_coulomb_cone_projection_correctness(self):
         """project_coulomb_cone handles inside-cone, polar-cone, and surface cases."""
-        from newton._src.solvers.fba.solver_fba import project_coulomb_cone
+        from newton._src.solvers.fba.solver_fba import project_coulomb_cone  # noqa: PLC0415
 
         mu = 0.5
 
@@ -2548,7 +2554,6 @@ class TestPhase4StageBFriction(unittest.TestCase):
         self.assertAlmostEqual(s4, 0.0, places=10)
         np.testing.assert_allclose(v4, [0.0, 0.0], atol=1e-12)
 
-
     def test_friction_disabled_matches_stage_a(self):
         """SolverFBA(friction=False) must produce bit-identical results to Stage A."""
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
@@ -2559,8 +2564,8 @@ class TestPhase4StageBFriction(unittest.TestCase):
             vel=wp.vec3(0.0, 0.0, 0.0),
             vertices=[
                 wp.vec3(0.0, -0.5, 0.0),  # particle 0 — free, below plane
-                wp.vec3(1.0, 0.0, 0.0),   # pinned
-                wp.vec3(0.0, 0.0, 1.0),   # pinned
+                wp.vec3(1.0, 0.0, 0.0),  # pinned
+                wp.vec3(0.0, 0.0, 1.0),  # pinned
             ],
             indices=[0, 1, 2],
             density=1.0,
@@ -2599,18 +2604,19 @@ class TestPhase4StageBFriction(unittest.TestCase):
         qa = s_out_a.particle_q.numpy()
         qb = s_out_b.particle_q.numpy()
         # Two identical solvers must agree exactly.
-        np.testing.assert_array_equal(qa, qb,
-            err_msg="Two friction=False solvers diverged from each other")
+        np.testing.assert_array_equal(qa, qb, err_msg="Two friction=False solvers diverged from each other")
         # Particle 0 should be above the plane.
-        self.assertGreaterEqual(float(qa[0, 1]), -1e-4,
-            f"Particle still below plane: y={float(qa[0, 1]):.6f}")
+        self.assertGreaterEqual(float(qa[0, 1]), -1e-4, f"Particle still below plane: y={float(qa[0, 1]):.6f}")
 
     def test_friction_W_block_structure(self):
         """build_schur_complement with tangents returns 6x6 symmetric W for 2 contacts."""
         import scipy.sparse as sp
 
-        from newton._src.solvers.fba.linear_solver import FBALinearSolver, factorize_and_sparse_inverse
-        from newton._src.solvers.fba.solver_fba import compute_tangent_basis
+        from newton._src.solvers.fba.linear_solver import (  # noqa: PLC0415
+            FBALinearSolver,
+            factorize_and_sparse_inverse,
+        )
+        from newton._src.solvers.fba.solver_fba import compute_tangent_basis  # noqa: PLC0415
 
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
         rng = np.random.default_rng(42)
@@ -2645,18 +2651,16 @@ class TestPhase4StageBFriction(unittest.TestCase):
 
         W = solver.build_schur_complement(M, j_indices, j_normals, j_alpha, j_t1, j_t2)
 
-        # Shape must be 6x6 (3 rows per contact × 2 contacts).
+        # Shape must be 6x6 (3 rows per contact x 2 contacts).
         self.assertEqual(W.shape, (6, 6), f"Expected (6,6), got {W.shape}")
 
         # Symmetry.
-        np.testing.assert_allclose(W, W.T, atol=1e-10,
-                                    err_msg="Friction W is not symmetric")
+        np.testing.assert_allclose(W, W.T, atol=1e-10, err_msg="Friction W is not symmetric")
 
         # All eigenvalues positive (SPD since the contacts are at distinct particles
         # and the directions are orthonormal).
         eigvals = np.linalg.eigvalsh(W)
-        self.assertGreater(float(eigvals.min()), 0.0,
-                            f"W has non-positive eigenvalue: {eigvals.min():.3e}")
+        self.assertGreater(float(eigvals.min()), 0.0, f"W has non-positive eigenvalue: {eigvals.min():.3e}")
 
     def test_static_friction_holds_particle_on_plane(self):
         """A particle on a horizontal plane with lateral gravity should not drift when mu is sufficient.
@@ -2719,12 +2723,10 @@ class TestPhase4StageBFriction(unittest.TestCase):
         # Measure tangential displacement (x and z components of particle 0).
         tangent_drift = float(np.sqrt(q[0, 0] ** 2 + q[0, 2] ** 2))
         self.assertLessEqual(
-            tangent_drift, 1e-3,
-            f"Static friction failed: tangent drift = {tangent_drift:.6f} m (target <= 1e-3 m)"
+            tangent_drift, 1e-3, f"Static friction failed: tangent drift = {tangent_drift:.6f} m (target <= 1e-3 m)"
         )
         # Particle should stay on or above the plane.
-        self.assertGreaterEqual(float(q[0, 1]), -1e-4,
-            f"Particle fell through plane: y = {float(q[0, 1]):.6f}")
+        self.assertGreaterEqual(float(q[0, 1]), -1e-4, f"Particle fell through plane: y = {float(q[0, 1]):.6f}")
 
     def test_kinetic_friction_slows_sliding(self):
         """Particle sliding on a plane should decelerate with friction vs without.
@@ -2736,6 +2738,7 @@ class TestPhase4StageBFriction(unittest.TestCase):
           - mu=0.5: particle decelerates.
         Expected: x(mu=0.5) < x(mu=0).
         """
+
         def run_sliding(mu_val: float) -> float:
             builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
             builder.add_cloth_mesh(
@@ -2790,9 +2793,9 @@ class TestPhase4StageBFriction(unittest.TestCase):
         x_friction = run_sliding(0.5)
 
         self.assertLess(
-            x_friction, x_frictionless,
-            f"Friction should decelerate particle: x(mu=0.5)={x_friction:.4f} "
-            f"should be < x(mu=0)={x_frictionless:.4f}"
+            x_friction,
+            x_frictionless,
+            f"Friction should decelerate particle: x(mu=0.5)={x_friction:.4f} should be < x(mu=0)={x_frictionless:.4f}",
         )
 
 

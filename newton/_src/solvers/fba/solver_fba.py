@@ -12,9 +12,7 @@ from ...sim import Contacts, Control, Model, State
 from ..solver import SolverBase
 
 
-def project_coulomb_cone(
-    s: float, v: np.ndarray, mu: float
-) -> tuple[float, np.ndarray]:
+def project_coulomb_cone(s: float, v: np.ndarray, mu: float) -> tuple[float, np.ndarray]:
     """Project ``(s, v)`` onto the Coulomb friction cone K = {s' >= 0, |v'| <= mu * s'}.
 
     Three cases:
@@ -192,9 +190,7 @@ class SolverFBA(SolverBase):
         self._lam = float(lam) if lam is not None else None
         self.friction = bool(friction)
         self._mu_per_pair_override = (
-            np.asarray(mu_per_pair_override, dtype=np.float64)
-            if mu_per_pair_override is not None
-            else None
+            np.asarray(mu_per_pair_override, dtype=np.float64) if mu_per_pair_override is not None else None
         )
 
         # PD setup is dt-dependent; we cache the assembly at a reference dt and
@@ -333,7 +329,6 @@ class SolverFBA(SolverBase):
             project_stretching_corotational_tet_kernel,
             project_stretching_neohookean_kernel,
             project_stretching_neohookean_tet_kernel,
-            subtract_vec3_kernel,
             write_velocity_kernel,
             zero_vec3_kernel,
         )
@@ -613,7 +608,7 @@ class SolverFBA(SolverBase):
         Jacobian arrays (particle index, normal, alpha, signed-distance offset)
         that the Schur-complement path inside :meth:`step` will consume.
 
-        For Stage A all contacts are particle-vs-static-shape so ``α = 1.0``.
+        For Stage A all contacts are particle-vs-static-shape so ``alpha = 1.0``.
         The signed-distance offset is ``dot(normal, body_pos_world)`` where
         ``body_pos_world = wp.transform_point(body_transform, body_pos)``
         (or ``body_pos`` directly when the shape has no body — body index ``-1``).
@@ -633,7 +628,7 @@ class SolverFBA(SolverBase):
         particle_h = contacts.soft_contact_particle.numpy()[:M_raw]
         shape_h = contacts.soft_contact_shape.numpy()[:M_raw]
         body_pos_h = contacts.soft_contact_body_pos.numpy()[:M_raw]  # shape-local
-        normal_h = contacts.soft_contact_normal.numpy()[:M_raw]       # world frame
+        normal_h = contacts.soft_contact_normal.numpy()[:M_raw]  # world frame
 
         # Access model fields needed for world-frame body_pos conversion.
         model = self.model
@@ -718,11 +713,7 @@ class SolverFBA(SolverBase):
                 for c in range(M):
                     mu_h[c] = float(self._mu_per_pair_override[c])
             else:
-                shape_mat_mu = (
-                    model.shape_material_mu.numpy()
-                    if hasattr(model, "shape_material_mu")
-                    else None
-                )
+                shape_mat_mu = model.shape_material_mu.numpy() if hasattr(model, "shape_material_mu") else None
                 for c in range(M):
                     s_idx = int(shape_h[c])
                     if shape_mat_mu is not None and s_idx >= 0 and s_idx < len(shape_mat_mu):
@@ -782,7 +773,9 @@ class SolverFBA(SolverBase):
         for c in range(M):
             ip = int(self._contact_particle_h[c])
             # r[c] = c_offset - J·x_unc  (positive when particle penetrates)
-            r[c] = self._contact_offset_h[c] - float(self._contact_alpha_h[c]) * float(np.dot(self._contact_normal_h[c], x_np[ip]))
+            r[c] = self._contact_offset_h[c] - float(self._contact_alpha_h[c]) * float(
+                np.dot(self._contact_normal_h[c], x_np[ip])
+            )
         return r
 
     def _solve_nsn_unilateral(self, W: np.ndarray, r: np.ndarray, max_iters: int = 20) -> np.ndarray:
@@ -816,13 +809,11 @@ class SolverFBA(SolverBase):
                 break
         return lam
 
-    def _solve_nsn_coulomb(
-        self, W: np.ndarray, r: np.ndarray, mu: np.ndarray, max_iters: int = 20
-    ) -> np.ndarray:
+    def _solve_nsn_coulomb(self, W: np.ndarray, r: np.ndarray, mu: np.ndarray, max_iters: int = 20) -> np.ndarray:
         """Solve the frictional LCP via blocked projected Gauss-Seidel.
 
         Operates on 3-blocks ``[λ_n, λ_t1, λ_t2]`` per contact.  Each block
-        is updated by solving the local 3×3 system (``W_cc``), then projecting
+        is updated by solving the local 3x3 system (``W_cc``), then projecting
         onto the Coulomb cone.
 
         Args:
@@ -879,7 +870,6 @@ class SolverFBA(SolverBase):
         Returns:
             Correction vec3 Warp array of length N.
         """
-        from .kernels import accumulate_vec3_kernel  # noqa: PLC0415
 
         M = self._contact_count
         total_rows = 3 * M
@@ -915,8 +905,13 @@ class SolverFBA(SolverBase):
                     wp.launch(
                         build_contact_jacobian_dir_kernel,
                         dim=1,
-                        inputs=[N, c, self._contact_particle_d, self._contact_alpha_d,
-                                 wp.vec3(float(direction[0]), float(direction[1]), float(direction[2]))],
+                        inputs=[
+                            N,
+                            c,
+                            self._contact_particle_d,
+                            self._contact_alpha_d,
+                            wp.vec3(float(direction[0]), float(direction[1]), float(direction[2])),
+                        ],
                         outputs=[work],
                         device=dev,
                     )
@@ -971,8 +966,14 @@ class SolverFBA(SolverBase):
                 wp.launch(
                     set_lambda_jacobian_vec3_kernel,
                     dim=1,
-                    inputs=[c, self._contact_particle_d, self._contact_normal_d,
-                            self._contact_alpha_d, float(lam[c]), N],
+                    inputs=[
+                        c,
+                        self._contact_particle_d,
+                        self._contact_normal_d,
+                        self._contact_alpha_d,
+                        float(lam[c]),
+                        N,
+                    ],
                     outputs=[work],
                     device=dev,
                 )

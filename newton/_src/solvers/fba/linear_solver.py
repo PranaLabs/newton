@@ -29,11 +29,9 @@ if TYPE_CHECKING:
 from ...sim import Model
 from .kernels import (
     apply_permutation_scalar_kernel,
-    build_contact_jacobian_vec3_kernel,
     extract_component_kernel,
     insert_component_kernel,
     scale_by_diag_kernel,
-    zero_vec3_kernel,
 )
 
 
@@ -817,7 +815,7 @@ class FBALinearSolver:
             j_normals: World-frame contact normal per contact, shape ``[M]``, dtype vec3.
             j_alpha: Jacobian coefficient per contact, shape ``[M]``, dtype float32.
             j_tangent1: First tangent direction per contact, shape ``[M]``, dtype vec3.
-                When ``None``, Stage A behavior (M×M W).
+                When ``None``, Stage A behavior (M x M W).
             j_tangent2: Second tangent direction per contact, shape ``[M]``, dtype vec3.
                 Must be provided together with ``j_tangent1``.
 
@@ -843,12 +841,12 @@ class FBALinearSolver:
         y_out = wp.empty(n, dtype=wp.vec3, device=dev)
 
         # Pull contact metadata to host (small M).
-        idx_np = j_indices.numpy()   # (M,) int32
-        n_np = j_normals.numpy()     # (M, 3) float32
-        a_np = j_alpha.numpy()       # (M,) float32
+        idx_np = j_indices.numpy()  # (M,) int32
+        n_np = j_normals.numpy()  # (M, 3) float32
+        a_np = j_alpha.numpy()  # (M,) float32
         if has_friction:
-            t1_np = j_tangent1.numpy()   # (M, 3) float32
-            t2_np = j_tangent2.numpy()   # (M, 3) float32
+            t1_np = j_tangent1.numpy()  # (M, 3) float32
+            t2_np = j_tangent2.numpy()  # (M, 3) float32
 
         # Cache y columns for reuse in correction step.
         self._y_cache: list[np.ndarray] = []
@@ -869,14 +867,19 @@ class FBALinearSolver:
                 wp.launch(
                     build_contact_jacobian_dir_kernel,
                     dim=1,
-                    inputs=[n, c, j_indices, j_alpha,
-                             wp.vec3(float(direction[0]), float(direction[1]), float(direction[2]))],
+                    inputs=[
+                        n,
+                        c,
+                        j_indices,
+                        j_alpha,
+                        wp.vec3(float(direction[0]), float(direction[1]), float(direction[2])),
+                    ],
                     outputs=[jcol],
                     device=dev,
                 )
                 # Solve: y_{c,a} = A⁻¹ · jcol.
                 self.solve(jcol, y_out)
-                y_np = y_out.numpy()   # (N, 3)
+                y_np = y_out.numpy()  # (N, 3)
                 self._y_cache.append(y_np.copy())
 
                 # Fill column `row` of W:
