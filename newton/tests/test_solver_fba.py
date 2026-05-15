@@ -2658,6 +2658,143 @@ class TestPhase4StageBFriction(unittest.TestCase):
         self.assertGreater(float(eigvals.min()), 0.0,
                             f"W has non-positive eigenvalue: {eigvals.min():.3e}")
 
+    def test_static_friction_holds_particle_on_plane(self):
+        """A particle on a horizontal plane with lateral gravity should not drift when mu is sufficient.
+
+        Setup: single free particle at (0, 0, 0) exactly on the plane (y=0).
+        Gravity has a horizontal component: gravity_world = (0.1, -1.0, 0.0) [m/s^2].
+        Normal load: F_n = m * 1.0. Tangent force: F_t = m * 0.1.
+        With mu = 0.5: mu * F_n = 0.5 > F_t = 0.1 -> static friction should hold.
+        After 50 steps, tangent displacement should be < 1e-3 m.
+        """
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=[
+                wp.vec3(0.0, 0.0, 0.0),  # particle 0 — free, exactly on plane
+                wp.vec3(1.0, 0.0, 0.0),  # pinned
+                wp.vec3(0.0, 0.0, 1.0),  # pinned
+            ],
+            indices=[0, 1, 2],
+            density=1.0,
+            tri_ke=1.0e4,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+        )
+        builder.particle_mass[1] = 0.0
+        builder.particle_mass[2] = 0.0
+        model = builder.finalize()
+        # Set lateral gravity (horizontal component pushes particle tangentially).
+        _g = wp.zeros(1, dtype=wp.vec3)
+        _g.fill_(wp.vec3(0.1, -1.0, 0.0))
+        model.gravity.assign(_g)
+        device = model.device
+
+        # mu=0.5 override per-pair.
+        mu_override = np.full(1, 0.5, dtype=np.float64)
+        solver = SolverFBA(model, iterations=5, friction=True, mu_per_pair_override=mu_override)
+
+        contacts = newton.Contacts(rigid_contact_max=0, soft_contact_max=1, device=device)
+        contacts.soft_contact_count.assign(np.array([1], dtype=np.int32))
+        contacts.soft_contact_particle.assign(np.array([0], dtype=np.int32))
+        contacts.soft_contact_normal.assign(np.array([[0.0, 1.0, 0.0]], dtype=np.float32))
+        contacts.soft_contact_body_pos.assign(np.array([[0.0, 0.0, 0.0]], dtype=np.float32))
+        contacts.soft_contact_shape.assign(np.array([-1], dtype=np.int32))
+
+        dt = 1.0 / 60.0
+        state = model.state()
+        state_out = model.state()
+
+        for _ in range(50):
+            state.clear_forces()
+            solver.step(state, state_out, None, contacts, dt)
+            state, state_out = state_out, state
+
+        q = state.particle_q.numpy()
+        # Measure tangential displacement (x and z components of particle 0).
+        tangent_drift = float(np.sqrt(q[0, 0] ** 2 + q[0, 2] ** 2))
+        self.assertLessEqual(
+            tangent_drift, 1e-3,
+            f"Static friction failed: tangent drift = {tangent_drift:.6f} m (target <= 1e-3 m)"
+        )
+        # Particle should stay on or above the plane.
+        self.assertGreaterEqual(float(q[0, 1]), -1e-4,
+            f"Particle fell through plane: y = {float(q[0, 1]):.6f}")
+
+    def test_kinetic_friction_slows_sliding(self):
+        """Particle sliding on a plane should decelerate with friction vs without.
+
+        Setup: particle at (0, 0, 0) with initial velocity (1.0, 0.0, 0.0) [m/s],
+        gravity = (0, -1, 0), plane normal = (0, 1, 0).
+        Compare tangent position after 50 steps:
+          - mu=0 (frictionless): particle slides freely.
+          - mu=0.5: particle decelerates.
+        Expected: x(mu=0.5) < x(mu=0).
+        """
+        def run_sliding(mu_val: float) -> float:
+            builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+            builder.add_cloth_mesh(
+                pos=wp.vec3(0.0, 0.0, 0.0),
+                rot=wp.quat_identity(),
+                scale=1.0,
+                vel=wp.vec3(0.0, 0.0, 0.0),
+                vertices=[
+                    wp.vec3(0.0, 0.0, 0.0),
+                    wp.vec3(1.0, 0.0, 0.0),
+                    wp.vec3(0.0, 0.0, 1.0),
+                ],
+                indices=[0, 1, 2],
+                density=1.0,
+                tri_ke=1.0e4,
+                tri_ka=0.0,
+                tri_kd=0.0,
+                edge_ke=0.0,
+                edge_kd=0.0,
+            )
+            builder.particle_mass[1] = 0.0
+            builder.particle_mass[2] = 0.0
+            model = builder.finalize()
+            device = model.device
+
+            # Give particle 0 an initial tangential velocity.
+            state = model.state()
+            vel = state.particle_qd.numpy()
+            vel[0] = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+            state.particle_qd.assign(vel)
+            state_out = model.state()
+
+            mu_override = np.full(1, mu_val, dtype=np.float64)
+            solver = SolverFBA(model, iterations=5, friction=True, mu_per_pair_override=mu_override)
+
+            contacts = newton.Contacts(rigid_contact_max=0, soft_contact_max=1, device=device)
+            contacts.soft_contact_count.assign(np.array([1], dtype=np.int32))
+            contacts.soft_contact_particle.assign(np.array([0], dtype=np.int32))
+            contacts.soft_contact_normal.assign(np.array([[0.0, 1.0, 0.0]], dtype=np.float32))
+            contacts.soft_contact_body_pos.assign(np.array([[0.0, 0.0, 0.0]], dtype=np.float32))
+            contacts.soft_contact_shape.assign(np.array([-1], dtype=np.int32))
+
+            dt = 1.0 / 60.0
+            for _ in range(50):
+                state.clear_forces()
+                solver.step(state, state_out, None, contacts, dt)
+                state, state_out = state_out, state
+
+            return float(state.particle_q.numpy()[0, 0])
+
+        x_frictionless = run_sliding(0.0)
+        x_friction = run_sliding(0.5)
+
+        self.assertLess(
+            x_friction, x_frictionless,
+            f"Friction should decelerate particle: x(mu=0.5)={x_friction:.4f} "
+            f"should be < x(mu=0)={x_frictionless:.4f}"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
