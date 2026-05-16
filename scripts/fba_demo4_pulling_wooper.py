@@ -213,12 +213,14 @@ def run() -> dict:
         targets[pin_idx] = pin_init + (PIN_DIR * pulled).astype(np.float32)
         solver.set_pin_targets(targets)
 
+        wp.synchronize_device()
         t0 = time.perf_counter()
         s_in.clear_forces()
         pipeline.collide(s_in, contacts)
         solver.step(s_in, s_out, None, contacts, DT)
-        s_in, s_out = s_out, s_in
+        wp.synchronize_device()
         step_times.append(1000.0 * (time.perf_counter() - t0))
+        s_in, s_out = s_out, s_in
 
     q_final = s_in.particle_q.numpy()
     finite_ok = bool(np.all(np.isfinite(q_final)))

@@ -963,51 +963,60 @@ class SolverFBA(SolverBase):
         dev = self._device
         ls = self._linear_solver
 
-        correction_np = np.zeros((N, 3), dtype=np.float64)
+        correction = wp.zeros(N, dtype=wp.vec3, device=dev)
 
         if hasattr(ls, "_A_inv_Jt_d") and ls._A_inv_Jt_d.shape[0] >= total_rows:
-            # Use cached device buffer: pull only once, accumulate on host (total_rows is small).
-            A_inv_Jt_np = ls._A_inv_Jt_d.numpy()[:total_rows]  # (total_rows, N, 3)
-            for row in range(total_rows):
+            # Use cached device buffer: accumulate weighted rows entirely on GPU.
+            from .kernels import accumulate_lambda_correction_kernel  # noqa: PLC0415
+
+            lam_d = wp.array(lam.astype(np.float32), dtype=wp.float32, device=dev)
+            wp.launch(
+                accumulate_lambda_correction_kernel,
+                dim=N,
+                inputs=[lam_d, ls._A_inv_Jt_d, int(total_rows)],
+                outputs=[correction],
+                device=dev,
+            )
+            return correction
+
+        # Fallback path: re-solve for each row (only used when the cached
+        # ``_A_inv_Jt_d`` buffer is unavailable, e.g. tests that bypass the
+        # batched Schur build).
+        correction_np = np.zeros((N, 3), dtype=np.float64)
+
+        from .kernels import build_contact_jacobian_dir_kernel, zero_vec3_kernel  # noqa: PLC0415
+
+        tmp = wp.empty(N, dtype=wp.vec3, device=dev)
+        work = wp.empty(N, dtype=wp.vec3, device=dev)
+        for c in range(M):
+            if not hasattr(self, "_contact_tangent1_h"):
+                continue
+            n = self._contact_normal_h[c].astype(np.float64)
+            t1 = self._contact_tangent1_h[c].astype(np.float64)
+            t2 = self._contact_tangent2_h[c].astype(np.float64)
+            directions = [n, t1, t2]
+            for a, direction in enumerate(directions):
+                row = 3 * c + a
                 if abs(lam[row]) < 1e-15:
                     continue
-                correction_np += lam[row] * A_inv_Jt_np[row].astype(np.float64)
-        else:
-            # Fallback: re-solve for each row.
-            from .kernels import build_contact_jacobian_dir_kernel, zero_vec3_kernel  # noqa: PLC0415
+                wp.launch(zero_vec3_kernel, dim=N, inputs=[work], device=dev)
+                wp.launch(
+                    build_contact_jacobian_dir_kernel,
+                    dim=1,
+                    inputs=[
+                        N,
+                        c,
+                        self._contact_particle_d,
+                        self._contact_alpha_d,
+                        wp.vec3(float(direction[0]), float(direction[1]), float(direction[2])),
+                    ],
+                    outputs=[work],
+                    device=dev,
+                )
+                ls.solve(work, tmp)
+                tmp_np = tmp.numpy().astype(np.float64)
+                correction_np += lam[row] * tmp_np
 
-            tmp = wp.empty(N, dtype=wp.vec3, device=dev)
-            work = wp.empty(N, dtype=wp.vec3, device=dev)
-            for c in range(M):
-                if not hasattr(self, "_contact_tangent1_h"):
-                    continue
-                n = self._contact_normal_h[c].astype(np.float64)
-                t1 = self._contact_tangent1_h[c].astype(np.float64)
-                t2 = self._contact_tangent2_h[c].astype(np.float64)
-                directions = [n, t1, t2]
-                for a, direction in enumerate(directions):
-                    row = 3 * c + a
-                    if abs(lam[row]) < 1e-15:
-                        continue
-                    wp.launch(zero_vec3_kernel, dim=N, inputs=[work], device=dev)
-                    wp.launch(
-                        build_contact_jacobian_dir_kernel,
-                        dim=1,
-                        inputs=[
-                            N,
-                            c,
-                            self._contact_particle_d,
-                            self._contact_alpha_d,
-                            wp.vec3(float(direction[0]), float(direction[1]), float(direction[2])),
-                        ],
-                        outputs=[work],
-                        device=dev,
-                    )
-                    ls.solve(work, tmp)
-                    tmp_np = tmp.numpy().astype(np.float64)
-                    correction_np += lam[row] * tmp_np
-
-        correction = wp.zeros(N, dtype=wp.vec3, device=dev)
         correction.assign(correction_np.astype(np.float32))
         return correction
 
@@ -1033,15 +1042,18 @@ class SolverFBA(SolverBase):
         correction = wp.zeros(N, dtype=wp.vec3, device=dev)
 
         if hasattr(ls, "_A_inv_Jt_d") and ls._A_inv_Jt_d.shape[0] >= M:
-            # Reuse cached A⁻¹ · J_c^T columns from build_schur_complement.
-            # Single host pull for the (M, N, 3) block needed.
-            A_inv_Jt_np = ls._A_inv_Jt_d.numpy()[:M]  # (M, N, 3)
-            correction_np = np.zeros((N, 3), dtype=np.float64)
-            for c in range(M):
-                if abs(lam[c]) < 1e-15:
-                    continue
-                correction_np += lam[c] * A_inv_Jt_np[c].astype(np.float64)
-            correction.assign(correction_np.astype(np.float32))
+            # Reuse cached A⁻¹ · J_c^T columns from build_schur_complement and
+            # run the weighted sum entirely on device.
+            from .kernels import accumulate_lambda_correction_kernel  # noqa: PLC0415
+
+            lam_d = wp.array(lam.astype(np.float32), dtype=wp.float32, device=dev)
+            wp.launch(
+                accumulate_lambda_correction_kernel,
+                dim=N,
+                inputs=[lam_d, ls._A_inv_Jt_d, int(M)],
+                outputs=[correction],
+                device=dev,
+            )
         else:
             # Fallback: re-solve for each contact.
             from .kernels import (  # noqa: PLC0415
