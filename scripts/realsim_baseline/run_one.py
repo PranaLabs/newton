@@ -68,7 +68,9 @@ def run(demo: str, max_frame: int | None = None) -> dict:
                 "wall_s": round(wall, 1),
                 "scene": str(scene),
                 "max_frame": max_frame,
-                "stdout_tail": (e.stdout or b"")[-2000:].decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or "")[-2000:],
+                "stdout_tail": (e.stdout or b"")[-2000:].decode("utf-8", "replace")
+                if isinstance(e.stdout, bytes)
+                else (e.stdout or "")[-2000:],
             }
         wall = time.perf_counter() - t0
     finally:

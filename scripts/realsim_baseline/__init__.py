@@ -11,7 +11,10 @@ DEMOS: dict[str, dict] = {
     "TwistingBarNH": {"scene": "simulation/config/CudaTests/TwistingBarNH/scene.json", "expected_frames": 810},
     "StretchingCloth": {"scene": "simulation/config/CudaTests/StretchingCloth/scene.json"},
     "PullingWooper": {"scene": "simulation/config/CudaTests/PullingWooper/scene.json", "expected_frames": 500},
-    "CrossingGingerbreadman": {"scene": "simulation/config/CudaTests/CrossingGingerbreadman/scene.json", "expected_frames": 810},
+    "CrossingGingerbreadman": {
+        "scene": "simulation/config/CudaTests/CrossingGingerbreadman/scene.json",
+        "expected_frames": 810,
+    },
     "SqueezingBall": {"scene": "simulation/config/CudaTests/SqueezingBall/scene.json", "expected_frames": 600},
     "SharpCorner": {"scene": "simulation/config/CudaTests/SharpCorner/scene.json", "expected_frames": 200},
     "ClothOnKnives": {"scene": "simulation/config/CudaTests/ClothOnKnives/scene.json", "expected_frames": 900},

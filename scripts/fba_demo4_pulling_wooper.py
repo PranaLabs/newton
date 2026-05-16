@@ -17,15 +17,15 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402
-import warp as wp  # noqa: E402
+import matplotlib.pyplot as plt
+import numpy as np
+import warp as wp
 
-import newton  # noqa: E402
-from newton.solvers import SolverFBA  # noqa: E402
-from scripts.fba_cudatest_bench.medit import load_medit_mesh  # noqa: E402
-from scripts.fba_cudatest_bench.perf import record_row, stats_from_times_ms  # noqa: E402
-from scripts.fba_cudatest_bench.pin import select_in_aabb  # noqa: E402
+import newton
+from newton.solvers import SolverFBA
+from scripts.fba_cudatest_bench.medit import load_medit_mesh
+from scripts.fba_cudatest_bench.perf import record_row, stats_from_times_ms
+from scripts.fba_cudatest_bench.pin import select_in_aabb
 
 # ---------------------------------------------------------------------------
 # Constants from RealSim CudaTests/PullingWooper

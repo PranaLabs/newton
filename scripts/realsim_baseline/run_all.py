@@ -18,7 +18,7 @@ OUT = Path(__file__).parent.parent / "cudatest_baselines.json"
 # we override here only when the original count is impractical for a baseline run.
 MAX_FRAME_OVERRIDES: dict[str, int] = {
     "CableGrabRaptor": 1000,  # upstream 6000 — too long for a baseline
-    "ClothOnKnives": 600,     # upstream 900
+    "ClothOnKnives": 600,  # upstream 900
 }
 
 

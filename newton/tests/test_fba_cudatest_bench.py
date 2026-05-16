@@ -40,6 +40,7 @@ class PerfStatsTests(unittest.TestCase):
 class PinSelectorTests(unittest.TestCase):
     def test_aabb_selects_inside_only(self) -> None:
         import numpy as np
+
         from scripts.fba_cudatest_bench.pin import select_in_aabb
 
         verts = np.array(
