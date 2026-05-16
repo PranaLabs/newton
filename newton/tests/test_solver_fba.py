@@ -4207,5 +4207,73 @@ class SolverFBAIsodofJtLambdaDeterminismTests(unittest.TestCase):
         np.testing.assert_allclose(q1, q2, atol=1e-6, err_msg="isodof J^T·lambda scatter non-deterministic")
 
 
+class FBNonsmoothFunctionTests(unittest.TestCase):
+    """Unit tests for FB unilateral and frictional nonsmooth row evaluations."""
+
+    def test_unilateral_at_stuck_state(self) -> None:
+        """Small penetration with positive lambda → stick regime (small compliance)."""
+        from newton._src.solvers.fba.solver_fba import fb_unilateral_row
+
+        compliance, h = fb_unilateral_row(penetration=0.01, lam=100.0, precond=1.0, dt=0.01, pene0=0.0)
+        self.assertLess(compliance, 10.0, f"stick compliance should be small; got {compliance}")
+        self.assertTrue(np.isfinite(h))
+
+    def test_unilateral_degenerate_zero_zero(self) -> None:
+        """Both penetration and lambda zero — degenerate; epsilon-denom should kick in."""
+        from newton._src.solvers.fba.solver_fba import fb_unilateral_row
+
+        compliance, h = fb_unilateral_row(penetration=0.0, lam=0.0, precond=1.0, dt=0.01, pene0=0.0)
+        self.assertTrue(np.isfinite(compliance))
+        self.assertTrue(np.isfinite(h))
+
+    def test_frictional_stick_regime(self) -> None:
+        """Cone slack > 0 → stick. Small compliance, h ≈ pene0."""
+        from newton._src.solvers.fba.solver_fba import fb_frictional_row
+
+        compliance, h = fb_frictional_row(
+            penetration=1e-6,
+            lam_t=10.0,
+            lam_n=100.0,
+            mu=0.5,
+            precond=1.0,
+            dt=0.01,
+            pene0=0.0,
+        )
+        # mu*lam_n - |lam_t| = 40 (well inside cone of width 50).
+        self.assertLess(compliance, 1.0, f"stick compliance should be small; got {compliance}")
+
+    def test_frictional_slip_regime(self) -> None:
+        """On cone (|lam_t| ≈ mu*lam_n) + non-zero slip → large compliance (decoupled)."""
+        from newton._src.solvers.fba.solver_fba import fb_frictional_row
+
+        compliance, h = fb_frictional_row(
+            penetration=0.1,
+            lam_t=50.0,
+            lam_n=100.0,
+            mu=0.5,
+            precond=1.0,
+            dt=0.01,
+            pene0=0.0,
+        )
+        # mu*lam_n = 50 = |lam_t| (on cone).
+        self.assertGreater(compliance, 10.0, f"slip compliance should be large; got {compliance}")
+
+    def test_frictional_inactive_contact(self) -> None:
+        """lam_n = 0 → inactive contact. compliance = 1/dt, h = -dt·lam_t."""
+        from newton._src.solvers.fba.solver_fba import fb_frictional_row
+
+        compliance, h = fb_frictional_row(
+            penetration=0.05,
+            lam_t=10.0,
+            lam_n=0.0,
+            mu=0.5,
+            precond=1.0,
+            dt=0.01,
+            pene0=0.0,
+        )
+        self.assertAlmostEqual(compliance, 1.0 / 0.01, places=3)
+        self.assertAlmostEqual(h, -0.01 * 10.0, places=6)
+
+
 if __name__ == "__main__":
     unittest.main()
