@@ -494,7 +494,7 @@ class SolverFBA(SolverBase):
             project_bending_kernel,
             project_pin_kernel,
             project_stretching_arap_kernel,
-            project_stretching_arap_tet_kernel,
+            project_stretching_arap_tet_compute_kernel,
             project_stretching_corotational_kernel,
             project_stretching_corotational_tet_compute_kernel,
             project_stretching_neohookean_kernel,
@@ -651,14 +651,27 @@ class SolverFBA(SolverBase):
             # Tet ARAP projection.
             if self._tet_indices_d is not None and model.tet_count > 0:
                 if self.stretching_model == "arap":
+                    # Deterministic (compute → gather) tet ARAP scatter.
                     wp.launch(
-                        project_stretching_arap_tet_kernel,
+                        project_stretching_arap_tet_compute_kernel,
                         dim=model.tet_count,
                         inputs=[
                             self._x_cur,
                             self._tet_indices_d,
                             self._tet_rest_inv_d,
                             self._tet_weight_d,
+                        ],
+                        outputs=[self._tet_contrib_d],
+                        device=device,
+                    )
+                    wp.launch(
+                        gather_per_particle_kernel,
+                        dim=N,
+                        inputs=[
+                            self._tet_contrib_d,
+                            self._particle_tet_offsets_d,
+                            self._particle_tet_element_d,
+                            self._particle_tet_local_d,
                         ],
                         outputs=[self._rhs],
                         device=device,
