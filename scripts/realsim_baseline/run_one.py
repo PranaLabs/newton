@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -21,15 +22,23 @@ TIMING_RE = re.compile(r"Total time step cost\s*=\s*([0-9]+\.?[0-9]*)\s*ms")
 
 
 def _make_offline_scene(scene_path: Path, max_frame: int | None) -> Path:
-    """Deep-copy a CudaTests scene.json with ``offline=true`` and ``maxFrame`` injected."""
+    """Deep-copy a CudaTests scene.json with ``offline=true`` and ``maxFrame`` injected.
+
+    The caller is responsible for unlinking the returned path.
+    """
     cfg = json.loads(scene_path.read_text())
     cfg["offline"] = True
     if max_frame is None:
         max_frame = int(cfg.get("maxFrame") or cfg.get("stop") or 100)
     cfg["maxFrame"] = int(max_frame)
-    tmp = Path(tempfile.mkstemp(prefix=f"realsim_{scene_path.parent.name}_", suffix=".json")[1])
-    tmp.write_text(json.dumps(cfg, indent=2))
-    return tmp
+    fd, tmp_path = tempfile.mkstemp(prefix=f"realsim_{scene_path.parent.name}_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(cfg, indent=2))
+    except Exception:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise
+    return Path(tmp_path)
 
 
 def run(demo: str, max_frame: int | None = None) -> dict:
@@ -41,16 +50,29 @@ def run(demo: str, max_frame: int | None = None) -> dict:
     if max_frame is None:
         max_frame = cfg.get("expected_frames")
     tmp_scene = _make_offline_scene(scene, max_frame)
-
-    t0 = time.perf_counter()
-    proc = subprocess.run(
-        [str(REALSIM_BIN), "-m", str(tmp_scene)],
-        cwd=str(REALSIM_ROOT),
-        capture_output=True,
-        text=True,
-        timeout=3600,
-    )
-    wall = time.perf_counter() - t0
+    try:
+        t0 = time.perf_counter()
+        try:
+            proc = subprocess.run(
+                [str(REALSIM_BIN), "-m", str(tmp_scene)],
+                cwd=str(REALSIM_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=3600,
+            )
+        except subprocess.TimeoutExpired as e:
+            wall = time.perf_counter() - t0
+            return {
+                "demo": demo,
+                "status": "timeout",
+                "wall_s": round(wall, 1),
+                "scene": str(scene),
+                "max_frame": max_frame,
+                "stdout_tail": (e.stdout or b"")[-2000:].decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or "")[-2000:],
+            }
+        wall = time.perf_counter() - t0
+    finally:
+        tmp_scene.unlink(missing_ok=True)
 
     stdout_clean = ANSI.sub("", proc.stdout)
     times_ms = [float(m.group(1)) for m in TIMING_RE.finditer(stdout_clean)]
@@ -77,6 +99,7 @@ def run(demo: str, max_frame: int | None = None) -> dict:
         "scene": str(scene),
         "max_frame": max_frame,
         "returncode": proc.returncode,
+        "clean_exit": proc.returncode == 0,
     }
 
 
