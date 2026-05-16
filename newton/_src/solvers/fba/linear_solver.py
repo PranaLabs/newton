@@ -919,9 +919,9 @@ class FBALinearSolver:
         three rows per contact ordered ``[n_c, t1_c, t2_c]`` for c = 0..M-1.
         Off-diagonal coupling between contacts is fully included.
 
-        Implementation uses Approach B (multi-RHS batched solve): all M_rows A^{-1} solves
-        are executed in three batched passes (one per spatial axis), each firing a single
-        multi-RHS SpMV kernel over all RHS simultaneously. Results are stored on device in
+        Implementation uses Approach B (multi-RHS batched solve) with all 3 spatial axes
+        fused into a single solve: the ``3 * M_rows`` columns of ``A^{-1} J^T`` are computed
+        in one batched pass over the shared Cholesky factor. Results are stored on device in
         a single ``A_inv_Jt`` buffer of shape ``(M_rows, N)``.  The ``W`` matrix is then
         built entirely on device via a 2D kernel (one thread per (c', c) pair) and only
         one host pull is needed at the end.
@@ -946,14 +946,15 @@ class FBALinearSolver:
             Dense float64 NumPy array of shape ``(M, M)`` (Stage A) or ``(3M, 3M)`` (Stage B).
         """
         from .kernels import (  # noqa: PLC0415
-            pack_jacobian_axis_kernel,
-            unpack_to_A_inv_Jt_axis_kernel,
+            pack_jacobian_3axis_kernel,
+            unpack_to_A_inv_Jt_3axis_kernel,
         )
 
         has_friction = j_tangent1 is not None and j_tangent2 is not None
         rows_per_contact = 3 if has_friction else 1
         M = num_contacts
         total_rows = M * rows_per_contact
+        rhs_total = 3 * total_rows
         n = self.n
         dev = self.device
 
@@ -992,9 +993,11 @@ class FBALinearSolver:
         if not hasattr(self, "_A_inv_Jt_d") or self._A_inv_Jt_d.shape[0] < total_rows or self._A_inv_Jt_d.shape[1] != n:
             self._A_inv_Jt_d = wp.empty(shape=(total_rows, n), dtype=wp.vec3, device=dev)
 
-        # --- Allocate/reuse 2D float64 buffers for multi-RHS pack/solve ---
-        if not hasattr(self, "_b_multi_d") or self._b_multi_d.shape[0] < total_rows or self._b_multi_d.shape[1] != n:
-            cap = max(total_rows, int(getattr(self, "_b_multi_cap", 0) * 1.5) + 1)
+        # --- Allocate/reuse 2D float64 buffers for batched 3-axis multi-RHS pack/solve ---
+        # Buffers must hold 3 * total_rows RHS rows (one block per spatial axis,
+        # concatenated row-major).
+        if not hasattr(self, "_b_multi_d") or self._b_multi_d.shape[0] < rhs_total or self._b_multi_d.shape[1] != n:
+            cap = max(rhs_total, int(getattr(self, "_b_multi_cap", 0) * 1.5) + 1)
             self._b_multi_cap = cap
             self._b_multi_d = wp.zeros(shape=(cap, n), dtype=wp.float64, device=dev)
             self._y_multi_d = wp.zeros(shape=(cap, n), dtype=wp.float64, device=dev)
@@ -1003,42 +1006,42 @@ class FBALinearSolver:
         b_multi_v = wp.array(
             ptr=self._b_multi_d.ptr,
             dtype=wp.float64,
-            shape=(total_rows, n),
+            shape=(rhs_total, n),
             device=dev,
         )
         y_multi_v = wp.array(
             ptr=self._y_multi_d.ptr,
             dtype=wp.float64,
-            shape=(total_rows, n),
+            shape=(rhs_total, n),
             device=dev,
         )
 
-        # --- Approach B: 3 axis passes (one multi-RHS solve per axis) ---
-        # Each pass packs one spatial axis of J^T, solves A^{-1} for all total_rows
-        # RHS simultaneously, then unpacks results into A_inv_Jt.
-        # Total kernel launches: 3 * (1 pack + 5 solve + 1 unpack) = 21 launches,
-        # vs ~15 * total_rows launches for the Approach A per-row loop.
-        self._ensure_multi_rhs_buffers(total_rows)
-        for axis in range(3):
-            # Zero b_multi for this axis pass.
-            b_multi_v.zero_()
-            # Pack J^T axis: b_multi[r, particle[r]] = alpha[r] * dir[r][axis].
-            wp.launch(
-                pack_jacobian_axis_kernel,
-                dim=total_rows,
-                inputs=[axis, row_particle_d, row_dir_d, row_alpha_d],
-                outputs=[b_multi_v],
-                device=dev,
-            )
-            # Batched solve: y_multi = A^{-1} * b_multi (all total_rows RHS at once).
-            self.solve_multi_rhs_scalar(b_multi_v, y_multi_v, total_rows)
-            # Unpack: A_inv_Jt[r, i][axis] = float32(y_multi[r, i]).
-            wp.launch(
-                unpack_to_A_inv_Jt_axis_kernel,
-                dim=(total_rows, n),
-                inputs=[axis, y_multi_v, self._A_inv_Jt_d],
-                device=dev,
-            )
+        # --- Batched 3-axis pass: single multi-RHS solve for all 3 spatial axes ---
+        # Pack J^T for all 3 axes into one contiguous (3*total_rows, N) buffer, run
+        # a single ``solve_multi_rhs_scalar`` over R = 3*total_rows RHS, then unpack
+        # all 3 axes back into ``A_inv_Jt`` with one kernel.
+        # Total kernel launches: 1 pack + 5 solve + 1 unpack = 7 launches,
+        # vs 3 * 7 = 21 launches for the prior per-axis loop.
+        self._ensure_multi_rhs_buffers(rhs_total)
+        # Zero b_multi for all 3 axis blocks.
+        b_multi_v.zero_()
+        # Pack J^T axes: b_multi[axis*total_rows + r, particle[r]] = alpha[r] * dir[r][axis].
+        wp.launch(
+            pack_jacobian_3axis_kernel,
+            dim=rhs_total,
+            inputs=[total_rows, row_particle_d, row_dir_d, row_alpha_d],
+            outputs=[b_multi_v],
+            device=dev,
+        )
+        # Batched solve: y_multi = A^{-1} * b_multi for all 3*total_rows RHS at once.
+        self.solve_multi_rhs_scalar(b_multi_v, y_multi_v, rhs_total)
+        # Unpack: A_inv_Jt[r, i] = (y_multi[r, i], y_multi[total_rows+r, i], y_multi[2*total_rows+r, i]).
+        wp.launch(
+            unpack_to_A_inv_Jt_3axis_kernel,
+            dim=(total_rows, n),
+            inputs=[total_rows, y_multi_v, self._A_inv_Jt_d],
+            device=dev,
+        )
 
         # --- Build W on device via 2D kernel, then single host pull ---
         # Allocate/reuse W device buffer.

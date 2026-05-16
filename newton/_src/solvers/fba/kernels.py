@@ -1371,3 +1371,67 @@ def unpack_to_A_inv_Jt_axis_kernel(
     else:
         v[2] = wp.float32(y_multi[r, i])
     A_inv_Jt[r, i] = v
+
+
+@wp.kernel
+def pack_jacobian_3axis_kernel(
+    total_rows: int,
+    contact_particle: wp.array[wp.int32],
+    contact_dir: wp.array[wp.vec3],
+    contact_alpha: wp.array[wp.float32],
+    b_multi: wp.array2d[wp.float64],
+):
+    """Pack all 3 spatial axes of J^T into a single contiguous b_multi for batched solve.
+
+    Rows of ``b_multi`` are laid out by axis-major blocks:
+        rows [0, total_rows)               -> axis 0 (x)
+        rows [total_rows, 2*total_rows)    -> axis 1 (y)
+        rows [2*total_rows, 3*total_rows)  -> axis 2 (z)
+
+    For RHS row ``axis*total_rows + r``:
+        b_multi[axis*total_rows + r, particle[r]] = alpha[r] * dir[r][axis].
+
+    Called with ``dim = 3 * total_rows``. Caller must zero ``b_multi`` before launch.
+
+    Args:
+        total_rows: Number of contact rows (length of ``contact_particle``).
+        contact_particle: Particle index per row, shape ``[total_rows]``, int32.
+        contact_dir: Contact direction per row, shape ``[total_rows]``, vec3.
+        contact_alpha: Jacobian coefficient per row, shape ``[total_rows]``, float32.
+        b_multi: Output RHS buffer, shape ``(3*total_rows, N)`` float64.
+    """
+    tid = wp.tid()
+    axis = tid / total_rows
+    r = tid - axis * total_rows
+    p = contact_particle[r]
+    d = contact_dir[r]
+    alpha = wp.float64(contact_alpha[r])
+    b_multi[tid, p] = alpha * wp.float64(d[axis])
+
+
+@wp.kernel
+def unpack_to_A_inv_Jt_3axis_kernel(
+    total_rows: int,
+    y_multi: wp.array2d[wp.float64],
+    A_inv_Jt: wp.array2d[wp.vec3],
+):
+    """Write all 3 axes of y_multi back into A_inv_Jt in a single launch.
+
+    For row ``r`` and node ``i``:
+        A_inv_Jt[r, i] = (float32(y_multi[r, i]),
+                          float32(y_multi[total_rows + r, i]),
+                          float32(y_multi[2*total_rows + r, i])).
+
+    Called with ``dim = (total_rows, N)``.
+
+    Args:
+        total_rows: Number of contact rows.
+        y_multi: Solved result, shape ``(3*total_rows, N)`` float64.
+        A_inv_Jt: Output buffer, shape ``(total_rows, N)`` vec3; fully written.
+    """
+    r, i = wp.tid()
+    A_inv_Jt[r, i] = wp.vec3(
+        wp.float32(y_multi[r, i]),
+        wp.float32(y_multi[total_rows + r, i]),
+        wp.float32(y_multi[2 * total_rows + r, i]),
+    )
