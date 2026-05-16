@@ -37,5 +37,23 @@ class PerfStatsTests(unittest.TestCase):
         self.assertEqual(s["median_ms"], 3.0)
 
 
+class PinSelectorTests(unittest.TestCase):
+    def test_aabb_selects_inside_only(self) -> None:
+        import numpy as np
+        from scripts.fba_cudatest_bench.pin import select_in_aabb
+
+        verts = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 1.0, 1.0],
+                [-1.0, -1.0, -1.0],
+                [0.5, 0.5, 0.5],
+            ],
+            dtype=np.float64,
+        )
+        idx = select_in_aabb(verts, lo=(-0.1, -0.1, -0.1), hi=(0.6, 0.6, 0.6))
+        np.testing.assert_array_equal(idx, np.array([0, 3], dtype=np.int32))
+
+
 if __name__ == "__main__":
     unittest.main()
