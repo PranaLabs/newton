@@ -156,7 +156,7 @@ class SolverFBA(SolverBase):
         lam: float | None = None,
         friction: bool = True,
         mu_per_pair_override: np.ndarray | None = None,
-        nsn_iterations: int = 10,
+        nsn_iterations: int = 1,
         lambda_cap: float | None = None,
     ) -> None:
         """

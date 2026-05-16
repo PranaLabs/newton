@@ -3419,10 +3419,10 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
         )
         return builder.finalize()
 
-    def test_default_nsn_iter_is_10(self) -> None:
+    def test_default_nsn_iter_is_1(self) -> None:
         model = self._tiny_cloth_model()
         solver = SolverFBA(model)
-        self.assertEqual(solver.nsn_iterations, 10)
+        self.assertEqual(solver.nsn_iterations, 1)
 
     def test_nsn_iter_overridable(self) -> None:
         model = self._tiny_cloth_model()
