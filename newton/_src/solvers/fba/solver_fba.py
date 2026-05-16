@@ -247,6 +247,12 @@ class SolverFBA(SolverBase):
         # track whether that buffer is fresh for the current step.
         self._cached_A_inv_Jt_valid: bool = False
 
+        # λ persistent across PD outer iters within a step. RealSim parity:
+        # cuda_lambda.setZero once per frame in prepare_gpu, then λ += dλ
+        # accumulates over PD outer iters.
+        self._lam_unilateral_persistent: np.ndarray | None = None
+        self._lam_coulomb_persistent: np.ndarray | None = None
+
         # Per-element device data (filled by _setup_pd_system).
         self._tri_indices_d = None
         self._tri_rest_inv_d = None
@@ -402,6 +408,19 @@ class SolverFBA(SolverBase):
             self._invalidate_schur_cache()
 
         has_contacts = self._contact_count > 0
+
+        # RealSim parity: λ = 0 once per step (per frame), then accumulates
+        # across the PD outer iters below.
+        M = self._contact_count
+        if M > 0:
+            if self._lam_unilateral_persistent is None or self._lam_unilateral_persistent.shape != (M,):
+                self._lam_unilateral_persistent = np.zeros(M, dtype=np.float64)
+            else:
+                self._lam_unilateral_persistent.fill(0.0)
+            if self._lam_coulomb_persistent is None or self._lam_coulomb_persistent.shape != (3 * M,):
+                self._lam_coulomb_persistent = np.zeros(3 * M, dtype=np.float64)
+            else:
+                self._lam_coulomb_persistent.fill(0.0)
 
         model = self.model
         N = model.particle_count
@@ -577,7 +596,14 @@ class SolverFBA(SolverBase):
                     W = self._cached_W
                     x_unc_np = self._x_cur.numpy()  # (N, 3) float32
                     r = self._compute_contact_residual_friction(x_unc_np)
-                    lam = self._solve_nsn_coulomb(W, r, self._contact_mu_h[:M], max_iters=self.nsn_iterations)
+                    lam = self._solve_nsn_coulomb(
+                        W,
+                        r,
+                        self._contact_mu_h[:M],
+                        max_iters=self.nsn_iterations,
+                        lam_init=self._lam_coulomb_persistent,
+                    )
+                    self._lam_coulomb_persistent = lam.copy()
                     if np.any(np.abs(lam) > 1e-15):
                         correction = self._apply_lambda_correction_friction(lam)
                         wp.launch(
@@ -600,7 +626,13 @@ class SolverFBA(SolverBase):
                     W = self._cached_W
                     x_unc_np = self._x_cur.numpy()  # (N, 3) float32
                     r = self._compute_contact_residual(x_unc_np)
-                    lam = self._solve_nsn_unilateral(W, r, max_iters=self.nsn_iterations)
+                    lam = self._solve_nsn_unilateral(
+                        W,
+                        r,
+                        max_iters=self.nsn_iterations,
+                        lam_init=self._lam_unilateral_persistent,
+                    )
+                    self._lam_unilateral_persistent = lam.copy()
                     if np.any(lam > 1e-15):
                         correction = self._apply_lambda_correction(lam)
                         wp.launch(
@@ -657,6 +689,9 @@ class SolverFBA(SolverBase):
         """
         self._cached_W = None
         self._cached_A_inv_Jt_valid = False
+        # λ warm-start: persistent buffer must be resized when contact-set changes.
+        self._lam_unilateral_persistent = None
+        self._lam_coulomb_persistent = None
 
     # ------------------------------------------------------------------
     # Phase 4 Stage A — contact state (allocated lazily on first call).
@@ -900,7 +935,13 @@ class SolverFBA(SolverBase):
             )
         return r
 
-    def _solve_nsn_unilateral(self, W: np.ndarray, r: np.ndarray, max_iters: int = 20) -> np.ndarray:
+    def _solve_nsn_unilateral(
+        self,
+        W: np.ndarray,
+        r: np.ndarray,
+        max_iters: int = 20,
+        lam_init: np.ndarray | None = None,
+    ) -> np.ndarray:
         """Solve the unilateral LCP via projected Gauss-Seidel.
 
         Finds ``λ ≥ 0`` satisfying ``W·λ = r`` (normal contact forces).
@@ -919,7 +960,10 @@ class SolverFBA(SolverBase):
             Contact impulse vector ``λ``, shape ``(M,)``, float64.
         """
         M = len(r)
-        lam = np.zeros(M, dtype=np.float64)
+        if lam_init is not None and lam_init.shape == (M,):
+            lam = lam_init.astype(np.float64, copy=True)
+        else:
+            lam = np.zeros(M, dtype=np.float64)
         for _ in range(max_iters):
             lam_old = lam.copy()
             for c in range(M):
@@ -933,7 +977,14 @@ class SolverFBA(SolverBase):
             np.clip(lam, -self.lambda_cap, self.lambda_cap, out=lam)
         return lam
 
-    def _solve_nsn_coulomb(self, W: np.ndarray, r: np.ndarray, mu: np.ndarray, max_iters: int = 20) -> np.ndarray:
+    def _solve_nsn_coulomb(
+        self,
+        W: np.ndarray,
+        r: np.ndarray,
+        mu: np.ndarray,
+        max_iters: int = 20,
+        lam_init: np.ndarray | None = None,
+    ) -> np.ndarray:
         """Solve the frictional LCP via blocked projected Gauss-Seidel.
 
         Operates on 3-blocks ``[λ_n, λ_t1, λ_t2]`` per contact.  Each block
@@ -958,7 +1009,10 @@ class SolverFBA(SolverBase):
             ``[λ_n_0, λ_t1_0, λ_t2_0, λ_n_1, ...]``.
         """
         M = len(mu)
-        lam = np.zeros(3 * M, dtype=np.float64)
+        if lam_init is not None and lam_init.shape == (3 * M,):
+            lam = lam_init.astype(np.float64, copy=True)
+        else:
+            lam = np.zeros(3 * M, dtype=np.float64)
         for _ in range(max_iters):
             lam_old = lam.copy()
             for c in range(M):

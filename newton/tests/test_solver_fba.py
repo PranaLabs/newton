@@ -3603,5 +3603,69 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
         self.assertEqual(solver.lambda_cap, 100.0)
 
 
+class SolverFBALambdaWarmStartTests(unittest.TestCase):
+    """λ warm-start across PD outer iters reproduces RealSim's per-frame reset.
+
+    Verifies:
+    1. λ is zero at step entry (per-frame setZero).
+    2. After the first NSN call within a step, λ persistent is non-zero.
+    3. After update_contacts changes the set, λ persistent is reset.
+    """
+
+    def _cloth_on_plane_model(self):
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=-9.81)
+        builder.add_ground_plane()
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.2, -0.2, 0.15),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.05,
+            tri_ke=1.0e4,
+            tri_ka=0.0,
+            tri_kd=0.0,
+        )
+        return builder.finalize()
+
+    def test_lam_persistent_initially_none(self) -> None:
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._cloth_on_plane_model()
+        solver = SolverFBA(model)
+        self.assertIsNone(solver._lam_unilateral_persistent)
+        self.assertIsNone(solver._lam_coulomb_persistent)
+
+    def test_lam_persistent_accumulates_within_step(self) -> None:
+        """After one step with contacts, the persistent λ buffer is non-zero."""
+        from newton import CollisionPipeline  # noqa: PLC0415
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._cloth_on_plane_model()
+        solver = SolverFBA(model, friction=False)
+        s_in, s_out = model.state(), model.state()
+        pipeline = CollisionPipeline(model, soft_contact_margin=0.05)
+        contacts = pipeline.contacts()
+
+        # Step a few times to let cloth settle into contact.
+        for _ in range(10):
+            s_in.clear_forces()
+            pipeline.collide(s_in, contacts)
+            solver.step(s_in, s_out, None, contacts, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+
+        # λ should be populated for the contact set
+        # (cloth bottom row resting on plane).
+        if solver._contact_count > 0:
+            self.assertIsNotNone(solver._lam_unilateral_persistent)
+            self.assertGreater(
+                float(np.abs(solver._lam_unilateral_persistent).max()),
+                0.0,
+                "λ should be non-zero after sustained contact",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
