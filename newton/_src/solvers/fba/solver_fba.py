@@ -158,6 +158,7 @@ class SolverFBA(SolverBase):
         mu_per_pair_override: np.ndarray | None = None,
         nsn_iterations: int = 1,
         lambda_cap: float | None = None,
+        use_isodof: bool = True,
     ) -> None:
         """
         Args:
@@ -177,6 +178,13 @@ class SolverFBA(SolverBase):
             lambda_cap: Optional per-step clamp ``|λ| <= lambda_cap`` applied
                 to contact impulses after the NSN solve. ``None`` disables
                 clamping; mirrors RealSim's ``constraintsolver.maxforce``.
+            use_isodof: If ``True`` (default, Task P), build the Schur
+                complement via the isodof-restricted path that computes only
+                the ``A^{-1}[i, j]`` entries for the unique contacted
+                particles, skipping the multi-RHS Cholesky solve over ``M``
+                columns of ``J^T``. Mirrors RealSim's
+                ``CUDASparseInverseSolver::addHAinvHT_gpu``. Set to ``False``
+                only for regression testing against the legacy path.
         """
         super().__init__(model)
 
@@ -215,6 +223,7 @@ class SolverFBA(SolverBase):
         )
         self.nsn_iterations = int(nsn_iterations)
         self.lambda_cap = lambda_cap
+        self.use_isodof = bool(use_isodof)
 
         # PD setup is dt-dependent; we cache the assembly at a reference dt and
         # rebuild lazily inside `step` if the dt changes.
@@ -591,6 +600,7 @@ class SolverFBA(SolverBase):
                             self._contact_alpha_d,
                             self._contact_tangent1_d,
                             self._contact_tangent2_d,
+                            use_isodof=self.use_isodof,
                         )
                         self._cached_A_inv_Jt_valid = True
                     W = self._cached_W
@@ -621,6 +631,7 @@ class SolverFBA(SolverBase):
                             self._contact_particle_d,
                             self._contact_normal_d,
                             self._contact_alpha_d,
+                            use_isodof=self.use_isodof,
                         )
                         self._cached_A_inv_Jt_valid = True
                     W = self._cached_W
@@ -1077,6 +1088,13 @@ class SolverFBA(SolverBase):
 
         correction = wp.zeros(N, dtype=wp.vec3, device=dev)
 
+        # Isodof-mode path: rebuild ``J^T lambda`` and run a single Cholesky
+        # solve. This is the default for ``use_isodof=True`` because the
+        # ``_A_inv_Jt_d`` cache is not populated by the isodof Schur build.
+        if self.use_isodof and hasattr(ls, "_row_particle_d") and ls._row_total == total_rows:
+            ls.apply_lambda_correction_isodof(lam, correction)
+            return correction
+
         if hasattr(ls, "_A_inv_Jt_d") and ls._A_inv_Jt_d.shape[0] >= total_rows:
             # Use cached device buffer: accumulate weighted rows entirely on GPU.
             from .kernels import accumulate_lambda_correction_kernel  # noqa: PLC0415
@@ -1152,6 +1170,13 @@ class SolverFBA(SolverBase):
         ls = self._linear_solver
 
         correction = wp.zeros(N, dtype=wp.vec3, device=dev)
+
+        # Isodof-mode path: rebuild ``J^T lambda`` and run a single Cholesky
+        # solve. This is the default for ``use_isodof=True`` because the
+        # ``_A_inv_Jt_d`` cache is not populated by the isodof Schur build.
+        if self.use_isodof and hasattr(ls, "_row_particle_d") and ls._row_total == M:
+            ls.apply_lambda_correction_isodof(lam, correction)
+            return correction
 
         if hasattr(ls, "_A_inv_Jt_d") and ls._A_inv_Jt_d.shape[0] >= M:
             # Reuse cached A⁻¹ · J_c^T columns from build_schur_complement and

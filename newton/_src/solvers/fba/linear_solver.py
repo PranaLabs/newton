@@ -909,6 +909,7 @@ class FBALinearSolver:
         j_alpha: wp.array,
         j_tangent1: wp.array | None = None,
         j_tangent2: wp.array | None = None,
+        use_isodof: bool = True,
     ) -> np.ndarray:
         """Build ``W = J · A⁻¹ · Jᵀ`` as a dense NumPy array (batched GPU implementation).
 
@@ -919,18 +920,22 @@ class FBALinearSolver:
         three rows per contact ordered ``[n_c, t1_c, t2_c]`` for c = 0..M-1.
         Off-diagonal coupling between contacts is fully included.
 
-        Implementation uses Approach B (multi-RHS batched solve) with all 3 spatial axes
-        fused into a single solve: the ``3 * M_rows`` columns of ``A^{-1} J^T`` are computed
-        in one batched pass over the shared Cholesky factor. Results are stored on device in
-        a single ``A_inv_Jt`` buffer of shape ``(M_rows, N)``.  The ``W`` matrix is then
-        built entirely on device via a 2D kernel (one thread per (c', c) pair) and only
-        one host pull is needed at the end.
+        Two implementations are supported:
 
-        The ``_A_inv_Jt_d`` attribute is set to the device buffer of shape ``(M_rows, N)``
-        after this call and is reused by
-        :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA._apply_lambda_correction_friction`
-        and :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA._apply_lambda_correction`
-        to avoid re-solving. The legacy ``_y_cache`` attribute is no longer populated.
+        - ``use_isodof=True`` (default, Task P): computes only the selected
+            ``A^{-1}[i, j]`` entries for ``i, j`` in the unique-particle set of
+            ``j_indices`` (the "isolated DOFs" / isodofs).  ``W`` is then assembled
+            from ``Wi``, the per-particle direction, and the contact alpha entirely
+            on device.  This avoids the ``M`` multi-RHS Cholesky solves entirely.
+            The ``_A_inv_Jt_d`` buffer is *not* populated on this path; callers that
+            need the lambda correction must use the isodof-aware
+            :meth:`apply_lambda_correction_isodof` helper.
+
+        - ``use_isodof=False`` (regression / fallback): the previous Approach B
+            multi-RHS solve. Computes ``A^{-1} J^T`` for all ``3 * M_rows`` columns
+            and assembles ``W`` from those columns.  The ``_A_inv_Jt_d`` device
+            buffer of shape ``(M_rows, N)`` is left populated and reused by
+            :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA._apply_lambda_correction*`.
 
         Args:
             num_contacts: Number of active contacts ``M``.
@@ -941,11 +946,16 @@ class FBALinearSolver:
                 When ``None``, Stage A behavior (M x M W).
             j_tangent2: Second tangent direction per contact, shape ``[M]``, dtype vec3.
                 Must be provided together with ``j_tangent1``.
+            use_isodof: If ``True`` (default) use the isodof-restricted build
+                that skips the multi-RHS solve.  If ``False``, use the legacy
+                multi-RHS path (kept for regression testing).
 
         Returns:
             Dense float64 NumPy array of shape ``(M, M)`` (Stage A) or ``(3M, 3M)`` (Stage B).
         """
         from .kernels import (  # noqa: PLC0415
+            compose_W_from_wi_kernel,
+            compute_wi_kernel,
             pack_jacobian_3axis_kernel,
             unpack_to_A_inv_Jt_3axis_kernel,
         )
@@ -961,33 +971,78 @@ class FBALinearSolver:
         # --- Build unified per-row direction and particle arrays on device ---
         # For Stage A: total_rows == M, each row uses normal direction.
         # For Stage B: total_rows == 3M, rows interleaved [n_c, t1_c, t2_c].
-        idx_np = j_indices.numpy()  # (M,) int32 — small, needed for row dir array
-        n_np = j_normals.numpy()  # (M, 3) float32
-        a_np = j_alpha.numpy()  # (M,) float32
+        # ``j_*`` arrays may be over-allocated (capacity > M); slice to active range.
+        idx_np = j_indices.numpy()[:M]  # (M,) int32 — small, needed for row dir array
+        n_np = j_normals.numpy()[:M]  # (M, 3) float32
+        a_np = j_alpha.numpy()[:M]  # (M,) float32
         if has_friction:
-            t1_np = j_tangent1.numpy()  # (M, 3) float32
-            t2_np = j_tangent2.numpy()  # (M, 3) float32
+            t1_np = j_tangent1.numpy()[:M]  # (M, 3) float32
+            t2_np = j_tangent2.numpy()[:M]  # (M, 3) float32
 
         # Build (total_rows,) arrays for particle index, direction, alpha.
         row_particle = np.empty(total_rows, dtype=np.int32)
         row_dir = np.empty((total_rows, 3), dtype=np.float32)
         row_alpha = np.empty(total_rows, dtype=np.float32)
-        for c in range(M):
-            if has_friction:
-                for a, d in enumerate([n_np[c], t1_np[c], t2_np[c]]):
-                    row = c * 3 + a
-                    row_particle[row] = idx_np[c]
-                    row_dir[row] = d
-                    row_alpha[row] = a_np[c]
-            else:
-                row_particle[c] = idx_np[c]
-                row_dir[c] = n_np[c]
-                row_alpha[c] = a_np[c]
+        if has_friction:
+            # Stage B: 3 rows per contact, interleaved (n, t1, t2).
+            row_particle[0::3] = idx_np
+            row_particle[1::3] = idx_np
+            row_particle[2::3] = idx_np
+            row_dir[0::3] = n_np
+            row_dir[1::3] = t1_np
+            row_dir[2::3] = t2_np
+            row_alpha[0::3] = a_np
+            row_alpha[1::3] = a_np
+            row_alpha[2::3] = a_np
+        else:
+            row_particle[:] = idx_np
+            row_dir[:] = n_np
+            row_alpha[:] = a_np
 
         # Upload direction arrays to device.
         row_particle_d = wp.array(row_particle, dtype=wp.int32, device=dev)
         row_dir_d = wp.array(row_dir, dtype=wp.vec3, device=dev)
         row_alpha_d = wp.array(row_alpha, dtype=wp.float32, device=dev)
+
+        # --- Allocate/reuse W device buffer (used by both paths). ---
+        if (
+            not hasattr(self, "_W_device_d")
+            or self._W_device_d.shape[0] < total_rows
+            or self._W_device_d.shape[1] < total_rows
+        ):
+            self._W_device_d = wp.empty(shape=(total_rows, total_rows), dtype=wp.float64, device=dev)
+
+        # Stash per-row contact metadata for the isodof lambda-correction path.
+        # (Used by :meth:`apply_lambda_correction_isodof`; harmless on the
+        # legacy path which has its own ``_A_inv_Jt_d`` cache.)
+        self._row_particle_d = row_particle_d
+        self._row_dir_d = row_dir_d
+        self._row_alpha_d = row_alpha_d
+        self._row_total = total_rows
+
+        # =====================================================================
+        # Isodof-restricted path (Task P): build ``Wi`` of size (k, k) for the
+        # unique contacted particles, then assemble W via a 2D kernel reading
+        # ``Wi[isodof_rank(p_cp), isodof_rank(p_c)]``. Skips the multi-RHS solve
+        # entirely. ``_A_inv_Jt_d`` is intentionally NOT populated here — the
+        # solver_fba lambda correction uses the isodof helper instead.
+        # =====================================================================
+        if use_isodof:
+            return self._build_schur_isodof(
+                row_particle,
+                row_particle_d,
+                row_dir_d,
+                row_alpha_d,
+                total_rows,
+                compute_wi_kernel,
+                compose_W_from_wi_kernel,
+            )
+
+        # =====================================================================
+        # Legacy multi-RHS path: compute ``A^{-1} J^T`` for all ``3*total_rows``
+        # columns, then assemble W via ``accumulate_schur_W_kernel``. Kept for
+        # regression testing and as a fallback when the isodof path is disabled.
+        # =====================================================================
 
         # --- Allocate/reuse A_inv_Jt buffer: shape (total_rows, N) on device ---
         if not hasattr(self, "_A_inv_Jt_d") or self._A_inv_Jt_d.shape[0] < total_rows or self._A_inv_Jt_d.shape[1] != n:
@@ -1043,15 +1098,6 @@ class FBALinearSolver:
             device=dev,
         )
 
-        # --- Build W on device via 2D kernel, then single host pull ---
-        # Allocate/reuse W device buffer.
-        if (
-            not hasattr(self, "_W_device_d")
-            or self._W_device_d.shape[0] < total_rows
-            or self._W_device_d.shape[1] < total_rows
-        ):
-            self._W_device_d = wp.empty(shape=(total_rows, total_rows), dtype=wp.float64, device=dev)
-
         # Zero W before accumulation (only the active sub-block).
         W_zeros = np.zeros((total_rows, total_rows), dtype=np.float64)
         self._W_device_d.assign(W_zeros)
@@ -1068,3 +1114,174 @@ class FBALinearSolver:
         W = self._W_device_d.numpy()[:total_rows, :total_rows].copy()
 
         return W
+
+    def _build_schur_isodof(
+        self,
+        row_particle: np.ndarray,
+        row_particle_d: wp.array,
+        row_dir_d: wp.array,
+        row_alpha_d: wp.array,
+        total_rows: int,
+        compute_wi_kernel,
+        compose_W_from_wi_kernel,
+    ) -> np.ndarray:
+        """Isodof-restricted Schur build.
+
+        Mirrors RealSim ``addHAinvHT_gpu`` (CUDASparseInverseSolver.cpp:215-339):
+        we collect the unique contacted DOFs ``isodofs``, compute the dense
+        ``k x k`` matrix ``Wi[a, b] = A^{-1}[isodofs[a], isodofs[b]]`` via a
+        column-intersection kernel over the sparse-inverse factor ``S``, and
+        then assemble ``W[c', c]`` from per-contact ``(particle, dir, alpha)``
+        triples and an ``isodof_rank`` lookup.
+
+        The legacy multi-RHS solve over ``A`` is skipped entirely — for sparse
+        meshes where ``k^2 * nnz_col(S) << M * nnz(S)``, this is the dominant
+        speedup ("Task P", ~RealSim parity).
+        """
+        N = self.n
+        dev = self.device
+
+        # --- Build isodofs (unique sorted particle indices) on host ---
+        # For Stage A: row_particle has one entry per contact.
+        # For Stage B: each contact contributes 3 identical particle entries
+        # (n/t1/t2 share a particle), so dedup gives the same set.
+        # M is small (~1000), so np.unique is cheap.
+        isodofs_h = np.unique(row_particle.astype(np.int64)).astype(np.int32)
+        k = int(isodofs_h.size)
+
+        # --- Build per-particle rank table (-1 for non-isodof particles) ---
+        # We use a dense ``[N]`` int32 array so the composition kernel can do
+        # ``rank = isodof_rank[particle]`` in O(1). Memory: 4*N bytes (e.g.
+        # 21 KB for N = 5325). Allocated on host then uploaded.
+        isodof_rank_h = np.full(N, -1, dtype=np.int32)
+        isodof_rank_h[isodofs_h] = np.arange(k, dtype=np.int32)
+
+        # --- Build perm[isodofs[a]] for the Wi kernel ---
+        # The runtime solve computes ``A^{-1} = P · S^T · D^{-1} · S · P^T``
+        # (see :meth:`solve`), where ``P[i, k] = δ_{k, perm[i]}``. Therefore
+        # ``A^{-1}[i, j] = M[perm[i], perm[j]]`` with ``M = S^T D^{-1} S``,
+        # which gives
+        #     Wi[a, b] = sum_k S[k, perm[isodofs[a]]] * Dinv[k]
+        #                      * S[k, perm[isodofs[b]]].
+        # We precompute ``perm[isodofs[a]]`` per isodof. Using ``invperm`` here
+        # silently builds the wrong matrix (different particles map under the
+        # two permutations) and produces NaN downstream once contacts engage.
+        perm_h = self._perm.numpy()
+        isodof_perm_h = perm_h[isodofs_h].astype(np.int32)
+
+        # --- Upload to device (allocate / reuse buffers) ---
+        if not hasattr(self, "_isodofs_cap") or self._isodofs_cap < k:
+            cap = max(k, int(getattr(self, "_isodofs_cap", 0) * 1.5) + 1)
+            self._isodofs_cap = cap
+            self._isodof_perm_d = wp.empty(cap, dtype=wp.int32, device=dev)
+            self._Wi_device_d = wp.empty(shape=(cap, cap), dtype=wp.float64, device=dev)
+        if not hasattr(self, "_isodof_rank_d") or self._isodof_rank_d.shape[0] != N:
+            self._isodof_rank_d = wp.empty(N, dtype=wp.int32, device=dev)
+        self._isodof_perm_d.assign(isodof_perm_h)
+        self._isodof_rank_d.assign(isodof_rank_h)
+
+        # Active sub-views of the Wi buffer (k x k).
+        Wi_v = wp.array(
+            ptr=self._Wi_device_d.ptr,
+            dtype=wp.float64,
+            shape=(k, k),
+            device=dev,
+        )
+
+        # --- Compute Wi entries (only sums over column intersections) ---
+        # One thread per (a, b) pair; the kernel writes only a <= b and mirrors
+        # to (b, a). With the sparse-inverse factor S already on device as the
+        # CSR-of-S^T BSR (one row per S column), the inner loop is a sorted
+        # two-pointer intersection of two columns.
+        wp.launch(
+            compute_wi_kernel,
+            dim=(k, k),
+            inputs=[
+                self._ST_bsr.offsets,
+                self._ST_bsr.columns,
+                self._ST_bsr.values,
+                self._Dinv,
+                self._isodof_perm_d,
+            ],
+            outputs=[Wi_v],
+            device=dev,
+        )
+
+        # --- Compose W[c', c] = alpha[c']*alpha[c] * dot(dir[c'], dir[c]) * Wi[r', r] ---
+        # The (total_rows x total_rows) W is written densely; one thread per
+        # (c', c) pair. ``isodof_rank[N]`` provides the rank lookup per particle.
+        wp.launch(
+            compose_W_from_wi_kernel,
+            dim=(total_rows, total_rows),
+            inputs=[
+                row_particle_d,
+                row_dir_d,
+                row_alpha_d,
+                self._isodof_rank_d,
+                Wi_v,
+            ],
+            outputs=[self._W_device_d],
+            device=dev,
+        )
+
+        # Single host pull for the (total_rows x total_rows) W matrix.
+        W = self._W_device_d.numpy()[:total_rows, :total_rows].copy()
+        return W
+
+    def apply_lambda_correction_isodof(
+        self,
+        lam: np.ndarray,
+        out: wp.array,
+    ) -> None:
+        """Compute ``correction = A^{-1} J^T lambda`` via a single Cholesky solve.
+
+        For the isodof path, ``_A_inv_Jt_d`` is *not* populated — instead we
+        rebuild ``J^T lambda`` (a vec3 array of length ``N``, accumulated over
+        contact rows via atomics) and call :meth:`solve` once. This is much
+        cheaper than the multi-RHS dot accumulation when the contact set is
+        small relative to the total DOF count.
+
+        Args:
+            lam: Contact impulse vector, shape ``(total_rows,)``, float64.
+                ``total_rows == M`` for Stage A, ``3 * M`` for Stage B.
+            out: Output correction, shape ``[N]``, vec3. Overwritten.
+        """
+        from .kernels import build_jt_lambda_vec3_kernel  # noqa: PLC0415
+
+        if not hasattr(self, "_row_particle_d"):
+            raise RuntimeError(
+                "apply_lambda_correction_isodof requires a prior isodof-mode "
+                "build_schur_complement call (which sets _row_*_d arrays)."
+            )
+
+        n = self.n
+        dev = self.device
+        n_rows = self._row_total
+
+        if not hasattr(self, "_jt_lambda_d") or self._jt_lambda_d.shape[0] != n:
+            self._jt_lambda_d = wp.empty(n, dtype=wp.vec3, device=dev)
+        if not hasattr(self, "_lam_d") or self._lam_d.shape[0] < n_rows:
+            cap = max(n_rows, int(getattr(self, "_lam_cap", 0) * 1.5) + 1)
+            self._lam_cap = cap
+            self._lam_d = wp.empty(cap, dtype=wp.float32, device=dev)
+
+        self._lam_d.assign(lam.astype(np.float32))
+        # Zero the per-particle accumulator before atomic adds.
+        self._jt_lambda_d.zero_()
+
+        wp.launch(
+            build_jt_lambda_vec3_kernel,
+            dim=n_rows,
+            inputs=[
+                self._row_particle_d,
+                self._row_dir_d,
+                self._row_alpha_d,
+                self._lam_d,
+                int(n_rows),
+            ],
+            outputs=[self._jt_lambda_d],
+            device=dev,
+        )
+
+        # Single Cholesky solve: out = A^{-1} * (J^T lambda).
+        self.solve(self._jt_lambda_d, out)

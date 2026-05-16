@@ -2784,6 +2784,82 @@ class TestPhase4StageAContact(unittest.TestCase):
             err_msg="Approach B W diverges from analytical reference",
         )
 
+    def test_isodof_W_matches_dense_path(self):
+        """``build_schur_complement(use_isodof=True)`` produces the same W as
+        the legacy ``use_isodof=False`` multi-RHS path.
+
+        The isodof path computes only ``A^{-1}[i, j]`` entries restricted to
+        the unique contacted particles and assembles ``W`` from a per-particle
+        rank table. It must match the dense (multi-RHS solve) path bitwise
+        modulo float64 round-off.
+
+        Regression for a sign/indexing bug where ``invperm[isodofs]`` was used
+        in place of ``perm[isodofs]`` when computing the selected ``A^{-1}``
+        entries, which silently builds the wrong matrix and triggers NaN
+        downstream as soon as contacts engage.
+        """
+        import scipy.sparse as _sp
+
+        from newton._src.solvers.fba.linear_solver import (  # noqa: PLC0415
+            FBALinearSolver,
+            factorize_and_sparse_inverse,
+        )
+
+        # Build a sparse SPD matrix whose COLAMD ordering produces a
+        # non-trivial ``perm_r`` (``perm_r != invperm_r``). A purely random
+        # dense SPD often factors with the identity permutation under COLAMD,
+        # which masks any bug that swaps ``perm[isodofs]`` for
+        # ``invperm[isodofs]``.
+        rng = np.random.default_rng(11)
+        N = 200
+        M = 7
+
+        A_lil = _sp.lil_matrix((N, N))
+        for i in range(N):
+            A_lil[i, i] = 4.0 + rng.random()
+            if i > 0:
+                v = float(rng.standard_normal())
+                A_lil[i, i - 1] = v
+                A_lil[i - 1, i] = v
+            if i > 4:
+                v = 0.1 * float(rng.standard_normal())
+                A_lil[i, i - 5] = v
+                A_lil[i - 5, i] = v
+        for j in (10, 30, 50, 100, 150):
+            A_lil[0, j] = 0.5
+            A_lil[j, 0] = 0.5
+        A = A_lil.tocsc()
+        fs = factorize_and_sparse_inverse(A)
+        # Sanity: this is the regime where perm != invperm.
+        assert not np.array_equal(fs.perm_r, fs.invperm_r), (
+            "Test setup invalid: COLAMD chose identity ordering; the isodof vs dense W test would be vacuous."
+        )
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+
+        rng2 = np.random.default_rng(17)
+        # Allow duplicate particles in contact rows — both paths should still agree.
+        j_indices = rng2.integers(0, N, size=M, dtype=np.int32)
+        j_normals = rng2.standard_normal((M, 3)).astype(np.float32)
+        j_normals /= np.linalg.norm(j_normals, axis=1, keepdims=True) + 1e-8
+        j_alpha = rng2.uniform(0.5, 2.0, size=M).astype(np.float32)
+
+        j_indices_d = wp.array(j_indices, dtype=wp.int32, device=device)
+        j_normals_d = wp.array(j_normals, dtype=wp.vec3, device=device)
+        j_alpha_d = wp.array(j_alpha, dtype=wp.float32, device=device)
+
+        solver = FBALinearSolver(fs, device=device)
+        W_dense = solver.build_schur_complement(M, j_indices_d, j_normals_d, j_alpha_d, use_isodof=False)
+        W_iso = solver.build_schur_complement(M, j_indices_d, j_normals_d, j_alpha_d, use_isodof=True)
+
+        np.testing.assert_allclose(
+            W_iso,
+            W_dense,
+            rtol=1e-6,
+            atol=1e-8,
+            err_msg="Isodof W diverges from dense-path W",
+        )
+
 
 class TestPhase4StageBFriction(unittest.TestCase):
     """Phase 4 Stage B: Coulomb friction via NonSmooth Newton."""

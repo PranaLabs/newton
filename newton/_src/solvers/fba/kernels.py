@@ -1486,3 +1486,157 @@ def accumulate_lambda_correction_kernel(
     for r in range(n_rows):
         c = c + lam[r] * A_inv_Jt[r, i]
     out[i] = c
+
+
+# ---------------------------------------------------------------------------
+# Task P — isodof-restricted Schur build primitives
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def compute_wi_kernel(
+    ST_offsets: wp.array[wp.int32],
+    ST_columns: wp.array[wp.int32],
+    ST_values: wp.array[wp.float64],
+    D_inv: wp.array[wp.float64],
+    isodof_perm: wp.array[wp.int32],
+    Wi: wp.array2d[wp.float64],
+):
+    """Compute ``Wi[a, b] = A^{-1}[isodofs[a], isodofs[b]]`` for selected DOFs.
+
+    Uses ``A^{-1} = P^T S^T D^{-1} S P`` so
+
+        Wi[a, b] = sum_k S[k, ip[a]] * D_inv[k] * S[k, ip[b]]
+
+    where ``ip[a] = invperm[isodofs[a]]``. The sparsity pattern of S is the
+    elimination tree, so the sum is over the intersection of column ``ip[a]``
+    and column ``ip[b]`` of S.
+
+    ``S`` is provided through its transpose ``S^T`` in CSR form (i.e.,
+    ``ST_offsets`` row-indexes ``S^T``, equivalent to column-indexing ``S``).
+    For row ``c`` of ``S^T``, the entries ``(ST_columns[k], ST_values[k])`` are
+    ``(row_in_S, S[row_in_S, c])`` with ``row_in_S`` sorted ascending — so the
+    intersection of two columns of S reduces to a two-pointer merge over the
+    sorted row-index lists.
+
+    One thread per ``(a, b)`` pair in the ``(k, k)`` output ``Wi``. Writes both
+    ``Wi[a, b]`` and ``Wi[b, a]`` for ``a <= b``; threads with ``a > b`` exit
+    early.
+
+    Args:
+        ST_offsets: CSR row offsets of ``S^T``, length ``N + 1``, int32.
+        ST_columns: CSR column indices of ``S^T``, length ``nnz(S)``, int32 —
+            these are the row indices of ``S`` in column order.
+        ST_values: CSR values of ``S^T``, length ``nnz(S)``, float64 —
+            same numerical values as ``S`` since transposition only reorders.
+        D_inv: ``D^{-1}`` diagonal, length ``N``, float64.
+        isodof_perm: ``invperm[isodofs[a]]`` for ``a = 0..k-1``, length ``k``,
+            int32.
+        Wi: Output symmetric matrix, shape ``(k, k)`` float64.
+    """
+    a, b = wp.tid()
+    if b < a:
+        return
+    ip_a = isodof_perm[a]
+    ip_b = isodof_perm[b]
+    beg_i = ST_offsets[ip_a]
+    end_i = ST_offsets[ip_a + 1]
+    beg_j = ST_offsets[ip_b]
+    end_j = ST_offsets[ip_b + 1]
+    pi = beg_i
+    pj = beg_j
+    acc = wp.float64(0.0)
+    while pi < end_i and pj < end_j:
+        ki = ST_columns[pi]
+        kj = ST_columns[pj]
+        if ki == kj:
+            acc = acc + ST_values[pi] * D_inv[ki] * ST_values[pj]
+            pi = pi + 1
+            pj = pj + 1
+        elif ki < kj:
+            pi = pi + 1
+        else:
+            pj = pj + 1
+    Wi[a, b] = acc
+    if b != a:
+        Wi[b, a] = acc
+
+
+@wp.kernel
+def compose_W_from_wi_kernel(
+    contact_particle: wp.array[wp.int32],
+    contact_dir: wp.array[wp.vec3],
+    contact_alpha: wp.array[wp.float32],
+    isodof_rank: wp.array[wp.int32],
+    Wi: wp.array2d[wp.float64],
+    W: wp.array2d[wp.float64],
+):
+    """Assemble ``W[c', c] = alpha[c'] * alpha[c] * (dir[c'] . dir[c]) * Wi[r', r]``.
+
+    For particle-vs-static-shape contact rows, the Jacobian for row ``c`` has a
+    single nonzero column at ``particle[c]`` with value
+    ``alpha[c] * dir[c]`` (vec3). The scalar ``A^{-1}`` acts component-wise on
+    each spatial axis, so
+
+        (J A^{-1} J^T)[c', c] = alpha[c'] * alpha[c] * (dir[c'] . dir[c])
+                                 * A^{-1}[particle[c'], particle[c]]
+                              = alpha[c'] * alpha[c] * (dir[c'] . dir[c])
+                                 * Wi[rank(particle[c']), rank(particle[c])].
+
+    One thread per ``(c', c)`` pair in the ``(total_rows, total_rows)`` W.
+
+    Args:
+        contact_particle: Particle index per contact row, shape ``[total_rows]``.
+        contact_dir: Contact direction per row, shape ``[total_rows]``.
+        contact_alpha: Jacobian coefficient per row, shape ``[total_rows]``.
+        isodof_rank: Per-particle rank within ``isodofs`` (``isodof_rank[p] = a``
+            iff ``isodofs[a] == p``), shape ``[N]``. Entries for non-isodof
+            particles are ``-1`` but are never indexed because every contact
+            row's particle is by construction an isodof.
+        Wi: ``(k, k)`` matrix of selected ``A^{-1}`` entries, float64.
+        W: Output ``(total_rows, total_rows)`` Schur complement, float64.
+    """
+    cp, c = wp.tid()
+    p_cp = contact_particle[cp]
+    p_c = contact_particle[c]
+    r_cp = isodof_rank[p_cp]
+    r_c = isodof_rank[p_c]
+    alpha = wp.float64(contact_alpha[cp]) * wp.float64(contact_alpha[c])
+    dot = wp.float64(wp.dot(contact_dir[cp], contact_dir[c]))
+    W[cp, c] = alpha * dot * Wi[r_cp, r_c]
+
+
+@wp.kernel
+def build_jt_lambda_vec3_kernel(
+    contact_particle: wp.array[wp.int32],
+    contact_dir: wp.array[wp.vec3],
+    contact_alpha: wp.array[wp.float32],
+    lam: wp.array[wp.float32],
+    n_rows: int,
+    out: wp.array[wp.vec3],
+):
+    """Compute ``out[p] = sum_{r: particle[r]=p} alpha[r] * lam[r] * dir[r]``.
+
+    One thread per contact row, accumulating into the per-particle vec3 output
+    via atomic adds. Used by the isodof path to construct
+    ``b = J^T * lambda`` so the lambda correction reduces to a single
+    ``A^{-1} b`` solve.
+
+    Caller must zero ``out`` before launch.
+
+    Args:
+        contact_particle: Particle index per row, shape ``[n_rows]``.
+        contact_dir: Contact direction per row, shape ``[n_rows]``.
+        contact_alpha: Jacobian coefficient per row, shape ``[n_rows]``.
+        lam: Contact impulse per row, shape ``[n_rows]``, float32.
+        n_rows: Number of active rows (``M`` for Stage A, ``3*M`` for Stage B).
+        out: Per-particle accumulator, shape ``[N]``, vec3. Written via
+            ``wp.atomic_add``.
+    """
+    r = wp.tid()
+    if r >= n_rows:
+        return
+    p = contact_particle[r]
+    weight = contact_alpha[r] * lam[r]
+    contribution = weight * contact_dir[r]
+    wp.atomic_add(out, p, contribution)
