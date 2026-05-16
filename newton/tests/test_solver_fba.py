@@ -3743,5 +3743,114 @@ class SolverFBALambdaWarmStartTests(unittest.TestCase):
             )
 
 
+class SolverFBAKinematicCylinderTests(unittest.TestCase):
+    """Per-shape angular velocity surfaces in Stage B tangent offsets."""
+
+    def _ball_and_cylinder(self):
+        """Tiny tet ball + 1 cylinder (axis +X world). Returns (model, pipeline, contacts)."""
+        import math
+
+        import newton
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=-10.0)
+        builder.add_soft_grid(
+            pos=wp.vec3(0.0, 0.5, 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=2,
+            dim_y=2,
+            dim_z=2,
+            cell_x=0.2,
+            cell_y=0.2,
+            cell_z=0.2,
+            density=500.0,
+            k_mu=5.0e3,
+            k_lambda=5.0e3,
+            k_damp=0.0,
+        )
+        # Z-aligned cylinder primitive → rotate to +X via 90° about -Y.
+        half = math.pi / 4.0
+        qy = -math.sin(half)
+        qw = math.cos(half)
+        q = wp.quat(0.0, qy, 0.0, qw)
+        builder.add_shape_cylinder(
+            body=-1,
+            xform=wp.transform(wp.vec3(0.0, -0.2, 0.0), q),
+            radius=0.3,
+            half_height=2.0,
+        )
+        model = builder.finalize()
+        pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.1)
+        contacts = pipeline.contacts()
+        return model, pipeline, contacts
+
+    def test_default_no_kinematic_motion(self) -> None:
+        from newton.solvers import SolverFBA
+        model, _, _ = self._ball_and_cylinder()
+        solver = SolverFBA(model, friction=True)
+        self.assertTrue(np.all(solver._shape_omega_h == 0.0))
+
+    def test_kinematic_motion_stored_per_shape(self) -> None:
+        from newton.solvers import SolverFBA
+        model, _, _ = self._ball_and_cylinder()
+        solver = SolverFBA(
+            model,
+            friction=True,
+            shape_angular_velocity={0: -3.0},
+        )
+        self.assertEqual(float(solver._shape_omega_h[0]), -3.0)
+
+    def test_kinematic_anchor_velocity_shifts_offsets(self) -> None:
+        """ω ≠ 0 produces nonzero v_anchor; ω = 0 leaves it zero."""
+        from newton.solvers import SolverFBA
+
+        model, pipeline, contacts = self._ball_and_cylinder()
+        s_in = model.state()
+        s_out = model.state()
+
+        # Drop the ball onto the cylinder to land contacts.
+        solver_static = SolverFBA(
+            model,
+            friction=True,
+            mu_per_pair_override=np.full(model.particle_count, 0.5),
+        )
+        for _ in range(20):
+            s_in.clear_forces()
+            pipeline.collide(s_in, contacts)
+            solver_static.step(s_in, s_out, None, contacts, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+            if solver_static._contact_count > 0:
+                break
+        self.assertGreater(
+            solver_static._contact_count, 0,
+            "Need at least one contact for the kinematic path."
+        )
+
+        solver_spin = SolverFBA(
+            model,
+            friction=True,
+            mu_per_pair_override=np.full(model.particle_count, 0.5),
+            shape_angular_velocity={0: -3.0},
+        )
+        # Drive one step on both so update_contacts ran on each.
+        s2 = model.state()
+        solver_static.step(s_in, s_out, None, contacts, 1.0 / 60.0)
+        solver_spin.step(s_in, s2, None, contacts, 1.0 / 60.0)
+
+        # static path: v_anchor must be exactly zero.
+        np.testing.assert_allclose(
+            solver_static._contact_v_anchor_h[: solver_static._contact_count],
+            0.0,
+        )
+        # spin path: v_anchor must be nonzero for at least one contact.
+        self.assertGreater(
+            float(np.linalg.norm(
+                solver_spin._contact_v_anchor_h[: solver_spin._contact_count]
+            )),
+            1e-6,
+            "Expected ω ≠ 0 to produce nonzero v_anchor."
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

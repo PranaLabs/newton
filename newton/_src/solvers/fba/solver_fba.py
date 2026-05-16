@@ -72,6 +72,23 @@ def compute_tangent_basis(n: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return t1, t2
 
 
+def _quat_rotate_z_axis(q: np.ndarray) -> np.ndarray:
+    """Apply quaternion ``q = (qx, qy, qz, qw)`` to the local +Z unit vector.
+
+    Returns the world-frame direction of a shape's local +Z, used as the spin
+    axis for Newton's cylinder primitive (which extends along local +Z).
+    """
+    qx, qy, qz, qw = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    return np.array(
+        [
+            2.0 * (qx * qz + qw * qy),
+            2.0 * (qy * qz - qw * qx),
+            1.0 - 2.0 * (qx * qx + qy * qy),
+        ],
+        dtype=np.float64,
+    )
+
+
 def _transform_point(pos: np.ndarray, quat: np.ndarray, p: np.ndarray) -> np.ndarray:
     """Apply a rigid transform ``T = (pos, quat)`` to point ``p``.
 
@@ -159,6 +176,7 @@ class SolverFBA(SolverBase):
         nsn_iterations: int = 1,
         lambda_cap: float | None = None,
         use_isodof: bool = True,
+        shape_angular_velocity: dict[int, float] | None = None,
     ) -> None:
         """
         Args:
@@ -185,6 +203,14 @@ class SolverFBA(SolverBase):
                 columns of ``J^T``. Mirrors RealSim's
                 ``CUDASparseInverseSolver::addHAinvHT_gpu``. Set to ``False``
                 only for regression testing against the legacy path.
+            shape_angular_velocity: Optional ``{shape_index: ω_rad_s}`` mapping.
+                Each listed shape rotates about its local +Z axis (Newton's
+                cylinder primitive axis) at the given angular speed.  Surfaces
+                with nonzero ω contribute a tangential anchor velocity
+                ``v_anchor = ω · axis_world × (world_anchor − shape_center)``
+                into the Stage B friction residual; the shape geometry itself
+                stays static.  Defaults to no kinematic motion.  Mirrors
+                RealSim's ``cylindercollisions[i].rollingvel``.
         """
         super().__init__(model)
 
@@ -224,6 +250,15 @@ class SolverFBA(SolverBase):
         self.nsn_iterations = int(nsn_iterations)
         self.lambda_cap = lambda_cap
         self.use_isodof = bool(use_isodof)
+
+        # Per-shape kinematic angular velocity (rad/s about local +Z).  RealSim
+        # parity for ``cylindercollisions.rollingvel``.
+        n_shapes = int(model.shape_count) if hasattr(model, "shape_count") and model.shape_count else 0
+        self._shape_omega_h = np.zeros(max(n_shapes, 1), dtype=np.float64)
+        if shape_angular_velocity is not None:
+            for s_idx, omega in shape_angular_velocity.items():
+                if 0 <= int(s_idx) < n_shapes:
+                    self._shape_omega_h[int(s_idx)] = float(omega)
 
         # PD setup is dt-dependent; we cache the assembly at a reference dt and
         # rebuild lazily inside `step` if the dt changes.
@@ -417,6 +452,24 @@ class SolverFBA(SolverBase):
             self._invalidate_schur_cache()
 
         has_contacts = self._contact_count > 0
+
+        # Apply kinematic anchor advancement: tangent_offset = base + dt · dot(t, v_anchor).
+        # update_contacts cached base offsets + v_anchor; the dt-dependent
+        # shift is applied here.  When ω = 0 everywhere, v_anchor is zero
+        # and this is a no-op (offsets equal base).
+        if (
+            self.friction
+            and self._contact_count > 0
+            and hasattr(self, "_contact_v_anchor_h")
+        ):
+            M_kin = self._contact_count
+            v_anchor = self._contact_v_anchor_h[:M_kin]
+            t1 = self._contact_tangent1_d.numpy()[:M_kin].astype(np.float64)
+            t2 = self._contact_tangent2_d.numpy()[:M_kin].astype(np.float64)
+            shift1 = dt * np.einsum("ij,ij->i", t1, v_anchor)
+            shift2 = dt * np.einsum("ij,ij->i", t2, v_anchor)
+            self._contact_tangent1_offset_h = self._contact_tangent1_offset_h_base + shift1
+            self._contact_tangent2_offset_h = self._contact_tangent2_offset_h_base + shift2
 
         # RealSim parity: λ = 0 once per step (per frame), then accumulates
         # across the PD outer iters below.
@@ -839,6 +892,17 @@ class SolverFBA(SolverBase):
             # large friction impulses.
             tangent1_offset_h = np.zeros(M, dtype=np.float64)
             tangent2_offset_h = np.zeros(M, dtype=np.float64)
+
+            # Precompute per-shape world-frame Z axis (Newton's cylinder
+            # extends along local +Z; world axis = shape_q rotated +Z).
+            shape_transform_np = (
+                model.shape_transform.numpy()
+                if hasattr(model, "shape_transform") and model.shape_transform is not None
+                else None
+            )
+
+            v_anchor_h = np.zeros((M, 3), dtype=np.float64)
+
             for c in range(M):
                 t1, t2 = compute_tangent_basis(normal_h[c])
                 t1_h[c] = t1.astype(np.float32)
@@ -860,10 +924,31 @@ class SolverFBA(SolverBase):
                         world_anchor = _transform_point(pos_b, quat_b, bpos)
                 tangent1_offset_h[c] = float(np.dot(t1, world_anchor))
                 tangent2_offset_h[c] = float(np.dot(t2, world_anchor))
+
+                # Kinematic anchor velocity for spinning shapes.
+                if (
+                    s_idx >= 0
+                    and s_idx < self._shape_omega_h.shape[0]
+                    and self._shape_omega_h[s_idx] != 0.0
+                    and shape_transform_np is not None
+                ):
+                    xf = shape_transform_np[s_idx]
+                    shape_p = np.asarray(xf[:3], dtype=np.float64)
+                    shape_q = np.asarray(xf[3:], dtype=np.float64)
+                    axis_world = _quat_rotate_z_axis(shape_q)
+                    r_local = world_anchor - shape_p
+                    omega = float(self._shape_omega_h[s_idx])
+                    v_anchor_h[c] = omega * np.cross(axis_world, r_local)
+
             self._contact_tangent1_d.assign(t1_h)
             self._contact_tangent2_d.assign(t2_h)
             self._contact_tangent1_h = t1_h
             self._contact_tangent2_h = t2_h
+            self._contact_v_anchor_h = v_anchor_h
+            # Cache the BASE offsets (no dt-shift); step() applies the
+            # kinematic dt·dot(t, v_anchor) shift on entry.
+            self._contact_tangent1_offset_h_base = tangent1_offset_h.copy()
+            self._contact_tangent2_offset_h_base = tangent2_offset_h.copy()
             self._contact_tangent1_offset_h = tangent1_offset_h
             self._contact_tangent2_offset_h = tangent2_offset_h
 
