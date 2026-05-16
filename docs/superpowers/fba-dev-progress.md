@@ -6,6 +6,44 @@ Live tracker for the Newton port of RealSim's "Fast But Accurate" projective-dyn
 - **Upstream target**: `newton-physics/newton` (eventual PR after feature parity)
 - **Last updated**: 2026-05-17
 
+## 2026-05-17 — Phase 2-D: deterministic PD reductions
+
+**Goal**: eliminate GPU nondeterminism in FBA's PD pipeline so 3 consecutive SqueezingBall runs produce bit-identical particle positions.
+
+**Root cause** (identified during P2-B troubleshooting): all PD project kernels and the isodof J^T·λ kernel scattered via `wp.atomic_add`. Combined with the kinematic-rolling-friction Coulomb cone, ~1e-7 atomic-order noise amplified into ~5 unit divergence over 600 frames on SqueezingBall. ω=0 demos were unaffected (small noise dissipates harmlessly without sliding friction).
+
+**Fix**: replaced 7 atomic-scatter PD kernels with `(compute → gather)` pairs using particle-element CSR adjacency (built once at `_setup_pd_system`):
+
+- `project_stretching_arap_tet` → compute writes per-(tet, local_v) vec3 + universal `gather_per_particle_kernel`
+- `project_stretching_corotational_tet` → same pattern
+- `project_stretching_neohookean_tet` → same pattern
+- `project_stretching_arap` (tri) → same with `n_verts_per_element=3`
+- `project_stretching_corotational` (tri) → same
+- `project_stretching_neohookean` (tri) → same
+- `project_bending` → same with 4-vertex edge stencil
+- `build_jt_lambda_vec3_kernel` (isodof J^T·λ) → replaced by per-particle row-aggregation walking a contact-row → particle CSR built per-frame at `update_contacts`
+
+Plus a contact-array lexicographic sort in `update_contacts` (commit `09e4f855`) that eliminates non-determinism inherited from Newton's `pipeline.collide()` atomic-counter ordering.
+
+**Acceptance criteria** (Phase 2-D scope):
+- ✓ All 98 FBA unit tests pass (87 prior + 11 new across Tasks A–F: 3 adjacency, 1 tet-ARAP, 1 tet-Corot, 1 tet-NH, 3 tri energies, 1 bending, 1 isodof J^T·λ)
+- ✓ SqueezingBall: 3 consecutive runs produce bit-identical `(min_y, x_drift, z_drift) = (-7.312, +2.921, -5.446)`
+- ✓ PullingWooper: stable, `min_y=-8.410`, `pulled=10.0`, `mean_ms=21.93` (was 10.54 pre-P2D — ~2× slower due to extra kernel launch per energy, but still 0.91× RealSim 24.08 baseline)
+- ✓ `grep "atomic_add"` in active path returns empty (legacy kernels kept around as regression-test fallbacks; not on the runtime path)
+- ✗ SqueezingBall **trajectory parity vs RealSim**: NOT achieved. FBA settles at `(+2.92, ~−7, −5.45)`; RealSim reaches `(0.32, −8.34, −0.01)`. Behavior divergence is independent of determinism and remains an open Phase 2 follow-up — likely traces to either (a) initial-penetration recovery formulation or (b) kinematic friction over-energizing the body in this specific configuration.
+
+**Commits this phase** (chronological, all on `ziqiu/fba-solver-design`):
+- `09e4f855` Sort soft contacts lexicographically for deterministic NSN ordering
+- `cb4e31b7` Add particle-element CSR adjacency builder for deterministic PD reductions (P2D-A)
+- `f561ae3b` Refactor tet ARAP projection to particle-centered reduction (P2D-B kernel defs)
+- `6406068d` Refactor tet Corot and NH projections to particle-centered reduction (P2D-C)
+- `a02f212d` Wire tet ARAP launch through compute+gather deterministic path (P2D-B wiring fix)
+- `9203bcb1` Refactor tri stretching projections to particle-centered reduction (P2D-D)
+- `c885849c` Refactor isometric bending projection to particle-centered reduction (P2D-E)
+- `98cd069f` Refactor isodof J^T lambda scatter to particle-centered reduction (P2D-F)
+
+**Next**: P3 CrossingGingerbreadman — TET NH gingerbreadman_10k pulled through a 13-cylinder corridor (gravity=0, PULLING pin, all cylinders mu=0). Reuses P1 PULLING + P2-D deterministic PD path with no rolling friction. Should expose any remaining bugs in the multi-cylinder static-contact path.
+
 ## 2026-05-17 — Phase 1 (PullingWooper) complete, full RealSim parity
 
 **Acceptance criteria** from `docs/superpowers/specs/2026-05-16-cudatests-full-reproduction-spec.md`:

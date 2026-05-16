@@ -161,5 +161,47 @@ Acceptance:
 | H' Bending fix | 93 | Non-flat rest formula match (Wooper has no bending — no perf change) |
 | T' λ warm-start across PD outer | 92 | RealSim parity for contact convergence |
 | **P Isodof Schur** | **10.54** | Restrict A⁻¹ to (isodofs × isodofs) instead of dense R=3M |
+| P2-D Deterministic PD | 21.93 | All PD scatter kernels rewritten as (compute → gather) — atomic-free, bit-deterministic across reruns. ~2× slower than P due to extra kernel launch per energy term; still ≤ RealSim 24.08 ms. |
 
 Snapshots: `demo4/pulling_wooper_strip.png` (6 frames spaced across the pull).
+
+## Demo 5 — SqueezingBall (kinematic friction + deterministic PD)
+
+`scripts/fba_demo5_squeezing_ball.py`
+
+7129-particle Neo-Hookean tet ball (E=1e4, ν=0.4, mass=1000), 600 frames at
+dt=0.01, gravity=-10 Y. Four rolling cylinders (r=1, mu=0.5, |ω|=3 rad/s)
+arranged in two perpendicular pairs squeeze the ball; plane at y=-10 catches it.
+
+| Solver        | mean ms | median ms | p95 ms | stable |
+|---------------|---:|---:|---:|:---:|
+| RealSim NSN_CUDA (baseline, 600 frames offline) | 83.87 | – | – | ✓ |
+| SolverFBA (kinematic friction + deterministic PD) | 24.03 | 16.40 | 33.30 | ✓ |
+
+Phase 2 acceptance (deterministic / perf):
+- **Determinism**: 3 consecutive runs produce **bit-identical** `min_y`, `x_drift`, `z_drift` (verified post P2-D-F)
+- **Perf**: 0.29× RealSim baseline ✓
+- **Stability**: `stable=True` over 600 frames ✓
+
+### Known divergence vs RealSim
+
+FBA's deterministic trajectory at frame 599 is mean ≈ (+2.92, ?, −5.45) with `min_y ≈ −7.3`. RealSim's reference trajectory (from `simulation/output_abc/SqueezingBall/output_obj_0.abc`) is mean ≈ (+0.32, −8.34, −0.01) with `min_y ≈ −10.0`. FBA's ball does not fully descend to the plane and drifts laterally; RealSim's ball squeezes straight through and settles on the plane.
+
+Independent contributing factors documented during P2 investigation:
+1. **Initial penetration recovery**: scene config has ball mesh overlapping cyl0/cyl1 by ~0.1m at frame 0. Both engines must recover from this; FBA's recovery differs from RealSim's at frame 100+ (energy bookkeeping diverges).
+2. **Kinematic anchor formulation**: FBA mirrors RealSim's `disp = R·ω·dt` along the rolling tangent, with cylinder-aligned basis (`t1 = normal × axis`, `t2 = axis`). However the resulting friction force in this configuration energizes the body (com_y increasing under gravity), which is the trace-level cause of the trajectory mismatch.
+3. **NSN inner iter count**: FBA defaults to 1 (matches RealSim's single Newton step). Increasing to 10 does not narrow the gap — confirming the issue is not under-convergence.
+
+These are Phase 2 follow-ups, not P2-D scope. P2-D delivered: deterministic PD + kinematic friction infrastructure that other phases (P3+) build on. SqueezingBall behavior parity remains open.
+
+### P2-D scope: deterministic PD reductions
+
+Eliminated `wp.atomic_add` scatter in all active PD kernels by replacing them with `(compute → gather)` pairs:
+- `project_stretching_*_tet_kernel` (ARAP/Corot/NH, 3 kernels) → compute writes per-(tet, local_v) vec3 to scratch; gather sums per-particle via CSR adjacency
+- `project_stretching_*_kernel` (tri ARAP/Corot/NH, 3 kernels) → same pattern with `n_verts_per_element=3`
+- `project_bending_kernel` (1 kernel) → same pattern with 4-vertex edge stencil
+- `build_jt_lambda_vec3_kernel` (isodof Schur Jᵀλ) → replaced by per-particle row-aggregation kernel walking a contact-row → particle CSR built at `update_contacts` time
+
+CSR adjacencies (`_particle_tet_*_d`, `_particle_tri_*_d`, `_particle_edge_*_d`, `_isodof_row_*_d`) are precomputed at `_setup_pd_system` and reused.
+
+All 98 FBA unit tests pass (87 prior + 11 new determinism / adjacency tests across Tasks A-F).
