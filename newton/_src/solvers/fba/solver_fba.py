@@ -1017,7 +1017,11 @@ class SolverFBA(SolverBase):
             correction.assign(correction_np.astype(np.float32))
         else:
             # Fallback: re-solve for each contact.
-            from .kernels import accumulate_vec3_kernel, set_lambda_jacobian_vec3_kernel, zero_vec3_kernel  # noqa: PLC0415
+            from .kernels import (  # noqa: PLC0415
+                accumulate_vec3_kernel,
+                set_lambda_jacobian_vec3_kernel,
+                zero_vec3_kernel,
+            )
 
             tmp = wp.empty(N, dtype=wp.vec3, device=dev)
             work = wp.empty(N, dtype=wp.vec3, device=dev)

@@ -28,11 +28,11 @@ if TYPE_CHECKING:
 
 from ...sim import Model
 from .kernels import (
+    accumulate_schur_W_kernel,
     apply_permutation_scalar_kernel,
     extract_component_kernel,
     insert_component_kernel,
     scale_by_diag_kernel,
-    accumulate_schur_W_kernel,
 )
 
 
@@ -846,8 +846,8 @@ class FBALinearSolver:
         # For Stage A: total_rows == M, each row uses normal direction.
         # For Stage B: total_rows == 3M, rows interleaved [n_c, t1_c, t2_c].
         idx_np = j_indices.numpy()  # (M,) int32 — small, needed for row dir array
-        n_np = j_normals.numpy()   # (M, 3) float32
-        a_np = j_alpha.numpy()     # (M,) float32
+        n_np = j_normals.numpy()  # (M, 3) float32
+        a_np = j_alpha.numpy()  # (M,) float32
         if has_friction:
             t1_np = j_tangent1.numpy()  # (M, 3) float32
             t2_np = j_tangent2.numpy()  # (M, 3) float32
@@ -874,11 +874,7 @@ class FBALinearSolver:
         row_alpha_d = wp.array(row_alpha, dtype=wp.float32, device=dev)
 
         # --- Allocate/reuse A_inv_Jt buffer: shape (total_rows, N) on device ---
-        if (
-            not hasattr(self, "_A_inv_Jt_d")
-            or self._A_inv_Jt_d.shape[0] < total_rows
-            or self._A_inv_Jt_d.shape[1] != n
-        ):
+        if not hasattr(self, "_A_inv_Jt_d") or self._A_inv_Jt_d.shape[0] < total_rows or self._A_inv_Jt_d.shape[1] != n:
             self._A_inv_Jt_d = wp.empty(shape=(total_rows, n), dtype=wp.vec3, device=dev)
 
         # Scratch buffers for a single solve call.
