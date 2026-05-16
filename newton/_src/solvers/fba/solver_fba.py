@@ -312,6 +312,9 @@ class SolverFBA(SolverBase):
         self._tet_indices_d = None
         self._tet_rest_inv_d = None
         self._tet_weight_d = None
+        # Per-(tet, local vertex) scratch for deterministic (compute → gather)
+        # PD scatter; allocated in _setup_pd_system, reused per step.
+        self._tet_contrib_d = None
 
         # Particle-centered CSR adjacency for deterministic PD reductions (Task P2-D-A).
         # Lets the PD scatter use (compute → gather) instead of atomic_add.
@@ -428,10 +431,19 @@ class SolverFBA(SolverBase):
             self._particle_tet_offsets_d = wp.array(offs, dtype=wp.int32, device=device)
             self._particle_tet_element_d = wp.array(elem_idx, dtype=wp.int32, device=device)
             self._particle_tet_local_d = wp.array(local_v, dtype=wp.int32, device=device)
+            # Per-(tet, local vertex) scratch buffer for deterministic
+            # (compute → gather) PD reduction. Reused across energies
+            # (only one stretching_model is active per step).
+            self._tet_contrib_d = wp.zeros(
+                shape=(int(self.model.tet_count), 4),
+                dtype=wp.vec3,
+                device=device,
+            )
         else:
             self._particle_tet_offsets_d = None
             self._particle_tet_element_d = None
             self._particle_tet_local_d = None
+            self._tet_contrib_d = None
 
         if tri_indices_np is not None and tri_indices_np.size > 0:
             offs, elem_idx, local_v = build_particle_element_csr(tri_indices_np, n_p, 3)
@@ -478,14 +490,15 @@ class SolverFBA(SolverBase):
             accumulate_vec3_kernel,
             add_inertia_to_rhs_kernel,
             compute_inertial_kernel,
+            gather_per_particle_kernel,
             project_bending_kernel,
             project_pin_kernel,
             project_stretching_arap_kernel,
             project_stretching_arap_tet_kernel,
             project_stretching_corotational_kernel,
-            project_stretching_corotational_tet_kernel,
+            project_stretching_corotational_tet_compute_kernel,
             project_stretching_neohookean_kernel,
-            project_stretching_neohookean_tet_kernel,
+            project_stretching_neohookean_tet_compute_kernel,
             write_velocity_kernel,
             zero_vec3_kernel,
         )
@@ -651,8 +664,9 @@ class SolverFBA(SolverBase):
                         device=device,
                     )
                 elif self.stretching_model == "corotational":
+                    # Deterministic (compute → gather) tet Corot scatter.
                     wp.launch(
-                        project_stretching_corotational_tet_kernel,
+                        project_stretching_corotational_tet_compute_kernel,
                         dim=model.tet_count,
                         inputs=[
                             self._x_cur,
@@ -662,12 +676,25 @@ class SolverFBA(SolverBase):
                             self._mu,
                             self._lam,
                         ],
+                        outputs=[self._tet_contrib_d],
+                        device=device,
+                    )
+                    wp.launch(
+                        gather_per_particle_kernel,
+                        dim=N,
+                        inputs=[
+                            self._tet_contrib_d,
+                            self._particle_tet_offsets_d,
+                            self._particle_tet_element_d,
+                            self._particle_tet_local_d,
+                        ],
                         outputs=[self._rhs],
                         device=device,
                     )
                 elif self.stretching_model == "neohookean":
+                    # Deterministic (compute → gather) tet NH scatter.
                     wp.launch(
-                        project_stretching_neohookean_tet_kernel,
+                        project_stretching_neohookean_tet_compute_kernel,
                         dim=model.tet_count,
                         inputs=[
                             self._x_cur,
@@ -676,6 +703,18 @@ class SolverFBA(SolverBase):
                             self._tet_weight_d,
                             self._mu,
                             self._lam,
+                        ],
+                        outputs=[self._tet_contrib_d],
+                        device=device,
+                    )
+                    wp.launch(
+                        gather_per_particle_kernel,
+                        dim=N,
+                        inputs=[
+                            self._tet_contrib_d,
+                            self._particle_tet_offsets_d,
+                            self._particle_tet_element_d,
+                            self._particle_tet_local_d,
                         ],
                         outputs=[self._rhs],
                         device=device,

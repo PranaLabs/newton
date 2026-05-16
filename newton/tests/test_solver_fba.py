@@ -3973,5 +3973,97 @@ class SolverFBATetArapDeterminismTests(unittest.TestCase):
         np.testing.assert_allclose(q1, q2, atol=1e-6, err_msg="tet ARAP scatter produced non-deterministic output")
 
 
+class SolverFBATetCorotDeterminismTests(unittest.TestCase):
+    """Refactored tet Corot scatter is bit-deterministic across reruns."""
+
+    def _run_once(self) -> np.ndarray:
+        import newton
+        from newton.solvers import SolverFBA
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=-10.0)
+        builder.add_soft_grid(
+            pos=wp.vec3(0.0, 1.0, 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=3,
+            dim_y=3,
+            dim_z=3,
+            cell_x=0.1,
+            cell_y=0.1,
+            cell_z=0.1,
+            density=500.0,
+            k_mu=5.0e3,
+            k_lambda=5.0e3,
+            k_damp=0.0,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(
+            model,
+            iterations=1,
+            friction=False,
+            stretching_model="corotational",
+            mu=5.0e3,
+            lam=5.0e3,
+        )
+        s_in = model.state()
+        s_out = model.state()
+        for _ in range(3):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+        return s_in.particle_q.numpy().copy()
+
+    def test_two_runs_identical(self) -> None:
+        q1 = self._run_once()
+        q2 = self._run_once()
+        np.testing.assert_allclose(q1, q2, atol=1e-6, err_msg="tet Corot scatter produced non-deterministic output")
+
+
+class SolverFBATetNHDeterminismTests(unittest.TestCase):
+    """Refactored tet NH scatter is bit-deterministic across reruns."""
+
+    def _run_once(self) -> np.ndarray:
+        import newton
+        from newton.solvers import SolverFBA
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=-10.0)
+        builder.add_soft_grid(
+            pos=wp.vec3(0.0, 1.0, 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=3,
+            dim_y=3,
+            dim_z=3,
+            cell_x=0.1,
+            cell_y=0.1,
+            cell_z=0.1,
+            density=500.0,
+            k_mu=5.0e3,
+            k_lambda=5.0e3,
+            k_damp=0.0,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(
+            model,
+            iterations=1,
+            friction=False,
+            stretching_model="neohookean",
+            mu=5.0e3,
+            lam=5.0e3,
+        )
+        s_in = model.state()
+        s_out = model.state()
+        for _ in range(3):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+        return s_in.particle_q.numpy().copy()
+
+    def test_two_runs_identical(self) -> None:
+        q1 = self._run_once()
+        q2 = self._run_once()
+        np.testing.assert_allclose(q1, q2, atol=1e-6, err_msg="tet NH scatter produced non-deterministic output")
+
+
 if __name__ == "__main__":
     unittest.main()
