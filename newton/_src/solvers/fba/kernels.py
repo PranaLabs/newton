@@ -1240,3 +1240,134 @@ def subtract_vec3_kernel(
     """out[i] = a[i] - b[i]."""
     tid = wp.tid()
     out[tid] = a[tid] - b[tid]
+
+
+# ---------------------------------------------------------------------------
+# Approach B — multi-RHS batched primitives for Schur complement build
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def bsr_mv_multi_rhs_scalar_kernel(
+    A_offsets: wp.array[wp.int32],
+    A_columns: wp.array[wp.int32],
+    A_values: wp.array[wp.float64],
+    x: wp.array2d[wp.float64],
+    y: wp.array2d[wp.float64],
+):
+    """y[rhs, row] = sum_k A[row, col_k] * x[rhs, col_k].
+
+    One thread per (rhs_idx, matrix_row). ``A`` is a scalar 1x1 BSR matrix
+    (i.e. A_values is a flat 1D array of length ``nnz``; block = scalar).
+
+    Args:
+        A_offsets: CSR row offsets, length ``nrow + 1``, int32.
+        A_columns: Column indices, length ``nnz``, int32.
+        A_values: Scalar values, length ``nnz``, float64.
+        x: Input, shape ``(R, N)`` float64.
+        y: Output, shape ``(R, N)`` float64; written in-place.
+    """
+    rhs_idx, row = wp.tid()
+    v = wp.float64(0.0)
+    beg = A_offsets[row]
+    end = A_offsets[row + 1]
+    for block in range(beg, end):
+        col = A_columns[block]
+        v = v + A_values[block] * x[rhs_idx, col]
+    y[rhs_idx, row] = v
+
+
+@wp.kernel
+def apply_permutation_multi_rhs_kernel(
+    src: wp.array2d[wp.float64],
+    perm: wp.array[wp.int32],
+    dst: wp.array2d[wp.float64],
+):
+    """dst[r, i] = src[r, perm[i]] — multi-RHS gather.
+
+    One thread per (rhs_idx, element_idx).
+
+    Args:
+        src: Source array, shape ``(R, N)`` float64.
+        perm: Permutation, length ``N``, int32.
+        dst: Destination array, shape ``(R, N)`` float64.
+    """
+    rhs_idx, i = wp.tid()
+    dst[rhs_idx, i] = src[rhs_idx, perm[i]]
+
+
+@wp.kernel
+def scale_by_diag_multi_rhs_kernel(
+    src: wp.array2d[wp.float64],
+    diag: wp.array[wp.float64],
+    dst: wp.array2d[wp.float64],
+):
+    """dst[r, i] = diag[i] * src[r, i] — multi-RHS diagonal scaling.
+
+    One thread per (rhs_idx, element_idx).
+
+    Args:
+        src: Source array, shape ``(R, N)`` float64.
+        diag: Diagonal coefficients, length ``N``, float64.
+        dst: Destination array, shape ``(R, N)`` float64.
+    """
+    rhs_idx, i = wp.tid()
+    dst[rhs_idx, i] = diag[i] * src[rhs_idx, i]
+
+
+@wp.kernel
+def pack_jacobian_axis_kernel(
+    axis: int,
+    contact_particle: wp.array[wp.int32],
+    contact_dir: wp.array[wp.vec3],
+    contact_alpha: wp.array[wp.float32],
+    b_multi: wp.array2d[wp.float64],
+):
+    """Pack one axis of J^T into b_multi for multi-RHS solve.
+
+    For RHS row ``r`` (i.e. contact row ``r``):
+        b_multi[r, :] = 0.0 for all particles except particle[r],
+        b_multi[r, particle[r]] = alpha[r] * dir[r][axis].
+
+    Called with ``dim = total_rows``. Caller must zero ``b_multi`` before launch.
+
+    Args:
+        axis: Spatial axis to extract (0=x, 1=y, 2=z).
+        contact_particle: Particle index per row, shape ``[total_rows]``, int32.
+        contact_dir: Contact direction per row, shape ``[total_rows]``, vec3.
+        contact_alpha: Jacobian coefficient per row, shape ``[total_rows]``, float32.
+        b_multi: Output RHS buffer, shape ``(total_rows, N)`` float64.
+    """
+    r = wp.tid()
+    p = contact_particle[r]
+    d = contact_dir[r]
+    alpha = wp.float64(contact_alpha[r])
+    b_multi[r, p] = alpha * wp.float64(d[axis])
+
+
+@wp.kernel
+def unpack_to_A_inv_Jt_axis_kernel(
+    axis: int,
+    y_multi: wp.array2d[wp.float64],
+    A_inv_Jt: wp.array2d[wp.vec3],
+):
+    """Write one axis of y_multi back into A_inv_Jt.
+
+    A_inv_Jt[r, i][axis] = float32(y_multi[r, i]).
+
+    Called with ``dim = (total_rows, N)``.
+
+    Args:
+        axis: Spatial axis to write (0=x, 1=y, 2=z).
+        y_multi: Solved result, shape ``(total_rows, N)`` float64.
+        A_inv_Jt: Output buffer, shape ``(total_rows, N)`` vec3; only axis is written.
+    """
+    r, i = wp.tid()
+    v = A_inv_Jt[r, i]
+    if axis == 0:
+        v[0] = wp.float32(y_multi[r, i])
+    elif axis == 1:
+        v[1] = wp.float32(y_multi[r, i])
+    else:
+        v[2] = wp.float32(y_multi[r, i])
+    A_inv_Jt[r, i] = v

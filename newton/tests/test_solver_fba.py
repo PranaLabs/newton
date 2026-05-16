@@ -248,6 +248,57 @@ class TestFBALinearSolver(unittest.TestCase):
             r = A.dot(x_np[:, c]) - b_np[:, c]
             self.assertLess(np.linalg.norm(r) / max(np.linalg.norm(b_np[:, c]), 1e-12), 1e-6)
 
+    def test_solve_multi_rhs_matches_single_rhs(self):
+        """solve_multi_rhs_scalar produces same result as R separate solve() calls."""
+        import scipy.sparse as _sp
+
+        from newton._src.solvers.fba.linear_solver import (  # noqa: PLC0415
+            FBALinearSolver,
+            factorize_and_sparse_inverse,
+        )
+
+        rng = np.random.default_rng(42)
+        N = 12
+        # Build a small random SPD matrix.
+        A_dense = rng.standard_normal((N, N))
+        A_dense = A_dense @ A_dense.T + N * np.eye(N)
+        A = _sp.csr_matrix(A_dense)
+
+        fs = factorize_and_sparse_inverse(A)
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        solver = FBALinearSolver(fs, device=device)
+
+        R = 5
+        # Build R random scalar RHS rows (shape (R, N)).
+        b_np = rng.standard_normal((R, N))
+
+        # --- Single-RHS reference via solve() ---
+        ref = np.zeros((R, N), dtype=np.float64)
+        for r in range(R):
+            b_vec3 = np.zeros((N, 3), dtype=np.float32)
+            b_vec3[:, 0] = b_np[r].astype(np.float32)
+            b_d = wp.array(b_vec3, dtype=wp.vec3, device=device)
+            x_d = wp.zeros(N, dtype=wp.vec3, device=device)
+            solver.solve(b_d, x_d)
+            x_np = x_d.numpy()  # (N, 3) float32
+            ref[r] = x_np[:, 0].astype(np.float64)
+
+        # --- Multi-RHS path ---
+        b_multi = wp.array(b_np, dtype=wp.float64, device=device)
+        x_multi = wp.zeros(shape=(R, N), dtype=wp.float64, device=device)
+        solver.solve_multi_rhs_scalar(b_multi, x_multi, R)
+        got = x_multi.numpy()
+
+        # Tolerance: single-RHS uses float32 intermediate (vec3 extract/insert),
+        # multi-RHS is float64 throughout. Expect ~1e-6 relative error from f32 cast.
+        np.testing.assert_allclose(
+            got,
+            ref,
+            rtol=1e-5,
+            atol=1e-6,
+            err_msg="solve_multi_rhs_scalar disagrees with single-rhs solve()",
+        )
+
     def test_permutation_roundtrip(self):
         from newton._src.solvers.fba.kernels import apply_permutation_vec3_kernel  # noqa: PLC0415
 
@@ -2510,6 +2561,64 @@ class TestPhase4StageAContact(unittest.TestCase):
         # Tolerance accounts for float32 → float64 round-trip in solve().
         self.assertAlmostEqual(
             W[0, 0], W00_expected, delta=1e-7, msg=f"W[0,0]={W[0, 0]:.8f} != expected {W00_expected:.8f}"
+        )
+
+    def test_approach_b_W_matches_approach_a(self):
+        """Approach B multi-RHS Schur build produces W within 1e-7 of analytical reference."""
+        import scipy.sparse as _sp
+
+        from newton._src.solvers.fba.linear_solver import (  # noqa: PLC0415
+            FBALinearSolver,
+            factorize_and_sparse_inverse,
+        )
+
+        rng = np.random.default_rng(7)
+        N = 20
+        M = 5  # contacts
+
+        A_dense = rng.standard_normal((N, N))
+        A_dense = A_dense @ A_dense.T + N * np.eye(N)
+        A = _sp.csr_matrix(A_dense)
+        fs = factorize_and_sparse_inverse(A)
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+
+        # Build random contact arrays.
+        rng2 = np.random.default_rng(13)
+        j_indices = rng2.integers(0, N, size=M, dtype=np.int32)
+        j_normals = rng2.standard_normal((M, 3)).astype(np.float32)
+        j_normals /= np.linalg.norm(j_normals, axis=1, keepdims=True) + 1e-8
+        j_alpha = np.ones(M, dtype=np.float32)
+
+        j_indices_d = wp.array(j_indices, dtype=wp.int32, device=device)
+        j_normals_d = wp.array(j_normals, dtype=wp.vec3, device=device)
+        j_alpha_d = wp.array(j_alpha, dtype=wp.float32, device=device)
+
+        # Call build_schur_complement — uses Approach B internally.
+        solver = FBALinearSolver(fs, device=device)
+        W_b = solver.build_schur_complement(M, j_indices_d, j_normals_d, j_alpha_d)
+
+        # Reference: compute W analytically via numpy.
+        # W[cp, c] = alpha[cp] * sum_ax n_cp[ax] * A_inv[p_cp, p_c] * alpha[c] * n_c[ax]
+        A_inv = np.linalg.inv(A_dense)
+        W_ref = np.zeros((M, M), dtype=np.float64)
+        for cp in range(M):
+            p_cp = j_indices[cp]
+            a_cp = float(j_alpha[cp])
+            n_cp = j_normals[cp].astype(np.float64)
+            for c in range(M):
+                p_c = j_indices[c]
+                a_c = float(j_alpha[c])
+                n_c = j_normals[c].astype(np.float64)
+                # A^{-1} applied component-wise: contribution per axis sums independently.
+                W_ref[cp, c] = a_cp * a_c * float(np.dot(n_cp, n_c)) * float(A_inv[p_cp, p_c])
+
+        np.testing.assert_allclose(
+            W_b,
+            W_ref,
+            rtol=1e-5,
+            atol=1e-7,
+            err_msg="Approach B W diverges from analytical reference",
         )
 
 
