@@ -836,6 +836,30 @@ class SolverFBA(SolverBase):
             self._contact_count = 0
             return
 
+        # Deterministic contact ordering.  The collision pipeline writes
+        # contacts to slots assigned by ``wp.atomic_add(soft_contact_count,
+        # 0, 1)`` (see ``newton/_src/geometry/kernels.py``), so the per-frame
+        # order depends on GPU thread-scheduling and varies between runs
+        # with identical seeds.  Downstream consumers (NSN Gauss-Seidel,
+        # atomic ``J^T lambda`` accumulation) are order-sensitive, which
+        # causes wildly different trajectories across runs (SqueezingBall
+        # demo: ~5 unit spread in ball ``min_y``).  Lexicographically sort
+        # the contact arrays by ``(particle, shape, normal)`` so the
+        # solver sees an identical permutation every step.  ``M`` is at
+        # most ~thousand here, so the sort is negligible.
+        sort_keys = (
+            normal_h[:, 2].astype(np.float64),
+            normal_h[:, 1].astype(np.float64),
+            normal_h[:, 0].astype(np.float64),
+            shape_h.astype(np.int64),
+            particle_h.astype(np.int64),
+        )
+        order = np.lexsort(sort_keys)
+        particle_h = particle_h[order]
+        shape_h = shape_h[order]
+        body_pos_h = body_pos_h[order]
+        normal_h = normal_h[order]
+
         self._ensure_contact_buffers(M)
 
         # Build offset: pene0[c] = dot(normal, world_anchor)
