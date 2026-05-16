@@ -3786,12 +3786,14 @@ class SolverFBAKinematicCylinderTests(unittest.TestCase):
 
     def test_default_no_kinematic_motion(self) -> None:
         from newton.solvers import SolverFBA
+
         model, _, _ = self._ball_and_cylinder()
         solver = SolverFBA(model, friction=True)
         self.assertTrue(np.all(solver._shape_omega_h == 0.0))
 
     def test_kinematic_motion_stored_per_shape(self) -> None:
         from newton.solvers import SolverFBA
+
         model, _, _ = self._ball_and_cylinder()
         solver = SolverFBA(
             model,
@@ -3821,10 +3823,7 @@ class SolverFBAKinematicCylinderTests(unittest.TestCase):
             s_in, s_out = s_out, s_in
             if solver_static._contact_count > 0:
                 break
-        self.assertGreater(
-            solver_static._contact_count, 0,
-            "Need at least one contact for the kinematic path."
-        )
+        self.assertGreater(solver_static._contact_count, 0, "Need at least one contact for the kinematic path.")
 
         solver_spin = SolverFBA(
             model,
@@ -3844,11 +3843,9 @@ class SolverFBAKinematicCylinderTests(unittest.TestCase):
         )
         # spin path: v_anchor must be nonzero for at least one contact.
         self.assertGreater(
-            float(np.linalg.norm(
-                solver_spin._contact_v_anchor_h[: solver_spin._contact_count]
-            )),
+            float(np.linalg.norm(solver_spin._contact_v_anchor_h[: solver_spin._contact_count])),
             1e-6,
-            "Expected ω ≠ 0 to produce nonzero v_anchor."
+            "Expected ω ≠ 0 to produce nonzero v_anchor.",
         )
 
     def test_cylinder_aligned_basis_for_spinning_shape(self) -> None:
@@ -3889,8 +3886,9 @@ class SolverFBAKinematicCylinderTests(unittest.TestCase):
         # And t1 must carry most of the v_anchor norm.
         v_norm = np.linalg.norm(v, axis=1)
         self.assertGreater(
-            float(np.min(np.abs(proj_t1) / np.maximum(v_norm, 1e-12))), 0.95,
-            "v_anchor should lie almost entirely along the rolling tangent t1."
+            float(np.min(np.abs(proj_t1) / np.maximum(v_norm, 1e-12))),
+            0.95,
+            "v_anchor should lie almost entirely along the rolling tangent t1.",
         )
 
 
@@ -3899,6 +3897,7 @@ class ParticleElementCsrTests(unittest.TestCase):
 
     def test_basic_tet_adjacency(self) -> None:
         import numpy as np
+
         from newton._src.solvers.fba.linear_solver import build_particle_element_csr
 
         # 2 tets sharing vertices 1, 2, 3.
@@ -3913,6 +3912,7 @@ class ParticleElementCsrTests(unittest.TestCase):
 
     def test_tri_adjacency(self) -> None:
         import numpy as np
+
         from newton._src.solvers.fba.linear_solver import build_particle_element_csr
 
         tris = np.array([[0, 1, 2], [1, 2, 3]], dtype=np.int32)
@@ -3924,6 +3924,7 @@ class ParticleElementCsrTests(unittest.TestCase):
 
     def test_empty_adjacency(self) -> None:
         import numpy as np
+
         from newton._src.solvers.fba.linear_solver import build_particle_element_csr
 
         empty = np.zeros((0, 4), dtype=np.int32)
@@ -3931,6 +3932,45 @@ class ParticleElementCsrTests(unittest.TestCase):
         self.assertEqual(offsets.tolist(), [0, 0, 0, 0])
         self.assertEqual(elem_idx.shape, (0,))
         self.assertEqual(local_v.shape, (0,))
+
+
+class SolverFBATetArapDeterminismTests(unittest.TestCase):
+    """Refactored tet ARAP scatter is bit-deterministic across reruns."""
+
+    def _run_once(self) -> np.ndarray:
+        import newton
+        from newton.solvers import SolverFBA
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=-10.0)
+        builder.add_soft_grid(
+            pos=wp.vec3(0.0, 1.0, 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=3,
+            dim_y=3,
+            dim_z=3,
+            cell_x=0.1,
+            cell_y=0.1,
+            cell_z=0.1,
+            density=500.0,
+            k_mu=5.0e3,
+            k_lambda=5.0e3,
+            k_damp=0.0,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=1, friction=False, stretching_model="arap")
+        s_in = model.state()
+        s_out = model.state()
+        for _ in range(3):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+        return s_in.particle_q.numpy().copy()
+
+    def test_two_runs_identical(self) -> None:
+        q1 = self._run_once()
+        q2 = self._run_once()
+        np.testing.assert_allclose(q1, q2, atol=1e-6, err_msg="tet ARAP scatter produced non-deterministic output")
 
 
 if __name__ == "__main__":

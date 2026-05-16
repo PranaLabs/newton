@@ -10,6 +10,40 @@ mat32 = wp.types.matrix(shape=(3, 2), dtype=wp.float32)
 
 
 @wp.kernel
+def gather_per_particle_kernel(
+    contributions: wp.array2d[wp.vec3],  # (num_elements, n_verts_per_element)
+    offsets: wp.array[wp.int32],  # (n_particles + 1,)
+    element_idx: wp.array[wp.int32],  # (total_incidence,)
+    local_idx: wp.array[wp.int32],  # (total_incidence,)
+    rhs: wp.array[wp.vec3],  # (n_particles,) — ACCUMULATED into
+):
+    """Sum per-element contributions into per-particle rhs.
+
+    For each particle, reads its incident-element entries from the CSR
+    adjacency (built by ``build_particle_element_csr``) and sums the
+    corresponding ``contributions[element_idx, local_idx]`` vec3 values.
+    Adds the sum to ``rhs`` (does NOT overwrite) so other terms (inertial
+    prediction, pin energy, contact lambda correction) already in rhs are
+    preserved.
+
+    Args:
+        contributions: ``(num_elements, n_verts_per_element)`` per-element
+            contribution to each of its incident vertices.
+        offsets: CSR row offsets (``n_particles + 1`` entries).
+        element_idx: CSR entry → element index.
+        local_idx: CSR entry → local vertex index within element.
+        rhs: ``(n_particles,)`` accumulator (in-out).
+    """
+    p = wp.tid()
+    start = offsets[p]
+    end = offsets[p + 1]
+    s = wp.vec3(0.0, 0.0, 0.0)
+    for k in range(start, end):
+        s = s + contributions[element_idx[k], local_idx[k]]
+    rhs[p] = rhs[p] + s
+
+
+@wp.kernel
 def apply_permutation_vec3_kernel(
     src: wp.array[wp.vec3],
     perm: wp.array[wp.int32],
@@ -284,6 +318,72 @@ def project_stretching_arap_tet_kernel(
     wp.atomic_add(rhs, i1, row0)
     wp.atomic_add(rhs, i2, row1)
     wp.atomic_add(rhs, i3, row2)
+
+
+@wp.kernel
+def project_stretching_arap_tet_compute_kernel(
+    positions: wp.array[wp.vec3],
+    tet_indices: wp.array[wp.int32],  # flat shape (4*T,)
+    tet_rest_inv: wp.array[wp.mat33],
+    tet_weight: wp.array[wp.float32],
+    # output (per-tet, per-local-vertex contributions)
+    contributions: wp.array2d[wp.vec3],  # (T, 4)
+):
+    """Compute per-tet ARAP contribution to each of its 4 local vertices.
+
+    Same math as :func:`project_stretching_arap_tet_kernel` but writes to a
+    pre-allocated ``(T, 4)`` scratch buffer instead of atomic-adding into rhs.
+    Pair with :func:`gather_per_particle_kernel` for the deterministic
+    reduction.
+
+    Args:
+        positions: Current particle positions [m], shape ``[particle_count]``.
+        tet_indices: Flat tet indices, shape ``[4 * tet_count]``.
+        tet_rest_inv: Per-tet 3x3 rest-pose inverse (Dm_inv), shape ``[tet_count]``.
+        tet_weight: Per-tet weight (2*mu * volume), shape ``[tet_count]``.
+        contributions: Output ``(tet_count, 4)`` per-local-vertex contribution.
+    """
+    t = wp.tid()
+    i0 = tet_indices[4 * t + 0]
+    i1 = tet_indices[4 * t + 1]
+    i2 = tet_indices[4 * t + 2]
+    i3 = tet_indices[4 * t + 3]
+
+    p0 = positions[i0]
+    p1 = positions[i1]
+    p2 = positions[i2]
+    p3 = positions[i3]
+
+    e1 = p1 - p0
+    e2 = p2 - p0
+    e3 = p3 - p0
+    Ds = wp.mat33(
+        e1[0],
+        e2[0],
+        e3[0],
+        e1[1],
+        e2[1],
+        e3[1],
+        e1[2],
+        e2[2],
+        e3[2],
+    )
+    Dm_inv = tet_rest_inv[t]
+    F = Ds * Dm_inv
+
+    R = project_arap_3x3(F)
+
+    w = tet_weight[t]
+    RT = wp.transpose(R)
+    proj = w * (Dm_inv * RT)
+
+    row0 = wp.vec3(proj[0, 0], proj[0, 1], proj[0, 2])
+    row1 = wp.vec3(proj[1, 0], proj[1, 1], proj[1, 2])
+    row2 = wp.vec3(proj[2, 0], proj[2, 1], proj[2, 2])
+    contributions[t, 0] = -(row0 + row1 + row2)
+    contributions[t, 1] = row0
+    contributions[t, 2] = row1
+    contributions[t, 3] = row2
 
 
 @wp.func

@@ -509,11 +509,7 @@ class SolverFBA(SolverBase):
         # update_contacts cached base offsets + v_anchor; the dt-dependent
         # shift is applied here.  When ω = 0 everywhere, v_anchor is zero
         # and this is a no-op (offsets equal base).
-        if (
-            self.friction
-            and self._contact_count > 0
-            and hasattr(self, "_contact_v_anchor_h")
-        ):
+        if self.friction and self._contact_count > 0 and hasattr(self, "_contact_v_anchor_h"):
             M_kin = self._contact_count
             v_anchor = self._contact_v_anchor_h[:M_kin]
             t1 = self._contact_tangent1_d.numpy()[:M_kin].astype(np.float64)
