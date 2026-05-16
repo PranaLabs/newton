@@ -1020,51 +1020,69 @@ def project_stretching_neohookean_kernel(
 
 @wp.kernel
 def project_bending_kernel(
-    positions: wp.array[wp.vec3],  # x_cur (unused in MVP scatter; reserved)
-    x_ref: wp.array[wp.vec3],  # rest positions (defines rest curvature)
+    positions: wp.array[wp.vec3],  # x_cur — current iterate
     edge_indices: wp.array2d[wp.int32],  # shape (E, 4)
     edge_quad_q: wp.array[wp.vec4],  # length-4 vector q per edge; Q = q*q^T
     edge_weight: wp.array[wp.float32],
+    edge_norm: wp.array[wp.float32],  # ‖q·x_rest‖ — rest curvature magnitude
     rhs: wp.array[wp.vec3],
 ):
     """Per-edge isometric bending scatter for PD cloth.
 
-    RealSim `PDIsometricBendingEnergy::localProjection` scatters
-    `w * q[a] * (q^T * x_ref)` into each of the 4 stencil vertices via atomic_add.
-    For flat rest (where the cotangent q satisfies q^T * x_ref = 0), the scatter
-    is zero. The Hessian's matching `-w * q*q^T * x_cur` term is absorbed into
-    the prefactored A in build_pd_system.
+    Matches RealSim ``PDIsometricBendingEnergy::localProjection``: for each
+    interior edge, the local step projects the current curvature vector
+    ``q·x_cur`` onto a sphere of radius ``_norm[i] = ‖q·x_rest‖``, i.e. pulls
+    the curvature *magnitude* back to its rest value while letting the
+    direction follow ``x_cur``. This is correct on both flat and curved rest
+    cloth; the previous ``q·x_ref`` form only agreed on flat rest.
 
-    Note: ``positions`` (x_cur) is reserved for future contact / non-flat-rest
-    variants and is not read in the MVP implementation.
+    The local-projection target is ``ê · _norm[i]`` with
+    ``ê = (q·x_cur) / ‖q·x_cur‖``. We scatter
+    ``w · q[a] · ê · _norm[i]`` into each of the 4 stencil vertices via
+    ``atomic_add``. When ``‖q·x_cur‖`` is below ``1e-12`` the contribution is
+    skipped (numerator and target both shrink to zero); when
+    ``_norm[i] == 0`` (flat rest) the contribution is also zero.
+
+    The Hessian's matching ``w · q·qᵀ`` term is absorbed into the prefactored
+    ``A`` in :func:`build_pd_system` and does not depend on ``x_cur``.
 
     Args:
         positions: Current particle positions [m], shape ``[particle_count]``.
-        x_ref: Reference particle positions [m] (defines rest curvature).
         edge_indices: 4-vertex bending stencil, shape ``[edge_count, 4]``.
         edge_quad_q: Per-edge length-4 cotangent vector ``q``.
-        edge_weight: Per-edge bending stiffness ``w``.
+        edge_weight: Per-edge bending stiffness ``w`` (already scaled by
+            ``3 / (A0 + A1)``).
+        edge_norm: Per-edge rest curvature magnitude ``‖q·x_rest‖``.
         rhs: Output RHS accumulator; receives atomic-add contributions.
     """
     e = wp.tid()
-    q = edge_quad_q[e]
     w = edge_weight[e]
     if w == 0.0:
         return
+    norm_rest = edge_norm[e]
+    if norm_rest == 0.0:
+        return
 
+    q = edge_quad_q[e]
     i0 = edge_indices[e, 0]
     i1 = edge_indices[e, 1]
     i2 = edge_indices[e, 2]
     i3 = edge_indices[e, 3]
 
-    # Compute q^T * x_ref (a vec3 because positions are vec3).
-    qTxref = x_ref[i0] * q[0] + x_ref[i1] * q[1] + x_ref[i2] * q[2] + x_ref[i3] * q[3]
+    # Compute q^T * x_cur (a vec3 because positions are vec3).
+    qTxcur = positions[i0] * q[0] + positions[i1] * q[1] + positions[i2] * q[2] + positions[i3] * q[3]
+    norm_cur = wp.length(qTxcur)
+    if norm_cur < 1.0e-12:
+        return
 
-    # Scatter w * q[a] * (q^T * x_ref) to each row.
-    wp.atomic_add(rhs, i0, w * q[0] * qTxref)
-    wp.atomic_add(rhs, i1, w * q[1] * qTxref)
-    wp.atomic_add(rhs, i2, w * q[2] * qTxref)
-    wp.atomic_add(rhs, i3, w * q[3] * qTxref)
+    # Target curvature: unit direction of q·x_cur, scaled to rest magnitude.
+    target = qTxcur * (norm_rest / norm_cur)
+
+    # Scatter w * q[a] * target to each row.
+    wp.atomic_add(rhs, i0, w * q[0] * target)
+    wp.atomic_add(rhs, i1, w * q[1] * target)
+    wp.atomic_add(rhs, i2, w * q[2] * target)
+    wp.atomic_add(rhs, i3, w * q[3] * target)
 
 
 @wp.kernel

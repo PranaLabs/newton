@@ -424,25 +424,188 @@ class TestBendingProjection(unittest.TestCase):
             device=device,
         )
         edge_indices = wp.array([[0, 1, 2, 3]], dtype=wp.int32, device=device)
-        # For this flat-rest test, set x_ref = positions; with a translation-invariant
-        # q (sum to zero), qᵀ·x_ref = 0 ⇒ scatter contribution is zero.
-        x_ref = wp.array(positions.numpy(), dtype=wp.vec3, device=device)
-        # q = [1,1,-1,-1] satisfies sum-to-zero.
+        # q = [1,1,-1,-1] satisfies sum-to-zero; on the flat positions above
+        # ``q·x_rest = (0,0,0)`` so ``edge_norm = 0`` and the kernel short-circuits.
         edge_quad_q = wp.array([wp.vec4(1.0, 1.0, -1.0, -1.0)], dtype=wp.vec4, device=device)
         weight = wp.array([1.0], dtype=wp.float32, device=device)
+        edge_norm = wp.array([0.0], dtype=wp.float32, device=device)
         rhs = wp.zeros(4, dtype=wp.vec3, device=device)
 
         wp.launch(
             project_bending_kernel,
             dim=1,
-            inputs=[positions, x_ref, edge_indices, edge_quad_q, weight],
+            inputs=[positions, edge_indices, edge_quad_q, weight, edge_norm],
             outputs=[rhs],
             device=device,
         )
-        # qᵀ·x_ref = x_ref[0] + x_ref[1] - x_ref[2] - x_ref[3]
-        #          = (0,0,0)+(1,0,0)-(0.5,0,1)-(0.5,0,-1) = (0,0,0)
-        # So scatter is zero.
+        # Flat-rest ``edge_norm = 0`` ⇒ scatter contribution is zero.
         np.testing.assert_allclose(rhs.numpy(), np.zeros((4, 3)), atol=1e-6)
+
+
+class SolverFBABendingCurvedRestTests(unittest.TestCase):
+    """Regression (Task H'): bending local-step minimises curvature *magnitude*,
+    not direction, on curved rest cloth.
+
+    The previous kernel scattered ``w · q · (q · x_ref)`` which is the gradient
+    of ``‖(q·x_cur) - (q·x_ref)‖²``. That penalises any deviation from the
+    *rest curvature vector*, including curvature flips (e.g. cloth bent
+    against its rest direction). RealSim's
+    ``PDIsometricBendingEnergy::localProjection`` instead scatters
+    ``w · q · ê · ‖q·x_rest‖`` where ``ê = (q·x_cur) / ‖q·x_cur‖``: the
+    direction follows ``x_cur`` and only the magnitude is restored.
+
+    The two formulas agree on flat rest (where ``‖q·x_rest‖ = 0``); they
+    diverge on curved rest and disagree in sign whenever ``q·x_cur`` and
+    ``q·x_rest`` point in opposite directions.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_scatter_follows_x_cur_not_x_rest(self) -> None:
+        """Crafted stencil: x_cur curvature direction is +z, rest is along -z.
+
+        The new kernel must scatter ``w · q · (0, 0, +norm_rest)`` (sign of
+        ``q·x_cur``). The legacy kernel would have scattered
+        ``w · q · (q·x_ref)`` ~ ``w · q · (0, 0, -norm_rest)`` -- opposite sign.
+        """
+        from newton._src.solvers.fba.kernels import project_bending_kernel  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        # Stencil chosen so ``q = [1, 1, -1, -1]`` satisfies sum-to-zero.
+        # x_cur has only v1 lifted along +z by 1.0 so ``q · x_cur = (0, 0, +1)``.
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(0, 0, 1), wp.vec3(0, 0, 0), wp.vec3(0, 0, 0)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        edge_indices = wp.array([[0, 1, 2, 3]], dtype=wp.int32, device=device)
+        edge_quad_q = wp.array([wp.vec4(1.0, 1.0, -1.0, -1.0)], dtype=wp.vec4, device=device)
+        weight = wp.array([2.0], dtype=wp.float32, device=device)
+        # Rest curvature magnitude = 0.5; the rest direction is irrelevant --
+        # the new kernel only uses the magnitude.
+        edge_norm = wp.array([0.5], dtype=wp.float32, device=device)
+        rhs = wp.zeros(4, dtype=wp.vec3, device=device)
+
+        wp.launch(
+            project_bending_kernel,
+            dim=1,
+            inputs=[positions, edge_indices, edge_quad_q, weight, edge_norm],
+            outputs=[rhs],
+            device=device,
+        )
+
+        # Expected (new kernel): ``w · q[a] · ê · norm_rest`` with
+        # ``ê = q·x_cur / ‖q·x_cur‖ = (0, 0, 1)``.
+        # rhs[0] = 2 * 1 * (0, 0, 1) * 0.5 = (0, 0, 1)
+        # rhs[1] = 2 * 1 * (0, 0, 1) * 0.5 = (0, 0, 1)
+        # rhs[2] = 2 * -1 * (0, 0, 1) * 0.5 = (0, 0, -1)
+        # rhs[3] = 2 * -1 * (0, 0, 1) * 0.5 = (0, 0, -1)
+        expected = np.array(
+            [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, -1.0], [0.0, 0.0, -1.0]],
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(rhs.numpy(), expected, atol=1e-6)
+
+        # The legacy kernel would have scattered ``w · q · (q · x_ref)``. To
+        # reach magnitude 0.5 from this stencil ``x_ref`` would have to satisfy
+        # ``q · x_ref = (0, 0, ±0.5)``; the rest-as-flipped-curvature variant
+        # gives the -z sign. The new RHS is along +z, so this assertion would
+        # have failed with the old kernel (different sign in the z component).
+        self.assertGreater(rhs.numpy()[0, 2], 0.0)
+        self.assertLess(rhs.numpy()[2, 2], 0.0)
+
+    def test_zero_curvature_x_cur_skips_scatter(self) -> None:
+        """When ``‖q·x_cur‖ ≈ 0`` the kernel must short-circuit to zero scatter
+        (no division-by-zero), regardless of ``edge_norm``.
+        """
+        from newton._src.solvers.fba.kernels import project_bending_kernel  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        # All positions zero ⇒ ``q · x_cur = 0``.
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(0, 0, 0), wp.vec3(0, 0, 0), wp.vec3(0, 0, 0)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        edge_indices = wp.array([[0, 1, 2, 3]], dtype=wp.int32, device=device)
+        edge_quad_q = wp.array([wp.vec4(1.0, 1.0, -1.0, -1.0)], dtype=wp.vec4, device=device)
+        weight = wp.array([2.0], dtype=wp.float32, device=device)
+        edge_norm = wp.array([0.5], dtype=wp.float32, device=device)
+        rhs = wp.zeros(4, dtype=wp.vec3, device=device)
+
+        wp.launch(
+            project_bending_kernel,
+            dim=1,
+            inputs=[positions, edge_indices, edge_quad_q, weight, edge_norm],
+            outputs=[rhs],
+            device=device,
+        )
+        np.testing.assert_allclose(rhs.numpy(), np.zeros((4, 3)), atol=0.0)
+
+    def test_pre_bent_strip_preserves_curvature_magnitude(self) -> None:
+        """End-to-end: curved-rest 3x3 cloth strip remains near its rest shape
+        under gravity-free, bending-only forces. The old kernel pulled
+        ``q·x_cur`` toward the rest *vector* and would lock in the rest
+        direction; the new kernel pulls only the magnitude back. Either way the
+        rest configuration is an equilibrium, so this test serves mainly as an
+        integration check that the new kernel signature flows end-to-end
+        without NaN or runaway growth.
+        """
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=0.0)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=2,
+            dim_y=2,
+            cell_x=0.5,
+            cell_y=0.5,
+            mass=1.0,
+            tri_ke=1.0e2,
+            tri_ka=1.0e2,
+            tri_kd=0.0,
+            edge_ke=10.0,
+            edge_kd=0.0,
+        )
+        model = builder.finalize(device="cpu")
+
+        # Curve the rest: lift the centre vertex out of the plane before the
+        # solver captures ``particle_q`` as the bending reference.  This makes
+        # ``‖q·x_rest‖ > 0`` on every interior edge.
+        q_np = model.particle_q.numpy().copy()
+        # The (2, 2) grid has 9 particles; the centre vertex is at index 4.
+        q_np[4, 2] += 0.2
+        model.particle_q = wp.array(q_np, dtype=wp.vec3, device=model.device)
+
+        # Pin all four corners so the strip is anchored but the interior
+        # vertices stay free.
+        inv_mass = model.particle_inv_mass.numpy().copy()
+        for corner in (0, 2, 6, 8):
+            inv_mass[corner] = 0.0
+        model.particle_inv_mass = wp.array(inv_mass, dtype=wp.float32, device=model.device)
+        mass = np.where(inv_mass > 0.0, 1.0 / np.maximum(inv_mass, 1.0e-30), 0.0).astype(np.float32)
+        model.particle_mass = wp.array(mass, dtype=wp.float32, device=model.device)
+
+        solver = SolverFBA(model, iterations=8, pin_stiffness=1e10)
+
+        state_in = model.state()
+        state_out = model.state()
+        dt = 1.0 / 60.0
+        for _ in range(20):
+            solver.step(state_in, state_out, control=None, contacts=None, dt=dt)
+            state_in, state_out = state_out, state_in
+
+        pos_final = state_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(pos_final)), "positions diverged to non-finite values")
+        # Centre vertex should remain lifted by roughly the rest curvature; the
+        # old kernel would also satisfy this (rest is equilibrium for both),
+        # but together with the unit tests above this guards the integration.
+        self.assertGreater(pos_final[4, 2], 0.1, "centre vertex collapsed below rest curvature")
+        self.assertLess(pos_final[4, 2], 0.3, "centre vertex blew up past rest curvature")
 
 
 class TestPublicAPI(unittest.TestCase):

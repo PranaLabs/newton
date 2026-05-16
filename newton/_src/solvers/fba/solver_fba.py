@@ -254,6 +254,7 @@ class SolverFBA(SolverBase):
         self._edge_indices_d = None
         self._edge_quad_q_d = None
         self._edge_weight_d = None
+        self._edge_norm_d = None
         self._pin_indices_d = None
 
         # Tet device data (filled by _setup_pd_system).
@@ -308,6 +309,22 @@ class SolverFBA(SolverBase):
             edge_w = meta["edge_weight"] * meta.get("edge_quad_scale", np.ones_like(meta["edge_weight"]))
             self._edge_weight_d = wp.array(
                 edge_w.astype(np.float32),
+                dtype=wp.float32,
+                device=device,
+            )
+            # Rest curvature magnitude per edge: ``‖q·x_rest‖``. The local
+            # projection pulls ``q·x_cur`` back to this magnitude (not all the
+            # way to a flat configuration), matching RealSim
+            # ``PDIsometricBendingEnergy::computeRestBendingEnergy`` which
+            # caches ``_norm[i]`` at init. Computed here from the cotangent
+            # stencil and rest positions so the meta dict stays geometry-only.
+            x_rest = self.model.particle_q.numpy().astype(np.float64)
+            q = meta["edge_quad_q"]
+            stencil_rest = x_rest[meta["edge_indices"]]  # (E, 4, 3)
+            qTx_rest = (q[:, :, None] * stencil_rest).sum(axis=1)  # (E, 3)
+            edge_norm = np.linalg.norm(qTx_rest, axis=1)  # (E,)
+            self._edge_norm_d = wp.array(
+                edge_norm.astype(np.float32),
                 dtype=wp.float32,
                 device=device,
             )
@@ -481,10 +498,10 @@ class SolverFBA(SolverBase):
                     dim=self._edge_indices_d.shape[0],
                     inputs=[
                         self._x_cur,
-                        self._x_ref,
                         self._edge_indices_d,
                         self._edge_quad_q_d,
                         self._edge_weight_d,
+                        self._edge_norm_d,
                     ],
                     outputs=[self._rhs],
                     device=device,
