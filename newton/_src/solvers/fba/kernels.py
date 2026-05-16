@@ -1204,6 +1204,34 @@ def accumulate_vec3_kernel(
 
 
 @wp.kernel
+def accumulate_schur_W_kernel(
+    contact_particle: wp.array[wp.int32],
+    contact_dir: wp.array[wp.vec3],
+    contact_alpha: wp.array[wp.float32],
+    A_inv_Jt: wp.array2d[wp.vec3],
+    W: wp.array2d[wp.float64],
+):
+    """Compute W[c_prime, c] = alpha[c_prime] * dot(dir[c_prime], (A^{-1} J^T)[c, particle[c_prime]]).
+
+    Each thread handles one (c_prime, c) pair in the M_rows x M_rows output W.
+
+    Args:
+        contact_particle: Particle index per row, shape ``[M_rows]``.
+        contact_dir: Contact direction (normal or tangent) per row, shape ``[M_rows]``.
+        contact_alpha: Jacobian coefficient per row, shape ``[M_rows]``.
+        A_inv_Jt: Result of A^{-1} applied to each J^T column, shape ``[M_rows, N]`` (2D,
+            indexed as A_inv_Jt[row_c, particle]).
+        W: Output Schur complement matrix, shape ``[M_rows, M_rows]``.
+    """
+    c_prime, c = wp.tid()
+    p = contact_particle[c_prime]
+    y_at_p = A_inv_Jt[c, p]
+    alpha = contact_alpha[c_prime]
+    n = contact_dir[c_prime]
+    W[c_prime, c] = wp.float64(alpha) * wp.float64(wp.dot(n, y_at_p))
+
+
+@wp.kernel
 def subtract_vec3_kernel(
     a: wp.array[wp.vec3],
     b: wp.array[wp.vec3],

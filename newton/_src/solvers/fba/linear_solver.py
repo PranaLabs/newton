@@ -32,6 +32,7 @@ from .kernels import (
     extract_component_kernel,
     insert_component_kernel,
     scale_by_diag_kernel,
+    accumulate_schur_W_kernel,
 )
 
 
@@ -795,7 +796,7 @@ class FBALinearSolver:
         j_tangent1: wp.array | None = None,
         j_tangent2: wp.array | None = None,
     ) -> np.ndarray:
-        """Build ``W = J · A⁻¹ · Jᵀ`` as a dense NumPy array.
+        """Build ``W = J · A⁻¹ · Jᵀ`` as a dense NumPy array (batched GPU implementation).
 
         Stage A (``j_tangent1`` and ``j_tangent2`` are ``None``): emits an ``(M, M)``
         matrix with one row per contact (normal direction only).
@@ -804,10 +805,17 @@ class FBALinearSolver:
         three rows per contact ordered ``[n_c, t1_c, t2_c]`` for c = 0..M-1.
         Off-diagonal coupling between contacts is fully included.
 
-        The ``_y_cache`` attribute is updated to contain one entry per row (M entries
-        in Stage A; 3M entries in Stage B); each entry is the corresponding ``A⁻¹ · J_row^T``
-        column as a (N, 3) float64 NumPy array.  Used by
-        :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA._apply_lambda_correction_friction`.
+        Implementation uses Approach A (batched but with per-row solve loop, device-side W
+        dot products): all M_rows A^{-1} solves keep intermediate results on device in a
+        single ``A_inv_Jt`` buffer of shape ``(M_rows, N)``.  The ``W`` matrix is then
+        built entirely on device via a 2D kernel (one thread per (c', c) pair) and only
+        one host pull is needed at the end.
+
+        The ``_A_inv_Jt_d`` attribute is set to the device buffer of shape ``(M_rows, N)``
+        after this call and is reused by
+        :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA._apply_lambda_correction_friction`
+        and :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA._apply_lambda_correction`
+        to avoid re-solving. The legacy ``_y_cache`` attribute is no longer populated.
 
         Args:
             num_contacts: Number of active contacts ``M``.
@@ -834,65 +842,96 @@ class FBALinearSolver:
         n = self.n
         dev = self.device
 
-        W = np.zeros((total_rows, total_rows), dtype=np.float64)
-
-        # Allocate scratch for one Jacobian column (sparse vec3, length N).
-        jcol = wp.zeros(n, dtype=wp.vec3, device=dev)
-        y_out = wp.empty(n, dtype=wp.vec3, device=dev)
-
-        # Pull contact metadata to host (small M).
-        idx_np = j_indices.numpy()  # (M,) int32
-        n_np = j_normals.numpy()  # (M, 3) float32
-        a_np = j_alpha.numpy()  # (M,) float32
+        # --- Build unified per-row direction and particle arrays on device ---
+        # For Stage A: total_rows == M, each row uses normal direction.
+        # For Stage B: total_rows == 3M, rows interleaved [n_c, t1_c, t2_c].
+        idx_np = j_indices.numpy()  # (M,) int32 — small, needed for row dir array
+        n_np = j_normals.numpy()   # (M, 3) float32
+        a_np = j_alpha.numpy()     # (M,) float32
         if has_friction:
             t1_np = j_tangent1.numpy()  # (M, 3) float32
             t2_np = j_tangent2.numpy()  # (M, 3) float32
 
-        # Cache y columns for reuse in correction step.
-        self._y_cache: list[np.ndarray] = []
-
-        # For each (contact c, axis a) row in J, compute y_{c,a} = A⁻¹ J_{c,a}^T
-        # then fill one column of W.
+        # Build (total_rows,) arrays for particle index, direction, alpha.
+        row_particle = np.empty(total_rows, dtype=np.int32)
+        row_dir = np.empty((total_rows, 3), dtype=np.float32)
+        row_alpha = np.empty(total_rows, dtype=np.float32)
         for c in range(M):
             if has_friction:
-                directions: list[np.ndarray] = [n_np[c], t1_np[c], t2_np[c]]
+                for a, d in enumerate([n_np[c], t1_np[c], t2_np[c]]):
+                    row = c * 3 + a
+                    row_particle[row] = idx_np[c]
+                    row_dir[row] = d
+                    row_alpha[row] = a_np[c]
             else:
-                directions = [n_np[c]]
+                row_particle[c] = idx_np[c]
+                row_dir[c] = n_np[c]
+                row_alpha[c] = a_np[c]
 
-            for a, direction in enumerate(directions):
-                row = c * rows_per_contact + a
-                # Zero the sparse column.
-                wp.launch(zero_vec3_kernel, dim=n, inputs=[jcol], device=dev)
-                # Set jcol[idx] = alpha * direction.
-                wp.launch(
-                    build_contact_jacobian_dir_kernel,
-                    dim=1,
-                    inputs=[
-                        n,
-                        c,
-                        j_indices,
-                        j_alpha,
-                        wp.vec3(float(direction[0]), float(direction[1]), float(direction[2])),
-                    ],
-                    outputs=[jcol],
-                    device=dev,
-                )
-                # Solve: y_{c,a} = A⁻¹ · jcol.
-                self.solve(jcol, y_out)
-                y_np = y_out.numpy()  # (N, 3)
-                self._y_cache.append(y_np.copy())
+        # Upload direction arrays to device.
+        row_particle_d = wp.array(row_particle, dtype=wp.int32, device=dev)
+        row_dir_d = wp.array(row_dir, dtype=wp.vec3, device=dev)
+        row_alpha_d = wp.array(row_alpha, dtype=wp.float32, device=dev)
 
-                # Fill column `row` of W:
-                # W[row', row] = J_{row'} · y_{c,a}
-                #   = alpha[c'] * dot(dir_{c',a'}, y_np[idx[c']])
-                for cp in range(M):
-                    if has_friction:
-                        dirs_cp: list[np.ndarray] = [n_np[cp], t1_np[cp], t2_np[cp]]
-                    else:
-                        dirs_cp = [n_np[cp]]
-                    ip = idx_np[cp]
-                    for ap, dir_cp in enumerate(dirs_cp):
-                        rowp = cp * rows_per_contact + ap
-                        W[rowp, row] = float(a_np[cp]) * float(np.dot(dir_cp, y_np[ip]))
+        # --- Allocate/reuse A_inv_Jt buffer: shape (total_rows, N) on device ---
+        if (
+            not hasattr(self, "_A_inv_Jt_d")
+            or self._A_inv_Jt_d.shape[0] < total_rows
+            or self._A_inv_Jt_d.shape[1] != n
+        ):
+            self._A_inv_Jt_d = wp.empty(shape=(total_rows, n), dtype=wp.vec3, device=dev)
+
+        # Scratch buffers for a single solve call.
+        jcol = wp.zeros(n, dtype=wp.vec3, device=dev)
+        y_out = wp.empty(n, dtype=wp.vec3, device=dev)
+
+        # --- Per-row solve loop: keep y on device, copy to A_inv_Jt row ---
+        for row in range(total_rows):
+            c = row // rows_per_contact
+            direction = row_dir[row]
+            # Zero the sparse column.
+            wp.launch(zero_vec3_kernel, dim=n, inputs=[jcol], device=dev)
+            # Set jcol[idx] = alpha * direction.
+            wp.launch(
+                build_contact_jacobian_dir_kernel,
+                dim=1,
+                inputs=[
+                    n,
+                    c,
+                    j_indices,
+                    j_alpha,
+                    wp.vec3(float(direction[0]), float(direction[1]), float(direction[2])),
+                ],
+                outputs=[jcol],
+                device=dev,
+            )
+            # Solve: y_row = A⁻¹ · jcol (device → device).
+            self.solve(jcol, y_out)
+            # Copy y_out into A_inv_Jt[row] (device-to-device, no host pull).
+            wp.copy(self._A_inv_Jt_d[row], y_out)
+
+        # --- Build W on device via 2D kernel, then single host pull ---
+        # Allocate/reuse W device buffer.
+        if (
+            not hasattr(self, "_W_device_d")
+            or self._W_device_d.shape[0] < total_rows
+            or self._W_device_d.shape[1] < total_rows
+        ):
+            self._W_device_d = wp.empty(shape=(total_rows, total_rows), dtype=wp.float64, device=dev)
+
+        # Zero W before accumulation (only the active sub-block).
+        W_zeros = np.zeros((total_rows, total_rows), dtype=np.float64)
+        self._W_device_d.assign(W_zeros)
+
+        # Launch 2D kernel: one thread per (c_prime, c) entry.
+        wp.launch(
+            accumulate_schur_W_kernel,
+            dim=(total_rows, total_rows),
+            inputs=[row_particle_d, row_dir_d, row_alpha_d, self._A_inv_Jt_d, self._W_device_d],
+            device=dev,
+        )
+
+        # Single host pull for the (total_rows × total_rows) W matrix.
+        W = self._W_device_d.numpy()[:total_rows, :total_rows].copy()
 
         return W

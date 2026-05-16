@@ -913,9 +913,9 @@ class SolverFBA(SolverBase):
     def _apply_lambda_correction_friction(self, lam: np.ndarray) -> wp.array:
         """Compute ``correction = A⁻¹ · Jᵀ · λ`` for Stage B (3M λ).
 
-        Uses the cached ``_y_cache`` from
+        Uses the cached ``_A_inv_Jt_d`` device buffer from
         :meth:`~newton._src.solvers.fba.linear_solver.FBALinearSolver.build_schur_complement`
-        which contains one (N, 3) array per row (3M total entries for friction).
+        which contains one (N,) vec3 row per row (3M total entries for friction).
 
         Each row r corresponds to contact ``c = r // 3``, axis ``a = r % 3``:
 
@@ -938,11 +938,13 @@ class SolverFBA(SolverBase):
 
         correction_np = np.zeros((N, 3), dtype=np.float64)
 
-        if hasattr(ls, "_y_cache") and len(ls._y_cache) == total_rows:
+        if hasattr(ls, "_A_inv_Jt_d") and ls._A_inv_Jt_d.shape[0] >= total_rows:
+            # Use cached device buffer: pull only once, accumulate on host (total_rows is small).
+            A_inv_Jt_np = ls._A_inv_Jt_d.numpy()[:total_rows]  # (total_rows, N, 3)
             for row in range(total_rows):
                 if abs(lam[row]) < 1e-15:
                     continue
-                correction_np += lam[row] * ls._y_cache[row]
+                correction_np += lam[row] * A_inv_Jt_np[row].astype(np.float64)
         else:
             # Fallback: re-solve for each row.
             from .kernels import build_contact_jacobian_dir_kernel, zero_vec3_kernel  # noqa: PLC0415
@@ -985,7 +987,7 @@ class SolverFBA(SolverBase):
     def _apply_lambda_correction(self, lam: np.ndarray) -> wp.array:
         """Compute ``correction = A⁻¹ · Jᵀ · λ`` (vec3 array of length N).
 
-        Reuses the cached ``_y_cache`` from the last
+        Reuses the cached ``_A_inv_Jt_d`` device buffer from the last
         :meth:`~newton._src.solvers.fba.linear_solver.FBALinearSolver.build_schur_complement`
         call when available, otherwise re-solves.
 
@@ -995,7 +997,6 @@ class SolverFBA(SolverBase):
         Returns:
             Correction vec3 Warp array of length N.
         """
-        from .kernels import accumulate_vec3_kernel  # noqa: PLC0415
 
         M = self._contact_count
         N = self.model.particle_count
@@ -1004,17 +1005,19 @@ class SolverFBA(SolverBase):
 
         correction = wp.zeros(N, dtype=wp.vec3, device=dev)
 
-        if hasattr(ls, "_y_cache") and len(ls._y_cache) == M:
+        if hasattr(ls, "_A_inv_Jt_d") and ls._A_inv_Jt_d.shape[0] >= M:
             # Reuse cached A⁻¹ · J_c^T columns from build_schur_complement.
+            # Single host pull for the (M, N, 3) block needed.
+            A_inv_Jt_np = ls._A_inv_Jt_d.numpy()[:M]  # (M, N, 3)
             correction_np = np.zeros((N, 3), dtype=np.float64)
             for c in range(M):
                 if abs(lam[c]) < 1e-15:
                     continue
-                correction_np += lam[c] * ls._y_cache[c]
+                correction_np += lam[c] * A_inv_Jt_np[c].astype(np.float64)
             correction.assign(correction_np.astype(np.float32))
         else:
             # Fallback: re-solve for each contact.
-            from .kernels import set_lambda_jacobian_vec3_kernel, zero_vec3_kernel  # noqa: PLC0415
+            from .kernels import accumulate_vec3_kernel, set_lambda_jacobian_vec3_kernel, zero_vec3_kernel  # noqa: PLC0415
 
             tmp = wp.empty(N, dtype=wp.vec3, device=dev)
             work = wp.empty(N, dtype=wp.vec3, device=dev)
