@@ -2223,36 +2223,44 @@ def compose_W_from_wi_kernel(
 
 
 @wp.kernel
-def build_jt_lambda_vec3_kernel(
-    contact_particle: wp.array[wp.int32],
-    contact_dir: wp.array[wp.vec3],
-    contact_alpha: wp.array[wp.float32],
-    lam: wp.array[wp.float32],
-    n_rows: int,
-    out: wp.array[wp.vec3],
+def gather_jt_lambda_kernel(
+    row_offsets: wp.array[wp.int32],  # (N + 1,) CSR offsets into row_indices
+    row_indices: wp.array[wp.int32],  # (total_rows,) contact rows incident to each particle
+    contact_dir: wp.array[wp.vec3],  # (total_rows,) per-row direction
+    contact_alpha: wp.array[wp.float32],  # (total_rows,) per-row Jacobian coefficient
+    lam: wp.array[wp.float32],  # (total_rows,) per-row impulse
+    out: wp.array[wp.vec3],  # (N,) per-particle J^T * lambda — OVERWRITTEN
 ):
     """Compute ``out[p] = sum_{r: particle[r]=p} alpha[r] * lam[r] * dir[r]``.
 
-    One thread per contact row, accumulating into the per-particle vec3 output
-    via atomic adds. Used by the isodof path to construct
-    ``b = J^T * lambda`` so the lambda correction reduces to a single
-    ``A^{-1} b`` solve.
+    Particle-centered (deterministic) gather replacing the atomic-scatter
+    :func:`build_jt_lambda_vec3_kernel`. One thread per particle reads its
+    incident contact rows from the inverse-mapping CSR (built once per
+    contact-set update by
+    :meth:`~newton._src.solvers.fba.linear_solver.FBALinearSolver.build_schur_complement`)
+    and sums ``alpha[r] * lam[r] * dir[r]`` over them.
 
-    Caller must zero ``out`` before launch.
+    For Stage A (unilateral): one row per contact, ``total_rows == M``.
+    For Stage B (Coulomb): three rows per contact (n, t1, t2 — all sharing
+    the same particle), ``total_rows == 3*M``. Both cases use the same CSR
+    layout because rows are indexed by their position in the per-row
+    direction/alpha arrays.
+
+    Overwrites ``out`` (does not accumulate).
 
     Args:
-        contact_particle: Particle index per row, shape ``[n_rows]``.
-        contact_dir: Contact direction per row, shape ``[n_rows]``.
-        contact_alpha: Jacobian coefficient per row, shape ``[n_rows]``.
-        lam: Contact impulse per row, shape ``[n_rows]``, float32.
-        n_rows: Number of active rows (``M`` for Stage A, ``3*M`` for Stage B).
-        out: Per-particle accumulator, shape ``[N]``, vec3. Written via
-            ``wp.atomic_add``.
+        row_offsets: CSR row offsets (``N + 1`` entries), shape ``[N + 1]``.
+        row_indices: CSR entry → contact row index, shape ``[total_rows]``.
+        contact_dir: Contact direction per row, shape ``[total_rows]``.
+        contact_alpha: Jacobian coefficient per row, shape ``[total_rows]``.
+        lam: Contact impulse per row, shape ``[total_rows]``, float32.
+        out: Per-particle accumulator, shape ``[N]``, vec3. Overwritten.
     """
-    r = wp.tid()
-    if r >= n_rows:
-        return
-    p = contact_particle[r]
-    weight = contact_alpha[r] * lam[r]
-    contribution = weight * contact_dir[r]
-    wp.atomic_add(out, p, contribution)
+    p = wp.tid()
+    start = row_offsets[p]
+    end = row_offsets[p + 1]
+    s = wp.vec3(0.0, 0.0, 0.0)
+    for k in range(start, end):
+        r = row_indices[k]
+        s = s + (contact_alpha[r] * lam[r]) * contact_dir[r]
+    out[p] = s

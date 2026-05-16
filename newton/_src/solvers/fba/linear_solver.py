@@ -1068,6 +1068,21 @@ class FBALinearSolver:
         self._row_alpha_d = row_alpha_d
         self._row_total = total_rows
 
+        # Inverse mapping (particle → incident contact rows) for the
+        # deterministic ``J^T·lambda`` gather in
+        # :meth:`apply_lambda_correction_isodof`. Each contact row maps to
+        # exactly one particle (Stage A: 1 row/contact; Stage B: 3 rows/contact
+        # all sharing one particle), so a stable-sort by particle yields a
+        # CSR adjacency. Built once per contact-set update — host-side cost is
+        # ``O(total_rows log total_rows)`` and ``total_rows`` is small (~1k).
+        order = np.argsort(row_particle, kind="stable").astype(np.int32)
+        sorted_particles = row_particle[order]
+        counts = np.bincount(sorted_particles, minlength=n).astype(np.int32)
+        offsets = np.zeros(n + 1, dtype=np.int32)
+        offsets[1:] = np.cumsum(counts)
+        self._isodof_row_offsets_d = wp.array(offsets, dtype=wp.int32, device=dev)
+        self._isodof_row_indices_d = wp.array(order, dtype=wp.int32, device=dev)
+
         # =====================================================================
         # Isodof-restricted path (Task P): build ``Wi`` of size (k, k) for the
         # unique contacted particles, then assemble W via a 2D kernel reading
@@ -1284,22 +1299,24 @@ class FBALinearSolver:
         """Compute ``correction = A^{-1} J^T lambda`` via a single Cholesky solve.
 
         For the isodof path, ``_A_inv_Jt_d`` is *not* populated — instead we
-        rebuild ``J^T lambda`` (a vec3 array of length ``N``, accumulated over
-        contact rows via atomics) and call :meth:`solve` once. This is much
-        cheaper than the multi-RHS dot accumulation when the contact set is
-        small relative to the total DOF count.
+        rebuild ``J^T lambda`` (a vec3 array of length ``N``, summed over
+        contact rows by a particle-centered gather over the inverse-mapping
+        CSR built in :meth:`build_schur_complement`) and call :meth:`solve`
+        once. This is much cheaper than the multi-RHS dot accumulation when
+        the contact set is small relative to the total DOF count, and the
+        gather avoids ``wp.atomic_add`` so the assembly is bit-deterministic.
 
         Args:
             lam: Contact impulse vector, shape ``(total_rows,)``, float64.
                 ``total_rows == M`` for Stage A, ``3 * M`` for Stage B.
             out: Output correction, shape ``[N]``, vec3. Overwritten.
         """
-        from .kernels import build_jt_lambda_vec3_kernel  # noqa: PLC0415
+        from .kernels import gather_jt_lambda_kernel  # noqa: PLC0415
 
-        if not hasattr(self, "_row_particle_d"):
+        if not hasattr(self, "_row_particle_d") or not hasattr(self, "_isodof_row_offsets_d"):
             raise RuntimeError(
                 "apply_lambda_correction_isodof requires a prior isodof-mode "
-                "build_schur_complement call (which sets _row_*_d arrays)."
+                "build_schur_complement call (which sets _row_*_d / _isodof_row_*_d arrays)."
             )
 
         n = self.n
@@ -1314,18 +1331,18 @@ class FBALinearSolver:
             self._lam_d = wp.empty(cap, dtype=wp.float32, device=dev)
 
         self._lam_d.assign(lam.astype(np.float32))
-        # Zero the per-particle accumulator before atomic adds.
-        self._jt_lambda_d.zero_()
 
+        # Particle-centered gather: out[p] = sum over its incident contact rows.
+        # Overwrites _jt_lambda_d (no zero-init needed; kernel writes every p).
         wp.launch(
-            build_jt_lambda_vec3_kernel,
-            dim=n_rows,
+            gather_jt_lambda_kernel,
+            dim=n,
             inputs=[
-                self._row_particle_d,
+                self._isodof_row_offsets_d,
+                self._isodof_row_indices_d,
                 self._row_dir_d,
                 self._row_alpha_d,
                 self._lam_d,
-                int(n_rows),
             ],
             outputs=[self._jt_lambda_d],
             device=dev,

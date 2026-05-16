@@ -4156,5 +4156,56 @@ class SolverFBABendingDeterminismTests(unittest.TestCase):
         np.testing.assert_allclose(q1, q2, atol=1e-6, err_msg="bending scatter non-deterministic")
 
 
+class SolverFBAIsodofJtLambdaDeterminismTests(unittest.TestCase):
+    """Refactored isodof J^T·lambda scatter is bit-deterministic across reruns."""
+
+    def _run_once(self) -> np.ndarray:
+        import newton
+        from newton import CollisionPipeline
+        from newton.solvers import SolverFBA
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=-9.81)
+        builder.add_ground_plane()
+        # Cloth that develops Stage B friction contacts on the plane.
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.2, -0.2, 0.15),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=5,
+            dim_y=5,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.05,
+            tri_ke=1.0e4,
+            tri_ka=0.0,
+            tri_kd=0.0,
+        )
+        model = builder.finalize()
+        if hasattr(model, "shape_material_mu") and model.shape_material_mu is not None:
+            mu_arr = model.shape_material_mu.numpy()
+            mu_arr[0] = 0.3
+            model.shape_material_mu.assign(mu_arr.astype(np.float32))
+        pipeline = CollisionPipeline(model, soft_contact_margin=0.1)
+        contacts = pipeline.contacts()
+        solver = SolverFBA(
+            model,
+            friction=True,
+            mu_per_pair_override=np.full(model.particle_count, 0.3, dtype=np.float64),
+        )
+        s_in = model.state()
+        s_out = model.state()
+        for _ in range(10):
+            s_in.clear_forces()
+            pipeline.collide(s_in, contacts)
+            solver.step(s_in, s_out, None, contacts, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+        return s_in.particle_q.numpy().copy()
+
+    def test_two_runs_identical(self) -> None:
+        q1 = self._run_once()
+        q2 = self._run_once()
+        np.testing.assert_allclose(q1, q2, atol=1e-6, err_msg="isodof J^T·lambda scatter non-deterministic")
+
+
 if __name__ == "__main__":
     unittest.main()
