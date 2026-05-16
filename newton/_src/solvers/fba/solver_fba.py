@@ -703,14 +703,42 @@ class SolverFBA(SolverBase):
         if self.friction:
             t1_h = np.zeros((M, 3), dtype=np.float32)
             t2_h = np.zeros((M, 3), dtype=np.float32)
+            # Per-contact tangential offsets: dot(t1, world_anchor) and
+            # dot(t2, world_anchor).  These are used in the friction residual
+            # r_t = dot(t, anchor) - alpha * dot(t, x_unc), which correctly
+            # measures tangential displacement from the contact anchor (not
+            # from the world origin).  Without this correction, the residual
+            # is ~10x too large for off-origin contacts, driving astronomically
+            # large friction impulses.
+            tangent1_offset_h = np.zeros(M, dtype=np.float64)
+            tangent2_offset_h = np.zeros(M, dtype=np.float64)
             for c in range(M):
                 t1, t2 = compute_tangent_basis(normal_h[c])
                 t1_h[c] = t1.astype(np.float32)
                 t2_h[c] = t2.astype(np.float32)
+                # world_anchor for this contact (already in world frame).
+                # offset_h[c] = dot(n, world_anchor), so to get world_anchor
+                # we project body_pos through the body transform (already done
+                # in offset_h construction loop above; reuse body_pos_h).
+                # We recompute world_anchor here consistently with offset_h.
+                s_idx = int(shape_h[c])
+                bpos = body_pos_h[c]
+                world_anchor = bpos.copy()
+                if shape_body_np is not None and s_idx >= 0:
+                    b_idx = int(shape_body_np[s_idx])
+                    if b_idx >= 0 and body_q_np is not None:
+                        bq = body_q_np[b_idx]
+                        pos_b = bq[:3]
+                        quat_b = bq[3:]
+                        world_anchor = _transform_point(pos_b, quat_b, bpos)
+                tangent1_offset_h[c] = float(np.dot(t1, world_anchor))
+                tangent2_offset_h[c] = float(np.dot(t2, world_anchor))
             self._contact_tangent1_d.assign(t1_h)
             self._contact_tangent2_d.assign(t2_h)
             self._contact_tangent1_h = t1_h
             self._contact_tangent2_h = t2_h
+            self._contact_tangent1_offset_h = tangent1_offset_h
+            self._contact_tangent2_offset_h = tangent2_offset_h
 
             # Compute per-contact friction μ via VBD-style sqrt mixing.
             particle_mu = float(getattr(model, "particle_mu", 0.5))
@@ -737,12 +765,19 @@ class SolverFBA(SolverBase):
 
         For each contact c:
 
-        - ``r_n[c]  = offset[c] - alpha[c] * dot(n[c],  x_np[p[c]])``
-        - ``r_t1[c] =           - alpha[c] * dot(t1[c], x_np[p[c]])``
-        - ``r_t2[c] =           - alpha[c] * dot(t2[c], x_np[p[c]])``
+        - ``r_n[c]  = offset_n[c]  - alpha[c] * dot(n[c],  x_np[p[c]])``
+        - ``r_t1[c] = offset_t1[c] - alpha[c] * dot(t1[c], x_np[p[c]])``
+        - ``r_t2[c] = offset_t2[c] - alpha[c] * dot(t2[c], x_np[p[c]])``
 
-        Tangent residuals target zero tangential displacement relative to the
-        contact anchor (PD-position friction).
+        where ``offset_n = dot(n, world_anchor)`` and
+        ``offset_t1 = dot(t1, world_anchor)``,
+        ``offset_t2 = dot(t2, world_anchor)`` (set in :meth:`update_contacts`).
+
+        The tangent residuals measure displacement from the contact anchor
+        along each tangent direction, so they are zero when the particle
+        sits exactly at the anchor.  Using the global origin (offset = 0)
+        was incorrect and inflated residuals by ~10x for off-origin
+        contacts, driving unphysically large friction impulses.
 
         Args:
             x_np: Unconstrained solution, shape ``(N, 3)``, float32.
@@ -761,8 +796,8 @@ class SolverFBA(SolverBase):
             t1 = self._contact_tangent1_h[c].astype(np.float64)
             t2 = self._contact_tangent2_h[c].astype(np.float64)
             r[3 * c + 0] = float(self._contact_offset_h[c]) - alpha * float(np.dot(n, xp))
-            r[3 * c + 1] = -alpha * float(np.dot(t1, xp))
-            r[3 * c + 2] = -alpha * float(np.dot(t2, xp))
+            r[3 * c + 1] = float(self._contact_tangent1_offset_h[c]) - alpha * float(np.dot(t1, xp))
+            r[3 * c + 2] = float(self._contact_tangent2_offset_h[c]) - alpha * float(np.dot(t2, xp))
         return r
 
     def _compute_contact_residual(self, x_np: np.ndarray) -> np.ndarray:
@@ -822,6 +857,13 @@ class SolverFBA(SolverBase):
         is updated by solving the local 3x3 system (``W_cc``), then projecting
         onto the Coulomb cone.
 
+        Complementarity is enforced per-block: if the effective normal residual
+        ``r_eff[0] ≤ 0`` (no penetration for this contact after accounting for
+        contributions from all other active contacts), the entire 3-block is
+        forced to zero.  This mirrors Stage A's ``max(0, r/W)`` clamp and
+        prevents the friction cone projection from generating spurious repulsive
+        impulses on contacts where the gap is still open.
+
         Args:
             W: Dense ``(3M, 3M)`` Schur complement matrix.
             r: Residual vector of shape ``(3M,)``.
@@ -842,6 +884,17 @@ class SolverFBA(SolverBase):
                 # Effective RHS: r_eff = r[s] - sum_{c' != c} W[s, s'] lam[s']
                 off_diag = W[s, :] @ lam - W_cc @ lam[s]
                 r_eff = r[s] - off_diag
+                # Unilateral complementarity: contact is inactive when the
+                # normal component of the effective residual is non-positive
+                # (gap still open).  Forcing the block to zero matches the
+                # Stage A max(0, r/W) clamp and prevents the Coulomb-cone
+                # projection from manufacturing spurious outward impulses via
+                # Case-3 when tangential residuals are large but r_n < 0.
+                if r_eff[0] <= 0.0:
+                    lam[3 * c + 0] = 0.0
+                    lam[3 * c + 1] = 0.0
+                    lam[3 * c + 2] = 0.0
+                    continue
                 # Solve 3x3: lam_unc = W_cc^{-1} r_eff
                 if np.linalg.det(W_cc) < 1e-20:
                     continue

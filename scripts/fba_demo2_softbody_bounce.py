@@ -121,10 +121,7 @@ def run_demo() -> tuple:
     min_z = float(q_final[:, 2].min())
     mean_step_ms = 1000.0 * float(np.mean(step_times))
 
-    print(
-        f"  [softbody-bounce] finite={finite_ok}  min_z={min_z:.3f}  "
-        f"mean_step={mean_step_ms:.1f} ms"
-    )
+    print(f"  [softbody-bounce] finite={finite_ok}  min_z={min_z:.3f}  mean_step={mean_step_ms:.1f} ms")
     return snapshots, mean_step_ms, finite_ok, min_z
 
 

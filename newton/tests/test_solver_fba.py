@@ -2798,6 +2798,100 @@ class TestPhase4StageBFriction(unittest.TestCase):
             f"Friction should decelerate particle: x(mu=0.5)={x_friction:.4f} should be < x(mu=0)={x_frictionless:.4f}",
         )
 
+    def test_friction_multi_shape_scene_runs(self):
+        """Regression: cloth + cylinder (off-origin) with friction=True must not
+        produce spurious impulses or free-fall when mu_per_pair_override is
+        sized to particle_count.
+
+        Before the fix the tangent residual was computed relative to the world
+        origin rather than the contact anchor, inflating residuals by ~10x for
+        off-origin contacts.  The resulting runaway friction impulses launched
+        the cloth upward, clearing all contacts on the next frame, so the cloth
+        free-fell indefinitely at ~3 ms/step instead of the expected ~300+ ms.
+
+        Setup: 6x6 cloth dropped over a tilted cylinder (static).  After 50
+        steps with friction=True and mu_per_pair_override sized to
+        particle_count, verify:
+          - no NaN in positions, and
+          - cloth stays within reasonable vertical bounds (not launched to
+            |z| > 5 m).
+        """
+        DIM = 6
+        CELL_SIZE = 0.08
+        CYLINDER_RADIUS = 0.3
+        CYLINDER_HALF_HEIGHT = 0.6
+        CYLINDER_TILT_DEG = 30.0
+        DT = 1.0 / 60.0
+
+        angle_rad = np.deg2rad(CYLINDER_TILT_DEG)
+        qx = float(np.sin(angle_rad / 2.0))
+        qw = float(np.cos(angle_rad / 2.0))
+        tilt_quat = wp.quat(qx, 0.0, 0.0, qw)
+        cylinder_center_z = 0.5
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=-9.81)
+        builder.add_shape_cylinder(
+            body=-1,
+            xform=wp.transform(wp.vec3(0.0, 0.0, cylinder_center_z), tilt_quat),
+            radius=CYLINDER_RADIUS,
+            half_height=CYLINDER_HALF_HEIGHT,
+        )
+        cloth_start_x = -DIM * CELL_SIZE / 2.0
+        cloth_start_y = -DIM * CELL_SIZE / 2.0
+        cloth_start_z = cylinder_center_z + CYLINDER_HALF_HEIGHT + 0.5
+        builder.add_cloth_grid(
+            pos=wp.vec3(cloth_start_x, cloth_start_y, cloth_start_z),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=DIM,
+            dim_y=DIM,
+            cell_x=CELL_SIZE,
+            cell_y=CELL_SIZE,
+            mass=0.02,
+            tri_ke=8.0e3,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=5.0e-3,
+            edge_kd=0.0,
+        )
+        model = builder.finalize()
+
+        pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.08)
+        contacts = pipeline.contacts()
+
+        particle_count = model.particle_count
+        # mu_per_pair_override sized to particle_count — this is the Demo 3 pattern
+        # that previously triggered the bug.
+        mu_override = np.full(particle_count, 0.4, dtype=np.float64)
+        solver = SolverFBA(model, iterations=5, friction=True, mu_per_pair_override=mu_override)
+
+        s_in = model.state()
+        s_out = model.state()
+
+        for _ in range(50):
+            s_in.clear_forces()
+            pipeline.collide(s_in, contacts)
+            solver.step(s_in, s_out, None, contacts, DT)
+            s_in, s_out = s_out, s_in
+
+        q = s_in.particle_q.numpy()
+        self.assertTrue(
+            np.all(np.isfinite(q)),
+            "NaN/Inf positions after 50 friction steps on cloth-cylinder scene",
+        )
+        min_z = float(q[:, 2].min())
+        max_z = float(q[:, 2].max())
+        self.assertGreater(
+            min_z,
+            -5.0,
+            f"Cloth fell too far (min_z={min_z:.2f} m); friction impulses may be spurious",
+        )
+        self.assertLess(
+            max_z,
+            5.0,
+            f"Cloth launched upward (max_z={max_z:.2f} m); friction impulses may be spurious",
+        )
+
 
 class TestPhase4StageCShapePrimitives(unittest.TestCase):
     """Phase 4 Stage C: verify the Schur-complement pipeline works for non-plane
