@@ -787,6 +787,120 @@ class FBALinearSolver:
             # 7. Insert result into component c of output x.
             wp.launch(insert_component_kernel, dim=n, inputs=[self._x_scalar, c], outputs=[x], device=dev)
 
+    def _ensure_multi_rhs_buffers(self, R: int) -> None:
+        """Allocate or grow multi-RHS scratch buffers to hold R right-hand sides."""
+        n = self.n
+        dev = self.device
+        if hasattr(self, "_multi_rhs_cap") and self._multi_rhs_cap >= R:
+            return
+        # Grow by at least 1.5x to amortize repeated allocation.
+        new_cap = max(R, int(getattr(self, "_multi_rhs_cap", 0) * 1.5) + 1)
+        self._multi_rhs_cap = new_cap
+        self._b_perm_multi = wp.empty(shape=(new_cap, n), dtype=wp.float64, device=dev)
+        self._Sb_multi = wp.empty(shape=(new_cap, n), dtype=wp.float64, device=dev)
+        self._DSb_multi = wp.empty(shape=(new_cap, n), dtype=wp.float64, device=dev)
+        self._SDSb_multi = wp.empty(shape=(new_cap, n), dtype=wp.float64, device=dev)
+
+    def solve_multi_rhs_scalar(
+        self,
+        b_multi: wp.array2d,
+        x_multi: wp.array2d,
+        R: int,
+    ) -> None:
+        """Apply A^{-1} to R scalar RHS rows in a single batched pass.
+
+        Each row of ``b_multi`` is one scalar RHS (length N). Each row of
+        ``x_multi`` receives the corresponding scalar solution A^{-1} b[r].
+
+        Pipeline (same as :meth:`solve` but batched over all R rows):
+
+        1. ``b_perm[r, i] = b_multi[r, invperm[i]]``  (multi-RHS invperm gather)
+        2. ``Sb[r, i]     = sum_j S[i, j] * b_perm[r, j]``  (multi-RHS SpMV with S)
+        3. ``DSb[r, i]    = Dinv[i] * Sb[r, i]``  (multi-RHS diag scale)
+        4. ``SDSb[r, i]   = sum_j S^T[i, j] * DSb[r, j]``  (multi-RHS SpMV with S^T)
+        5. ``x_multi[r, i] = SDSb[r, perm[i]]``  (multi-RHS perm gather)
+
+        Args:
+            b_multi: Input RHS rows, shape ``(≥R, N)`` float64.
+            x_multi: Output solution rows, shape ``(≥R, N)`` float64; written in-place.
+            R: Number of active RHS rows to process (must be ≤ b_multi.shape[0]).
+        """
+        from .kernels import (  # noqa: PLC0415
+            apply_permutation_multi_rhs_kernel,
+            bsr_mv_multi_rhs_scalar_kernel,
+            scale_by_diag_multi_rhs_kernel,
+        )
+
+        self._ensure_multi_rhs_buffers(R)
+        n = self.n
+        dev = self.device
+
+        # View active sub-slices (pointer into pre-allocated buffer, no copy).
+        b_perm_v = wp.array(
+            ptr=self._b_perm_multi.ptr,
+            dtype=wp.float64,
+            shape=(R, n),
+            device=dev,
+        )
+        Sb_v = wp.array(ptr=self._Sb_multi.ptr, dtype=wp.float64, shape=(R, n), device=dev)
+        DSb_v = wp.array(ptr=self._DSb_multi.ptr, dtype=wp.float64, shape=(R, n), device=dev)
+        SDSb_v = wp.array(ptr=self._SDSb_multi.ptr, dtype=wp.float64, shape=(R, n), device=dev)
+
+        # Step 1: b_perm[r, i] = b_multi[r, invperm[i]]
+        wp.launch(
+            apply_permutation_multi_rhs_kernel,
+            dim=(R, n),
+            inputs=[b_multi, self._invperm],
+            outputs=[b_perm_v],
+            device=dev,
+        )
+
+        # Step 2: Sb[r, i] = sum_j S[i,j] * b_perm[r, j]
+        wp.launch(
+            bsr_mv_multi_rhs_scalar_kernel,
+            dim=(R, n),
+            inputs=[
+                self._S_bsr.offsets,
+                self._S_bsr.columns,
+                self._S_bsr.values,
+                b_perm_v,
+            ],
+            outputs=[Sb_v],
+            device=dev,
+        )
+
+        # Step 3: DSb[r, i] = Dinv[i] * Sb[r, i]
+        wp.launch(
+            scale_by_diag_multi_rhs_kernel,
+            dim=(R, n),
+            inputs=[Sb_v, self._Dinv],
+            outputs=[DSb_v],
+            device=dev,
+        )
+
+        # Step 4: SDSb[r, i] = sum_j S^T[i,j] * DSb[r, j]
+        wp.launch(
+            bsr_mv_multi_rhs_scalar_kernel,
+            dim=(R, n),
+            inputs=[
+                self._ST_bsr.offsets,
+                self._ST_bsr.columns,
+                self._ST_bsr.values,
+                DSb_v,
+            ],
+            outputs=[SDSb_v],
+            device=dev,
+        )
+
+        # Step 5: x_multi[r, i] = SDSb[r, perm[i]]
+        wp.launch(
+            apply_permutation_multi_rhs_kernel,
+            dim=(R, n),
+            inputs=[SDSb_v, self._perm],
+            outputs=[x_multi],
+            device=dev,
+        )
+
     def build_schur_complement(
         self,
         num_contacts: int,
@@ -805,9 +919,10 @@ class FBALinearSolver:
         three rows per contact ordered ``[n_c, t1_c, t2_c]`` for c = 0..M-1.
         Off-diagonal coupling between contacts is fully included.
 
-        Implementation uses Approach A (batched but with per-row solve loop, device-side W
-        dot products): all M_rows A^{-1} solves keep intermediate results on device in a
-        single ``A_inv_Jt`` buffer of shape ``(M_rows, N)``.  The ``W`` matrix is then
+        Implementation uses Approach B (multi-RHS batched solve): all M_rows A^{-1} solves
+        are executed in three batched passes (one per spatial axis), each firing a single
+        multi-RHS SpMV kernel over all RHS simultaneously. Results are stored on device in
+        a single ``A_inv_Jt`` buffer of shape ``(M_rows, N)``.  The ``W`` matrix is then
         built entirely on device via a 2D kernel (one thread per (c', c) pair) and only
         one host pull is needed at the end.
 
@@ -831,8 +946,8 @@ class FBALinearSolver:
             Dense float64 NumPy array of shape ``(M, M)`` (Stage A) or ``(3M, 3M)`` (Stage B).
         """
         from .kernels import (  # noqa: PLC0415
-            build_contact_jacobian_dir_kernel,
-            zero_vec3_kernel,
+            pack_jacobian_axis_kernel,
+            unpack_to_A_inv_Jt_axis_kernel,
         )
 
         has_friction = j_tangent1 is not None and j_tangent2 is not None
@@ -877,34 +992,53 @@ class FBALinearSolver:
         if not hasattr(self, "_A_inv_Jt_d") or self._A_inv_Jt_d.shape[0] < total_rows or self._A_inv_Jt_d.shape[1] != n:
             self._A_inv_Jt_d = wp.empty(shape=(total_rows, n), dtype=wp.vec3, device=dev)
 
-        # Scratch buffers for a single solve call.
-        jcol = wp.zeros(n, dtype=wp.vec3, device=dev)
-        y_out = wp.empty(n, dtype=wp.vec3, device=dev)
+        # --- Allocate/reuse 2D float64 buffers for multi-RHS pack/solve ---
+        if not hasattr(self, "_b_multi_d") or self._b_multi_d.shape[0] < total_rows or self._b_multi_d.shape[1] != n:
+            cap = max(total_rows, int(getattr(self, "_b_multi_cap", 0) * 1.5) + 1)
+            self._b_multi_cap = cap
+            self._b_multi_d = wp.zeros(shape=(cap, n), dtype=wp.float64, device=dev)
+            self._y_multi_d = wp.zeros(shape=(cap, n), dtype=wp.float64, device=dev)
 
-        # --- Per-row solve loop: keep y on device, copy to A_inv_Jt row ---
-        for row in range(total_rows):
-            c = row // rows_per_contact
-            direction = row_dir[row]
-            # Zero the sparse column.
-            wp.launch(zero_vec3_kernel, dim=n, inputs=[jcol], device=dev)
-            # Set jcol[idx] = alpha * direction.
+        # Active sub-views (pointer into pre-allocated buffer, no copy).
+        b_multi_v = wp.array(
+            ptr=self._b_multi_d.ptr,
+            dtype=wp.float64,
+            shape=(total_rows, n),
+            device=dev,
+        )
+        y_multi_v = wp.array(
+            ptr=self._y_multi_d.ptr,
+            dtype=wp.float64,
+            shape=(total_rows, n),
+            device=dev,
+        )
+
+        # --- Approach B: 3 axis passes (one multi-RHS solve per axis) ---
+        # Each pass packs one spatial axis of J^T, solves A^{-1} for all total_rows
+        # RHS simultaneously, then unpacks results into A_inv_Jt.
+        # Total kernel launches: 3 * (1 pack + 5 solve + 1 unpack) = 21 launches,
+        # vs ~15 * total_rows launches for the Approach A per-row loop.
+        self._ensure_multi_rhs_buffers(total_rows)
+        for axis in range(3):
+            # Zero b_multi for this axis pass.
+            b_multi_v.zero_()
+            # Pack J^T axis: b_multi[r, particle[r]] = alpha[r] * dir[r][axis].
             wp.launch(
-                build_contact_jacobian_dir_kernel,
-                dim=1,
-                inputs=[
-                    n,
-                    c,
-                    j_indices,
-                    j_alpha,
-                    wp.vec3(float(direction[0]), float(direction[1]), float(direction[2])),
-                ],
-                outputs=[jcol],
+                pack_jacobian_axis_kernel,
+                dim=total_rows,
+                inputs=[axis, row_particle_d, row_dir_d, row_alpha_d],
+                outputs=[b_multi_v],
                 device=dev,
             )
-            # Solve: y_row = A⁻¹ · jcol (device → device).
-            self.solve(jcol, y_out)
-            # Copy y_out into A_inv_Jt[row] (device-to-device, no host pull).
-            wp.copy(self._A_inv_Jt_d[row], y_out)
+            # Batched solve: y_multi = A^{-1} * b_multi (all total_rows RHS at once).
+            self.solve_multi_rhs_scalar(b_multi_v, y_multi_v, total_rows)
+            # Unpack: A_inv_Jt[r, i][axis] = float32(y_multi[r, i]).
+            wp.launch(
+                unpack_to_A_inv_Jt_axis_kernel,
+                dim=(total_rows, n),
+                inputs=[axis, y_multi_v, self._A_inv_Jt_d],
+                device=dev,
+            )
 
         # --- Build W on device via 2D kernel, then single host pull ---
         # Allocate/reuse W device buffer.
@@ -927,7 +1061,7 @@ class FBALinearSolver:
             device=dev,
         )
 
-        # Single host pull for the (total_rows × total_rows) W matrix.
+        # Single host pull for the (total_rows x total_rows) W matrix.
         W = self._W_device_d.numpy()[:total_rows, :total_rows].copy()
 
         return W
