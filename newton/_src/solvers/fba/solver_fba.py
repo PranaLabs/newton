@@ -318,6 +318,9 @@ class SolverFBA(SolverBase):
         # Per-(tri, local vertex) scratch for deterministic (compute → gather)
         # PD cloth-stretching scatter; allocated in _setup_pd_system, reused per step.
         self._tri_contrib_d: wp.array | None = None
+        # Per-(edge, local vertex) scratch for deterministic (compute → gather)
+        # PD isometric bending scatter; allocated in _setup_pd_system, reused per step.
+        self._edge_contrib_d: wp.array | None = None
 
         # Particle-centered CSR adjacency for deterministic PD reductions (Task P2-D-A).
         # Lets the PD scatter use (compute → gather) instead of atomic_add.
@@ -472,10 +475,18 @@ class SolverFBA(SolverBase):
             self._particle_edge_offsets_d = wp.array(offs, dtype=wp.int32, device=device)
             self._particle_edge_element_d = wp.array(elem_idx, dtype=wp.int32, device=device)
             self._particle_edge_local_d = wp.array(local_v, dtype=wp.int32, device=device)
+            # Per-(edge, local vertex) scratch buffer for deterministic
+            # (compute → gather) PD bending reduction.
+            self._edge_contrib_d = wp.zeros(
+                shape=(int(edge_indices_np.shape[0]), 4),
+                dtype=wp.vec3,
+                device=device,
+            )
         else:
             self._particle_edge_offsets_d = None
             self._particle_edge_element_d = None
             self._particle_edge_local_d = None
+            self._edge_contrib_d = None
 
     def step(
         self,
@@ -503,7 +514,7 @@ class SolverFBA(SolverBase):
             add_inertia_to_rhs_kernel,
             compute_inertial_kernel,
             gather_per_particle_kernel,
-            project_bending_kernel,
+            project_bending_compute_kernel,
             project_pin_kernel,
             project_stretching_arap_compute_kernel,
             project_stretching_arap_tet_compute_kernel,
@@ -682,10 +693,10 @@ class SolverFBA(SolverBase):
                         outputs=[self._rhs],
                         device=device,
                     )
-            # Bending projection.
+            # Bending projection — deterministic (compute → gather) scatter.
             if self._edge_indices_d is not None:
                 wp.launch(
-                    project_bending_kernel,
+                    project_bending_compute_kernel,
                     dim=self._edge_indices_d.shape[0],
                     inputs=[
                         self._x_cur,
@@ -693,6 +704,18 @@ class SolverFBA(SolverBase):
                         self._edge_quad_q_d,
                         self._edge_weight_d,
                         self._edge_norm_d,
+                    ],
+                    outputs=[self._edge_contrib_d],
+                    device=device,
+                )
+                wp.launch(
+                    gather_per_particle_kernel,
+                    dim=N,
+                    inputs=[
+                        self._edge_contrib_d,
+                        self._particle_edge_offsets_d,
+                        self._particle_edge_element_d,
+                        self._particle_edge_local_d,
                     ],
                     outputs=[self._rhs],
                     device=device,

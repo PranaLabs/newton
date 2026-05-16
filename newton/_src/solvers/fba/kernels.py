@@ -1629,6 +1629,79 @@ def project_bending_kernel(
 
 
 @wp.kernel
+def project_bending_compute_kernel(
+    positions: wp.array[wp.vec3],  # x_cur — current iterate
+    edge_indices: wp.array2d[wp.int32],  # shape (E, 4)
+    edge_quad_q: wp.array[wp.vec4],  # length-4 vector q per edge; Q = q*q^T
+    edge_weight: wp.array[wp.float32],
+    edge_norm: wp.array[wp.float32],  # ‖q·x_rest‖ — rest curvature magnitude
+    # output (per-edge, per-local-vertex contributions)
+    contributions: wp.array2d[wp.vec3],  # (E, 4)
+):
+    """Compute per-edge bending contribution to each of its 4 stencil vertices.
+
+    Same math as :func:`project_bending_kernel` but writes to a pre-allocated
+    ``(E, 4)`` scratch buffer instead of atomic-adding into rhs. Pair with
+    :func:`gather_per_particle_kernel` for the deterministic reduction.
+
+    The contribution at local vertex ``a`` is ``w · q[a] · target`` where
+    ``target = (q·x_cur).normalized() · ‖q·x_rest‖`` matches the H'-fixed
+    normalize-then-scale-by-rest-norm form. When weight, rest curvature, or
+    current curvature is too small the contribution is zeroed.
+
+    Args:
+        positions: Current particle positions [m], shape ``[particle_count]``.
+        edge_indices: 4-vertex bending stencil, shape ``[edge_count, 4]``.
+        edge_quad_q: Per-edge length-4 cotangent vector ``q``.
+        edge_weight: Per-edge bending stiffness ``w`` (already scaled by
+            ``3 / (A0 + A1)``).
+        edge_norm: Per-edge rest curvature magnitude ``‖q·x_rest‖``.
+        contributions: Output ``(edge_count, 4)`` per-local-vertex contribution.
+    """
+    e = wp.tid()
+    zero = wp.vec3(0.0, 0.0, 0.0)
+    w = edge_weight[e]
+    if w == 0.0:
+        contributions[e, 0] = zero
+        contributions[e, 1] = zero
+        contributions[e, 2] = zero
+        contributions[e, 3] = zero
+        return
+    norm_rest = edge_norm[e]
+    if norm_rest == 0.0:
+        contributions[e, 0] = zero
+        contributions[e, 1] = zero
+        contributions[e, 2] = zero
+        contributions[e, 3] = zero
+        return
+
+    q = edge_quad_q[e]
+    i0 = edge_indices[e, 0]
+    i1 = edge_indices[e, 1]
+    i2 = edge_indices[e, 2]
+    i3 = edge_indices[e, 3]
+
+    # Compute q^T * x_cur (a vec3 because positions are vec3).
+    qTxcur = positions[i0] * q[0] + positions[i1] * q[1] + positions[i2] * q[2] + positions[i3] * q[3]
+    norm_cur = wp.length(qTxcur)
+    if norm_cur < 1.0e-12:
+        contributions[e, 0] = zero
+        contributions[e, 1] = zero
+        contributions[e, 2] = zero
+        contributions[e, 3] = zero
+        return
+
+    # Target curvature: unit direction of q·x_cur, scaled to rest magnitude.
+    target = qTxcur * (norm_rest / norm_cur)
+
+    # Per-local-vertex contribution: w * q[a] * target.
+    contributions[e, 0] = w * q[0] * target
+    contributions[e, 1] = w * q[1] * target
+    contributions[e, 2] = w * q[2] * target
+    contributions[e, 3] = w * q[3] * target
+
+
+@wp.kernel
 def project_pin_kernel(
     pin_indices: wp.array[wp.int32],
     x_ref: wp.array[wp.vec3],  # full vec3 array indexed by particle index

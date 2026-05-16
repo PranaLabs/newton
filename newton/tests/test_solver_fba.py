@@ -4116,5 +4116,45 @@ class SolverFBATriDeterminismTests(unittest.TestCase):
         np.testing.assert_allclose(q1, q2, atol=1e-6, err_msg="tri NH scatter non-deterministic")
 
 
+class SolverFBABendingDeterminismTests(unittest.TestCase):
+    """Refactored bending scatter is bit-deterministic across reruns."""
+
+    def _run_once(self) -> np.ndarray:
+        import newton
+        from newton.solvers import SolverFBA
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=-9.81)
+        # Cloth with bending edges enabled.
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.2, -0.2, 0.5),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=5,
+            dim_y=5,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.05,
+            tri_ke=1.0e4,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-2,  # bending stiffness > 0
+            edge_kd=0.0,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=1, friction=False, stretching_model="arap")
+        s_in = model.state()
+        s_out = model.state()
+        for _ in range(3):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+        return s_in.particle_q.numpy().copy()
+
+    def test_two_runs_identical(self) -> None:
+        q1 = self._run_once()
+        q2 = self._run_once()
+        np.testing.assert_allclose(q1, q2, atol=1e-6, err_msg="bending scatter non-deterministic")
+
+
 if __name__ == "__main__":
     unittest.main()
