@@ -4,7 +4,36 @@ Live tracker for the Newton port of RealSim's "Fast But Accurate" projective-dyn
 
 - **Branch**: `ziqiu/fba-solver-design` on `PranaLabs/newton`
 - **Upstream target**: `newton-physics/newton` (eventual PR after feature parity)
-- **Last updated**: 2026-05-15
+- **Last updated**: 2026-05-17
+
+## 2026-05-17 — Phase 1 (PullingWooper) complete, full RealSim parity
+
+**Acceptance criteria** from `docs/superpowers/specs/2026-05-16-cudatests-full-reproduction-spec.md`:
+- ✓ Visual: wooper threading through 2 static cylinders, stable, finite
+- ✓ Tests: 83/83 FBA unit tests pass
+- ✓ Perf: `mean_ms ≤ RealSim baseline` (FBA 10.54 vs RealSim 24.08 = **0.44×**)
+
+**Commits this phase** (chronological, all on `ziqiu/fba-solver-design`):
+- `e5fd6589` Add RealSim baseline driver for one demo (Task B)
+- `29c7a329` Close tempfile leak and handle subprocess timeout (Task B fix)
+- `b5c4bed9` Run RealSim baselines and persist JSON (Task C)
+- `229987ef` Add shared FBA CudaTests bench utilities (Task D)
+- `87959d62` Make SolverFBA NSN iter count and lambda cap configurable (Task E)
+- `d28620ce` Add AABB pin-region selector (Task F)
+- `fc505b10` Add CudaTests PullingWooper demo for SolverFBA (Task G)
+- `3f1b2a89` Batch 3-axis solves in SolverFBA Schur build (Task I')
+- `ae48a198` Move SolverFBA lambda correction to Warp kernel and sync demo timing (Task J')
+- `b80366b2` Cache A^-1 J^T across PD outer iters in SolverFBA (Task L)
+- `c2792253` Lower SolverFBA default NSN iter to 1 (Task N)
+- `cfe3f11e` Match RealSim isometric bending scatter for non-flat rest (Task H')
+- `9fe262cb` Warm-start contact lambda across PD outer iters in SolverFBA (Task T')
+- `ff1a7b6e` Add isodof-restricted Schur build for SolverFBA (Task P)
+
+**Audit findings (Task Q)** confirmed Newton FBA matches RealSim on 13/21 components; 4 known-divergences are intentional (Newton stays correct: Corotational `.trace()`, Coulomb circular cone, FE mass lumping); 2 actionable divergences fixed in this phase (H' bending, T' λ warm-start); 1 marked for Phase 6 (multi-env).
+
+**Key insight**: isodof Schur was the dominant ~10× speedup. PD Hessian's COLAMD ordering breaks the naive symmetric-perm assumption — must use `perm` not `invperm` for `Wi[i,j] = (S^T D^-1 S)[perm[isodof_i], perm[isodof_j]]`.
+
+**Next phase**: P2 SqueezingBall (kinematic rolling cylinder + plane, NH ball_7k, Stage B friction).
 
 ## Status overview
 

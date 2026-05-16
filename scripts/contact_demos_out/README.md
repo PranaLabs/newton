@@ -126,3 +126,40 @@ uv run python scripts/fba_demo3_cloth_on_cylinder.py
 ```
 
 Output PNGs and perf tables land in `scripts/contact_demos_out/{demo1,demo2,demo3}/`.
+
+---
+
+## Demo 4 — PullingWooper (CudaTests reproduction)
+
+`scripts/fba_demo4_pulling_wooper.py`
+
+5325-particle tet wooper (Neo-Hookean, E=1e7, ν=0.3, mass=1000),
+500 frames at dt=0.01, single PULLING action (dir=-Y, vel=2 m/s,
+maxlength=10 m), 2 static cylinders (r=1, axis=+X, mu=0), gravity=0,
+5 PD outer iter × 1 NSN inner iter, isodof Schur build.
+
+| Solver        | mean ms | median ms | p95 ms | stable |
+|---------------|---:|---:|---:|:---:|
+| RealSim NSN_CUDA (baseline) | 24.08 | – | – | ✓ |
+| SolverFBA (isodof, nsn=1) | **10.54** | 7.58 | 24.21 | ✓ |
+| SolverFBA (isodof, nsn=10) | 21.28 | 18.43 | 50.95 | ✓ |
+
+Acceptance:
+- Visual: wooper threads through both cylinders, no penetration, no fragmentation
+- Stability: `stable=True`, `min_y=-8.410`, `pulled=10.00` at final frame
+- Perf: ms/step ≤ RealSim baseline ✓ (0.44× at nsn=1)
+
+### Performance journey
+
+| Stage | mean ms | What changed |
+|---|---:|---|
+| Initial (Task G) | 505 | Naive Schur build |
+| I' Batch 3-axis solves | 204 (sync) | One R=3M solve instead of 3 axis-loop solves |
+| J' λ correction → Warp | 438 | Host loop eliminated (was 53 ms/step) |
+| L Cache A⁻¹·Jᵀ + W | 100.5 | Build Schur once per step instead of 3.4× |
+| N NSN default 10 → 1 | 93 | Single Newton step matches RealSim parity |
+| H' Bending fix | 93 | Non-flat rest formula match (Wooper has no bending — no perf change) |
+| T' λ warm-start across PD outer | 92 | RealSim parity for contact convergence |
+| **P Isodof Schur** | **10.54** | Restrict A⁻¹ to (isodofs × isodofs) instead of dense R=3M |
+
+Snapshots: `demo4/pulling_wooper_strip.png` (6 frames spaced across the pull).
