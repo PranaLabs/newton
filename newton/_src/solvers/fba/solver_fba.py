@@ -234,6 +234,19 @@ class SolverFBA(SolverBase):
         # Phase 4 Stage A — contact state (0 = no contacts registered yet).
         self._contact_count: int = 0
 
+        # Task L: cache ``W`` and the device buffer of ``A⁻¹ · Jᵀ`` across
+        # PD outer iterations within a single ``step()`` call.  Both depend
+        # only on (J, A) which are constant within a step (J is set once
+        # by :meth:`update_contacts`, A is fixed unless dt or the model
+        # changes).  The cache is invalidated whenever either input could
+        # change: by :meth:`update_contacts` (J change) and by
+        # :meth:`notify_model_changed` / :meth:`_setup_pd_system` (A change).
+        self._cached_W: np.ndarray | None = None
+        # ``_A_inv_Jt_d`` itself lives on the :class:`FBALinearSolver` and
+        # is reused by :meth:`_apply_lambda_correction*`; we only need to
+        # track whether that buffer is fresh for the current step.
+        self._cached_A_inv_Jt_valid: bool = False
+
         # Per-element device data (filled by _setup_pd_system).
         self._tri_indices_d = None
         self._tri_rest_inv_d = None
@@ -261,6 +274,8 @@ class SolverFBA(SolverBase):
         self._linear_solver = FBALinearSolver(fs, device=self._device)
         self._meta = meta
         self._dt_setup = dt
+        # A changed → any cached W / A^{-1} J^T is stale.
+        self._invalidate_schur_cache()
 
         device = self._device
         self._tri_indices_d = wp.array(
@@ -367,6 +382,7 @@ class SolverFBA(SolverBase):
         # Reset contact count when contacts=None so the path stays disabled.
         if contacts is None:
             self._contact_count = 0
+            self._invalidate_schur_cache()
 
         has_contacts = self._contact_count > 0
 
@@ -528,14 +544,20 @@ class SolverFBA(SolverBase):
 
                 if self.friction and hasattr(self, "_contact_tangent1_d"):
                     # Stage B: 3M Schur complement with Coulomb cone projection.
-                    W = ls.build_schur_complement(
-                        M,
-                        self._contact_particle_d,
-                        self._contact_normal_d,
-                        self._contact_alpha_d,
-                        self._contact_tangent1_d,
-                        self._contact_tangent2_d,
-                    )
+                    # Task L: reuse cached W and ls._A_inv_Jt_d across PD outer
+                    # iters — both depend only on (J, A), which are fixed
+                    # within a step.
+                    if self._cached_W is None or not self._cached_A_inv_Jt_valid:
+                        self._cached_W = ls.build_schur_complement(
+                            M,
+                            self._contact_particle_d,
+                            self._contact_normal_d,
+                            self._contact_alpha_d,
+                            self._contact_tangent1_d,
+                            self._contact_tangent2_d,
+                        )
+                        self._cached_A_inv_Jt_valid = True
+                    W = self._cached_W
                     x_unc_np = self._x_cur.numpy()  # (N, 3) float32
                     r = self._compute_contact_residual_friction(x_unc_np)
                     lam = self._solve_nsn_coulomb(W, r, self._contact_mu_h[:M], max_iters=self.nsn_iterations)
@@ -550,12 +572,15 @@ class SolverFBA(SolverBase):
                         )
                 else:
                     # Stage A: M Schur complement, unilateral (λ ≥ 0) only.
-                    W = ls.build_schur_complement(
-                        M,
-                        self._contact_particle_d,
-                        self._contact_normal_d,
-                        self._contact_alpha_d,
-                    )
+                    if self._cached_W is None or not self._cached_A_inv_Jt_valid:
+                        self._cached_W = ls.build_schur_complement(
+                            M,
+                            self._contact_particle_d,
+                            self._contact_normal_d,
+                            self._contact_alpha_d,
+                        )
+                        self._cached_A_inv_Jt_valid = True
+                    W = self._cached_W
                     x_unc_np = self._x_cur.numpy()  # (N, 3) float32
                     r = self._compute_contact_residual(x_unc_np)
                     lam = self._solve_nsn_unilateral(W, r, max_iters=self.nsn_iterations)
@@ -603,6 +628,18 @@ class SolverFBA(SolverBase):
         if flags & (SolverNotifyFlags.SHAPE_PROPERTIES | SolverNotifyFlags.BODY_INERTIAL_PROPERTIES):
             self._linear_solver = None
             self._dt_setup = None
+            self._invalidate_schur_cache()
+
+    def _invalidate_schur_cache(self) -> None:
+        """Drop the per-step ``W`` / ``A⁻¹·Jᵀ`` cache.
+
+        Called whenever either input (``J`` from
+        :meth:`update_contacts` or the Cholesky factor of ``A`` from
+        :meth:`_setup_pd_system` / :meth:`notify_model_changed`) might
+        change so the next :meth:`step` rebuilds the Schur complement.
+        """
+        self._cached_W = None
+        self._cached_A_inv_Jt_valid = False
 
     # ------------------------------------------------------------------
     # Phase 4 Stage A — contact state (allocated lazily on first call).
@@ -647,6 +684,10 @@ class SolverFBA(SolverBase):
             state: Optional current :class:`~newton.State`; unused in Stage A
                 (penetration offset derived purely from the contact anchor).
         """
+        # Contact data is about to change → drop the Schur cache so the
+        # next ``step()`` rebuilds ``W`` / ``A⁻¹·Jᵀ`` with fresh J.
+        self._invalidate_schur_cache()
+
         M_raw = int(contacts.soft_contact_count.numpy()[0])
         if M_raw == 0:
             self._contact_count = 0
