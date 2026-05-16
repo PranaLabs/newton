@@ -207,10 +207,11 @@ class SolverFBA(SolverBase):
                 Each listed shape rotates about its local +Z axis (Newton's
                 cylinder primitive axis) at the given angular speed.  Surfaces
                 with nonzero ω contribute a tangential anchor velocity
-                ``v_anchor = ω · axis_world × (world_anchor − shape_center)``
+                ``v_anchor = −ω · axis_world × (world_anchor − shape_center)``
                 into the Stage B friction residual; the shape geometry itself
-                stays static.  Defaults to no kinematic motion.  Mirrors
-                RealSim's ``cylindercollisions[i].rollingvel``.
+                stays static.  Sign matches RealSim CudaTests'
+                ``cylindercollisions[i].rollingvel`` (tangent direction
+                ``normal × axis``).  Defaults to no kinematic motion.
         """
         super().__init__(model)
 
@@ -938,7 +939,12 @@ class SolverFBA(SolverBase):
                     axis_world = _quat_rotate_z_axis(shape_q)
                     r_local = world_anchor - shape_p
                     omega = float(self._shape_omega_h[s_idx])
-                    v_anchor_h[c] = omega * np.cross(axis_world, r_local)
+                    # RealSim sign convention: tangent = normal × axis (see
+                    # CudaTests CylinderCollision.cpp), so the anchor velocity
+                    # along that tangent is +radius·ω.  Newton's cross is
+                    # ``axis × r_radial`` = ``-radius (normal × axis)``, hence
+                    # the leading minus sign here.
+                    v_anchor_h[c] = -omega * np.cross(axis_world, r_local)
 
             self._contact_tangent1_d.assign(t1_h)
             self._contact_tangent2_d.assign(t2_h)
