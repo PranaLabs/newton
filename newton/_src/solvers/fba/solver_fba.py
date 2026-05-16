@@ -905,7 +905,51 @@ class SolverFBA(SolverBase):
             v_anchor_h = np.zeros((M, 3), dtype=np.float64)
 
             for c in range(M):
-                t1, t2 = compute_tangent_basis(normal_h[c])
+                s_idx = int(shape_h[c])
+                # Determine whether this contact is on a spinning cylinder
+                # shape; if so, we use a structured cylinder-aligned tangent
+                # basis (RealSim parity) instead of the arbitrary basis from
+                # ``compute_tangent_basis``.  This prevents the t1/t2 Schur
+                # off-diagonal coupling from over-correcting v_anchor and
+                # pumping energy into the body (see SqueezingBall diagnosis).
+                is_spinning_shape = (
+                    s_idx >= 0
+                    and s_idx < self._shape_omega_h.shape[0]
+                    and self._shape_omega_h[s_idx] != 0.0
+                    and shape_transform_np is not None
+                )
+
+                # Precompute axis_world once if the shape has a transform —
+                # used by both the cylinder-aligned basis and v_anchor below.
+                axis_world = None
+                shape_p = None
+                if is_spinning_shape:
+                    xf = shape_transform_np[s_idx]
+                    shape_p = np.asarray(xf[:3], dtype=np.float64)
+                    shape_q = np.asarray(xf[3:], dtype=np.float64)
+                    axis_world = _quat_rotate_z_axis(shape_q)
+
+                # Pick tangent basis.
+                if is_spinning_shape:
+                    n_arr = np.asarray(normal_h[c], dtype=np.float64)
+                    # t1 = normalize(normal × axis) — rolling direction.
+                    t1_vec = np.cross(n_arr, axis_world)
+                    n1 = float(np.linalg.norm(t1_vec))
+                    if n1 < 1e-9:
+                        # Degenerate: normal parallel to axis (e.g. cap face).
+                        # Fall back to arbitrary basis.
+                        t1, t2 = compute_tangent_basis(normal_h[c])
+                    else:
+                        t1 = t1_vec / n1
+                        # t2 lies along the cylinder axis projected onto the
+                        # tangent plane; ``normal × t1`` produces an axis-
+                        # aligned vector with a determined sign.
+                        t2_raw = np.cross(n_arr, t1)
+                        n2 = float(np.linalg.norm(t2_raw))
+                        t2 = t2_raw / max(n2, 1e-30)
+                else:
+                    t1, t2 = compute_tangent_basis(normal_h[c])
+
                 t1_h[c] = t1.astype(np.float32)
                 t2_h[c] = t2.astype(np.float32)
                 # world_anchor for this contact (already in world frame).
@@ -913,7 +957,6 @@ class SolverFBA(SolverBase):
                 # we project body_pos through the body transform (already done
                 # in offset_h construction loop above; reuse body_pos_h).
                 # We recompute world_anchor here consistently with offset_h.
-                s_idx = int(shape_h[c])
                 bpos = body_pos_h[c]
                 world_anchor = bpos.copy()
                 if shape_body_np is not None and s_idx >= 0:
@@ -927,16 +970,7 @@ class SolverFBA(SolverBase):
                 tangent2_offset_h[c] = float(np.dot(t2, world_anchor))
 
                 # Kinematic anchor velocity for spinning shapes.
-                if (
-                    s_idx >= 0
-                    and s_idx < self._shape_omega_h.shape[0]
-                    and self._shape_omega_h[s_idx] != 0.0
-                    and shape_transform_np is not None
-                ):
-                    xf = shape_transform_np[s_idx]
-                    shape_p = np.asarray(xf[:3], dtype=np.float64)
-                    shape_q = np.asarray(xf[3:], dtype=np.float64)
-                    axis_world = _quat_rotate_z_axis(shape_q)
+                if is_spinning_shape:
                     r_local = world_anchor - shape_p
                     omega = float(self._shape_omega_h[s_idx])
                     # RealSim sign convention: tangent = normal × axis (see

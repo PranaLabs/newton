@@ -3851,6 +3851,48 @@ class SolverFBAKinematicCylinderTests(unittest.TestCase):
             "Expected ω ≠ 0 to produce nonzero v_anchor."
         )
 
+    def test_cylinder_aligned_basis_for_spinning_shape(self) -> None:
+        """For shapes with ω≠0, tangent basis is (normal × axis, normalize(normal × t1)).
+
+        Verifies (i) v_anchor lies almost entirely along t1, (ii) projection onto
+        t2 ≈ 0 (the axial direction carries no anchor shift, matching RealSim).
+        """
+        from newton.solvers import SolverFBA
+
+        model, pipeline, contacts = self._ball_and_cylinder()
+        s_in = model.state()
+        s_out = model.state()
+        solver_spin = SolverFBA(
+            model,
+            friction=True,
+            mu_per_pair_override=np.full(model.particle_count, 0.5),
+            shape_angular_velocity={0: -3.0},
+        )
+        for _ in range(20):
+            s_in.clear_forces()
+            pipeline.collide(s_in, contacts)
+            solver_spin.step(s_in, s_out, None, contacts, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+            if solver_spin._contact_count > 0:
+                break
+        self.assertGreater(solver_spin._contact_count, 0)
+
+        M = solver_spin._contact_count
+        v = solver_spin._contact_v_anchor_h[:M]
+        t1 = solver_spin._contact_tangent1_d.numpy()[:M].astype(np.float64)
+        t2 = solver_spin._contact_tangent2_d.numpy()[:M].astype(np.float64)
+        proj_t1 = np.einsum("ij,ij->i", t1, v)
+        proj_t2 = np.einsum("ij,ij->i", t2, v)
+        # RealSim parity: v_anchor projection onto axial t2 must be ≈ 0.
+        # Allow small slack for numerical SVD / float32 round-trip on tangent arrays.
+        self.assertLess(float(np.max(np.abs(proj_t2))), 1e-4)
+        # And t1 must carry most of the v_anchor norm.
+        v_norm = np.linalg.norm(v, axis=1)
+        self.assertGreater(
+            float(np.min(np.abs(proj_t1) / np.maximum(v_norm, 1e-12))), 0.95,
+            "v_anchor should lie almost entirely along the rolling tangent t1."
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
