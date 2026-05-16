@@ -156,7 +156,28 @@ class SolverFBA(SolverBase):
         lam: float | None = None,
         friction: bool = True,
         mu_per_pair_override: np.ndarray | None = None,
+        nsn_iterations: int = 10,
+        lambda_cap: float | None = None,
     ) -> None:
+        """
+        Args:
+            model: The :class:`~newton.Model` containing cloth/tet attributes to integrate.
+            iterations: Number of PD local-global iterations per step.
+            pin_stiffness: Soft-pin stiffness [N/m].
+            stretching_model: Stretching model — ``"arap"``, ``"corotational"``, or ``"neohookean"``.
+            mu: First Lamé parameter [Pa]; required for ``"corotational"``/``"neohookean"``.
+            lam: Second Lamé parameter [Pa]; required for ``"corotational"``/``"neohookean"``.
+            friction: If ``True`` (default) use Stage B Coulomb friction NSN solver;
+                otherwise use Stage A unilateral NSN.
+            mu_per_pair_override: Optional ``(num_pairs,)`` array of friction
+                coefficients overriding ``model.shape_material_mu`` lookups.
+            nsn_iterations: Maximum projected Gauss-Seidel iterations for the
+                contact NSN solver per PD step. Matches RealSim's per-scene
+                ``constraintsolver.iterations`` setting.
+            lambda_cap: Optional per-step clamp ``|λ| <= lambda_cap`` applied
+                to contact impulses after the NSN solve. ``None`` disables
+                clamping; mirrors RealSim's ``constraintsolver.maxforce``.
+        """
         super().__init__(model)
 
         # ---- Validate ----
@@ -192,6 +213,8 @@ class SolverFBA(SolverBase):
         self._mu_per_pair_override = (
             np.asarray(mu_per_pair_override, dtype=np.float64) if mu_per_pair_override is not None else None
         )
+        self.nsn_iterations = int(nsn_iterations)
+        self.lambda_cap = lambda_cap
 
         # PD setup is dt-dependent; we cache the assembly at a reference dt and
         # rebuild lazily inside `step` if the dt changes.
@@ -515,7 +538,7 @@ class SolverFBA(SolverBase):
                     )
                     x_unc_np = self._x_cur.numpy()  # (N, 3) float32
                     r = self._compute_contact_residual_friction(x_unc_np)
-                    lam = self._solve_nsn_coulomb(W, r, self._contact_mu_h[:M], max_iters=20)
+                    lam = self._solve_nsn_coulomb(W, r, self._contact_mu_h[:M], max_iters=self.nsn_iterations)
                     if np.any(np.abs(lam) > 1e-15):
                         correction = self._apply_lambda_correction_friction(lam)
                         wp.launch(
@@ -535,7 +558,7 @@ class SolverFBA(SolverBase):
                     )
                     x_unc_np = self._x_cur.numpy()  # (N, 3) float32
                     r = self._compute_contact_residual(x_unc_np)
-                    lam = self._solve_nsn_unilateral(W, r, max_iters=20)
+                    lam = self._solve_nsn_unilateral(W, r, max_iters=self.nsn_iterations)
                     if np.any(lam > 1e-15):
                         correction = self._apply_lambda_correction(lam)
                         wp.launch(
@@ -848,6 +871,8 @@ class SolverFBA(SolverBase):
                 lam[c] = max(0.0, (r[c] - off_diag) / W[c, c])
             if np.linalg.norm(lam - lam_old, np.inf) < 1e-8:
                 break
+        if self.lambda_cap is not None:
+            np.clip(lam, -self.lambda_cap, self.lambda_cap, out=lam)
         return lam
 
     def _solve_nsn_coulomb(self, W: np.ndarray, r: np.ndarray, mu: np.ndarray, max_iters: int = 20) -> np.ndarray:
@@ -908,6 +933,8 @@ class SolverFBA(SolverBase):
                 lam[3 * c + 2] = v_proj[1]
             if np.linalg.norm(lam - lam_old, np.inf) < 1e-8:
                 break
+        if self.lambda_cap is not None:
+            np.clip(lam, -self.lambda_cap, self.lambda_cap, out=lam)
         return lam
 
     def _apply_lambda_correction_friction(self, lam: np.ndarray) -> wp.array:

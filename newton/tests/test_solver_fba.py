@@ -3399,5 +3399,46 @@ class TestPhase4StageCShapePrimitives(unittest.TestCase):
         )
 
 
+class SolverFBAConstructorOptionsTests(unittest.TestCase):
+    """Constructor exposes NSN iter count and lambda cap."""
+
+    def _tiny_cloth_model(self):
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=-9.81)
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.1, -0.1, 0.2),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=3,
+            dim_y=3,
+            cell_x=0.05,
+            cell_y=0.05,
+            mass=0.05,
+            tri_ke=1.0e4,
+            tri_ka=0.0,
+            tri_kd=0.0,
+        )
+        return builder.finalize()
+
+    def test_default_nsn_iter_is_10(self) -> None:
+        model = self._tiny_cloth_model()
+        solver = SolverFBA(model)
+        self.assertEqual(solver.nsn_iterations, 10)
+
+    def test_nsn_iter_overridable(self) -> None:
+        model = self._tiny_cloth_model()
+        solver = SolverFBA(model, nsn_iterations=25)
+        self.assertEqual(solver.nsn_iterations, 25)
+
+    def test_lambda_cap_default_is_none(self) -> None:
+        model = self._tiny_cloth_model()
+        solver = SolverFBA(model)
+        self.assertIsNone(solver.lambda_cap)
+
+    def test_lambda_cap_settable(self) -> None:
+        model = self._tiny_cloth_model()
+        solver = SolverFBA(model, lambda_cap=100.0)
+        self.assertEqual(solver.lambda_cap, 100.0)
+
+
 if __name__ == "__main__":
     unittest.main()
