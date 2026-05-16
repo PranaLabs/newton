@@ -314,7 +314,10 @@ class SolverFBA(SolverBase):
         self._tet_weight_d = None
         # Per-(tet, local vertex) scratch for deterministic (compute → gather)
         # PD scatter; allocated in _setup_pd_system, reused per step.
-        self._tet_contrib_d = None
+        self._tet_contrib_d: wp.array | None = None
+        # Per-(tri, local vertex) scratch for deterministic (compute → gather)
+        # PD cloth-stretching scatter; allocated in _setup_pd_system, reused per step.
+        self._tri_contrib_d: wp.array | None = None
 
         # Particle-centered CSR adjacency for deterministic PD reductions (Task P2-D-A).
         # Lets the PD scatter use (compute → gather) instead of atomic_add.
@@ -450,10 +453,19 @@ class SolverFBA(SolverBase):
             self._particle_tri_offsets_d = wp.array(offs, dtype=wp.int32, device=device)
             self._particle_tri_element_d = wp.array(elem_idx, dtype=wp.int32, device=device)
             self._particle_tri_local_d = wp.array(local_v, dtype=wp.int32, device=device)
+            # Per-(tri, local vertex) scratch buffer for deterministic
+            # (compute → gather) PD reduction. Reused across energies
+            # (only one stretching_model is active per step).
+            self._tri_contrib_d = wp.zeros(
+                shape=(int(tri_indices_np.shape[0]), 3),
+                dtype=wp.vec3,
+                device=device,
+            )
         else:
             self._particle_tri_offsets_d = None
             self._particle_tri_element_d = None
             self._particle_tri_local_d = None
+            self._tri_contrib_d = None
 
         if edge_indices_np is not None and edge_indices_np.size > 0:
             offs, elem_idx, local_v = build_particle_element_csr(edge_indices_np, n_p, 4)
@@ -493,11 +505,11 @@ class SolverFBA(SolverBase):
             gather_per_particle_kernel,
             project_bending_kernel,
             project_pin_kernel,
-            project_stretching_arap_kernel,
+            project_stretching_arap_compute_kernel,
             project_stretching_arap_tet_compute_kernel,
-            project_stretching_corotational_kernel,
+            project_stretching_corotational_compute_kernel,
             project_stretching_corotational_tet_compute_kernel,
-            project_stretching_neohookean_kernel,
+            project_stretching_neohookean_compute_kernel,
             project_stretching_neohookean_tet_compute_kernel,
             write_velocity_kernel,
             zero_vec3_kernel,
@@ -589,50 +601,87 @@ class SolverFBA(SolverBase):
                     outputs=[self._rhs],
                     device=device,
                 )
-            # Stretching projection.
-            if self.stretching_model == "arap":
-                wp.launch(
-                    project_stretching_arap_kernel,
-                    dim=model.tri_count,
-                    inputs=[
-                        self._x_cur,
-                        self._tri_indices_d,
-                        self._tri_rest_inv_d,
-                        self._tri_weight_d,
-                    ],
-                    outputs=[self._rhs],
-                    device=device,
-                )
-            elif self.stretching_model == "corotational":
-                wp.launch(
-                    project_stretching_corotational_kernel,
-                    dim=model.tri_count,
-                    inputs=[
-                        self._x_cur,
-                        self._tri_indices_d,
-                        self._tri_rest_inv_d,
-                        self._tri_weight_d,
-                        self._mu,
-                        self._lam,
-                    ],
-                    outputs=[self._rhs],
-                    device=device,
-                )
-            elif self.stretching_model == "neohookean":
-                wp.launch(
-                    project_stretching_neohookean_kernel,
-                    dim=model.tri_count,
-                    inputs=[
-                        self._x_cur,
-                        self._tri_indices_d,
-                        self._tri_rest_inv_d,
-                        self._tri_weight_d,
-                        self._mu,
-                        self._lam,
-                    ],
-                    outputs=[self._rhs],
-                    device=device,
-                )
+            # Tri (cloth) stretching projection — deterministic compute+gather.
+            if self._tri_indices_d is not None and model.tri_count > 0:
+                if self.stretching_model == "arap":
+                    wp.launch(
+                        project_stretching_arap_compute_kernel,
+                        dim=model.tri_count,
+                        inputs=[
+                            self._x_cur,
+                            self._tri_indices_d,
+                            self._tri_rest_inv_d,
+                            self._tri_weight_d,
+                        ],
+                        outputs=[self._tri_contrib_d],
+                        device=device,
+                    )
+                    wp.launch(
+                        gather_per_particle_kernel,
+                        dim=N,
+                        inputs=[
+                            self._tri_contrib_d,
+                            self._particle_tri_offsets_d,
+                            self._particle_tri_element_d,
+                            self._particle_tri_local_d,
+                        ],
+                        outputs=[self._rhs],
+                        device=device,
+                    )
+                elif self.stretching_model == "corotational":
+                    wp.launch(
+                        project_stretching_corotational_compute_kernel,
+                        dim=model.tri_count,
+                        inputs=[
+                            self._x_cur,
+                            self._tri_indices_d,
+                            self._tri_rest_inv_d,
+                            self._tri_weight_d,
+                            self._mu,
+                            self._lam,
+                        ],
+                        outputs=[self._tri_contrib_d],
+                        device=device,
+                    )
+                    wp.launch(
+                        gather_per_particle_kernel,
+                        dim=N,
+                        inputs=[
+                            self._tri_contrib_d,
+                            self._particle_tri_offsets_d,
+                            self._particle_tri_element_d,
+                            self._particle_tri_local_d,
+                        ],
+                        outputs=[self._rhs],
+                        device=device,
+                    )
+                elif self.stretching_model == "neohookean":
+                    wp.launch(
+                        project_stretching_neohookean_compute_kernel,
+                        dim=model.tri_count,
+                        inputs=[
+                            self._x_cur,
+                            self._tri_indices_d,
+                            self._tri_rest_inv_d,
+                            self._tri_weight_d,
+                            self._mu,
+                            self._lam,
+                        ],
+                        outputs=[self._tri_contrib_d],
+                        device=device,
+                    )
+                    wp.launch(
+                        gather_per_particle_kernel,
+                        dim=N,
+                        inputs=[
+                            self._tri_contrib_d,
+                            self._particle_tri_offsets_d,
+                            self._particle_tri_element_d,
+                            self._particle_tri_local_d,
+                        ],
+                        outputs=[self._rhs],
+                        device=device,
+                    )
             # Bending projection.
             if self._edge_indices_d is not None:
                 wp.launch(

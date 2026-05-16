@@ -976,6 +976,77 @@ def project_stretching_arap_kernel(
     wp.atomic_add(rhs, i2, row1)
 
 
+@wp.kernel
+def project_stretching_arap_compute_kernel(
+    positions: wp.array[wp.vec3],
+    tri_indices: wp.array[wp.int32],  # flat shape (3*T,)
+    tri_rest_inv: wp.array[wp.mat22],
+    tri_weight: wp.array[wp.float32],
+    # output (per-tri, per-local-vertex contributions)
+    contributions: wp.array2d[wp.vec3],  # (T, 3)
+):
+    """Compute per-tri ARAP contribution to each of its 3 local vertices.
+
+    Same math as :func:`project_stretching_arap_kernel` but writes to a
+    pre-allocated ``(T, 3)`` scratch buffer instead of atomic-adding into rhs.
+    Pair with :func:`gather_per_particle_kernel` for the deterministic
+    reduction.
+
+    Args:
+        positions: Current particle positions [m], shape ``[particle_count]``.
+        tri_indices: Flat triangle indices, shape ``[3 * tri_count]``.
+        tri_rest_inv: Per-triangle 2x2 rest-pose inverse (``Dm_inv``).
+        tri_weight: Per-triangle stretching weight (``ke * area``).
+        contributions: Output ``(tri_count, 3)`` per-local-vertex contribution.
+    """
+    t = wp.tid()
+    i0 = tri_indices[3 * t + 0]
+    i1 = tri_indices[3 * t + 1]
+    i2 = tri_indices[3 * t + 2]
+
+    p0 = positions[i0]
+    p1 = positions[i1]
+    p2 = positions[i2]
+
+    Ds_col0 = p1 - p0
+    Ds_col1 = p2 - p0
+    Ds = mat32(
+        Ds_col0[0],
+        Ds_col1[0],
+        Ds_col0[1],
+        Ds_col1[1],
+        Ds_col0[2],
+        Ds_col1[2],
+    )
+    Dm_inv = tri_rest_inv[t]
+    F = Ds * Dm_inv
+
+    P = svd_3x2(F)
+
+    w = tri_weight[t]
+    PT00 = P[0, 0]
+    PT01 = P[1, 0]
+    PT02 = P[2, 0]
+    PT10 = P[0, 1]
+    PT11 = P[1, 1]
+    PT12 = P[2, 1]
+
+    row0 = wp.vec3(
+        w * (Dm_inv[0, 0] * PT00 + Dm_inv[0, 1] * PT10),
+        w * (Dm_inv[0, 0] * PT01 + Dm_inv[0, 1] * PT11),
+        w * (Dm_inv[0, 0] * PT02 + Dm_inv[0, 1] * PT12),
+    )
+    row1 = wp.vec3(
+        w * (Dm_inv[1, 0] * PT00 + Dm_inv[1, 1] * PT10),
+        w * (Dm_inv[1, 0] * PT01 + Dm_inv[1, 1] * PT11),
+        w * (Dm_inv[1, 0] * PT02 + Dm_inv[1, 1] * PT12),
+    )
+
+    contributions[t, 0] = -(row0 + row1)
+    contributions[t, 1] = row0
+    contributions[t, 2] = row1
+
+
 @wp.func
 def project_corotational_sigma(sigma_sq: wp.vec2, mu: float, lam: float) -> wp.vec2:
     """Closed-form 2D corotational local projection on singular values.
@@ -1129,6 +1200,104 @@ def project_stretching_corotational_kernel(
     wp.atomic_add(rhs, i0, -(row0 + row1))
     wp.atomic_add(rhs, i1, row0)
     wp.atomic_add(rhs, i2, row1)
+
+
+@wp.kernel
+def project_stretching_corotational_compute_kernel(
+    positions: wp.array[wp.vec3],
+    tri_indices: wp.array[wp.int32],  # flat shape (3*T,)
+    tri_rest_inv: wp.array[wp.mat22],
+    tri_weight: wp.array[wp.float32],
+    mu: float,
+    lam: float,
+    # output (per-tri, per-local-vertex contributions)
+    contributions: wp.array2d[wp.vec3],  # (T, 3)
+):
+    """Compute per-tri corotational contribution to each of its 3 local vertices.
+
+    Same math as :func:`project_stretching_corotational_kernel` but writes to a
+    pre-allocated ``(T, 3)`` scratch buffer instead of atomic-adding into rhs.
+    Pair with :func:`gather_per_particle_kernel` for the deterministic
+    reduction.
+
+    Args:
+        positions: Current particle positions [m], shape ``[particle_count]``.
+        tri_indices: Flat triangle indices, shape ``[3 * tri_count]``.
+        tri_rest_inv: Per-triangle 2x2 rest-pose inverse (``Dm_inv``).
+        tri_weight: Per-triangle stretching weight (``ke * area``).
+        mu: First Lame parameter [Pa].
+        lam: Second Lame parameter [Pa].
+        contributions: Output ``(tri_count, 3)`` per-local-vertex contribution.
+    """
+    t = wp.tid()
+    i0 = tri_indices[3 * t + 0]
+    i1 = tri_indices[3 * t + 1]
+    i2 = tri_indices[3 * t + 2]
+
+    p0 = positions[i0]
+    p1 = positions[i1]
+    p2 = positions[i2]
+
+    Ds_col0 = p1 - p0
+    Ds_col1 = p2 - p0
+    Ds = mat32(
+        Ds_col0[0],
+        Ds_col1[0],
+        Ds_col0[1],
+        Ds_col1[1],
+        Ds_col0[2],
+        Ds_col1[2],
+    )
+    Dm_inv = tri_rest_inv[t]
+    F = Ds * Dm_inv
+
+    FtF = wp.transpose(F) * F
+    _U2, sigma_sq, V2 = wp.svd2(FtF)
+
+    s0_real = wp.sqrt(wp.max(sigma_sq[0], 1.0e-20))
+    s1_real = wp.sqrt(wp.max(sigma_sq[1], 1.0e-20))
+
+    v0 = wp.vec2(V2[0, 0], V2[1, 0])
+    v1 = wp.vec2(V2[0, 1], V2[1, 1])
+    u0 = (F * v0) / s0_real
+    u1 = (F * v1) / s1_real
+
+    sigma_proj = project_corotational_sigma(sigma_sq, mu, lam)
+
+    p_col0 = u0 * (sigma_proj[0] * V2[0, 0]) + u1 * (sigma_proj[1] * V2[0, 1])
+    p_col1 = u0 * (sigma_proj[0] * V2[1, 0]) + u1 * (sigma_proj[1] * V2[1, 1])
+
+    P = mat32(
+        p_col0[0],
+        p_col1[0],
+        p_col0[1],
+        p_col1[1],
+        p_col0[2],
+        p_col1[2],
+    )
+
+    w = tri_weight[t]
+    PT00 = P[0, 0]
+    PT01 = P[1, 0]
+    PT02 = P[2, 0]
+    PT10 = P[0, 1]
+    PT11 = P[1, 1]
+    PT12 = P[2, 1]
+
+    row0 = wp.vec3(
+        w * (Dm_inv[0, 0] * PT00 + Dm_inv[0, 1] * PT10),
+        w * (Dm_inv[0, 0] * PT01 + Dm_inv[0, 1] * PT11),
+        w * (Dm_inv[0, 0] * PT02 + Dm_inv[0, 1] * PT12),
+    )
+    row1 = wp.vec3(
+        w * (Dm_inv[1, 0] * PT00 + Dm_inv[1, 1] * PT10),
+        w * (Dm_inv[1, 0] * PT01 + Dm_inv[1, 1] * PT11),
+        w * (Dm_inv[1, 0] * PT02 + Dm_inv[1, 1] * PT12),
+    )
+
+    contributions[t, 0] = -(row0 + row1)
+    contributions[t, 1] = row0
+    contributions[t, 2] = row1
 
 
 @wp.func
@@ -1292,6 +1461,104 @@ def project_stretching_neohookean_kernel(
     wp.atomic_add(rhs, i0, -(row0 + row1))
     wp.atomic_add(rhs, i1, row0)
     wp.atomic_add(rhs, i2, row1)
+
+
+@wp.kernel
+def project_stretching_neohookean_compute_kernel(
+    positions: wp.array[wp.vec3],
+    tri_indices: wp.array[wp.int32],  # flat shape (3*T,)
+    tri_rest_inv: wp.array[wp.mat22],
+    tri_weight: wp.array[wp.float32],
+    mu: float,
+    lam: float,
+    # output (per-tri, per-local-vertex contributions)
+    contributions: wp.array2d[wp.vec3],  # (T, 3)
+):
+    """Compute per-tri Neo-Hookean contribution to each of its 3 local vertices.
+
+    Same math as :func:`project_stretching_neohookean_kernel` but writes to a
+    pre-allocated ``(T, 3)`` scratch buffer instead of atomic-adding into rhs.
+    Pair with :func:`gather_per_particle_kernel` for the deterministic
+    reduction.
+
+    Args:
+        positions: Current particle positions [m], shape ``[particle_count]``.
+        tri_indices: Flat triangle indices, shape ``[3 * tri_count]``.
+        tri_rest_inv: Per-triangle 2x2 rest-pose inverse (``Dm_inv``).
+        tri_weight: Per-triangle stretching weight (``ke * area``).
+        mu: First Lame parameter [Pa].
+        lam: Second Lame parameter [Pa].
+        contributions: Output ``(tri_count, 3)`` per-local-vertex contribution.
+    """
+    t = wp.tid()
+    i0 = tri_indices[3 * t + 0]
+    i1 = tri_indices[3 * t + 1]
+    i2 = tri_indices[3 * t + 2]
+
+    p0 = positions[i0]
+    p1 = positions[i1]
+    p2 = positions[i2]
+
+    Ds_col0 = p1 - p0
+    Ds_col1 = p2 - p0
+    Ds = mat32(
+        Ds_col0[0],
+        Ds_col1[0],
+        Ds_col0[1],
+        Ds_col1[1],
+        Ds_col0[2],
+        Ds_col1[2],
+    )
+    Dm_inv = tri_rest_inv[t]
+    F = Ds * Dm_inv
+
+    FtF = wp.transpose(F) * F
+    _U2, sigma_sq, V2 = wp.svd2(FtF)
+
+    s0_real = wp.sqrt(wp.max(sigma_sq[0], 1.0e-20))
+    s1_real = wp.sqrt(wp.max(sigma_sq[1], 1.0e-20))
+
+    v0 = wp.vec2(V2[0, 0], V2[1, 0])
+    v1 = wp.vec2(V2[0, 1], V2[1, 1])
+    u0 = (F * v0) / s0_real
+    u1 = (F * v1) / s1_real
+
+    sigma_proj = project_neohookean_sigma(sigma_sq, mu, lam)
+
+    p_col0 = u0 * (sigma_proj[0] * V2[0, 0]) + u1 * (sigma_proj[1] * V2[0, 1])
+    p_col1 = u0 * (sigma_proj[0] * V2[1, 0]) + u1 * (sigma_proj[1] * V2[1, 1])
+
+    P = mat32(
+        p_col0[0],
+        p_col1[0],
+        p_col0[1],
+        p_col1[1],
+        p_col0[2],
+        p_col1[2],
+    )
+
+    w = tri_weight[t]
+    PT00 = P[0, 0]
+    PT01 = P[1, 0]
+    PT02 = P[2, 0]
+    PT10 = P[0, 1]
+    PT11 = P[1, 1]
+    PT12 = P[2, 1]
+
+    row0 = wp.vec3(
+        w * (Dm_inv[0, 0] * PT00 + Dm_inv[0, 1] * PT10),
+        w * (Dm_inv[0, 0] * PT01 + Dm_inv[0, 1] * PT11),
+        w * (Dm_inv[0, 0] * PT02 + Dm_inv[0, 1] * PT12),
+    )
+    row1 = wp.vec3(
+        w * (Dm_inv[1, 0] * PT00 + Dm_inv[1, 1] * PT10),
+        w * (Dm_inv[1, 0] * PT01 + Dm_inv[1, 1] * PT11),
+        w * (Dm_inv[1, 0] * PT02 + Dm_inv[1, 1] * PT12),
+    )
+
+    contributions[t, 0] = -(row0 + row1)
+    contributions[t, 1] = row0
+    contributions[t, 2] = row1
 
 
 @wp.kernel

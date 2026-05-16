@@ -4065,5 +4065,56 @@ class SolverFBATetNHDeterminismTests(unittest.TestCase):
         np.testing.assert_allclose(q1, q2, atol=1e-6, err_msg="tet NH scatter produced non-deterministic output")
 
 
+class SolverFBATriDeterminismTests(unittest.TestCase):
+    """Refactored tri stretching scatters are bit-deterministic across reruns."""
+
+    def _run_once(self, stretching_model: str, mu_val: float = 0.0, lam_val: float = 0.0) -> np.ndarray:
+        import newton
+        from newton.solvers import SolverFBA
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=-9.81)
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.2, -0.2, 0.5),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=5,
+            dim_y=5,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.05,
+            tri_ke=1.0e4,
+            tri_ka=0.0,
+            tri_kd=0.0,
+        )
+        model = builder.finalize()
+        kwargs = {"iterations": 1, "friction": False, "stretching_model": stretching_model}
+        if stretching_model != "arap":
+            kwargs["mu"] = mu_val
+            kwargs["lam"] = lam_val
+        solver = SolverFBA(model, **kwargs)
+        s_in = model.state()
+        s_out = model.state()
+        for _ in range(3):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+        return s_in.particle_q.numpy().copy()
+
+    def test_arap_two_runs_identical(self) -> None:
+        q1 = self._run_once("arap")
+        q2 = self._run_once("arap")
+        np.testing.assert_allclose(q1, q2, atol=1e-6, err_msg="tri ARAP scatter non-deterministic")
+
+    def test_corot_two_runs_identical(self) -> None:
+        q1 = self._run_once("corotational", mu_val=1.0e3, lam_val=1.0e3)
+        q2 = self._run_once("corotational", mu_val=1.0e3, lam_val=1.0e3)
+        np.testing.assert_allclose(q1, q2, atol=1e-6, err_msg="tri Corot scatter non-deterministic")
+
+    def test_nh_two_runs_identical(self) -> None:
+        q1 = self._run_once("neohookean", mu_val=1.0e3, lam_val=1.0e3)
+        q2 = self._run_once("neohookean", mu_val=1.0e3, lam_val=1.0e3)
+        np.testing.assert_allclose(q1, q2, atol=1e-6, err_msg="tri NH scatter non-deterministic")
+
+
 if __name__ == "__main__":
     unittest.main()
