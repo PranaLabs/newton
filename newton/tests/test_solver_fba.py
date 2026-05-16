@@ -3894,5 +3894,44 @@ class SolverFBAKinematicCylinderTests(unittest.TestCase):
         )
 
 
+class ParticleElementCsrTests(unittest.TestCase):
+    """Adjacency CSR builder produces correct (offsets, element_idx, local_vertex_idx)."""
+
+    def test_basic_tet_adjacency(self) -> None:
+        import numpy as np
+        from newton._src.solvers.fba.linear_solver import build_particle_element_csr
+
+        # 2 tets sharing vertices 1, 2, 3.
+        tets = np.array([[0, 1, 2, 3], [1, 2, 3, 4]], dtype=np.int32)
+        offsets, elem_idx, local_v = build_particle_element_csr(tets, n_particles=5, n_verts_per_element=4)
+
+        self.assertEqual(offsets.tolist(), [0, 1, 3, 5, 7, 8])
+        # Vertex 1's entries: (tet=0, local=1) and (tet=1, local=0).
+        v1_slice = slice(offsets[1], offsets[2])
+        elem_v1 = sorted(zip(elem_idx[v1_slice].tolist(), local_v[v1_slice].tolist()))
+        self.assertEqual(elem_v1, [(0, 1), (1, 0)])
+
+    def test_tri_adjacency(self) -> None:
+        import numpy as np
+        from newton._src.solvers.fba.linear_solver import build_particle_element_csr
+
+        tris = np.array([[0, 1, 2], [1, 2, 3]], dtype=np.int32)
+        offsets, elem_idx, local_v = build_particle_element_csr(tris, n_particles=4, n_verts_per_element=3)
+        self.assertEqual(offsets.tolist(), [0, 1, 3, 5, 6])
+        v1_slice = slice(offsets[1], offsets[2])
+        elem_v1 = sorted(zip(elem_idx[v1_slice].tolist(), local_v[v1_slice].tolist()))
+        self.assertEqual(elem_v1, [(0, 1), (1, 0)])
+
+    def test_empty_adjacency(self) -> None:
+        import numpy as np
+        from newton._src.solvers.fba.linear_solver import build_particle_element_csr
+
+        empty = np.zeros((0, 4), dtype=np.int32)
+        offsets, elem_idx, local_v = build_particle_element_csr(empty, n_particles=3, n_verts_per_element=4)
+        self.assertEqual(offsets.tolist(), [0, 0, 0, 0])
+        self.assertEqual(elem_idx.shape, (0,))
+        self.assertEqual(local_v.shape, (0,))
+
+
 if __name__ == "__main__":
     unittest.main()

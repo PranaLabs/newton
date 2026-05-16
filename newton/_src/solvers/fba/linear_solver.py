@@ -599,6 +599,54 @@ def _compute_lower_inverse_column_warp(
     return S_values_d.numpy()
 
 
+def build_particle_element_csr(
+    element_indices: np.ndarray,
+    n_particles: int,
+    n_verts_per_element: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build CSR adjacency from elements (tri / tet / edge stencil) to particles.
+
+    For each particle ``p``, the entries in ``element_idx[offsets[p]:offsets[p+1]]``
+    name the elements incident on ``p``, with the corresponding entry in
+    ``local_vertex_idx`` giving which of the element's local vertices is ``p``.
+    Used by SolverFBA's particle-centered PD reduction (atomic-free, deterministic).
+
+    Args:
+        element_indices: ``(num_elements, n_verts_per_element)`` particle indices.
+        n_particles: Total particle count in the model.
+        n_verts_per_element: 3 for triangles, 4 for tetrahedra or 4-vertex
+            bending stencils.
+
+    Returns:
+        ``(offsets, element_idx, local_vertex_idx)``:
+
+        - ``offsets``: ``(n_particles + 1,) int32`` such that
+          ``offsets[p+1] - offsets[p]`` is the number of elements incident to ``p``.
+        - ``element_idx``: ``(total_incidence,) int32`` element index per entry,
+          where ``total_incidence == num_elements * n_verts_per_element``.
+        - ``local_vertex_idx``: ``(total_incidence,) int32`` local-vertex index in
+          ``[0, n_verts_per_element)`` for each entry.
+    """
+    num_elements = int(element_indices.shape[0])
+    if num_elements == 0:
+        return (
+            np.zeros(n_particles + 1, dtype=np.int32),
+            np.zeros(0, dtype=np.int32),
+            np.zeros(0, dtype=np.int32),
+        )
+    particles = element_indices.reshape(-1).astype(np.int64)
+    elements = np.repeat(np.arange(num_elements, dtype=np.int64), n_verts_per_element)
+    locals_ = np.tile(np.arange(n_verts_per_element, dtype=np.int64), num_elements)
+    order = np.argsort(particles, kind="stable")
+    particles = particles[order]
+    elements = elements[order]
+    locals_ = locals_[order]
+    counts = np.bincount(particles, minlength=n_particles).astype(np.int32)
+    offsets = np.zeros(n_particles + 1, dtype=np.int32)
+    offsets[1:] = np.cumsum(counts)
+    return offsets, elements.astype(np.int32), locals_.astype(np.int32)
+
+
 def _compute_isometric_bending_q(edge_indices: np.ndarray, positions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Per-edge length-4 vector q and per-edge scale ``3 / (A0 + A1)``.
 

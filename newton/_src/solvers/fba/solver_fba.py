@@ -313,6 +313,18 @@ class SolverFBA(SolverBase):
         self._tet_rest_inv_d = None
         self._tet_weight_d = None
 
+        # Particle-centered CSR adjacency for deterministic PD reductions (Task P2-D-A).
+        # Lets the PD scatter use (compute → gather) instead of atomic_add.
+        self._particle_tet_offsets_d = None
+        self._particle_tet_element_d = None
+        self._particle_tet_local_d = None
+        self._particle_tri_offsets_d = None
+        self._particle_tri_element_d = None
+        self._particle_tri_local_d = None
+        self._particle_edge_offsets_d = None
+        self._particle_edge_element_d = None
+        self._particle_edge_local_d = None
+
     def _setup_pd_system(self, dt: float) -> None:
         """Build / rebuild the PD Hessian, factor it, and upload device data."""
         from .linear_solver import (  # noqa: PLC0415
@@ -401,6 +413,45 @@ class SolverFBA(SolverBase):
                 dtype=wp.float32,
                 device=device,
             )
+
+        # Particle-centered CSR adjacency for deterministic PD reductions (Task P2-D-A).
+        # Lets the PD scatter use (compute → gather) instead of atomic_add.
+        from .linear_solver import build_particle_element_csr  # noqa: PLC0415
+
+        n_p = int(self.model.particle_count)
+        tet_indices_np = meta["tet_indices"]
+        tri_indices_np = meta["tri_indices"]
+        edge_indices_np = meta["edge_indices"]
+
+        if tet_indices_np is not None and tet_indices_np.size > 0:
+            offs, elem_idx, local_v = build_particle_element_csr(tet_indices_np, n_p, 4)
+            self._particle_tet_offsets_d = wp.array(offs, dtype=wp.int32, device=device)
+            self._particle_tet_element_d = wp.array(elem_idx, dtype=wp.int32, device=device)
+            self._particle_tet_local_d = wp.array(local_v, dtype=wp.int32, device=device)
+        else:
+            self._particle_tet_offsets_d = None
+            self._particle_tet_element_d = None
+            self._particle_tet_local_d = None
+
+        if tri_indices_np is not None and tri_indices_np.size > 0:
+            offs, elem_idx, local_v = build_particle_element_csr(tri_indices_np, n_p, 3)
+            self._particle_tri_offsets_d = wp.array(offs, dtype=wp.int32, device=device)
+            self._particle_tri_element_d = wp.array(elem_idx, dtype=wp.int32, device=device)
+            self._particle_tri_local_d = wp.array(local_v, dtype=wp.int32, device=device)
+        else:
+            self._particle_tri_offsets_d = None
+            self._particle_tri_element_d = None
+            self._particle_tri_local_d = None
+
+        if edge_indices_np is not None and edge_indices_np.size > 0:
+            offs, elem_idx, local_v = build_particle_element_csr(edge_indices_np, n_p, 4)
+            self._particle_edge_offsets_d = wp.array(offs, dtype=wp.int32, device=device)
+            self._particle_edge_element_d = wp.array(elem_idx, dtype=wp.int32, device=device)
+            self._particle_edge_local_d = wp.array(local_v, dtype=wp.int32, device=device)
+        else:
+            self._particle_edge_offsets_d = None
+            self._particle_edge_element_d = None
+            self._particle_edge_local_d = None
 
     def step(
         self,
