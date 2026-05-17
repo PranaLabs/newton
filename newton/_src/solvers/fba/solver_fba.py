@@ -1710,3 +1710,468 @@ class SolverFBA(SolverBase):
             np.clip(lam, -cap_internal, cap_internal, out=lam)
         lam_apply = (dt * dt) * omega * lam
         return lam, omega, lam_apply
+
+    # ------------------------------------------------------------------
+    # NSN inner-loop GPU drivers (Steps 6-10 of the NSN GPU port)
+    # ------------------------------------------------------------------
+    #
+    # The drivers below mirror :meth:`_solve_nsn_unilateral` and
+    # :meth:`_solve_nsn_coulomb` but execute the per-iteration sequence
+    # (residual → penetration → FB rows → Schur build → linear solve →
+    # lambda update → box clamp → cap clip) on the device. They are
+    # transitional: the host-side ``W`` / ``r`` / ``lam_init`` / ``omega_init``
+    # arguments are accepted for direct CPU-parity testing and to keep the
+    # ``step()`` plumbing decisions in Step 11. The new methods exit with
+    # host-side ``(lam, omega, lam_apply)`` for the same reason.
+    #
+    # See ``docs/superpowers/plans/2026-05-17-fba-nsn-gpu-port.md`` for the
+    # roll-out plan; RealSim reference is ``NonSmoothNewton.cpp:102-171``.
+
+    def _ensure_pcr_solver(self, max_n: int) -> None:
+        """Lazily create / resize the NSN-Schur PCR solver."""
+        from .nsn_pcr_solver import NSNPCRSolver  # noqa: PLC0415
+
+        existing = getattr(self, "_pcr_solver", None)
+        if existing is None or existing.max_n < max_n:
+            self._pcr_solver = NSNPCRSolver(
+                max_n=max_n,
+                device=self._device,
+                # Tight tolerance so PCR ≈ ``np.linalg.solve`` to fp64 noise.
+                tol=1.0e-10,
+                max_iter=max(1000, 2 * max_n),
+            )
+
+    def _ensure_nsn_inner_buffers(self, n_rows: int) -> None:
+        """Allocate or resize the device-resident NSN inner-loop scratch."""
+        existing_n = int(getattr(self, "_nsn_inner_n", 0))
+        if existing_n >= n_rows:
+            return
+        cap = max(n_rows, 16)
+        device = self._device
+        self._nsn_inner_n = cap
+        self._nsn_lam_d = wp.zeros(cap, dtype=wp.float64, device=device)
+        self._nsn_omega_d = wp.zeros(cap, dtype=wp.float64, device=device)
+        self._nsn_compliance_d = wp.zeros(cap, dtype=wp.float64, device=device)
+        self._nsn_h_d = wp.zeros(cap, dtype=wp.float64, device=device)
+        self._nsn_penetration_d = wp.zeros(cap, dtype=wp.float64, device=device)
+        self._nsn_precond_d = wp.zeros(cap, dtype=wp.float64, device=device)
+        self._nsn_r_d = wp.zeros(cap, dtype=wp.float64, device=device)
+        self._nsn_pene0_d = wp.zeros(cap, dtype=wp.float64, device=device)
+        self._nsn_rhs_d = wp.zeros(cap, dtype=wp.float64, device=device)
+        self._nsn_dlam_d = wp.zeros(cap, dtype=wp.float64, device=device)
+        self._nsn_lam_apply_d = wp.zeros(cap, dtype=wp.float64, device=device)
+        # 2D buffers are square in the NSN setting.
+        self._nsn_W_d = wp.zeros((cap, cap), dtype=wp.float64, device=device)
+        self._nsn_a_schur_d = wp.zeros((cap, cap), dtype=wp.float64, device=device)
+
+    def _solve_nsn_unilateral_gpu(
+        self,
+        W: np.ndarray,
+        r: np.ndarray,
+        pene0: np.ndarray,
+        max_iters: int = 1,
+        lam_init: np.ndarray | None = None,
+        omega_init: np.ndarray | None = None,
+        dt: float = 0.01,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """GPU port of :meth:`_solve_nsn_unilateral` (Stage A NSN inner).
+
+        Sequence per FB-Newton iter (mirrors the CPU loop body 1:1):
+
+            1. ``penetration = -r + dt²·W·(ω·λ)``
+            2. ``(ω, c, h) = fb_unilateral_row(...)`` per row
+            3. ``A_schur = ωωᵀ ⊙ W + diag(c)``
+            4. ``rhs = (1/dt²)·(h - ω·J·x_corrected)``
+            5. ``dλ = A_schur⁻¹·rhs`` via :class:`NSNPCRSolver`
+            6. ``λ += dλ``
+
+        After the loop, applies the optional ``lambda_cap / dt²``
+        symmetric clip and returns ``lam_apply = dt²·ω·λ``.
+
+        Args:
+            W: ``(M, M)`` Schur complement (host fp64).
+            r: ``(M,)`` host residual.
+            pene0: ``(M,)`` per-row anchor projection.
+            max_iters: FB-Newton iters; matches ``nsn_iterations``.
+            lam_init: Optional ``(M,)`` warm-start lambda.
+            omega_init: Optional ``(M,)`` warm-start omega.
+            dt: Timestep (s).
+
+        Returns:
+            ``(lam, omega, lam_apply)`` host fp64 arrays of shape ``(M,)``.
+            Matches the CPU reference's return triple exactly.
+
+        References:
+            RealSim ``NonSmoothNewton.cpp:102-171`` (Newton step assembly)
+            and ``:332-341`` (unilateral FB row).
+        """
+        from . import kernels as K  # noqa: PLC0415
+
+        M = int(len(r))
+        if M == 0:
+            return (
+                np.zeros(0, dtype=np.float64),
+                np.zeros(0, dtype=np.float64),
+                np.zeros(0, dtype=np.float64),
+            )
+
+        device = self._device
+        self._ensure_nsn_inner_buffers(M)
+        self._ensure_pcr_solver(M)
+
+        cap = self._nsn_inner_n
+        # ``W`` must be uploaded at full capacity (the buffer is fixed-size);
+        # the kernels read only the active ``MxM`` block because ``dim=M``.
+        # We pad with zeros outside the active block so the unused rows
+        # contribute nothing to ``W @ x`` reductions.
+        W_pad = np.zeros((cap, cap), dtype=np.float64)
+        W_pad[:M, :M] = W.astype(np.float64)
+        self._nsn_W_d.assign(W_pad)
+        r_pad = np.zeros(cap, dtype=np.float64)
+        r_pad[:M] = r.astype(np.float64)
+        self._nsn_r_d.assign(r_pad)
+        pene0_pad = np.zeros(cap, dtype=np.float64)
+        pene0_pad[:M] = pene0.astype(np.float64)
+        self._nsn_pene0_d.assign(pene0_pad)
+        lam_h = np.zeros(cap, dtype=np.float64)
+        if lam_init is not None and lam_init.shape == (M,):
+            lam_h[:M] = lam_init.astype(np.float64)
+        omega_h = np.zeros(cap, dtype=np.float64)
+        if omega_init is not None and omega_init.shape == (M,):
+            omega_h[:M] = omega_init.astype(np.float64)
+        self._nsn_lam_d.assign(lam_h)
+        self._nsn_omega_d.assign(omega_h)
+
+        dt_w = wp.float64(dt)
+        n_rows_w = wp.int32(M)
+
+        # Step 7-prep: precond = dt² · max(W_ii, 1e-12) (Stage A).
+        wp.launch(
+            K.compute_precond_unilateral_kernel,
+            dim=M,
+            inputs=[self._nsn_W_d, dt_w],
+            outputs=[self._nsn_precond_d],
+            device=device,
+        )
+
+        for _ in range(int(max_iters)):
+            # Step 7: penetration = -r + dt²·W·(ω·λ).
+            wp.launch(
+                K.compute_penetration_kernel,
+                dim=M,
+                inputs=[
+                    self._nsn_r_d,
+                    self._nsn_W_d,
+                    self._nsn_omega_d,
+                    self._nsn_lam_d,
+                    n_rows_w,
+                    dt_w,
+                ],
+                outputs=[self._nsn_penetration_d],
+                device=device,
+            )
+
+            # Step 9 — FB rows (unilateral) overwrite omega/compliance/h.
+            wp.launch(
+                K.compute_unilateral_fb_kernel,
+                dim=M,
+                inputs=[
+                    self._nsn_penetration_d,
+                    self._nsn_lam_d,
+                    self._nsn_precond_d,
+                    self._nsn_pene0_d,
+                    dt_w,
+                ],
+                outputs=[
+                    self._nsn_omega_d,
+                    self._nsn_compliance_d,
+                    self._nsn_h_d,
+                ],
+                device=device,
+            )
+
+            # build_a_schur_kernel: A_schur = ωωᵀ ⊙ W + diag(c). Launched
+            # over the active MxM block.
+            wp.launch(
+                K.build_a_schur_kernel,
+                dim=(M, M),
+                inputs=[
+                    self._nsn_W_d,
+                    self._nsn_omega_d,
+                    self._nsn_compliance_d,
+                ],
+                outputs=[self._nsn_a_schur_d],
+                device=device,
+            )
+
+            # Step 8: rhs = (1/dt²) · (h - ω · J·x_corrected).
+            wp.launch(
+                K.compute_nsn_rhs_kernel,
+                dim=M,
+                inputs=[
+                    self._nsn_h_d,
+                    self._nsn_omega_d,
+                    self._nsn_pene0_d,
+                    self._nsn_r_d,
+                    self._nsn_W_d,
+                    self._nsn_lam_d,
+                    n_rows_w,
+                    dt_w,
+                ],
+                outputs=[self._nsn_rhs_d],
+                device=device,
+            )
+
+            # PCR Schur solve: ``A_schur · dlam = rhs`` on the active
+            # M-sized slice. Warp 1.14 supports basic strided slicing on
+            # device arrays; the resulting views share storage with the
+            # pre-allocated buffers (no copy) so the PCR solver writes
+            # ``dlam`` straight into ``_nsn_dlam_d``.
+            a_view = self._nsn_a_schur_d[:M, :M]
+            rhs_view = self._nsn_rhs_d[:M]
+            dlam_view = self._nsn_dlam_d[:M]
+            try:
+                self._pcr_solver.solve(a_view, rhs_view, dlam_view)
+            except Exception:
+                # Match CPU LinAlgError fall-through: stop iterating, keep
+                # current lambda.
+                break
+
+            # λ += dλ.
+            wp.launch(
+                K.axpy_lambda_kernel,
+                dim=M,
+                inputs=[self._nsn_dlam_d],
+                outputs=[self._nsn_lam_d],
+                device=device,
+            )
+
+        # Optional lambda_cap (in internal units = physical / dt²).
+        if self.lambda_cap is not None:
+            cap_internal = float(self.lambda_cap) / (dt * dt)
+            wp.launch(
+                K.lambda_cap_clip_kernel,
+                dim=M,
+                inputs=[wp.float64(cap_internal)],
+                outputs=[self._nsn_lam_d],
+                device=device,
+            )
+
+        # lam_apply = dt² · ω · lam.
+        wp.launch(
+            K.compute_lam_apply_kernel,
+            dim=M,
+            inputs=[self._nsn_lam_d, self._nsn_omega_d, dt_w],
+            outputs=[self._nsn_lam_apply_d],
+            device=device,
+        )
+
+        lam = self._nsn_lam_d.numpy()[:M].astype(np.float64, copy=True)
+        omega = self._nsn_omega_d.numpy()[:M].astype(np.float64, copy=True)
+        lam_apply = self._nsn_lam_apply_d.numpy()[:M].astype(np.float64, copy=True)
+        return lam, omega, lam_apply
+
+    def _solve_nsn_coulomb_gpu(
+        self,
+        W: np.ndarray,
+        r: np.ndarray,
+        mu: np.ndarray,
+        pene0: np.ndarray,
+        max_iters: int = 1,
+        lam_init: np.ndarray | None = None,
+        omega_init: np.ndarray | None = None,
+        dt: float = 0.01,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """GPU port of :meth:`_solve_nsn_coulomb` (Stage B NSN inner).
+
+        Identical structure to :meth:`_solve_nsn_unilateral_gpu` with row
+        count ``3M`` and the frictional FB block replacing the unilateral
+        per-row evaluation. After the Newton update, the per-contact
+        signed-cone tangent clamp from RealSim
+        ``NonSmoothNewton.cpp:395-403`` runs on device via
+        :func:`coulomb_box_clamp_kernel`.
+
+        Args:
+            W: ``(3M, 3M)`` Schur complement.
+            r: ``(3M,)`` host residual.
+            mu: ``(M,)`` per-contact friction coefficient.
+            pene0: ``(3M,)`` per-row anchor projection.
+            max_iters: FB-Newton iters.
+            lam_init: Optional ``(3M,)`` warm-start lambda.
+            omega_init: Optional ``(3M,)`` warm-start omega.
+            dt: Timestep (s).
+
+        Returns:
+            ``(lam, omega, lam_apply)`` host fp64 arrays of shape ``(3M,)``.
+
+        References:
+            RealSim ``NonSmoothNewton.cpp:102-171`` (Newton assembly),
+            ``:343-378`` (frictional FB row), ``:395-403`` (cone clamp).
+        """
+        from . import kernels as K  # noqa: PLC0415
+
+        M = int(len(mu))
+        if M == 0:
+            return (
+                np.zeros(0, dtype=np.float64),
+                np.zeros(0, dtype=np.float64),
+                np.zeros(0, dtype=np.float64),
+            )
+        n_rows = 3 * M
+        device = self._device
+
+        self._ensure_nsn_inner_buffers(n_rows)
+        self._ensure_pcr_solver(n_rows)
+        cap = self._nsn_inner_n
+
+        # Stage B mu is a separate per-contact (size-M) array.
+        mu_cap = max(M, 16)
+        mu_existing = getattr(self, "_nsn_mu_d", None)
+        if mu_existing is None or mu_existing.size < mu_cap:
+            self._nsn_mu_d = wp.zeros(mu_cap, dtype=wp.float64, device=device)
+        mu_h = np.zeros(self._nsn_mu_d.size, dtype=np.float64)
+        mu_h[:M] = mu.astype(np.float64)
+        self._nsn_mu_d.assign(mu_h)
+
+        # Upload inputs into the pre-allocated buffers, zero-padded to capacity.
+        W_pad = np.zeros((cap, cap), dtype=np.float64)
+        W_pad[:n_rows, :n_rows] = W.astype(np.float64)
+        self._nsn_W_d.assign(W_pad)
+        r_pad = np.zeros(cap, dtype=np.float64)
+        r_pad[:n_rows] = r.astype(np.float64)
+        self._nsn_r_d.assign(r_pad)
+        pene0_pad = np.zeros(cap, dtype=np.float64)
+        pene0_pad[:n_rows] = pene0.astype(np.float64)
+        self._nsn_pene0_d.assign(pene0_pad)
+        lam_h = np.zeros(cap, dtype=np.float64)
+        if lam_init is not None and lam_init.shape == (n_rows,):
+            lam_h[:n_rows] = lam_init.astype(np.float64)
+        omega_h = np.zeros(cap, dtype=np.float64)
+        if omega_init is not None and omega_init.shape == (n_rows,):
+            omega_h[:n_rows] = omega_init.astype(np.float64)
+        self._nsn_lam_d.assign(lam_h)
+        self._nsn_omega_d.assign(omega_h)
+
+        dt_w = wp.float64(dt)
+        n_rows_w = wp.int32(n_rows)
+
+        # Stage B precond: dt²·W_ii for normal rows; dt·W_ii for tangents.
+        wp.launch(
+            K.compute_precond_coulomb_kernel,
+            dim=n_rows,
+            inputs=[self._nsn_W_d, dt_w],
+            outputs=[self._nsn_precond_d],
+            device=device,
+        )
+
+        for _ in range(int(max_iters)):
+            wp.launch(
+                K.compute_penetration_kernel,
+                dim=n_rows,
+                inputs=[
+                    self._nsn_r_d,
+                    self._nsn_W_d,
+                    self._nsn_omega_d,
+                    self._nsn_lam_d,
+                    n_rows_w,
+                    dt_w,
+                ],
+                outputs=[self._nsn_penetration_d],
+                device=device,
+            )
+
+            wp.launch(
+                K.compute_frictional_fb_kernel,
+                dim=M,
+                inputs=[
+                    self._nsn_penetration_d,
+                    self._nsn_lam_d,
+                    self._nsn_mu_d,
+                    self._nsn_precond_d,
+                    self._nsn_pene0_d,
+                    dt_w,
+                ],
+                outputs=[
+                    self._nsn_omega_d,
+                    self._nsn_compliance_d,
+                    self._nsn_h_d,
+                ],
+                device=device,
+            )
+
+            wp.launch(
+                K.build_a_schur_kernel,
+                dim=(n_rows, n_rows),
+                inputs=[
+                    self._nsn_W_d,
+                    self._nsn_omega_d,
+                    self._nsn_compliance_d,
+                ],
+                outputs=[self._nsn_a_schur_d],
+                device=device,
+            )
+
+            wp.launch(
+                K.compute_nsn_rhs_kernel,
+                dim=n_rows,
+                inputs=[
+                    self._nsn_h_d,
+                    self._nsn_omega_d,
+                    self._nsn_pene0_d,
+                    self._nsn_r_d,
+                    self._nsn_W_d,
+                    self._nsn_lam_d,
+                    n_rows_w,
+                    dt_w,
+                ],
+                outputs=[self._nsn_rhs_d],
+                device=device,
+            )
+
+            a_view = self._nsn_a_schur_d[:n_rows, :n_rows]
+            rhs_view = self._nsn_rhs_d[:n_rows]
+            dlam_view = self._nsn_dlam_d[:n_rows]
+            try:
+                self._pcr_solver.solve(a_view, rhs_view, dlam_view)
+            except Exception:
+                break
+
+            wp.launch(
+                K.axpy_lambda_kernel,
+                dim=n_rows,
+                inputs=[self._nsn_dlam_d],
+                outputs=[self._nsn_lam_d],
+                device=device,
+            )
+
+            # Per-contact signed-cone clamp on tangent lambdas.
+            wp.launch(
+                K.coulomb_box_clamp_kernel,
+                dim=M,
+                inputs=[self._nsn_mu_d],
+                outputs=[self._nsn_lam_d],
+                device=device,
+            )
+
+        if self.lambda_cap is not None:
+            cap_internal = float(self.lambda_cap) / (dt * dt)
+            wp.launch(
+                K.lambda_cap_clip_kernel,
+                dim=n_rows,
+                inputs=[wp.float64(cap_internal)],
+                outputs=[self._nsn_lam_d],
+                device=device,
+            )
+
+        wp.launch(
+            K.compute_lam_apply_kernel,
+            dim=n_rows,
+            inputs=[self._nsn_lam_d, self._nsn_omega_d, dt_w],
+            outputs=[self._nsn_lam_apply_d],
+            device=device,
+        )
+
+        lam = self._nsn_lam_d.numpy()[:n_rows].astype(np.float64, copy=True)
+        omega = self._nsn_omega_d.numpy()[:n_rows].astype(np.float64, copy=True)
+        lam_apply = self._nsn_lam_apply_d.numpy()[:n_rows].astype(np.float64, copy=True)
+        return lam, omega, lam_apply

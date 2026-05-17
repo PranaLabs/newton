@@ -3152,6 +3152,412 @@ def build_a_schur_kernel(
 
 
 # ---------------------------------------------------------------------------
+# NSN inner driver — residual, penetration, rhs, FB row launchers, box clamp.
+#
+# Steps 6-10 of the NSN GPU port (see
+# ``docs/superpowers/plans/2026-05-17-fba-nsn-gpu-port.md``). Each kernel is
+# a direct port of a numpy expression in
+# :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA._solve_nsn_unilateral`
+# / ``_solve_nsn_coulomb``; cross-reference RealSim
+# ``NonSmoothNewton.cpp:102-171`` for the full FB-Newton update sequence.
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def compute_contact_residual_unilateral_kernel(
+    contact_offset: wp.array[wp.float64],  # (M,) device, n·anchor
+    contact_alpha: wp.array[wp.float32],  # (M,)
+    contact_normal: wp.array[wp.vec3],  # (M,) world frame
+    contact_particle: wp.array[wp.int32],  # (M,)
+    x: wp.array[wp.vec3],  # (N,) particle positions (float32)
+    r: wp.array[wp.float64],  # (M,) output residual
+):
+    """GPU port of :meth:`SolverFBA._compute_contact_residual` (Stage A).
+
+    Computes ``r[c] = offset[c] - alpha[c] * dot(normal[c], x[particle[c]])``
+    one contact per thread. Mirrors the CPU loop body exactly, including
+    the float32→float64 promotion on ``dot`` (Warp ``wp.dot`` on a ``vec3``
+    returns ``float32``; we widen to fp64 before the multiply to match the
+    CPU ``np.dot`` working in fp64 after the explicit cast).
+
+    Args:
+        contact_offset: ``n·anchor`` per contact (fp64), shape ``[M]``.
+        contact_alpha: Per-contact Jacobian scale (fp32), shape ``[M]``.
+        contact_normal: World-frame unit normal, shape ``[M]``.
+        contact_particle: Per-contact particle index, shape ``[M]``.
+        x: Particle positions (fp32), shape ``[N]``.
+        r: Output residual (fp64), shape ``[M]``.
+    """
+    c = wp.tid()
+    ip = contact_particle[c]
+    alpha = wp.float64(contact_alpha[c])
+    n_dot_x = wp.float64(wp.dot(contact_normal[c], x[ip]))
+    r[c] = contact_offset[c] - alpha * n_dot_x
+
+
+@wp.kernel
+def compute_contact_residual_coulomb_kernel(
+    contact_offset_n: wp.array[wp.float64],  # (M,) n·anchor
+    contact_offset_t1: wp.array[wp.float64],  # (M,) t1·anchor (with kinematic shift)
+    contact_offset_t2: wp.array[wp.float64],  # (M,) t2·anchor (with kinematic shift)
+    contact_alpha: wp.array[wp.float32],  # (M,)
+    contact_normal: wp.array[wp.vec3],  # (M,)
+    contact_t1: wp.array[wp.vec3],  # (M,)
+    contact_t2: wp.array[wp.vec3],  # (M,)
+    contact_particle: wp.array[wp.int32],  # (M,)
+    x: wp.array[wp.vec3],  # (N,) particle positions (float32)
+    r: wp.array[wp.float64],  # (3M,) output residual
+):
+    """GPU port of :meth:`SolverFBA._compute_contact_residual_friction` (Stage B).
+
+    Emits ``r[3c+0/1/2] = offset_{n/t1/t2}[c] - alpha[c] * dot(axis, x[p[c]])``
+    where ``axis`` is normal / t1 / t2 respectively. One contact per thread
+    writes three consecutive rows in interleaved ``[r_n, r_t1, r_t2]``
+    layout, matching the CPU reference.
+
+    Args:
+        contact_offset_n: ``n·anchor`` (fp64), shape ``[M]``.
+        contact_offset_t1: ``t1·anchor`` (fp64), shape ``[M]``.
+        contact_offset_t2: ``t2·anchor`` (fp64), shape ``[M]``.
+        contact_alpha: Per-contact Jacobian scale (fp32), shape ``[M]``.
+        contact_normal: World-frame unit normal, shape ``[M]``.
+        contact_t1: First tangent vectors, shape ``[M]``.
+        contact_t2: Second tangent vectors, shape ``[M]``.
+        contact_particle: Per-contact particle index, shape ``[M]``.
+        x: Particle positions (fp32), shape ``[N]``.
+        r: Output residual (fp64), shape ``[3M]``.
+    """
+    c = wp.tid()
+    ip = contact_particle[c]
+    alpha = wp.float64(contact_alpha[c])
+    xp = x[ip]
+    r[3 * c + 0] = contact_offset_n[c] - alpha * wp.float64(wp.dot(contact_normal[c], xp))
+    r[3 * c + 1] = contact_offset_t1[c] - alpha * wp.float64(wp.dot(contact_t1[c], xp))
+    r[3 * c + 2] = contact_offset_t2[c] - alpha * wp.float64(wp.dot(contact_t2[c], xp))
+
+
+@wp.kernel
+def compute_precond_unilateral_kernel(
+    W: wp.array2d[wp.float64],  # (M, M) Schur W
+    dt: wp.float64,
+    precond: wp.array[wp.float64],  # (M,) output
+):
+    """Compute ``precond[i] = dt² · max(|W_ii|, 1e-12)`` (Stage A).
+
+    GPU port of the CPU expression in
+    :meth:`SolverFBA._solve_nsn_unilateral`:
+    ``precond = (dt*dt) * np.where(|diag_W|>1e-12, max(diag_W, 1e-12), 1.0)``.
+    Note the ``np.where`` falls through to ``1.0`` only when ``|diag_W| <=
+    1e-12`` (degenerate row); otherwise we take ``max(diag_W, 1e-12)`` which
+    differs from ``|diag_W|`` for negative diagonals. We replicate this
+    branch exactly so the GPU output bit-matches the CPU reference.
+
+    Args:
+        W: Dense Schur complement, shape ``[M, M]``.
+        dt: Timestep (fp64).
+        precond: Output preconditioner, shape ``[M]``.
+    """
+    i = wp.tid()
+    d = W[i, i]
+    dt2 = dt * dt
+    if wp.abs(d) > wp.float64(1.0e-12):
+        if d > wp.float64(1.0e-12):
+            precond[i] = dt2 * d
+        else:
+            precond[i] = dt2 * wp.float64(1.0e-12)
+    else:
+        precond[i] = dt2 * wp.float64(1.0)
+
+
+@wp.kernel
+def compute_precond_coulomb_kernel(
+    W: wp.array2d[wp.float64],  # (3M, 3M) Schur W
+    dt: wp.float64,
+    precond: wp.array[wp.float64],  # (3M,) output
+):
+    """Compute Stage B preconditioner: ``dt²·W_ii`` for normal rows and
+    ``dt·W_ii`` for tangent rows, with ``|W_ii|`` floor of ``1e-12``.
+
+    GPU port of the per-contact loop in
+    :meth:`SolverFBA._solve_nsn_coulomb` (``w_n/w_t1/w_t2 =
+    max(|diag_W[3c..]|, 1e-12)``; ``precond[3c] = dt²·w_n``;
+    ``precond[3c+1/2] = dt·w_t1/t2``).
+
+    Args:
+        W: Dense Schur complement, shape ``[3M, 3M]``.
+        dt: Timestep (fp64).
+        precond: Output preconditioner, shape ``[3M]``.
+    """
+    i = wp.tid()  # 0..3M
+    w = wp.abs(W[i, i])
+    if w < wp.float64(1.0e-12):
+        w = wp.float64(1.0e-12)
+    if (i % 3) == 0:
+        precond[i] = dt * dt * w
+    else:
+        precond[i] = dt * w
+
+
+@wp.kernel
+def compute_penetration_kernel(
+    r: wp.array[wp.float64],
+    W: wp.array2d[wp.float64],
+    omega: wp.array[wp.float64],
+    lam: wp.array[wp.float64],
+    n_rows: wp.int32,
+    dt: wp.float64,
+    penetration: wp.array[wp.float64],
+):
+    """GPU port of ``penetration = -r + dt² · W · (ω · λ)``.
+
+    Mirrors the CPU expression inside the FB-Newton loop:
+    ``penetration = -r + (dt*dt) * (W @ (omega * lam))``.
+    One row per thread; an O(n) inner loop reduces the matvec contribution
+    locally so the result is bit-deterministic across launches.
+
+    Args:
+        r: Contact residual (fp64), shape ``[n_rows]``.
+        W: Schur complement, shape ``[n_rows, n_rows]``.
+        omega: FB row weights, shape ``[n_rows]``.
+        lam: Current lambda, shape ``[n_rows]``.
+        n_rows: Active row count (``M`` for Stage A, ``3M`` for Stage B).
+        dt: Timestep.
+        penetration: Output penetration, shape ``[n_rows]``.
+    """
+    i = wp.tid()
+    s = wp.float64(0.0)
+    for j in range(n_rows):
+        s = s + W[i, j] * omega[j] * lam[j]
+    penetration[i] = -r[i] + dt * dt * s
+
+
+@wp.kernel
+def compute_nsn_rhs_kernel(
+    h: wp.array[wp.float64],
+    omega: wp.array[wp.float64],
+    pene0: wp.array[wp.float64],
+    r: wp.array[wp.float64],
+    W: wp.array2d[wp.float64],
+    lam: wp.array[wp.float64],
+    n_rows: wp.int32,
+    dt: wp.float64,
+    rhs: wp.array[wp.float64],
+):
+    """GPU port of ``rhs = (1/dt²) · (h - ω · J·x_corrected)`` (NSN inner RHS).
+
+    Mirrors the CPU expressions:
+
+        J_x = (pene0 - r) + (dt*dt) * (W @ (omega * lam))
+        rhs = (1.0 / (dt*dt)) * (h - omega * J_x)
+
+    Fuses the two expressions into a single kernel launch to avoid an
+    intermediate device buffer for ``J_x``. The ``W @ (omega · lam)``
+    matvec is recomputed per row (same inner loop as
+    :func:`compute_penetration_kernel`); the launch cost reduction
+    outweighs the redundant FLOPs at the M sizes targeted by NSN
+    (M ~ 100..3000).
+
+    Args:
+        h: Per-row Schur RHS contribution, shape ``[n_rows]``.
+        omega: Per-row FB weighting, shape ``[n_rows]``.
+        pene0: Per-row anchor projection, shape ``[n_rows]``.
+        r: Contact residual, shape ``[n_rows]``.
+        W: Schur complement, shape ``[n_rows, n_rows]``.
+        lam: Current lambda, shape ``[n_rows]``.
+        n_rows: Active row count.
+        dt: Timestep.
+        rhs: Output NSN RHS, shape ``[n_rows]``.
+    """
+    i = wp.tid()
+    Wol = wp.float64(0.0)
+    for j in range(n_rows):
+        Wol = Wol + W[i, j] * omega[j] * lam[j]
+    J_x = (pene0[i] - r[i]) + dt * dt * Wol
+    rhs[i] = (wp.float64(1.0) / (dt * dt)) * (h[i] - omega[i] * J_x)
+
+
+@wp.kernel
+def compute_unilateral_fb_kernel(
+    penetration: wp.array[wp.float64],
+    lam: wp.array[wp.float64],
+    precond: wp.array[wp.float64],
+    pene0: wp.array[wp.float64],
+    dt: wp.float64,
+    omega: wp.array[wp.float64],  # output
+    compliance: wp.array[wp.float64],  # output
+    h: wp.array[wp.float64],  # output
+):
+    """Evaluate :func:`fb_unilateral_row_wp` for every row.
+
+    Per-row launcher that calls the existing ``@wp.func`` FB evaluator;
+    one thread populates ``(omega[i], compliance[i], h[i])``. Matches the
+    CPU per-row ``fb_unilateral_row(...)`` loop in
+    :meth:`SolverFBA._solve_nsn_unilateral`.
+
+    Args:
+        penetration: Per-row penetration ``J·q - pene0``, shape ``[M]``.
+        lam: Per-row lambda, shape ``[M]``.
+        precond: Per-row preconditioner, shape ``[M]``.
+        pene0: Per-row anchor projection, shape ``[M]``.
+        dt: Timestep.
+        omega: Output FB weighting, shape ``[M]``.
+        compliance: Output diagonal compliance, shape ``[M]``.
+        h: Output Schur RHS contribution, shape ``[M]``.
+    """
+    i = wp.tid()
+    out = fb_unilateral_row_wp(penetration[i], lam[i], precond[i], dt, pene0[i])
+    omega[i] = out[0]
+    compliance[i] = out[1]
+    h[i] = out[2]
+
+
+@wp.kernel
+def compute_frictional_fb_kernel(
+    penetration: wp.array[wp.float64],  # (3M,)
+    lam: wp.array[wp.float64],  # (3M,)
+    mu: wp.array[wp.float64],  # (M,) per-contact
+    precond: wp.array[wp.float64],  # (3M,)
+    pene0: wp.array[wp.float64],  # (3M,)
+    dt: wp.float64,
+    omega: wp.array[wp.float64],  # (3M,) output
+    compliance: wp.array[wp.float64],  # (3M,) output
+    h: wp.array[wp.float64],  # (3M,) output
+):
+    """Evaluate the 3-row FB block (normal + 2 tangents) per contact.
+
+    One thread per contact emits the unilateral normal row plus two
+    frictional tangent rows, matching the CPU loop body in
+    :meth:`SolverFBA._solve_nsn_coulomb`. The tangent rows take the
+    *current iterate* of ``lam_n`` as their companion normal lambda
+    (RealSim ``NonSmoothNewton.cpp:343-378``); this is identical to the
+    CPU reference which reads ``lam[idx_n]`` before computing the tangent
+    rows in the same iteration.
+
+    Args:
+        penetration: Per-row penetration, shape ``[3M]``.
+        lam: Per-row lambda, shape ``[3M]``.
+        mu: Per-contact friction coefficient, shape ``[M]``.
+        precond: Per-row preconditioner, shape ``[3M]``.
+        pene0: Per-row anchor projection, shape ``[3M]``.
+        dt: Timestep.
+        omega: Output FB weighting, shape ``[3M]``.
+        compliance: Output diagonal compliance, shape ``[3M]``.
+        h: Output Schur RHS contribution, shape ``[3M]``.
+    """
+    c = wp.tid()  # 0..M
+    idx_n = 3 * c
+    idx_t1 = 3 * c + 1
+    idx_t2 = 3 * c + 2
+    lam_n = lam[idx_n]
+    mu_c = mu[c]
+    out_n = fb_unilateral_row_wp(penetration[idx_n], lam_n, precond[idx_n], dt, pene0[idx_n])
+    omega[idx_n] = out_n[0]
+    compliance[idx_n] = out_n[1]
+    h[idx_n] = out_n[2]
+    out_t1 = fb_frictional_row_wp(penetration[idx_t1], lam[idx_t1], lam_n, mu_c, precond[idx_t1], dt, pene0[idx_t1])
+    omega[idx_t1] = out_t1[0]
+    compliance[idx_t1] = out_t1[1]
+    h[idx_t1] = out_t1[2]
+    out_t2 = fb_frictional_row_wp(penetration[idx_t2], lam[idx_t2], lam_n, mu_c, precond[idx_t2], dt, pene0[idx_t2])
+    omega[idx_t2] = out_t2[0]
+    compliance[idx_t2] = out_t2[1]
+    h[idx_t2] = out_t2[2]
+
+
+@wp.kernel
+def axpy_lambda_kernel(
+    dlam: wp.array[wp.float64],
+    lam: wp.array[wp.float64],  # inout
+):
+    """``lam += dlam`` (NSN Newton update step)."""
+    i = wp.tid()
+    lam[i] = lam[i] + dlam[i]
+
+
+@wp.kernel
+def coulomb_box_clamp_kernel(
+    mu: wp.array[wp.float64],  # (M,)
+    lam: wp.array[wp.float64],  # (3M,) inout
+):
+    """Per-contact Coulomb signed-cone clamp on tangent lambdas.
+
+    Mirrors RealSim ``NonSmoothNewton.cpp:395-403`` (friction branch) and
+    the CPU reference loop in :meth:`SolverFBA._solve_nsn_coulomb`. ``lam_n``
+    is read **signed** (per RealSim — the ``if(_lambda[cid] < 0.0)`` line
+    is explicitly commented out) so ``upper = mu·lam_n`` and
+    ``lower = -mu·lam_n`` can swap when ``lam_n < 0``. The two ``if``
+    statements per tangent must run in the exact CPU order (``> upper``
+    first, then ``< lower``) — when ``lam_n < 0`` the first clamp pulls
+    ``lam_t`` down to a negative ``upper``; the second then clamps it back
+    up to ``lower`` (positive), yielding RealSim's saturated behavior
+    rather than the degenerate ``np.clip(low > high)`` artifact.
+
+    Args:
+        mu: Per-contact friction coefficient (fp64), shape ``[M]``.
+        lam: Per-row lambda (fp64), shape ``[3M]``. Modified in place.
+    """
+    c = wp.tid()
+    lam_n = lam[3 * c]
+    upper = mu[c] * lam_n
+    lower = -mu[c] * lam_n
+    if lam[3 * c + 1] > upper:
+        lam[3 * c + 1] = upper
+    if lam[3 * c + 1] < lower:
+        lam[3 * c + 1] = lower
+    if lam[3 * c + 2] > upper:
+        lam[3 * c + 2] = upper
+    if lam[3 * c + 2] < lower:
+        lam[3 * c + 2] = lower
+
+
+@wp.kernel
+def lambda_cap_clip_kernel(
+    cap_internal: wp.float64,
+    lam: wp.array[wp.float64],  # inout
+):
+    """Symmetric clip: ``lam[i] = clip(lam[i], -cap, +cap)``.
+
+    Implements the CPU post-loop ``np.clip(lam, -cap_internal,
+    cap_internal, out=lam)`` where ``cap_internal = lambda_cap / dt²``.
+    The conversion factor is applied at the caller; this kernel only
+    knows the internal-units cap.
+
+    Args:
+        cap_internal: Symmetric cap in internal lambda units (fp64).
+        lam: Lambda buffer (fp64), shape ``[n_rows]``. Modified in place.
+    """
+    i = wp.tid()
+    if lam[i] > cap_internal:
+        lam[i] = cap_internal
+    if lam[i] < -cap_internal:
+        lam[i] = -cap_internal
+
+
+@wp.kernel
+def compute_lam_apply_kernel(
+    lam: wp.array[wp.float64],
+    omega: wp.array[wp.float64],
+    dt: wp.float64,
+    lam_apply: wp.array[wp.float64],
+):
+    """Compute ``lam_apply = dt² · ω · lam`` (position-LCP correction units).
+
+    See :meth:`SolverFBA._solve_nsn_unilateral` docstring for the
+    derivation: RealSim's correction is ``Δq = dt² · A⁻¹ · Jᵀ · (ω · λ)``
+    whereas FBA's ``apply_lambda_correction_combined`` adds
+    ``A⁻¹·Jᵀ·λ_apply`` directly, so we pre-scale by ``dt²·ω`` here.
+
+    Args:
+        lam: Force-units lambda (fp64), shape ``[n_rows]``.
+        omega: Per-row FB weighting (fp64), shape ``[n_rows]``.
+        dt: Timestep (fp64).
+        lam_apply: Output correction-units lambda, shape ``[n_rows]``.
+    """
+    i = wp.tid()
+    lam_apply[i] = dt * dt * omega[i] * lam[i]
+
+
+# ---------------------------------------------------------------------------
 # Step 5.5 — update_contacts per-contact bookkeeping ported to GPU.
 #
 # CPU implementation pulled six per-contact buffers to host every step and
