@@ -3014,3 +3014,138 @@ def gather_jt_lambda_kernel(
         r = row_indices[k]
         s = s + (contact_alpha[r] * lam[r]) * contact_dir[r]
     out[p] = s
+
+
+# ---------------------------------------------------------------------------
+# NSN inner LCP — Fischer-Burmeister rows + Schur build (Option C, fp64).
+#
+# GPU port of RealSim's ``NonSmoothNewton::buildSchurFB`` per-row scalar
+# evaluators and the ``A_schur = ωωᵀ ⊙ W + diag(c)`` assembly. The inner
+# Schur solve runs in fp64 for parity with the CPU reference; see audit V
+# in ``docs/superpowers/plans/2026-05-17-fba-nsn-gpu-port.md``.
+# ---------------------------------------------------------------------------
+
+
+@wp.func
+def fb_unilateral_row_wp(
+    penetration: wp.float64,
+    lam: wp.float64,
+    precond: wp.float64,
+    dt: wp.float64,
+    pene0: wp.float64,
+) -> wp.vec3d:
+    """Fischer-Burmeister evaluation for a unilateral (normal) contact row.
+
+    GPU port of RealSim ``NonSmoothNewton.cpp:332-341`` and the CPU
+    reference :func:`~newton._src.solvers.fba.solver_fba.fb_unilateral_row`.
+    Returns a :class:`warp.vec3d` packing ``(omega, compliance, h)`` —
+    Warp ``@wp.func`` cannot return Python tuples, so we use the fp64 vec3
+    type for the three scalars.
+
+    Args:
+        penetration: ``J·q - pene0`` at current iterate (m).
+        lam: Current normal lambda (N).
+        precond: ``1 / W_ii`` (1/N).
+        dt: Timestep (s).
+        pene0: ``n·anchor`` (m).
+
+    Returns:
+        ``vec3d(omega, compliance, h)`` matching the CPU reference's tuple
+        return semantics. The degenerate-root branch returns
+        ``(0, precond/dt², pene0)`` to suppress this row's contribution.
+    """
+    pene = penetration
+    plam = precond * lam
+    root = wp.sqrt(pene * pene + plam * plam)
+    if root < wp.float64(1.0e-30):
+        return wp.vec3d(wp.float64(0.0), precond / (dt * dt), pene0)
+    omega = wp.float64(1.0) - pene / root
+    compliance = (wp.float64(1.0) - plam / root) * (precond / (dt * dt))
+    h = -(pene + plam - root) + omega * (penetration + pene0)
+    return wp.vec3d(omega, compliance, h)
+
+
+@wp.func
+def fb_frictional_row_wp(
+    penetration: wp.float64,
+    lam_t: wp.float64,
+    lam_n: wp.float64,
+    mu: wp.float64,
+    precond: wp.float64,
+    dt: wp.float64,
+    pene0: wp.float64,
+) -> wp.vec3d:
+    """Fischer-Burmeister evaluation for a frictional (tangent) contact row.
+
+    GPU port of RealSim ``NonSmoothNewton.cpp:343-378`` and the CPU
+    reference :func:`~newton._src.solvers.fba.solver_fba.fb_frictional_row`.
+    Returns ``(omega, compliance, h)`` packed as :class:`warp.vec3d`.
+
+    Inactive contact (``lam_n ≤ 0``): ``omega = 0``, ``compliance = 1/dt``,
+    ``h = -dt · lam_t``.
+
+    Active contact (``lam_n > 0``): smooth complementarity between slip
+    speed ``|penetration|/dt`` and cone slack ``μ·lam_n - |lam_t|``.
+    ``omega = 1``; compliance varies between near-zero (stick) and ``~1/dt``
+    (slip).
+
+    Args:
+        penetration: Tangential ``J·q - pene0`` row value (m).
+        lam_t: Current tangent lambda (N).
+        lam_n: Companion normal lambda (N).
+        mu: Coulomb friction coefficient.
+        precond: ``1 / W_ii`` for this tangent row (1/N).
+        dt: Timestep (s).
+        pene0: ``t·anchor`` (m).
+
+    Returns:
+        ``vec3d(omega, compliance, h)`` matching the CPU reference.
+    """
+    if lam_n <= wp.float64(0.0):
+        return wp.vec3d(
+            wp.float64(0.0),
+            wp.float64(1.0) / dt,
+            -dt * lam_t,
+        )
+
+    abspenevel = wp.abs(penetration / dt)
+    tmp = precond * (mu * lam_n - wp.abs(lam_t))
+    root = wp.sqrt(abspenevel * abspenevel + tmp * tmp)
+    denom = abspenevel + mu * precond * lam_n - root
+    if wp.abs(denom) < wp.float64(1.0e-30):
+        compliance = wp.float64(1.0) / dt
+    else:
+        compliance = ((root - tmp) / denom) * (precond / dt)
+    h = -(dt * dt) * compliance * lam_t + pene0
+    return wp.vec3d(wp.float64(1.0), compliance, h)
+
+
+@wp.kernel
+def build_a_schur_kernel(
+    W: wp.array2d[wp.float64],  # (n_rows, n_rows) Schur complement
+    omega: wp.array[wp.float64],  # (n_rows,) per-row weighting
+    compliance: wp.array[wp.float64],  # (n_rows,) per-row diagonal compliance
+    a_schur: wp.array2d[wp.float64],  # (n_rows, n_rows) OUTPUT
+):
+    """Assemble ``A_schur = ωωᵀ ⊙ W + diag(compliance)`` on GPU.
+
+    GPU port of the CPU expression in
+    :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA._solve_nsn_unilateral`
+    (``A_schur = (omega[:, None] * omega[None, :]) * W + np.diag(compliance)``),
+    which mirrors RealSim ``NonSmoothNewton.cpp:332-341`` (unilateral) and
+    ``:343-378`` (frictional) row contributions assembled into the inner
+    Schur LHS.
+
+    Launch with ``dim=(n_rows, n_rows)``.
+
+    Args:
+        W: Dense Schur complement, shape ``[n_rows, n_rows]``.
+        omega: Per-row Fischer-Burmeister weighting, shape ``[n_rows]``.
+        compliance: Per-row diagonal compliance, shape ``[n_rows]``.
+        a_schur: Output LHS matrix, shape ``[n_rows, n_rows]``. Overwritten.
+    """
+    i, j = wp.tid()
+    val = omega[i] * omega[j] * W[i, j]
+    if i == j:
+        val = val + compliance[i]
+    a_schur[i, j] = val
