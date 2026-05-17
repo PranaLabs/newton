@@ -996,14 +996,19 @@ class SolverFBA(SolverBase):
         :meth:`update_contacts` or the Cholesky factor of ``A`` from
         :meth:`_setup_pd_system` / :meth:`notify_model_changed`) might
         change so the next :meth:`step` rebuilds the Schur complement.
+
+        The persistent λ/ω warm-start buffers
+        (``_lam_unilateral_persistent``, ``_lam_coulomb_persistent``,
+        ``_omega_unilateral_persistent``, ``_omega_coulomb_persistent``)
+        are intentionally left untouched here. Per-step entry in
+        :meth:`step` reallocates them when the contact count ``M``
+        changes and otherwise zero-fills them in-place, matching
+        RealSim's ``cuda_lambda.setZero(_num_constraint)`` pattern in
+        ``CUDANonSmoothNewton::prepare_gpu`` — a per-step concern that
+        is decoupled from Schur factor invalidation.
         """
         self._cached_W = None
         self._cached_A_inv_Jt_valid = False
-        # λ warm-start: persistent buffer must be resized when contact-set changes.
-        self._lam_unilateral_persistent = None
-        self._lam_coulomb_persistent = None
-        self._omega_unilateral_persistent = None
-        self._omega_coulomb_persistent = None
 
     # ------------------------------------------------------------------
     # Phase 4 Stage A — contact state (allocated lazily on first call).

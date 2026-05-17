@@ -1142,6 +1142,71 @@ class TestSolverFBAReconfigure(unittest.TestCase):
         q = s_out.particle_q.numpy()
         self.assertTrue(np.all(np.isfinite(q)))
 
+    def test_schur_invalidation_preserves_lambda_buffer_refs(self):
+        """``_invalidate_schur_cache`` must not touch persistent λ/ω buffers.
+
+        Task 1.3.f: the persistent warm-start buffers
+        (``_lam_unilateral_persistent``, ``_lam_coulomb_persistent``,
+        ``_omega_unilateral_persistent``, ``_omega_coulomb_persistent``)
+        are reset/resized at step entry to match RealSim's per-step
+        ``cuda_lambda.setZero(_num_constraint)``. Schur factor
+        invalidation (driven by contact-set change or model notify) is
+        a separate concern and must leave the warm-start buffers
+        intact so the abstraction boundary stays clean.
+        """
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._build_4x4_cloth()
+        solver = SolverFBA(model, iterations=5)
+
+        # Seed all four persistent buffers with distinguishable sentinel data.
+        solver._lam_unilateral_persistent = np.full(5, 0.123, dtype=np.float64)
+        solver._lam_coulomb_persistent = np.full(15, 0.456, dtype=np.float64)
+        solver._omega_unilateral_persistent = np.full(5, 0.789, dtype=np.float64)
+        solver._omega_coulomb_persistent = np.full(15, 0.321, dtype=np.float64)
+
+        # Also pre-poison the Schur cache slots so we can confirm they get cleared.
+        solver._cached_W = object()
+        solver._cached_A_inv_Jt_valid = True
+
+        solver._invalidate_schur_cache()
+
+        # Schur cache must be dropped.
+        self.assertIsNone(solver._cached_W, "Schur W cache must be invalidated")
+        self.assertFalse(
+            solver._cached_A_inv_Jt_valid,
+            "A_inv_Jt cache validity flag must be cleared",
+        )
+
+        # Persistent λ/ω buffers must survive unchanged (identity + contents).
+        self.assertIsNotNone(
+            solver._lam_unilateral_persistent,
+            "_lam_unilateral_persistent must be preserved",
+        )
+        self.assertEqual(solver._lam_unilateral_persistent.shape, (5,))
+        np.testing.assert_allclose(solver._lam_unilateral_persistent, 0.123)
+
+        self.assertIsNotNone(
+            solver._lam_coulomb_persistent,
+            "_lam_coulomb_persistent must be preserved",
+        )
+        self.assertEqual(solver._lam_coulomb_persistent.shape, (15,))
+        np.testing.assert_allclose(solver._lam_coulomb_persistent, 0.456)
+
+        self.assertIsNotNone(
+            solver._omega_unilateral_persistent,
+            "_omega_unilateral_persistent must be preserved",
+        )
+        self.assertEqual(solver._omega_unilateral_persistent.shape, (5,))
+        np.testing.assert_allclose(solver._omega_unilateral_persistent, 0.789)
+
+        self.assertIsNotNone(
+            solver._omega_coulomb_persistent,
+            "_omega_coulomb_persistent must be preserved",
+        )
+        self.assertEqual(solver._omega_coulomb_persistent.shape, (15,))
+        np.testing.assert_allclose(solver._omega_coulomb_persistent, 0.321)
+
     def test_notify_unrelated_flag_no_resetup(self):
         from newton._src.solvers import SolverNotifyFlags  # noqa: PLC0415
         from newton.solvers import SolverFBA  # noqa: PLC0415
