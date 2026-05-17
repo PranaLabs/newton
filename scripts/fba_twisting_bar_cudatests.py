@@ -4,7 +4,7 @@
 """Twisting bar CudaTests-params run for SolverFBA with Neo-Hookean energy.
 
 Matches CudaTests/TwistingBarNH setup exactly:
-  - Mesh: cube_volume_11340P.mesh (11340 verts, ~58956 tets)
+  - Mesh: ARAP=cube_volume_5292P.mesh (5292 verts), NH/Corot=cube_volume_11340P.mesh (11340 verts)
   - E=1e9, nu=0.45
   - 810 frames, dt=0.01
   - PD iterations=5
@@ -45,7 +45,16 @@ from newton.solvers import SolverFBA
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).parent
 OUT_DIR = SCRIPT_DIR / "twisting_bar_out_cudatests"
-MESH_PATH = Path("/home/ziqiu/work/RealSim_py/realsim_py/resources/mesh/volume/cube_volume_11340P.mesh")
+# Per-CudaTests-demo mesh paths.
+# Demo 1 TwistingBar (ARAP) → object_5k.json → cube_volume_5292P.mesh
+# Demo 2 TwistingBarNH (NH) → object_10k_nh.json → cube_volume_11340P.mesh
+# Demo "corotational" → not a CudaTests scene; reuse NH mesh for code-path coverage.
+_MESH_REALSIM_ROOT = Path("/home/ziqiu/work/RealSim_py/realsim_py/resources/mesh/volume")
+MESH_PATH_PER_ENERGY = {
+    "arap": _MESH_REALSIM_ROOT / "cube_volume_5292P.mesh",
+    "neohookean": _MESH_REALSIM_ROOT / "cube_volume_11340P.mesh",
+    "corotational": _MESH_REALSIM_ROOT / "cube_volume_11340P.mesh",
+}
 
 # RealSim NH .abc trajectory path (pre-run, 810 frames)
 ABC_PATH = Path("/home/ziqiu/work/RealSim_py/realsim_py/simulation/output_abc/TwistingBarNH/output_obj_0.abc")
@@ -93,9 +102,17 @@ NU = 0.45
 MU = YOUNG / (2.0 * (1.0 + NU))
 LAM = YOUNG * NU / ((1.0 + NU) * (1.0 - 2.0 * NU))
 
-# Rolling pin parameters
+# Rolling pin parameters.
+# RealSim's Actions.h:65 converts scene's `avel` field from degrees to radians
+# via `rad = diff * M_PI / 180.0`. Scene values (deg/s):
+#   TwistingBar/object_5k.json:23-27,36-40       avel = +/- 10 deg/s
+#   TwistingBarNH/object_10k_nh.json (same)      avel = +/- 10 deg/s
+# Previous bug: PIN_AVEL = 10.0 was interpreted as rad/s, so FBA rotated
+# 180/pi (~57.3x) faster than RealSim, hitting MAX_ANGLE around frame 16
+# instead of never within the 810-frame stop.
 MAX_ANGLE = math.pi / 2.0  # 90 degrees (maxrotation=90)
-PIN_AVEL = 10.0  # rad/s
+PIN_AVEL_DEG_PER_S = 10.0
+PIN_AVEL = math.radians(PIN_AVEL_DEG_PER_S)  # rad/s
 PIN_Y_TOP = 1.99
 PIN_Y_BOT = -1.99
 
@@ -384,7 +401,7 @@ def write_full_perf_summary(device: str) -> Path:
 
     header_note = (
         "Newton FBA CudaTests params: E=1e9, nu=0.45, 810 frames, dt=0.01, PD_iter=5\n"
-        "Mesh: cube_volume_11340P.mesh (11340 verts, ~58956 tets)\n"
+        "Mesh: ARAP=cube_volume_5292P.mesh, NH/Corot=cube_volume_11340P.mesh\n"
         f"Device: {device}\n\n"
     )
 
@@ -621,15 +638,17 @@ def main() -> None:
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Load mesh
-    print(f"\n=== Loading mesh: {MESH_PATH} ===")
+    # Load mesh (per-energy: CudaTests Demo 1 ARAP uses 5292P, Demo 2 NH uses 11340P).
+    mesh_path = MESH_PATH_PER_ENERGY[args.energy]
+    print(f"\n=== Loading mesh: {mesh_path} ===")
     t0 = time.perf_counter()
-    verts, tets = load_medit_mesh(MESH_PATH)
+    verts, tets = load_medit_mesh(mesh_path)
     print(f"  Load time: {(time.perf_counter() - t0) * 1000:.0f} ms")
     N = len(verts)
     T = len(tets)
-    print(f"  Vertices: {N} (expect 11340)")
-    print(f"  Tets:     {T} (expect ~58956)")
+    expected_n = 5292 if args.energy == "arap" else 11340
+    print(f"  Vertices: {N} (expect {expected_n})")
+    print(f"  Tets:     {T}")
 
     # Build model
     print("\n=== Building model ===")
