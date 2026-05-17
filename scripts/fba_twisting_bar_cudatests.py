@@ -194,6 +194,12 @@ def build_model(
     """Build Newton ModelBuilder for twisting bar."""
     N = len(verts)
     T = len(tets)
+    # Uniform mass lumping per RealSim Mass.cpp:12-21 (Mass::addObjectMass):
+    # obj_mass / num_vertices per particle. This matches locked decision #3
+    # of the FBA-RealSim parity plan; we feed the uniform value directly to
+    # add_particles so no post-finalize override is needed for this demo.
+    # TOTAL_MASS = 1000.0 from CudaTests/TwistingBar/object_5k.json
+    # mechanical_props.obj_mass (per scripts/realsim_baseline/decisions.json).
     mass_per_particle = TOTAL_MASS / N
 
     y = verts[:, 1]

@@ -129,6 +129,18 @@ def build_model() -> tuple:
 
     model = builder.finalize()
 
+    # Match RealSim's uniform mass lumping (Mass.cpp:12-21):
+    # obj_mass / particle_count per particle, replacing Newton's FE lumping.
+    # Locked decision #3 of the FBA-RealSim parity plan; per-demo override since
+    # FE lumping remains the correct default for Newton's other solvers.
+    # total_mass = OBJ_MASS (1000.0) from CudaTests/SqueezingBall/ball_7k.json
+    # mechanical_props.obj_mass (per scripts/realsim_baseline/decisions.json).
+    uniform_mass = OBJ_MASS / model.particle_count
+    mass_arr = np.full(model.particle_count, uniform_mass, dtype=np.float32)
+    inv_mass_arr = np.full(model.particle_count, 1.0 / uniform_mass, dtype=np.float32)
+    model.particle_mass.assign(mass_arr)
+    model.particle_inv_mass.assign(inv_mass_arr)
+
     if hasattr(model, "shape_material_mu") and model.shape_material_mu is not None:
         mu_arr = model.shape_material_mu.numpy()
         mu_arr[:] = FRICTION_MU
