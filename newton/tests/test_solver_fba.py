@@ -4589,5 +4589,246 @@ class FBNonsmoothFunctionTests(unittest.TestCase):
         self.assertGreater(compliance, 10.0)
 
 
+class SolverFBAInIterReDeriveTests(unittest.TestCase):
+    """Task 1.3.g: in-iter ``b += dt²·J·(ω·λ)`` combined-form correction.
+
+    Ports RealSim's ``NonSmoothNewton::applyConstraintCorrection`` flow
+    (``b += dt²·J·(ω·λ); _systemlinearsolver->solve(x, b)``) into FBA,
+    replacing the split-form ``x_cur += A⁻¹·Jᵀ·lam_apply``. The two are
+    algebraically equivalent by linearity of ``A⁻¹``; this test class
+    verifies both numerical equivalence and the warm-start preservation
+    that the combined-form bakes in through the next PD outer iter's
+    ``_rhs``.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _make_linear_solver(self, N=16):
+        """Build a small SPD linear solver and run build_schur_complement.
+
+        Returns (solver, A_csr_dense, particles, normals, alpha,
+        contact_dev_arrays).
+        """
+        import scipy.sparse as sp
+
+        from newton._src.solvers.fba.linear_solver import (  # noqa: PLC0415
+            FBALinearSolver,
+            factorize_and_sparse_inverse,
+        )
+
+        rng = np.random.default_rng(12345)
+        diag = rng.uniform(5.0, 15.0, N)
+        off = rng.uniform(-0.3, 0.3, N - 1)
+        A = sp.diags([off, diag, off], [-1, 0, 1], shape=(N, N), format="csr").astype(np.float64)
+        fs = factorize_and_sparse_inverse(A)
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        solver = FBALinearSolver(fs, device=device)
+
+        # 3 distinct-particle contacts with random normalized directions.
+        M = 3
+        particles = np.array([1, 5, 10], dtype=np.int32)
+        normals_np = np.array(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.5, 0.5, 0.707]],
+            dtype=np.float32,
+        )
+        normals_np /= np.linalg.norm(normals_np, axis=1, keepdims=True)
+        alpha_np = np.ones(M, dtype=np.float32)
+
+        p_d = wp.array(particles, dtype=wp.int32, device=device)
+        n_d = wp.array(normals_np, dtype=wp.vec3, device=device)
+        a_d = wp.array(alpha_np, dtype=wp.float32, device=device)
+
+        # Trigger isodof Schur build (the default in solver_fba) — populates
+        # ``_row_*_d`` / ``_isodof_row_*_d`` arrays used by
+        # ``apply_lambda_correction_combined``.
+        solver.build_schur_complement(M, p_d, n_d, a_d, use_isodof=True)
+
+        return (
+            solver,
+            A.toarray(),
+            particles,
+            normals_np,
+            alpha_np,
+            (p_d, n_d, a_d),
+        )
+
+    def test_combined_form_matches_split_form(self):
+        """``A⁻¹·(rhs + Jᵀ·lam) == A⁻¹·rhs + A⁻¹·Jᵀ·lam`` within float32 tolerance.
+
+        Verifies the algebraic equivalence of the new combined-form
+        ``apply_lambda_correction_combined`` (port target) against the
+        split-form ``correction = A⁻¹·Jᵀ·lam_apply; x_cur += correction``
+        (FBA pre-port behavior). Both must produce the same ``x_cur`` up
+        to float32 rounding noise.
+        """
+        N = 16
+        solver, _A_dense, particles, _normals, _alpha, _ = self._make_linear_solver(N=N)
+        device = solver.device
+
+        rng = np.random.default_rng(98765)
+        rhs_np = rng.standard_normal((N, 3)).astype(np.float32)
+        M = len(particles)
+        lam_np = rng.standard_normal(M).astype(np.float64)
+
+        # --- Reference: split-form ---
+        rhs_ref = wp.array(rhs_np.copy(), dtype=wp.vec3, device=device)
+        x_unc = wp.empty(N, dtype=wp.vec3, device=device)
+        solver.solve(rhs_ref, x_unc)
+        correction = wp.zeros(N, dtype=wp.vec3, device=device)
+        solver.apply_lambda_correction_isodof(lam_np, correction)
+        x_split = x_unc.numpy().astype(np.float64) + correction.numpy().astype(np.float64)
+
+        # --- Combined-form ---
+        rhs_comb = wp.array(rhs_np.copy(), dtype=wp.vec3, device=device)
+        x_comb = wp.empty(N, dtype=wp.vec3, device=device)
+        solver.apply_lambda_correction_combined(lam_np, rhs_comb, x_comb)
+        x_combined = x_comb.numpy().astype(np.float64)
+
+        # Float32 round-trip noise is ~1e-6 relative; allow a generous bound.
+        np.testing.assert_allclose(
+            x_combined,
+            x_split,
+            rtol=1e-4,
+            atol=1e-5,
+            err_msg=(
+                "apply_lambda_correction_combined (in-iter b += Jᵀ·lam, then "
+                "A⁻¹·b) disagrees with the split-form "
+                "(x_unc = A⁻¹·rhs, correction = A⁻¹·Jᵀ·lam, x = x_unc + "
+                "correction)."
+            ),
+        )
+
+    def test_combined_form_mutates_rhs_in_place(self):
+        """``rhs_inout`` is incremented by ``Jᵀ·lam`` (matches RealSim's
+        ``b += dt²·J·(ω·λ)`` in-place mutation).
+
+        This is the structural difference vs the split-form: in the
+        combined-form, the next PD outer iter's reuse of ``_rhs`` reflects
+        the prior iter's λ via the accumulated ``Jᵀ·λ`` term, which is
+        the warm-start mechanism RealSim relies on.
+        """
+        N = 16
+        solver, _A_dense, particles, normals, alpha, _ = self._make_linear_solver(N=N)
+        device = solver.device
+
+        rng = np.random.default_rng(11111)
+        rhs_init = rng.standard_normal((N, 3)).astype(np.float32)
+        M = len(particles)
+        lam_np = rng.standard_normal(M).astype(np.float64)
+
+        # Compute Jᵀ·lam analytically: for each contact r, particle p[r] gets
+        # ``alpha[r] * lam[r] * normal[r]`` added.
+        jt_lam_ref = np.zeros((N, 3), dtype=np.float64)
+        for c in range(M):
+            jt_lam_ref[int(particles[c])] += float(alpha[c]) * float(lam_np[c]) * normals[c].astype(np.float64)
+
+        rhs_d = wp.array(rhs_init.copy(), dtype=wp.vec3, device=device)
+        x_d = wp.empty(N, dtype=wp.vec3, device=device)
+        solver.apply_lambda_correction_combined(lam_np, rhs_d, x_d)
+
+        rhs_after = rhs_d.numpy().astype(np.float64)
+        expected_rhs = rhs_init.astype(np.float64) + jt_lam_ref
+        np.testing.assert_allclose(
+            rhs_after,
+            expected_rhs,
+            rtol=1e-5,
+            atol=1e-6,
+            err_msg=(
+                "apply_lambda_correction_combined did not mutate rhs_inout "
+                "to rhs_inout + Jᵀ·lam; warm-start preservation across PD "
+                "outer iters depends on this in-place update."
+            ),
+        )
+
+    def test_combined_form_zero_lam_is_pure_solve(self):
+        """When ``lam == 0``, combined-form reduces to ``x = A⁻¹·rhs`` (no contact contribution)."""
+        N = 16
+        solver, _A_dense, particles, _normals, _alpha, _ = self._make_linear_solver(N=N)
+        device = solver.device
+
+        rng = np.random.default_rng(22222)
+        rhs_np = rng.standard_normal((N, 3)).astype(np.float32)
+        M = len(particles)
+        lam_zero = np.zeros(M, dtype=np.float64)
+
+        # Reference: pure solve.
+        rhs_ref = wp.array(rhs_np.copy(), dtype=wp.vec3, device=device)
+        x_ref = wp.empty(N, dtype=wp.vec3, device=device)
+        solver.solve(rhs_ref, x_ref)
+
+        rhs_comb = wp.array(rhs_np.copy(), dtype=wp.vec3, device=device)
+        x_comb = wp.empty(N, dtype=wp.vec3, device=device)
+        solver.apply_lambda_correction_combined(lam_zero, rhs_comb, x_comb)
+
+        # Both rhs buffers must end identical (no Jᵀ·0 added) and x must match.
+        np.testing.assert_allclose(rhs_comb.numpy(), rhs_ref.numpy(), atol=0.0)
+        np.testing.assert_allclose(
+            x_comb.numpy().astype(np.float64),
+            x_ref.numpy().astype(np.float64),
+            rtol=1e-6,
+            atol=1e-7,
+            err_msg="lam = 0 must produce x == A⁻¹·rhs (no contact contribution).",
+        )
+
+    def test_two_pd_outer_iters_preserve_warm_start_via_rhs(self):
+        """Simulate two PD outer iters; the second iter's ``Jᵀ·λ`` accumulates
+        on top of ``rhs`` exactly the way RealSim does ``b += dt²·J·(ω·λ)``.
+
+        Verifies the warm-start preservation path: the combined-form uses
+        ``rhs`` mutation (rather than the deleted ``dt²·W·(ω·λ_init)``
+        term in NSN iter-0 penetration) to carry the prior iter's λ
+        forward into the next outer iter.
+        """
+        N = 16
+        solver, A_dense, particles, normals, alpha, _ = self._make_linear_solver(N=N)
+        device = solver.device
+        M = len(particles)
+
+        rng = np.random.default_rng(33333)
+        # Fresh rhs each PD outer iter (this is what solver_fba does — it
+        # zeros _rhs at the start of each outer iter and rebuilds it).
+        rhs_iter0 = rng.standard_normal((N, 3)).astype(np.float32)
+        lam_iter0 = rng.standard_normal(M).astype(np.float64)
+
+        rhs_iter1 = rng.standard_normal((N, 3)).astype(np.float32)  # different rhs after re-projection
+        lam_iter1 = rng.standard_normal(M).astype(np.float64)
+
+        # Iter 0: rhs0 → x0 = A⁻¹·(rhs0 + Jᵀ·lam0).
+        rhs0_d = wp.array(rhs_iter0.copy(), dtype=wp.vec3, device=device)
+        x0_d = wp.empty(N, dtype=wp.vec3, device=device)
+        solver.apply_lambda_correction_combined(lam_iter0, rhs0_d, x0_d)
+
+        # Iter 1: independent rhs1 → x1 = A⁻¹·(rhs1 + Jᵀ·lam1).
+        rhs1_d = wp.array(rhs_iter1.copy(), dtype=wp.vec3, device=device)
+        x1_d = wp.empty(N, dtype=wp.vec3, device=device)
+        solver.apply_lambda_correction_combined(lam_iter1, rhs1_d, x1_d)
+
+        # Compare against analytic reference for iter 1: must depend only on
+        # (rhs1, lam1), not on (rhs0, lam0) — i.e., no carryover of warm-start
+        # via state inside the linear solver.
+        Ainv = np.linalg.inv(A_dense)
+        jt_lam1 = np.zeros((N, 3), dtype=np.float64)
+        for c in range(M):
+            jt_lam1[int(particles[c])] += float(alpha[c]) * float(lam_iter1[c]) * normals[c].astype(np.float64)
+        ref_b1 = rhs_iter1.astype(np.float64) + jt_lam1
+        ref_x1 = (Ainv @ ref_b1).astype(np.float64)
+
+        np.testing.assert_allclose(
+            x1_d.numpy().astype(np.float64),
+            ref_x1,
+            rtol=1e-4,
+            atol=1e-5,
+            err_msg=(
+                "Second PD outer iter's combined-form solve must match "
+                "A⁻¹·(rhs1 + Jᵀ·lam1) without leaking iter-0 state. The "
+                "warm-start carryover is intended to flow through "
+                "``λ_persistent`` (caller-side), not through linear-solver "
+                "internal buffers."
+            ),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

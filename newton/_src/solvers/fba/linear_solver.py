@@ -1350,3 +1350,94 @@ class FBALinearSolver:
 
         # Single Cholesky solve: out = A^{-1} * (J^T lambda).
         self.solve(self._jt_lambda_d, out)
+
+    def apply_lambda_correction_combined(
+        self,
+        lam: np.ndarray,
+        rhs_inout: wp.array[wp.vec3],
+        x_out: wp.array[wp.vec3],
+    ) -> None:
+        """Compute ``x_out = A⁻¹ · (rhs_inout + Jᵀ · lam)`` with in-place rhs update.
+
+        Implements RealSim's combined-form constraint correction from
+        ``NonSmoothNewton.cpp:151-167`` (``applyConstraintCorrection``):
+
+            b += dt² · Jᵀ · (ω · λ)
+            _systemlinearsolver->solve(x, b)
+
+        Used by :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA.step` to
+        replace the prior split-form ``x_cur += A⁻¹ · Jᵀ · lam_apply``. The
+        combined form is algebraically equivalent but bit-distinct under
+        float32 rounding, matching RealSim's single ``A⁻¹`` solve over the
+        already-incremented ``b`` vector.
+
+        The implementation:
+
+        1. Gathers ``Jᵀ · lam`` into the cached ``_jt_lambda_d`` buffer (same
+           particle-centered gather as :meth:`apply_lambda_correction_isodof`).
+        2. Accumulates that into ``rhs_inout`` in-place (``rhs_inout[p] +=
+           (Jᵀ·lam)[p]``).
+        3. Runs a single Cholesky solve ``x_out = A⁻¹ · rhs_inout``.
+
+        Both the isodof and legacy non-isodof Schur build paths populate the
+        per-row metadata (``_row_*_d``, ``_isodof_row_*_d``) needed for the
+        gather, so this helper works under both modes.
+
+        Args:
+            lam: Contact impulse vector, shape ``(total_rows,)``, float64.
+                ``total_rows == M`` for Stage A, ``3 * M`` for Stage B.
+            rhs_inout: Right-hand side vec3 array of length ``N`` —
+                MUTATED in place to ``rhs_inout + Jᵀ·lam``.
+            x_out: Output position correction, shape ``[N]``, vec3.
+                Overwritten with ``A⁻¹ · (rhs_inout + Jᵀ·lam)``.
+        """
+        from .kernels import accumulate_vec3_kernel, gather_jt_lambda_kernel  # noqa: PLC0415
+
+        if not hasattr(self, "_row_particle_d") or not hasattr(self, "_isodof_row_offsets_d"):
+            raise RuntimeError(
+                "apply_lambda_correction_combined requires a prior "
+                "build_schur_complement call (which sets _row_*_d / "
+                "_isodof_row_*_d arrays)."
+            )
+
+        n = self.n
+        dev = self.device
+        n_rows = self._row_total
+
+        if not hasattr(self, "_jt_lambda_d") or self._jt_lambda_d.shape[0] != n:
+            self._jt_lambda_d = wp.empty(n, dtype=wp.vec3, device=dev)
+        if not hasattr(self, "_lam_d") or self._lam_d.shape[0] < n_rows:
+            cap = max(n_rows, int(getattr(self, "_lam_cap", 0) * 1.5) + 1)
+            self._lam_cap = cap
+            self._lam_d = wp.empty(cap, dtype=wp.float32, device=dev)
+
+        self._lam_d.assign(lam.astype(np.float32))
+
+        # Step 1: particle-centered gather Jᵀ·lam into _jt_lambda_d.
+        wp.launch(
+            gather_jt_lambda_kernel,
+            dim=n,
+            inputs=[
+                self._isodof_row_offsets_d,
+                self._isodof_row_indices_d,
+                self._row_dir_d,
+                self._row_alpha_d,
+                self._lam_d,
+            ],
+            outputs=[self._jt_lambda_d],
+            device=dev,
+        )
+
+        # Step 2: rhs_inout += Jᵀ·lam  (RealSim's b += dt²·J·(ω·λ); the dt²·ω
+        # weighting is folded into ``lam`` by the caller, see
+        # ``_solve_nsn_*`` which returns ``lam_apply = dt²·ω·λ``).
+        wp.launch(
+            accumulate_vec3_kernel,
+            dim=n,
+            inputs=[self._jt_lambda_d],
+            outputs=[rhs_inout],
+            device=dev,
+        )
+
+        # Step 3: single Cholesky solve x_out = A⁻¹ · rhs_inout.
+        self.solve(rhs_inout, x_out)

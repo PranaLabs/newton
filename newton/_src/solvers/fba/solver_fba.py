@@ -560,7 +560,6 @@ class SolverFBA(SolverBase):
                 step or when changed (PD Hessian depends on dt).
         """
         from .kernels import (  # noqa: PLC0415
-            accumulate_vec3_kernel,
             add_inertia_to_rhs_kernel,
             compute_inertial_kernel,
             gather_per_particle_kernel,
@@ -908,15 +907,15 @@ class SolverFBA(SolverBase):
                     )
                     self._lam_coulomb_persistent = lam.copy()
                     self._omega_coulomb_persistent = omega_last.copy()
+                    # RealSim in-iter combined-form correction (Task 1.3.g,
+                    # A-tier alignment): mirrors NonSmoothNewton.cpp:151-167's
+                    # ``applyConstraintCorrection`` — ``b += dt²·J·(ω·λ);
+                    # _systemlinearsolver->solve(x, b)``. Replaces the prior
+                    # split-form ``correction = A⁻¹·Jᵀ·lam_apply;
+                    # x_cur += correction``. Algebraically equivalent but
+                    # bit-distinct under float32 rounding.
                     if np.any(np.abs(lam_apply) > 1e-15):
-                        correction = self._apply_lambda_correction_friction(lam_apply)
-                        wp.launch(
-                            accumulate_vec3_kernel,
-                            dim=N,
-                            inputs=[correction],
-                            outputs=[self._x_cur],
-                            device=device,
-                        )
+                        ls.apply_lambda_correction_combined(lam_apply, self._rhs, self._x_cur)
                 else:
                     # Stage A: M Schur complement, unilateral (λ ≥ 0) only.
                     if self._cached_W is None or not self._cached_A_inv_Jt_valid:
@@ -943,15 +942,14 @@ class SolverFBA(SolverBase):
                     )
                     self._lam_unilateral_persistent = lam.copy()
                     self._omega_unilateral_persistent = omega_last.copy()
+                    # RealSim in-iter combined-form correction (Task 1.3.g):
+                    # mirrors NonSmoothNewton.cpp:151-167 — ``b += dt²·J·(ω·λ);
+                    # _systemlinearsolver->solve(x, b)``. Replaces the prior
+                    # split-form ``correction = A⁻¹·Jᵀ·lam_apply;
+                    # x_cur += correction``. Algebraically equivalent but
+                    # bit-distinct under float32 rounding.
                     if np.any(lam_apply > 1e-15):
-                        correction = self._apply_lambda_correction(lam_apply)
-                        wp.launch(
-                            accumulate_vec3_kernel,
-                            dim=N,
-                            inputs=[correction],
-                            outputs=[self._x_cur],
-                            device=device,
-                        )
+                        ls.apply_lambda_correction_combined(lam_apply, self._rhs, self._x_cur)
 
         # 3) Write velocity and update state_out.
         wp.copy(state_out.particle_q, self._x_cur)
