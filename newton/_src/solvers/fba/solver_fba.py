@@ -214,7 +214,7 @@ class SolverFBA(SolverBase):
         lam: float | None = None,
         friction: bool = True,
         mu_per_pair_override: np.ndarray | None = None,
-        nsn_iterations: int = 1,
+        nsn_iterations: int = 10,
         lambda_cap: float | None = None,
         use_isodof: bool = True,
         shape_angular_velocity: dict[int, float] | None = None,
@@ -232,8 +232,9 @@ class SolverFBA(SolverBase):
             mu_per_pair_override: Optional ``(num_pairs,)`` array of friction
                 coefficients overriding ``model.shape_material_mu`` lookups.
             nsn_iterations: Maximum projected Gauss-Seidel iterations for the
-                contact NSN solver per PD step. Matches RealSim's per-scene
-                ``constraintsolver.iterations`` setting.
+                contact NSN solver per PD step. Defaults to ``10`` to match
+                RealSim's ``constraintsolver.iterations: 10`` cap (verified
+                across all CudaTests demos that set this field).
             lambda_cap: Optional per-step clamp ``|λ| <= lambda_cap`` applied
                 to contact impulses after the NSN solve. ``None`` disables
                 clamping; mirrors RealSim's ``constraintsolver.maxforce``.

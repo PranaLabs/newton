@@ -2578,9 +2578,7 @@ class TestPhase4StageAContact(unittest.TestCase):
         """
         model = self._build_single_particle_model(y=-0.5)
         device = model.device
-        # nsn_iterations=10 matches RealSim's max-iter cap; FB-Newton needs >1 iter
-        # to fully resolve deep penetration from a cold start (P2-E port).
-        solver = SolverFBA(model, iterations=10, nsn_iterations=10)
+        solver = SolverFBA(model, iterations=10)
 
         contacts = self._make_contacts(
             device,
@@ -2630,8 +2628,7 @@ class TestPhase4StageAContact(unittest.TestCase):
         device = model.device
         N = model.particle_count
 
-        # nsn_iterations=10 to give FB-Newton enough iters for deep-penetration recovery.
-        solver = SolverFBA(model, iterations=10, nsn_iterations=10)
+        solver = SolverFBA(model, iterations=10)
 
         # All particles start at y = -0.5; identify the free ones.
         pos_np = model.particle_q.numpy()  # (N, 3)  # noqa: F841
@@ -2907,9 +2904,8 @@ class TestPhase4StageBFriction(unittest.TestCase):
         dt = 1.0 / 60.0
 
         # Two identical friction=False solvers must agree exactly.
-        # nsn_iterations=10 needed for FB-Newton to fully resolve the y=-0.5 penetration.
-        solver_a = SolverFBA(model, iterations=5, friction=False, nsn_iterations=10)
-        solver_b = SolverFBA(model, iterations=5, friction=False, nsn_iterations=10)
+        solver_a = SolverFBA(model, iterations=5, friction=False)
+        solver_b = SolverFBA(model, iterations=5, friction=False)
 
         s_in_a, s_out_a = model.state(), model.state()
         s_in_b, s_out_b = model.state(), model.state()
@@ -3628,10 +3624,10 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
         )
         return builder.finalize()
 
-    def test_default_nsn_iter_is_1(self) -> None:
+    def test_default_nsn_iter_is_10(self) -> None:
         model = self._tiny_cloth_model()
         solver = SolverFBA(model)
-        self.assertEqual(solver.nsn_iterations, 1)
+        self.assertEqual(solver.nsn_iterations, 10)
 
     def test_nsn_iter_overridable(self) -> None:
         model = self._tiny_cloth_model()

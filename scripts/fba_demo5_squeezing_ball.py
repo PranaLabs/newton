@@ -27,13 +27,11 @@ from newton.solvers import SolverFBA
 from scripts.fba_cudatest_bench.medit import load_medit_mesh
 from scripts.fba_cudatest_bench.perf import record_row, stats_from_times_ms
 
-MESH_PATH = Path(
-    "/home/ziqiu/work/RealSim_py/realsim_py/resources/mesh/volume/ball_volume_7129P.mesh"
-)
+MESH_PATH = Path("/home/ziqiu/work/RealSim_py/realsim_py/resources/mesh/volume/ball_volume_7129P.mesh")
 DT = 0.01
 TOTAL_FRAMES = 600
 PD_ITERATIONS = 5
-NSN_ITERATIONS = 1
+NSN_ITERATIONS = 10  # matches RealSim's constraintsolver.iterations cap
 GRAVITY = -10.0  # Y-down
 
 YOUNG = 1.0e4
@@ -214,9 +212,7 @@ def main() -> None:
 
     result = run()
     stats = result["stats"]
-    print(
-        f"  mean_ms={stats['mean_ms']:.2f}  median={stats['median_ms']:.2f}  p95={stats['p95_ms']:.2f}"
-    )
+    print(f"  mean_ms={stats['mean_ms']:.2f}  median={stats['median_ms']:.2f}  p95={stats['p95_ms']:.2f}")
     print(
         f"  stable={stats['stable']}  min_y={stats['min_y']:.3f}  "
         f"x_drift={stats['x_drift']:.3f}  z_drift={stats['z_drift']:.3f}"
