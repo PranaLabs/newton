@@ -3149,3 +3149,236 @@ def build_a_schur_kernel(
     if i == j:
         val = val + compliance[i]
     a_schur[i, j] = val
+
+
+# ---------------------------------------------------------------------------
+# Step 5.5 — update_contacts per-contact bookkeeping ported to GPU.
+#
+# CPU implementation pulled six per-contact buffers to host every step and
+# ran a Python ``for`` loop to evaluate the body transform, sphere/cylinder
+# cushion, and (Stage B) the tangent basis / kinematic anchor velocity.
+# These kernels move that loop on-device; only the lexsort (intentional S.1
+# for determinism) and the singleton ``soft_contact_count`` read still hit
+# the host. See :meth:`newton._src.solvers.fba.solver_fba.SolverFBA.update_contacts`.
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def compute_world_anchor_kernel(
+    body_pos: wp.array[wp.vec3],  # (M,) contact anchor in body-local or world frame
+    shape_idx: wp.array[wp.int32],  # (M,) shape index per contact
+    shape_body: wp.array[wp.int32],  # (n_shapes,) body index per shape (-1 = static)
+    body_q: wp.array[wp.transform],  # (n_bodies,) world-frame body transform
+    has_body_q: wp.int32,  # 1 if body_q is valid (n_bodies > 0)
+    has_shape_body: wp.int32,  # 1 if shape_body is valid
+    world_anchor: wp.array[wp.vec3],  # (M,) OUTPUT contact anchor in world frame
+):
+    """Promote per-contact ``body_pos`` to world frame.
+
+    Matches the CPU reference in
+    :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA.update_contacts`:
+    if the contact's shape is attached to a dynamic body, transform
+    ``body_pos`` through the body quaternion; otherwise pass through
+    (static shapes already store world-frame anchors per the collision
+    pipeline convention).
+
+    Args:
+        body_pos: Per-contact anchor, shape ``[M]``.
+        shape_idx: Per-contact shape index, shape ``[M]``; ``< 0`` skips body lookup.
+        shape_body: Body index per shape (``-1`` for static), shape ``[n_shapes]``.
+        body_q: World-frame body transforms, shape ``[n_bodies]``.
+        has_body_q: ``1`` when ``body_q`` is populated; ``0`` triggers pass-through.
+        has_shape_body: ``1`` when ``shape_body`` is populated; ``0`` triggers pass-through.
+        world_anchor: Output world-frame anchors, shape ``[M]``.
+    """
+    c = wp.tid()
+    bpos = body_pos[c]
+    s = shape_idx[c]
+    if s < 0 or has_shape_body == 0 or has_body_q == 0:
+        world_anchor[c] = bpos
+        return
+    b_idx = shape_body[s]
+    if b_idx < 0:
+        world_anchor[c] = bpos
+        return
+    world_anchor[c] = wp.transform_point(body_q[b_idx], bpos)
+
+
+@wp.kernel
+def compute_normal_offset_kernel(
+    normal: wp.array[wp.vec3],  # (M,) world-frame unit normal per contact
+    world_anchor: wp.array[wp.vec3],  # (M,) world-frame contact anchor
+    shape_idx: wp.array[wp.int32],  # (M,)
+    shape_type: wp.array[wp.int32],  # (n_shapes,)
+    has_shape_type: wp.int32,
+    sphere_geo_type: wp.int32,  # GeoType.SPHERE value
+    cylinder_geo_type: wp.int32,  # GeoType.CYLINDER value
+    offset: wp.array[wp.float64],  # (M,) OUTPUT
+):
+    """Compute ``offset[c] = n·world_anchor`` plus sphere/cylinder cushion.
+
+    Matches the CPU loop in
+    :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA.update_contacts`:
+    apply the 0.01 m RealSim interpenetration cushion to sphere and
+    cylinder normal rows (``SphereCollision.cpp:121``,
+    ``CylinderCollision.cpp:84``); plane and mesh contacts have no cushion.
+
+    Args:
+        normal: Per-contact unit normal, shape ``[M]``.
+        world_anchor: Per-contact world-frame anchor, shape ``[M]``.
+        shape_idx: Per-contact shape index, shape ``[M]``.
+        shape_type: Geometry type per shape, shape ``[n_shapes]``.
+        has_shape_type: ``1`` when ``shape_type`` is populated.
+        sphere_geo_type: Integer value of :class:`~newton.geometry.GeoType.SPHERE`.
+        cylinder_geo_type: Integer value of :class:`~newton.geometry.GeoType.CYLINDER`.
+        offset: Output ``n·anchor`` (with cushion if applicable), shape ``[M]``.
+    """
+    c = wp.tid()
+    val = wp.float64(wp.dot(normal[c], world_anchor[c]))
+    s = shape_idx[c]
+    if has_shape_type == 1 and s >= 0:
+        st = shape_type[s]
+        if st == sphere_geo_type or st == cylinder_geo_type:
+            val = val - wp.float64(0.01)
+    offset[c] = val
+
+
+@wp.kernel
+def compute_tangent_basis_kernel(
+    normal: wp.array[wp.vec3],  # (M,) world-frame unit normal per contact
+    shape_idx: wp.array[wp.int32],  # (M,)
+    shape_omega: wp.array[wp.float64],  # (n_shapes,) angular vel about local +Z
+    shape_transform: wp.array[wp.transform],  # (n_shapes,) shape→world transform
+    has_shape_omega: wp.int32,
+    has_shape_transform: wp.int32,
+    t1_out: wp.array[wp.vec3],  # (M,) OUTPUT first tangent
+    t2_out: wp.array[wp.vec3],  # (M,) OUTPUT second tangent
+    is_spinning_out: wp.array[wp.int32],  # (M,) OUTPUT flag for v_anchor
+):
+    """Compute per-contact orthonormal tangent basis ``(t1, t2)``.
+
+    Mirrors :func:`~newton._src.solvers.fba.solver_fba.compute_tangent_basis`
+    for the default case (pick a reference direction, cross with ``n``).
+    When the contact's shape has nonzero ``shape_omega`` and a valid
+    transform, switch to the cylinder-rolling-aligned basis used in
+    ``update_contacts``: ``t1 = normalize(cross(n, axis_world))``,
+    ``t2 = normalize(cross(n, t1))``. ``is_spinning_out[c]`` is set to ``1``
+    only when the override succeeded - the v_anchor kernel uses that flag
+    to decide whether to emit a kinematic anchor velocity.
+
+    Args:
+        normal: Per-contact unit normal, shape ``[M]``.
+        shape_idx: Per-contact shape index, shape ``[M]``.
+        shape_omega: Per-shape angular velocity about local +Z, shape ``[n_shapes]``.
+        shape_transform: Per-shape transform, shape ``[n_shapes]``.
+        has_shape_omega: ``1`` when ``shape_omega`` is populated.
+        has_shape_transform: ``1`` when ``shape_transform`` is populated.
+        t1_out: Output first tangent vectors, shape ``[M]``.
+        t2_out: Output second tangent vectors, shape ``[M]``.
+        is_spinning_out: Output spinning-shape flags, shape ``[M]``.
+    """
+    c = wp.tid()
+    n = normal[c]
+    # Default arbitrary basis: pick world Y when n is nearly aligned to world X,
+    # otherwise world X — matches ``compute_tangent_basis`` exactly.
+    if wp.abs(n[0]) > 0.9:
+        ref = wp.vec3(0.0, 1.0, 0.0)
+    else:
+        ref = wp.vec3(1.0, 0.0, 0.0)
+    t1 = wp.cross(n, ref)
+    t1_len = wp.length(t1)
+    t1 = t1 / (t1_len + 1.0e-30)
+    t2 = wp.cross(n, t1)
+    t2_len = wp.length(t2)
+    t2 = t2 / (t2_len + 1.0e-30)
+    is_spin = wp.int32(0)
+
+    s = shape_idx[c]
+    if has_shape_omega == 1 and has_shape_transform == 1 and s >= 0 and s < shape_omega.shape[0]:
+        if shape_omega[s] != wp.float64(0.0):
+            xf = shape_transform[s]
+            axis_world = wp.transform_vector(xf, wp.vec3(0.0, 0.0, 1.0))
+            t1_vec = wp.cross(n, axis_world)
+            n1 = wp.length(t1_vec)
+            if n1 >= 1.0e-9:
+                t1 = t1_vec / n1
+                t2_raw = wp.cross(n, t1)
+                n2 = wp.length(t2_raw)
+                t2 = t2_raw / wp.max(n2, 1.0e-30)
+                is_spin = wp.int32(1)
+    t1_out[c] = t1
+    t2_out[c] = t2
+    is_spinning_out[c] = is_spin
+
+
+@wp.kernel
+def compute_tangent_offsets_kernel(
+    t1: wp.array[wp.vec3],
+    t2: wp.array[wp.vec3],
+    world_anchor: wp.array[wp.vec3],
+    tangent1_offset: wp.array[wp.float64],  # (M,) OUTPUT
+    tangent2_offset: wp.array[wp.float64],  # (M,) OUTPUT
+):
+    """Compute per-contact tangent offsets ``t·world_anchor``.
+
+    Provides the friction residual reference position so
+    ``r_t = t·anchor - alpha·t·x_unc`` measures tangential displacement
+    from the contact point rather than from the world origin.
+
+    Args:
+        t1: First tangent vectors, shape ``[M]``.
+        t2: Second tangent vectors, shape ``[M]``.
+        world_anchor: World-frame contact anchors, shape ``[M]``.
+        tangent1_offset: Output ``t1·anchor`` (fp64), shape ``[M]``.
+        tangent2_offset: Output ``t2·anchor`` (fp64), shape ``[M]``.
+    """
+    c = wp.tid()
+    a = world_anchor[c]
+    tangent1_offset[c] = wp.float64(wp.dot(t1[c], a))
+    tangent2_offset[c] = wp.float64(wp.dot(t2[c], a))
+
+
+@wp.kernel
+def compute_v_anchor_kernel(
+    is_spinning: wp.array[wp.int32],  # (M,) flag from compute_tangent_basis_kernel
+    shape_idx: wp.array[wp.int32],  # (M,)
+    shape_omega: wp.array[wp.float64],  # (n_shapes,)
+    shape_transform: wp.array[wp.transform],  # (n_shapes,)
+    world_anchor: wp.array[wp.vec3],  # (M,) world-frame anchor
+    v_anchor: wp.array[wp.vec3d],  # (M,) OUTPUT fp64 kinematic velocity
+):
+    """Kinematic anchor velocity for rolling cylinder contacts.
+
+    For non-spinning contacts ``v_anchor = 0``. For spinning cylinder
+    shapes ``v_anchor = -omega · cross(axis_world, r_local)`` where
+    ``r_local = world_anchor - shape_translation`` and ``axis_world`` is
+    the shape's local +Z direction in world frame. The leading minus
+    matches RealSim's sign convention; see comment in CPU reference
+    :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA.update_contacts`.
+
+    Args:
+        is_spinning: Per-contact spinning-shape flag from
+            :func:`compute_tangent_basis_kernel`, shape ``[M]``.
+        shape_idx: Per-contact shape index, shape ``[M]``.
+        shape_omega: Per-shape angular velocity, shape ``[n_shapes]``.
+        shape_transform: Per-shape transform, shape ``[n_shapes]``.
+        world_anchor: Per-contact world-frame anchor, shape ``[M]``.
+        v_anchor: Output kinematic anchor velocity (fp64 vec3), shape ``[M]``.
+    """
+    c = wp.tid()
+    if is_spinning[c] == 0:
+        v_anchor[c] = wp.vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
+        return
+    s = shape_idx[c]
+    xf = shape_transform[s]
+    axis_world = wp.transform_vector(xf, wp.vec3(0.0, 0.0, 1.0))
+    shape_p = wp.transform_get_translation(xf)
+    a = world_anchor[c]
+    r_local = wp.vec3(a[0] - shape_p[0], a[1] - shape_p[1], a[2] - shape_p[2])
+    cross_ar = wp.cross(axis_world, r_local)
+    omega = shape_omega[s]
+    v_anchor[c] = wp.vec3d(
+        -omega * wp.float64(cross_ar[0]),
+        -omega * wp.float64(cross_ar[1]),
+        -omega * wp.float64(cross_ar[2]),
+    )

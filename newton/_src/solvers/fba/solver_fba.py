@@ -328,6 +328,9 @@ class SolverFBA(SolverBase):
             for s_idx, omega in shape_angular_velocity.items():
                 if 0 <= int(s_idx) < n_shapes:
                     self._shape_omega_h[int(s_idx)] = float(omega)
+        # Device mirror consumed by the Step 5.5 GPU contact kernels; the
+        # host array stays the source of truth (small, rarely modified).
+        self._shape_omega_d = wp.array(self._shape_omega_h, dtype=wp.float64, device=model.device)
 
         # PD setup is dt-dependent; we cache the assembly at a reference dt and
         # rebuild lazily inside `step` if the dt changes.
@@ -1139,6 +1142,17 @@ class SolverFBA(SolverBase):
         self._contact_tangent1_d = wp.empty(cap, dtype=wp.vec3, device=device)
         self._contact_tangent2_d = wp.empty(cap, dtype=wp.vec3, device=device)
         self._contact_mu_h = np.zeros(cap, dtype=np.float64)  # host-side mu array
+        # Step 5.5: device-resident scratch buffers consumed by the
+        # ``update_contacts`` GPU kernels (world anchor, tangent offsets,
+        # spinning flag, v_anchor). Sized to ``cap`` once here so kernel
+        # launches in :meth:`update_contacts` never re-allocate.
+        self._contact_shape_d = wp.empty(cap, dtype=wp.int32, device=device)
+        self._contact_body_pos_d = wp.empty(cap, dtype=wp.vec3, device=device)
+        self._contact_world_anchor_d = wp.empty(cap, dtype=wp.vec3, device=device)
+        self._contact_is_spinning_d = wp.empty(cap, dtype=wp.int32, device=device)
+        self._contact_tangent1_offset_d = wp.empty(cap, dtype=wp.float64, device=device)
+        self._contact_tangent2_offset_d = wp.empty(cap, dtype=wp.float64, device=device)
+        self._contact_v_anchor_d = wp.empty(cap, dtype=wp.vec3d, device=device)
 
     def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
         """Ingest the active particle-vs-shape contact set for the next step.
@@ -1172,7 +1186,12 @@ class SolverFBA(SolverBase):
             self._contact_count = 0
             return
 
-        # Pull contact data to host for filtering (M is small in Stage A).
+        # Pull contact data to host for the lexsort (intentional S.1
+        # for deterministic contact ordering; M is small so this is fast).
+        # The collision pipeline writes contacts to slots assigned by
+        # ``wp.atomic_add(soft_contact_count, 0, 1)`` so per-frame order
+        # depends on GPU thread scheduling — downstream Gauss-Seidel and
+        # atomic ``J^T λ`` accumulation are order-sensitive, hence we sort.
         particle_h = contacts.soft_contact_particle.numpy()[:M_raw]
         shape_h = contacts.soft_contact_shape.numpy()[:M_raw]
         # soft_contact_body_pos convention (from create_soft_contacts kernel):
@@ -1181,13 +1200,6 @@ class SolverFBA(SolverBase):
         #     (because X_wb = identity so X_ws = X_bs, and body_pos = X_bs * x_local).
         body_pos_h = contacts.soft_contact_body_pos.numpy()[:M_raw]
         normal_h = contacts.soft_contact_normal.numpy()[:M_raw]  # world frame
-
-        # Access model fields needed for world-frame body_pos conversion.
-        model = self.model
-        shape_body_np = model.shape_body.numpy() if hasattr(model, "shape_body") else None
-        shape_type_np = (
-            model.shape_type.numpy() if hasattr(model, "shape_type") and model.shape_type is not None else None
-        )
 
         # Filter out sentinel entries (particle == -1).
         valid_mask = particle_h >= 0
@@ -1201,17 +1213,7 @@ class SolverFBA(SolverBase):
             self._contact_count = 0
             return
 
-        # Deterministic contact ordering.  The collision pipeline writes
-        # contacts to slots assigned by ``wp.atomic_add(soft_contact_count,
-        # 0, 1)`` (see ``newton/_src/geometry/kernels.py``), so the per-frame
-        # order depends on GPU thread-scheduling and varies between runs
-        # with identical seeds.  Downstream consumers (NSN Gauss-Seidel,
-        # atomic ``J^T lambda`` accumulation) are order-sensitive, which
-        # causes wildly different trajectories across runs (SqueezingBall
-        # demo: ~5 unit spread in ball ``min_y``).  Lexicographically sort
-        # the contact arrays by ``(particle, shape, normal)`` so the
-        # solver sees an identical permutation every step.  ``M`` is at
-        # most ~thousand here, so the sort is negligible.
+        # Deterministic contact ordering (host-side lexsort — see comment above).
         sort_keys = (
             normal_h[:, 2].astype(np.float64),
             normal_h[:, 1].astype(np.float64),
@@ -1227,170 +1229,160 @@ class SolverFBA(SolverBase):
 
         self._ensure_contact_buffers(M)
 
-        # Build offset: pene0[c] = dot(normal, world_anchor)
-        # world_anchor is the contact-point position in world frame.
-        offset_h = np.zeros(M, dtype=np.float64)
+        # Step 5.5: per-contact bookkeeping (world_anchor, n·anchor offset,
+        # tangent basis, t·anchor tangent offsets, v_anchor for rolling
+        # cylinders) runs on GPU.  Only the lexsort above and the
+        # singleton ``soft_contact_count`` read still hit the host;
+        # everything else stays device-resident.
+        from .kernels import (  # noqa: PLC0415
+            compute_normal_offset_kernel,
+            compute_tangent_basis_kernel,
+            compute_tangent_offsets_kernel,
+            compute_v_anchor_kernel,
+            compute_world_anchor_kernel,
+        )
+
+        model = self.model
+        device = self._device
         alpha_h = np.ones(M, dtype=np.float32)
 
-        body_q_np = model.body_q.numpy() if hasattr(model, "body_q") and model.body_q is not None else None
+        # Upload (sorted) compact contact arrays to device once.
+        self._contact_particle_d.assign(particle_h.astype(np.int32))
+        self._contact_normal_d.assign(normal_h.astype(np.float32))
+        self._contact_alpha_d.assign(alpha_h)
+        self._contact_shape_d.assign(shape_h.astype(np.int32))
+        self._contact_body_pos_d.assign(body_pos_h.astype(np.float32))
 
-        for c in range(M):
-            s_idx = int(shape_h[c])
-            bpos = body_pos_h[c]  # contact anchor (coordinate frame depends on body_index; see note above)
+        # Resolve model fields used by the GPU kernels.  When a field is
+        # absent or empty we still pass a non-null dummy buffer through
+        # the kernel and gate the lookup with a ``has_*`` flag, matching
+        # the CPU branches that previously skipped these lookups.
+        body_q_arr = model.body_q if hasattr(model, "body_q") and model.body_q is not None else None
+        has_body_q = wp.int32(1 if body_q_arr is not None and body_q_arr.size > 0 else 0)
+        if body_q_arr is None or body_q_arr.size == 0:
+            body_q_arr = wp.empty(1, dtype=wp.transform, device=device)
 
-            # Compute world anchor.
-            # For dynamic bodies: bpos is in body-local frame → apply body_q to get world.
-            # For static shapes: bpos is already in world frame (body_index=-1, X_wb=identity).
-            # Do NOT apply shape_transform to static shapes — that would be a double-transform.
-            world_anchor = bpos.copy()
-            if shape_body_np is not None and s_idx >= 0:
-                b_idx = int(shape_body_np[s_idx])
-                if b_idx >= 0 and body_q_np is not None:
-                    # Shape attached to a moving body — transform body-local → world.
-                    bq = body_q_np[b_idx]  # (7,): [px, py, pz, qx, qy, qz, qw]
-                    pos_b = bq[:3]
-                    quat_b = bq[3:]  # [qx, qy, qz, qw]
-                    world_anchor = _transform_point(pos_b, quat_b, bpos)
-                # else: body_index < 0 → bpos is already world frame; keep world_anchor = bpos
+        shape_body_arr = model.shape_body if hasattr(model, "shape_body") and model.shape_body is not None else None
+        has_shape_body = wp.int32(1 if shape_body_arr is not None and shape_body_arr.size > 0 else 0)
+        if shape_body_arr is None or shape_body_arr.size == 0:
+            shape_body_arr = wp.empty(1, dtype=wp.int32, device=device)
 
-            n = normal_h[c]
-            offset_h[c] = float(np.dot(n, world_anchor))
+        shape_type_arr = model.shape_type if hasattr(model, "shape_type") and model.shape_type is not None else None
+        has_shape_type = wp.int32(1 if shape_type_arr is not None and shape_type_arr.size > 0 else 0)
+        if shape_type_arr is None or shape_type_arr.size == 0:
+            shape_type_arr = wp.empty(1, dtype=wp.int32, device=device)
 
-            # RealSim sphere/cylinder normal rows use a 0.01 m interpenetration
-            # cushion (``_point - 0.01*n`` in SphereCollision.cpp:121 and
-            # CylinderCollision.cpp:84). Plane and mesh contacts have no cushion.
-            # Since |n|=1, the vector shift reduces to a scalar ``-0.01``.
-            # Tangent offsets intentionally keep the unshifted anchor (see
-            # SphereCollision.cpp:127-129 and CylinderCollision.cpp:88-91).
-            if shape_type_np is not None and s_idx >= 0:
-                st = int(shape_type_np[s_idx])
-                if st == int(GeoType.SPHERE) or st == int(GeoType.CYLINDER):
-                    offset_h[c] -= 0.01
+        shape_transform_arr = (
+            model.shape_transform if hasattr(model, "shape_transform") and model.shape_transform is not None else None
+        )
+        has_shape_transform = wp.int32(1 if shape_transform_arr is not None and shape_transform_arr.size > 0 else 0)
+        if shape_transform_arr is None or shape_transform_arr.size == 0:
+            shape_transform_arr = wp.empty(1, dtype=wp.transform, device=device)
 
-        # Upload compact arrays to device.
-        self._contact_particle_d.assign(particle_h[:M].astype(np.int32))
-        self._contact_normal_d.assign(normal_h[:M].astype(np.float32))
-        self._contact_alpha_d.assign(alpha_h[:M])
-        self._contact_offset_d.assign(offset_h[:M])
+        has_shape_omega = wp.int32(1 if self._shape_omega_d.size > 0 else 0)
 
-        # Keep host copies for the residual computation (avoids repeated .numpy()).
-        self._contact_particle_h = particle_h[:M].astype(np.int32)
-        self._contact_normal_h = normal_h[:M].astype(np.float32)
-        self._contact_alpha_h = alpha_h[:M]
-        self._contact_offset_h = offset_h[:M]
+        # Kernel 1: world-frame anchor.  Static-shape contacts pass body_pos
+        # through; dynamic contacts apply body_q.
+        wp.launch(
+            compute_world_anchor_kernel,
+            dim=M,
+            inputs=[
+                self._contact_body_pos_d,
+                self._contact_shape_d,
+                shape_body_arr,
+                body_q_arr,
+                has_body_q,
+                has_shape_body,
+            ],
+            outputs=[self._contact_world_anchor_d],
+            device=device,
+        )
+
+        # Kernel 2: normal offset with sphere/cylinder cushion.
+        wp.launch(
+            compute_normal_offset_kernel,
+            dim=M,
+            inputs=[
+                self._contact_normal_d,
+                self._contact_world_anchor_d,
+                self._contact_shape_d,
+                shape_type_arr,
+                has_shape_type,
+                wp.int32(int(GeoType.SPHERE)),
+                wp.int32(int(GeoType.CYLINDER)),
+            ],
+            outputs=[self._contact_offset_d],
+            device=device,
+        )
+
+        # Host mirrors of the basic contact fields are still consumed by
+        # the CPU residual (``_compute_contact_residual*``); a follow-on
+        # step in the plan moves the residual to GPU and removes these.
+        self._contact_particle_h = particle_h.astype(np.int32)
+        self._contact_normal_h = normal_h.astype(np.float32)
+        self._contact_alpha_h = alpha_h
+        self._contact_offset_h = self._contact_offset_d.numpy()[:M].copy()
         self._contact_count = M
 
-        # Stage B: compute tangent basis and friction μ for each contact.
+        # Stage B: tangent basis, tangent offsets, kinematic anchor velocity.
         if self.friction:
-            t1_h = np.zeros((M, 3), dtype=np.float32)
-            t2_h = np.zeros((M, 3), dtype=np.float32)
-            # Per-contact tangential offsets: dot(t1, world_anchor) and
-            # dot(t2, world_anchor).  These are used in the friction residual
-            # r_t = dot(t, anchor) - alpha * dot(t, x_unc), which correctly
-            # measures tangential displacement from the contact anchor (not
-            # from the world origin).  Without this correction, the residual
-            # is ~10x too large for off-origin contacts, driving astronomically
-            # large friction impulses.
-            tangent1_offset_h = np.zeros(M, dtype=np.float64)
-            tangent2_offset_h = np.zeros(M, dtype=np.float64)
-
-            # Precompute per-shape world-frame Z axis (Newton's cylinder
-            # extends along local +Z; world axis = shape_q rotated +Z).
-            shape_transform_np = (
-                model.shape_transform.numpy()
-                if hasattr(model, "shape_transform") and model.shape_transform is not None
-                else None
+            wp.launch(
+                compute_tangent_basis_kernel,
+                dim=M,
+                inputs=[
+                    self._contact_normal_d,
+                    self._contact_shape_d,
+                    self._shape_omega_d,
+                    shape_transform_arr,
+                    has_shape_omega,
+                    has_shape_transform,
+                ],
+                outputs=[
+                    self._contact_tangent1_d,
+                    self._contact_tangent2_d,
+                    self._contact_is_spinning_d,
+                ],
+                device=device,
+            )
+            wp.launch(
+                compute_tangent_offsets_kernel,
+                dim=M,
+                inputs=[
+                    self._contact_tangent1_d,
+                    self._contact_tangent2_d,
+                    self._contact_world_anchor_d,
+                ],
+                outputs=[
+                    self._contact_tangent1_offset_d,
+                    self._contact_tangent2_offset_d,
+                ],
+                device=device,
+            )
+            wp.launch(
+                compute_v_anchor_kernel,
+                dim=M,
+                inputs=[
+                    self._contact_is_spinning_d,
+                    self._contact_shape_d,
+                    self._shape_omega_d,
+                    shape_transform_arr,
+                    self._contact_world_anchor_d,
+                ],
+                outputs=[self._contact_v_anchor_d],
+                device=device,
             )
 
-            v_anchor_h = np.zeros((M, 3), dtype=np.float64)
-
-            for c in range(M):
-                s_idx = int(shape_h[c])
-                # Determine whether this contact is on a spinning cylinder
-                # shape; if so, we use a structured cylinder-aligned tangent
-                # basis (RealSim parity) instead of the arbitrary basis from
-                # ``compute_tangent_basis``.  This prevents the t1/t2 Schur
-                # off-diagonal coupling from over-correcting v_anchor and
-                # pumping energy into the body (see SqueezingBall diagnosis).
-                is_spinning_shape = (
-                    s_idx >= 0
-                    and s_idx < self._shape_omega_h.shape[0]
-                    and self._shape_omega_h[s_idx] != 0.0
-                    and shape_transform_np is not None
-                )
-
-                # Precompute axis_world once if the shape has a transform —
-                # used by both the cylinder-aligned basis and v_anchor below.
-                axis_world = None
-                shape_p = None
-                if is_spinning_shape:
-                    xf = shape_transform_np[s_idx]
-                    shape_p = np.asarray(xf[:3], dtype=np.float64)
-                    shape_q = np.asarray(xf[3:], dtype=np.float64)
-                    axis_world = _quat_rotate_z_axis(shape_q)
-
-                # Pick tangent basis.
-                if is_spinning_shape:
-                    n_arr = np.asarray(normal_h[c], dtype=np.float64)
-                    # t1 = normalize(normal × axis) — rolling direction.
-                    t1_vec = np.cross(n_arr, axis_world)
-                    n1 = float(np.linalg.norm(t1_vec))
-                    if n1 < 1e-9:
-                        # Degenerate: normal parallel to axis (e.g. cap face).
-                        # Fall back to arbitrary basis.
-                        t1, t2 = compute_tangent_basis(normal_h[c])
-                    else:
-                        t1 = t1_vec / n1
-                        # t2 lies along the cylinder axis projected onto the
-                        # tangent plane; ``normal × t1`` produces an axis-
-                        # aligned vector with a determined sign.
-                        t2_raw = np.cross(n_arr, t1)
-                        n2 = float(np.linalg.norm(t2_raw))
-                        t2 = t2_raw / max(n2, 1e-30)
-                else:
-                    t1, t2 = compute_tangent_basis(normal_h[c])
-
-                t1_h[c] = t1.astype(np.float32)
-                t2_h[c] = t2.astype(np.float32)
-                # world_anchor for this contact (already in world frame).
-                # offset_h[c] = dot(n, world_anchor), so to get world_anchor
-                # we project body_pos through the body transform (already done
-                # in offset_h construction loop above; reuse body_pos_h).
-                # We recompute world_anchor here consistently with offset_h.
-                bpos = body_pos_h[c]
-                world_anchor = bpos.copy()
-                if shape_body_np is not None and s_idx >= 0:
-                    b_idx = int(shape_body_np[s_idx])
-                    if b_idx >= 0 and body_q_np is not None:
-                        bq = body_q_np[b_idx]
-                        pos_b = bq[:3]
-                        quat_b = bq[3:]
-                        world_anchor = _transform_point(pos_b, quat_b, bpos)
-                tangent1_offset_h[c] = float(np.dot(t1, world_anchor))
-                tangent2_offset_h[c] = float(np.dot(t2, world_anchor))
-
-                # Kinematic anchor velocity for spinning shapes.
-                if is_spinning_shape:
-                    r_local = world_anchor - shape_p
-                    omega = float(self._shape_omega_h[s_idx])
-                    # RealSim sign convention: tangent = normal × axis (see
-                    # CudaTests CylinderCollision.cpp), so the anchor velocity
-                    # along that tangent is +radius·ω.  Newton's cross is
-                    # ``axis × r_radial`` = ``-radius (normal × axis)``, hence
-                    # the leading minus sign here.
-                    v_anchor_h[c] = -omega * np.cross(axis_world, r_local)
-
-            self._contact_tangent1_d.assign(t1_h)
-            self._contact_tangent2_d.assign(t2_h)
-            self._contact_tangent1_h = t1_h
-            self._contact_tangent2_h = t2_h
-            self._contact_v_anchor_h = v_anchor_h
-            # Cache the BASE offsets (no dt-shift); step() applies the
-            # kinematic dt·dot(t, v_anchor) shift on entry.
-            self._contact_tangent1_offset_h_base = tangent1_offset_h.copy()
-            self._contact_tangent2_offset_h_base = tangent2_offset_h.copy()
-            self._contact_tangent1_offset_h = tangent1_offset_h
-            self._contact_tangent2_offset_h = tangent2_offset_h
+            # Host mirrors (transitional — Step 6 moves the friction
+            # residual to GPU and we can drop most of these).
+            self._contact_tangent1_h = self._contact_tangent1_d.numpy()[:M].copy()
+            self._contact_tangent2_h = self._contact_tangent2_d.numpy()[:M].copy()
+            self._contact_v_anchor_h = self._contact_v_anchor_d.numpy()[:M].copy()
+            t1_offset_h = self._contact_tangent1_offset_d.numpy()[:M].copy()
+            t2_offset_h = self._contact_tangent2_offset_d.numpy()[:M].copy()
+            self._contact_tangent1_offset_h_base = t1_offset_h.copy()
+            self._contact_tangent2_offset_h_base = t2_offset_h.copy()
+            self._contact_tangent1_offset_h = t1_offset_h
+            self._contact_tangent2_offset_h = t2_offset_h
 
             # Per-contact friction μ. RealSim uses the shape's material μ directly
             # (no particle-side μ, no mixing) — see RealSim collision shape mu
@@ -1718,4 +1710,3 @@ class SolverFBA(SolverBase):
             np.clip(lam, -cap_internal, cap_internal, out=lam)
         lam_apply = (dt * dt) * omega * lam
         return lam, omega, lam_apply
-
