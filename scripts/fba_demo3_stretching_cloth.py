@@ -41,7 +41,7 @@ from scripts.fba_cudatest_bench.pin import select_in_aabb
 MESH_PATH = Path("/home/ziqiu/work/RealSim_py/realsim_py/resources/mesh/cloth/square_20201P.obj")
 DT = 0.01
 TOTAL_FRAMES = 1200
-PD_ITERATIONS = 5
+PD_ITERATIONS = 10  # RealSim's offline binding overrides scene LocalGlobal_CUDA=5 to 10
 NSN_ITERATIONS = 1  # No contacts — NSN unused but keeps the API uniform.
 GRAVITY = -1.0  # Y-up, scene.json gravity=[0, -1, 0]
 
@@ -236,6 +236,11 @@ def run(diag_frame: int | None = None, diag_out: str | None = None) -> dict:
         nh_solver="lbfgs",
         mu=mu_lame,
         lam=lam,
+        # Pin stiffness: 1e10 aligns to RealSim's empirically observed
+        # `w_pin_R` in the system matrix (per intermediate-variable diff at
+        # frame 10: FBA RHS pin contribution was 100x stronger than RealSim's
+        # under the A_FBA = A_R/dt^2 scaling). Was 1e12 default.
+        pin_stiffness=1.0e10,
     )
     if diag_frame is not None:
         if diag_out is None:

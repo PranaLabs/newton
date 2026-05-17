@@ -93,7 +93,7 @@ def save_perf_json(energy: str, stats: dict) -> None:
 # ---------------------------------------------------------------------------
 DT = 0.01
 NUM_FRAMES = 810
-PD_ITERATIONS = 5
+PD_ITERATIONS = 10  # RealSim's offline binding overrides scene LocalGlobal_CUDA=5 to 10
 TOTAL_MASS = 1000.0  # kg
 
 # E=1e9, nu=0.45 -> Lamé parameters

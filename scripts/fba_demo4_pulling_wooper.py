@@ -34,7 +34,7 @@ from scripts.fba_cudatest_bench.pin import select_in_aabb
 MESH_PATH = Path("/home/ziqiu/work/RealSim_py/realsim_py/resources/mesh/volume/wooper_volume_5325P.mesh")
 DT = 0.01
 TOTAL_FRAMES = 500
-PD_ITERATIONS = 5
+PD_ITERATIONS = 10  # RealSim's offline binding overrides scene LocalGlobal_CUDA=5 to 10
 NSN_ITERATIONS = 1  # RealSim does 1 FB-Newton step per NSN call
 GRAVITY = 0.0  # PullingWooper scene.json sets gravity = 0
 
@@ -206,6 +206,8 @@ def run(diag_frame: int | None = None, diag_out: str | None = None) -> dict:
         # RealSim PullingWooper/scene.json::constraintsolver.maxforce = 1e12 (no
         # effective cap).  Wired here for Phase 2.4 / per-scene λ-cap alignment.
         lambda_cap=1.0e12,
+        # Pin stiffness aligned to RealSim's empirical w_pin_R (1e10) — was 1e12.
+        pin_stiffness=1.0e10,
     )
     if diag_frame is not None:
         if diag_out is None:
