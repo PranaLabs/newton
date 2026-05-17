@@ -215,7 +215,7 @@ class SolverFBA(SolverBase):
         lam: float | None = None,
         friction: bool = True,
         mu_per_pair_override: np.ndarray | None = None,
-        nsn_iterations: int = 10,
+        nsn_iterations: int = 1,
         lambda_cap: float | None = None,
         use_isodof: bool = True,
         shape_angular_velocity: dict[int, float] | None = None,
@@ -232,10 +232,18 @@ class SolverFBA(SolverBase):
                 otherwise use Stage A unilateral NSN.
             mu_per_pair_override: Optional ``(num_pairs,)`` array of friction
                 coefficients overriding ``model.shape_material_mu`` lookups.
-            nsn_iterations: Maximum projected Gauss-Seidel iterations for the
-                contact NSN solver per PD step. Defaults to ``10`` to match
-                RealSim's ``constraintsolver.iterations: 10`` cap (verified
-                across all CudaTests demos that set this field).
+            nsn_iterations: Number of FB-Newton linearization steps per
+                NSN call. Defaults to ``1``, matching RealSim's single
+                FB-Newton step per ``build`` -> ``solve`` ->
+                ``applyConstraintCorrection`` sequence in
+                ``NonSmoothNewton.cpp:102-171``. RealSim's scene.json
+                ``constraintsolver.iterations: 10`` is the **PCR Schur
+                LCP solver's** iterative-convergence cap, not a FB-Newton
+                outer loop count -- FBA uses a direct ``np.linalg.solve``
+                on the Schur block which is equivalent to PCR-to-
+                convergence on dense SPD systems. Values >1 add extra
+                FB-Newton linearizations beyond what RealSim does; useful
+                for stress-testing the FB residual but breaks 1:1 parity.
             lambda_cap: Optional per-step clamp on contact impulse magnitude in
                 **physical force units [N]**, matching RealSim's
                 ``constraintsolver.maxforce`` scene.json field. The internal

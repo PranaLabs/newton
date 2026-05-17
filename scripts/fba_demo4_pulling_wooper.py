@@ -34,7 +34,7 @@ MESH_PATH = Path("/home/ziqiu/work/RealSim_py/realsim_py/resources/mesh/volume/w
 DT = 0.01
 TOTAL_FRAMES = 500
 PD_ITERATIONS = 5
-NSN_ITERATIONS = 10
+NSN_ITERATIONS = 1  # RealSim does 1 FB-Newton step per NSN call
 GRAVITY = 0.0  # PullingWooper scene.json sets gravity = 0
 
 YOUNG = 1.0e7

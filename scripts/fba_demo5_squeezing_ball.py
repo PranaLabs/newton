@@ -31,7 +31,7 @@ MESH_PATH = Path("/home/ziqiu/work/RealSim_py/realsim_py/resources/mesh/volume/b
 DT = 0.01
 TOTAL_FRAMES = 600
 PD_ITERATIONS = 5
-NSN_ITERATIONS = 10  # matches RealSim's constraintsolver.iterations cap
+NSN_ITERATIONS = 1  # RealSim does 1 FB-Newton step per NSN call
 GRAVITY = -10.0  # Y-down
 
 YOUNG = 1.0e4
