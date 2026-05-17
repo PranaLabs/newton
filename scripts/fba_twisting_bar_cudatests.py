@@ -510,12 +510,18 @@ def run_newton_energy(
     snaps: list[tuple[int, np.ndarray]] = []
     step_times: list[float] = []
     nan_frame: int | None = None
+    # Full per-frame trajectory (NUM_FRAMES+1 entries: state before step 0, ..., state after step NUM_FRAMES-1).
+    trajectory = np.empty((NUM_FRAMES + 1, model.particle_count, 3), dtype=np.float32)
 
     center = np.array([0.0, 0.0, 0.0], dtype=np.float64)
 
     print(f"  [{label}] Running {NUM_FRAMES} frames...", flush=True)
+    # Snapshot initial state before any step (frame 0 = pre-integration, matches RealSim .abc convention).
+    trajectory[0] = state_in.particle_q.numpy()
     for f in range(NUM_FRAMES):
-        # Compute rolling angles
+        # Compute rolling angles for step f+1 (advance from frame f to frame f+1).
+        # RealSim's ROLLING action advances by `_avel*dt` per step from the
+        # _previous_ frame angle, so step number = f+1 (1-indexed).
         top_angle = min(PIN_AVEL * (f + 1) * DT, MAX_ANGLE)
         bot_angle = max(-PIN_AVEL * (f + 1) * DT, -MAX_ANGLE)
 
@@ -552,6 +558,12 @@ def run_newton_energy(
                 print(f"  [{label}] NaN detected at frame {f}! Stopping simulation.", flush=True)
                 break
 
+        # state_in is now the post-step state (after the f-th step).  Save
+        # full-trajectory entry at index f+1 so trajectory[k] = state after k
+        # steps (matches RealSim .abc frame indexing, where frame 0 is the
+        # pre-integration initial state and frame f is after f steps).
+        trajectory[f + 1] = state_in.particle_q.numpy()
+
         # Save snapshot
         if f in snapshot_set:
             q_snap = state_in.particle_q.numpy().copy()
@@ -583,18 +595,25 @@ def run_newton_energy(
         flush=True,
     )
 
-    # Save trajectory snapshots
+    # Save full per-frame trajectory + snapshot subset for backward compat.
+    out_subdir.mkdir(parents=True, exist_ok=True)
+    if nan_frame is not None:
+        # Truncate to valid range when run aborted on NaN.
+        trajectory_out = trajectory[: nan_frame + 1].copy()
+    else:
+        trajectory_out = trajectory
     if snaps:
         snap_frames = [s[0] for s in snaps]
         snap_arrays = np.stack([s[1] for s in snaps], axis=0)
-        out_subdir.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
             str(out_subdir / "trajectory.npz"),
             frames=np.array(snap_frames, dtype=np.int32),
-            positions=snap_arrays,
+            positions=trajectory_out,
+            snapshot_frames=np.array(snap_frames, dtype=np.int32),
+            snapshot_positions=snap_arrays,
         )
 
-    return np.array([]), stats
+    return trajectory_out, stats
 
 
 # ---------------------------------------------------------------------------

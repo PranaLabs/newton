@@ -193,8 +193,10 @@ def run() -> dict:
 
     snapshots: dict[int, np.ndarray] = {}
     step_times: list[float] = []
+    trajectory = np.empty((TOTAL_FRAMES + 1, model.particle_count, 3), dtype=np.float32)
 
     for frame in range(TOTAL_FRAMES + 1):
+        trajectory[frame] = s_in.particle_q.numpy()
         if frame in SNAPSHOT_FRAMES:
             snapshots[frame] = s_in.particle_q.numpy().copy()
         if frame == TOTAL_FRAMES:
@@ -209,6 +211,11 @@ def run() -> dict:
         wp.synchronize_device()
         step_times.append(1000.0 * (time.perf_counter() - t0))
 
+        # Progress log every 20 frames.
+        if frame % 20 == 0 and frame > 0:
+            recent_mean = float(np.mean(step_times[-20:]))
+            print(f"  frame {frame:4d}/{TOTAL_FRAMES}  step_ms_last20={recent_mean:.1f}", flush=True)
+
     q_final = s_in.particle_q.numpy()
     finite_ok = bool(np.all(np.isfinite(q_final)))
     stats = stats_from_times_ms(step_times)
@@ -216,6 +223,11 @@ def run() -> dict:
     stats["min_y"] = float(q_final[:, 1].min())
     stats["x_drift"] = float(q_final[:, 0].mean())
     stats["z_drift"] = float(q_final[:, 2].mean())
+
+    traj_path = Path("/tmp/fba_demo5_squeezing_ball.npz")
+    np.savez_compressed(traj_path, positions=trajectory)
+    stats["trajectory_npz"] = str(traj_path)
+
     return {"snapshots": snapshots, "stats": stats}
 
 

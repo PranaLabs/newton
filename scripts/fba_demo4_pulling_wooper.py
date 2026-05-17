@@ -214,9 +214,11 @@ def run() -> dict:
 
     snapshots: dict[int, np.ndarray] = {}
     step_times: list[float] = []
+    trajectory = np.empty((TOTAL_FRAMES + 1, model.particle_count, 3), dtype=np.float32)
     pulled = 0.0
 
     for frame in range(TOTAL_FRAMES + 1):
+        trajectory[frame] = s_in.particle_q.numpy()
         if frame in SNAPSHOT_FRAMES:
             snapshots[frame] = s_in.particle_q.numpy().copy()
         if frame == TOTAL_FRAMES:
@@ -244,6 +246,11 @@ def run() -> dict:
     stats["stable"] = finite_ok
     stats["min_y"] = float(q_final[:, 1].min())
     stats["pulled"] = pulled
+
+    traj_path = Path("/tmp/fba_demo4_pulling_wooper.npz")
+    np.savez_compressed(traj_path, positions=trajectory)
+    stats["trajectory_npz"] = str(traj_path)
+
     return {"snapshots": snapshots, "stats": stats}
 
 
