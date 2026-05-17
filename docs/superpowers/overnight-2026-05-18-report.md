@@ -185,3 +185,71 @@ Compared FBA vs RealSim Stretching Cloth at frame 10 (first cumulative drift >1e
 **All 4 demos pass Tier 1 binary success criterion** (the user-defined "0/1 success"). Tier 2 drift YELLOW pending pin-stiffness + PD-iter alignment.
 
 
+
+---
+
+## Final State (06:00)
+
+### Commits added overnight (12 new on top of `2aef460a`)
+
+```
+f1602c63 Add overnight 2026-05-18 report and Phase 1.2/0.20 audit specs
+ee684882 Align PD iter count and pin stiffness to RealSim baseline
+96e653bc Add per-PD-iter diagnostic dump + RealSim diff script
+6089ac79 Fix TwistingBar off-by-one and full trajectory dumps
+e0ba1e9a Remove dead _apply_lambda_correction* methods
+2551a1b0 Add Tier 1/2/3 demo parity verification harness
+42c7e3e5 Add Demo 3 StretchingCloth FBA script
+cbd60487 Wire per-scene lambda_cap=1e12 in demos 4 and 5
+97af46c8 Add Phase 0 audit-v2 + Phase 1 review specs
+118bf5ee Fix TwistingBar PIN_AVEL deg/rad and mesh path
+80334bd7 Align NSN inner to RealSim: A1 A2 A3 AA.1
+c900a43e Port LBFGS for tri/tet Neo-Hookean local projection
+```
+
+Plus an additional commit in RealSim repo:
+```
+f5009b2b Add per-step diagnostic dump (REALSIM_DIAG_FRAME/OUT env vars)
+```
+
+### Tasks completed overnight (15)
+
+- Phase 1.2 bending audit ✅ (4 MATCH, 1 DIVERGE-intentional)
+- Phase 0.20 byte-recheck ✅ (75 MATCH, 5 flagged — all addressed)
+- Phase 2.4 per-scene λ-cap ✅
+- Phase 1.3.a LBFGS port ✅ (was already on disk; sliced into commit `c900a43e`)
+- All Phase 1.3.b-h ✅ (b reclassified MATCH-by-identity; c, d, e, f, g, h committed earlier)
+- Phase 3 demo verification ✅ (4 demos Tier 1 PASS; Tier 2 still YELLOW pending finer alignment)
+- Phase 4 cleanup ✅ (Category A: dead code removed; Category B: kernel cleanup deferred since test callers exist)
+- 4 new tasks created and completed: Demo 3 script, Tier 1/2/3 harness, Phase 1.3.h nsn_iter=1, Phase 4
+
+### Tasks still pending
+
+- **#4 Phase 1.1 SqueezingBall NSN trajectory parity**: Demo 5 verdict YELLOW. Root cause same as Demo 4 (PD iter + pin stiffness). Demo 5 has 25-min wall time so was not re-run with the new fixes; expect similar 5-10x improvement when re-run.
+- **#24 NSN inner solver GPU port (CPU/numpy → GPU/Warp)**: Tagged by user as "all-GPU version" must-do for final. 7-10 days estimated; plan at `docs/superpowers/plans/2026-05-17-fba-nsn-gpu-port.md`.
+
+### Per-demo final verdicts
+
+| Demo | Tier 1 binary | max_drift (post-fix) | Verdict | Status |
+|---|---|---|---|---|
+| 2 TwistingBarNH | ✅ PASS | 2.6 mm | YELLOW (near-GREEN) | Demo 2 essentially solved; remaining fp32 noise |
+| 3 StretchingCloth | ✅ PASS | 2.8 mm (was 19) | YELLOW (near-GREEN) | 7x improvement from PD iter + pin fix |
+| 4 PullingWooper | ✅ PASS, min_y -8.408 matches RealSim | 2.5 m (was 33) | YELLOW | 13x improvement; cumulative still over Tier 2 1e-2 target |
+| 5 SqueezingBall | ✅ PASS, min_y -10.0 exact | 1.0 m (pre-fix) | YELLOW | Fixes applied to script, **not re-run** (slow); expect similar improvement |
+
+### Root causes diagnosed via intermediate-variable diff (Demo 3 frame 10)
+
+1. **PD outer iter count override**: RealSim offline binding sets PD iter = 10 regardless of scene's `LocalGlobal_CUDA` value. FBA was using scene-spec 5. Aligned to 10 in all 4 demo scripts.
+2. **Pin stiffness 100x mismatch**: empirical FBA RHS / RealSim RHS ratio at pinned particles = 1e6, but A_FBA = A_R/dt² scaling requires ratio = 1/dt² = 1e4. Pin's pull on stencil neighbors was 100x too strong in FBA. Aligned `pin_stiffness=1e10` in demos 3/4/5 (was Newton default 1e12).
+
+### Audit-v2.md correction needed (carry over to morning)
+
+Component M (pin handling) was originally classified MATCH. Empirical diff shows DIVERGE-accidental. The audit's "both sides scale consistently with dt² split" claim was wrong — the absolute values needed for stencil-neighbor effects differ by 100x. Reclassify and document.
+
+### Next steps for morning user review
+
+1. **Re-run Demo 5 with the new fixes** (`PD_ITERATIONS=10`, `pin_stiffness=1e10`) — expect Tier 2 improvement similar to Demo 3/4.
+2. **Decide if FBA's `pin_stiffness` default should also change** (currently `1e12` in `SolverFBA.__init__`). Demo scripts now override to 1e10; if all demos use 1e10, lower the default.
+3. **Start NSN inner solver GPU port** (Task #24): the dominant overnight-time cost was SqueezingBall's 25-min CPU-bound NSN numpy. Port it to Warp via the existing plan at `docs/superpowers/plans/2026-05-17-fba-nsn-gpu-port.md`.
+4. **Phase 4 Cat B kernel cleanup**: 5 atomic-add legacy kernels still have unit-test callers (not production callers). Decide: drop kernels + their dedicated tests together, or port tests to compute-kernel replacements.
+5. **Audit-v2 Component M reclassification** to DIVERGE-accidental.
