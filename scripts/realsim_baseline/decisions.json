@@ -1,0 +1,171 @@
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-05-17",
+  "source": "Phase 0 Task 0.2 of FBA-RealSim parity plan",
+  "global_decisions": {
+    "coulomb_cone_shape": {
+      "value": "rectangular_box",
+      "realsim_ref": "src/Scomponent/lagrange/solvers/NonSmoothNewton.cpp:400-403",
+      "function": "NonSmoothNewtonSolver::boundConstraintForces",
+      "notes": "Per-axis clamp |lambda_t1|, |lambda_t2| <= mu * lambda_n. Cited lines verified: lines 400-403 of NonSmoothNewton.cpp clamp _lambda[cid+1] and _lambda[cid+2] independently to +/- (mu * _lambda[cid]). Confirms rectangular (box) cone, not isotropic (circular) cone. Surrounding context: boundConstraintForces() iterates pairs; bilateral (lines 386-390), unilateral (391-394), friction (395-404). Normal lambda is also clamped to +/- _maxforce before friction tangent clamp (lines 396-397)."
+    },
+    "mass_lumping": {
+      "value": "uniform_total_over_n",
+      "realsim_ref": "src/Scomponent/integrator/localglobal/energy/Mass.cpp:12-21",
+      "function": "Mass::addObjectMass",
+      "notes": "m_i = total_mass / num_vertices_in_object. Verified at Mass.cpp:12-21: `real m = value/vertices.size();` then `_mass[i] = m; _invmass[i] = 1.0/m;` for each vertex i in vertices. Applied per-object (each object's obj_mass is divided uniformly across its own vertices); for multi-object scenes each object has its own uniform lumping."
+    }
+  },
+  "per_demo": {
+    "TwistingBar": {
+      "scene_path": "simulation/config/CudaTests/TwistingBar/scene.json",
+      "object_configs": ["simulation/config/CudaTests/TwistingBar/object_5k.json"],
+      "total_mass": 1000,
+      "total_mass_field": "mechanical_props.obj_mass",
+      "total_mass_per_object": {"object_0": 1000},
+      "constraintsolver_iterations": null,
+      "constraintsolver_maxforce": null,
+      "notes": "No 'constraintsolver' block in scene.json (demo has no contacts). Single object with obj_mass=1000."
+    },
+    "TwistingBarNH": {
+      "scene_path": "simulation/config/CudaTests/TwistingBarNH/scene.json",
+      "object_configs": ["simulation/config/CudaTests/TwistingBarNH/object_10k_nh.json"],
+      "total_mass": 1000,
+      "total_mass_field": "mechanical_props.obj_mass",
+      "total_mass_per_object": {"object_0": 1000},
+      "constraintsolver_iterations": null,
+      "constraintsolver_maxforce": null,
+      "notes": "No 'constraintsolver' block (no contacts). Single Neo-Hookean object, obj_mass=1000."
+    },
+    "StretchingCloth": {
+      "scene_path": "simulation/config/CudaTests/StretchingCloth/scene.json",
+      "object_configs": ["simulation/config/CudaTests/StretchingCloth/object_NH_20k.json"],
+      "total_mass": 1000,
+      "total_mass_field": "mechanical_props.obj_mass",
+      "total_mass_per_object": {"object_0": 1000},
+      "constraintsolver_iterations": null,
+      "constraintsolver_maxforce": null,
+      "notes": "No 'constraintsolver' block (no contacts; pure FEM stretching). Single object, obj_mass=1000."
+    },
+    "PullingWooper": {
+      "scene_path": "simulation/config/CudaTests/PullingWooper/scene.json",
+      "object_configs": ["simulation/config/CudaTests/PullingWooper/wooper_5k.json"],
+      "total_mass": 1000,
+      "total_mass_field": "mechanical_props.obj_mass",
+      "total_mass_per_object": {"object_0": 1000},
+      "constraintsolver_type": "NonSmoothNewton_CUDA",
+      "constraintsolver_iterations": 10,
+      "constraintsolver_maxforce": 1000000000000.0,
+      "constraintsolver_tolerance": 1e-09,
+      "constraintsolver_function": "FB",
+      "notes": "Matches plan expectation (maxforce=1e12, iters=10)."
+    },
+    "SqueezingBall": {
+      "scene_path": "simulation/config/CudaTests/SqueezingBall/scene.json",
+      "object_configs": ["simulation/config/CudaTests/SqueezingBall/ball_7k.json"],
+      "total_mass": 1000,
+      "total_mass_field": "mechanical_props.obj_mass",
+      "total_mass_per_object": {"object_0": 1000},
+      "constraintsolver_type": "NonSmoothNewton_CUDA",
+      "constraintsolver_iterations": 10,
+      "constraintsolver_maxforce": 1000000000000.0,
+      "constraintsolver_tolerance": 1e-09,
+      "constraintsolver_function": "FB",
+      "notes": "Matches plan expectation (maxforce=1e12, iters=10)."
+    },
+    "CrossingGingerbreadman": {
+      "scene_path": "simulation/config/CudaTests/CrossingGingerbreadman/scene.json",
+      "object_configs": ["simulation/config/CudaTests/CrossingGingerbreadman/ginger_10k.json"],
+      "total_mass": 1000,
+      "total_mass_field": "mechanical_props.obj_mass",
+      "total_mass_per_object": {"object_0": 1000},
+      "constraintsolver_type": "NonSmoothNewton_CUDA",
+      "constraintsolver_iterations": 10,
+      "constraintsolver_maxforce": 1000000000000000.0,
+      "constraintsolver_tolerance": 1e-09,
+      "constraintsolver_function": "FB",
+      "notes": "DIVERGENCE FROM PLAN: maxforce is 1e15, not 1e12 as plan stated. Iterations=10 matches. Both 1e15 and 1e12 are effectively 'no cap' for normal physical regimes, so this is unlikely to cause behavioral divergence, but Phase 2 default should follow the actual scene value 1e15 for this demo."
+    },
+    "SharpCorner": {
+      "scene_path": "simulation/config/CudaTests/SharpCorner/scene.json",
+      "object_configs": ["simulation/config/CudaTests/SharpCorner/cloth_5k.json"],
+      "total_mass": 1000,
+      "total_mass_field": "mechanical_props.obj_mass",
+      "total_mass_per_object": {"object_0": 1000},
+      "constraintsolver_type": "NonSmoothNewton_CUDA",
+      "constraintsolver_iterations": 10,
+      "constraintsolver_maxforce": 100,
+      "constraintsolver_tolerance": 1e-09,
+      "constraintsolver_function": "FB",
+      "notes": "Matches plan expectation (maxforce=100, iters=10). Tight cap to prevent CCD blow-up at sharp corner. Note: maxforce is integer 100 (not float)."
+    },
+    "ClothOnKnives": {
+      "scene_path": "simulation/config/CudaTests/ClothOnKnives/scene.json",
+      "object_configs": ["simulation/config/CudaTests/ClothOnKnives/cloth_5k.json"],
+      "total_mass": 1000,
+      "total_mass_field": "mechanical_props.obj_mass",
+      "total_mass_per_object": {"object_0": 1000},
+      "constraintsolver_type": "NonSmoothNewton_CUDA",
+      "constraintsolver_iterations": 10,
+      "constraintsolver_maxforce": 100.0,
+      "constraintsolver_tolerance": 1e-09,
+      "constraintsolver_function": "FB",
+      "notes": "Matches plan expectation (maxforce=100, iters=10)."
+    },
+    "ParallelEnvTest": {
+      "scene_path": "simulation/config/CudaTests/ParallelEnvTest/scene.json",
+      "object_configs": ["simulation/config/CudaTests/ParallelEnvTest/cloth0.json"],
+      "total_mass": 1000,
+      "total_mass_field": "mechanical_props.obj_mass",
+      "total_mass_per_object": {"object_0": 1000},
+      "constraintsolver_type": "LiteNonSmoothNewton_CUDA",
+      "constraintsolver_iterations": 10,
+      "constraintsolver_maxforce": 10000000000.0,
+      "constraintsolver_tolerance": 1e-09,
+      "constraintsolver_function": "FB",
+      "notes": "Matches plan expectation (maxforce=1e10, iters=10). NOTE: uses 'LiteNonSmoothNewton_CUDA' (parallel-env variant) instead of full 'NonSmoothNewton_CUDA'. Also uses 'LocalGlobal' (not 'LocalGlobal_CUDA') integrator and has top-level 'parallelEnv' block."
+    },
+    "CableGrabRaptor": {
+      "scene_path": "simulation/config/CudaTests/CableGrabRaptor/scene.json",
+      "object_configs": [
+        "simulation/config/CudaTests/CableGrabRaptor/gripper0.json",
+        "simulation/config/CudaTests/CableGrabRaptor/gripper1.json",
+        "simulation/config/CudaTests/CableGrabRaptor/raptor_10k.json"
+      ],
+      "total_mass": null,
+      "total_mass_field": "mechanical_props.obj_mass",
+      "total_mass_per_object": {"object_0": 1, "object_1": 1, "object_2": 10},
+      "constraintsolver_type": "NonSmoothNewton_CUDA",
+      "constraintsolver_iterations": 10,
+      "constraintsolver_maxforce": 1000000000000.0,
+      "constraintsolver_tolerance": 1e-09,
+      "constraintsolver_function": "FB",
+      "notes": "Matches plan expectation (maxforce=1e12, iters=10). Multi-object scene: gripper0 (mass=1), gripper1 (mass=1), raptor (mass=10). 'total_mass' set to null because the demo has 3 distinct per-object masses; each object's mass is independently lumped via addObjectMass over that object's own vertices. Also has 'cable' and 'cableInvStiff' on grippers, and one torus obstacle."
+    }
+  },
+  "verification_notes": {
+    "decision_2_coulomb_box": "Verified at NonSmoothNewton.cpp:400-403 exactly as plan claimed. Lines 400-403 are inside the 'friction' branch of boundConstraintForces() and clamp tangent components 1 and 2 independently to +/- mu*lambda_n.",
+    "decision_3_uniform_mass": "Verified at Mass.cpp:12-21 (file path is src/Scomponent/integrator/localglobal/energy/Mass.cpp). Lines 12-21 exactly match plan claim. The mass field name in scene/object JSONs is 'mechanical_props.obj_mass' (not 'mass' or 'total_mass').",
+    "summary_table": {
+      "columns": ["demo", "total_mass(per obj)", "iters", "maxforce"],
+      "rows": [
+        ["TwistingBar", 1000, null, null],
+        ["TwistingBarNH", 1000, null, null],
+        ["StretchingCloth", 1000, null, null],
+        ["PullingWooper", 1000, 10, 1e12],
+        ["SqueezingBall", 1000, 10, 1e12],
+        ["CrossingGingerbreadman", 1000, 10, 1e15],
+        ["SharpCorner", 1000, 10, 100],
+        ["ClothOnKnives", 1000, 10, 100],
+        ["ParallelEnvTest", 1000, 10, 1e10],
+        ["CableGrabRaptor", "[1,1,10]", 10, 1e12]
+      ]
+    },
+    "divergences_from_plan": [
+      "CrossingGingerbreadman maxforce is 1e15, not 1e12 as plan stated. Both are effectively 'no cap' but Phase 2 should use 1e15 to match scene exactly.",
+      "ParallelEnvTest uses 'LiteNonSmoothNewton_CUDA' (parallel-env variant), not the full 'NonSmoothNewton_CUDA'. Iter count and cap are equivalent but the solver class differs - Phase 2 should confirm parity expectations.",
+      "TwistingBar/TwistingBarNH/StretchingCloth have NO constraintsolver block at all (pure FEM, no contacts). Phase 2 NSN defaults are irrelevant for these demos.",
+      "CableGrabRaptor has 3 distinct per-object masses, not a single 'total_mass'. addObjectMass is called once per object with that object's obj_mass."
+    ]
+  }
+}

@@ -99,6 +99,28 @@ The user wants every CudaTests demo's particle positions to match RealSim's `out
 
 **对已知 RealSim bug 的特殊处理**（在 Resolved decisions 表里逐项列出）：必须明确文档化、并量化预期的 trajectory delta。
 
+## Scope update 2026-05-17 (post-kickoff)
+
+User-confirmed scope cuts after Phase 0 audit + Phase 2.1-2.3 + Phase 1.3.a + global review:
+
+**First cut (post Phase 2.3):**
+- Demo 7 SharpCorner — was Phase 5.1
+- Demo 9 ParallelEnvTest — was Phase 5.3 (multi-env + LiteSchur)
+- Demo 10 CableGrabRaptor — was Phase 5.4 (Bergou cable + soft-soft + dynamic pin + torus)
+
+**Second cut (post global review, Q-G1 decision):**
+- Demo 8 ClothOnKnives — was Phase 5.2. **Architecture mismatch is unsolvable byte-equivalently**: RealSim `GenericCCD` uses VF/EE continuous detection + barycentric multi-DOF constraint rows (one constraint touches ≥3 particles); Newton's collision pipeline is single-particle SDF. Reconciling would require porting VF/EE to Newton AND extending FBA's contact buffer schema for multi-DOF rows. Dropped as not worth the 2-3 weeks for one demo.
+
+**Third cut (further trim):**
+- Demo 6 CrossingGingerbreadman — dropped 2026-05-17 by user. Was the largest cylinder-count scene (13 static cylinders + PULLING pin); not needed once SqueezingBall covers the multi-cylinder + plane case.
+
+**Fourth cut (further trim):**
+- Demo 1 TwistingBar (TET ARAP variant) — dropped 2026-05-17 by user. Demo 2 TwistingBarNH covers the rolling-pin code path on TET; ARAP verification not needed.
+
+**Demos retained (4 total):** 2 TwistingBarNH, 3 StretchingCloth, 4 PullingWooper, 5 SqueezingBall.
+
+All are rigid-collider (sphere/cylinder/plane) demos. Phase 5 is now empty — no new infrastructure required beyond what's already in tree. The `--energy arap` code path in `fba_twisting_bar_cudatests.py` is retained for ad-hoc testing but is not part of in-scope verification.
+
 ## Resolved decisions (locked at plan kickoff, 2026-05-17)
 
 User-confirmed alignment policy: **byte alignment with RealSim except where the divergence is a known-correctness bug in RealSim** (e.g. Eigen `.trace()` on 2D/3D Vec returns only x[0]). Per item:
@@ -110,7 +132,7 @@ User-confirmed alignment policy: **byte alignment with RealSim except where the 
 | 3 | Mass lumping | **Switch to RealSim's uniform** `mass/N` per particle | Affects all demos with non-uniform meshes (basically all). |
 | 4 | NSN inner iter default | **Switch to RealSim's cap = 10** | Was 1 (P1's perf-driven choice); RealSim caps at 10. |
 | 5 | λ-cap default | **Switch to per-scene values** (`maxforce` from scene.json: 1e12 default, 100 for ClothOnKnives/SharpCorner) | Mirror RealSim's per-config setup. |
-| 6 | Drift tolerance | **1e-3 m initial; relax to 1e-2 if FP order accumulates** | Tight initial target, validate on Demo 1 first. |
+| 6 | Drift tolerance | **SUPERSEDED 2026-05-17 by 3-tier verification spec** at `docs/superpowers/specs/2026-05-17-fba-verification-criteria.md` (Tier 1 binary + Tier 2 per-demo drift + Tier 3 diagnostics) | Single fixed threshold unrealistic for contact-heavy demos; per-demo threshold + binary gate is more rigorous |
 | 7 | Plan scope | **All 10 CudaTests demos** | User-confirmed. Includes new infra: multi-env (P9), cable element + soft-soft (P10). |
 
 
@@ -303,9 +325,11 @@ Demos 1–4 should be byte-identical after Phase 2 with minimal new work. Demos 
 
 ---
 
-## Phase 5 — New infrastructure for Demos 9 & 10
+## Phase 5 — [FULLY SUPERSEDED 2026-05-17]
 
-### Task 5.1: SharpCorner (Demo 7) — primitive box contact through FBA Stage A path
+> **NOTE 2026-05-17 (second cut):** All Phase 5 tasks dropped. Phase 5.1 (SharpCorner), 5.2 (ClothOnKnives), 5.3 (ParallelEnvTest), 5.4 (CableGrabRaptor) all out of scope. All remaining in-scope demos (1, 2, 3, 4, 5, 6) use rigid colliders only; no new infrastructure required. Sub-sections below retained for historical reference.
+
+### Task 5.1 [SUPERSEDED 2026-05-17 first cut]: SharpCorner (Demo 7) — primitive box contact through FBA Stage A path
 
 **Files**: `scripts/fba_demo7_sharp_corner.py` (new), unit test in `test_solver_fba.py`.
 
@@ -313,7 +337,7 @@ Newton's `add_shape_box(half_extents=...)` produces a `GeoType.BOX` primitive. `
 
 Acceptance: a unit test with a stationary particle near a box face produces the expected contact normal and offset. Then Demo 7 runs the cloth_5k scene; trajectory diff vs RealSim's abc passes.
 
-### Task 5.2: ClothOnKnives (Demo 8) — `GeoType.MESH` contact path
+### Task 5.2 [SUPERSEDED 2026-05-17 second cut]: ClothOnKnives (Demo 8) — `GeoType.MESH` contact path
 
 **Files**: `scripts/fba_demo8_cloth_on_knives.py`, unit test for MESH contact.
 
@@ -321,7 +345,7 @@ Newton's `add_shape_mesh` produces a `GeoType.MESH`. `create_soft_contacts` supp
 
 Unit test: a small cloth grid above a single triangulated tetrahedron; verify the contact set after `pipeline.collide()` is sensible. Then Demo 8.
 
-### Task 5.3: ParallelEnvTest (Demo 9) — multi-env scaffold
+### Task 5.3 [SUPERSEDED 2026-05-17]: ParallelEnvTest (Demo 9) — multi-env scaffold
 
 **Files**: `newton/_src/solvers/fba/solver_fba.py` (multi-env support), `newton/_src/solvers/fba/linear_solver.py` (LiteSchur path), `scripts/fba_demo9_parallel_env.py`.
 
@@ -339,7 +363,7 @@ Implement RealSim's `LiteNonSmoothNewton_CUDA` analogue: when contacts span 25 e
 
 Acceptance: 25-env scene runs, wall ≤ 25× single-env wall. Trajectory matches RealSim per Phase 3.
 
-### Task 5.4: CableGrabRaptor (Demo 10) — cable + soft-soft + torus + dynamic pin
+### Task 5.4 [SUPERSEDED 2026-05-17]: CableGrabRaptor (Demo 10) — cable + soft-soft + torus + dynamic pin
 
 **Files**: `newton/_src/solvers/fba/kernels.py` (new Bergou cable kernels), `newton/_src/solvers/fba/solver_fba.py` (cable energy + soft-soft contact + dynamic pin), `scripts/fba_demo10_cable_grab_raptor.py`.
 
@@ -448,8 +472,10 @@ See "Resolved decisions" table at top of plan. All 7 prior open questions are lo
 | Phase 1 (rectify accidental divergences) | 2-3 days | NSN trajectory parity, bending re-verify, etc. |
 | Phase 2 (apply locked decisions) | 1 day | box cone, nsn=10, uniform mass, per-scene λ-cap |
 | Phase 3 (per-demo verification, demos 1-6) | 1-2 days | 6 demos byte-aligned with RealSim |
-| Phase 5.1-5.2 (Demo 7-8 mesh contact) | 2-3 days | SharpCorner + ClothOnKnives |
-| Phase 5.3 (Demo 9 multi-env + LiteSchur) | 4-5 days | ParallelEnvTest |
-| Phase 5.4 (Demo 10 cable + soft-soft) | 5-7 days | CableGrabRaptor — largest piece |
 | Phase 4 (cleanup) | 0.5 day | legacy kernel removal, docs |
-| **Total** | **~3 weeks** | All 10 demos byte-aligned with RealSim |
+| **Total** | **~1 week** | 6 demos byte-aligned with RealSim (1, 2, 3, 4, 5, 6) |
+
+**Scope cuts 2026-05-17:**
+- First cut: Phase 5.1 SharpCorner (Demo 7), 5.3 ParallelEnvTest (Demo 9), 5.4 CableGrabRaptor (Demo 10) removed.
+- Second cut: Phase 5.2 ClothOnKnives (Demo 8) removed (GenericCCD architectural mismatch per Q-G1).
+- Combined effort drop ~12-17 days.
