@@ -3644,6 +3644,65 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
         solver = SolverFBA(model, lambda_cap=100.0)
         self.assertEqual(solver.lambda_cap, 100.0)
 
+    def test_lambda_cap_clamps_in_physical_force_units(self) -> None:
+        """``lambda_cap`` is interpreted in physical force [N] units.
+
+        FBA's internal ``λ_FBA = λ_R/dt²``, so the clamp at the NSN clip
+        site must be ``self.lambda_cap / dt²`` (RealSim ``_maxforce``
+        semantics). Verifies both unilateral and Coulomb solvers.
+        """
+        model = self._tiny_cloth_model()
+        lambda_cap = 1.0  # physical-force units [N]
+        solver = SolverFBA(model, lambda_cap=lambda_cap)
+        dt = 0.01
+        internal_cap = lambda_cap / (dt * dt)  # 1e4
+
+        # Unilateral: W=I, r=100, pene0=0 yields unclamped |lam| ~ 4e5
+        # which exceeds the internal cap (1e4) but is far above the raw
+        # cap (1.0).  Post-clamp |lam| must equal internal_cap, not 1.0.
+        m_uni = 3
+        w_uni = np.eye(m_uni, dtype=np.float64)
+        r_uni = np.full(m_uni, 100.0, dtype=np.float64)
+        pene0_uni = np.zeros(m_uni, dtype=np.float64)
+        lam_uni, _, _ = solver._solve_nsn_unilateral(
+            w_uni, r_uni, pene0_uni, max_iters=1, dt=dt
+        )
+        self.assertTrue(
+            np.all(np.abs(lam_uni) <= internal_cap + 1e-9),
+            msg=f"unilateral lam exceeds internal cap: {lam_uni}",
+        )
+        self.assertGreater(
+            float(np.max(np.abs(lam_uni))),
+            lambda_cap,
+            msg=(
+                "unilateral lam clamped to raw lambda_cap; "
+                "expected clamp at lambda_cap/dt²"
+            ),
+        )
+
+        # Coulomb: same setup with 3M rows; normal-row lam saturates at
+        # internal cap, tangent rows stay 0 (lam_n>0 active, t = 0).
+        m_cou = 2
+        w_cou = np.eye(3 * m_cou, dtype=np.float64)
+        r_cou = np.full(3 * m_cou, 100.0, dtype=np.float64)
+        mu_cou = np.full(m_cou, 0.5, dtype=np.float64)
+        pene0_cou = np.zeros(3 * m_cou, dtype=np.float64)
+        lam_cou, _, _ = solver._solve_nsn_coulomb(
+            w_cou, r_cou, mu_cou, pene0_cou, max_iters=1, dt=dt
+        )
+        self.assertTrue(
+            np.all(np.abs(lam_cou) <= internal_cap + 1e-9),
+            msg=f"coulomb lam exceeds internal cap: {lam_cou}",
+        )
+        self.assertGreater(
+            float(np.max(np.abs(lam_cou))),
+            lambda_cap,
+            msg=(
+                "coulomb lam clamped to raw lambda_cap; "
+                "expected clamp at lambda_cap/dt²"
+            ),
+        )
+
 
 class SolverFBALambdaWarmStartTests(unittest.TestCase):
     """λ warm-start across PD outer iters reproduces RealSim's per-frame reset.

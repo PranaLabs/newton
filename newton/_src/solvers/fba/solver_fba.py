@@ -235,9 +235,12 @@ class SolverFBA(SolverBase):
                 contact NSN solver per PD step. Defaults to ``10`` to match
                 RealSim's ``constraintsolver.iterations: 10`` cap (verified
                 across all CudaTests demos that set this field).
-            lambda_cap: Optional per-step clamp ``|λ| <= lambda_cap`` applied
-                to contact impulses after the NSN solve. ``None`` disables
-                clamping; mirrors RealSim's ``constraintsolver.maxforce``.
+            lambda_cap: Optional per-step clamp on contact impulse magnitude in
+                **physical force units [N]**, matching RealSim's
+                ``constraintsolver.maxforce`` scene.json field. The internal
+                Lagrange multiplier ``λ_FBA = λ_R/dt²`` is scaled, so the clamp
+                is internally divided by ``dt²`` at each NSN solve. ``None``
+                disables clamping.
             use_isodof: If ``True`` (default, Task P), build the Schur
                 complement via the isodof-restricted path that computes only
                 the ``A^{-1}[i, j]`` entries for the unique contacted
@@ -1416,7 +1419,8 @@ class SolverFBA(SolverBase):
             np.maximum(lam, 0.0, out=lam)
 
         if self.lambda_cap is not None:
-            np.clip(lam, -self.lambda_cap, self.lambda_cap, out=lam)
+            cap_internal = self.lambda_cap / (dt * dt)
+            np.clip(lam, -cap_internal, cap_internal, out=lam)
         lam_apply = (dt * dt) * omega * lam
         return lam, omega, lam_apply
 
@@ -1554,7 +1558,8 @@ class SolverFBA(SolverBase):
                 lam[3 * c + 2] = float(np.clip(lam[3 * c + 2], -cone, cone))
 
         if self.lambda_cap is not None:
-            np.clip(lam, -self.lambda_cap, self.lambda_cap, out=lam)
+            cap_internal = self.lambda_cap / (dt * dt)
+            np.clip(lam, -cap_internal, cap_internal, out=lam)
         lam_apply = (dt * dt) * omega * lam
         return lam, omega, lam_apply
 
