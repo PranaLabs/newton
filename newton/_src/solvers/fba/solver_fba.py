@@ -372,6 +372,10 @@ class SolverFBA(SolverBase):
         # accumulates over PD outer iters.
         self._lam_unilateral_persistent: np.ndarray | None = None
         self._lam_coulomb_persistent: np.ndarray | None = None
+        # ω persistent across PD outer iters: needed by NSN iter-0 to compute
+        # penetration at the previously-corrected position.
+        self._omega_unilateral_persistent: np.ndarray | None = None
+        self._omega_coulomb_persistent: np.ndarray | None = None
 
         # Per-element device data (filled by _setup_pd_system).
         self._tri_indices_d = None
@@ -631,7 +635,9 @@ class SolverFBA(SolverBase):
             self._contact_tangent2_offset_h = self._contact_tangent2_offset_h_base + shift2
 
         # RealSim parity: λ = 0 once per step (per frame), then accumulates
-        # across the PD outer iters below.
+        # across the PD outer iters below. ω carries the previous step's
+        # weighting so iter-0 of the next call can compute penetration at the
+        # already-corrected position.
         M = self._contact_count
         if M > 0:
             if self._lam_unilateral_persistent is None or self._lam_unilateral_persistent.shape != (M,):
@@ -642,6 +648,14 @@ class SolverFBA(SolverBase):
                 self._lam_coulomb_persistent = np.zeros(3 * M, dtype=np.float64)
             else:
                 self._lam_coulomb_persistent.fill(0.0)
+            if self._omega_unilateral_persistent is None or self._omega_unilateral_persistent.shape != (M,):
+                self._omega_unilateral_persistent = np.zeros(M, dtype=np.float64)
+            else:
+                self._omega_unilateral_persistent.fill(0.0)
+            if self._omega_coulomb_persistent is None or self._omega_coulomb_persistent.shape != (3 * M,):
+                self._omega_coulomb_persistent = np.zeros(3 * M, dtype=np.float64)
+            else:
+                self._omega_coulomb_persistent.fill(0.0)
 
         model = self.model
         N = model.particle_count
@@ -906,16 +920,25 @@ class SolverFBA(SolverBase):
                     W = self._cached_W
                     x_unc_np = self._x_cur.numpy()  # (N, 3) float32
                     r = self._compute_contact_residual_friction(x_unc_np)
-                    lam = self._solve_nsn_coulomb(
+                    # Build per-row pene0 from cached anchor projections.
+                    pene0_b = np.empty(3 * M, dtype=np.float64)
+                    pene0_b[0::3] = self._contact_offset_h[:M]
+                    pene0_b[1::3] = self._contact_tangent1_offset_h[:M]
+                    pene0_b[2::3] = self._contact_tangent2_offset_h[:M]
+                    lam, omega_last, lam_apply = self._solve_nsn_coulomb(
                         W,
                         r,
                         self._contact_mu_h[:M],
+                        pene0_b,
                         max_iters=self.nsn_iterations,
                         lam_init=self._lam_coulomb_persistent,
+                        omega_init=self._omega_coulomb_persistent,
+                        dt=dt,
                     )
                     self._lam_coulomb_persistent = lam.copy()
-                    if np.any(np.abs(lam) > 1e-15):
-                        correction = self._apply_lambda_correction_friction(lam)
+                    self._omega_coulomb_persistent = omega_last.copy()
+                    if np.any(np.abs(lam_apply) > 1e-15):
+                        correction = self._apply_lambda_correction_friction(lam_apply)
                         wp.launch(
                             accumulate_vec3_kernel,
                             dim=N,
@@ -937,15 +960,20 @@ class SolverFBA(SolverBase):
                     W = self._cached_W
                     x_unc_np = self._x_cur.numpy()  # (N, 3) float32
                     r = self._compute_contact_residual(x_unc_np)
-                    lam = self._solve_nsn_unilateral(
+                    pene0_a = self._contact_offset_h[:M].astype(np.float64, copy=True)
+                    lam, omega_last, lam_apply = self._solve_nsn_unilateral(
                         W,
                         r,
+                        pene0_a,
                         max_iters=self.nsn_iterations,
                         lam_init=self._lam_unilateral_persistent,
+                        omega_init=self._omega_unilateral_persistent,
+                        dt=dt,
                     )
                     self._lam_unilateral_persistent = lam.copy()
-                    if np.any(lam > 1e-15):
-                        correction = self._apply_lambda_correction(lam)
+                    self._omega_unilateral_persistent = omega_last.copy()
+                    if np.any(lam_apply > 1e-15):
+                        correction = self._apply_lambda_correction(lam_apply)
                         wp.launch(
                             accumulate_vec3_kernel,
                             dim=N,
@@ -1003,6 +1031,8 @@ class SolverFBA(SolverBase):
         # λ warm-start: persistent buffer must be resized when contact-set changes.
         self._lam_unilateral_persistent = None
         self._lam_coulomb_persistent = None
+        self._omega_unilateral_persistent = None
+        self._omega_coulomb_persistent = None
 
     # ------------------------------------------------------------------
     # Phase 4 Stage A — contact state (allocated lazily on first call).
@@ -1345,115 +1375,207 @@ class SolverFBA(SolverBase):
         self,
         W: np.ndarray,
         r: np.ndarray,
-        max_iters: int = 20,
+        pene0: np.ndarray,
+        max_iters: int = 1,
         lam_init: np.ndarray | None = None,
-    ) -> np.ndarray:
-        """Solve the unilateral LCP via projected Gauss-Seidel.
+        omega_init: np.ndarray | None = None,
+        dt: float = 0.01,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """RealSim NonSmoothNewton port for unilateral LCP (Stage A).
 
-        Finds ``λ ≥ 0`` satisfying ``W·λ = r`` (normal contact forces).
-        Uses component-wise clamped Gauss-Seidel:
+        Returns ``(lam, omega, lam_apply)``:
+          - ``lam`` (force units, for warm-start): RealSim's accumulated λ.
+          - ``omega``: per-row weighting from the last NSN iter.
+          - ``lam_apply`` = ``dt² · ω · lam`` (position-LCP units): the value to
+            pass into :meth:`_apply_lambda_correction` (which adds
+            ``A⁻¹·Jᵀ·lam_apply`` to ``x_unc``).
 
-        .. code-block:: text
-
-            λ_c ← max(0, (r_c - Σ_{c'≠c} W[c,c'] λ_{c'}) / W[c,c])
-
-        Args:
-            W: Dense ``(M, M)`` Schur complement matrix.
-            r: Residual ``J · x_unc - c``, shape ``(M,)``.
-            max_iters: Maximum Gauss-Seidel iterations.
-
-        Returns:
-            Contact impulse vector ``λ``, shape ``(M,)``, float64.
+        The two scales differ because RealSim's correction is
+        ``Δq = dt² · A⁻¹ · Jᵀ · (ω · λ_force)``, whereas FBA's
+        ``_apply_lambda_correction`` adds ``A⁻¹·Jᵀ·λ`` directly. ``omega``
+        from the previous step is needed so that the next call can compute the
+        correct iter-0 ``penetration = -r + dt²·W·(ω·λ)`` accounting for the
+        previously-applied correction.
         """
         M = len(r)
+        if M == 0:
+            return (
+                np.zeros(0, dtype=np.float64),
+                np.zeros(0, dtype=np.float64),
+                np.zeros(0, dtype=np.float64),
+            )
         if lam_init is not None and lam_init.shape == (M,):
             lam = lam_init.astype(np.float64, copy=True)
         else:
             lam = np.zeros(M, dtype=np.float64)
+        if omega_init is not None and omega_init.shape == (M,):
+            omega = omega_init.astype(np.float64, copy=True)
+        else:
+            omega = np.zeros(M, dtype=np.float64)
+
+        diag_W = np.diag(W)
+        # RealSim convention: precond[i] = dt² · W_ii for unilateral rows.
+        precond = (dt * dt) * np.where(np.abs(diag_W) > 1e-12, np.maximum(diag_W, 1e-12), 1.0)
+
         for _ in range(max_iters):
-            lam_old = lam.copy()
+            # penetration = -r + dt²·W·(ω·λ). With warm-start ω·λ this reflects
+            # the gap at the position currently corrected by the previous iter.
+            penetration = -r + (dt * dt) * (W @ (omega * lam))
+            omega = np.zeros(M, dtype=np.float64)
+            compliance = np.zeros(M, dtype=np.float64)
+            h = np.zeros(M, dtype=np.float64)
             for c in range(M):
-                if W[c, c] <= 1e-12:
-                    continue
-                off_diag = W[c, :] @ lam - W[c, c] * lam[c]
-                lam[c] = max(0.0, (r[c] - off_diag) / W[c, c])
-            if np.linalg.norm(lam - lam_old, np.inf) < 1e-8:
+                on, cn, hn = fb_unilateral_row(
+                    penetration=penetration[c], lam=lam[c],
+                    precond=precond[c], dt=dt, pene0=pene0[c],
+                )
+                omega[c] = on
+                compliance[c] = cn
+                h[c] = hn
+
+            A_schur = (omega[:, None] * omega[None, :]) * W + np.diag(compliance)
+            # J·x_corrected = J·x_unc + dt²·W·(ω·λ) = (pene0 − r) + dt²·W·(ω·λ).
+            J_x = (pene0 - r) + (dt * dt) * (W @ (omega * lam))
+            rhs = (1.0 / (dt * dt)) * (h - omega * J_x)
+
+            try:
+                dlam = np.linalg.solve(A_schur, rhs)
+            except np.linalg.LinAlgError:
                 break
+            lam = lam + dlam
+            np.maximum(lam, 0.0, out=lam)
+
         if self.lambda_cap is not None:
             np.clip(lam, -self.lambda_cap, self.lambda_cap, out=lam)
-        return lam
+        lam_apply = (dt * dt) * omega * lam
+        return lam, omega, lam_apply
 
     def _solve_nsn_coulomb(
         self,
         W: np.ndarray,
         r: np.ndarray,
         mu: np.ndarray,
-        max_iters: int = 20,
+        pene0: np.ndarray,
+        max_iters: int = 1,
         lam_init: np.ndarray | None = None,
-    ) -> np.ndarray:
-        """Solve the frictional LCP via blocked projected Gauss-Seidel.
+        omega_init: np.ndarray | None = None,
+        dt: float = 0.01,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """RealSim NonSmoothNewton port for the frictional LCP.
 
-        Operates on 3-blocks ``[λ_n, λ_t1, λ_t2]`` per contact.  Each block
-        is updated by solving the local 3x3 system (``W_cc``), then projecting
-        onto the Coulomb cone.
-
-        Complementarity is enforced per-block: if the effective normal residual
-        ``r_eff[0] ≤ 0`` (no penetration for this contact after accounting for
-        contributions from all other active contacts), the entire 3-block is
-        forced to zero.  This mirrors Stage A's ``max(0, r/W)`` clamp and
-        prevents the friction cone projection from generating spurious repulsive
-        impulses on contacts where the gap is still open.
+        Implements the dλ-Newton update from ``NonSmoothNewton.cpp:102-170``
+        + ``343-378``, with omega weighting and position-LCP coupling. λ
+        accumulates across ``max_iters`` iterations.
 
         Args:
-            W: Dense ``(3M, 3M)`` Schur complement matrix.
-            r: Residual vector of shape ``(3M,)``.
-            mu: Per-contact friction coefficient, shape ``(M,)``.
-            max_iters: Maximum blocked Gauss-Seidel iterations.
+            W: ``(3M, 3M)`` Schur complement.
+            r: ``(3M,)`` residual ``pene0 − α·J·x_unc`` from
+                ``_compute_contact_residual_friction``.
+            mu: ``(M,)`` per-contact friction coefficient.
+            pene0: ``(3M,)`` per-row anchor projection. Constant within step.
+            max_iters: NSN iterations (default 1).
+            lam_init: Optional warm-start ``(3M,)`` lambda.
+            omega_init: Optional warm-start ``(3M,)`` omega from previous call.
+            dt: Timestep (s).
 
         Returns:
-            Contact impulse vector ``λ``, shape ``(3M,)``, float64, ordered
-            ``[λ_n_0, λ_t1_0, λ_t2_0, λ_n_1, ...]``.
+            ``(lam, omega, lam_apply)``:
+              - ``lam`` (force units, ``(3M,)``): RealSim-style accumulated λ
+                with layout ``[λ_n_0, λ_t1_0, λ_t2_0, ...]``. Use as warm-start.
+              - ``omega``: per-row weighting from the last NSN iter.
+              - ``lam_apply`` = ``dt² · ω · lam``: pass into
+                :meth:`_apply_lambda_correction_friction`.
         """
         M = len(mu)
-        if lam_init is not None and lam_init.shape == (3 * M,):
+        if M == 0:
+            return (
+                np.zeros(0, dtype=np.float64),
+                np.zeros(0, dtype=np.float64),
+                np.zeros(0, dtype=np.float64),
+            )
+        size_total = 3 * M
+
+        if lam_init is not None and lam_init.shape == (size_total,):
             lam = lam_init.astype(np.float64, copy=True)
         else:
-            lam = np.zeros(3 * M, dtype=np.float64)
+            lam = np.zeros(size_total, dtype=np.float64)
+        if omega_init is not None and omega_init.shape == (size_total,):
+            omega = omega_init.astype(np.float64, copy=True)
+        else:
+            omega = np.zeros(size_total, dtype=np.float64)
+
+        diag_W = np.diag(W)
+        # RealSim convention: precond[3c]   = dt² · W_ii  (unilateral row)
+        #                     precond[3c+1] = dt   · W_ii  (tangent rows)
+        #                     precond[3c+2] = dt   · W_ii
+        precond = np.zeros(size_total, dtype=np.float64)
+        for c in range(M):
+            w_n = max(float(abs(diag_W[3 * c])), 1e-12)
+            w_t1 = max(float(abs(diag_W[3 * c + 1])), 1e-12)
+            w_t2 = max(float(abs(diag_W[3 * c + 2])), 1e-12)
+            precond[3 * c] = (dt * dt) * w_n
+            precond[3 * c + 1] = dt * w_t1
+            precond[3 * c + 2] = dt * w_t2
+
         for _ in range(max_iters):
-            lam_old = lam.copy()
+            # penetration = -r + dt²·W·(ω·λ); on iter 0 with ω=0 this is -r.
+            penetration = -r + (dt * dt) * (W @ (omega * lam))
+
+            omega = np.zeros(size_total, dtype=np.float64)
+            compliance = np.zeros(size_total, dtype=np.float64)
+            h = np.zeros(size_total, dtype=np.float64)
             for c in range(M):
-                s = slice(3 * c, 3 * c + 3)
-                W_cc = W[s, s]
-                # Effective RHS: r_eff = r[s] - sum_{c' != c} W[s, s'] lam[s']
-                off_diag = W[s, :] @ lam - W_cc @ lam[s]
-                r_eff = r[s] - off_diag
-                # Unilateral complementarity: contact is inactive when the
-                # normal component of the effective residual is non-positive
-                # (gap still open).  Forcing the block to zero matches the
-                # Stage A max(0, r/W) clamp and prevents the Coulomb-cone
-                # projection from manufacturing spurious outward impulses via
-                # Case-3 when tangential residuals are large but r_n < 0.
-                if r_eff[0] <= 0.0:
-                    lam[3 * c + 0] = 0.0
-                    lam[3 * c + 1] = 0.0
-                    lam[3 * c + 2] = 0.0
-                    continue
-                # Solve 3x3: lam_unc = W_cc^{-1} r_eff
-                if np.linalg.det(W_cc) < 1e-20:
-                    continue
-                lam_unc = np.linalg.solve(W_cc, r_eff)
-                # Project onto Coulomb cone.
-                s_unc = float(lam_unc[0])
-                v_unc = lam_unc[1:3]
-                s_proj, v_proj = project_coulomb_cone(s_unc, v_unc, float(mu[c]))
-                lam[3 * c + 0] = s_proj
-                lam[3 * c + 1] = v_proj[0]
-                lam[3 * c + 2] = v_proj[1]
-            if np.linalg.norm(lam - lam_old, np.inf) < 1e-8:
+                idx_n = 3 * c
+                idx_t1 = 3 * c + 1
+                idx_t2 = 3 * c + 2
+                on, cn, hn = fb_unilateral_row(
+                    penetration=penetration[idx_n], lam=lam[idx_n],
+                    precond=precond[idx_n], dt=dt, pene0=pene0[idx_n],
+                )
+                ot1, ct1, ht1 = fb_frictional_row(
+                    penetration=penetration[idx_t1], lam_t=lam[idx_t1],
+                    lam_n=lam[idx_n], mu=mu[c],
+                    precond=precond[idx_t1], dt=dt, pene0=pene0[idx_t1],
+                )
+                ot2, ct2, ht2 = fb_frictional_row(
+                    penetration=penetration[idx_t2], lam_t=lam[idx_t2],
+                    lam_n=lam[idx_n], mu=mu[c],
+                    precond=precond[idx_t2], dt=dt, pene0=pene0[idx_t2],
+                )
+                omega[idx_n] = on
+                omega[idx_t1] = ot1
+                omega[idx_t2] = ot2
+                compliance[idx_n] = cn
+                compliance[idx_t1] = ct1
+                compliance[idx_t2] = ct2
+                h[idx_n] = hn
+                h[idx_t1] = ht1
+                h[idx_t2] = ht2
+
+            # Schur LHS.
+            A_schur = (omega[:, None] * omega[None, :]) * W + np.diag(compliance)
+            # J·x_corrected = J·x_unc + dt²·W·(ω·λ) = (pene0 − r) + dt²·W·(ω·λ).
+            J_x = (pene0 - r) + (dt * dt) * (W @ (omega * lam))
+            rhs = (1.0 / (dt * dt)) * (h - omega * J_x)
+
+            try:
+                dlam = np.linalg.solve(A_schur, rhs)
+            except np.linalg.LinAlgError:
                 break
+            lam = lam + dlam
+
+            # boundConstraintForces: clamp box per contact.
+            for c in range(M):
+                lam_n_c = max(0.0, lam[3 * c])
+                lam[3 * c] = lam_n_c
+                cone = mu[c] * lam_n_c
+                lam[3 * c + 1] = float(np.clip(lam[3 * c + 1], -cone, cone))
+                lam[3 * c + 2] = float(np.clip(lam[3 * c + 2], -cone, cone))
+
         if self.lambda_cap is not None:
             np.clip(lam, -self.lambda_cap, self.lambda_cap, out=lam)
-        return lam
+        lam_apply = (dt * dt) * omega * lam
+        return lam, omega, lam_apply
 
     def _apply_lambda_correction_friction(self, lam: np.ndarray) -> wp.array:
         """Compute ``correction = A⁻¹ · Jᵀ · λ`` for Stage B (3M λ).
