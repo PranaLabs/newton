@@ -975,13 +975,20 @@ class SolverFBA(SolverBase):
                     )
                     self._lam_unilateral_persistent = lam.copy()
                     self._omega_unilateral_persistent = omega_last.copy()
+                    # Symmetric magnitude guard, matching Stage B above and
+                    # RealSim's NonSmoothNewton.cpp:151-171 (always apply
+                    # correction). Pre-A1-fix the one-sided guard was masked
+                    # by the np.maximum(lam, 0.0) clamp; removing that clamp
+                    # exposes transient all-negative lam_apply, which a
+                    # one-sided guard would silently skip.
+                    #
                     # RealSim in-iter combined-form correction (Task 1.3.g):
                     # mirrors NonSmoothNewton.cpp:151-167 — ``b += dt²·J·(ω·λ);
                     # _systemlinearsolver->solve(x, b)``. Replaces the prior
                     # split-form ``correction = A⁻¹·Jᵀ·lam_apply;
                     # x_cur += correction``. Algebraically equivalent but
                     # bit-distinct under float32 rounding.
-                    if np.any(lam_apply > 1e-15):
+                    if np.any(np.abs(lam_apply) > 1e-15):
                         ls.apply_lambda_correction_combined(lam_apply, self._rhs, self._x_cur)
 
         # 3) Write velocity and update state_out.
@@ -1313,7 +1320,14 @@ class SolverFBA(SolverBase):
             self._contact_tangent1_offset_h = tangent1_offset_h
             self._contact_tangent2_offset_h = tangent2_offset_h
 
-            # Compute per-contact friction μ via VBD-style sqrt mixing.
+            # Per-contact friction μ. RealSim uses the shape's material μ directly
+            # (no particle-side μ, no mixing) — see RealSim collision shape mu
+            # propagation. FBA previously did `sqrt(particle_mu * shape_mu)` (VBD-style
+            # mixing), which diverged from RealSim whenever a demo didn't override
+            # via mu_per_pair_override. Per Q-G2 user decision 2026-05-17, align to
+            # RealSim: shape μ directly. particle_mu kept as a fallback only when
+            # the shape has no material μ (purely a robustness path; no in-scope
+            # demo hits it).
             particle_mu = float(getattr(model, "particle_mu", 0.5))
             mu_h = np.zeros(M, dtype=np.float64)
             if self._mu_per_pair_override is not None:
@@ -1324,7 +1338,7 @@ class SolverFBA(SolverBase):
                 for c in range(M):
                     s_idx = int(shape_h[c])
                     if shape_mat_mu is not None and s_idx >= 0 and s_idx < len(shape_mat_mu):
-                        mu_h[c] = float(np.sqrt(particle_mu * float(shape_mat_mu[s_idx])))
+                        mu_h[c] = float(shape_mat_mu[s_idx])
                     else:
                         mu_h[c] = particle_mu
             self._contact_mu_h = mu_h[:M]
@@ -1467,7 +1481,13 @@ class SolverFBA(SolverBase):
             except np.linalg.LinAlgError:
                 break
             lam = lam + dlam
-            np.maximum(lam, 0.0, out=lam)
+            # No lam_n >= 0 clamp here. RealSim's boundConstraintForces
+            # (NonSmoothNewton.cpp:391-394, unilateral branch) explicitly
+            # comments out `if(_lambda[cid] < 0.0) _lambda[cid] = 0.0;` —
+            # FB-Newton allows transient negative lambda inside the inner
+            # solve and lets the FB residual converge. The previous
+            # np.maximum(lam, 0.0) clamp converted Stage A toward
+            # Signorini-PGS (see realsim-port-discipline P2-E v1 failure).
 
         if self.lambda_cap is not None:
             cap_internal = self.lambda_cap / (dt * dt)
@@ -1600,13 +1620,26 @@ class SolverFBA(SolverBase):
                 break
             lam = lam + dlam
 
-            # boundConstraintForces: clamp box per contact.
+            # boundConstraintForces (NonSmoothNewton.cpp:395-403, friction
+            # branch): signed cone clamp. lam_n is NOT clamped to >= 0 inside
+            # the inner loop (the `if(_lambda[cid] < 0.0) = 0` line is
+            # explicitly commented out in RealSim). Tangent clamp is two
+            # independent if-statements applied in order; when lam_n < 0 this
+            # saturates lam_t to -mu*lam_n (positive) rather than producing a
+            # degenerate np.clip with low > high. Mirroring RealSim's exact
+            # mutation order:
             for c in range(M):
-                lam_n_c = max(0.0, lam[3 * c])
-                lam[3 * c] = lam_n_c
-                cone = mu[c] * lam_n_c
-                lam[3 * c + 1] = float(np.clip(lam[3 * c + 1], -cone, cone))
-                lam[3 * c + 2] = float(np.clip(lam[3 * c + 2], -cone, cone))
+                lam_n_c = lam[3 * c]  # SIGNED, per RealSim
+                upper = mu[c] * lam_n_c
+                lower = -mu[c] * lam_n_c
+                if lam[3 * c + 1] > upper:
+                    lam[3 * c + 1] = upper
+                if lam[3 * c + 1] < lower:
+                    lam[3 * c + 1] = lower
+                if lam[3 * c + 2] > upper:
+                    lam[3 * c + 2] = upper
+                if lam[3 * c + 2] < lower:
+                    lam[3 * c + 2] = lower
 
         if self.lambda_cap is not None:
             cap_internal = self.lambda_cap / (dt * dt)
