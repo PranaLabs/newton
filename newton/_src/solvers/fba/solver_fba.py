@@ -221,6 +221,7 @@ class SolverFBA(SolverBase):
         use_isodof: bool = True,
         shape_angular_velocity: dict[int, float] | None = None,
         nh_solver: Literal["newton5", "lbfgs"] = "lbfgs",
+        use_gpu_nsn: bool = True,
     ) -> None:
         """
         Args:
@@ -277,6 +278,18 @@ class SolverFBA(SolverBase):
                 legacy 5-iter fixed Newton (no line search, no convergence
                 check) for regression. Ignored unless
                 ``stretching_model="neohookean"``.
+            use_gpu_nsn: If ``True`` (default) dispatch the NSN inner solve
+                to the device-resident drivers
+                (:meth:`_solve_nsn_unilateral_gpu` /
+                :meth:`_solve_nsn_coulomb_gpu`) that execute the residual,
+                FB row, Schur-build, PCR solve, lambda update, and box-cone
+                clamp on the GPU. Set to ``False`` to fall back to the
+                host/numpy reference path
+                (:meth:`_solve_nsn_unilateral` / :meth:`_solve_nsn_coulomb`)
+                for regression bisection. The GPU path is functionally
+                equivalent; per-step performance still incurs host/device
+                marshaling of the Schur ``W`` matrix and per-PCR-iter
+                synchronizations (see the NSN GPU port plan, Step 12).
         """
         super().__init__(model)
 
@@ -319,6 +332,7 @@ class SolverFBA(SolverBase):
         self.nsn_iterations = int(nsn_iterations)
         self.lambda_cap = lambda_cap
         self.use_isodof = bool(use_isodof)
+        self.use_gpu_nsn = bool(use_gpu_nsn)
 
         # Per-shape kinematic angular velocity (rad/s about local +Z).  RealSim
         # parity for ``cylindercollisions.rollingvel``.
@@ -981,7 +995,8 @@ class SolverFBA(SolverBase):
                     pene0_b[0::3] = self._contact_offset_h[:M]
                     pene0_b[1::3] = self._contact_tangent1_offset_h[:M]
                     pene0_b[2::3] = self._contact_tangent2_offset_h[:M]
-                    lam, omega_last, lam_apply = self._solve_nsn_coulomb(
+                    nsn_coulomb = self._solve_nsn_coulomb_gpu if self.use_gpu_nsn else self._solve_nsn_coulomb
+                    lam, omega_last, lam_apply = nsn_coulomb(
                         W,
                         r,
                         self._contact_mu_h[:M],
@@ -1017,7 +1032,8 @@ class SolverFBA(SolverBase):
                     x_unc_np = self._x_cur.numpy()  # (N, 3) float32
                     r = self._compute_contact_residual(x_unc_np)
                     pene0_a = self._contact_offset_h[:M].astype(np.float64, copy=True)
-                    lam, omega_last, lam_apply = self._solve_nsn_unilateral(
+                    nsn_unilateral = self._solve_nsn_unilateral_gpu if self.use_gpu_nsn else self._solve_nsn_unilateral
+                    lam, omega_last, lam_apply = nsn_unilateral(
                         W,
                         r,
                         pene0_a,
