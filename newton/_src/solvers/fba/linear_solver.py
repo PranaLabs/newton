@@ -983,7 +983,7 @@ class FBALinearSolver:
             multi-RHS solve. Computes ``A^{-1} J^T`` for all ``3 * M_rows`` columns
             and assembles ``W`` from those columns.  The ``_A_inv_Jt_d`` device
             buffer of shape ``(M_rows, N)`` is left populated and reused by
-            :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA._apply_lambda_correction*`.
+            :meth:`apply_lambda_correction_combined`.
 
         Args:
             num_contacts: Number of active contacts ``M``.

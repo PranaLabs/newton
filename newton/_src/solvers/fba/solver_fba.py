@@ -355,8 +355,8 @@ class SolverFBA(SolverBase):
         # :meth:`notify_model_changed` / :meth:`_setup_pd_system` (A change).
         self._cached_W: np.ndarray | None = None
         # ``_A_inv_Jt_d`` itself lives on the :class:`FBALinearSolver` and
-        # is reused by :meth:`_apply_lambda_correction*`; we only need to
-        # track whether that buffer is fresh for the current step.
+        # is reused by :meth:`~newton._src.solvers.fba.linear_solver.FBALinearSolver.apply_lambda_correction_combined`;
+        # we only need to track whether that buffer is fresh for the current step.
         self._cached_A_inv_Jt_valid: bool = False
 
         # λ persistent across PD outer iters within a step. RealSim parity:
@@ -1422,12 +1422,12 @@ class SolverFBA(SolverBase):
           - ``lam`` (force units, for warm-start): RealSim's accumulated λ.
           - ``omega``: per-row weighting from the last NSN iter.
           - ``lam_apply`` = ``dt² · ω · lam`` (position-LCP units): the value to
-            pass into :meth:`_apply_lambda_correction` (which adds
-            ``A⁻¹·Jᵀ·lam_apply`` to ``x_unc``).
+            pass into :meth:`~newton._src.solvers.fba.linear_solver.FBALinearSolver.apply_lambda_correction_combined`
+            (which adds ``A⁻¹·Jᵀ·lam_apply`` to ``x_unc``).
 
         The two scales differ because RealSim's correction is
         ``Δq = dt² · A⁻¹ · Jᵀ · (ω · λ_force)``, whereas FBA's
-        ``_apply_lambda_correction`` adds ``A⁻¹·Jᵀ·λ`` directly. ``omega``
+        ``apply_lambda_correction_combined`` adds ``A⁻¹·Jᵀ·λ`` directly. ``omega``
         from the previous step is needed so that the next call can compute the
         correct iter-0 ``penetration = -r + dt²·W·(ω·λ)`` accounting for the
         previously-applied correction.
@@ -1529,7 +1529,7 @@ class SolverFBA(SolverBase):
                 with layout ``[λ_n_0, λ_t1_0, λ_t2_0, ...]``. Use as warm-start.
               - ``omega``: per-row weighting from the last NSN iter.
               - ``lam_apply`` = ``dt² · ω · lam``: pass into
-                :meth:`_apply_lambda_correction_friction`.
+                :meth:`~newton._src.solvers.fba.linear_solver.FBALinearSolver.apply_lambda_correction_combined`.
         """
         M = len(mu)
         if M == 0:
@@ -1647,166 +1647,3 @@ class SolverFBA(SolverBase):
         lam_apply = (dt * dt) * omega * lam
         return lam, omega, lam_apply
 
-    def _apply_lambda_correction_friction(self, lam: np.ndarray) -> wp.array:
-        """Compute ``correction = A⁻¹ · Jᵀ · λ`` for Stage B (3M λ).
-
-        Uses the cached ``_A_inv_Jt_d`` device buffer from
-        :meth:`~newton._src.solvers.fba.linear_solver.FBALinearSolver.build_schur_complement`
-        which contains one (N,) vec3 row per row (3M total entries for friction).
-
-        Each row r corresponds to contact ``c = r // 3``, axis ``a = r % 3``:
-
-        - a=0: normal contribution
-        - a=1: t1 contribution
-        - a=2: t2 contribution
-
-        Args:
-            lam: Contact impulse vector, shape ``(3M,)``, float64.
-
-        Returns:
-            Correction vec3 Warp array of length N.
-        """
-
-        M = self._contact_count
-        total_rows = 3 * M
-        N = self.model.particle_count
-        dev = self._device
-        ls = self._linear_solver
-
-        correction = wp.zeros(N, dtype=wp.vec3, device=dev)
-
-        # Isodof-mode path: rebuild ``J^T lambda`` and run a single Cholesky
-        # solve. This is the default for ``use_isodof=True`` because the
-        # ``_A_inv_Jt_d`` cache is not populated by the isodof Schur build.
-        if self.use_isodof and hasattr(ls, "_row_particle_d") and ls._row_total == total_rows:
-            ls.apply_lambda_correction_isodof(lam, correction)
-            return correction
-
-        if hasattr(ls, "_A_inv_Jt_d") and ls._A_inv_Jt_d.shape[0] >= total_rows:
-            # Use cached device buffer: accumulate weighted rows entirely on GPU.
-            from .kernels import accumulate_lambda_correction_kernel  # noqa: PLC0415
-
-            lam_d = wp.array(lam.astype(np.float32), dtype=wp.float32, device=dev)
-            wp.launch(
-                accumulate_lambda_correction_kernel,
-                dim=N,
-                inputs=[lam_d, ls._A_inv_Jt_d, int(total_rows)],
-                outputs=[correction],
-                device=dev,
-            )
-            return correction
-
-        # Fallback path: re-solve for each row (only used when the cached
-        # ``_A_inv_Jt_d`` buffer is unavailable, e.g. tests that bypass the
-        # batched Schur build).
-        correction_np = np.zeros((N, 3), dtype=np.float64)
-
-        from .kernels import build_contact_jacobian_dir_kernel, zero_vec3_kernel  # noqa: PLC0415
-
-        tmp = wp.empty(N, dtype=wp.vec3, device=dev)
-        work = wp.empty(N, dtype=wp.vec3, device=dev)
-        for c in range(M):
-            if not hasattr(self, "_contact_tangent1_h"):
-                continue
-            n = self._contact_normal_h[c].astype(np.float64)
-            t1 = self._contact_tangent1_h[c].astype(np.float64)
-            t2 = self._contact_tangent2_h[c].astype(np.float64)
-            directions = [n, t1, t2]
-            for a, direction in enumerate(directions):
-                row = 3 * c + a
-                if abs(lam[row]) < 1e-15:
-                    continue
-                wp.launch(zero_vec3_kernel, dim=N, inputs=[work], device=dev)
-                wp.launch(
-                    build_contact_jacobian_dir_kernel,
-                    dim=1,
-                    inputs=[
-                        N,
-                        c,
-                        self._contact_particle_d,
-                        self._contact_alpha_d,
-                        wp.vec3(float(direction[0]), float(direction[1]), float(direction[2])),
-                    ],
-                    outputs=[work],
-                    device=dev,
-                )
-                ls.solve(work, tmp)
-                tmp_np = tmp.numpy().astype(np.float64)
-                correction_np += lam[row] * tmp_np
-
-        correction.assign(correction_np.astype(np.float32))
-        return correction
-
-    def _apply_lambda_correction(self, lam: np.ndarray) -> wp.array:
-        """Compute ``correction = A⁻¹ · Jᵀ · λ`` (vec3 array of length N).
-
-        Reuses the cached ``_A_inv_Jt_d`` device buffer from the last
-        :meth:`~newton._src.solvers.fba.linear_solver.FBALinearSolver.build_schur_complement`
-        call when available, otherwise re-solves.
-
-        Args:
-            lam: Contact impulse vector, shape ``(M,)``, float64.
-
-        Returns:
-            Correction vec3 Warp array of length N.
-        """
-
-        M = self._contact_count
-        N = self.model.particle_count
-        dev = self._device
-        ls = self._linear_solver
-
-        correction = wp.zeros(N, dtype=wp.vec3, device=dev)
-
-        # Isodof-mode path: rebuild ``J^T lambda`` and run a single Cholesky
-        # solve. This is the default for ``use_isodof=True`` because the
-        # ``_A_inv_Jt_d`` cache is not populated by the isodof Schur build.
-        if self.use_isodof and hasattr(ls, "_row_particle_d") and ls._row_total == M:
-            ls.apply_lambda_correction_isodof(lam, correction)
-            return correction
-
-        if hasattr(ls, "_A_inv_Jt_d") and ls._A_inv_Jt_d.shape[0] >= M:
-            # Reuse cached A⁻¹ · J_c^T columns from build_schur_complement and
-            # run the weighted sum entirely on device.
-            from .kernels import accumulate_lambda_correction_kernel  # noqa: PLC0415
-
-            lam_d = wp.array(lam.astype(np.float32), dtype=wp.float32, device=dev)
-            wp.launch(
-                accumulate_lambda_correction_kernel,
-                dim=N,
-                inputs=[lam_d, ls._A_inv_Jt_d, int(M)],
-                outputs=[correction],
-                device=dev,
-            )
-        else:
-            # Fallback: re-solve for each contact.
-            from .kernels import (  # noqa: PLC0415
-                accumulate_vec3_kernel,
-                set_lambda_jacobian_vec3_kernel,
-                zero_vec3_kernel,
-            )
-
-            tmp = wp.empty(N, dtype=wp.vec3, device=dev)
-            work = wp.empty(N, dtype=wp.vec3, device=dev)
-            for c in range(M):
-                if abs(lam[c]) < 1e-15:
-                    continue
-                wp.launch(zero_vec3_kernel, dim=N, inputs=[work], device=dev)
-                wp.launch(
-                    set_lambda_jacobian_vec3_kernel,
-                    dim=1,
-                    inputs=[
-                        c,
-                        self._contact_particle_d,
-                        self._contact_normal_d,
-                        self._contact_alpha_d,
-                        float(lam[c]),
-                        N,
-                    ],
-                    outputs=[work],
-                    device=dev,
-                )
-                ls.solve(work, tmp)
-                wp.launch(accumulate_vec3_kernel, dim=N, inputs=[tmp], outputs=[correction], device=dev)
-
-        return correction

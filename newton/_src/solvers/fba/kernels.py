@@ -2854,39 +2854,6 @@ def unpack_to_A_inv_Jt_3axis_kernel(
     )
 
 
-@wp.kernel
-def accumulate_lambda_correction_kernel(
-    lam: wp.array[wp.float32],
-    A_inv_Jt: wp.array2d[wp.vec3],
-    n_rows: int,
-    out: wp.array[wp.vec3],
-):
-    """Compute ``out[i] = Σ_r lam[r] * A_inv_Jt[r, i]`` for one particle per thread.
-
-    Replaces the prior host-side Python loop in
-    :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA._apply_lambda_correction`
-    and :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA._apply_lambda_correction_friction`.
-
-    Each thread handles a single particle ``i`` and accumulates the weighted
-    sum across rows. Each output cell is written by exactly one thread, so no
-    atomics are required.
-
-    Called with ``dim = N`` (number of particles).
-
-    Args:
-        lam: Contact impulse vector, shape ``[n_rows]``, float32. Stage A uses
-            ``n_rows == M``; Stage B uses ``n_rows == 3*M``.
-        A_inv_Jt: Cached ``A⁻¹ Jᵀ`` device buffer, shape ``[n_rows, N]`` vec3.
-        n_rows: Number of active contact rows (M or 3M).
-        out: Output correction array, shape ``[N]`` vec3; fully written.
-    """
-    i = wp.tid()
-    c = wp.vec3(0.0, 0.0, 0.0)
-    for r in range(n_rows):
-        c = c + lam[r] * A_inv_Jt[r, i]
-    out[i] = c
-
-
 # ---------------------------------------------------------------------------
 # Task P — isodof-restricted Schur build primitives
 # ---------------------------------------------------------------------------
