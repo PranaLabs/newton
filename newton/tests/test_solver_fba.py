@@ -3857,6 +3857,133 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
         )
 
 
+class SolverFBAStageAStageBEquivalenceTests(unittest.TestCase):
+    """Stage A (unilateral, M-row) ≡ Stage B (frictional, 3M-row) at μ=0.
+
+    Justifies keeping FBA's ``_solve_nsn_unilateral`` (which has no RealSim
+    equivalent — RealSim always uses the 3M frictional path) as a
+    perf-valuable shortcut. The unit test below proves the two paths produce
+    numerically identical ``λ_n`` and ``lam_apply_n`` when ``μ = 0`` so the
+    short-circuit is a no-op in physical behavior.
+
+    Math: with ``μ = 0`` Stage B's frictional FB row collapses — at iter 0
+    the inactive branch (``lam_n ≤ 0``) yields ``ω_t = 0, h_t = 0`` (since
+    ``lam_t = 0``); at later iters the active branch with ``μ = 0`` and
+    ``lam_t = 0`` yields ``ω_t = 1, h_t = 0, compliance_t = 1/dt``. When the
+    Stage B ``W`` is constructed block-diagonal (normal block = ``W_A``,
+    tangent blocks = identity, all cross-blocks zero), the resulting Schur
+    system decouples: the normal-normal sub-block matches Stage A's system
+    exactly, and the tangent rows always solve to zero. Therefore ``λ_n``
+    and ``ω_n·λ_n`` (the value applied as a correction) must agree to
+    machine precision.
+    """
+
+    def _tiny_cloth_model(self):
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=-9.81)
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.1, -0.1, 0.2),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=3,
+            dim_y=3,
+            cell_x=0.05,
+            cell_y=0.05,
+            mass=0.05,
+            tri_ke=1.0e4,
+            tri_ka=0.0,
+            tri_kd=0.0,
+        )
+        return builder.finalize()
+
+    def _build_stage_b_inputs(
+        self,
+        W_a: np.ndarray,
+        r_a: np.ndarray,
+        pene0_a: np.ndarray,
+        tangent_diag: float = 1.0,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Lift an M-row Stage A scenario to a 3M-row Stage B scenario.
+
+        Normal-block ``W_b[3i, 3j] = W_a[i, j]``; tangent diagonals set to
+        ``tangent_diag`` (any positive value works since tangent rows decouple
+        at μ=0); all cross-blocks zero. ``r``/``pene0``/``mu`` lifted to 3M
+        with zero tangent entries and zero friction.
+        """
+        M = W_a.shape[0]
+        W_b = np.zeros((3 * M, 3 * M), dtype=np.float64)
+        for i in range(M):
+            for j in range(M):
+                W_b[3 * i, 3 * j] = W_a[i, j]
+            W_b[3 * i + 1, 3 * i + 1] = tangent_diag
+            W_b[3 * i + 2, 3 * i + 2] = tangent_diag
+        r_b = np.zeros(3 * M, dtype=np.float64)
+        r_b[0::3] = r_a
+        pene0_b = np.zeros(3 * M, dtype=np.float64)
+        pene0_b[0::3] = pene0_a
+        mu_b = np.zeros(M, dtype=np.float64)
+        return W_b, r_b, mu_b, pene0_b
+
+    def _assert_stage_a_equiv_stage_b(
+        self,
+        solver: SolverFBA,
+        W_a: np.ndarray,
+        r_a: np.ndarray,
+        pene0_a: np.ndarray,
+        *,
+        dt: float = 0.01,
+        max_iters: int = 10,
+        atol: float = 1e-10,
+        rtol: float = 1e-10,
+    ) -> None:
+        W_b, r_b, mu_b, pene0_b = self._build_stage_b_inputs(W_a, r_a, pene0_a)
+
+        lam_a, omega_a, lam_apply_a = solver._solve_nsn_unilateral(W_a, r_a, pene0_a, max_iters=max_iters, dt=dt)
+        lam_b, omega_b, lam_apply_b = solver._solve_nsn_coulomb(W_b, r_b, mu_b, pene0_b, max_iters=max_iters, dt=dt)
+
+        # Normal rows must agree to machine precision.
+        np.testing.assert_allclose(lam_a, lam_b[0::3], atol=atol, rtol=rtol)
+        np.testing.assert_allclose(omega_a, omega_b[0::3], atol=atol, rtol=rtol)
+        np.testing.assert_allclose(lam_apply_a, lam_apply_b[0::3], atol=atol, rtol=rtol)
+
+        # Tangent λ and applied corrections must be exactly zero with μ=0.
+        np.testing.assert_array_equal(lam_b[1::3], 0.0)
+        np.testing.assert_array_equal(lam_b[2::3], 0.0)
+        np.testing.assert_array_equal(lam_apply_b[1::3], 0.0)
+        np.testing.assert_array_equal(lam_apply_b[2::3], 0.0)
+
+    def test_single_contact_penetrating(self) -> None:
+        model = self._tiny_cloth_model()
+        solver = SolverFBA(model)
+        W_a = np.array([[1.0]], dtype=np.float64)
+        r_a = np.array([-0.1], dtype=np.float64)
+        pene0_a = np.zeros(1, dtype=np.float64)
+        self._assert_stage_a_equiv_stage_b(solver, W_a, r_a, pene0_a)
+
+    def test_three_contacts_well_conditioned(self) -> None:
+        model = self._tiny_cloth_model()
+        solver = SolverFBA(model)
+        W_a = np.array(
+            [
+                [1.0, 0.1, 0.0],
+                [0.1, 1.2, 0.05],
+                [0.0, 0.05, 0.8],
+            ],
+            dtype=np.float64,
+        )
+        r_a = np.array([-0.1, -0.05, -0.02], dtype=np.float64)
+        pene0_a = np.zeros(3, dtype=np.float64)
+        self._assert_stage_a_equiv_stage_b(solver, W_a, r_a, pene0_a)
+
+    def test_nonzero_pene0_offset(self) -> None:
+        model = self._tiny_cloth_model()
+        solver = SolverFBA(model)
+        W_a = np.diag([1.0, 1.2, 0.8]).astype(np.float64)
+        r_a = np.array([-0.05, -0.03, -0.01], dtype=np.float64)
+        # pene0 exercises the row anchor offset in fb_unilateral_row's `h`.
+        pene0_a = np.array([0.02, -0.01, 0.005], dtype=np.float64)
+        self._assert_stage_a_equiv_stage_b(solver, W_a, r_a, pene0_a)
+
+
 class SolverFBALambdaWarmStartTests(unittest.TestCase):
     """λ warm-start across PD outer iters reproduces RealSim's per-frame reset.
 
