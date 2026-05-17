@@ -4840,5 +4840,287 @@ class SolverFBAInIterReDeriveTests(unittest.TestCase):
         )
 
 
+class TestNeoHookeanLBFGS(unittest.TestCase):
+    """Unit tests for the RealSim-faithful LBFGS port (Tri/Tet NH local projection).
+
+    Validates :func:`project_neohookean_sigma2d_lbfgs` and
+    :func:`project_neohookean_sigma3d_lbfgs` against ``scipy.optimize.minimize``
+    (L-BFGS-B reference) on the same objective ``Psi(sigma) + (k/2)*||sigma-sigma_0||^2``.
+    Also cross-validates the analytic gradient via finite differences.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        wp.init()
+
+    def _device(self) -> str:
+        return "cuda:0" if wp.is_cuda_available() else "cpu"
+
+    @staticmethod
+    def _nh_obj_2d(sigma, sigma0, mu, lam):
+        k = 2.0 * mu
+        s0, s1 = sigma
+        if s0 <= 0.0 or s1 <= 0.0:
+            return np.inf
+        j = s0 * s1
+        log_i3 = 2.0 * np.log(j)
+        i1 = s0 * s0 + s1 * s1
+        psi = 0.5 * mu * (i1 - log_i3 - 3.0) + 0.125 * lam * log_i3 * log_i3
+        return psi + 0.5 * k * np.sum((np.asarray(sigma) - np.asarray(sigma0)) ** 2)
+
+    @staticmethod
+    def _nh_obj_3d(sigma, sigma0, mu, lam):
+        k = 2.0 * mu
+        s0, s1, s2 = sigma
+        if s0 <= 0.0 or s1 <= 0.0 or s2 <= 0.0:
+            return np.inf
+        j = s0 * s1 * s2
+        log_i3 = 2.0 * np.log(j)
+        i1 = s0 * s0 + s1 * s1 + s2 * s2
+        psi = 0.5 * mu * (i1 - log_i3 - 3.0) + 0.125 * lam * log_i3 * log_i3
+        return psi + 0.5 * k * np.sum((np.asarray(sigma) - np.asarray(sigma0)) ** 2)
+
+    @staticmethod
+    def _build_drivers():
+        # Local kernels that drive the @wp.func directly so we can test the
+        # math in isolation (same pattern as the existing SVD/projection tests).
+        from newton._src.solvers.fba.kernels import (  # noqa: PLC0415
+            nh_gradient_2d,
+            nh_gradient_3d,
+            project_neohookean_sigma2d_lbfgs,
+            project_neohookean_sigma3d_lbfgs,
+        )
+
+        @wp.kernel
+        def drive_lbfgs2d(
+            sigma_init: wp.array[wp.vec2d],
+            mu: wp.array[wp.float64],
+            lam: wp.array[wp.float64],
+            out: wp.array[wp.vec2d],
+        ):
+            tid = wp.tid()
+            out[tid] = project_neohookean_sigma2d_lbfgs(sigma_init[tid], mu[tid], lam[tid])
+
+        @wp.kernel
+        def drive_lbfgs3d(
+            sigma_init: wp.array[wp.vec3d],
+            mu: wp.array[wp.float64],
+            lam: wp.array[wp.float64],
+            out: wp.array[wp.vec3d],
+        ):
+            tid = wp.tid()
+            out[tid] = project_neohookean_sigma3d_lbfgs(sigma_init[tid], mu[tid], lam[tid])
+
+        @wp.kernel
+        def drive_grad2d(
+            sigma: wp.array[wp.vec2d],
+            sigma_init: wp.array[wp.vec2d],
+            mu: wp.array[wp.float64],
+            lam: wp.array[wp.float64],
+            out: wp.array[wp.vec2d],
+        ):
+            tid = wp.tid()
+            k = wp.float64(2.0) * mu[tid]
+            out[tid] = nh_gradient_2d(sigma[tid], sigma_init[tid], mu[tid], lam[tid], k)
+
+        @wp.kernel
+        def drive_grad3d(
+            sigma: wp.array[wp.vec3d],
+            sigma_init: wp.array[wp.vec3d],
+            mu: wp.array[wp.float64],
+            lam: wp.array[wp.float64],
+            out: wp.array[wp.vec3d],
+        ):
+            tid = wp.tid()
+            k = wp.float64(2.0) * mu[tid]
+            out[tid] = nh_gradient_3d(sigma[tid], sigma_init[tid], mu[tid], lam[tid], k)
+
+        return drive_lbfgs2d, drive_lbfgs3d, drive_grad2d, drive_grad3d
+
+    def test_lbfgs_2d_matches_scipy_lbfgsb(self):
+        """Tri LBFGS Warp port matches scipy ``L-BFGS-B`` to <=1e-6 on five anchors."""
+        try:
+            import scipy.optimize as opt
+        except ImportError:
+            self.skipTest("scipy required for LBFGS reference")
+
+        device = self._device()
+        drive2, _, _, _ = self._build_drivers()
+        anchors = np.array(
+            [
+                [1.0, 1.0],  # rest
+                [1.5, 0.7],  # mild stretch + compression
+                [0.1, 0.1],  # extreme compression
+                [3.0, 1.0],  # extreme stretch
+                [0.05, 2.0],  # mixed extreme
+            ]
+        )
+        mu = 3571.43
+        lam = 14285.71
+        sigma_d = wp.array(anchors.astype(np.float64), dtype=wp.vec2d, device=device)
+        mu_d = wp.array([mu] * len(anchors), dtype=wp.float64, device=device)
+        lam_d = wp.array([lam] * len(anchors), dtype=wp.float64, device=device)
+        out = wp.zeros(len(anchors), dtype=wp.vec2d, device=device)
+        wp.launch(drive2, dim=len(anchors), inputs=[sigma_d, mu_d, lam_d], outputs=[out], device=device)
+        res = out.numpy()
+        for anchor, r in zip(anchors, res, strict=True):
+            sc = opt.minimize(
+                self._nh_obj_2d,
+                anchor,
+                args=(anchor, mu, lam),
+                method="L-BFGS-B",
+                bounds=[(1e-6, None), (1e-6, None)],
+                options={"maxiter": 50, "ftol": 1e-12, "gtol": 1e-9, "maxcor": 8},
+            )
+            np.testing.assert_allclose(r, sc.x, atol=1e-6, err_msg=f"anchor={anchor}, warp={r}, scipy={sc.x}")
+            # Objective at warp output should match scipy's at <= 1e-10 (both are
+            # near-stationary points).
+            f_warp = self._nh_obj_2d(r, anchor, mu, lam)
+            f_scipy = self._nh_obj_2d(sc.x, anchor, mu, lam)
+            self.assertLess(
+                abs(f_warp - f_scipy),
+                1e-8,
+                f"anchor={anchor}: |Δf|={abs(f_warp - f_scipy):.2e}",
+            )
+
+    def test_lbfgs_3d_matches_scipy_lbfgsb(self):
+        """Tet LBFGS Warp port matches scipy ``L-BFGS-B`` to <=1e-6 on five anchors."""
+        try:
+            import scipy.optimize as opt
+        except ImportError:
+            self.skipTest("scipy required for LBFGS reference")
+
+        device = self._device()
+        _, drive3, _, _ = self._build_drivers()
+        anchors = np.array(
+            [
+                [1.0, 1.0, 1.0],
+                [1.5, 0.7, 0.9],
+                [0.1, 0.1, 0.1],
+                [3.0, 1.0, 1.0],
+                [1.0, 1.0, 0.05],
+            ]
+        )
+        mu = 3571.43
+        lam = 14285.71
+        sigma_d = wp.array(anchors.astype(np.float64), dtype=wp.vec3d, device=device)
+        mu_d = wp.array([mu] * len(anchors), dtype=wp.float64, device=device)
+        lam_d = wp.array([lam] * len(anchors), dtype=wp.float64, device=device)
+        out = wp.zeros(len(anchors), dtype=wp.vec3d, device=device)
+        wp.launch(drive3, dim=len(anchors), inputs=[sigma_d, mu_d, lam_d], outputs=[out], device=device)
+        res = out.numpy()
+        for anchor, r in zip(anchors, res, strict=True):
+            sc = opt.minimize(
+                self._nh_obj_3d,
+                anchor,
+                args=(anchor, mu, lam),
+                method="L-BFGS-B",
+                bounds=[(1e-6, None)] * 3,
+                options={"maxiter": 50, "ftol": 1e-12, "gtol": 1e-9, "maxcor": 8},
+            )
+            np.testing.assert_allclose(r, sc.x, atol=1e-6, err_msg=f"anchor={anchor}, warp={r}, scipy={sc.x}")
+            f_warp = self._nh_obj_3d(r, anchor, mu, lam)
+            f_scipy = self._nh_obj_3d(sc.x, anchor, mu, lam)
+            self.assertLess(abs(f_warp - f_scipy), 1e-7)
+
+    def test_nh_gradient_2d_matches_finite_difference(self):
+        """``nh_gradient_2d`` matches scipy ``approx_fprime`` finite difference."""
+        try:
+            import scipy.optimize as opt
+        except ImportError:
+            self.skipTest("scipy required for FD reference")
+
+        device = self._device()
+        _, _, drive_g2, _ = self._build_drivers()
+        sigma = np.array([[1.3, 0.8], [0.4, 1.7]])
+        sigma0 = np.array([[1.0, 1.0], [0.5, 1.5]])
+        mu = 100.0
+        lam = 200.0
+        sd = wp.array(sigma.astype(np.float64), dtype=wp.vec2d, device=device)
+        s0d = wp.array(sigma0.astype(np.float64), dtype=wp.vec2d, device=device)
+        mu_d = wp.array([mu] * len(sigma), dtype=wp.float64, device=device)
+        lam_d = wp.array([lam] * len(sigma), dtype=wp.float64, device=device)
+        out = wp.zeros(len(sigma), dtype=wp.vec2d, device=device)
+        wp.launch(drive_g2, dim=len(sigma), inputs=[sd, s0d, mu_d, lam_d], outputs=[out], device=device)
+        g_warp = out.numpy()
+        for i, (s, s0) in enumerate(zip(sigma, sigma0, strict=True)):
+            g_fd = opt.approx_fprime(s, self._nh_obj_2d, 1e-7, s0, mu, lam)
+            np.testing.assert_allclose(g_warp[i], g_fd, rtol=1e-4, atol=1e-3)
+
+    def test_nh_gradient_3d_matches_finite_difference(self):
+        """``nh_gradient_3d`` matches scipy ``approx_fprime`` finite difference."""
+        try:
+            import scipy.optimize as opt
+        except ImportError:
+            self.skipTest("scipy required for FD reference")
+
+        device = self._device()
+        _, _, _, drive_g3 = self._build_drivers()
+        sigma = np.array([[1.3, 0.8, 0.9], [0.6, 1.5, 1.1]])
+        sigma0 = np.array([[1.0, 1.0, 1.0], [0.8, 1.2, 1.0]])
+        mu = 100.0
+        lam = 200.0
+        sd = wp.array(sigma.astype(np.float64), dtype=wp.vec3d, device=device)
+        s0d = wp.array(sigma0.astype(np.float64), dtype=wp.vec3d, device=device)
+        mu_d = wp.array([mu] * len(sigma), dtype=wp.float64, device=device)
+        lam_d = wp.array([lam] * len(sigma), dtype=wp.float64, device=device)
+        out = wp.zeros(len(sigma), dtype=wp.vec3d, device=device)
+        wp.launch(drive_g3, dim=len(sigma), inputs=[sd, s0d, mu_d, lam_d], outputs=[out], device=device)
+        g_warp = out.numpy()
+        for i, (s, s0) in enumerate(zip(sigma, sigma0, strict=True)):
+            g_fd = opt.approx_fprime(s, self._nh_obj_3d, 1e-7, s0, mu, lam)
+            np.testing.assert_allclose(g_warp[i], g_fd, rtol=1e-4, atol=1e-3)
+
+    def test_nh_solver_kwarg_default_is_lbfgs(self):
+        """Default ``nh_solver='lbfgs'`` is wired into ``SolverFBA``."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=2,
+            dim_y=2,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.1,
+            tri_ke=1.0e3,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+            fix_left=False,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(model, stretching_model="neohookean", mu=100.0, lam=200.0)
+        self.assertEqual(solver.nh_solver, "lbfgs")
+
+    def test_nh_solver_kwarg_rejects_unknown(self):
+        """Unknown ``nh_solver`` strings raise ``ValueError``."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=2,
+            dim_y=2,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.1,
+            tri_ke=1.0e3,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+            fix_left=False,
+        )
+        model = builder.finalize()
+        with self.assertRaises(ValueError):
+            SolverFBA(model, stretching_model="neohookean", mu=100.0, lam=200.0, nh_solver="bogus")
+
+
 if __name__ == "__main__":
     unittest.main()

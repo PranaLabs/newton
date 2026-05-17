@@ -219,6 +219,7 @@ class SolverFBA(SolverBase):
         lambda_cap: float | None = None,
         use_isodof: bool = True,
         shape_angular_velocity: dict[int, float] | None = None,
+        nh_solver: Literal["newton5", "lbfgs"] = "lbfgs",
     ) -> None:
         """
         Args:
@@ -266,6 +267,15 @@ class SolverFBA(SolverBase):
                 stays static.  Sign matches RealSim CudaTests'
                 ``cylindercollisions[i].rollingvel`` (tangent direction
                 ``normal × axis``).  Defaults to no kinematic motion.
+            nh_solver: Local-projection inner solver for the Neo-Hookean
+                stretching model.  ``"lbfgs"`` (default) uses an LBFGS+Armijo
+                cubic-backtracking line search ported from RealSim
+                ``mcl::optlib::LBFGS<double, 2/3>`` (M=8, c_1=1e-4, tol=1e-6,
+                max_iters=50; LBFGS.hpp:36-152, Backtracking.hpp:74-145,
+                HyperelasticProblemS.h:5-120). ``"newton5"`` keeps FBA's
+                legacy 5-iter fixed Newton (no line search, no convergence
+                check) for regression. Ignored unless
+                ``stretching_model="neohookean"``.
         """
         super().__init__(model)
 
@@ -279,6 +289,8 @@ class SolverFBA(SolverBase):
                 f"stretching_model={stretching_model!r} not yet implemented; "
                 "supported: 'arap', 'corotational', 'neohookean'"
             )
+        if nh_solver not in ("newton5", "lbfgs"):
+            raise ValueError(f"nh_solver={nh_solver!r} not supported; choose 'newton5' or 'lbfgs'")
         if stretching_model in ("corotational", "neohookean"):
             if mu is None or lam is None:
                 raise ValueError(
@@ -296,6 +308,7 @@ class SolverFBA(SolverBase):
         self.iterations = int(iterations)
         self.pin_stiffness = float(pin_stiffness)
         self.stretching_model = stretching_model
+        self.nh_solver = nh_solver
         self._mu = float(mu) if mu is not None else None
         self._lam = float(lam) if lam is not None else None
         self.friction = bool(friction)
@@ -578,7 +591,9 @@ class SolverFBA(SolverBase):
             project_stretching_corotational_compute_kernel,
             project_stretching_corotational_tet_compute_kernel,
             project_stretching_neohookean_compute_kernel,
+            project_stretching_neohookean_compute_kernel_lbfgs,
             project_stretching_neohookean_tet_compute_kernel,
+            project_stretching_neohookean_tet_compute_kernel_lbfgs,
             write_velocity_kernel,
             zero_vec3_kernel,
         )
@@ -734,8 +749,13 @@ class SolverFBA(SolverBase):
                         device=device,
                     )
                 elif self.stretching_model == "neohookean":
+                    nh_tri_kernel = (
+                        project_stretching_neohookean_compute_kernel_lbfgs
+                        if self.nh_solver == "lbfgs"
+                        else project_stretching_neohookean_compute_kernel
+                    )
                     wp.launch(
-                        project_stretching_neohookean_compute_kernel,
+                        nh_tri_kernel,
                         dim=model.tri_count,
                         inputs=[
                             self._x_cur,
@@ -845,8 +865,13 @@ class SolverFBA(SolverBase):
                     )
                 elif self.stretching_model == "neohookean":
                     # Deterministic (compute → gather) tet NH scatter.
+                    nh_tet_kernel = (
+                        project_stretching_neohookean_tet_compute_kernel_lbfgs
+                        if self.nh_solver == "lbfgs"
+                        else project_stretching_neohookean_tet_compute_kernel
+                    )
                     wp.launch(
-                        project_stretching_neohookean_tet_compute_kernel,
+                        nh_tet_kernel,
                         dim=model.tet_count,
                         inputs=[
                             self._x_cur,
