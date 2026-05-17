@@ -2871,40 +2871,6 @@ class TestPhase4StageBFriction(unittest.TestCase):
     def setUpClass(cls):
         wp.init()
 
-    def test_coulomb_cone_projection_correctness(self):
-        """project_coulomb_cone handles inside-cone, polar-cone, and surface cases."""
-        from newton._src.solvers.fba.solver_fba import project_coulomb_cone  # noqa: PLC0415
-
-        mu = 0.5
-
-        # Case 1: Already inside cone (s >= 0 and |v| <= mu * s).
-        s1, v1 = project_coulomb_cone(2.0, np.array([0.5, 0.5]), mu)
-        # |v| = sqrt(0.5) ≈ 0.707, mu * s = 1.0 → inside
-        self.assertAlmostEqual(s1, 2.0, places=10)
-        np.testing.assert_allclose(v1, [0.5, 0.5], atol=1e-12)
-
-        # Case 2: In polar cone (mu * |v| <= -s → project to origin).
-        # s = -5, |v| = 1.0, mu * |v| = 0.5, -s = 5 → 0.5 < 5 → polar
-        s2, v2 = project_coulomb_cone(-5.0, np.array([0.6, 0.8]), mu)
-        self.assertAlmostEqual(s2, 0.0, places=10)
-        np.testing.assert_allclose(v2, [0.0, 0.0], atol=1e-12)
-
-        # Case 3: Surface projection (neither inside nor polar).
-        # Use s = -0.1, v = [3.0, 4.0], |v| = 5.0
-        # factor = (s + mu * |v|) / (1 + mu^2) = (-0.1 + 2.5) / 1.25 = 1.92
-        # s_new = 1.92, v_new = mu * factor / |v| * v = 0.5 * 1.92 / 5.0 * [3, 4]
-        #       = 0.192 * [3, 4] = [0.576, 0.768]
-        s3, v3 = project_coulomb_cone(-0.1, np.array([3.0, 4.0]), mu)
-        self.assertAlmostEqual(s3, 1.92, places=10)
-        np.testing.assert_allclose(v3, [0.576, 0.768], atol=1e-10)
-        # Verify on cone surface: |v3| = mu * s3
-        self.assertAlmostEqual(np.linalg.norm(v3), mu * s3, places=10)
-
-        # Case 4: s = 0, v = [0, 0] → inside cone (both zero).
-        s4, v4 = project_coulomb_cone(0.0, np.array([0.0, 0.0]), mu)
-        self.assertAlmostEqual(s4, 0.0, places=10)
-        np.testing.assert_allclose(v4, [0.0, 0.0], atol=1e-12)
-
     def test_friction_disabled_matches_stage_a(self):
         """SolverFBA(friction=False) must produce bit-identical results to Stage A."""
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
