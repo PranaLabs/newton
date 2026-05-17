@@ -184,6 +184,9 @@ def run() -> dict:
         lam=lam,
         mu_per_pair_override=mu_override,
         shape_angular_velocity=shape_omega,
+        # RealSim SqueezingBall/scene.json::constraintsolver.maxforce = 1e12 (no
+        # effective cap).  Wired here for Phase 2.4 / per-scene λ-cap alignment.
+        lambda_cap=1.0e12,
     )
     s_in = model.state()
     s_out = model.state()

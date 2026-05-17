@@ -202,6 +202,9 @@ def run() -> dict:
         stretching_model="neohookean",
         mu=mu,
         lam=lam,
+        # RealSim PullingWooper/scene.json::constraintsolver.maxforce = 1e12 (no
+        # effective cap).  Wired here for Phase 2.4 / per-scene λ-cap alignment.
+        lambda_cap=1.0e12,
     )
     s_in = model.state()
     s_out = model.state()
