@@ -9,6 +9,7 @@ from typing import Literal
 import numpy as np
 import warp as wp
 
+from ...geometry.types import GeoType
 from ...sim import Contacts, Control, Model, State
 from ..solver import SolverBase
 
@@ -1069,6 +1070,9 @@ class SolverFBA(SolverBase):
         # Access model fields needed for world-frame body_pos conversion.
         model = self.model
         shape_body_np = model.shape_body.numpy() if hasattr(model, "shape_body") else None
+        shape_type_np = (
+            model.shape_type.numpy() if hasattr(model, "shape_type") and model.shape_type is not None else None
+        )
 
         # Filter out sentinel entries (particle == -1).
         valid_mask = particle_h >= 0
@@ -1136,6 +1140,17 @@ class SolverFBA(SolverBase):
 
             n = normal_h[c]
             offset_h[c] = float(np.dot(n, world_anchor))
+
+            # RealSim sphere/cylinder normal rows use a 0.01 m interpenetration
+            # cushion (``_point - 0.01*n`` in SphereCollision.cpp:121 and
+            # CylinderCollision.cpp:84). Plane and mesh contacts have no cushion.
+            # Since |n|=1, the vector shift reduces to a scalar ``-0.01``.
+            # Tangent offsets intentionally keep the unshifted anchor (see
+            # SphereCollision.cpp:127-129 and CylinderCollision.cpp:88-91).
+            if shape_type_np is not None and s_idx >= 0:
+                st = int(shape_type_np[s_idx])
+                if st == int(GeoType.SPHERE) or st == int(GeoType.CYLINDER):
+                    offset_h[c] -= 0.01
 
         # Upload compact arrays to device.
         self._contact_particle_d.assign(particle_h[:M].astype(np.int32))

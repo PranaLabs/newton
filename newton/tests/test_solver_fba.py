@@ -2860,6 +2860,104 @@ class TestPhase4StageAContact(unittest.TestCase):
             err_msg="Isodof W diverges from dense-path W",
         )
 
+    def test_contact_offset_cushion_per_shape_type(self):
+        """Sphere/cylinder normal offsets get a 0.01 m cushion; plane/mesh do not.
+
+        Ports RealSim ``SphereCollision.cpp:121`` / ``CylinderCollision.cpp:84``,
+        which shift the contact anchor inward by ``0.01 * normal`` when
+        building the normal-row ``pene0``.  Because ``|n| = 1``, this is
+        equivalent to subtracting ``0.01`` from ``dot(n, world_anchor)``.
+        ``PlaneCollision.cpp`` has no such shift, so plane contacts must keep
+        the unshifted offset.
+        """
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        # One free particle (needed so the solver has at least one DOF).
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=[
+                wp.vec3(0.0, -0.5, 0.0),
+                wp.vec3(1.0, 0.0, 0.0),
+                wp.vec3(0.0, 0.0, 1.0),
+            ],
+            indices=[0, 1, 2],
+            density=1.0,
+            tri_ke=1.0e4,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+        )
+        builder.particle_mass[1] = 0.0
+        builder.particle_mass[2] = 0.0
+        # Three static shapes covering the three relevant geometry types.
+        sphere_shape = builder.add_shape_sphere(body=-1, radius=0.5)
+        plane_shape = builder.add_shape_plane()
+        cylinder_shape = builder.add_shape_cylinder(body=-1, radius=0.3, half_height=0.4)
+        model = builder.finalize()
+        device = model.device
+
+        # Sanity-check the shape-type enum values land where we expect.
+        shape_types = model.shape_type.numpy()
+        from newton._src.geometry.types import GeoType  # noqa: PLC0415
+
+        self.assertEqual(int(shape_types[sphere_shape]), int(GeoType.SPHERE))
+        self.assertEqual(int(shape_types[plane_shape]), int(GeoType.PLANE))
+        self.assertEqual(int(shape_types[cylinder_shape]), int(GeoType.CYLINDER))
+
+        # Three contacts with identical anchor and normal — only the shape
+        # type differs.  Anchor (0.2, 0.3, 0.4), normal (0, 1, 0) ->
+        # dot(n, anchor) = 0.3.
+        anchor = (0.2, 0.3, 0.4)
+        normal = (0.0, 1.0, 0.0)
+        contacts = newton.Contacts(rigid_contact_max=0, soft_contact_max=3, device=device)
+        contacts.soft_contact_count.assign(np.array([3], dtype=np.int32))
+        contacts.soft_contact_particle.assign(np.array([0, 0, 0], dtype=np.int32))
+        contacts.soft_contact_normal.assign(np.array([normal, normal, normal], dtype=np.float32))
+        contacts.soft_contact_body_pos.assign(np.array([anchor, anchor, anchor], dtype=np.float32))
+        contacts.soft_contact_shape.assign(np.array([sphere_shape, plane_shape, cylinder_shape], dtype=np.int32))
+
+        solver = SolverFBA(model, iterations=1, friction=False)
+        solver.update_contacts(contacts)
+
+        # Map our shape index back to the (post-sort) contact slot by reading
+        # the per-contact shape array off the host cache.  ``update_contacts``
+        # lexsorts by ``(normal_z, normal_y, normal_x, shape, particle)``, so
+        # with identical normals the sort is by shape index ascending.
+        offsets = solver._contact_offset_h
+        self.assertEqual(offsets.shape[0], 3)
+
+        # Solve the post-sort ordering: shapes are sorted ascending.
+        sorted_shapes = sorted([sphere_shape, plane_shape, cylinder_shape])
+        slot_of = {s: sorted_shapes.index(s) for s in (sphere_shape, plane_shape, cylinder_shape)}
+
+        # ``soft_contact_body_pos`` is stored float32, so the dot product
+        # round-trip through host has ~1e-7 precision.  Tolerance is well
+        # below the 0.01 cushion magnitude so a missing/incorrect cushion is
+        # detected unambiguously.
+        atol = 1e-6
+        base = float(np.dot(np.asarray(normal, dtype=np.float64), np.asarray(anchor, dtype=np.float64)))
+        self.assertAlmostEqual(
+            float(offsets[slot_of[sphere_shape]]),
+            base - 0.01,
+            delta=atol,
+            msg="Sphere normal offset must include the -0.01 m cushion",
+        )
+        self.assertAlmostEqual(
+            float(offsets[slot_of[plane_shape]]),
+            base,
+            delta=atol,
+            msg="Plane normal offset must NOT include any cushion",
+        )
+        self.assertAlmostEqual(
+            float(offsets[slot_of[cylinder_shape]]),
+            base - 0.01,
+            delta=atol,
+            msg="Cylinder normal offset must include the -0.01 m cushion",
+        )
+
 
 class TestPhase4StageBFriction(unittest.TestCase):
     """Phase 4 Stage B: Coulomb friction via NonSmooth Newton."""
@@ -3664,9 +3762,7 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
         w_uni = np.eye(m_uni, dtype=np.float64)
         r_uni = np.full(m_uni, 100.0, dtype=np.float64)
         pene0_uni = np.zeros(m_uni, dtype=np.float64)
-        lam_uni, _, _ = solver._solve_nsn_unilateral(
-            w_uni, r_uni, pene0_uni, max_iters=1, dt=dt
-        )
+        lam_uni, _, _ = solver._solve_nsn_unilateral(w_uni, r_uni, pene0_uni, max_iters=1, dt=dt)
         self.assertTrue(
             np.all(np.abs(lam_uni) <= internal_cap + 1e-9),
             msg=f"unilateral lam exceeds internal cap: {lam_uni}",
@@ -3674,10 +3770,7 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
         self.assertGreater(
             float(np.max(np.abs(lam_uni))),
             lambda_cap,
-            msg=(
-                "unilateral lam clamped to raw lambda_cap; "
-                "expected clamp at lambda_cap/dt²"
-            ),
+            msg=("unilateral lam clamped to raw lambda_cap; expected clamp at lambda_cap/dt²"),
         )
 
         # Coulomb: same setup with 3M rows; normal-row lam saturates at
@@ -3687,9 +3780,7 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
         r_cou = np.full(3 * m_cou, 100.0, dtype=np.float64)
         mu_cou = np.full(m_cou, 0.5, dtype=np.float64)
         pene0_cou = np.zeros(3 * m_cou, dtype=np.float64)
-        lam_cou, _, _ = solver._solve_nsn_coulomb(
-            w_cou, r_cou, mu_cou, pene0_cou, max_iters=1, dt=dt
-        )
+        lam_cou, _, _ = solver._solve_nsn_coulomb(w_cou, r_cou, mu_cou, pene0_cou, max_iters=1, dt=dt)
         self.assertTrue(
             np.all(np.abs(lam_cou) <= internal_cap + 1e-9),
             msg=f"coulomb lam exceeds internal cap: {lam_cou}",
@@ -3697,10 +3788,7 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
         self.assertGreater(
             float(np.max(np.abs(lam_cou))),
             lambda_cap,
-            msg=(
-                "coulomb lam clamped to raw lambda_cap; "
-                "expected clamp at lambda_cap/dt²"
-            ),
+            msg=("coulomb lam clamped to raw lambda_cap; expected clamp at lambda_cap/dt²"),
         )
 
 
