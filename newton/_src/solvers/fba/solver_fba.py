@@ -19,42 +19,36 @@ def fb_unilateral_row(
     precond: float,
     dt: float,
     pene0: float,
-) -> tuple[float, float]:
+) -> tuple[float, float, float]:
     """Fischer-Burmeister evaluation for a unilateral (normal) contact row.
 
-    Implements the FB function ``Φ(a, b) = √(a² + b²) − a − b`` smoothing the
-    complementarity ``a · b = 0, a ≥ 0, b ≥ 0`` between slip speed
-    ``a = |penetration / dt|`` and the per-row preconditioned lambda
-    ``b = precond · lam``. Used as the per-iter row contribution in the
-    NSN Newton step: regularized linear system
-    ``(W + diag(compliance)) · λ_new = h``.
-
-    Port of RealSim ``NonSmoothNewton.cpp:332-341``.
+    Port of RealSim ``NonSmoothNewton.cpp:332-341``. Returns
+    ``(omega, compliance, h)``.
 
     Args:
-        penetration: Constraint residual ``J·q − pene0`` (m).
-        lam: Current lambda iterate for this row (N).
-        precond: Per-row preconditioner ``1 / W_ii`` (1/N).
+        penetration: ``J·q − pene0`` at current iterate (m).
+        lam: Current normal lambda (N).
+        precond: ``1 / W_ii`` (1/N).
         dt: Timestep (s).
-        pene0: Anchor projection ``t·anchor`` or normal-offset (m).
+        pene0: ``n·anchor`` (m).
 
     Returns:
-        ``(compliance, h)``:
-        - ``compliance`` (1/N): diagonal regularization added to ``W_ii``.
-          Small in stick; ~1/dt scale in slip.
-        - ``h`` (m): row RHS of the regularized linear system,
-          ``-dt²·compliance·lam + pene0``.
+        ``(omega, compliance, h)``:
+        - ``omega``: per-row weighting ``1 − pene/√(pene² + (precond·lam)²)``.
+          May exceed 1 in deep penetration (penetration < 0); intentional.
+        - ``compliance``: diagonal regularization for the Schur LHS.
+        - ``h``: row contribution to the Schur RHS,
+          ``−(pene + precond·lam − root) + omega · (penetration + pene0)``.
     """
-    abspenevel = abs(penetration / dt)
-    tmp = precond * lam
-    root = math.sqrt(abspenevel * abspenevel + tmp * tmp)
-    denom = abspenevel + precond * lam - root
-    if abs(denom) < 1e-30:
-        compliance = 1.0 / dt
-    else:
-        compliance = ((root - tmp) / denom) * (precond / dt)
-    h = -(dt * dt) * compliance * lam + pene0
-    return compliance, h
+    pene = penetration
+    plam = precond * lam
+    root = math.sqrt(pene * pene + plam * plam)
+    if root < 1e-30:
+        return 0.0, precond / (dt * dt), pene0
+    omega = 1.0 - pene / root
+    compliance = (1.0 - plam / root) * (precond / (dt * dt))
+    h = -(pene + plam - root) + omega * (penetration + pene0)
+    return omega, compliance, h
 
 
 def fb_frictional_row(
@@ -65,40 +59,21 @@ def fb_frictional_row(
     precond: float,
     dt: float,
     pene0: float,
-) -> tuple[float, float]:
-    """Fischer-Burmeister evaluation for a frictional (tangent) row.
+) -> tuple[float, float, float]:
+    """Fischer-Burmeister evaluation for a frictional (tangent) contact row.
 
-    Smooths the complementarity between:
+    Port of RealSim ``NonSmoothNewton.cpp:343-378``. Returns
+    ``(omega, compliance, h)``.
 
-    - ``a = |penetration / dt|`` (slip speed along tangent)
-    - ``b = precond · (μ · lam_n − |lam_t|)`` (cone slack)
+    Inactive contact (``lam_n ≤ 0``): ``omega = 0``, ``compliance = 1/dt``,
+    ``h = -dt · lam_t``.
 
-    Stick (slack > 0, slip ≈ 0): compliance small → row enforces
-    ``J·q = pene0``. Slip (slack ≈ 0, slip > 0): compliance large → row
-    decouples; the global linear solve caps ``|λ_t| ≤ μ·λ_n`` with sign
-    from off-diagonal Schur coupling.
-
-    Inactive contact (``lam_n ≤ 0``): ``compliance = 1/dt``, ``h = -dt·lam_t``
-    (matches RealSim's ``lambda ≤ 0`` early-out at NonSmoothNewton.cpp:348-356).
-
-    Port of RealSim ``NonSmoothNewton.cpp:355-378`` tangent-row branch.
-
-    Args:
-        penetration: Tangent constraint residual (m).
-        lam_t: Current tangent lambda iterate (N).
-        lam_n: Current normal lambda iterate (N).
-        mu: Coulomb friction coefficient (>= 0).
-        precond: Per-row preconditioner ``1 / W_ii`` (1/N).
-        dt: Timestep (s).
-        pene0: Anchor projection ``t·anchor`` (m).
-
-    Returns:
-        ``(compliance, h)``:
-        - ``compliance`` (1/N): diagonal regularization added to ``W_ii``.
-        - ``h`` (m): row RHS of the regularized linear system.
+    Active contact (``lam_n > 0``): smooth complementarity between slip speed
+    ``|penetration|/dt`` and cone slack ``μ·lam_n − |lam_t|``. ``omega = 1``,
+    compliance varies between near-zero (stick) and ``~1/dt`` (slip).
     """
     if lam_n <= 0.0:
-        return 1.0 / dt, -dt * lam_t
+        return 0.0, 1.0 / dt, -dt * lam_t
 
     abspenevel = abs(penetration / dt)
     tmp = precond * (mu * lam_n - abs(lam_t))
@@ -109,7 +84,7 @@ def fb_frictional_row(
     else:
         compliance = ((root - tmp) / denom) * (precond / dt)
     h = -(dt * dt) * compliance * lam_t + pene0
-    return compliance, h
+    return 1.0, compliance, h
 
 
 def project_coulomb_cone(s: float, v: np.ndarray, mu: float) -> tuple[float, np.ndarray]:
