@@ -1426,8 +1426,11 @@ class SolverFBA(SolverBase):
             h = np.zeros(M, dtype=np.float64)
             for c in range(M):
                 on, cn, hn = fb_unilateral_row(
-                    penetration=penetration[c], lam=lam[c],
-                    precond=precond[c], dt=dt, pene0=pene0[c],
+                    penetration=penetration[c],
+                    lam=lam[c],
+                    precond=precond[c],
+                    dt=dt,
+                    pene0=pene0[c],
                 )
                 omega[c] = on
                 compliance[c] = cn
@@ -1529,18 +1532,29 @@ class SolverFBA(SolverBase):
                 idx_t1 = 3 * c + 1
                 idx_t2 = 3 * c + 2
                 on, cn, hn = fb_unilateral_row(
-                    penetration=penetration[idx_n], lam=lam[idx_n],
-                    precond=precond[idx_n], dt=dt, pene0=pene0[idx_n],
+                    penetration=penetration[idx_n],
+                    lam=lam[idx_n],
+                    precond=precond[idx_n],
+                    dt=dt,
+                    pene0=pene0[idx_n],
                 )
                 ot1, ct1, ht1 = fb_frictional_row(
-                    penetration=penetration[idx_t1], lam_t=lam[idx_t1],
-                    lam_n=lam[idx_n], mu=mu[c],
-                    precond=precond[idx_t1], dt=dt, pene0=pene0[idx_t1],
+                    penetration=penetration[idx_t1],
+                    lam_t=lam[idx_t1],
+                    lam_n=lam[idx_n],
+                    mu=mu[c],
+                    precond=precond[idx_t1],
+                    dt=dt,
+                    pene0=pene0[idx_t1],
                 )
                 ot2, ct2, ht2 = fb_frictional_row(
-                    penetration=penetration[idx_t2], lam_t=lam[idx_t2],
-                    lam_n=lam[idx_n], mu=mu[c],
-                    precond=precond[idx_t2], dt=dt, pene0=pene0[idx_t2],
+                    penetration=penetration[idx_t2],
+                    lam_t=lam[idx_t2],
+                    lam_n=lam[idx_n],
+                    mu=mu[c],
+                    precond=precond[idx_t2],
+                    dt=dt,
+                    pene0=pene0[idx_t2],
                 )
                 omega[idx_n] = on
                 omega[idx_t1] = ot1

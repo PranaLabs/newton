@@ -4216,9 +4216,8 @@ class FBNonsmoothFunctionTests(unittest.TestCase):
 
     def test_unilateral_signature(self) -> None:
         from newton._src.solvers.fba.solver_fba import fb_unilateral_row
-        omega, compliance, h = fb_unilateral_row(
-            penetration=0.0, lam=0.0, precond=1.0, dt=0.01, pene0=0.0
-        )
+
+        omega, compliance, h = fb_unilateral_row(penetration=0.0, lam=0.0, precond=1.0, dt=0.01, pene0=0.0)
         self.assertTrue(np.isfinite(omega))
         self.assertTrue(np.isfinite(compliance))
         self.assertTrue(np.isfinite(h))
@@ -4226,27 +4225,31 @@ class FBNonsmoothFunctionTests(unittest.TestCase):
     def test_unilateral_open(self) -> None:
         """Open contact (penetration > 0) with lam = 0 → omega = 0."""
         from newton._src.solvers.fba.solver_fba import fb_unilateral_row
-        omega, _, _ = fb_unilateral_row(
-            penetration=0.1, lam=0.0, precond=1.0, dt=0.01, pene0=0.0
-        )
+
+        omega, _, _ = fb_unilateral_row(penetration=0.1, lam=0.0, precond=1.0, dt=0.01, pene0=0.0)
         # ω = 1 - pene/root = 1 - 0.1/0.1 = 0.
         self.assertAlmostEqual(omega, 0.0, places=5)
 
     def test_unilateral_penetration(self) -> None:
         """Penetrating contact (penetration < 0) → omega > 1."""
         from newton._src.solvers.fba.solver_fba import fb_unilateral_row
-        omega, _, _ = fb_unilateral_row(
-            penetration=-0.1, lam=0.0, precond=1.0, dt=0.01, pene0=0.0
-        )
+
+        omega, _, _ = fb_unilateral_row(penetration=-0.1, lam=0.0, precond=1.0, dt=0.01, pene0=0.0)
         # ω = 1 - (-0.1)/0.1 = 2.
         self.assertAlmostEqual(omega, 2.0, places=3)
 
     def test_frictional_inactive(self) -> None:
         """λ_n ≤ 0 → omega = 0, compliance = 1/dt, h = -dt·λ_t."""
         from newton._src.solvers.fba.solver_fba import fb_frictional_row
+
         omega, compliance, h = fb_frictional_row(
-            penetration=0.05, lam_t=10.0, lam_n=0.0, mu=0.5,
-            precond=1.0, dt=0.01, pene0=0.0,
+            penetration=0.05,
+            lam_t=10.0,
+            lam_n=0.0,
+            mu=0.5,
+            precond=1.0,
+            dt=0.01,
+            pene0=0.0,
         )
         self.assertAlmostEqual(omega, 0.0, places=5)
         self.assertAlmostEqual(compliance, 100.0, places=3)
@@ -4255,9 +4258,15 @@ class FBNonsmoothFunctionTests(unittest.TestCase):
     def test_frictional_active_stick(self) -> None:
         """Active contact + cone slack > 0 → omega = 1, compliance small."""
         from newton._src.solvers.fba.solver_fba import fb_frictional_row
+
         omega, compliance, _ = fb_frictional_row(
-            penetration=1e-6, lam_t=10.0, lam_n=100.0, mu=0.5,
-            precond=1.0, dt=0.01, pene0=0.0,
+            penetration=1e-6,
+            lam_t=10.0,
+            lam_n=100.0,
+            mu=0.5,
+            precond=1.0,
+            dt=0.01,
+            pene0=0.0,
         )
         self.assertAlmostEqual(omega, 1.0, places=5)
         self.assertLess(compliance, 5.0)
@@ -4265,9 +4274,15 @@ class FBNonsmoothFunctionTests(unittest.TestCase):
     def test_frictional_active_slip(self) -> None:
         """Active contact + on cone → omega = 1, compliance large."""
         from newton._src.solvers.fba.solver_fba import fb_frictional_row
+
         omega, compliance, _ = fb_frictional_row(
-            penetration=0.1, lam_t=50.0, lam_n=100.0, mu=0.5,
-            precond=1.0, dt=0.01, pene0=0.0,
+            penetration=0.1,
+            lam_t=50.0,
+            lam_n=100.0,
+            mu=0.5,
+            precond=1.0,
+            dt=0.01,
+            pene0=0.0,
         )
         self.assertAlmostEqual(omega, 1.0, places=5)
         self.assertGreater(compliance, 10.0)
