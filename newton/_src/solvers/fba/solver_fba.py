@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -369,6 +370,17 @@ class SolverFBA(SolverBase):
         self._omega_unilateral_persistent: np.ndarray | None = None
         self._omega_coulomb_persistent: np.ndarray | None = None
 
+        # Optional single-frame diagnostic dump of per-PD-outer-iter intermediate
+        # variables, used for line-by-line parity with RealSim. Enabled via
+        # :meth:`configure_diagnostic_dump`. ``_step_count`` is incremented at the
+        # start of each :meth:`step` call; when it equals ``_diag_frame``, the
+        # solver records intermediate state and writes the buffers as ``.npz``
+        # to ``_diag_out_path`` at end of step.
+        self._diag_frame: int | None = None
+        self._diag_out_path: Path | None = None
+        self._diag_buffers: dict[str, np.ndarray] = {}
+        self._step_count: int = 0
+
         # Per-element device data (filled by _setup_pd_system).
         self._tri_indices_d = None
         self._tri_rest_inv_d = None
@@ -404,6 +416,24 @@ class SolverFBA(SolverBase):
         self._particle_edge_offsets_d = None
         self._particle_edge_element_d = None
         self._particle_edge_local_d = None
+
+    def configure_diagnostic_dump(self, frame: int, out_path: str) -> None:
+        """Configure a single-frame diagnostic dump of PD intermediate state.
+
+        On the ``frame``-th call to :meth:`step` (1-indexed), the solver
+        captures per-PD-outer-iter intermediate variables (``x_pre``,
+        ``x_inertia``, ``rhs_k{k}``, ``x_post_solve_k{k}``) into an in-memory
+        buffer and writes them to ``out_path`` as a ``.npz`` archive once
+        the step completes. Used to compare against RealSim's binary dumps
+        for line-by-line parity verification.
+
+        Args:
+            frame: 1-indexed step number at which to capture the dump.
+            out_path: Destination ``.npz`` file path.
+        """
+        self._diag_frame = int(frame)
+        self._diag_out_path = Path(out_path)
+        self._diag_buffers = {}
 
     def _setup_pd_system(self, dt: float) -> None:
         """Build / rebuild the PD Hessian, factor it, and upload device data."""
@@ -598,6 +628,17 @@ class SolverFBA(SolverBase):
             zero_vec3_kernel,
         )
 
+        # Diagnostic dump: increment step counter at the START so frame N
+        # corresponds to the N-th step() call (1-indexed). _diag_active becomes
+        # True only on the configured frame; if not configured, it is always
+        # False and all dump code below is a no-op.
+        self._step_count += 1
+        _diag_active = self._diag_frame is not None and self._step_count == self._diag_frame
+        if _diag_active:
+            self._diag_buffers = {
+                "x_pre": state_in.particle_q.numpy().astype(np.float64).copy(),
+            }
+
         if self._linear_solver is None or self._dt_setup is None or abs(self._dt_setup - dt) > 1e-12:
             self._setup_pd_system(dt)
 
@@ -672,6 +713,9 @@ class SolverFBA(SolverBase):
         )
         # Initialize current iterate x_cur = x_inertia (copy).
         wp.copy(self._x_cur, self._x_inertia)
+
+        if _diag_active:
+            self._diag_buffers["x_inertia"] = self._x_inertia.numpy().astype(np.float64).copy()
 
         # 2) PD outer iterations.
         for _k in range(self.iterations):
@@ -896,8 +940,14 @@ class SolverFBA(SolverBase):
                         outputs=[self._rhs],
                         device=device,
                     )
+            if _diag_active:
+                self._diag_buffers[f"rhs_k{_k}"] = self._rhs.numpy().astype(np.float64).copy()
+
             # Global linear solve: x_unc = A^-1 . rhs  (unconstrained).
             self._linear_solver.solve(self._rhs, self._x_cur)
+
+            if _diag_active:
+                self._diag_buffers[f"x_post_solve_k{_k}"] = self._x_cur.numpy().astype(np.float64).copy()
 
             if has_contacts:
                 # --- Schur-complement NSN contact correction ---
@@ -1000,6 +1050,28 @@ class SolverFBA(SolverBase):
             outputs=[state_out.particle_qd],
             device=device,
         )
+
+        # Diagnostic dump: flush captured buffers to .npz at end of step.
+        if _diag_active and self._diag_out_path is not None:
+            self._diag_out_path.parent.mkdir(parents=True, exist_ok=True)
+            meta = {
+                "N": int(N),
+                "PD_iter": int(self.iterations),
+                "frame": int(self._diag_frame),
+                "dt": float(dt),
+            }
+            np.savez(
+                str(self._diag_out_path),
+                _meta_N=np.int64(meta["N"]),
+                _meta_PD_iter=np.int64(meta["PD_iter"]),
+                _meta_frame=np.int64(meta["frame"]),
+                _meta_dt=np.float64(meta["dt"]),
+                **self._diag_buffers,
+            )
+            print(
+                f"[SolverFBA] wrote diagnostic dump for frame {self._diag_frame} "
+                f"to {self._diag_out_path} ({len(self._diag_buffers)} arrays)"
+            )
 
     def set_pin_targets(self, target_positions) -> None:
         """Update reference positions for pinned particles (dynamic pin).

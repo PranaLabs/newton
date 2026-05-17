@@ -10,6 +10,7 @@ Outputs PNGs + perf row to ``scripts/contact_demos_out/demo4/``.
 
 from __future__ import annotations
 
+import argparse
 import math
 import time
 from pathlib import Path
@@ -189,7 +190,7 @@ def render_frame(ax, q: np.ndarray, frame: int) -> None:
     ax.set_zlim(-3, 3)
 
 
-def run() -> dict:
+def run(diag_frame: int | None = None, diag_out: str | None = None) -> dict:
     model, pipeline, contacts, verts_world, pin_idx, mu, lam = build_model()
     n_tets = len(model.tet_indices.numpy()) // 4
     print(f"  particles={model.particle_count}  tets={n_tets}  pinned={len(pin_idx)}")
@@ -206,6 +207,10 @@ def run() -> dict:
         # effective cap).  Wired here for Phase 2.4 / per-scene λ-cap alignment.
         lambda_cap=1.0e12,
     )
+    if diag_frame is not None:
+        if diag_out is None:
+            raise ValueError("--diag-out required when --diag-frame is set")
+        solver.configure_diagnostic_dump(int(diag_frame), str(diag_out))
     s_in = model.state()
     s_out = model.state()
 
@@ -255,12 +260,19 @@ def run() -> dict:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="FBA Demo 4: PullingWooper")
+    parser.add_argument("--diag-frame", type=int, default=None,
+                        help="1-indexed step to dump PD intermediate state")
+    parser.add_argument("--diag-out", type=str, default=None,
+                        help="Output .npz path for the diagnostic dump")
+    args = parser.parse_args()
+
     wp.init()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     print("Demo 4: PullingWooper")
     print("=" * 60)
 
-    result = run()
+    result = run(diag_frame=args.diag_frame, diag_out=args.diag_out)
     stats = result["stats"]
     print(f"  mean_ms={stats['mean_ms']:.2f}  median={stats['median_ms']:.2f}  p95={stats['p95_ms']:.2f}")
     print(f"  stable={stats['stable']}  min_y={stats['min_y']:.3f}  pulled={stats['pulled']:.2f}")

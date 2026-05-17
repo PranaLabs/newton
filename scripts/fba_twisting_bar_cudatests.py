@@ -483,6 +483,8 @@ def run_newton_energy(
     label: str,
     stretching_model: str,
     out_subdir: Path,
+    diag_frame: int | None = None,
+    diag_out: str | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Run Newton SolverFBA for NUM_FRAMES steps with rolling pin update."""
     mu_arg = MU if stretching_model != "arap" else None
@@ -505,6 +507,14 @@ def run_newton_energy(
     # Reset state for actual run
     state_in = model.state()
     state_out = model.state()
+    # Configure diag dump _after_ the setup warm-up step so frame numbers map
+    # to the main loop's 1-indexed frames. Counter was already incremented once
+    # by the warm-up; reset to 0 here so the next step() increments to 1.
+    if diag_frame is not None:
+        if diag_out is None:
+            raise ValueError("--diag-out required when --diag-frame is set")
+        solver._step_count = 0  # noqa: SLF001 — exposed for diagnostic anchor
+        solver.configure_diagnostic_dump(int(diag_frame), str(diag_out))
 
     snapshot_set = set(SNAPSHOT_FRAMES)
     snaps: list[tuple[int, np.ndarray]] = []
@@ -642,6 +652,18 @@ def main() -> None:
         action="store_true",
         help="Rewrite perf_summary.txt with all accumulated Newton + RealSim stats",
     )
+    parser.add_argument(
+        "--diag-frame",
+        type=int,
+        default=None,
+        help="1-indexed step (relative to main loop, post-warm-up) to dump PD intermediate state",
+    )
+    parser.add_argument(
+        "--diag-out",
+        type=str,
+        default=None,
+        help="Output .npz path for the diagnostic dump",
+    )
     args = parser.parse_args()
 
     wall_start = time.perf_counter()
@@ -690,6 +712,8 @@ def main() -> None:
         label=label,
         stretching_model=stretching_model,
         out_subdir=out_subdir,
+        diag_frame=args.diag_frame,
+        diag_out=args.diag_out,
     )
 
     # Performance summary

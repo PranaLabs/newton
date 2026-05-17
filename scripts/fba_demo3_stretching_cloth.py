@@ -18,6 +18,7 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import math
 import time
 from pathlib import Path
@@ -210,8 +211,14 @@ def render_frame(ax, q: np.ndarray, frame: int) -> None:
 # ---------------------------------------------------------------------------
 # Sim loop
 # ---------------------------------------------------------------------------
-def run() -> dict:
+def run(diag_frame: int | None = None, diag_out: str | None = None) -> dict:
     """Run the StretchingCloth simulation for ``TOTAL_FRAMES`` steps.
+
+    Args:
+        diag_frame: Optional 1-indexed step number at which to dump per-PD-outer-iter
+            intermediate state for parity comparison with RealSim.
+        diag_out: Output path for the diagnostic ``.npz`` dump. Required if
+            ``diag_frame`` is set.
 
     Returns:
         Dict with keys ``"snapshots"``, ``"stats"``, ``"trajectory"``.
@@ -230,6 +237,10 @@ def run() -> dict:
         mu=mu_lame,
         lam=lam,
     )
+    if diag_frame is not None:
+        if diag_out is None:
+            raise ValueError("--diag-out required when --diag-frame is set")
+        solver.configure_diagnostic_dump(int(diag_frame), str(diag_out))
     s_in = model.state()
     s_out = model.state()
 
@@ -285,6 +296,21 @@ def run() -> dict:
 # ---------------------------------------------------------------------------
 def main() -> None:
     """Run Demo 3 and emit trajectory, snapshot strip, and perf row."""
+    parser = argparse.ArgumentParser(description="FBA Demo 3: StretchingCloth")
+    parser.add_argument(
+        "--diag-frame",
+        type=int,
+        default=None,
+        help="1-indexed step number at which to dump PD intermediate state for parity check",
+    )
+    parser.add_argument(
+        "--diag-out",
+        type=str,
+        default=None,
+        help="Output .npz path for the diagnostic dump",
+    )
+    args = parser.parse_args()
+
     wp.init()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     NPZ_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -292,7 +318,7 @@ def main() -> None:
     print("=" * 60)
 
     wall_t0 = time.perf_counter()
-    result = run()
+    result = run(diag_frame=args.diag_frame, diag_out=args.diag_out)
     wall_time_s = time.perf_counter() - wall_t0
     stats = result["stats"]
     stats["wall_time_s"] = round(wall_time_s, 3)
