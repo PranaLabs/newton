@@ -128,6 +128,30 @@ def _compute_precond_kernel(
         precond[i] = wp.float64(1.0) / d
 
 
+_MAT1X1_F64 = wp.types.matrix((1, 1), wp.float64)
+
+
+@wp.kernel
+def _precond_from_bsr_diag_kernel(
+    diag_blocks: wp.array[_MAT1X1_F64],
+    precond: wp.array[wp.float64],
+):
+    """Build ``precond[i] = 1/diag_blocks[i][0, 0]`` for the LiteNSN sparse Schur.
+
+    The BSR Schur ``W`` produced by :meth:`FBALinearSolver.build_schur_lite` has
+    ``1×1`` block shape, so ``bsr_get_diag`` returns one ``mat1x1`` per row.
+    Mirrors :func:`_compute_precond_kernel` for the dense path: ``1/W[i,i]``,
+    with the standard zero-diagonal-zero-output guard so a degenerate row
+    yields a zero update instead of NaN.
+    """
+    i = wp.tid()
+    d = diag_blocks[i][0, 0]
+    if d == wp.float64(0.0):
+        precond[i] = wp.float64(0.0)
+    else:
+        precond[i] = wp.float64(1.0) / d
+
+
 @wp.kernel
 def _matvec_tiled_kernel(
     A: wp.array2d[wp.float64],
@@ -500,6 +524,161 @@ class NSNPCRSolver:
         # Copy x back to caller-provided output buffer.
         wp.copy(x_out, self._x, count=n)
 
+        return (nb_iter, rho)
+
+    def solve_sparse(
+        self,
+        W_bsr,
+        b: wp.array[wp.float64],
+        x_out: wp.array[wp.float64],
+    ) -> tuple[int, float]:
+        """LiteNSN sparse-Schur PCR: ``W_bsr @ x = b`` for a BSR ``W`` with
+        ``1×1`` blocks.
+
+        Matches :meth:`solve` numerically — same termination criterion, same
+        Jacobi preconditioner, same ``check_every`` host-sync cadence — but
+        replaces the dense tiled matvec with :func:`warp.sparse.bsr_mv`.  This
+        is the linear-solver entry point for ``SolverFBA(nsn_schur_mode="lite")``.
+
+        Args:
+            W_bsr: ``BsrMatrix`` of block shape ``(1, 1)`` and scalar type
+                ``wp.float64`` (the LiteNSN Schur ``H · M⁻¹ · Hᵀ``).
+            b: ``(n,)`` RHS, fp64.
+            x_out: ``(n,)`` output, fp64.
+
+        Returns:
+            ``(iterations_taken, final_rho)``.
+
+        Raises:
+            ValueError: when shapes are inconsistent.
+        """
+        import warp.sparse as wps  # noqa: PLC0415
+
+        n = int(b.shape[0])
+        if n <= 0:
+            raise ValueError(f"system size must be positive, got n={n}")
+        if n > self.max_n:
+            raise ValueError(f"system size n={n} exceeds preallocated max_n={self.max_n}")
+        if int(W_bsr.shape[0]) != n or int(W_bsr.shape[1]) != n:
+            raise ValueError(
+                f"W_bsr shape {tuple(W_bsr.shape)} incompatible with b shape ({n},)"
+            )
+        if x_out.shape[0] != n:
+            raise ValueError(f"x_out shape ({x_out.shape[0]},) incompatible with b shape ({n},)")
+
+        device = self.device
+        max_iter = min(self.max_iter, n)
+
+        # ----- x = 0 ----------------------------------------------------
+        self._x.zero_()
+
+        # ----- Early exit if b == 0 -------------------------------------
+        dot_b = float(wp.utils.array_inner(b, b, count=n))
+        if dot_b == 0.0:
+            wp.copy(x_out, self._x, count=n)
+            return (0, 0.0)
+
+        # ----- Build Jacobi preconditioner from W's diagonal ------------
+        diag_blocks = wps.bsr_get_diag(W_bsr)  # array[mat1x1[float64]], length n
+        wp.launch(
+            _precond_from_bsr_diag_kernel,
+            dim=n,
+            inputs=[diag_blocks],
+            outputs=[self._precond],
+            device=device,
+        )
+
+        # ----- r = b ---------------------------------------------------
+        wp.copy(self._r, b, count=n)
+
+        # ----- d = P * r -----------------------------------------------
+        wp.launch(
+            _apply_precond_kernel,
+            dim=n,
+            inputs=[self._r, self._precond],
+            outputs=[self._d],
+            device=device,
+        )
+
+        # ----- q = W * d -----------------------------------------------
+        # ``wps.bsr_mv(W, d, q)`` with the sparse W replacing the dense matvec.
+        wps.bsr_mv(W_bsr, self._d, self._q)
+
+        # ----- h = q ---------------------------------------------------
+        wp.copy(self._h, self._q, count=n)
+
+        # ----- rho = <r, h> --------------------------------------------
+        wp.utils.array_inner(self._r, self._h, out=self._rho_d, count=n)
+        rho = float(self._rho_d.numpy()[0])
+        tol_sq = self.tol * self.tol * rho
+
+        # ---- PCR main loop --------------------------------------------
+        # No CUDA-graph capture here: bsr_mv currently issues internal
+        # allocations on shape change that defeat capture. The eager loop is
+        # still fully async between syncs; ``check_every`` bounds the host
+        # round-trips per solve. If profiling shows the launch overhead
+        # dominates LiteNSN at scale, revisit and add capture support.
+        nb_iter = 0
+        check_every = self.check_every
+        while nb_iter < max_iter and rho > tol_sq:
+            block_end = min(nb_iter + check_every, max_iter)
+            while nb_iter < block_end:
+                # ----- den = <q, q> ---------------------------------
+                wp.utils.array_inner(self._q, self._q, out=self._den_d, count=n)
+                wp.launch(
+                    _div_scalar_kernel, dim=1,
+                    inputs=[self._rho_d, self._den_d],
+                    outputs=[self._alpha_d], device=device,
+                )
+                # x += alpha * d
+                wp.launch(
+                    _axpy_arr_kernel, dim=n,
+                    inputs=[self._alpha_d, wp.float64(1.0), self._d],
+                    outputs=[self._x], device=device,
+                )
+                # r -= alpha * q
+                wp.launch(
+                    _axpy_arr_kernel, dim=n,
+                    inputs=[self._alpha_d, wp.float64(-1.0), self._q],
+                    outputs=[self._r], device=device,
+                )
+                # s = P * r
+                wp.launch(
+                    _apply_precond_kernel, dim=n,
+                    inputs=[self._r, self._precond],
+                    outputs=[self._s], device=device,
+                )
+                # h = W * s   (sparse matvec)
+                wps.bsr_mv(W_bsr, self._s, self._h)
+                # rho_old = rho ; rho = <r, h>
+                wp.launch(
+                    _copy_scalar_kernel, dim=1,
+                    inputs=[self._rho_d],
+                    outputs=[self._rho_old_d], device=device,
+                )
+                wp.utils.array_inner(self._r, self._h, out=self._rho_d, count=n)
+                wp.launch(
+                    _div_scalar_kernel, dim=1,
+                    inputs=[self._rho_d, self._rho_old_d],
+                    outputs=[self._beta_d], device=device,
+                )
+                # d = beta*d + s
+                wp.launch(
+                    _scal_add_arr_kernel, dim=n,
+                    inputs=[self._beta_d, self._s],
+                    outputs=[self._d], device=device,
+                )
+                # q = beta*q + h
+                wp.launch(
+                    _scal_add_arr_kernel, dim=n,
+                    inputs=[self._beta_d, self._h],
+                    outputs=[self._q], device=device,
+                )
+                nb_iter += 1
+
+            rho = float(self._rho_d.numpy()[0])
+
+        wp.copy(x_out, self._x, count=n)
         return (nb_iter, rho)
 
     # ------------------------------------------------------------------

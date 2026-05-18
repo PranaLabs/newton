@@ -1403,6 +1403,349 @@ class FBALinearSolver:
         W = self._W_device_d.numpy()[:total_rows, :total_rows].copy()
         return W
 
+    def setup_lite_mass(self, inv_mass_d: wp.array, dt: float) -> None:
+        """Cache the LiteNSN mass matrix ``M_inv_dt2 = diag(dt² · inv_mass) ⊗ I₃``.
+
+        Builds (or rebuilds, when dt or pinned-particle layout changes) a
+        block-diagonal BSR matrix with ``3×3`` blocks ``dt² · inv_mass[p] · I₃``
+        per particle ``p``.  Pinned particles (``inv_mass == 0``) contribute a
+        zero block, so contacts that target pinned vertices automatically
+        produce a zero entry in ``W_lite`` — consistent with the full-NSN path,
+        which sees an infinite mass on the diagonal of ``A`` for pinned rows
+        and therefore a zero in ``A⁻¹``.
+
+        The ``dt²`` factor is the FBA scaling convention: ``A_FBA = A_R / dt²``,
+        so its diagonal ``M / dt²`` inverts to ``dt² · inv_mass``.  Without
+        this factor, ``W_lite`` is off by ``1/dt²`` and FB-Newton's linearization
+        no longer matches the full-NSN baseline.
+        """
+        n = inv_mass_d.shape[0]
+        if n != self.n:
+            raise ValueError(f"inv_mass length {n} != solver n {self.n}")
+        dev = self.device
+
+        # Block dtype for both M_inv and (later) H, M_inv·Hᵀ. Each block is a
+        # 3×3 dense matrix in row-major fp64.
+        if not hasattr(self, "_mat3x3_dtype"):
+            self._mat3x3_dtype = wp.types.matrix((3, 3), wp.float64)
+
+        # Build host-side per-block values: 3×3 identity scaled by dt²·inv_mass.
+        inv_mass_h = inv_mass_d.numpy().astype(np.float64)
+        dt2 = float(dt) * float(dt)
+        blocks = np.zeros((n, 3, 3), dtype=np.float64)
+        diag = dt2 * inv_mass_h
+        blocks[:, 0, 0] = diag
+        blocks[:, 1, 1] = diag
+        blocks[:, 2, 2] = diag
+
+        if not hasattr(self, "_M_inv_dt2_bsr") or self._M_inv_dt2_bsr is None:
+            self._M_inv_dt2_bsr = wps.bsr_zeros(
+                rows_of_blocks=n,
+                cols_of_blocks=n,
+                block_type=self._mat3x3_dtype,
+                device=dev,
+            )
+
+        rows = wp.array(np.arange(n, dtype=np.int32), dtype=wp.int32, device=dev)
+        cols = wp.array(np.arange(n, dtype=np.int32), dtype=wp.int32, device=dev)
+        vals = wp.array(blocks, dtype=self._mat3x3_dtype, device=dev)
+        wps.bsr_set_from_triplets(self._M_inv_dt2_bsr, rows, cols, vals, prune_numerical_zeros=False)
+        self._lite_dt_setup = float(dt)
+        # Cache for ``build_schur_lite_dense``: the dense-W kernel reads
+        # ``inv_mass`` and ``dt²`` directly instead of going through bsr_mm.
+        # Same lifecycle as the BSR mass matrix: rebuilds when dt or pin layout changes.
+        self._inv_mass_d = wp.array(inv_mass_h, dtype=wp.float64, device=dev)
+        self._lite_dt2 = dt2
+
+    def build_schur_lite(
+        self,
+        num_contacts: int,
+        j_indices: wp.array,
+        j_normals: wp.array,
+        j_alpha: wp.array,
+        j_tangent1: wp.array | None = None,
+        j_tangent2: wp.array | None = None,
+    ) -> "wps.BsrMatrix":
+        """Build the LiteNSN sparse Schur complement ``W = H · M⁻¹ · Hᵀ``.
+
+        ``H`` is the contact Jacobian as a sparse ``(total_rows, N)`` BSR matrix
+        with ``1×3`` blocks (one block per row at column ``row_particle[r]``,
+        value ``alpha[r] · dir[r]``).  ``M⁻¹`` is the block-diagonal mass-inverse
+        BSR cached by :meth:`setup_lite_mass`.  The product collapses to a
+        ``(total_rows, total_rows)`` BSR with ``1×1`` blocks; a nonzero appears
+        at ``(c', c)`` iff ``row_particle[c'] == row_particle[c]``.
+
+        Unlike :meth:`build_schur_complement`, this method does not download
+        ``W`` to the host — the sparse PCR path consumes the BsrMatrix on
+        device.  Callers that need a numpy view should call
+        ``W.to_scipy_sparse().toarray()`` (slow, debug only).
+
+        Args:
+            num_contacts: Active contact count ``M``.
+            j_indices, j_normals, j_alpha, j_tangent1, j_tangent2: Same layout
+                as :meth:`build_schur_complement`.
+
+        Returns:
+            ``BsrMatrix[mat1x1[float64]]`` of shape ``(total_rows, total_rows)``.
+            The matrix is owned by the linear solver and reused across calls;
+            do not modify it externally.
+        """
+        if not hasattr(self, "_M_inv_dt2_bsr") or self._M_inv_dt2_bsr is None:
+            raise RuntimeError(
+                "build_schur_lite called before setup_lite_mass; SolverFBA must"
+                " invoke setup_lite_mass on every _setup_pd_system pass."
+            )
+
+        has_friction = j_tangent1 is not None and j_tangent2 is not None
+        rows_per_contact = 3 if has_friction else 1
+        M = int(num_contacts)
+        total_rows = M * rows_per_contact
+        if total_rows == 0:
+            # Caller treats absent W as zero.
+            return None
+        dev = self.device
+        n = self.n
+
+        # ---- Assemble per-row (particle, alpha · dir) on host ----
+        idx_np = j_indices.numpy()[:M].astype(np.int32)
+        n_np = j_normals.numpy()[:M].astype(np.float64)
+        a_np = j_alpha.numpy()[:M].astype(np.float64)
+        row_particle = np.empty(total_rows, dtype=np.int32)
+        row_dir = np.empty((total_rows, 3), dtype=np.float64)
+        row_alpha = np.empty(total_rows, dtype=np.float64)
+        if has_friction:
+            t1_np = j_tangent1.numpy()[:M].astype(np.float64)
+            t2_np = j_tangent2.numpy()[:M].astype(np.float64)
+            row_particle[0::3] = idx_np; row_particle[1::3] = idx_np; row_particle[2::3] = idx_np
+            row_dir[0::3] = n_np; row_dir[1::3] = t1_np; row_dir[2::3] = t2_np
+            row_alpha[0::3] = a_np; row_alpha[1::3] = a_np; row_alpha[2::3] = a_np
+        else:
+            row_particle[:] = idx_np; row_dir[:] = n_np; row_alpha[:] = a_np
+
+        # Block value per row: 1×3 row-vector ``alpha · dir``.
+        h_blocks = (row_alpha[:, None] * row_dir).reshape(total_rows, 1, 3)
+
+        if not hasattr(self, "_mat1x3_dtype"):
+            self._mat1x3_dtype = wp.types.matrix((1, 3), wp.float64)
+
+        # ---- Build / reuse H BSR (1×3 blocks, total_rows × N) ----
+        if not hasattr(self, "_H_lite_bsr") or self._H_lite_bsr is None:
+            self._H_lite_bsr = wps.bsr_zeros(
+                rows_of_blocks=total_rows,
+                cols_of_blocks=n,
+                block_type=self._mat1x3_dtype,
+                device=dev,
+            )
+        else:
+            # ``bsr_set_from_triplets`` accepts a destination of any size; the
+            # destination shape is updated to match the new triplet extents.
+            self._H_lite_bsr.nrow = total_rows
+        rows_d = wp.array(np.arange(total_rows, dtype=np.int32), dtype=wp.int32, device=dev)
+        cols_d = wp.array(row_particle, dtype=wp.int32, device=dev)
+        vals_d = wp.array(h_blocks, dtype=self._mat1x3_dtype, device=dev)
+        wps.bsr_set_from_triplets(
+            self._H_lite_bsr, rows_d, cols_d, vals_d, prune_numerical_zeros=False
+        )
+
+        # ---- M_inv · Hᵀ (3×1 blocks, N × total_rows) ----
+        HT = wps.bsr_transposed(self._H_lite_bsr)
+        Minv_HT = wps.bsr_mm(self._M_inv_dt2_bsr, HT)
+
+        # ---- W = H · (M_inv · Hᵀ)  (1×1 blocks, total_rows × total_rows) ----
+        self._W_lite_bsr = wps.bsr_mm(self._H_lite_bsr, Minv_HT)
+        self._W_lite_total_rows = total_rows
+        # Stash per-row metadata in case the lite path needs the lambda
+        # correction at the same granularity as the dense path.
+        self._row_particle_h = row_particle
+        self._row_dir_h = row_dir
+        self._row_alpha_h = row_alpha
+        return self._W_lite_bsr
+
+    def setup_lite_row_meta(
+        self,
+        num_contacts: int,
+        j_indices: wp.array,
+        j_normals: wp.array,
+        j_alpha: wp.array,
+        j_tangent1: wp.array | None = None,
+        j_tangent2: wp.array | None = None,
+    ) -> int:
+        """Populate per-row metadata for LiteNSN paths without building ``W``.
+
+        The fused-block-diagonal lite kernel
+        (:func:`kernels.fb_newton_lite_coulomb_kernel`) doesn't need an
+        explicit ``W`` buffer at all, but
+        :meth:`apply_lambda_correction_combined` still depends on
+        ``_row_particle_d`` / ``_row_dir_d`` / ``_row_alpha_d`` /
+        ``_isodof_row_*_d`` to gather ``Jᵀ·λ``.  This helper sets those up so
+        the lite paths can call ``apply_lambda_correction_combined`` without
+        going through :meth:`build_schur_lite_dense` (which would allocate the
+        dense ``W`` buffer — defeating the lite memory win at large ``M``).
+
+        Returns ``total_rows`` (``M`` for Stage A, ``3M`` for Stage B).
+        """
+        has_friction = j_tangent1 is not None and j_tangent2 is not None
+        rows_per_contact = 3 if has_friction else 1
+        M = int(num_contacts)
+        total_rows = M * rows_per_contact
+        dev = self.device
+        n = self.n
+
+        idx_np = j_indices.numpy()[:M].astype(np.int32)
+        n_np = j_normals.numpy()[:M]
+        a_np = j_alpha.numpy()[:M]
+        row_particle = np.empty(total_rows, dtype=np.int32)
+        row_dir = np.empty((total_rows, 3), dtype=np.float32)
+        row_alpha = np.empty(total_rows, dtype=np.float32)
+        if has_friction:
+            t1_np = j_tangent1.numpy()[:M]
+            t2_np = j_tangent2.numpy()[:M]
+            row_particle[0::3] = idx_np; row_particle[1::3] = idx_np; row_particle[2::3] = idx_np
+            row_dir[0::3] = n_np; row_dir[1::3] = t1_np; row_dir[2::3] = t2_np
+            row_alpha[0::3] = a_np; row_alpha[1::3] = a_np; row_alpha[2::3] = a_np
+        else:
+            row_particle[:] = idx_np; row_dir[:] = n_np; row_alpha[:] = a_np
+
+        self._row_particle_d = wp.array(row_particle, dtype=wp.int32, device=dev)
+        self._row_dir_d = wp.array(row_dir, dtype=wp.vec3, device=dev)
+        self._row_alpha_d = wp.array(row_alpha, dtype=wp.float32, device=dev)
+        self._row_total = total_rows
+
+        order = np.argsort(row_particle, kind="stable").astype(np.int32)
+        sorted_particles = row_particle[order]
+        counts = np.bincount(sorted_particles, minlength=n).astype(np.int32)
+        offsets = np.zeros(n + 1, dtype=np.int32)
+        offsets[1:] = np.cumsum(counts)
+        self._isodof_row_offsets_d = wp.array(offsets, dtype=wp.int32, device=dev)
+        self._isodof_row_indices_d = wp.array(order, dtype=wp.int32, device=dev)
+
+        return total_rows
+
+    def build_schur_lite_dense(
+        self,
+        num_contacts: int,
+        j_indices: wp.array,
+        j_normals: wp.array,
+        j_alpha: wp.array,
+        j_tangent1: wp.array | None = None,
+        j_tangent2: wp.array | None = None,
+    ) -> None:
+        """Write the LiteNSN Schur ``W_lite`` densely into ``_W_device_d``.
+
+        Uses :func:`compose_W_lite_kernel` to compute the dense projection of
+        the sparse Schur ``H · (dt²·M⁻¹) · Hᵀ``.  Off-particle entries are
+        explicitly zeroed; only entries sharing a particle take the lite
+        approximation.
+
+        This is the integration point for ``SolverFBA(nsn_schur_mode="lite")``
+        single-env validation (Phase 2.4): the dense ``W_lite`` slots into the
+        existing dense-PCR NSN inner.  At larger N (Phase 3), the dense buffer
+        is the bottleneck — switch to the truly-sparse path through
+        :meth:`build_schur_lite` + ``solve_sparse`` instead.
+
+        Side effects: populates ``_W_device_d[:total_rows, :total_rows]`` and
+        ``_W_device_active_rows`` so subsequent :meth:`W_device_view` calls
+        return the lite Schur.  Also stashes per-row metadata
+        (``_row_particle_d`` / ``_row_dir_d`` / ``_row_alpha_d``) and the
+        isodof inverse-mapping CSR used by
+        :meth:`apply_lambda_correction_isodof`.
+        """
+        from .kernels import compose_W_lite_kernel  # noqa: PLC0415
+
+        if not hasattr(self, "_inv_mass_d") or self._inv_mass_d is None:
+            raise RuntimeError(
+                "build_schur_lite_dense called before setup_lite_mass; SolverFBA must"
+                " invoke setup_lite_mass on every _setup_pd_system pass."
+            )
+        if not hasattr(self, "_lite_dt2") or self._lite_dt2 is None:
+            raise RuntimeError("setup_lite_mass did not cache dt²; check call order.")
+
+        has_friction = j_tangent1 is not None and j_tangent2 is not None
+        rows_per_contact = 3 if has_friction else 1
+        M = int(num_contacts)
+        total_rows = M * rows_per_contact
+        dev = self.device
+        n = self.n
+
+        # --- Build unified per-row (particle, dir, alpha) on device.  Same
+        # layout the dense full-NSN path uses; assembled fresh per call. ---
+        idx_np = j_indices.numpy()[:M].astype(np.int32)
+        n_np = j_normals.numpy()[:M]
+        a_np = j_alpha.numpy()[:M]
+        row_particle = np.empty(total_rows, dtype=np.int32)
+        row_dir = np.empty((total_rows, 3), dtype=np.float32)
+        row_alpha = np.empty(total_rows, dtype=np.float32)
+        if has_friction:
+            t1_np = j_tangent1.numpy()[:M]
+            t2_np = j_tangent2.numpy()[:M]
+            row_particle[0::3] = idx_np; row_particle[1::3] = idx_np; row_particle[2::3] = idx_np
+            row_dir[0::3] = n_np; row_dir[1::3] = t1_np; row_dir[2::3] = t2_np
+            row_alpha[0::3] = a_np; row_alpha[1::3] = a_np; row_alpha[2::3] = a_np
+        else:
+            row_particle[:] = idx_np; row_dir[:] = n_np; row_alpha[:] = a_np
+
+        row_particle_d = wp.array(row_particle, dtype=wp.int32, device=dev)
+        row_dir_d = wp.array(row_dir, dtype=wp.vec3, device=dev)
+        row_alpha_d = wp.array(row_alpha, dtype=wp.float32, device=dev)
+        self._row_particle_d = row_particle_d
+        self._row_dir_d = row_dir_d
+        self._row_alpha_d = row_alpha_d
+        self._row_total = total_rows
+
+        # --- Allocate / grow the W_device buffer to (total_rows, total_rows). ---
+        # Mirrors the full-NSN path's growth policy so callers using
+        # :meth:`W_device_view` see the same buffer semantics.
+        if (
+            not hasattr(self, "_W_device_d")
+            or self._W_device_d.shape[0] < total_rows
+            or self._W_device_d.shape[1] < total_rows
+        ):
+            prev = getattr(self, "_W_device_d", None)
+            prev_cap = prev.shape[0] if prev is not None else 0
+            cap = max(total_rows, int(prev_cap * 1.5) + 1)
+            self._W_device_d = wp.empty(shape=(cap, cap), dtype=wp.float64, device=dev)
+        self._W_device_active_rows = total_rows
+
+        # Isodof inverse-mapping CSR (apply_lambda_correction_isodof needs this).
+        order = np.argsort(row_particle, kind="stable").astype(np.int32)
+        sorted_particles = row_particle[order]
+        counts = np.bincount(sorted_particles, minlength=n).astype(np.int32)
+        offsets = np.zeros(n + 1, dtype=np.int32)
+        offsets[1:] = np.cumsum(counts)
+        self._isodof_row_offsets_d = wp.array(offsets, dtype=wp.int32, device=dev)
+        self._isodof_row_indices_d = wp.array(order, dtype=wp.int32, device=dev)
+
+        # --- Launch the lite Schur composition kernel.  Writes a contiguous
+        # (total_rows, total_rows) slice of the cap-sized buffer. ---
+        # The kernel reads ``_W_device_d`` as wp.array2d; the cap-sized buffer
+        # has stride ``cap * 8``, so when the active block is < cap we
+        # explicitly construct a strided view so the kernel writes to the
+        # right elements.
+        cap = int(self._W_device_d.shape[0])
+        if cap == total_rows:
+            W_v = self._W_device_d
+        else:
+            W_v = wp.array(
+                ptr=self._W_device_d.ptr,
+                dtype=wp.float64,
+                shape=(total_rows, total_rows),
+                strides=(cap * 8, 8),
+                device=dev,
+            )
+        wp.launch(
+            compose_W_lite_kernel,
+            dim=(total_rows, total_rows),
+            inputs=[
+                row_particle_d,
+                row_dir_d,
+                row_alpha_d,
+                self._inv_mass_d,
+                wp.float64(self._lite_dt2),
+            ],
+            outputs=[W_v],
+            device=dev,
+        )
+
     def W_device_view(self) -> wp.array2d[wp.float64]:
         """Return a ``(M, M)`` device view of the most recently built Schur W.
 

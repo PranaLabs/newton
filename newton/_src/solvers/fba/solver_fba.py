@@ -223,6 +223,7 @@ class SolverFBA(SolverBase):
         shape_angular_velocity: dict[int, float] | None = None,
         nh_solver: Literal["newton5", "lbfgs"] = "lbfgs",
         enable_perf_timing: bool = False,
+        nsn_schur_mode: Literal["full", "lite"] = "full",
     ) -> None:
         """
         Args:
@@ -302,6 +303,11 @@ class SolverFBA(SolverBase):
             )
         if nh_solver not in ("newton5", "lbfgs"):
             raise ValueError(f"nh_solver={nh_solver!r} not supported; choose 'newton5' or 'lbfgs'")
+        if nsn_schur_mode not in ("full", "lite"):
+            raise ValueError(
+                f"nsn_schur_mode={nsn_schur_mode!r} not supported; choose 'full' or 'lite'"
+            )
+        self.nsn_schur_mode = nsn_schur_mode
         if stretching_model in ("corotational", "neohookean"):
             if mu is None or lam is None:
                 raise ValueError(
@@ -541,6 +547,10 @@ class SolverFBA(SolverBase):
         A, meta = build_pd_system(self.model, dt=dt, pin_stiffness=self.pin_stiffness)
         fs = factorize_and_sparse_inverse(A)
         self._linear_solver = FBALinearSolver(fs, device=self._device)
+        # LiteNSN dense kernel + sparse BSR pipeline both consume the lite mass
+        # matrix; build it once here so the per-step Schur dispatch is allocation-free.
+        if self.nsn_schur_mode == "lite":
+            self._linear_solver.setup_lite_mass(self.model.particle_inv_mass, dt)
         self._meta = meta
         self._dt_setup = dt
         # A changed → any cached W / A^{-1} J^T is stale.
@@ -898,22 +908,40 @@ class SolverFBA(SolverBase):
                     if _perf_on:
                         wp.synchronize_device()
                         _t_schur_0 = time.perf_counter()
+
+                    use_lite_block_diag = self.nsn_schur_mode == "lite"
+
                     if self._cached_W is None or not self._cached_A_inv_Jt_valid:
                         # ``download=False``: the GPU NSN driver consumes ``W``
                         # via :meth:`FBALinearSolver.W_device_view`, so the
                         # device-to-host pull at the end of ``build_schur_complement``
                         # is dead work — skipping it removes the dominant cost
                         # on Demo 5 (Schur build was ~70% PCIe download time).
-                        ls.build_schur_complement(
-                            M,
-                            self._contact_particle_d,
-                            self._contact_normal_d,
-                            self._contact_alpha_d,
-                            self._contact_tangent1_d,
-                            self._contact_tangent2_d,
-                            use_isodof=self.use_isodof,
-                            download=False,
-                        )
+                        if use_lite_block_diag:
+                            # LiteNSN block-diagonal-by-particle path: no dense
+                            # W is materialized — the fused per-contact kernel
+                            # below builds each ``3×3`` local W on-the-fly.
+                            # Only the row-metadata CSR is needed so the
+                            # ``apply_lambda_correction_combined`` gather can run.
+                            ls.setup_lite_row_meta(
+                                M,
+                                self._contact_particle_d,
+                                self._contact_normal_d,
+                                self._contact_alpha_d,
+                                self._contact_tangent1_d,
+                                self._contact_tangent2_d,
+                            )
+                        else:
+                            ls.build_schur_complement(
+                                M,
+                                self._contact_particle_d,
+                                self._contact_normal_d,
+                                self._contact_alpha_d,
+                                self._contact_tangent1_d,
+                                self._contact_tangent2_d,
+                                use_isodof=self.use_isodof,
+                                download=False,
+                            )
                         self._cached_W = True
                         self._cached_A_inv_Jt_valid = True
                     if _perf_on:
@@ -923,7 +951,7 @@ class SolverFBA(SolverBase):
                     # Bottleneck #2 fix: residual + pene0 + warm-start all
                     # device-resident. The PD outer iter now does ZERO
                     # host<->device transfers around the NSN call.
-                    self._ensure_nsn_inner_buffers(3 * M)
+                    self._ensure_nsn_inner_buffers(3 * M, alloc_2d=not use_lite_block_diag)
                     from . import kernels as K_step  # noqa: PLC0415
 
                     wp.launch(
@@ -954,22 +982,62 @@ class SolverFBA(SolverBase):
                         outputs=[self._nsn_pene0_d],
                         device=device,
                     )
-                    self._solve_nsn_coulomb_gpu(
-                        None,
-                        None,
-                        None,
-                        None,
-                        max_iters=self.nsn_iterations,
-                        dt=dt,
-                        W_device=ls.W_device_view(),
-                        r_device=self._nsn_r_d,
-                        pene0_device=self._nsn_pene0_d,
-                        mu_device=self._contact_mu_d,
-                        lam_init_device=self._lam_coulomb_persistent_d,
-                        omega_init_device=self._omega_coulomb_persistent_d,
-                        skip_download=True,
-                        m_contacts=M,
-                    )
+                    if use_lite_block_diag:
+                        # Warm-start ω: the dense path uses the persistent
+                        # device buffer to seed FB-Newton iter 0; replicate
+                        # that here by copying into _nsn_omega_d.
+                        wp.copy(self._nsn_omega_d, self._omega_coulomb_persistent_d, count=3 * M)
+                        wp.copy(self._nsn_lam_d, self._lam_coulomb_persistent_d, count=3 * M)
+                        # Lambda cap: dense path post-clips after the FB loop;
+                        # we fold it into the kernel for one less launch.
+                        if self.lambda_cap is not None:
+                            cap_internal = float(self.lambda_cap) / (dt * dt)
+                            use_cap = 1
+                        else:
+                            cap_internal = 0.0  # sentinel — gated by use_cap
+                            use_cap = 0
+                        wp.launch(
+                            K_step.fb_newton_lite_coulomb_kernel,
+                            dim=M,
+                            inputs=[
+                                self._contact_particle_d,
+                                self._contact_normal_d,
+                                self._contact_tangent1_d,
+                                self._contact_tangent2_d,
+                                self._contact_alpha_d,
+                                self._contact_mu_d,
+                                self._nsn_r_d,
+                                self._nsn_pene0_d,
+                                ls._inv_mass_d,
+                                wp.float64(dt),
+                                wp.float64(cap_internal),
+                                wp.int32(use_cap),
+                                wp.int32(int(self.nsn_iterations)),
+                            ],
+                            outputs=[
+                                self._nsn_lam_d,
+                                self._nsn_omega_d,
+                                self._nsn_lam_apply_d,
+                            ],
+                            device=device,
+                        )
+                    else:
+                        self._solve_nsn_coulomb_gpu(
+                            None,
+                            None,
+                            None,
+                            None,
+                            max_iters=self.nsn_iterations,
+                            dt=dt,
+                            W_device=ls.W_device_view(),
+                            r_device=self._nsn_r_d,
+                            pene0_device=self._nsn_pene0_d,
+                            mu_device=self._contact_mu_d,
+                            lam_init_device=self._lam_coulomb_persistent_d,
+                            omega_init_device=self._omega_coulomb_persistent_d,
+                            skip_download=True,
+                            m_contacts=M,
+                        )
                     # Persist device-resident lam / omega for next PD iter.
                     wp.copy(self._lam_coulomb_persistent_d, self._nsn_lam_d, count=3 * M)
                     wp.copy(self._omega_coulomb_persistent_d, self._nsn_omega_d, count=3 * M)
@@ -992,14 +1060,22 @@ class SolverFBA(SolverBase):
                         # ``download=False``: see Stage B branch above — the
                         # GPU NSN driver reads ``W`` from device via
                         # :meth:`FBALinearSolver.W_device_view`.
-                        ls.build_schur_complement(
-                            M,
-                            self._contact_particle_d,
-                            self._contact_normal_d,
-                            self._contact_alpha_d,
-                            use_isodof=self.use_isodof,
-                            download=False,
-                        )
+                        if self.nsn_schur_mode == "lite":
+                            ls.build_schur_lite_dense(
+                                M,
+                                self._contact_particle_d,
+                                self._contact_normal_d,
+                                self._contact_alpha_d,
+                            )
+                        else:
+                            ls.build_schur_complement(
+                                M,
+                                self._contact_particle_d,
+                                self._contact_normal_d,
+                                self._contact_alpha_d,
+                                use_isodof=self.use_isodof,
+                                download=False,
+                            )
                         self._cached_W = True
                         self._cached_A_inv_Jt_valid = True
                     if _perf_on:
@@ -2067,16 +2143,27 @@ class SolverFBA(SolverBase):
                 max_iter=max(1000, 2 * max_n),
             )
 
-    def _ensure_nsn_inner_buffers(self, n_rows: int) -> None:
+    def _ensure_nsn_inner_buffers(self, n_rows: int, alloc_2d: bool = True) -> None:
         """Allocate or resize the device-resident NSN inner-loop scratch.
 
         Buffers grow with a 1.5x headroom factor so a slowly climbing contact
         count does not realloc the dense ``(cap, cap)`` matrices every frame.
         Demo 5 contact counts can ramp by tens of contacts between frames; a
         per-frame realloc otherwise pegs the device allocator and stalls.
+
+        Args:
+            n_rows: Minimum capacity needed for 1D buffers.
+            alloc_2d: When ``True`` (default), allocates the
+                ``(cap, cap)`` dense ``_nsn_W_d`` and ``_nsn_a_schur_d`` scratch
+                buffers used by the dense NSN inner.  Set to ``False`` in
+                ``nsn_schur_mode="lite"`` (block-diagonal-by-particle), where
+                neither buffer is touched; skipping the alloc keeps the lite
+                memory cost ``O(n_rows)`` so the solver fits on a single 32 GB
+                GPU up to ``N=25`` envs / 50k+ contact rows.
         """
         existing_n = int(getattr(self, "_nsn_inner_n", 0))
-        if existing_n >= n_rows:
+        existing_2d = bool(getattr(self, "_nsn_inner_has_2d", False))
+        if existing_n >= n_rows and (existing_2d or not alloc_2d):
             return
         # 1.5x growth factor on top of the strict minimum.  ``max`` against the
         # current capacity ensures monotonic growth and avoids shrinking after
@@ -2095,13 +2182,15 @@ class SolverFBA(SolverBase):
         self._nsn_rhs_d = wp.zeros(cap, dtype=wp.float64, device=device)
         self._nsn_dlam_d = wp.zeros(cap, dtype=wp.float64, device=device)
         self._nsn_lam_apply_d = wp.zeros(cap, dtype=wp.float64, device=device)
-        # 2D buffers are square in the NSN setting.  ``_nsn_W_d`` is used only
-        # as a fallback when the caller passes W as a host array (tests / CPU
-        # parity path).  The hot solver path passes the device-resident
-        # ``FBALinearSolver._W_device_d`` directly via ``W_device=`` and never
-        # touches this buffer, so its memory cost is only paid in test mode.
-        self._nsn_W_d = wp.zeros((cap, cap), dtype=wp.float64, device=device)
-        self._nsn_a_schur_d = wp.zeros((cap, cap), dtype=wp.float64, device=device)
+        if alloc_2d:
+            # 2D buffers are square in the NSN setting.  ``_nsn_W_d`` is used only
+            # as a fallback when the caller passes W as a host array (tests / CPU
+            # parity path).  The hot solver path passes the device-resident
+            # ``FBALinearSolver._W_device_d`` directly via ``W_device=`` and never
+            # touches this buffer, so its memory cost is only paid in test mode.
+            self._nsn_W_d = wp.zeros((cap, cap), dtype=wp.float64, device=device)
+            self._nsn_a_schur_d = wp.zeros((cap, cap), dtype=wp.float64, device=device)
+            self._nsn_inner_has_2d = True
 
     def _solve_nsn_unilateral_gpu(
         self,

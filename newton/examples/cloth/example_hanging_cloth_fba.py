@@ -80,6 +80,50 @@ def _select_in_aabb(points: np.ndarray, lo: tuple, hi: tuple) -> np.ndarray:
     return np.where(np.all((p >= lo) & (p <= hi), axis=1))[0].astype(np.int32)
 
 
+def build_hanging_cloth_builder() -> tuple[newton.ModelBuilder, np.ndarray]:
+    """Construct a single-env hanging-cloth ModelBuilder (not finalized).
+
+    Returns a `(builder, pin_idx)` pair so callers can finalize and then
+    zero out `particle_mass` on the pinned indices.  The pin selection
+    must happen pre-finalize because it indexes into the local cloth
+    vertex array — after `replicate()` is layered on top, per-world
+    indices are re-numbered and the AABB sweep would mis-fire.
+    """
+    if not _MESH_PATH.exists():
+        raise FileNotFoundError(
+            f"Cloth mesh not found at {_MESH_PATH}.  Update _MESH_PATH at the top of this example."
+        )
+    verts_local, tris = _load_obj(_MESH_PATH)
+    verts_world = (verts_local @ _rot_x(_ROT_X_DEG).T + _TRANS).astype(np.float32)
+
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=_GRAVITY)
+
+    e1 = verts_world[tris[:, 1]] - verts_world[tris[:, 0]]
+    e2 = verts_world[tris[:, 2]] - verts_world[tris[:, 0]]
+    tri_area = 0.5 * np.linalg.norm(np.cross(e1, e2), axis=1)
+    density = _OBJ_MASS / max(float(tri_area.sum()), 1e-12)
+
+    mu, _lam = _lame_from_young_poisson(_YOUNG, _POISSON)
+
+    builder.add_cloth_mesh(
+        pos=wp.vec3(0.0, 0.0, 0.0),
+        rot=wp.quat_identity(),
+        scale=1.0,
+        vel=wp.vec3(0.0, 0.0, 0.0),
+        vertices=[wp.vec3(*v.tolist()) for v in verts_world],
+        indices=tris.reshape(-1).tolist(),
+        density=density,
+        tri_ke=2.0 * mu,
+        tri_ka=0.0,
+        tri_kd=0.0,
+        edge_ke=_BENDING,
+        edge_kd=0.0,
+    )
+
+    pin_idx = _select_in_aabb(verts_world, _PIN_LO, _PIN_HI)
+    return builder, pin_idx
+
+
 class Example:
     def __init__(self, viewer, args):
         self.viewer = viewer
@@ -87,39 +131,7 @@ class Example:
         self.frame_dt = _DT
         self.sim_time = 0.0
 
-        if not _MESH_PATH.exists():
-            raise FileNotFoundError(
-                f"Cloth mesh not found at {_MESH_PATH}.  Update _MESH_PATH at the top of this example."
-            )
-        verts_local, tris = _load_obj(_MESH_PATH)
-        verts_world = (verts_local @ _rot_x(_ROT_X_DEG).T + _TRANS).astype(np.float32)
-
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=_GRAVITY)
-
-        e1 = verts_world[tris[:, 1]] - verts_world[tris[:, 0]]
-        e2 = verts_world[tris[:, 2]] - verts_world[tris[:, 0]]
-        tri_area = 0.5 * np.linalg.norm(np.cross(e1, e2), axis=1)
-        density = _OBJ_MASS / max(float(tri_area.sum()), 1e-12)
-
-        mu, lam = _lame_from_young_poisson(_YOUNG, _POISSON)
-
-        builder.add_cloth_mesh(
-            pos=wp.vec3(0.0, 0.0, 0.0),
-            rot=wp.quat_identity(),
-            scale=1.0,
-            vel=wp.vec3(0.0, 0.0, 0.0),
-            vertices=[wp.vec3(*v.tolist()) for v in verts_world],
-            indices=tris.reshape(-1).tolist(),
-            density=density,
-            tri_ke=2.0 * mu,
-            tri_ka=0.0,
-            tri_kd=0.0,
-            edge_ke=_BENDING,
-            edge_kd=0.0,
-        )
-
-        pin_idx = _select_in_aabb(verts_world, _PIN_LO, _PIN_HI)
-
+        builder, pin_idx = build_hanging_cloth_builder()
         self.model = builder.finalize()
 
         uniform_mass = _OBJ_MASS / self.model.particle_count
