@@ -4,26 +4,28 @@ Baseline (pre-fp64-SVD-lift, branch `ziqiu/fba-solver-design`).  FBA timings are
 
 All values are means in **milliseconds per PD outer iter** (per-iter granularity), except where the row label says otherwise. Ratio = FBA / RealSim; values > 1.0 mean FBA is slower.
 
+**NSN-Schur PCR matvec path:** Warp ``tile_matmul`` (block-per-row tile reduction), wrapped in a CUDA graph that replays one full PCR iter per ``cuGraphLaunch`` (Perf #5).  An earlier optional cuBLAS DGEMV path (Perf #4 via cupy) was removed in Perf #6 because cuBLAS trips ``cudaErrorStreamCaptureImplicit`` during graph capture, and the captured ``tile_matmul`` path wins by a large margin (Demo 5 step_mean ~43 ms graph + tile_matmul vs ~99 ms cuBLAS + eager).
+
 ## Per-component breakdown
 
 | Demo | Component | FBA (ms) | RealSim (ms) | Ratio |
 |---|---|---|---|---|
-| TwistingBarNH | Local (energy projection) | 1.152 | n/a | n/a |
-|  | Linear solve (A^-1 b) | 1.326 | n/a | n/a |
+| TwistingBarNH | Local (energy projection) | 1.177 | n/a | n/a |
+|  | Linear solve (A^-1 b) | 1.340 | n/a | n/a |
 |  | Schur W build | n/a | n/a | n/a |
 |  | NSN inner (build+cstsolve+correction) | n/a | n/a | n/a |
-| StretchingCloth | Local (energy projection) | 0.441 | n/a | n/a |
-|  | Linear solve (A^-1 b) | 1.488 | n/a | n/a |
+| StretchingCloth | Local (energy projection) | 0.484 | n/a | n/a |
+|  | Linear solve (A^-1 b) | 1.524 | n/a | n/a |
 |  | Schur W build | n/a | n/a | n/a |
 |  | NSN inner (build+cstsolve+correction) | n/a | n/a | n/a |
-| PullingWooper | Local (energy projection) | 1.335 | n/a | n/a |
-|  | Linear solve (A^-1 b) | 0.367 | n/a | n/a |
-|  | Schur W build | 2.094 | n/a | n/a |
-|  | NSN inner (build+cstsolve+correction) | 6.285 | n/a | n/a |
-| SqueezingBall | Local (energy projection) | 1.276 | n/a | n/a |
-|  | Linear solve (A^-1 b) | 0.706 | n/a | n/a |
-|  | Schur W build | 0.846 | n/a | n/a |
-|  | NSN inner (build+cstsolve+correction) | 2.851 | n/a | n/a |
+| PullingWooper | Local (energy projection) | 1.363 | n/a | n/a |
+|  | Linear solve (A^-1 b) | 0.396 | n/a | n/a |
+|  | Schur W build | 2.044 | n/a | n/a |
+|  | NSN inner (build+cstsolve+correction) | 0.774 | n/a | n/a |
+| SqueezingBall | Local (energy projection) | 1.300 | n/a | n/a |
+|  | Linear solve (A^-1 b) | 0.734 | n/a | n/a |
+|  | Schur W build | 0.873 | n/a | n/a |
+|  | NSN inner (build+cstsolve+correction) | 3.318 | n/a | n/a |
 
 ## NSN sub-phases (RealSim only)
 
@@ -40,20 +42,20 @@ FBA's GPU NSN driver does a single fused kernel sequence (``build_schur`` was al
 
 | Demo | FBA step mean (ms) | FBA p95 (ms) | RS frame_no_cd (ms) | RS total step (ms) | FBA setup (ms) | Frames (FBA measured / RS counted) |
 |---|---|---|---|---|---|---|
-| TwistingBarNH | 24.94 | 25.92 | n/a | n/a | 5758.9 | 80 / ? |
-| StretchingCloth | 19.41 | 20.63 | n/a | n/a | 3202.3 | 80 / ? |
-| PullingWooper | 20.49 | 18.92 | n/a | n/a | 704.2 | 80 / ? |
-| SqueezingBall | 58.03 | 71.99 | n/a | n/a | 2365.8 | 80 / ? |
+| TwistingBarNH | 25.36 | 26.39 | n/a | n/a | 5794.5 | 80 / ? |
+| StretchingCloth | 20.26 | 21.75 | n/a | n/a | 3235.2 | 80 / ? |
+| PullingWooper | 19.02 | 19.59 | n/a | n/a | 716.9 | 80 / ? |
+| SqueezingBall | 63.79 | 89.28 | n/a | n/a | 2410.8 | 80 / ? |
 
 ## Identified bottlenecks (largest contributor per demo)
 
-- **TwistingBarNH**: dominant FBA cost = **Linear solve** = 1.326 ms/iter.
+- **TwistingBarNH**: dominant FBA cost = **Linear solve** = 1.340 ms/iter.
   - Parity / gap notes: no >5x gaps detected
-- **StretchingCloth**: dominant FBA cost = **Linear solve** = 1.488 ms/iter.
+- **StretchingCloth**: dominant FBA cost = **Linear solve** = 1.524 ms/iter.
   - Parity / gap notes: no >5x gaps detected
-- **PullingWooper**: dominant FBA cost = **NSN inner** = 6.285 ms/iter.
+- **PullingWooper**: dominant FBA cost = **Schur W** = 2.044 ms/iter.
   - Parity / gap notes: no >5x gaps detected
-- **SqueezingBall**: dominant FBA cost = **NSN inner** = 2.851 ms/iter.
+- **SqueezingBall**: dominant FBA cost = **NSN inner** = 3.318 ms/iter.
   - Parity / gap notes: no >5x gaps detected
 
 ## Raw JSON

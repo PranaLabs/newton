@@ -340,8 +340,11 @@ Detailed numbers live in
 
 1. **Kernel fusion** of `fb_*_row` + Schur-diagonal stamp into a single
    launch per FB-Newton iter.
-2. **cuBLAS DGEMV** for the dense `W·(ω·λ)` matvec instead of the
-   hand-rolled Warp kernel; matches RealSim's path exactly.
+2. ~~**cuBLAS DGEMV** for the dense `W·(ω·λ)` matvec~~ — tried in Perf #4
+   then removed in Perf #6: cuBLAS DGEMV trips
+   `cudaErrorStreamCaptureImplicit` during CUDA graph capture, and
+   graph capture of the Warp `tile_matmul` path wins by a large margin
+   (Demo 5 step_mean 43.4 ms with graphs vs ~99 ms with cuBLAS+eager).
 3. **CUDA graphs** to amortize the per-PD-iter axpy chain (lambda
    update, omega writeback, correction accumulation) into one
    `cuGraphLaunch`.

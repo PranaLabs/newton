@@ -380,6 +380,16 @@ def format_markdown(results: list[DemoResult]) -> str:
         "otherwise. Ratio = FBA / RealSim; values > 1.0 mean FBA is slower."
     )
     lines.append("")
+    lines.append(
+        "**NSN-Schur PCR matvec path:** Warp ``tile_matmul`` (block-per-row "
+        "tile reduction), wrapped in a CUDA graph that replays one full PCR "
+        "iter per ``cuGraphLaunch`` (Perf #5).  An earlier optional cuBLAS "
+        "DGEMV path (Perf #4 via cupy) was removed in Perf #6 because cuBLAS "
+        "trips ``cudaErrorStreamCaptureImplicit`` during graph capture, and "
+        "the captured ``tile_matmul`` path wins by a large margin "
+        "(Demo 5 step_mean ~43 ms graph + tile_matmul vs ~99 ms cuBLAS + eager)."
+    )
+    lines.append("")
     lines.append("## Per-component breakdown")
     lines.append("")
     lines.append("| Demo | Component | FBA (ms) | RealSim (ms) | Ratio |")
