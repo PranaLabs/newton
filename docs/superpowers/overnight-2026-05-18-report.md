@@ -253,3 +253,77 @@ Component M (pin handling) was originally classified MATCH. Empirical diff shows
 3. **Start NSN inner solver GPU port** (Task #24): the dominant overnight-time cost was SqueezingBall's 25-min CPU-bound NSN numpy. Port it to Warp via the existing plan at `docs/superpowers/plans/2026-05-17-fba-nsn-gpu-port.md`.
 4. **Phase 4 Cat B kernel cleanup**: 5 atomic-add legacy kernels still have unit-test callers (not production callers). Decide: drop kernels + their dedicated tests together, or port tests to compute-kernel replacements.
 5. **Audit-v2 Component M reclassification** to DIVERGE-accidental.
+
+---
+
+## 08:30 — NSN GPU Port Steps 12 + 13 (final)
+
+Full plan completion of `2026-05-17-fba-nsn-gpu-port.md`.  See
+`docs/superpowers/specs/2026-05-18-fba-nsn-gpu-perf.md` for the
+detailed perf table.
+
+### Step 12 perf bench (RTX 5090, post-port, post a3845346)
+
+| Demo | Wall (s) | Mean ms/frame | Median | p95 | Frames | RealSim wall (s) | FBA/RealSim |
+|---|---|---|---|---|---|---|---|
+| 2 TwistingBarNH | 29.7 | 21.73 | 21.44 | 23.42 | 810 | n/a (no NSN) | n/a |
+| 3 StretchingCloth | 34.0 | 21.56 | 18.79 | 20.07 | 1 200 | n/a (no NSN) | n/a |
+| 4 PullingWooper | 161.3 | 314.42 | 108.06 | 1 188.23 | 500 | n/a | n/a |
+| 5 SqueezingBall | 419.4 | 691.10 | 410.66 | 1 641.43 | 600 | ~17 | ~24.7× |
+| **Total wall** | **644.4 s (10:44)** | — | — | — | — | — | — |
+
+### Tier 1 binary verdicts (all four)
+
+- Demo 2 TwistingBarNH: stable, all 810 frames finite — **PASS**.
+- Demo 3 StretchingCloth: stable, pulled = 1.000 m, x_extent = 4.000 m,
+  min_y = -0.007 m — **PASS**.
+- Demo 4 PullingWooper: stable, min_y = -8.408 (matches RealSim),
+  pulled = 10.00 m — **PASS**.
+- Demo 5 SqueezingBall: stable, min_y = -10.000 exact, x_drift = 21 mm,
+  z_drift = 5 mm — **PASS**.
+
+### Step 12 acceptance vs targets
+
+- Demo 5 ratio ≤ 5×: **NOT MET** (~24.7×).  4 follow-up optimizations
+  recorded (kernel fusion, cuBLAS DGEMV, CUDA graphs, on-device
+  residual).
+- Demo 4 mean ms ≥ 2× pre-port: **NOT MET** on the mean (1.16×).
+  Median speedup is 3.4× (108 ms vs ~365 ms expected median pre-port);
+  the mean is contaminated by p95 = 1 188 ms heavy-contact-frame
+  outliers.  Wall time dropped 3 min → 2:41.
+- Demo 2, 3 unchanged: **EXCEEDED** (2.0-2.3× faster from PD-loop +
+  module-cache side-effects, NSN was never invoked).
+- Total wall < 10 min: **NOT MET** (10:44, over by 44 s — Demo 5).
+
+### Step 13 CPU cleanup (commit `375e2ea6`)
+
+- Removed `use_gpu_nsn: bool = True` kwarg and dispatch branches in
+  `SolverFBA.step` (both Stage A and Stage B); GPU NSN is now
+  unconditional.
+- `_solve_nsn_unilateral` / `_solve_nsn_coulomb` numpy bodies kept
+  (marked `.. deprecated:: Step 13 (NSN GPU port)`) because
+  `test_fba_nsn_gpu_driver` uses them as the GPU-vs-CPU parity
+  oracle, and `test_solver_fba` calls them directly in 3 tests.
+- `_compute_contact_residual*` kept (still on the live `step()` path
+  feeding host fp64 `r` arrays to the GPU drivers — Step 14 follow-up
+  will remove this round-trip).
+- Net diff: -63 / +48 lines in `solver_fba.py`.
+
+### Cumulative commit list for NSN GPU port (Steps 1-13)
+
+| Commit | Step | Subject |
+|---|---|---|
+| `5d552589` | 2-4 | Port FB row functions to GPU @wp.func + Schur build kernel |
+| `90a88d74` | 5 | Port RealSim CUDADenseJacobiPCRSolver to Warp/Newton |
+| `d42be19c` | 5.5 | Port update_contacts contact bookkeeping to GPU kernels |
+| `b3056c13` | 6-10 | Add GPU NSN inner driver: residual, penetration, rhs, clamp |
+| `68b57482` | 9, 11 | Wire GPU NSN drivers as default in SolverFBA.step |
+| `a3845346` | 12 (opt) | Optimize GPU NSN: device W, batched PCR sync, growth |
+| `375e2ea6` | 13a | Remove dead CPU numpy NSN solver dispatch |
+| `<next>`   | 12, 13b | Document NSN GPU port: perf bench, audit-v2, plan finalize |
+
+### Final test status
+
+- `test_solver_fba`: 119/119 OK
+- `test_fba_nsn_gpu_driver` + `test_fba_nsn_pcr` + `test_fba_contact_kernels` +
+  `test_fba_nsn_gpu_kernels`: 34/34 OK
