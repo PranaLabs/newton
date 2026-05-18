@@ -1399,7 +1399,7 @@ class FBALinearSolver:
 
     def apply_lambda_correction_combined(
         self,
-        lam: np.ndarray,
+        lam: np.ndarray | wp.array,
         rhs_inout: wp.array[wp.vec3],
         x_out: wp.array[wp.vec3],
     ) -> None:
@@ -1430,14 +1430,17 @@ class FBALinearSolver:
         gather, so this helper works under both modes.
 
         Args:
-            lam: Contact impulse vector, shape ``(total_rows,)``, float64.
-                ``total_rows == M`` for Stage A, ``3 * M`` for Stage B.
+            lam: Contact impulse vector, shape ``(total_rows,)``. Accepts
+                either a host ``numpy`` array (legacy CPU path) or a
+                device-resident ``wp.array[wp.float64]`` produced by the
+                NSN inner driver. ``total_rows == M`` for Stage A,
+                ``3 * M`` for Stage B.
             rhs_inout: Right-hand side vec3 array of length ``N`` —
                 MUTATED in place to ``rhs_inout + Jᵀ·lam``.
             x_out: Output position correction, shape ``[N]``, vec3.
                 Overwritten with ``A⁻¹ · (rhs_inout + Jᵀ·lam)``.
         """
-        from .kernels import accumulate_vec3_kernel, gather_jt_lambda_kernel  # noqa: PLC0415
+        from .kernels import accumulate_vec3_kernel, cast_fp64_to_fp32_kernel, gather_jt_lambda_kernel  # noqa: PLC0415
 
         if not hasattr(self, "_row_particle_d") or not hasattr(self, "_isodof_row_offsets_d"):
             raise RuntimeError(
@@ -1457,7 +1460,20 @@ class FBALinearSolver:
             self._lam_cap = cap
             self._lam_d = wp.empty(cap, dtype=wp.float32, device=dev)
 
-        self._lam_d.assign(lam.astype(np.float32))
+        # Accept either a host numpy array (legacy path used by tests and
+        # the CPU NSN driver) or a device-resident fp64 array (the hot
+        # solver path emits ``_nsn_lam_apply_d`` directly to avoid the
+        # per-PD-iter device->host->device round-trip).
+        if isinstance(lam, wp.array):
+            wp.launch(
+                cast_fp64_to_fp32_kernel,
+                dim=n_rows,
+                inputs=[lam],
+                outputs=[self._lam_d],
+                device=dev,
+            )
+        else:
+            self._lam_d.assign(lam.astype(np.float32))
 
         # Step 1: particle-centered gather Jᵀ·lam into _jt_lambda_d.
         wp.launch(

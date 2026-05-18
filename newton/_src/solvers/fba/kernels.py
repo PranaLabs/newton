@@ -3831,6 +3831,96 @@ def compute_lam_apply_kernel(
     lam_apply[i] = dt * dt * omega[i] * lam[i]
 
 
+@wp.kernel
+def build_coulomb_pene0_kernel(
+    offset_n: wp.array[wp.float64],
+    offset_t1: wp.array[wp.float64],
+    offset_t2: wp.array[wp.float64],
+    pene0: wp.array[wp.float64],
+):
+    """Interleave per-contact normal/tangent offsets into the ``(3M,)`` pene0.
+
+    One thread per contact writes ``pene0[3c:3c+3] = [offset_n, offset_t1,
+    offset_t2]`` matching the row layout consumed by
+    :func:`compute_frictional_fb_kernel` and :func:`compute_nsn_rhs_kernel`.
+    Replaces the host-side ``pene0_b[0::3] = ...`` slicing previously run
+    each PD outer iter.
+
+    Args:
+        offset_n: ``n·anchor`` (fp64), shape ``[M]``.
+        offset_t1: Kinematic-shifted ``t1·anchor`` (fp64), shape ``[M]``.
+        offset_t2: Kinematic-shifted ``t2·anchor`` (fp64), shape ``[M]``.
+        pene0: Output interleaved pene0 (fp64), shape ``[>=3M]``.
+    """
+    c = wp.tid()
+    pene0[3 * c + 0] = offset_n[c]
+    pene0[3 * c + 1] = offset_t1[c]
+    pene0[3 * c + 2] = offset_t2[c]
+
+
+@wp.kernel
+def apply_tangent_kinematic_shift_kernel(
+    t1: wp.array[wp.vec3],
+    t2: wp.array[wp.vec3],
+    v_anchor: wp.array[wp.vec3d],
+    t1_offset_base: wp.array[wp.float64],
+    t2_offset_base: wp.array[wp.float64],
+    dt: wp.float64,
+    t1_offset_out: wp.array[wp.float64],
+    t2_offset_out: wp.array[wp.float64],
+):
+    """Apply per-step kinematic anchor shift to tangent offsets.
+
+    Mirrors the host expression
+    ``offset_t = offset_t_base + dt · dot(t, v_anchor)`` previously
+    computed in :meth:`SolverFBA.step` from host-side mirrors. Running on
+    device eliminates the per-step ``tangent1_d.numpy() / tangent2_d.numpy()
+    / v_anchor_d.numpy()`` download chain.
+
+    Args:
+        t1: Per-contact first tangent (fp32 vec3), shape ``[M]``.
+        t2: Per-contact second tangent (fp32 vec3), shape ``[M]``.
+        v_anchor: Per-contact kinematic anchor velocity (fp64 vec3),
+            shape ``[M]``.
+        t1_offset_base: Base ``t1·anchor`` (fp64), shape ``[M]``.
+        t2_offset_base: Base ``t2·anchor`` (fp64), shape ``[M]``.
+        dt: Timestep (fp64).
+        t1_offset_out: Output shifted offset ``t1·anchor + dt·t1·v_anchor``
+            (fp64), shape ``[M]``.
+        t2_offset_out: Output shifted offset ``t2·anchor + dt·t2·v_anchor``
+            (fp64), shape ``[M]``.
+    """
+    c = wp.tid()
+    v = v_anchor[c]
+    t1c = t1[c]
+    t2c = t2[c]
+    dot1 = wp.float64(t1c[0]) * v[0] + wp.float64(t1c[1]) * v[1] + wp.float64(t1c[2]) * v[2]
+    dot2 = wp.float64(t2c[0]) * v[0] + wp.float64(t2c[1]) * v[1] + wp.float64(t2c[2]) * v[2]
+    t1_offset_out[c] = t1_offset_base[c] + dt * dot1
+    t2_offset_out[c] = t2_offset_base[c] + dt * dot2
+
+
+@wp.kernel
+def cast_fp64_to_fp32_kernel(
+    src: wp.array[wp.float64],
+    dst: wp.array[wp.float32],
+):
+    """Narrow ``fp64 -> fp32`` element-wise copy.
+
+    Used to feed the device-resident fp64 ``lam_apply`` produced by the
+    NSN inner driver into :func:`gather_jt_lambda_kernel`, which reads
+    fp32 per-row impulses (matching the rest of the linear-solver
+    arithmetic). Both arrays must have the same length; only the first
+    ``dim`` entries (set via the kernel launch dim) are touched.
+
+    Args:
+        src: Source fp64 array, shape ``[n_rows]``.
+        dst: Destination fp32 array, shape ``[n_rows]``.
+    """
+    i = wp.tid()
+    dst[i] = wp.float32(src[i])
+
+
 # ---------------------------------------------------------------------------
 # Step 5.5 — update_contacts per-contact bookkeeping ported to GPU.
 #

@@ -727,17 +727,31 @@ class SolverFBA(SolverBase):
 
         # Apply kinematic anchor advancement: tangent_offset = base + dt · dot(t, v_anchor).
         # update_contacts cached base offsets + v_anchor; the dt-dependent
-        # shift is applied here.  When ω = 0 everywhere, v_anchor is zero
-        # and this is a no-op (offsets equal base).
-        if self.friction and self._contact_count > 0 and hasattr(self, "_contact_v_anchor_h"):
+        # shift is applied here on device (kernel) so the per-step
+        # ``tangent1_d.numpy() / tangent2_d.numpy() / v_anchor_d.numpy()``
+        # downloads no longer fire. When ω = 0 everywhere, v_anchor is
+        # zero and this is a no-op (offsets equal base).
+        if self.friction and self._contact_count > 0 and hasattr(self, "_contact_v_anchor_d"):
             M_kin = self._contact_count
-            v_anchor = self._contact_v_anchor_h[:M_kin]
-            t1 = self._contact_tangent1_d.numpy()[:M_kin].astype(np.float64)
-            t2 = self._contact_tangent2_d.numpy()[:M_kin].astype(np.float64)
-            shift1 = dt * np.einsum("ij,ij->i", t1, v_anchor)
-            shift2 = dt * np.einsum("ij,ij->i", t2, v_anchor)
-            self._contact_tangent1_offset_h = self._contact_tangent1_offset_h_base + shift1
-            self._contact_tangent2_offset_h = self._contact_tangent2_offset_h_base + shift2
+            from . import kernels as K_kin  # noqa: PLC0415
+
+            wp.launch(
+                K_kin.apply_tangent_kinematic_shift_kernel,
+                dim=M_kin,
+                inputs=[
+                    self._contact_tangent1_d,
+                    self._contact_tangent2_d,
+                    self._contact_v_anchor_d,
+                    self._contact_tangent1_offset_d,  # base (set in update_contacts)
+                    self._contact_tangent2_offset_d,  # base
+                    wp.float64(dt),
+                ],
+                outputs=[
+                    self._contact_tangent1_offset_shifted_d,
+                    self._contact_tangent2_offset_shifted_d,
+                ],
+                device=self._device,
+            )
 
         # RealSim parity: λ = 0 once per step (per frame), then accumulates
         # across the PD outer iters below. ω carries the previous step's
@@ -761,6 +775,28 @@ class SolverFBA(SolverBase):
                 self._omega_coulomb_persistent = np.zeros(3 * M, dtype=np.float64)
             else:
                 self._omega_coulomb_persistent.fill(0.0)
+
+            # Device-resident persistent warm-start buffers. Sized to the
+            # current row count and zeroed at step entry, matching the host
+            # arrays above. The hot solver path keeps the device versions
+            # authoritative across PD outer iters; the host arrays are
+            # refreshed once at end-of-step for tests / diagnostics.
+            n_rows_max = 3 * M
+            need_alloc = (
+                not hasattr(self, "_lam_unilateral_persistent_d")
+                or self._lam_unilateral_persistent_d is None
+                or self._lam_unilateral_persistent_d.size < n_rows_max
+            )
+            if need_alloc:
+                self._lam_unilateral_persistent_d = wp.zeros(n_rows_max, dtype=wp.float64, device=self._device)
+                self._lam_coulomb_persistent_d = wp.zeros(n_rows_max, dtype=wp.float64, device=self._device)
+                self._omega_unilateral_persistent_d = wp.zeros(n_rows_max, dtype=wp.float64, device=self._device)
+                self._omega_coulomb_persistent_d = wp.zeros(n_rows_max, dtype=wp.float64, device=self._device)
+            else:
+                self._lam_unilateral_persistent_d.zero_()
+                self._lam_coulomb_persistent_d.zero_()
+                self._omega_unilateral_persistent_d.zero_()
+                self._omega_coulomb_persistent_d.zero_()
 
         model = self.model
         N = model.particle_count
@@ -1062,42 +1098,66 @@ class SolverFBA(SolverBase):
                         wp.synchronize_device()
                         self._timing_schur_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_schur_0))
                         _t_nsn_0 = time.perf_counter()
-                    W = self._cached_W
-                    x_unc_np = self._x_cur.numpy()  # (N, 3) float32
-                    r = self._compute_contact_residual_friction(x_unc_np)
-                    # Build per-row pene0 from cached anchor projections.
-                    pene0_b = np.empty(3 * M, dtype=np.float64)
-                    pene0_b[0::3] = self._contact_offset_h[:M]
-                    pene0_b[1::3] = self._contact_tangent1_offset_h[:M]
-                    pene0_b[2::3] = self._contact_tangent2_offset_h[:M]
-                    # Hot path: pass the device-resident Schur W view
-                    # directly so the NSN driver skips the per-PD-iter
-                    # cap*cap*8 host -> device upload.  GPU is the only
-                    # active path; the legacy CPU numpy driver remains
-                    # under ``_legacy_cpu_solve_nsn_coulomb`` for
-                    # parity-only testing.
-                    lam, omega_last, lam_apply = self._solve_nsn_coulomb_gpu(
-                        W,
-                        r,
-                        self._contact_mu_h[:M],
-                        pene0_b,
+                    # Bottleneck #2 fix: residual + pene0 + warm-start all
+                    # device-resident. The PD outer iter now does ZERO
+                    # host<->device transfers around the NSN call.
+                    self._ensure_nsn_inner_buffers(3 * M)
+                    from . import kernels as K_step  # noqa: PLC0415
+
+                    wp.launch(
+                        K_step.compute_contact_residual_coulomb_kernel,
+                        dim=M,
+                        inputs=[
+                            self._contact_offset_d,
+                            self._contact_tangent1_offset_shifted_d,
+                            self._contact_tangent2_offset_shifted_d,
+                            self._contact_alpha_d,
+                            self._contact_normal_d,
+                            self._contact_tangent1_d,
+                            self._contact_tangent2_d,
+                            self._contact_particle_d,
+                            self._x_cur,
+                        ],
+                        outputs=[self._nsn_r_d],
+                        device=device,
+                    )
+                    wp.launch(
+                        K_step.build_coulomb_pene0_kernel,
+                        dim=M,
+                        inputs=[
+                            self._contact_offset_d,
+                            self._contact_tangent1_offset_shifted_d,
+                            self._contact_tangent2_offset_shifted_d,
+                        ],
+                        outputs=[self._nsn_pene0_d],
+                        device=device,
+                    )
+                    self._solve_nsn_coulomb_gpu(
+                        None,
+                        None,
+                        None,
+                        None,
                         max_iters=self.nsn_iterations,
-                        lam_init=self._lam_coulomb_persistent,
-                        omega_init=self._omega_coulomb_persistent,
                         dt=dt,
                         W_device=ls.W_device_view(),
+                        r_device=self._nsn_r_d,
+                        pene0_device=self._nsn_pene0_d,
+                        mu_device=self._contact_mu_d,
+                        lam_init_device=self._lam_coulomb_persistent_d,
+                        omega_init_device=self._omega_coulomb_persistent_d,
+                        skip_download=True,
+                        m_contacts=M,
                     )
-                    self._lam_coulomb_persistent = lam.copy()
-                    self._omega_coulomb_persistent = omega_last.copy()
+                    # Persist device-resident lam / omega for next PD iter.
+                    wp.copy(self._lam_coulomb_persistent_d, self._nsn_lam_d, count=3 * M)
+                    wp.copy(self._omega_coulomb_persistent_d, self._nsn_omega_d, count=3 * M)
                     # RealSim in-iter combined-form correction (Task 1.3.g,
                     # A-tier alignment): mirrors NonSmoothNewton.cpp:151-167's
-                    # ``applyConstraintCorrection`` — ``b += dt²·J·(ω·λ);
-                    # _systemlinearsolver->solve(x, b)``. Replaces the prior
-                    # split-form ``correction = A⁻¹·Jᵀ·lam_apply;
-                    # x_cur += correction``. Algebraically equivalent but
-                    # bit-distinct under float32 rounding.
-                    if np.any(np.abs(lam_apply) > 1e-15):
-                        ls.apply_lambda_correction_combined(lam_apply, self._rhs, self._x_cur)
+                    # ``applyConstraintCorrection``. The magnitude guard was
+                    # dropped along with the host download — the cost of a
+                    # no-op Cholesky solve is small relative to the saved
+                    # ``_nsn_lam_apply_d.numpy()`` round-trip.
+                    ls.apply_lambda_correction_combined(self._nsn_lam_apply_d, self._rhs, self._x_cur)
                     if _perf_on:
                         wp.synchronize_device()
                         self._timing_nsn_inner_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_nsn_0))
@@ -1119,40 +1179,45 @@ class SolverFBA(SolverBase):
                         wp.synchronize_device()
                         self._timing_schur_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_schur_0))
                         _t_nsn_0 = time.perf_counter()
-                    W = self._cached_W
-                    x_unc_np = self._x_cur.numpy()  # (N, 3) float32
-                    r = self._compute_contact_residual(x_unc_np)
-                    pene0_a = self._contact_offset_h[:M].astype(np.float64, copy=True)
-                    # GPU is the only active path; the legacy CPU numpy
-                    # driver remains under ``_legacy_cpu_solve_nsn_unilateral``
-                    # for parity-only testing.
-                    lam, omega_last, lam_apply = self._solve_nsn_unilateral_gpu(
-                        W,
-                        r,
-                        pene0_a,
+                    # Bottleneck #2 fix: residual + pene0 + warm-start all
+                    # device-resident.
+                    self._ensure_nsn_inner_buffers(M)
+                    from . import kernels as K_step  # noqa: PLC0415
+
+                    wp.launch(
+                        K_step.compute_contact_residual_unilateral_kernel,
+                        dim=M,
+                        inputs=[
+                            self._contact_offset_d,
+                            self._contact_alpha_d,
+                            self._contact_normal_d,
+                            self._contact_particle_d,
+                            self._x_cur,
+                        ],
+                        outputs=[self._nsn_r_d],
+                        device=device,
+                    )
+                    # Stage A pene0 == contact_offset (no kinematic shift).
+                    # Reuse the device buffer directly.
+                    self._solve_nsn_unilateral_gpu(
+                        None,
+                        None,
+                        None,
                         max_iters=self.nsn_iterations,
-                        lam_init=self._lam_unilateral_persistent,
-                        omega_init=self._omega_unilateral_persistent,
                         dt=dt,
                         W_device=ls.W_device_view(),
+                        r_device=self._nsn_r_d,
+                        pene0_device=self._contact_offset_d,
+                        lam_init_device=self._lam_unilateral_persistent_d,
+                        omega_init_device=self._omega_unilateral_persistent_d,
+                        skip_download=True,
+                        m_rows=M,
                     )
-                    self._lam_unilateral_persistent = lam.copy()
-                    self._omega_unilateral_persistent = omega_last.copy()
-                    # Symmetric magnitude guard, matching Stage B above and
-                    # RealSim's NonSmoothNewton.cpp:151-171 (always apply
-                    # correction). Pre-A1-fix the one-sided guard was masked
-                    # by the np.maximum(lam, 0.0) clamp; removing that clamp
-                    # exposes transient all-negative lam_apply, which a
-                    # one-sided guard would silently skip.
-                    #
-                    # RealSim in-iter combined-form correction (Task 1.3.g):
-                    # mirrors NonSmoothNewton.cpp:151-167 — ``b += dt²·J·(ω·λ);
-                    # _systemlinearsolver->solve(x, b)``. Replaces the prior
-                    # split-form ``correction = A⁻¹·Jᵀ·lam_apply;
-                    # x_cur += correction``. Algebraically equivalent but
-                    # bit-distinct under float32 rounding.
-                    if np.any(np.abs(lam_apply) > 1e-15):
-                        ls.apply_lambda_correction_combined(lam_apply, self._rhs, self._x_cur)
+                    wp.copy(self._lam_unilateral_persistent_d, self._nsn_lam_d, count=M)
+                    wp.copy(self._omega_unilateral_persistent_d, self._nsn_omega_d, count=M)
+                    # RealSim in-iter combined-form correction (Task 1.3.g);
+                    # see Stage B comment above re: dropped magnitude guard.
+                    ls.apply_lambda_correction_combined(self._nsn_lam_apply_d, self._rhs, self._x_cur)
                     if _perf_on:
                         wp.synchronize_device()
                         self._timing_nsn_inner_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_nsn_0))
@@ -1166,6 +1231,27 @@ class SolverFBA(SolverBase):
             outputs=[state_out.particle_qd],
             device=device,
         )
+
+        # End-of-step refresh of host-mirror persistent buffers. Done once
+        # per step (not per PD outer iter) so tests / diagnostics that read
+        # ``solver._lam_*_persistent`` continue to see populated arrays
+        # while the hot path remains free of per-PD-iter device->host
+        # downloads. When M==0 the host arrays were left at None / unchanged.
+        if has_contacts:
+            if self.friction and hasattr(self, "_lam_coulomb_persistent_d"):
+                self._lam_coulomb_persistent = self._lam_coulomb_persistent_d.numpy()[: 3 * M].astype(
+                    np.float64, copy=True
+                )
+                self._omega_coulomb_persistent = self._omega_coulomb_persistent_d.numpy()[: 3 * M].astype(
+                    np.float64, copy=True
+                )
+            elif hasattr(self, "_lam_unilateral_persistent_d"):
+                self._lam_unilateral_persistent = self._lam_unilateral_persistent_d.numpy()[:M].astype(
+                    np.float64, copy=True
+                )
+                self._omega_unilateral_persistent = self._omega_unilateral_persistent_d.numpy()[:M].astype(
+                    np.float64, copy=True
+                )
 
         # Diagnostic dump: flush captured buffers to .npz at end of step.
         if _diag_active and self._diag_out_path is not None:
@@ -1266,6 +1352,15 @@ class SolverFBA(SolverBase):
         self._contact_tangent1_offset_d = wp.empty(cap, dtype=wp.float64, device=device)
         self._contact_tangent2_offset_d = wp.empty(cap, dtype=wp.float64, device=device)
         self._contact_v_anchor_d = wp.empty(cap, dtype=wp.vec3d, device=device)
+        # Per-step kinematic-shifted tangent offsets (base + dt·t·v_anchor).
+        # Stage B residual + interleaved pene0 read these directly so the
+        # ``dt`` shift no longer round-trips through host arrays.
+        self._contact_tangent1_offset_shifted_d = wp.empty(cap, dtype=wp.float64, device=device)
+        self._contact_tangent2_offset_shifted_d = wp.empty(cap, dtype=wp.float64, device=device)
+        # Per-contact friction mu, device-resident fp64. Populated in
+        # :meth:`update_contacts` to avoid the per-PD-iter host->device
+        # upload that previously fired from the Stage B NSN driver.
+        self._contact_mu_d = wp.empty(cap, dtype=wp.float64, device=device)
 
     def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
         """Ingest the active particle-vs-shape contact set for the next step.
@@ -1519,6 +1614,13 @@ class SolverFBA(SolverBase):
                     else:
                         mu_h[c] = particle_mu
             self._contact_mu_h = mu_h[:M]
+            # Push mu to the device-resident buffer once per contact-set
+            # update; the Stage B NSN inner driver reads from this fp64
+            # array directly, eliminating the per-PD-iter ``M*8`` byte
+            # host -> device upload.
+            mu_padded = np.zeros(self._contact_mu_d.size, dtype=np.float64)
+            mu_padded[:M] = self._contact_mu_h
+            self._contact_mu_d.assign(mu_padded)
 
     # ------------------------------------------------------------------
     # Phase 4 Stage A — Schur-complement NSN helpers
@@ -1908,14 +2010,20 @@ class SolverFBA(SolverBase):
 
     def _solve_nsn_unilateral_gpu(
         self,
-        W: np.ndarray,
-        r: np.ndarray,
-        pene0: np.ndarray,
+        W: np.ndarray | None,
+        r: np.ndarray | None,
+        pene0: np.ndarray | None,
         max_iters: int = 1,
         lam_init: np.ndarray | None = None,
         omega_init: np.ndarray | None = None,
         dt: float = 0.01,
         W_device: wp.array2d[wp.float64] | None = None,
+        r_device: wp.array[wp.float64] | None = None,
+        pene0_device: wp.array[wp.float64] | None = None,
+        lam_init_device: wp.array[wp.float64] | None = None,
+        omega_init_device: wp.array[wp.float64] | None = None,
+        skip_download: bool = False,
+        m_rows: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """GPU port of :meth:`_solve_nsn_unilateral` (Stage A NSN inner).
 
@@ -1932,18 +2040,36 @@ class SolverFBA(SolverBase):
         symmetric clip and returns ``lam_apply = dt²·ω·λ``.
 
         Args:
-            W: ``(M, M)`` Schur complement (host fp64).
-            r: ``(M,)`` host residual.
-            pene0: ``(M,)`` per-row anchor projection.
+            W: ``(M, M)`` Schur complement (host fp64). May be ``None`` when
+                ``W_device`` is provided.
+            r: ``(M,)`` host residual. May be ``None`` when ``r_device`` is
+                provided.
+            pene0: ``(M,)`` per-row anchor projection. May be ``None`` when
+                ``pene0_device`` is provided.
             max_iters: FB-Newton iters; matches ``nsn_iterations``.
-            lam_init: Optional ``(M,)`` warm-start lambda.
-            omega_init: Optional ``(M,)`` warm-start omega.
+            lam_init: Optional ``(M,)`` warm-start lambda (host).
+            omega_init: Optional ``(M,)`` warm-start omega (host).
             dt: Timestep (s).
             W_device: Optional pre-populated ``(M, M)`` device-resident view of
                 the Schur W (e.g. ``FBALinearSolver.W_device_view()``).  When
                 provided, ``W`` is ignored and the per-PD-iter ``cap*cap*8``
                 host -> device upload is skipped.  The view must remain alive
                 for the duration of the call.
+            r_device: Optional device-resident ``(>=M,)`` fp64 residual.
+                Eliminates the per-PD-iter host->device upload of ``r``.
+            pene0_device: Optional device-resident ``(>=M,)`` fp64 anchor
+                projection. Eliminates the per-PD-iter host->device upload
+                of ``pene0``.
+            lam_init_device: Optional device-resident ``(>=M,)`` fp64
+                warm-start lambda (takes precedence over ``lam_init``).
+            omega_init_device: Optional device-resident ``(>=M,)`` fp64
+                warm-start omega (takes precedence over ``omega_init``).
+            skip_download: When ``True``, returns ``(empty, empty, empty)``
+                arrays — the device-resident ``_nsn_lam_d`` / ``_nsn_omega_d``
+                / ``_nsn_lam_apply_d`` buffers hold the authoritative result
+                and the caller is expected to consume them on device.
+            m_rows: Override row count when ``r_device`` is supplied (needed
+                because device arrays carry capacity, not active size).
 
         References:
             RealSim ``NonSmoothNewton.cpp:102-171`` (Newton step assembly)
@@ -1951,7 +2077,14 @@ class SolverFBA(SolverBase):
         """
         from . import kernels as K  # noqa: PLC0415
 
-        M = int(len(r))
+        if m_rows is not None:
+            M = int(m_rows)
+        elif r is not None:
+            M = int(len(r))
+        elif r_device is not None:
+            M = int(r_device.shape[0])
+        else:
+            M = 0
         if M == 0:
             return (
                 np.zeros(0, dtype=np.float64),
@@ -1976,20 +2109,46 @@ class SolverFBA(SolverBase):
             W_pad[:M, :M] = W.astype(np.float64)
             self._nsn_W_d.assign(W_pad)
             W_d = self._nsn_W_d
-        r_pad = np.zeros(cap, dtype=np.float64)
-        r_pad[:M] = r.astype(np.float64)
-        self._nsn_r_d.assign(r_pad)
-        pene0_pad = np.zeros(cap, dtype=np.float64)
-        pene0_pad[:M] = pene0.astype(np.float64)
-        self._nsn_pene0_d.assign(pene0_pad)
-        lam_h = np.zeros(cap, dtype=np.float64)
-        if lam_init is not None and lam_init.shape == (M,):
-            lam_h[:M] = lam_init.astype(np.float64)
-        omega_h = np.zeros(cap, dtype=np.float64)
-        if omega_init is not None and omega_init.shape == (M,):
-            omega_h[:M] = omega_init.astype(np.float64)
-        self._nsn_lam_d.assign(lam_h)
-        self._nsn_omega_d.assign(omega_h)
+        # Residual / pene0: prefer device buffers when supplied — eliminates
+        # the per-PD-iter ``cap*8`` host upload that previously fired every
+        # outer iter (Demo 5: ~6000 transfers/run).
+        if r_device is not None and r_device.shape[0] >= M:
+            r_d = r_device
+        else:
+            r_pad = np.zeros(cap, dtype=np.float64)
+            r_pad[:M] = r.astype(np.float64)
+            self._nsn_r_d.assign(r_pad)
+            r_d = self._nsn_r_d
+        if pene0_device is not None and pene0_device.shape[0] >= M:
+            pene0_d = pene0_device
+        else:
+            pene0_pad = np.zeros(cap, dtype=np.float64)
+            pene0_pad[:M] = pene0.astype(np.float64)
+            self._nsn_pene0_d.assign(pene0_pad)
+            pene0_d = self._nsn_pene0_d
+        # Warm-start: device buffers take precedence; otherwise upload from
+        # host arrays (legacy CPU path used by tests).
+        if lam_init_device is not None and lam_init_device.shape[0] >= M:
+            # Copy first M entries into the working buffer (preserves
+            # warm-start while letting the kernel write into the scratch).
+            wp.copy(self._nsn_lam_d, lam_init_device, count=M)
+            # Zero the tail above M to keep the cap-sized buffer clean.
+            if cap > M:
+                self._nsn_lam_d[M:cap].zero_()
+        else:
+            lam_h = np.zeros(cap, dtype=np.float64)
+            if lam_init is not None and lam_init.shape == (M,):
+                lam_h[:M] = lam_init.astype(np.float64)
+            self._nsn_lam_d.assign(lam_h)
+        if omega_init_device is not None and omega_init_device.shape[0] >= M:
+            wp.copy(self._nsn_omega_d, omega_init_device, count=M)
+            if cap > M:
+                self._nsn_omega_d[M:cap].zero_()
+        else:
+            omega_h = np.zeros(cap, dtype=np.float64)
+            if omega_init is not None and omega_init.shape == (M,):
+                omega_h[:M] = omega_init.astype(np.float64)
+            self._nsn_omega_d.assign(omega_h)
 
         dt_w = wp.float64(dt)
         n_rows_w = wp.int32(M)
@@ -2009,7 +2168,7 @@ class SolverFBA(SolverBase):
                 K.compute_penetration_kernel,
                 dim=M,
                 inputs=[
-                    self._nsn_r_d,
+                    r_d,
                     W_d,
                     self._nsn_omega_d,
                     self._nsn_lam_d,
@@ -2028,7 +2187,7 @@ class SolverFBA(SolverBase):
                     self._nsn_penetration_d,
                     self._nsn_lam_d,
                     self._nsn_precond_d,
-                    self._nsn_pene0_d,
+                    pene0_d,
                     dt_w,
                 ],
                 outputs=[
@@ -2060,8 +2219,8 @@ class SolverFBA(SolverBase):
                 inputs=[
                     self._nsn_h_d,
                     self._nsn_omega_d,
-                    self._nsn_pene0_d,
-                    self._nsn_r_d,
+                    pene0_d,
+                    r_d,
                     W_d,
                     self._nsn_lam_d,
                     n_rows_w,
@@ -2115,6 +2274,12 @@ class SolverFBA(SolverBase):
             device=device,
         )
 
+        if skip_download:
+            # Hot solver path: caller consumes the device buffers directly
+            # (``_nsn_lam_d`` / ``_nsn_omega_d`` / ``_nsn_lam_apply_d``).
+            empty = np.zeros(0, dtype=np.float64)
+            return empty, empty, empty
+
         lam = self._nsn_lam_d.numpy()[:M].astype(np.float64, copy=True)
         omega = self._nsn_omega_d.numpy()[:M].astype(np.float64, copy=True)
         lam_apply = self._nsn_lam_apply_d.numpy()[:M].astype(np.float64, copy=True)
@@ -2122,15 +2287,22 @@ class SolverFBA(SolverBase):
 
     def _solve_nsn_coulomb_gpu(
         self,
-        W: np.ndarray,
-        r: np.ndarray,
-        mu: np.ndarray,
-        pene0: np.ndarray,
+        W: np.ndarray | None,
+        r: np.ndarray | None,
+        mu: np.ndarray | None,
+        pene0: np.ndarray | None,
         max_iters: int = 1,
         lam_init: np.ndarray | None = None,
         omega_init: np.ndarray | None = None,
         dt: float = 0.01,
         W_device: wp.array2d[wp.float64] | None = None,
+        r_device: wp.array[wp.float64] | None = None,
+        pene0_device: wp.array[wp.float64] | None = None,
+        mu_device: wp.array[wp.float64] | None = None,
+        lam_init_device: wp.array[wp.float64] | None = None,
+        omega_init_device: wp.array[wp.float64] | None = None,
+        skip_download: bool = False,
+        m_contacts: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """GPU port of :meth:`_solve_nsn_coulomb` (Stage B NSN inner).
 
@@ -2142,20 +2314,39 @@ class SolverFBA(SolverBase):
         :func:`coulomb_box_clamp_kernel`.
 
         Args:
-            W: ``(3M, 3M)`` Schur complement.
-            r: ``(3M,)`` host residual.
-            mu: ``(M,)`` per-contact friction coefficient.
-            pene0: ``(3M,)`` per-row anchor projection.
+            W: ``(3M, 3M)`` Schur complement (host fp64). May be ``None``
+                when ``W_device`` is provided.
+            r: ``(3M,)`` host residual. May be ``None`` when ``r_device``
+                is provided.
+            mu: ``(M,)`` per-contact friction coefficient (host). May be
+                ``None`` when ``mu_device`` is provided.
+            pene0: ``(3M,)`` per-row anchor projection. May be ``None``
+                when ``pene0_device`` is provided.
             max_iters: FB-Newton iters.
-            lam_init: Optional ``(3M,)`` warm-start lambda.
-            omega_init: Optional ``(3M,)`` warm-start omega.
+            lam_init: Optional ``(3M,)`` warm-start lambda (host).
+            omega_init: Optional ``(3M,)`` warm-start omega (host).
             dt: Timestep (s).
             W_device: Optional pre-populated ``(3M, 3M)`` device-resident view
                 of the Schur W.  When provided, ``W`` is ignored and the
                 per-PD-iter ``cap*cap*8`` host -> device upload is skipped.
+            r_device: Optional device-resident ``(>=3M,)`` fp64 residual.
+            pene0_device: Optional device-resident ``(>=3M,)`` fp64 anchor
+                projection (interleaved ``[n, t1, t2]`` per contact).
+            mu_device: Optional device-resident ``(>=M,)`` fp64 friction
+                coefficient (avoids the per-PD-iter mu upload).
+            lam_init_device: Optional device-resident ``(>=3M,)`` fp64
+                warm-start lambda.
+            omega_init_device: Optional device-resident ``(>=3M,)`` fp64
+                warm-start omega.
+            skip_download: When ``True``, suppresses the device->host copy
+                of ``(lam, omega, lam_apply)`` — the caller is expected to
+                read the device buffers directly.
+            m_contacts: Override active contact count when only device
+                arrays are provided.
 
         Returns:
             ``(lam, omega, lam_apply)`` host fp64 arrays of shape ``(3M,)``.
+            All three are empty when ``skip_download=True``.
 
         References:
             RealSim ``NonSmoothNewton.cpp:102-171`` (Newton assembly),
@@ -2163,7 +2354,14 @@ class SolverFBA(SolverBase):
         """
         from . import kernels as K  # noqa: PLC0415
 
-        M = int(len(mu))
+        if m_contacts is not None:
+            M = int(m_contacts)
+        elif mu is not None:
+            M = int(len(mu))
+        elif mu_device is not None:
+            M = int(mu_device.shape[0])
+        else:
+            M = 0
         if M == 0:
             return (
                 np.zeros(0, dtype=np.float64),
@@ -2182,9 +2380,13 @@ class SolverFBA(SolverBase):
         mu_existing = getattr(self, "_nsn_mu_d", None)
         if mu_existing is None or mu_existing.size < mu_cap:
             self._nsn_mu_d = wp.zeros(mu_cap, dtype=wp.float64, device=device)
-        mu_h = np.zeros(self._nsn_mu_d.size, dtype=np.float64)
-        mu_h[:M] = mu.astype(np.float64)
-        self._nsn_mu_d.assign(mu_h)
+        if mu_device is not None and mu_device.shape[0] >= M:
+            mu_d = mu_device
+        else:
+            mu_h = np.zeros(self._nsn_mu_d.size, dtype=np.float64)
+            mu_h[:M] = mu.astype(np.float64)
+            self._nsn_mu_d.assign(mu_h)
+            mu_d = self._nsn_mu_d
 
         # Bottleneck #1 fix: prefer the caller-supplied device W when given,
         # eliminating the cap*cap fp64 upload that previously fired every
@@ -2196,20 +2398,40 @@ class SolverFBA(SolverBase):
             W_pad[:n_rows, :n_rows] = W.astype(np.float64)
             self._nsn_W_d.assign(W_pad)
             W_d = self._nsn_W_d
-        r_pad = np.zeros(cap, dtype=np.float64)
-        r_pad[:n_rows] = r.astype(np.float64)
-        self._nsn_r_d.assign(r_pad)
-        pene0_pad = np.zeros(cap, dtype=np.float64)
-        pene0_pad[:n_rows] = pene0.astype(np.float64)
-        self._nsn_pene0_d.assign(pene0_pad)
-        lam_h = np.zeros(cap, dtype=np.float64)
-        if lam_init is not None and lam_init.shape == (n_rows,):
-            lam_h[:n_rows] = lam_init.astype(np.float64)
-        omega_h = np.zeros(cap, dtype=np.float64)
-        if omega_init is not None and omega_init.shape == (n_rows,):
-            omega_h[:n_rows] = omega_init.astype(np.float64)
-        self._nsn_lam_d.assign(lam_h)
-        self._nsn_omega_d.assign(omega_h)
+        # Residual / pene0: prefer device buffers when supplied.
+        if r_device is not None and r_device.shape[0] >= n_rows:
+            r_d = r_device
+        else:
+            r_pad = np.zeros(cap, dtype=np.float64)
+            r_pad[:n_rows] = r.astype(np.float64)
+            self._nsn_r_d.assign(r_pad)
+            r_d = self._nsn_r_d
+        if pene0_device is not None and pene0_device.shape[0] >= n_rows:
+            pene0_d = pene0_device
+        else:
+            pene0_pad = np.zeros(cap, dtype=np.float64)
+            pene0_pad[:n_rows] = pene0.astype(np.float64)
+            self._nsn_pene0_d.assign(pene0_pad)
+            pene0_d = self._nsn_pene0_d
+        # Warm-start.
+        if lam_init_device is not None and lam_init_device.shape[0] >= n_rows:
+            wp.copy(self._nsn_lam_d, lam_init_device, count=n_rows)
+            if cap > n_rows:
+                self._nsn_lam_d[n_rows:cap].zero_()
+        else:
+            lam_h = np.zeros(cap, dtype=np.float64)
+            if lam_init is not None and lam_init.shape == (n_rows,):
+                lam_h[:n_rows] = lam_init.astype(np.float64)
+            self._nsn_lam_d.assign(lam_h)
+        if omega_init_device is not None and omega_init_device.shape[0] >= n_rows:
+            wp.copy(self._nsn_omega_d, omega_init_device, count=n_rows)
+            if cap > n_rows:
+                self._nsn_omega_d[n_rows:cap].zero_()
+        else:
+            omega_h = np.zeros(cap, dtype=np.float64)
+            if omega_init is not None and omega_init.shape == (n_rows,):
+                omega_h[:n_rows] = omega_init.astype(np.float64)
+            self._nsn_omega_d.assign(omega_h)
 
         dt_w = wp.float64(dt)
         n_rows_w = wp.int32(n_rows)
@@ -2228,7 +2450,7 @@ class SolverFBA(SolverBase):
                 K.compute_penetration_kernel,
                 dim=n_rows,
                 inputs=[
-                    self._nsn_r_d,
+                    r_d,
                     W_d,
                     self._nsn_omega_d,
                     self._nsn_lam_d,
@@ -2245,9 +2467,9 @@ class SolverFBA(SolverBase):
                 inputs=[
                     self._nsn_penetration_d,
                     self._nsn_lam_d,
-                    self._nsn_mu_d,
+                    mu_d,
                     self._nsn_precond_d,
-                    self._nsn_pene0_d,
+                    pene0_d,
                     dt_w,
                 ],
                 outputs=[
@@ -2276,8 +2498,8 @@ class SolverFBA(SolverBase):
                 inputs=[
                     self._nsn_h_d,
                     self._nsn_omega_d,
-                    self._nsn_pene0_d,
-                    self._nsn_r_d,
+                    pene0_d,
+                    r_d,
                     W_d,
                     self._nsn_lam_d,
                     n_rows_w,
@@ -2307,7 +2529,7 @@ class SolverFBA(SolverBase):
             wp.launch(
                 K.coulomb_box_clamp_kernel,
                 dim=M,
-                inputs=[self._nsn_mu_d],
+                inputs=[mu_d],
                 outputs=[self._nsn_lam_d],
                 device=device,
             )
@@ -2329,6 +2551,10 @@ class SolverFBA(SolverBase):
             outputs=[self._nsn_lam_apply_d],
             device=device,
         )
+
+        if skip_download:
+            empty = np.zeros(0, dtype=np.float64)
+            return empty, empty, empty
 
         lam = self._nsn_lam_d.numpy()[:n_rows].astype(np.float64, copy=True)
         omega = self._nsn_omega_d.numpy()[:n_rows].astype(np.float64, copy=True)
