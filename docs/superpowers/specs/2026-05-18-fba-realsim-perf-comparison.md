@@ -112,3 +112,42 @@ See `scripts/perf_compare_all_demos.json` for the full per-demo dump.
 ### What's next
 
 Re-run this harness after the fp64-SVD-lift subagent commits to quantify the impact on Local timing (NH kernels) and confirm whether the Demo 4 / Demo 5 ranking changes once SVD is on fp64. The Schur and NSN regressions are independent of SVD precision, so the Demo 4/5 critical path is unchanged.
+
+## Perf #4 — cuBLAS DGEMV for PCR matvec (2026-05-18)
+
+Adds an optional `newton[cublas]` extra (`cupy-cuda12x`) that dispatches the
+NSN-Schur PCR per-iter dense matvec through `cublasDgemv` for systems of
+size n ≥ 2000.  Smaller systems stay on the in-house Warp `tile_matmul` kernel
+because cupy's ~6 us Python-side dispatch overhead beats the tile kernel's
+~7-12 us total at n ≤ 1500.  Above n ≈ 2000, NVIDIA's hand-tuned DGEMV
+(~28 us at n=3000) outperforms `tile_matmul` (~90 us).
+
+Implementation notes:
+* `nsn_pcr_solver.py:_CUBLAS_MIN_N = 2000` (set to 0 to force cuBLAS for all
+  sizes for benchmarking, or to a large value to disable).
+* Direct binding via `cupy_backends.cuda.libs.cublas.dgemv` (the
+  `cupy.matmul` / `cupy.cublas.gemv` wrappers fall back to a 7x slower
+  strided-gemv kernel when A is a non-contiguous slice of a larger buffer,
+  which is exactly how FBA passes the preallocated Schur block to PCR).
+* cuBLAS handle bound once at construction to Warp's per-device stream
+  via `cublas.setStream(handle, wp_stream.cuda_stream)` -- zero per-call
+  stream-context overhead.
+
+Measured before/after on the same hardware (RTX 5090, fp64, 200-frame run,
+20-frame warmup, FBA-only -- RealSim columns unchanged):
+
+| Demo | Before NSN-inner (ms) | After NSN-inner (ms) | Δ | Before step_mean (ms) | After step_mean (ms) | Δ |
+|---|---|---|---|---|---|---|
+| PullingWooper | 5.17 | 5.47 | +6% (within noise, gated below threshold) | 49.03 | 51.74 | within noise |
+| SqueezingBall | 8.67 | 5.86 | **-32%** | 130.98 | 104.46 | **-20%** |
+
+Demo 4 is unchanged because every PCR call in that demo has n ≤ 258, well
+below the cuBLAS threshold.  Demo 5 sees the win: ~68% of its 200-frame PCR
+calls hit n ≥ 2000 (Stage B `n = 3M` with M climbing as the ball is
+squeezed), and DGEMV is ~2x faster than tile_matmul at those sizes.
+
+Fallback verified: importing the FBA solver and running PCR without cupy
+installed continues to work (the construction-time `is_cublas_available()`
+check returns `False` and the dispatch falls through to `tile_matmul`).
+See `test_fba_cublas_interop.py::TestPCRWithoutCublas` for the regression
+test.

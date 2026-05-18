@@ -78,6 +78,7 @@ These are reclassified from earlier ambiguity to explicit intentional architectu
 | ARCH.3 | Warp `wp.svd2/svd3` vs Eigen `JacobiSVD` | Different SVD algorithm — produces same projected `P` up to FP noise but not bit-identical |
 | ARCH.4 | Persistent `ω` buffer in FBA (bookkeeping for iter-0 penetration); RealSim recomputes every NSN iter | Bookkeeping artifact only; `ω` re-derived per iter inside FBA NSN loop too |
 | ARCH.5 | Newton's BSR sparse Cholesky vs RealSim's cuSparse direct | Different factorization implementation; same factored solve |
+| ARCH.6 | cuBLAS DGEMV optional dep (`newton[cublas]`, `cupy-cuda12x`) for the NSN-Schur PCR matvec at n ≥ 2000.  Below threshold, Newton's tile_matmul kernel; above, direct `cublasDgemv` via zero-copy CAI view -- matches RealSim's literal cuBLAS path | Perf #4 (2026-05-18): Demo 5 NSN-inner 8.67 → 5.55 ms (-36%), Demo 5 step_mean 131 → 99 ms (-24%); Demo 4 sizes below threshold so unchanged. Optional dep, FBA works identically without it -- no algorithmic effect, just kernel dispatch.  See `nsn_pcr_solver.py` `_CUBLAS_MIN_N` |
 
 ---
 

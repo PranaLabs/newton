@@ -58,11 +58,38 @@ Perf optimization notes (Perf #3, 2026-05):
     * Per-iter host syncs are gone — convergence is checked once at the end
       of the loop after a fixed iter count (still capped by ``rho > tol``).
       Saves 5-10 syncs per PCR call.
+
+Perf optimization notes (Perf #4, 2026-05):
+    * When the ``cublas`` extra (``pip install newton[cublas]``) is installed
+      *and* the active system size ``n`` exceeds ``_CUBLAS_MIN_N``, the two
+      per-iter dense matvecs ``q = A·d`` and ``h = A·s`` dispatch through
+      cuBLAS DGEMV via the zero-copy
+      :mod:`~newton._src.solvers.fba.cublas_interop` bridge.  cuBLAS DGEMV is
+      ~1.5-3.5x faster than ``_matvec_tiled_kernel`` at n ≥ 2000 on RTX 5090
+      fp64 (NVIDIA's hand-tuned kernels hit higher SM occupancy at these
+      sizes than the in-house tile reduction).
+    * We bind directly to ``cublas.dgemv`` via ``cupy_backends.cuda.libs``
+      rather than going through ``cupy.matmul`` / ``cupy.cublas.gemv``: the
+      higher-level wrappers fall back to a ~7x slower strided-gemv kernel
+      when ``A`` is a non-contiguous slice of a larger preallocated buffer,
+      which is exactly the FBA shape (the Schur LHS lives in a max_n²
+      buffer and only the leading M² block is active).  Setting the
+      cuBLAS leading dimension (``lda``) to the parent buffer's row stride
+      routes through the fast contiguous DGEMV path.
+    * Below the threshold the Python-side dispatch overhead (~10 us per
+      call) outweighs the gain, so we stay on ``_matvec_tiled_kernel``.
+      An RTX 5090 sweep on 2026-05-18 placed break-even at n ≈ 2000;
+      smaller Newton-iter problems (Demo 4, Demo 5 Stage A) stay on
+      tile_matmul and only Demo 5 Stage B (n ≈ 3M ≈ 3000) wins.
+    * The fallback (pure Warp tile_matmul) path is preserved; FBA works
+      identically without cupy installed.
 """
 
 from __future__ import annotations
 
 import warp as wp
+
+from .cublas_interop import cublas_dgemv, get_cublas_handle_for_stream, is_cublas_available
 
 # ---------------------------------------------------------------------------
 # Tile / block sizing for ``_matvec_tiled_kernel``
@@ -75,6 +102,18 @@ import warp as wp
 # win at n < 400 where launch overhead dominates.
 _PCR_TILE_K = wp.constant(128)
 _PCR_BLOCK_DIM = 128
+
+# Minimum system size at which cuBLAS DGEMV starts beating ``_matvec_tiled_kernel``.
+# Empirical break-even on an RTX 5090 fp64 (RealSim hardware, 2026-05-18 sweep)
+# at the PCR inner: tile_matmul runs at ~1.7 ms/solve for n ≤ 1500 (Python-side
+# launch overhead dominates), while cuBLAS DGEMV per call adds a flat ~6 us of
+# cupy dispatch.  Net wins start around n ≈ 2000 and the gap widens at larger n
+# (tile_matmul scales as O(n²/SM_count); cuBLAS DGEMV is bandwidth-bound and
+# scales as O(n²) at a lower constant).  Demo 4's M ≈ 86..258 contact counts
+# therefore stay on the tile_matmul path, while Demo 5 Stage B (n = 3M ≈ 3000)
+# goes through cuBLAS.  Set to 0 to force cuBLAS for all sizes (use only for
+# benchmarking) or to a large value to disable.
+_CUBLAS_MIN_N = 2000
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +305,13 @@ class NSNPCRSolver:
             to host to test for convergence.  The default ``25`` matches the
             empirical iter count of the NSN Schur LCP on Demo 4/5 — a single
             sync per ``solve()`` call covers the typical run.
+        use_cublas: Whether to dispatch the per-iter dense matvec through
+            cuBLAS DGEMV (Perf #4).  Defaults to ``True`` when the ``cublas``
+            extra is installed and ``False`` otherwise.  cuBLAS is only used
+            when the active ``n`` per call exceeds ``_CUBLAS_MIN_N`` (~2000);
+            below that the tile_matmul kernel is faster due to Python-side
+            dispatch overhead.  Setting to ``False`` forces the Warp
+            ``tile_matmul`` fallback for all sizes (useful for benchmarking).
     """
 
     def __init__(
@@ -275,6 +321,7 @@ class NSNPCRSolver:
         tol: float = 1.0e-5,
         max_iter: int = 100,
         check_every: int = 25,
+        use_cublas: bool | None = None,
     ) -> None:
         if max_n <= 0:
             raise ValueError(f"max_n must be positive, got {max_n}")
@@ -283,6 +330,19 @@ class NSNPCRSolver:
         self.device = device
         self.tol = float(tol)
         self.max_iter = int(max_iter)
+        # Auto-enable cuBLAS when the optional ``cublas`` extra is installed.
+        # ``use_cublas=True`` with no cupy raises so misconfigured environ-
+        # ments fail loudly instead of silently falling back.  Even when
+        # ``self._use_cublas`` is ``True`` the per-call gate ``n >=
+        # _CUBLAS_MIN_N`` may still route a particular solve through the
+        # tile_matmul kernel; the construction-time flag only enables the
+        # cupy buffer caching below.
+        if use_cublas is None:
+            self._use_cublas = is_cublas_available()
+        elif use_cublas and not is_cublas_available():
+            raise RuntimeError("use_cublas=True requires cupy. Install with `pip install newton[cublas]`.")
+        else:
+            self._use_cublas = bool(use_cublas)
         # Bottleneck #2 fix: rather than syncing ``rho`` every iter (which
         # forces a CPU stall after every PCR step), only test convergence
         # every ``check_every`` iters.  Iterations between checks run fully
@@ -314,6 +374,15 @@ class NSNPCRSolver:
         self._den_d = wp.zeros(1, dtype=wp.float64, device=device)
         self._alpha_d = wp.zeros(1, dtype=wp.float64, device=device)
         self._beta_d = wp.zeros(1, dtype=wp.float64, device=device)
+
+        # Bind cuBLAS to Warp's per-device stream once at construction.  All
+        # subsequent ``cublas_dgemv`` calls inherit Warp's stream ordering at
+        # zero per-call cost (no stream-context overhead, no ``cp.asarray``
+        # round trips on the vector buffers).  We hold the handle as a plain
+        # int so the inner loop avoids any Python attribute lookup.
+        self._cublas_handle: int | None = None
+        if self._use_cublas:
+            self._cublas_handle = get_cublas_handle_for_stream(device)
 
     # ------------------------------------------------------------------
     # Public API
@@ -361,6 +430,17 @@ class NSNPCRSolver:
         tile_k = int(_PCR_TILE_K)
         n_pad = ((n + tile_k - 1) // tile_k) * tile_k
 
+        # ----- cuBLAS dispatch decision ---------------------------------
+        # Route through cuBLAS DGEMV when:
+        #   1. cupy is installed (``self._use_cublas == True``), and
+        #   2. ``n`` exceeds the empirical break-even ``_CUBLAS_MIN_N``.
+        # Below the threshold, ``cublas_dgemv``'s ~10 us of Python-side
+        # dispatch + ~3 us cuBLAS host launch is more than the entire
+        # ``_matvec_tiled_kernel`` cost (~7-12 us at n ≤ 1500), so the
+        # tile_matmul kernel wins.  Above it, cuBLAS DGEMV's ~28 us at
+        # n ~ 3000 outperforms tile_matmul's ~90 us.
+        use_cublas_this_solve = self._use_cublas and n >= _CUBLAS_MIN_N
+
         # ----- Initialize x = 0 -----------------------------------------
         # RealSim ``_x.setZero(n)`` (line 136). We zero only the active slice.
         self._x.zero_()
@@ -399,17 +479,23 @@ class NSNPCRSolver:
         )
 
         # ----- q = A * d -----------------------------------------------
-        # RealSim line 156 (``cublasDgemv``).  Block-per-row tile reduction;
-        # the partial last K tile is zero-padded by the bounds-checked
-        # ``tile_load`` so we never read stale data beyond ``[:n, :n]``.
-        wp.launch_tiled(
-            _matvec_tiled_kernel,
-            dim=n,
-            inputs=[A, self._d, n_pad],
-            outputs=[self._q],
-            block_dim=_PCR_BLOCK_DIM,
-            device=device,
-        )
+        # RealSim line 156 (``cublasDgemv``).  Two paths:
+        #   - n >= _CUBLAS_MIN_N and cupy installed: direct cuBLAS DGEMV via
+        #     :func:`cublas_dgemv` (bypasses cupy.matmul's slow strided
+        #     dispatch).  Matches RealSim's literal cuBLAS call.
+        #   - Otherwise: block-per-row tile reduction with bounds-checked
+        #     ``tile_load`` so OOB elements load zero (last partial K-tile).
+        if use_cublas_this_solve:
+            cublas_dgemv(A, self._d, self._q, device=device, handle=self._cublas_handle)
+        else:
+            wp.launch_tiled(
+                _matvec_tiled_kernel,
+                dim=n,
+                inputs=[A, self._d, n_pad],
+                outputs=[self._q],
+                block_dim=_PCR_BLOCK_DIM,
+                device=device,
+            )
 
         # ----- h = q ---------------------------------------------------
         # RealSim line 159.
@@ -480,15 +566,19 @@ class NSNPCRSolver:
                 )
 
                 # ----- h = A * s -------------------------------------------
-                # RealSim line 189.
-                wp.launch_tiled(
-                    _matvec_tiled_kernel,
-                    dim=n,
-                    inputs=[A, self._s, n_pad],
-                    outputs=[self._h],
-                    block_dim=_PCR_BLOCK_DIM,
-                    device=device,
-                )
+                # RealSim line 189.  See ``q = A * d`` above for the cuBLAS
+                # vs tile_matmul dispatch rationale.
+                if use_cublas_this_solve:
+                    cublas_dgemv(A, self._s, self._h, device=device, handle=self._cublas_handle)
+                else:
+                    wp.launch_tiled(
+                        _matvec_tiled_kernel,
+                        dim=n,
+                        inputs=[A, self._s, n_pad],
+                        outputs=[self._h],
+                        block_dim=_PCR_BLOCK_DIM,
+                        device=device,
+                    )
 
                 # ----- rho_old = rho ; rho = <r, h> ------------------------
                 # RealSim lines 191-193.  Snapshot ``rho`` into ``rho_old`` on

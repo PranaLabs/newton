@@ -48,6 +48,15 @@ onnx = [
     "onnx>=1.16.0",
 ]
 
+# Optional: cuBLAS DGEMV acceleration for the FBA NSN-Schur PCR solver.
+# Enables a zero-copy Warp <-> cupy view via ``__cuda_array_interface__`` and
+# dispatches the per-iter dense matvec through cuBLAS DGEMV for large
+# (n >= ~2000) Schur systems.  Falls back to the pure-Warp tile_matmul path
+# when cupy is not installed -- the FBA solver works either way.
+cublas = [
+    "cupy-cuda12x>=12.0,<15",  # CUDA 12 cuBLAS wheels (works on 12.x driver/runtime)
+]
+
 # Asset import and mesh processing dependencies
 importers = [
     # HTTP client for downloading meshes from URIs
