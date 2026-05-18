@@ -772,13 +772,16 @@ class ViewerGL(ViewerBase):
         if color is not None:
             self.objects[name].color = (float(color[0]), float(color[1]), float(color[2]))
 
-        if roughness is not None or metallic is not None:
-            r, m, c, t = self.objects[name].material
-            if roughness is not None:
-                r = float(roughness)
-            if metallic is not None:
-                m = float(metallic)
-            self.objects[name].material = (r, m, c, t)
+        r, m, c, t = self.objects[name].material
+        if roughness is not None:
+            r = float(roughness)
+        if metallic is not None:
+            m = float(metallic)
+        # Enable the shader's texture branch iff a texture was supplied;
+        # otherwise the upload is bound but ignored (material.w drives the
+        # ``texture_enable`` uniform in the mesh fragment shader).
+        t = 1.0 if (texture is not None and self.objects[name].texture_id is not None) else 0.0
+        self.objects[name].material = (r, m, c, t)
 
     @override
     def log_instances(
