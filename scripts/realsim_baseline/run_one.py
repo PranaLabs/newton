@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 from scripts.realsim_baseline import DEMOS, REALSIM_ROOT
+from scripts.realsim_baseline.timing import parse_realsim_stdout
 
 REALSIM_BIN = REALSIM_ROOT / "build/bin/RealSim"
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -59,6 +60,7 @@ def run(demo: str, max_frame: int | None = None) -> dict:
                 capture_output=True,
                 text=True,
                 timeout=3600,
+                check=False,
             )
         except subprocess.TimeoutExpired as e:
             wall = time.perf_counter() - t0
@@ -90,6 +92,7 @@ def run(demo: str, max_frame: int | None = None) -> dict:
 
     sorted_t = sorted(times_ms)
     n = len(sorted_t)
+    timing = parse_realsim_stdout(proc.stdout, demo=demo)
     return {
         "demo": demo,
         "status": "ok",
@@ -102,6 +105,11 @@ def run(demo: str, max_frame: int | None = None) -> dict:
         "max_frame": max_frame,
         "returncode": proc.returncode,
         "clean_exit": proc.returncode == 0,
+        # Full per-PD-iter breakdown parsed from ``LocalGlobalSolver::printTimer``.
+        # Fields tied to NSN (``schur_ms``, ``build_ms``, ``cst_solve_ms``,
+        # ``correction_ms``, ``total_global_ms``, ``n_constraints_mean``,
+        # ``cst_solve_iter_mean``) are ``None`` for contact-free demos.
+        "timing": timing.to_dict(),
     }
 
 
