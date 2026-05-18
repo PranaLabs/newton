@@ -41,7 +41,12 @@ _BALL_SCALE = 3.0
 _BALL_TRANS = np.array([0.0, 2.6, 0.0])
 
 _CYL_RADIUS = 1.0
-_CYL_HALF_HEIGHT = 3.6  # 1.2x of the CudaTests reference 3.0 (visual extent only)
+_CYL_HALF_HEIGHT = 3.6  # 1.2x of the CudaTests reference 3.0
+# Multiplicative visual shrink applied only to the cylinder's render shape,
+# so the gray body sits slightly inside the stripe/marker grid (radius 1.0)
+# and the grid reads as ``on the surface''. Collision uses a separate full-size
+# invisible cylinder, so this shrink does NOT change physics.
+_CYL_VISUAL_SHRINK = 0.97
 _FRICTION_MU = 0.5
 
 # (base, axis_world, omega_rad_s) per cylinder, in shape-index order.
@@ -129,21 +134,73 @@ def _cyl_xform(base: np.ndarray, axis: np.ndarray) -> wp.transform:
 
 
 _BALL_COLOR = (0.55, 0.42, 0.82)  # blue-purple
-_CYL_COLOR = (0.55, 0.55, 0.58)  # gray
-_STRIPE_COLOR_A = (0.20, 0.20, 0.22)  # dark stripe
-_STRIPE_COLOR_B = (0.85, 0.85, 0.88)  # light stripe
-# Longitudinal stripe boxes attached to each cylinder surface.  We place
-# ``_N_STRIPES`` evenly around the cylinder at +radius offset; their
-# shape_transform is updated per step so they ride with the cylinder
-# rotation, producing a visible grid/striped texture.
-_N_STRIPES = 8
-_STRIPE_THICKNESS = 0.04  # radial half-extent (sticks slightly proud of cylinder surface)
-_STRIPE_HALF_WIDTH = 0.06  # tangential half-extent
-# Transverse ring marker rings at +/- 0.6 h_half along the axis, to give a
-# 2D-grid feel rather than just longitudinal lines.
-_N_RING_MARKERS = 6
-_RING_OFFSETS = (-0.66, 0.0, 0.66)  # multiples of half-height
-_RING_MARKER_RADIUS = 0.07
+_CYL_COLOR = (0.55, 0.55, 0.58)  # gray (modulates the checker texture)
+_CHECKER_DARK = (0.18, 0.18, 0.22)
+_CHECKER_LIGHT = (0.85, 0.85, 0.88)
+# Checker tiling along U (circumference) and V (axial); chosen so squares
+# look roughly uniform at radius=1, half_height=3.6.
+_CHECKER_U_TILES = 12.0
+_CHECKER_V_TILES = 14.0
+_CYL_MESH_U_SEGMENTS = 64  # azimuthal triangulation of the visual cylinder mesh
+
+
+def _make_cylinder_mesh(
+    radius: float, half_height: float, u_segments: int, u_tiles: float, v_tiles: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Z-aligned cylinder triangle mesh with UVs tiled (u_tiles x v_tiles).
+
+    Endcap vertices are pinned to a single UV inside a dark cell so the caps
+    render as solid dark, leaving the checker pattern only on the side wall.
+    Side-wall triangulation duplicates the seam (i=0 and i=u_segments share a
+    position but have distinct U coords) so GL_REPEAT wrapping is clean.
+    """
+    verts: list[tuple[float, float, float]] = []
+    uvs: list[tuple[float, float]] = []
+    tris: list[tuple[int, int, int]] = []
+    # Side wall — two rings at z = -h and +h.
+    for j, z in enumerate((-half_height, +half_height)):
+        for i in range(u_segments + 1):
+            theta = i * (2.0 * math.pi / u_segments)
+            verts.append((radius * math.cos(theta), radius * math.sin(theta), z))
+            uvs.append(((i / u_segments) * u_tiles, j * v_tiles))
+    ring_size = u_segments + 1
+    for i in range(u_segments):
+        a, b = i, i + 1
+        c, d = ring_size + i, ring_size + i + 1
+        tris.append((a, b, d))
+        tris.append((a, d, c))
+    # Endcaps — each cap gets a center vertex + duplicated ring with cap UV.
+    cap_uv = (0.25, 0.25)  # inside a dark cell of the 2x2 checker
+    for sign, ccw_swap in ((-1.0, True), (+1.0, False)):
+        center = len(verts)
+        verts.append((0.0, 0.0, sign * half_height))
+        uvs.append(cap_uv)
+        ring_start = len(verts)
+        for i in range(u_segments + 1):
+            theta = i * (2.0 * math.pi / u_segments)
+            verts.append((radius * math.cos(theta), radius * math.sin(theta), sign * half_height))
+            uvs.append(cap_uv)
+        for i in range(u_segments):
+            a, b = ring_start + i, ring_start + i + 1
+            tris.append((center, b, a) if ccw_swap else (center, a, b))
+    return (
+        np.asarray(verts, dtype=np.float32),
+        np.asarray(tris, dtype=np.int32).reshape(-1),
+        np.asarray(uvs, dtype=np.float32),
+    )
+
+
+def _make_checker_texture(size: int = 64) -> np.ndarray:
+    """2x2 checker RGB uint8 texture; GL_REPEAT tiles it across UVs."""
+    img = np.empty((size, size, 3), dtype=np.uint8)
+    half = size // 2
+    dark = np.array([int(255 * c) for c in _CHECKER_DARK], dtype=np.uint8)
+    light = np.array([int(255 * c) for c in _CHECKER_LIGHT], dtype=np.uint8)
+    img[:half, :half] = dark
+    img[:half, half:] = light
+    img[half:, :half] = light
+    img[half:, half:] = dark
+    return img
 
 
 class Example:
@@ -183,73 +240,59 @@ class Example:
             add_surface_mesh_edges=False,
         )
 
-        # Cylinders (gray) + a grid of small site-shapes attached to each
-        # cylinder surface to visualize rotation.  Per cylinder we add:
-        #   - ``_N_STRIPES`` longitudinal stripe-boxes alternating dark/light
-        #     placed around the circumference at radius offset,
-        #   - 3 transverse marker-sphere rings at ±0.66·half_height and mid.
-        # All markers are sites (non-colliding) and their shape_transforms
-        # are advanced by ``omega * dt`` each step in ``_advance_cylinder_rotation``.
-        self._cyl_shape_ids: list[int] = []
+        # Each cylinder is two shapes:
+        #   - collision: full-size, invisible primitive (drives physics + NSN
+        #     friction kinematics via ``shape_angular_velocity``),
+        #   - visual: UV-mapped triangle mesh as a site (non-colliding),
+        #     with a tiled 2x2 checker texture so the rotation is visible.
+        # The visual mesh is shrunk by ``_CYL_VISUAL_SHRINK`` so it sits just
+        # inside the collision surface — collision unaffected.
+        self._cyl_shape_ids: list[int] = []  # visual mesh shape ids (rotate per step)
+        self._cyl_collision_ids: list[int] = []  # collision-cylinder shape ids
         self._cyl_init_xforms: list[wp.transform] = []
         self._cyl_angles: list[float] = []
-        # Per-cylinder lists of (shape_id, base_angle, axis_z_offset, kind),
-        # kind in {"stripe", "marker"}.  ``base_angle`` is the local angle
-        # at sim time 0; runtime angle = base_angle + cyl_angle[i].
-        self._marker_data: list[list[tuple[int, float, float, str]]] = []
+
+        cyl_visual_verts, cyl_visual_idx, cyl_visual_uvs = _make_cylinder_mesh(
+            _CYL_RADIUS * _CYL_VISUAL_SHRINK,
+            _CYL_HALF_HEIGHT * _CYL_VISUAL_SHRINK,
+            _CYL_MESH_U_SEGMENTS,
+            _CHECKER_U_TILES,
+            _CHECKER_V_TILES,
+        )
+        cyl_visual_mesh = newton.Mesh(
+            vertices=cyl_visual_verts,
+            indices=cyl_visual_idx,
+            uvs=cyl_visual_uvs,
+            compute_inertia=False,
+            color=_CYL_COLOR,
+            texture=_make_checker_texture(),
+        )
 
         for base, axis, _omega in _CYLINDERS:
             xform = _cyl_xform(base, axis)
-            cyl_id = builder.add_shape_cylinder(
+
+            cfg_collision = builder.default_shape_cfg.copy()
+            cfg_collision.is_visible = False
+            coll_id = builder.add_shape_cylinder(
                 body=-1,
                 xform=xform,
                 radius=_CYL_RADIUS,
                 half_height=_CYL_HALF_HEIGHT,
+                cfg=cfg_collision,
+            )
+            self._cyl_collision_ids.append(coll_id)
+
+            cfg_visual = builder.default_site_cfg.copy()
+            vis_id = builder.add_shape_mesh(
+                body=-1,
+                xform=xform,
+                mesh=cyl_visual_mesh,
+                cfg=cfg_visual,
                 color=_CYL_COLOR,
             )
-            self._cyl_shape_ids.append(cyl_id)
+            self._cyl_shape_ids.append(vis_id)
             self._cyl_init_xforms.append(xform)
             self._cyl_angles.append(0.0)
-
-            per_cyl: list[tuple[int, float, float, str]] = []
-
-            # Longitudinal stripes (alternating dark/light) around the circumference.
-            for k in range(_N_STRIPES):
-                theta = k * (2.0 * math.pi / _N_STRIPES)
-                color = _STRIPE_COLOR_A if (k % 2 == 0) else _STRIPE_COLOR_B
-                stripe_xf = self._stripe_xform(xform, theta, 0.0)
-                # Long thin box: along cylinder axis = local Z = world axis-direction.
-                # half_extents in box-local frame: (tangential, radial, axial)
-                # We build the orientation so the box's long axis follows the cylinder's Z.
-                sid = builder.add_shape_box(
-                    body=-1,
-                    xform=stripe_xf,
-                    hx=_STRIPE_HALF_WIDTH,
-                    hy=_STRIPE_THICKNESS,
-                    hz=_CYL_HALF_HEIGHT * 0.98,
-                    color=color,
-                    as_site=True,
-                )
-                per_cyl.append((sid, theta, 0.0, "stripe"))
-
-            # Transverse ring markers at three z offsets, ``_N_RING_MARKERS``
-            # per ring, alternating colors for visibility.
-            for z_mult in _RING_OFFSETS:
-                z_off = z_mult * _CYL_HALF_HEIGHT
-                for k in range(_N_RING_MARKERS):
-                    theta = (k + 0.5) * (2.0 * math.pi / _N_RING_MARKERS)
-                    color = _STRIPE_COLOR_B if (k % 2 == 0) else _STRIPE_COLOR_A
-                    marker_xf = self._marker_xform(xform, theta, z_off)
-                    mid = builder.add_shape_sphere(
-                        body=-1,
-                        xform=marker_xf,
-                        radius=_RING_MARKER_RADIUS,
-                        color=color,
-                        as_site=True,
-                    )
-                    per_cyl.append((mid, theta, z_off, "marker"))
-
-            self._marker_data.append(per_cyl)
 
         builder.add_shape_plane(
             plane=(0.0, 1.0, 0.0, 10.0),
@@ -274,7 +317,9 @@ class Example:
 
         n_max_contacts = self.model.particle_count
         mu_override = np.full(n_max_contacts, _FRICTION_MU, dtype=np.float64)
-        shape_omega = {i: _CYLINDERS[i][2] for i in range(4)}
+        shape_omega = {
+            self._cyl_collision_ids[i]: _CYLINDERS[i][2] for i in range(len(_CYLINDERS))
+        }
 
         self.solver = SolverFBA(
             self.model,
@@ -320,13 +365,6 @@ class Example:
         self._ball_tri_indices = self.model.tri_indices.flatten()
 
     @staticmethod
-    def _quat_rotate_vec(q: np.ndarray, v: np.ndarray) -> np.ndarray:
-        """Rotate vector ``v`` by quaternion ``q = (qx, qy, qz, qw)``."""
-        qx, qy, qz, qw = q
-        t = 2.0 * np.cross([qx, qy, qz], v)
-        return v + qw * t + np.cross([qx, qy, qz], t)
-
-    @staticmethod
     def _quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
         """Hamilton product of two quats in (x, y, z, w) order: ``a ∘ b``."""
         ax, ay, az, aw = a
@@ -341,86 +379,31 @@ class Example:
             dtype=np.float64,
         )
 
-    @staticmethod
-    def _marker_xform(cyl_xform: wp.transform, angle: float, z_offset: float = 0.0) -> wp.transform:
-        """Sphere marker on the cylinder surface at local angle θ and axial
-        offset (along the cylinder's local +Z).  Returns world-space pose."""
-        base = np.asarray(cyl_xform.p, dtype=np.float64)
-        q = np.asarray(cyl_xform.q, dtype=np.float64)
-        local = np.array(
-            [_CYL_RADIUS * math.cos(angle), _CYL_RADIUS * math.sin(angle), z_offset],
-            dtype=np.float64,
-        )
-        world_pos = base + Example._quat_rotate_vec(q, local)
-        return wp.transform(wp.vec3(*world_pos.tolist()), wp.quat_identity())
-
-    @staticmethod
-    def _stripe_xform(cyl_xform: wp.transform, angle: float, z_offset: float) -> wp.transform:
-        """Longitudinal stripe-box pose: positioned at cylinder surface at
-        angle θ (radially outward), oriented so its long axis follows the
-        cylinder's local +Z."""
-        base = np.asarray(cyl_xform.p, dtype=np.float64)
-        q_cyl = np.asarray(cyl_xform.q, dtype=np.float64)
-        # Position: radius·(cosθ, sinθ, 0) in cylinder-local; rotate to world.
-        local_pos = np.array(
-            [
-                (_CYL_RADIUS + _STRIPE_THICKNESS) * math.cos(angle),
-                (_CYL_RADIUS + _STRIPE_THICKNESS) * math.sin(angle),
-                z_offset,
-            ],
-            dtype=np.float64,
-        )
-        world_pos = base + Example._quat_rotate_vec(q_cyl, local_pos)
-        # Orientation: the box's local axes need to be aligned so that:
-        #   box_x = radial direction (cosθ, sinθ, 0 in cyl-local)
-        #   box_y = perpendicular to radial in the cyl-local XY plane
-        #   box_z = cylinder's local +Z (axial)
-        # Compose: world_quat = q_cyl ∘ q_local_angle_about_Z
-        half = angle * 0.5
-        sh = math.sin(half)
-        q_local = np.array([0.0, 0.0, sh, math.cos(half)], dtype=np.float64)
-        q_world = Example._quat_mul(q_cyl, q_local)
-        return wp.transform(wp.vec3(*world_pos.tolist()), wp.quat(*q_world.tolist()))
-
     def _advance_cylinder_rotation(self) -> None:
-        """Update cylinder shape_transforms (rotation about local +Z) and
-        marker / stripe shape_transforms (positions on cylinder surface).
+        """Update each visual-cylinder mesh's shape_transform to spin about
+        its local +Z axis.  Collision cylinders stay at their initial xform
+        — they're rotationally symmetric so this is invariant to physics,
+        and ``shape_angular_velocity`` carries the kinematic surface speed
+        to NSN's friction step directly.
 
-        Sign convention: SolverFBA's friction kinematics use
-        ``v_anchor = -omega * cross(axis_world, r_local)`` (see
-        ``solver_fba.py``).  Substituting this into ``v_surface = w_world x r``
-        gives ``w_world = -omega * axis_world``, i.e. positive ``omega`` in
-        the ``_CYLINDERS`` table corresponds to a *negative* world-frame
-        angular velocity about the cylinder axis.  The visual rotation must
-        therefore decrement the angle by ``omega * dt`` (negating) so the
-        cylinder surface spin matches the direction the ball experiences
-        through friction.
+        Sign convention: SolverFBA friction uses
+        ``v_anchor = -omega * cross(axis_world, r_local)``, which corresponds
+        to a *negative* world-frame angular velocity along ``axis_world``
+        when ``omega > 0``.  The visual rotation therefore decrements the
+        angle by ``omega * dt``.
         """
         new_xforms = self._shape_transform_init_np.copy()
         for i, (_base, _axis, omega) in enumerate(_CYLINDERS):
             self._cyl_angles[i] -= omega * self.frame_dt
             angle = self._cyl_angles[i]
             cyl_xform = self._cyl_init_xforms[i]
-
-            # Cylinder body itself: rotate quat about local +Z by ``angle``.
             half = angle * 0.5
-            sh = math.sin(half)
-            q_local = np.array([0.0, 0.0, sh, math.cos(half)], dtype=np.float64)
+            q_local = np.array([0.0, 0.0, math.sin(half), math.cos(half)], dtype=np.float64)
             base_q = np.asarray(cyl_xform.q, dtype=np.float64)
             new_q = self._quat_mul(base_q, q_local)
-            cyl_id = self._cyl_shape_ids[i]
-            new_xforms[cyl_id][:3] = np.asarray(cyl_xform.p, dtype=np.float64)
-            new_xforms[cyl_id][3:] = new_q
-
-            # Stripes + ring markers move with the cylinder rotation.
-            for sid, base_angle, z_off, kind in self._marker_data[i]:
-                theta = base_angle + angle
-                if kind == "stripe":
-                    xf = self._stripe_xform(cyl_xform, theta, z_off)
-                else:
-                    xf = self._marker_xform(cyl_xform, theta, z_off)
-                new_xforms[sid][:3] = np.asarray(xf.p, dtype=np.float64)
-                new_xforms[sid][3:] = np.asarray(xf.q, dtype=np.float64)
+            vis_id = self._cyl_shape_ids[i]
+            new_xforms[vis_id][:3] = np.asarray(cyl_xform.p, dtype=np.float64)
+            new_xforms[vis_id][3:] = new_q
         self.model.shape_transform.assign(new_xforms.astype(np.float32))
 
     def step(self):
