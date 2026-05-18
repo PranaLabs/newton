@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -221,6 +222,7 @@ class SolverFBA(SolverBase):
         use_isodof: bool = True,
         shape_angular_velocity: dict[int, float] | None = None,
         nh_solver: Literal["newton5", "lbfgs"] = "lbfgs",
+        enable_perf_timing: bool = False,
     ) -> None:
         """
         Args:
@@ -277,6 +279,14 @@ class SolverFBA(SolverBase):
                 legacy 5-iter fixed Newton (no line search, no convergence
                 check) for regression. Ignored unless
                 ``stretching_model="neohookean"``.
+            enable_perf_timing: If ``True``, instrument :meth:`step` with
+                per-PD-iter ``wp.synchronize_device()``-bracketed timers for
+                the local energy projection, Schur ``W`` build, linear solve,
+                and NSN inner phase. Each PD outer iter appends one entry to
+                the corresponding ``_timing_*_ms_per_iter`` list. Off by
+                default — synchronization adds ~50us overhead per call, so
+                this is opt-in for matched-granularity profiling against
+                RealSim's ``LocalGlobalSolver::printTimer`` output.
         """
         super().__init__(model)
 
@@ -419,6 +429,64 @@ class SolverFBA(SolverBase):
         self._particle_edge_offsets_d = None
         self._particle_edge_element_d = None
         self._particle_edge_local_d = None
+
+        # Opt-in per-PD-iter perf instrumentation. Matches the granularity of
+        # RealSim's ``LocalGlobalSolver::printTimer`` (Schur, Local, Linear
+        # solve, NSN inner).  Each list grows by one entry per PD outer iter
+        # when :attr:`enable_perf_timing` is ``True``. Synchronization adds
+        # measurable overhead, so this is opt-in.
+        self.enable_perf_timing = bool(enable_perf_timing)
+        self._timing_local_ms_per_iter: list[float] = []
+        self._timing_schur_ms_per_iter: list[float] = []
+        self._timing_linear_solve_ms_per_iter: list[float] = []
+        self._timing_nsn_inner_ms_per_iter: list[float] = []
+
+    def reset_timing(self) -> None:
+        """Clear all per-PD-iter timing buffers.
+
+        Useful between warm-up steps and the measured window.
+        """
+        self._timing_local_ms_per_iter.clear()
+        self._timing_schur_ms_per_iter.clear()
+        self._timing_linear_solve_ms_per_iter.clear()
+        self._timing_nsn_inner_ms_per_iter.clear()
+
+    def get_timing_summary(self, last_n_steps: int | None = 50) -> dict:
+        """Return mean per-PD-iter timings over the last ``last_n_steps`` steps.
+
+        Args:
+            last_n_steps: Number of trailing PD outer iterations to include.
+                The buffer grows by :attr:`iterations` entries per ``step()``
+                call, so passing ``50`` means "last 50 steps" only if all
+                steps ran the same number of PD iters (default behaviour).
+                Pass ``None`` to average over the full history.
+
+        Returns:
+            Dict with keys ``local_ms``, ``linear_solve_ms``, ``schur_ms``,
+            ``nsn_inner_ms``, each a mean (``None`` if no samples were
+            recorded for that phase — e.g. ``schur_ms`` for contact-free
+            demos). Also includes ``n_samples`` (count of PD iters used).
+        """
+        if last_n_steps is None:
+            window = None
+        else:
+            window = int(last_n_steps) * int(self.iterations)
+
+        def _mean(buf: list[float]) -> float | None:
+            if not buf:
+                return None
+            slice_ = buf[-window:] if window is not None else buf
+            return sum(slice_) / len(slice_) if slice_ else None
+
+        return {
+            "local_ms": _mean(self._timing_local_ms_per_iter),
+            "linear_solve_ms": _mean(self._timing_linear_solve_ms_per_iter),
+            "schur_ms": _mean(self._timing_schur_ms_per_iter),
+            "nsn_inner_ms": _mean(self._timing_nsn_inner_ms_per_iter),
+            "n_samples": len(self._timing_local_ms_per_iter)
+            if window is None
+            else min(window, len(self._timing_local_ms_per_iter)),
+        }
 
     def configure_diagnostic_dump(self, frame: int, out_path: str) -> None:
         """Configure a single-frame diagnostic dump of PD intermediate state.
@@ -721,7 +789,12 @@ class SolverFBA(SolverBase):
             self._diag_buffers["x_inertia"] = self._x_inertia.numpy().astype(np.float64).copy()
 
         # 2) PD outer iterations.
+        _perf_on = self.enable_perf_timing
         for _k in range(self.iterations):
+            # ---- Local phase (energy projection + RHS assembly) ----
+            if _perf_on:
+                wp.synchronize_device()
+                _t_local_0 = time.perf_counter()
             # Zero RHS.
             wp.launch(zero_vec3_kernel, dim=N, inputs=[self._rhs], device=device)
             # Inertia term.
@@ -946,8 +1019,17 @@ class SolverFBA(SolverBase):
             if _diag_active:
                 self._diag_buffers[f"rhs_k{_k}"] = self._rhs.numpy().astype(np.float64).copy()
 
+            if _perf_on:
+                wp.synchronize_device()
+                self._timing_local_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_local_0))
+                _t_lin_0 = time.perf_counter()
+
             # Global linear solve: x_unc = A^-1 . rhs  (unconstrained).
             self._linear_solver.solve(self._rhs, self._x_cur)
+
+            if _perf_on:
+                wp.synchronize_device()
+                self._timing_linear_solve_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_lin_0))
 
             if _diag_active:
                 self._diag_buffers[f"x_post_solve_k{_k}"] = self._x_cur.numpy().astype(np.float64).copy()
@@ -962,6 +1044,9 @@ class SolverFBA(SolverBase):
                     # Task L: reuse cached W and ls._A_inv_Jt_d across PD outer
                     # iters — both depend only on (J, A), which are fixed
                     # within a step.
+                    if _perf_on:
+                        wp.synchronize_device()
+                        _t_schur_0 = time.perf_counter()
                     if self._cached_W is None or not self._cached_A_inv_Jt_valid:
                         self._cached_W = ls.build_schur_complement(
                             M,
@@ -973,6 +1058,10 @@ class SolverFBA(SolverBase):
                             use_isodof=self.use_isodof,
                         )
                         self._cached_A_inv_Jt_valid = True
+                    if _perf_on:
+                        wp.synchronize_device()
+                        self._timing_schur_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_schur_0))
+                        _t_nsn_0 = time.perf_counter()
                     W = self._cached_W
                     x_unc_np = self._x_cur.numpy()  # (N, 3) float32
                     r = self._compute_contact_residual_friction(x_unc_np)
@@ -1009,8 +1098,14 @@ class SolverFBA(SolverBase):
                     # bit-distinct under float32 rounding.
                     if np.any(np.abs(lam_apply) > 1e-15):
                         ls.apply_lambda_correction_combined(lam_apply, self._rhs, self._x_cur)
+                    if _perf_on:
+                        wp.synchronize_device()
+                        self._timing_nsn_inner_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_nsn_0))
                 else:
                     # Stage A: M Schur complement, unilateral (λ ≥ 0) only.
+                    if _perf_on:
+                        wp.synchronize_device()
+                        _t_schur_0 = time.perf_counter()
                     if self._cached_W is None or not self._cached_A_inv_Jt_valid:
                         self._cached_W = ls.build_schur_complement(
                             M,
@@ -1020,6 +1115,10 @@ class SolverFBA(SolverBase):
                             use_isodof=self.use_isodof,
                         )
                         self._cached_A_inv_Jt_valid = True
+                    if _perf_on:
+                        wp.synchronize_device()
+                        self._timing_schur_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_schur_0))
+                        _t_nsn_0 = time.perf_counter()
                     W = self._cached_W
                     x_unc_np = self._x_cur.numpy()  # (N, 3) float32
                     r = self._compute_contact_residual(x_unc_np)
@@ -1054,6 +1153,9 @@ class SolverFBA(SolverBase):
                     # bit-distinct under float32 rounding.
                     if np.any(np.abs(lam_apply) > 1e-15):
                         ls.apply_lambda_correction_combined(lam_apply, self._rhs, self._x_cur)
+                    if _perf_on:
+                        wp.synchronize_device()
+                        self._timing_nsn_inner_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_nsn_0))
 
         # 3) Write velocity and update state_out.
         wp.copy(state_out.particle_q, self._x_cur)
