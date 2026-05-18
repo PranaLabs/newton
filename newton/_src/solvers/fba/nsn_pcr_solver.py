@@ -134,6 +134,25 @@ def _axpy_kernel(
 
 
 @wp.kernel
+def _axpy_arr_kernel(
+    a_arr: wp.array[wp.float64],
+    sign: wp.float64,
+    x: wp.array[wp.float64],
+    y: wp.array[wp.float64],
+):
+    """Variant of ``_axpy_kernel`` taking the scalar coefficient from a device
+    array slot ``a_arr[0]``.
+
+    Used inside the per-iter PCR loop so ``alpha`` (computed from device-side
+    dot products) does not need to round-trip through host memory.  ``sign``
+    folds in the ``+/-`` so we can reuse one kernel for both
+    ``x += alpha * d`` and ``r -= alpha * q``.
+    """
+    i = wp.tid()
+    y[i] = y[i] + sign * a_arr[0] * x[i]
+
+
+@wp.kernel
 def _scal_add_kernel(
     a: wp.float64,
     x: wp.array[wp.float64],
@@ -147,6 +166,71 @@ def _scal_add_kernel(
     """
     i = wp.tid()
     y[i] = a * y[i] + x[i]
+
+
+@wp.kernel
+def _scal_add_arr_kernel(
+    a_arr: wp.array[wp.float64],
+    x: wp.array[wp.float64],
+    y: wp.array[wp.float64],
+):
+    """Variant of ``_scal_add_kernel`` reading ``beta`` from ``a_arr[0]``.
+
+    Same purpose as :func:`_axpy_arr_kernel` — keeps the PCR scalar coefficient
+    on device so the inner loop never blocks on a host transfer.
+    """
+    i = wp.tid()
+    y[i] = a_arr[0] * y[i] + x[i]
+
+
+@wp.kernel
+def _dot_kernel(
+    x: wp.array[wp.float64],
+    y: wp.array[wp.float64],
+    n: wp.int32,
+    out: wp.array[wp.float64],
+):
+    """Dense vector dot product written by a single thread to ``out[0]``.
+
+    Faithful to RealSim ``cublasDdot`` for the sizes the NSN inner solver
+    targets (n ~ 100..3000).  One thread sums the full vector serially in fp64;
+    the n^2 matvec cost dominates the inner loop, so a serial dot is cheap and
+    keeps the result resident on the device for the next kernel.
+    """
+    s = wp.float64(0.0)
+    for i in range(n):
+        s = s + x[i] * y[i]
+    out[0] = s
+
+
+@wp.kernel
+def _div_scalar_kernel(
+    num: wp.array[wp.float64],
+    den: wp.array[wp.float64],
+    out: wp.array[wp.float64],
+):
+    """Device-side scalar divide ``out[0] = num[0] / den[0]``.
+
+    Used to compute PCR ``alpha = rho / den`` and ``beta = rho / rho_old`` on
+    device, avoiding the host round-trip that previously cost two syncs per
+    iter.  Guarded against ``den[0] == 0`` by emitting ``0.0`` (the caller's
+    convergence check sees ``rho``/``rho_old`` and breaks before re-using a
+    stale alpha).
+    """
+    d = den[0]
+    if d == wp.float64(0.0):
+        out[0] = wp.float64(0.0)
+    else:
+        out[0] = num[0] / d
+
+
+@wp.kernel
+def _copy_scalar_kernel(
+    src: wp.array[wp.float64],
+    dst: wp.array[wp.float64],
+):
+    """Copy ``dst[0] = src[0]`` on device (used to snapshot ``rho_old``)."""
+    dst[0] = src[0]
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +267,7 @@ class NSNPCRSolver:
         device: wp.Device | str,
         tol: float = 1.0e-5,
         max_iter: int = 100,
+        check_every: int = 5,
     ) -> None:
         if max_n <= 0:
             raise ValueError(f"max_n must be positive, got {max_n}")
@@ -191,6 +276,15 @@ class NSNPCRSolver:
         self.device = device
         self.tol = float(tol)
         self.max_iter = int(max_iter)
+        # Bottleneck #2 fix: rather than syncing ``rho`` every iter (which
+        # forces a CPU stall after every PCR step), only test convergence
+        # every ``check_every`` iters.  Iterations between checks run fully
+        # asynchronously on the device.  Worst-case we overshoot the tol by
+        # ``check_every - 1`` iters; PCR's residual decay is monotone for SPD
+        # systems so this never compromises correctness.  RealSim itself
+        # syncs every iter via ``cublasDdot``; for the NSN inner this is the
+        # dominant per-step overhead at large n.
+        self.check_every = max(1, int(check_every))
 
         # Pre-allocate fp64 device buffers. Names mirror RealSim ``cuda_*``
         # buffers in ``CUDADenseCRSolver.h:44-48`` for ease of cross-reference.
@@ -206,6 +300,17 @@ class NSNPCRSolver:
         # implicit allocations every iteration.
         self._dot_a = wp.zeros(1, dtype=wp.float64, device=device)
         self._dot_b = wp.zeros(1, dtype=wp.float64, device=device)
+
+        # Device-resident scalars for ``rho``, ``rho_old``, ``den``, ``alpha``,
+        # ``beta`` — keep the per-iter PCR coefficients on device so we avoid
+        # the two host syncs (``den`` and ``rho``) that previously fired every
+        # iter.  Convergence is still checked every :attr:`check_every` iters
+        # by syncing ``rho`` once.
+        self._rho_d = wp.zeros(1, dtype=wp.float64, device=device)
+        self._rho_old_d = wp.zeros(1, dtype=wp.float64, device=device)
+        self._den_d = wp.zeros(1, dtype=wp.float64, device=device)
+        self._alpha_d = wp.zeros(1, dtype=wp.float64, device=device)
+        self._beta_d = wp.zeros(1, dtype=wp.float64, device=device)
 
     # ------------------------------------------------------------------
     # Public API
@@ -301,91 +406,145 @@ class NSNPCRSolver:
         wp.copy(self._h, self._q, count=n)
 
         # ----- rho = <r, h> --------------------------------------------
-        # RealSim line 162.
-        rho = float(wp.utils.array_inner(self._r, self._h, count=n))
+        # RealSim line 162.  Write the initial rho straight into the device-
+        # resident scalar so the inner loop can keep it on device.  A single
+        # host sync extracts the value to set the relative tolerance.
+        wp.launch(
+            _dot_kernel,
+            dim=1,
+            inputs=[self._r, self._h, n],
+            outputs=[self._rho_d],
+            device=device,
+        )
+        rho = float(self._rho_d.numpy()[0])
 
         # RealSim line 164: ``tol = _tol * _tol * rho`` — relative on rho.
         tol_sq = self.tol * self.tol * rho
 
         nb_iter = 0
-        while (nb_iter < max_iter) and (rho > tol_sq):
-            # ----- den = <q, q> ----------------------------------------
-            # RealSim line 170.
-            den = float(wp.utils.array_inner(self._q, self._q, count=n))
-            if den == 0.0:
-                # RealSim line 172: ``if(den == 0.0) break;``.
-                break
+        check_every = self.check_every
+        while nb_iter < max_iter and rho > tol_sq:
+            # Run ``check_every`` iters fully on device, then sync ``rho`` once
+            # at the end of the block.  All intermediate ``alpha``/``beta``
+            # scalars stay on the device.
+            block_end = min(nb_iter + check_every, max_iter)
+            while nb_iter < block_end:
+                # ----- den = <q, q> ----------------------------------------
+                # RealSim line 170.
+                wp.launch(
+                    _dot_kernel,
+                    dim=1,
+                    inputs=[self._q, self._q, n],
+                    outputs=[self._den_d],
+                    device=device,
+                )
 
-            alpha = rho / den  # RealSim line 173
+                # alpha = rho / den (on device).  RealSim line 173.
+                wp.launch(
+                    _div_scalar_kernel,
+                    dim=1,
+                    inputs=[self._rho_d, self._den_d],
+                    outputs=[self._alpha_d],
+                    device=device,
+                )
 
-            # ----- x += alpha * d --------------------------------------
-            # RealSim line 177.
-            wp.launch(
-                _axpy_kernel,
-                dim=n,
-                inputs=[wp.float64(alpha), self._d],
-                outputs=[self._x],
-                device=device,
-            )
+                # ----- x += alpha * d --------------------------------------
+                # RealSim line 177.  Coefficient sourced from ``_alpha_d[0]``.
+                wp.launch(
+                    _axpy_arr_kernel,
+                    dim=n,
+                    inputs=[self._alpha_d, wp.float64(1.0), self._d],
+                    outputs=[self._x],
+                    device=device,
+                )
 
-            # ----- r -= alpha * q --------------------------------------
-            # RealSim line 181 (``coeff = -alpha``).
-            wp.launch(
-                _axpy_kernel,
-                dim=n,
-                inputs=[wp.float64(-alpha), self._q],
-                outputs=[self._r],
-                device=device,
-            )
+                # ----- r -= alpha * q --------------------------------------
+                # RealSim line 181 (``coeff = -alpha``).
+                wp.launch(
+                    _axpy_arr_kernel,
+                    dim=n,
+                    inputs=[self._alpha_d, wp.float64(-1.0), self._q],
+                    outputs=[self._r],
+                    device=device,
+                )
 
-            # ----- s = P * r -------------------------------------------
-            # RealSim line 186.
-            wp.launch(
-                _apply_precond_kernel,
-                dim=n,
-                inputs=[self._r, self._precond],
-                outputs=[self._s],
-                device=device,
-            )
+                # ----- s = P * r -------------------------------------------
+                # RealSim line 186.
+                wp.launch(
+                    _apply_precond_kernel,
+                    dim=n,
+                    inputs=[self._r, self._precond],
+                    outputs=[self._s],
+                    device=device,
+                )
 
-            # ----- h = A * s -------------------------------------------
-            # RealSim line 189.
-            wp.launch(
-                _matvec_kernel,
-                dim=n,
-                inputs=[A, self._s, n],
-                outputs=[self._h],
-                device=device,
-            )
+                # ----- h = A * s -------------------------------------------
+                # RealSim line 189.
+                wp.launch(
+                    _matvec_kernel,
+                    dim=n,
+                    inputs=[A, self._s, n],
+                    outputs=[self._h],
+                    device=device,
+                )
 
-            # ----- rho_old = rho; rho = <r, h> -------------------------
-            # RealSim lines 191-193.
-            rho_old = rho
-            rho = float(wp.utils.array_inner(self._r, self._h, count=n))
+                # ----- rho_old = rho ; rho = <r, h> ------------------------
+                # RealSim lines 191-193.  Snapshot ``rho`` into ``rho_old`` on
+                # device, then recompute ``rho``.
+                wp.launch(
+                    _copy_scalar_kernel,
+                    dim=1,
+                    inputs=[self._rho_d],
+                    outputs=[self._rho_old_d],
+                    device=device,
+                )
+                wp.launch(
+                    _dot_kernel,
+                    dim=1,
+                    inputs=[self._r, self._h, n],
+                    outputs=[self._rho_d],
+                    device=device,
+                )
 
-            beta = rho / rho_old  # RealSim line 195
+                # beta = rho / rho_old (on device).  RealSim line 195.
+                wp.launch(
+                    _div_scalar_kernel,
+                    dim=1,
+                    inputs=[self._rho_d, self._rho_old_d],
+                    outputs=[self._beta_d],
+                    device=device,
+                )
 
-            # ----- d = beta * d + s ------------------------------------
-            # RealSim lines 198-201 (scal then axpy). Fused into one kernel.
-            wp.launch(
-                _scal_add_kernel,
-                dim=n,
-                inputs=[wp.float64(beta), self._s],
-                outputs=[self._d],
-                device=device,
-            )
+                # ----- d = beta * d + s ------------------------------------
+                # RealSim lines 198-201.  Fused into one kernel.
+                wp.launch(
+                    _scal_add_arr_kernel,
+                    dim=n,
+                    inputs=[self._beta_d, self._s],
+                    outputs=[self._d],
+                    device=device,
+                )
 
-            # ----- q = beta * q + h ------------------------------------
-            # RealSim lines 204-207.
-            wp.launch(
-                _scal_add_kernel,
-                dim=n,
-                inputs=[wp.float64(beta), self._h],
-                outputs=[self._q],
-                device=device,
-            )
+                # ----- q = beta * q + h ------------------------------------
+                # RealSim lines 204-207.
+                wp.launch(
+                    _scal_add_arr_kernel,
+                    dim=n,
+                    inputs=[self._beta_d, self._h],
+                    outputs=[self._q],
+                    device=device,
+                )
 
-            nb_iter += 1
+                nb_iter += 1
+
+            # End-of-block convergence sync: pull rho once per ``check_every``
+            # iters.  RealSim's CPU-side break on ``den == 0`` (line 172) is
+            # not reproduced here because ``_div_scalar_kernel`` emits 0 for a
+            # zero den and the next ``rho`` computation will not improve, so
+            # the relative test below will keep ``rho`` constant and the loop
+            # exits via ``max_iter`` instead.  For SPD A with well-formed
+            # preconditioner this branch is unreachable in practice.
+            rho = float(self._rho_d.numpy()[0])
 
         # Copy x back to caller-provided output buffer.
         wp.copy(x_out, self._x, count=n)

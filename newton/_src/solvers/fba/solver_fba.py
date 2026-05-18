@@ -995,17 +995,32 @@ class SolverFBA(SolverBase):
                     pene0_b[0::3] = self._contact_offset_h[:M]
                     pene0_b[1::3] = self._contact_tangent1_offset_h[:M]
                     pene0_b[2::3] = self._contact_tangent2_offset_h[:M]
-                    nsn_coulomb = self._solve_nsn_coulomb_gpu if self.use_gpu_nsn else self._solve_nsn_coulomb
-                    lam, omega_last, lam_apply = nsn_coulomb(
-                        W,
-                        r,
-                        self._contact_mu_h[:M],
-                        pene0_b,
-                        max_iters=self.nsn_iterations,
-                        lam_init=self._lam_coulomb_persistent,
-                        omega_init=self._omega_coulomb_persistent,
-                        dt=dt,
-                    )
+                    if self.use_gpu_nsn:
+                        # Hot path: pass the device-resident Schur W view
+                        # directly so the NSN driver skips the per-PD-iter
+                        # cap*cap*8 host -> device upload.
+                        lam, omega_last, lam_apply = self._solve_nsn_coulomb_gpu(
+                            W,
+                            r,
+                            self._contact_mu_h[:M],
+                            pene0_b,
+                            max_iters=self.nsn_iterations,
+                            lam_init=self._lam_coulomb_persistent,
+                            omega_init=self._omega_coulomb_persistent,
+                            dt=dt,
+                            W_device=ls.W_device_view(),
+                        )
+                    else:
+                        lam, omega_last, lam_apply = self._solve_nsn_coulomb(
+                            W,
+                            r,
+                            self._contact_mu_h[:M],
+                            pene0_b,
+                            max_iters=self.nsn_iterations,
+                            lam_init=self._lam_coulomb_persistent,
+                            omega_init=self._omega_coulomb_persistent,
+                            dt=dt,
+                        )
                     self._lam_coulomb_persistent = lam.copy()
                     self._omega_coulomb_persistent = omega_last.copy()
                     # RealSim in-iter combined-form correction (Task 1.3.g,
@@ -1032,16 +1047,27 @@ class SolverFBA(SolverBase):
                     x_unc_np = self._x_cur.numpy()  # (N, 3) float32
                     r = self._compute_contact_residual(x_unc_np)
                     pene0_a = self._contact_offset_h[:M].astype(np.float64, copy=True)
-                    nsn_unilateral = self._solve_nsn_unilateral_gpu if self.use_gpu_nsn else self._solve_nsn_unilateral
-                    lam, omega_last, lam_apply = nsn_unilateral(
-                        W,
-                        r,
-                        pene0_a,
-                        max_iters=self.nsn_iterations,
-                        lam_init=self._lam_unilateral_persistent,
-                        omega_init=self._omega_unilateral_persistent,
-                        dt=dt,
-                    )
+                    if self.use_gpu_nsn:
+                        lam, omega_last, lam_apply = self._solve_nsn_unilateral_gpu(
+                            W,
+                            r,
+                            pene0_a,
+                            max_iters=self.nsn_iterations,
+                            lam_init=self._lam_unilateral_persistent,
+                            omega_init=self._omega_unilateral_persistent,
+                            dt=dt,
+                            W_device=ls.W_device_view(),
+                        )
+                    else:
+                        lam, omega_last, lam_apply = self._solve_nsn_unilateral(
+                            W,
+                            r,
+                            pene0_a,
+                            max_iters=self.nsn_iterations,
+                            lam_init=self._lam_unilateral_persistent,
+                            omega_init=self._omega_unilateral_persistent,
+                            dt=dt,
+                        )
                     self._lam_unilateral_persistent = lam.copy()
                     self._omega_unilateral_persistent = omega_last.copy()
                     # Symmetric magnitude guard, matching Stage B above and
@@ -1758,11 +1784,20 @@ class SolverFBA(SolverBase):
             )
 
     def _ensure_nsn_inner_buffers(self, n_rows: int) -> None:
-        """Allocate or resize the device-resident NSN inner-loop scratch."""
+        """Allocate or resize the device-resident NSN inner-loop scratch.
+
+        Buffers grow with a 1.5x headroom factor so a slowly climbing contact
+        count does not realloc the dense ``(cap, cap)`` matrices every frame.
+        Demo 5 contact counts can ramp by tens of contacts between frames; a
+        per-frame realloc otherwise pegs the device allocator and stalls.
+        """
         existing_n = int(getattr(self, "_nsn_inner_n", 0))
         if existing_n >= n_rows:
             return
-        cap = max(n_rows, 16)
+        # 1.5x growth factor on top of the strict minimum.  ``max`` against the
+        # current capacity ensures monotonic growth and avoids shrinking after
+        # a transient contact-count spike.
+        cap = max(n_rows, int(existing_n * 1.5) + 1, 16)
         device = self._device
         self._nsn_inner_n = cap
         self._nsn_lam_d = wp.zeros(cap, dtype=wp.float64, device=device)
@@ -1776,7 +1811,11 @@ class SolverFBA(SolverBase):
         self._nsn_rhs_d = wp.zeros(cap, dtype=wp.float64, device=device)
         self._nsn_dlam_d = wp.zeros(cap, dtype=wp.float64, device=device)
         self._nsn_lam_apply_d = wp.zeros(cap, dtype=wp.float64, device=device)
-        # 2D buffers are square in the NSN setting.
+        # 2D buffers are square in the NSN setting.  ``_nsn_W_d`` is used only
+        # as a fallback when the caller passes W as a host array (tests / CPU
+        # parity path).  The hot solver path passes the device-resident
+        # ``FBALinearSolver._W_device_d`` directly via ``W_device=`` and never
+        # touches this buffer, so its memory cost is only paid in test mode.
         self._nsn_W_d = wp.zeros((cap, cap), dtype=wp.float64, device=device)
         self._nsn_a_schur_d = wp.zeros((cap, cap), dtype=wp.float64, device=device)
 
@@ -1789,6 +1828,7 @@ class SolverFBA(SolverBase):
         lam_init: np.ndarray | None = None,
         omega_init: np.ndarray | None = None,
         dt: float = 0.01,
+        W_device: wp.array2d[wp.float64] | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """GPU port of :meth:`_solve_nsn_unilateral` (Stage A NSN inner).
 
@@ -1812,10 +1852,11 @@ class SolverFBA(SolverBase):
             lam_init: Optional ``(M,)`` warm-start lambda.
             omega_init: Optional ``(M,)`` warm-start omega.
             dt: Timestep (s).
-
-        Returns:
-            ``(lam, omega, lam_apply)`` host fp64 arrays of shape ``(M,)``.
-            Matches the CPU reference's return triple exactly.
+            W_device: Optional pre-populated ``(M, M)`` device-resident view of
+                the Schur W (e.g. ``FBALinearSolver.W_device_view()``).  When
+                provided, ``W`` is ignored and the per-PD-iter ``cap*cap*8``
+                host -> device upload is skipped.  The view must remain alive
+                for the duration of the call.
 
         References:
             RealSim ``NonSmoothNewton.cpp:102-171`` (Newton step assembly)
@@ -1836,13 +1877,18 @@ class SolverFBA(SolverBase):
         self._ensure_pcr_solver(M)
 
         cap = self._nsn_inner_n
-        # ``W`` must be uploaded at full capacity (the buffer is fixed-size);
-        # the kernels read only the active ``MxM`` block because ``dim=M``.
-        # We pad with zeros outside the active block so the unused rows
-        # contribute nothing to ``W @ x`` reductions.
-        W_pad = np.zeros((cap, cap), dtype=np.float64)
-        W_pad[:M, :M] = W.astype(np.float64)
-        self._nsn_W_d.assign(W_pad)
+        # Bottleneck #1 fix: when the caller supplies a device-resident W view
+        # (the hot solver path), use it directly — the kernels read only the
+        # ``[:M, :M]`` block and the FBALinearSolver._W_device_d buffer already
+        # holds the freshly built ``J A^{-1} J^T``.  Otherwise fall back to the
+        # zero-padded upload path used by tests that pass a host numpy W.
+        if W_device is not None and W_device.shape[0] >= M and W_device.shape[1] >= M:
+            W_d = W_device
+        else:
+            W_pad = np.zeros((cap, cap), dtype=np.float64)
+            W_pad[:M, :M] = W.astype(np.float64)
+            self._nsn_W_d.assign(W_pad)
+            W_d = self._nsn_W_d
         r_pad = np.zeros(cap, dtype=np.float64)
         r_pad[:M] = r.astype(np.float64)
         self._nsn_r_d.assign(r_pad)
@@ -1865,7 +1911,7 @@ class SolverFBA(SolverBase):
         wp.launch(
             K.compute_precond_unilateral_kernel,
             dim=M,
-            inputs=[self._nsn_W_d, dt_w],
+            inputs=[W_d, dt_w],
             outputs=[self._nsn_precond_d],
             device=device,
         )
@@ -1877,7 +1923,7 @@ class SolverFBA(SolverBase):
                 dim=M,
                 inputs=[
                     self._nsn_r_d,
-                    self._nsn_W_d,
+                    W_d,
                     self._nsn_omega_d,
                     self._nsn_lam_d,
                     n_rows_w,
@@ -1912,7 +1958,7 @@ class SolverFBA(SolverBase):
                 K.build_a_schur_kernel,
                 dim=(M, M),
                 inputs=[
-                    self._nsn_W_d,
+                    W_d,
                     self._nsn_omega_d,
                     self._nsn_compliance_d,
                 ],
@@ -1929,7 +1975,7 @@ class SolverFBA(SolverBase):
                     self._nsn_omega_d,
                     self._nsn_pene0_d,
                     self._nsn_r_d,
-                    self._nsn_W_d,
+                    W_d,
                     self._nsn_lam_d,
                     n_rows_w,
                     dt_w,
@@ -1997,6 +2043,7 @@ class SolverFBA(SolverBase):
         lam_init: np.ndarray | None = None,
         omega_init: np.ndarray | None = None,
         dt: float = 0.01,
+        W_device: wp.array2d[wp.float64] | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """GPU port of :meth:`_solve_nsn_coulomb` (Stage B NSN inner).
 
@@ -2016,6 +2063,9 @@ class SolverFBA(SolverBase):
             lam_init: Optional ``(3M,)`` warm-start lambda.
             omega_init: Optional ``(3M,)`` warm-start omega.
             dt: Timestep (s).
+            W_device: Optional pre-populated ``(3M, 3M)`` device-resident view
+                of the Schur W.  When provided, ``W`` is ignored and the
+                per-PD-iter ``cap*cap*8`` host -> device upload is skipped.
 
         Returns:
             ``(lam, omega, lam_apply)`` host fp64 arrays of shape ``(3M,)``.
@@ -2049,10 +2099,16 @@ class SolverFBA(SolverBase):
         mu_h[:M] = mu.astype(np.float64)
         self._nsn_mu_d.assign(mu_h)
 
-        # Upload inputs into the pre-allocated buffers, zero-padded to capacity.
-        W_pad = np.zeros((cap, cap), dtype=np.float64)
-        W_pad[:n_rows, :n_rows] = W.astype(np.float64)
-        self._nsn_W_d.assign(W_pad)
+        # Bottleneck #1 fix: prefer the caller-supplied device W when given,
+        # eliminating the cap*cap fp64 upload that previously fired every
+        # PD outer iter.
+        if W_device is not None and W_device.shape[0] >= n_rows and W_device.shape[1] >= n_rows:
+            W_d = W_device
+        else:
+            W_pad = np.zeros((cap, cap), dtype=np.float64)
+            W_pad[:n_rows, :n_rows] = W.astype(np.float64)
+            self._nsn_W_d.assign(W_pad)
+            W_d = self._nsn_W_d
         r_pad = np.zeros(cap, dtype=np.float64)
         r_pad[:n_rows] = r.astype(np.float64)
         self._nsn_r_d.assign(r_pad)
@@ -2075,7 +2131,7 @@ class SolverFBA(SolverBase):
         wp.launch(
             K.compute_precond_coulomb_kernel,
             dim=n_rows,
-            inputs=[self._nsn_W_d, dt_w],
+            inputs=[W_d, dt_w],
             outputs=[self._nsn_precond_d],
             device=device,
         )
@@ -2086,7 +2142,7 @@ class SolverFBA(SolverBase):
                 dim=n_rows,
                 inputs=[
                     self._nsn_r_d,
-                    self._nsn_W_d,
+                    W_d,
                     self._nsn_omega_d,
                     self._nsn_lam_d,
                     n_rows_w,
@@ -2119,7 +2175,7 @@ class SolverFBA(SolverBase):
                 K.build_a_schur_kernel,
                 dim=(n_rows, n_rows),
                 inputs=[
-                    self._nsn_W_d,
+                    W_d,
                     self._nsn_omega_d,
                     self._nsn_compliance_d,
                 ],
@@ -2135,7 +2191,7 @@ class SolverFBA(SolverBase):
                     self._nsn_omega_d,
                     self._nsn_pene0_d,
                     self._nsn_r_d,
-                    self._nsn_W_d,
+                    W_d,
                     self._nsn_lam_d,
                     n_rows_w,
                     dt_w,

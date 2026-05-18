@@ -1053,12 +1053,23 @@ class FBALinearSolver:
         row_alpha_d = wp.array(row_alpha, dtype=wp.float32, device=dev)
 
         # --- Allocate/reuse W device buffer (used by both paths). ---
+        # Grow with a 1.5x headroom factor so a slow contact-count climb does
+        # not realloc every frame.  ``M`` can spike by 10s of contacts between
+        # frames in Demo 5 (squeezing), and a (cap, cap) dense float64 buffer
+        # is the dominant device alloc on the FBA hot path.
         if (
             not hasattr(self, "_W_device_d")
             or self._W_device_d.shape[0] < total_rows
             or self._W_device_d.shape[1] < total_rows
         ):
-            self._W_device_d = wp.empty(shape=(total_rows, total_rows), dtype=wp.float64, device=dev)
+            prev = getattr(self, "_W_device_d", None)
+            prev_cap = prev.shape[0] if prev is not None else 0
+            cap = max(total_rows, int(prev_cap * 1.5) + 1)
+            self._W_device_d = wp.empty(shape=(cap, cap), dtype=wp.float64, device=dev)
+        # Active row count for the populated sub-block — consumed by the NSN
+        # GPU drivers to build a (M, M) wp.array view of ``_W_device_d`` without
+        # touching the host.
+        self._W_device_active_rows = total_rows
 
         # Stash per-row contact metadata for the isodof lambda-correction path.
         # (Used by :meth:`apply_lambda_correction_isodof`; harmless on the
@@ -1161,9 +1172,10 @@ class FBALinearSolver:
             device=dev,
         )
 
-        # Zero W before accumulation (only the active sub-block).
-        W_zeros = np.zeros((total_rows, total_rows), dtype=np.float64)
-        self._W_device_d.assign(W_zeros)
+        # ``accumulate_schur_W_kernel`` writes ``W[c', c] = ...`` (pure assign,
+        # not accumulate), so a pre-launch zero is unnecessary. Skipping the
+        # host -> device zero blast saves ``total_rows^2 * 8`` bytes of upload
+        # per build.
 
         # Launch 2D kernel: one thread per (c_prime, c) entry.
         wp.launch(
@@ -1174,6 +1186,10 @@ class FBALinearSolver:
         )
 
         # Single host pull for the (total_rows x total_rows) W matrix.
+        # Kept for callers that still want a numpy view (CPU NSN reference,
+        # regression tests).  The GPU NSN drivers consume the device-resident
+        # ``_W_device_d`` directly via :meth:`W_device_view`, avoiding the
+        # per-PD-iter host -> device round trip.
         W = self._W_device_d.numpy()[:total_rows, :total_rows].copy()
 
         return W
@@ -1290,6 +1306,36 @@ class FBALinearSolver:
         # Single host pull for the (total_rows x total_rows) W matrix.
         W = self._W_device_d.numpy()[:total_rows, :total_rows].copy()
         return W
+
+    def W_device_view(self) -> wp.array2d[wp.float64]:
+        """Return a ``(M, M)`` device view of the most recently built Schur W.
+
+        The view aliases :attr:`_W_device_d` for the active row block populated
+        by the most recent :meth:`build_schur_complement` call.  Because the
+        underlying buffer has capacity ``(cap, cap)`` (with ``cap >= M`` and
+        ``cap`` grown by the 1.5x headroom factor), the view is non-contiguous
+        in its outer dimension and explicit strides matching the parent buffer
+        are passed; without them the default contiguous strides would mis-index
+        every row beyond the first.
+
+        Returns:
+            ``wp.array2d[wp.float64]`` of shape ``(M, M)`` sharing storage with
+            the persistent device buffer, or ``None`` if no W exists.
+        """
+        if not hasattr(self, "_W_device_d") or not hasattr(self, "_W_device_active_rows"):
+            return None
+        m = int(self._W_device_active_rows)
+        if m == 0:
+            return None
+        cap = int(self._W_device_d.shape[0])
+        dtype_size = 8  # wp.float64
+        return wp.array(
+            ptr=self._W_device_d.ptr,
+            dtype=wp.float64,
+            shape=(m, m),
+            strides=(cap * dtype_size, dtype_size),
+            device=self.device,
+        )
 
     def apply_lambda_correction_isodof(
         self,
