@@ -307,7 +307,7 @@ class Example:
         # Use ``camera.look_at`` (sets pitch+yaw consistently for the
         # requested target) so the scene shows up centered on first frame.
         if hasattr(self.viewer, "camera"):
-            cam_pos = wp.vec3(7.0, 2.0, 7.0)
+            cam_pos = wp.vec3(13.0, 3.0, 13.0)
             cam_target = wp.vec3(0.0, -3.0, 0.0)
             self.viewer.camera.pos = self.viewer.camera._as_vec3(cam_pos)
             self.viewer.camera.look_at(cam_target)
@@ -384,10 +384,21 @@ class Example:
 
     def _advance_cylinder_rotation(self) -> None:
         """Update cylinder shape_transforms (rotation about local +Z) and
-        marker / stripe shape_transforms (positions on cylinder surface)."""
+        marker / stripe shape_transforms (positions on cylinder surface).
+
+        Sign convention: SolverFBA's friction kinematics use
+        ``v_anchor = -omega * cross(axis_world, r_local)`` (see
+        ``solver_fba.py``).  Substituting this into ``v_surface = w_world x r``
+        gives ``w_world = -omega * axis_world``, i.e. positive ``omega`` in
+        the ``_CYLINDERS`` table corresponds to a *negative* world-frame
+        angular velocity about the cylinder axis.  The visual rotation must
+        therefore decrement the angle by ``omega * dt`` (negating) so the
+        cylinder surface spin matches the direction the ball experiences
+        through friction.
+        """
         new_xforms = self._shape_transform_init_np.copy()
         for i, (_base, _axis, omega) in enumerate(_CYLINDERS):
-            self._cyl_angles[i] += omega * self.frame_dt
+            self._cyl_angles[i] -= omega * self.frame_dt
             angle = self._cyl_angles[i]
             cyl_xform = self._cyl_init_xforms[i]
 
