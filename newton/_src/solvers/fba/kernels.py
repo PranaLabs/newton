@@ -274,6 +274,34 @@ def project_arap_3x3(F: wp.mat33) -> wp.mat33:
     return U * wp.transpose(V)
 
 
+@wp.func
+def project_arap_3x3_d(F: wp.mat33d) -> wp.mat33d:
+    """fp64 variant of :func:`project_arap_3x3`.
+
+    Lifts the SVD and reflection-handling rotation projection to ``wp.float64``
+    so that ill-conditioned ``F`` (large condition number, e.g. extreme
+    stretching of a wooper tail tip) does not lose accuracy through the fp32
+    SVD core. Mirrors RealSim's ``signedEigenSVD`` (``SVD.cpp:7-29``) which
+    runs an Eigen JacobiSVD in ``double``; the reflection branch here flips
+    column 2 of U to keep R a proper rotation.
+    """
+    U, _sigma, V = wp.svd3(F)
+    detUV = wp.determinant(U) * wp.determinant(V)
+    if detUV < wp.float64(0.0):
+        U = wp.mat33d(
+            U[0, 0],
+            U[0, 1],
+            -U[0, 2],
+            U[1, 0],
+            U[1, 1],
+            -U[1, 2],
+            U[2, 0],
+            U[2, 1],
+            -U[2, 2],
+        )
+    return U * wp.transpose(V)
+
+
 @wp.kernel
 def project_stretching_arap_tet_kernel(
     positions: wp.array[wp.vec3],
@@ -325,21 +353,44 @@ def project_stretching_arap_tet_kernel(
     Dm_inv = tet_rest_inv[t]
     F = Ds * Dm_inv
 
-    R = project_arap_3x3(F)
-
-    # proj = w * Dm_inv * R^T  (3x3)
-    w = tet_weight[t]
-    RT = wp.transpose(R)
-    proj = w * (Dm_inv * RT)
+    # fp64 SVD-based rotation projection. RealSim's signedEigenSVD
+    # (SVD.cpp:7-29) runs Eigen JacobiSVD in double; we mirror that here to
+    # avoid fp32 SVD accuracy loss on ill-conditioned F (e.g. extreme tail
+    # stretching). proj is then demoted to fp32 for the rhs scatter.
+    F_d = wp.mat33d(
+        wp.float64(F[0, 0]),
+        wp.float64(F[0, 1]),
+        wp.float64(F[0, 2]),
+        wp.float64(F[1, 0]),
+        wp.float64(F[1, 1]),
+        wp.float64(F[1, 2]),
+        wp.float64(F[2, 0]),
+        wp.float64(F[2, 1]),
+        wp.float64(F[2, 2]),
+    )
+    R_d = project_arap_3x3_d(F_d)
+    Dm_inv_d = wp.mat33d(
+        wp.float64(Dm_inv[0, 0]),
+        wp.float64(Dm_inv[0, 1]),
+        wp.float64(Dm_inv[0, 2]),
+        wp.float64(Dm_inv[1, 0]),
+        wp.float64(Dm_inv[1, 1]),
+        wp.float64(Dm_inv[1, 2]),
+        wp.float64(Dm_inv[2, 0]),
+        wp.float64(Dm_inv[2, 1]),
+        wp.float64(Dm_inv[2, 2]),
+    )
+    w_d = wp.float64(tet_weight[t])
+    proj_d = w_d * (Dm_inv_d * wp.transpose(R_d))
 
     # Scatter stencil (RealSim PDTetrahedronEnergy.cpp:191-194):
     #   rhs[t[0]] += -proj.row(0) - proj.row(1) - proj.row(2)
     #   rhs[t[1]] += proj.row(0)
     #   rhs[t[2]] += proj.row(1)
     #   rhs[t[3]] += proj.row(2)
-    row0 = wp.vec3(proj[0, 0], proj[0, 1], proj[0, 2])
-    row1 = wp.vec3(proj[1, 0], proj[1, 1], proj[1, 2])
-    row2 = wp.vec3(proj[2, 0], proj[2, 1], proj[2, 2])
+    row0 = wp.vec3(wp.float32(proj_d[0, 0]), wp.float32(proj_d[0, 1]), wp.float32(proj_d[0, 2]))
+    row1 = wp.vec3(wp.float32(proj_d[1, 0]), wp.float32(proj_d[1, 1]), wp.float32(proj_d[1, 2]))
+    row2 = wp.vec3(wp.float32(proj_d[2, 0]), wp.float32(proj_d[2, 1]), wp.float32(proj_d[2, 2]))
     wp.atomic_add(rhs, i0, -(row0 + row1 + row2))
     wp.atomic_add(rhs, i1, row0)
     wp.atomic_add(rhs, i2, row1)
@@ -397,15 +448,36 @@ def project_stretching_arap_tet_compute_kernel(
     Dm_inv = tet_rest_inv[t]
     F = Ds * Dm_inv
 
-    R = project_arap_3x3(F)
+    # fp64 SVD-based rotation projection (see scatter variant for rationale).
+    F_d = wp.mat33d(
+        wp.float64(F[0, 0]),
+        wp.float64(F[0, 1]),
+        wp.float64(F[0, 2]),
+        wp.float64(F[1, 0]),
+        wp.float64(F[1, 1]),
+        wp.float64(F[1, 2]),
+        wp.float64(F[2, 0]),
+        wp.float64(F[2, 1]),
+        wp.float64(F[2, 2]),
+    )
+    R_d = project_arap_3x3_d(F_d)
+    Dm_inv_d = wp.mat33d(
+        wp.float64(Dm_inv[0, 0]),
+        wp.float64(Dm_inv[0, 1]),
+        wp.float64(Dm_inv[0, 2]),
+        wp.float64(Dm_inv[1, 0]),
+        wp.float64(Dm_inv[1, 1]),
+        wp.float64(Dm_inv[1, 2]),
+        wp.float64(Dm_inv[2, 0]),
+        wp.float64(Dm_inv[2, 1]),
+        wp.float64(Dm_inv[2, 2]),
+    )
+    w_d = wp.float64(tet_weight[t])
+    proj_d = w_d * (Dm_inv_d * wp.transpose(R_d))
 
-    w = tet_weight[t]
-    RT = wp.transpose(R)
-    proj = w * (Dm_inv * RT)
-
-    row0 = wp.vec3(proj[0, 0], proj[0, 1], proj[0, 2])
-    row1 = wp.vec3(proj[1, 0], proj[1, 1], proj[1, 2])
-    row2 = wp.vec3(proj[2, 0], proj[2, 1], proj[2, 2])
+    row0 = wp.vec3(wp.float32(proj_d[0, 0]), wp.float32(proj_d[0, 1]), wp.float32(proj_d[0, 2]))
+    row1 = wp.vec3(wp.float32(proj_d[1, 0]), wp.float32(proj_d[1, 1]), wp.float32(proj_d[1, 2]))
+    row2 = wp.vec3(wp.float32(proj_d[2, 0]), wp.float32(proj_d[2, 1]), wp.float32(proj_d[2, 2]))
     contributions[t, 0] = -(row0 + row1 + row2)
     contributions[t, 1] = row0
     contributions[t, 2] = row1
@@ -460,6 +532,31 @@ def project_corotational_sigma3d(sigma: wp.vec3, mu: float, lam: float) -> wp.ve
     proj1 = b1 / alpha - scale
     proj2 = b2 / alpha - scale
     return wp.vec3(proj0, proj1, proj2)
+
+
+@wp.func
+def project_corotational_sigma3d_d(sigma: wp.vec3d, mu: wp.float64, lam: wp.float64) -> wp.vec3d:
+    """fp64 variant of :func:`project_corotational_sigma3d`.
+
+    Same closed-form Sherman-Morrison solve, lifted to ``wp.float64`` for the
+    Tet Corot local projection so that ill-conditioned singular values feed a
+    numerically stable solve. Pair with an fp64 SVD of F.
+    """
+    k = wp.float64(2.0) * mu
+    alpha = wp.float64(4.0) * mu
+    beta = lam
+    n = wp.float64(3.0)
+
+    b0 = wp.float64(2.0) * mu + wp.float64(3.0) * lam + k * sigma[0]
+    b1 = wp.float64(2.0) * mu + wp.float64(3.0) * lam + k * sigma[1]
+    b2 = wp.float64(2.0) * mu + wp.float64(3.0) * lam + k * sigma[2]
+    sum_b = b0 + b1 + b2
+
+    scale = beta * sum_b / (alpha * (alpha + n * beta))
+    proj0 = b0 / alpha - scale
+    proj1 = b1 / alpha - scale
+    proj2 = b2 / alpha - scale
+    return wp.vec3d(proj0, proj1, proj2)
 
 
 @wp.kernel
@@ -522,42 +619,63 @@ def project_stretching_corotational_tet_kernel(
     Dm_inv = tet_rest_inv[t]
     F = Ds * Dm_inv
 
-    U, sigma, V = wp.svd3(F)
-
-    # Corotational projection: closed-form 3D solve on singular values.
-    sigma_proj = project_corotational_sigma3d(wp.vec3(sigma[0], sigma[1], sigma[2]), mu, lam)
-
-    # Reconstruct P = U * diag(sigma_proj) * V^T  (3x3).
-    # P = (U * diag(s)) * V^T
-    s0 = sigma_proj[0]
-    s1 = sigma_proj[1]
-    s2 = sigma_proj[2]
-    US = wp.mat33(
-        U[0, 0] * s0,
-        U[0, 1] * s1,
-        U[0, 2] * s2,
-        U[1, 0] * s0,
-        U[1, 1] * s1,
-        U[1, 2] * s2,
-        U[2, 0] * s0,
-        U[2, 1] * s1,
-        U[2, 2] * s2,
+    # fp64 SVD + sigma projection + P reconstruction. Mirrors RealSim
+    # signedEigenSVD (SVD.cpp:7-29) which runs Eigen JacobiSVD in double.
+    # Demoted to fp32 at the rhs scatter boundary only.
+    F_d = wp.mat33d(
+        wp.float64(F[0, 0]),
+        wp.float64(F[0, 1]),
+        wp.float64(F[0, 2]),
+        wp.float64(F[1, 0]),
+        wp.float64(F[1, 1]),
+        wp.float64(F[1, 2]),
+        wp.float64(F[2, 0]),
+        wp.float64(F[2, 1]),
+        wp.float64(F[2, 2]),
     )
-    P = US * wp.transpose(V)
+    U_d, sigma_d, V_d = wp.svd3(F_d)
+    sigma_proj_d = project_corotational_sigma3d_d(
+        wp.vec3d(sigma_d[0], sigma_d[1], sigma_d[2]), wp.float64(mu), wp.float64(lam)
+    )
 
-    # proj = w * Dm_inv * P^T  (3x3)
-    w = tet_weight[t]
-    PT = wp.transpose(P)
-    proj = w * (Dm_inv * PT)
+    sd0 = sigma_proj_d[0]
+    sd1 = sigma_proj_d[1]
+    sd2 = sigma_proj_d[2]
+    US_d = wp.mat33d(
+        U_d[0, 0] * sd0,
+        U_d[0, 1] * sd1,
+        U_d[0, 2] * sd2,
+        U_d[1, 0] * sd0,
+        U_d[1, 1] * sd1,
+        U_d[1, 2] * sd2,
+        U_d[2, 0] * sd0,
+        U_d[2, 1] * sd1,
+        U_d[2, 2] * sd2,
+    )
+    P_d = US_d * wp.transpose(V_d)
+
+    Dm_inv_d = wp.mat33d(
+        wp.float64(Dm_inv[0, 0]),
+        wp.float64(Dm_inv[0, 1]),
+        wp.float64(Dm_inv[0, 2]),
+        wp.float64(Dm_inv[1, 0]),
+        wp.float64(Dm_inv[1, 1]),
+        wp.float64(Dm_inv[1, 2]),
+        wp.float64(Dm_inv[2, 0]),
+        wp.float64(Dm_inv[2, 1]),
+        wp.float64(Dm_inv[2, 2]),
+    )
+    w_d = wp.float64(tet_weight[t])
+    proj_d = w_d * (Dm_inv_d * wp.transpose(P_d))
 
     # Scatter stencil (RealSim PDTetrahedronEnergy.cpp:191-194):
     #   rhs[t[0]] += -proj.row(0) - proj.row(1) - proj.row(2)
     #   rhs[t[1]] += proj.row(0)
     #   rhs[t[2]] += proj.row(1)
     #   rhs[t[3]] += proj.row(2)
-    row0 = wp.vec3(proj[0, 0], proj[0, 1], proj[0, 2])
-    row1 = wp.vec3(proj[1, 0], proj[1, 1], proj[1, 2])
-    row2 = wp.vec3(proj[2, 0], proj[2, 1], proj[2, 2])
+    row0 = wp.vec3(wp.float32(proj_d[0, 0]), wp.float32(proj_d[0, 1]), wp.float32(proj_d[0, 2]))
+    row1 = wp.vec3(wp.float32(proj_d[1, 0]), wp.float32(proj_d[1, 1]), wp.float32(proj_d[1, 2]))
+    row2 = wp.vec3(wp.float32(proj_d[2, 0]), wp.float32(proj_d[2, 1]), wp.float32(proj_d[2, 2]))
     wp.atomic_add(rhs, i0, -(row0 + row1 + row2))
     wp.atomic_add(rhs, i1, row0)
     wp.atomic_add(rhs, i2, row1)
@@ -619,33 +737,56 @@ def project_stretching_corotational_tet_compute_kernel(
     Dm_inv = tet_rest_inv[t]
     F = Ds * Dm_inv
 
-    U, sigma, V = wp.svd3(F)
-
-    sigma_proj = project_corotational_sigma3d(wp.vec3(sigma[0], sigma[1], sigma[2]), mu, lam)
-
-    s0 = sigma_proj[0]
-    s1 = sigma_proj[1]
-    s2 = sigma_proj[2]
-    US = wp.mat33(
-        U[0, 0] * s0,
-        U[0, 1] * s1,
-        U[0, 2] * s2,
-        U[1, 0] * s0,
-        U[1, 1] * s1,
-        U[1, 2] * s2,
-        U[2, 0] * s0,
-        U[2, 1] * s1,
-        U[2, 2] * s2,
+    # fp64 SVD + sigma projection + P reconstruction (see scatter variant).
+    F_d = wp.mat33d(
+        wp.float64(F[0, 0]),
+        wp.float64(F[0, 1]),
+        wp.float64(F[0, 2]),
+        wp.float64(F[1, 0]),
+        wp.float64(F[1, 1]),
+        wp.float64(F[1, 2]),
+        wp.float64(F[2, 0]),
+        wp.float64(F[2, 1]),
+        wp.float64(F[2, 2]),
     )
-    P = US * wp.transpose(V)
+    U_d, sigma_d, V_d = wp.svd3(F_d)
+    sigma_proj_d = project_corotational_sigma3d_d(
+        wp.vec3d(sigma_d[0], sigma_d[1], sigma_d[2]), wp.float64(mu), wp.float64(lam)
+    )
 
-    w = tet_weight[t]
-    PT = wp.transpose(P)
-    proj = w * (Dm_inv * PT)
+    sd0 = sigma_proj_d[0]
+    sd1 = sigma_proj_d[1]
+    sd2 = sigma_proj_d[2]
+    US_d = wp.mat33d(
+        U_d[0, 0] * sd0,
+        U_d[0, 1] * sd1,
+        U_d[0, 2] * sd2,
+        U_d[1, 0] * sd0,
+        U_d[1, 1] * sd1,
+        U_d[1, 2] * sd2,
+        U_d[2, 0] * sd0,
+        U_d[2, 1] * sd1,
+        U_d[2, 2] * sd2,
+    )
+    P_d = US_d * wp.transpose(V_d)
 
-    row0 = wp.vec3(proj[0, 0], proj[0, 1], proj[0, 2])
-    row1 = wp.vec3(proj[1, 0], proj[1, 1], proj[1, 2])
-    row2 = wp.vec3(proj[2, 0], proj[2, 1], proj[2, 2])
+    Dm_inv_d = wp.mat33d(
+        wp.float64(Dm_inv[0, 0]),
+        wp.float64(Dm_inv[0, 1]),
+        wp.float64(Dm_inv[0, 2]),
+        wp.float64(Dm_inv[1, 0]),
+        wp.float64(Dm_inv[1, 1]),
+        wp.float64(Dm_inv[1, 2]),
+        wp.float64(Dm_inv[2, 0]),
+        wp.float64(Dm_inv[2, 1]),
+        wp.float64(Dm_inv[2, 2]),
+    )
+    w_d = wp.float64(tet_weight[t])
+    proj_d = w_d * (Dm_inv_d * wp.transpose(P_d))
+
+    row0 = wp.vec3(wp.float32(proj_d[0, 0]), wp.float32(proj_d[0, 1]), wp.float32(proj_d[0, 2]))
+    row1 = wp.vec3(wp.float32(proj_d[1, 0]), wp.float32(proj_d[1, 1]), wp.float32(proj_d[1, 2]))
+    row2 = wp.vec3(wp.float32(proj_d[2, 0]), wp.float32(proj_d[2, 1]), wp.float32(proj_d[2, 2]))
     contributions[t, 0] = -(row0 + row1 + row2)
     contributions[t, 1] = row0
     contributions[t, 2] = row1
@@ -1229,6 +1370,71 @@ def project_neohookean_sigma3d_lbfgs(
 
 
 @wp.func
+def project_neohookean_sigma3d_d(sigma: wp.vec3d, mu: wp.float64, lam: wp.float64) -> wp.vec3d:
+    """fp64 variant of :func:`project_neohookean_sigma3d` (5-iter Newton).
+
+    Lifts the per-iteration gradient/Hessian solve to ``wp.float64`` for the
+    Tet NH ``newton5`` projection path. Paired with an fp64 SVD of F so that
+    high-condition-number ``F`` (e.g. extreme tail-tip stretching) does not
+    lose accuracy through fp32 division by tiny singular values.
+    """
+    eps = wp.float64(1.0e-6)
+    k = wp.float64(2.0) * mu
+
+    s0 = wp.max(sigma[0], eps)
+    s1 = wp.max(sigma[1], eps)
+    s2 = wp.max(sigma[2], eps)
+    sigma0_0 = s0
+    sigma0_1 = s1
+    sigma0_2 = s2
+
+    for _i in range(5):
+        s0 = wp.max(s0, eps)
+        s1 = wp.max(s1, eps)
+        s2 = wp.max(s2, eps)
+
+        J = s0 * s1 * s2
+        log_J = wp.log(J)
+        inv0 = wp.float64(1.0) / s0
+        inv1 = wp.float64(1.0) / s1
+        inv2 = wp.float64(1.0) / s2
+
+        g0 = mu * (s0 - inv0) + lam * log_J * inv0 + k * (s0 - sigma0_0)
+        g1 = mu * (s1 - inv1) + lam * log_J * inv1 + k * (s1 - sigma0_1)
+        g2 = mu * (s2 - inv2) + lam * log_J * inv2 + k * (s2 - sigma0_2)
+
+        diag_factor = mu + lam - lam * log_J
+        H00 = mu + diag_factor * inv0 * inv0 + k
+        H11 = mu + diag_factor * inv1 * inv1 + k
+        H22 = mu + diag_factor * inv2 * inv2 + k
+        H01 = lam * inv0 * inv1
+        H02 = lam * inv0 * inv2
+        H12 = lam * inv1 * inv2
+
+        C00 = H11 * H22 - H12 * H12
+        C11 = H00 * H22 - H02 * H02
+        C22 = H00 * H11 - H01 * H01
+        C01 = -(H01 * H22 - H12 * H02)
+        C02 = H01 * H12 - H11 * H02
+        C12 = -(H00 * H12 - H01 * H02)
+
+        det_H = H00 * C00 + H01 * C01 + H02 * C02
+
+        dx0 = (C00 * g0 + C01 * g1 + C02 * g2) / det_H
+        dx1 = (C01 * g0 + C11 * g1 + C12 * g2) / det_H
+        dx2 = (C02 * g0 + C12 * g1 + C22 * g2) / det_H
+
+        s0 = s0 - dx0
+        s1 = s1 - dx1
+        s2 = s2 - dx2
+
+    s0 = wp.max(s0, eps)
+    s1 = wp.max(s1, eps)
+    s2 = wp.max(s2, eps)
+    return wp.vec3d(s0, s1, s2)
+
+
+@wp.func
 def project_neohookean_sigma3d(sigma: wp.vec3, mu: float, lam: float) -> wp.vec3:
     """Project SVD singular values to 3D Neo-Hookean PD equilibrium via 5 Newton iterations.
 
@@ -1380,37 +1586,58 @@ def project_stretching_neohookean_tet_kernel(
     Dm_inv = tet_rest_inv[t]
     F = Ds * Dm_inv
 
-    U, sigma, V = wp.svd3(F)
-
-    # Neo-Hookean projection: 5-iter Newton solve on singular values.
-    sigma_proj = project_neohookean_sigma3d(wp.vec3(sigma[0], sigma[1], sigma[2]), mu, lam)
-
-    # Reconstruct P = U * diag(sigma_proj) * V^T  (3x3).
-    s0 = sigma_proj[0]
-    s1 = sigma_proj[1]
-    s2 = sigma_proj[2]
-    US = wp.mat33(
-        U[0, 0] * s0,
-        U[0, 1] * s1,
-        U[0, 2] * s2,
-        U[1, 0] * s0,
-        U[1, 1] * s1,
-        U[1, 2] * s2,
-        U[2, 0] * s0,
-        U[2, 1] * s1,
-        U[2, 2] * s2,
+    # fp64 SVD + 5-iter Newton + P reconstruction. Mirrors RealSim
+    # signedEigenSVD (SVD.cpp:7-29). Demoted to fp32 at the rhs scatter.
+    F_d = wp.mat33d(
+        wp.float64(F[0, 0]),
+        wp.float64(F[0, 1]),
+        wp.float64(F[0, 2]),
+        wp.float64(F[1, 0]),
+        wp.float64(F[1, 1]),
+        wp.float64(F[1, 2]),
+        wp.float64(F[2, 0]),
+        wp.float64(F[2, 1]),
+        wp.float64(F[2, 2]),
     )
-    P = US * wp.transpose(V)
+    U_d, sigma_d, V_d = wp.svd3(F_d)
+    sigma_proj_d = project_neohookean_sigma3d_d(
+        wp.vec3d(sigma_d[0], sigma_d[1], sigma_d[2]), wp.float64(mu), wp.float64(lam)
+    )
 
-    # proj = w * Dm_inv * P^T  (3x3)
-    w = tet_weight[t]
-    PT = wp.transpose(P)
-    proj = w * (Dm_inv * PT)
+    sd0 = sigma_proj_d[0]
+    sd1 = sigma_proj_d[1]
+    sd2 = sigma_proj_d[2]
+    US_d = wp.mat33d(
+        U_d[0, 0] * sd0,
+        U_d[0, 1] * sd1,
+        U_d[0, 2] * sd2,
+        U_d[1, 0] * sd0,
+        U_d[1, 1] * sd1,
+        U_d[1, 2] * sd2,
+        U_d[2, 0] * sd0,
+        U_d[2, 1] * sd1,
+        U_d[2, 2] * sd2,
+    )
+    P_d = US_d * wp.transpose(V_d)
+
+    Dm_inv_d = wp.mat33d(
+        wp.float64(Dm_inv[0, 0]),
+        wp.float64(Dm_inv[0, 1]),
+        wp.float64(Dm_inv[0, 2]),
+        wp.float64(Dm_inv[1, 0]),
+        wp.float64(Dm_inv[1, 1]),
+        wp.float64(Dm_inv[1, 2]),
+        wp.float64(Dm_inv[2, 0]),
+        wp.float64(Dm_inv[2, 1]),
+        wp.float64(Dm_inv[2, 2]),
+    )
+    w_d = wp.float64(tet_weight[t])
+    proj_d = w_d * (Dm_inv_d * wp.transpose(P_d))
 
     # Scatter stencil.
-    row0 = wp.vec3(proj[0, 0], proj[0, 1], proj[0, 2])
-    row1 = wp.vec3(proj[1, 0], proj[1, 1], proj[1, 2])
-    row2 = wp.vec3(proj[2, 0], proj[2, 1], proj[2, 2])
+    row0 = wp.vec3(wp.float32(proj_d[0, 0]), wp.float32(proj_d[0, 1]), wp.float32(proj_d[0, 2]))
+    row1 = wp.vec3(wp.float32(proj_d[1, 0]), wp.float32(proj_d[1, 1]), wp.float32(proj_d[1, 2]))
+    row2 = wp.vec3(wp.float32(proj_d[2, 0]), wp.float32(proj_d[2, 1]), wp.float32(proj_d[2, 2]))
     wp.atomic_add(rhs, i0, -(row0 + row1 + row2))
     wp.atomic_add(rhs, i1, row0)
     wp.atomic_add(rhs, i2, row1)
@@ -1472,33 +1699,56 @@ def project_stretching_neohookean_tet_compute_kernel(
     Dm_inv = tet_rest_inv[t]
     F = Ds * Dm_inv
 
-    U, sigma, V = wp.svd3(F)
-
-    sigma_proj = project_neohookean_sigma3d(wp.vec3(sigma[0], sigma[1], sigma[2]), mu, lam)
-
-    s0 = sigma_proj[0]
-    s1 = sigma_proj[1]
-    s2 = sigma_proj[2]
-    US = wp.mat33(
-        U[0, 0] * s0,
-        U[0, 1] * s1,
-        U[0, 2] * s2,
-        U[1, 0] * s0,
-        U[1, 1] * s1,
-        U[1, 2] * s2,
-        U[2, 0] * s0,
-        U[2, 1] * s1,
-        U[2, 2] * s2,
+    # fp64 SVD + 5-iter Newton + P reconstruction (see scatter variant).
+    F_d = wp.mat33d(
+        wp.float64(F[0, 0]),
+        wp.float64(F[0, 1]),
+        wp.float64(F[0, 2]),
+        wp.float64(F[1, 0]),
+        wp.float64(F[1, 1]),
+        wp.float64(F[1, 2]),
+        wp.float64(F[2, 0]),
+        wp.float64(F[2, 1]),
+        wp.float64(F[2, 2]),
     )
-    P = US * wp.transpose(V)
+    U_d, sigma_d, V_d = wp.svd3(F_d)
+    sigma_proj_d = project_neohookean_sigma3d_d(
+        wp.vec3d(sigma_d[0], sigma_d[1], sigma_d[2]), wp.float64(mu), wp.float64(lam)
+    )
 
-    w = tet_weight[t]
-    PT = wp.transpose(P)
-    proj = w * (Dm_inv * PT)
+    sd0 = sigma_proj_d[0]
+    sd1 = sigma_proj_d[1]
+    sd2 = sigma_proj_d[2]
+    US_d = wp.mat33d(
+        U_d[0, 0] * sd0,
+        U_d[0, 1] * sd1,
+        U_d[0, 2] * sd2,
+        U_d[1, 0] * sd0,
+        U_d[1, 1] * sd1,
+        U_d[1, 2] * sd2,
+        U_d[2, 0] * sd0,
+        U_d[2, 1] * sd1,
+        U_d[2, 2] * sd2,
+    )
+    P_d = US_d * wp.transpose(V_d)
 
-    row0 = wp.vec3(proj[0, 0], proj[0, 1], proj[0, 2])
-    row1 = wp.vec3(proj[1, 0], proj[1, 1], proj[1, 2])
-    row2 = wp.vec3(proj[2, 0], proj[2, 1], proj[2, 2])
+    Dm_inv_d = wp.mat33d(
+        wp.float64(Dm_inv[0, 0]),
+        wp.float64(Dm_inv[0, 1]),
+        wp.float64(Dm_inv[0, 2]),
+        wp.float64(Dm_inv[1, 0]),
+        wp.float64(Dm_inv[1, 1]),
+        wp.float64(Dm_inv[1, 2]),
+        wp.float64(Dm_inv[2, 0]),
+        wp.float64(Dm_inv[2, 1]),
+        wp.float64(Dm_inv[2, 2]),
+    )
+    w_d = wp.float64(tet_weight[t])
+    proj_d = w_d * (Dm_inv_d * wp.transpose(P_d))
+
+    row0 = wp.vec3(wp.float32(proj_d[0, 0]), wp.float32(proj_d[0, 1]), wp.float32(proj_d[0, 2]))
+    row1 = wp.vec3(wp.float32(proj_d[1, 0]), wp.float32(proj_d[1, 1]), wp.float32(proj_d[1, 2]))
+    row2 = wp.vec3(wp.float32(proj_d[2, 0]), wp.float32(proj_d[2, 1]), wp.float32(proj_d[2, 2]))
     contributions[t, 0] = -(row0 + row1 + row2)
     contributions[t, 1] = row0
     contributions[t, 2] = row1
@@ -1521,9 +1771,11 @@ def project_stretching_neohookean_tet_compute_kernel_lbfgs(
 
     Same scatter math as the Newton variant. The local sigma projection is the
     RealSim-faithful LBFGS solver (:func:`project_neohookean_sigma3d_lbfgs`)
-    instead of FBA's 5-iter Newton. SVD inputs are cast fp32 -> fp64 before
-    LBFGS; the projected sigma is cast back to fp32 for the P reconstruction
-    and scatter, matching the existing kernel's mixed-precision contract.
+    instead of FBA's 5-iter Newton. SVD, LBFGS, sigma projection and P
+    reconstruction all run in ``wp.float64`` -- mirroring RealSim's
+    ``signedEigenSVD`` (``SVD.cpp:7-29``) + ``mcl::optlib::LBFGS<double,3>``
+    contract. Final ``proj`` is demoted to fp32 only at the contributions
+    write boundary (``_rhs`` itself is fp32).
     """
     t = wp.tid()
     i0 = tet_indices[4 * t + 0]
@@ -1553,37 +1805,59 @@ def project_stretching_neohookean_tet_compute_kernel_lbfgs(
     Dm_inv = tet_rest_inv[t]
     F = Ds * Dm_inv
 
-    U, sigma, V = wp.svd3(F)
+    # fp64 SVD. wp.svd3 accepts mat33d and returns (mat33d, vec3d, mat33d).
+    F_d = wp.mat33d(
+        wp.float64(F[0, 0]),
+        wp.float64(F[0, 1]),
+        wp.float64(F[0, 2]),
+        wp.float64(F[1, 0]),
+        wp.float64(F[1, 1]),
+        wp.float64(F[1, 2]),
+        wp.float64(F[2, 0]),
+        wp.float64(F[2, 1]),
+        wp.float64(F[2, 2]),
+    )
+    U_d, sigma_d, V_d = wp.svd3(F_d)
 
-    # LBFGS in fp64.
-    sigma_init = wp.vec3d(wp.float64(sigma[0]), wp.float64(sigma[1]), wp.float64(sigma[2]))
+    # LBFGS in fp64 on fp64 SVD output.
     mu_d = wp.float64(mu)
     lam_d = wp.float64(lam)
-    sigma_proj_d = project_neohookean_sigma3d_lbfgs(sigma_init, mu_d, lam_d)
-    s0 = wp.float32(sigma_proj_d[0])
-    s1 = wp.float32(sigma_proj_d[1])
-    s2 = wp.float32(sigma_proj_d[2])
+    sigma_proj_d = project_neohookean_sigma3d_lbfgs(wp.vec3d(sigma_d[0], sigma_d[1], sigma_d[2]), mu_d, lam_d)
 
-    US = wp.mat33(
-        U[0, 0] * s0,
-        U[0, 1] * s1,
-        U[0, 2] * s2,
-        U[1, 0] * s0,
-        U[1, 1] * s1,
-        U[1, 2] * s2,
-        U[2, 0] * s0,
-        U[2, 1] * s1,
-        U[2, 2] * s2,
+    # Reconstruct P = U diag(sigma_proj) V^T in fp64.
+    sd0 = sigma_proj_d[0]
+    sd1 = sigma_proj_d[1]
+    sd2 = sigma_proj_d[2]
+    US_d = wp.mat33d(
+        U_d[0, 0] * sd0,
+        U_d[0, 1] * sd1,
+        U_d[0, 2] * sd2,
+        U_d[1, 0] * sd0,
+        U_d[1, 1] * sd1,
+        U_d[1, 2] * sd2,
+        U_d[2, 0] * sd0,
+        U_d[2, 1] * sd1,
+        U_d[2, 2] * sd2,
     )
-    P = US * wp.transpose(V)
+    P_d = US_d * wp.transpose(V_d)
 
-    w = tet_weight[t]
-    PT = wp.transpose(P)
-    proj = w * (Dm_inv * PT)
+    Dm_inv_d = wp.mat33d(
+        wp.float64(Dm_inv[0, 0]),
+        wp.float64(Dm_inv[0, 1]),
+        wp.float64(Dm_inv[0, 2]),
+        wp.float64(Dm_inv[1, 0]),
+        wp.float64(Dm_inv[1, 1]),
+        wp.float64(Dm_inv[1, 2]),
+        wp.float64(Dm_inv[2, 0]),
+        wp.float64(Dm_inv[2, 1]),
+        wp.float64(Dm_inv[2, 2]),
+    )
+    w_d = wp.float64(tet_weight[t])
+    proj_d = w_d * (Dm_inv_d * wp.transpose(P_d))
 
-    row0 = wp.vec3(proj[0, 0], proj[0, 1], proj[0, 2])
-    row1 = wp.vec3(proj[1, 0], proj[1, 1], proj[1, 2])
-    row2 = wp.vec3(proj[2, 0], proj[2, 1], proj[2, 2])
+    row0 = wp.vec3(wp.float32(proj_d[0, 0]), wp.float32(proj_d[0, 1]), wp.float32(proj_d[0, 2]))
+    row1 = wp.vec3(wp.float32(proj_d[1, 0]), wp.float32(proj_d[1, 1]), wp.float32(proj_d[1, 2]))
+    row2 = wp.vec3(wp.float32(proj_d[2, 0]), wp.float32(proj_d[2, 1]), wp.float32(proj_d[2, 2]))
     contributions[t, 0] = -(row0 + row1 + row2)
     contributions[t, 1] = row0
     contributions[t, 2] = row1
