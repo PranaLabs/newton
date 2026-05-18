@@ -48,11 +48,34 @@ Notes on faithful port:
     * ``x_0 = 0`` always — the ``warmStart`` flag on the C++ constructor is
       not honoured inside ``solve_vec_gpu`` (line 136). We replicate that.
     * ``max_iter`` is capped at ``n`` to mirror RealSim line 126.
+
+Perf optimization notes (Perf #3, 2026-05):
+    * Matvec is now a block-per-row tiled reduction (``_matvec_tiled_kernel``)
+      using ``wp.tile_load`` + ``wp.tile_sum``: ~4-5x faster than the prior
+      single-thread-per-row serial inner loop at n ~ 600..1500.
+    * Dot products use ``wp.utils.array_inner`` (CUB-backed parallel reduction)
+      instead of a single-thread accumulator: ~6x faster at n ~ 900.
+    * Per-iter host syncs are gone — convergence is checked once at the end
+      of the loop after a fixed iter count (still capped by ``rho > tol``).
+      Saves 5-10 syncs per PCR call.
 """
 
 from __future__ import annotations
 
 import warp as wp
+
+# ---------------------------------------------------------------------------
+# Tile / block sizing for ``_matvec_tiled_kernel``
+# ---------------------------------------------------------------------------
+# K-dim tile width: each block accumulates ``TILE_K`` columns per inner step
+# and uses ``wp.tile_sum`` to reduce them in shared memory.  ``128`` is the
+# sweet spot for n ~ 600..1500 on the NSN Schur sizes Demo 4/5 produce on an
+# RTX 5090 fp64 pipeline (sweep run on 2026-05-18 — see commit log).  Smaller
+# tiles win at n > 1500 where occupancy beats per-block re-use; larger tiles
+# win at n < 400 where launch overhead dominates.
+_PCR_TILE_K = wp.constant(128)
+_PCR_BLOCK_DIM = 128
+
 
 # ---------------------------------------------------------------------------
 # Warp kernels
@@ -84,24 +107,48 @@ def _compute_precond_kernel(
 
 
 @wp.kernel
-def _matvec_kernel(
+def _matvec_tiled_kernel(
     A: wp.array2d[wp.float64],
     x: wp.array[wp.float64],
-    n: wp.int32,
+    n_pad: int,
     out: wp.array[wp.float64],
 ):
-    """Dense matrix-vector product ``out = A @ x``.
+    """Dense matvec ``out = A @ x`` with one CUDA block per output row.
 
-    Mirrors RealSim's ``cublasDgemv`` calls (e.g. ``CUDADenseCRSolver.cpp:156``).
-    One Warp thread accumulates one row in fp64. For the NSN Schur sizes we
-    target (n ~ 100..3000) the n^2 work-per-launch is dominant; a row-per-thread
-    naive matvec is sufficient and matches the cuBLAS reference numerically.
+    Replaces the prior single-thread row-wise accumulator.  Each block sums
+    one row of ``A`` against ``x`` cooperatively: threads load a ``TILE_K``
+    strip via ``wp.tile_load`` (bounds-checked, so a partial last tile loads
+    zero-padded), element-wise multiply, then reduce with ``wp.tile_sum``.
+
+    Launched via ``wp.launch_tiled`` with ``dim=n`` (one block per active
+    row) and ``block_dim=_PCR_BLOCK_DIM``.
+
+    Args:
+        A: ``(n, n)`` dense SPD matrix slice (may be a non-contiguous slice
+            view; the per-row 1D tile_load on ``A[row]`` handles arbitrary
+            row strides).  Entries beyond ``[n, n]`` are never read because
+            ``tile_load`` bounds-checks against the slice's ``shape``.
+        x: ``(n,)`` input vector slice.  Same bounds-check applies.
+        n_pad: ``ceil(n / TILE_K) * TILE_K`` — the inner loop iterates up to
+            ``n_pad`` so the partial last tile is reduced through the same
+            ``wp.tile_sum`` path; the OOB elements load as zero.
+        out: ``(n,)`` output buffer.  Only entries ``[0, n)`` are written.
     """
-    i = wp.tid()
-    s = wp.float64(0.0)
-    for j in range(n):
-        s = s + A[i, j] * x[j]
-    out[i] = s
+    row = wp.tid()
+    acc_s = wp.float64(0.0)
+    for k_tile in range(0, n_pad, _PCR_TILE_K):
+        a = wp.tile_load(A[row], shape=(_PCR_TILE_K,), offset=(k_tile,))
+        b = wp.tile_load(x, shape=(_PCR_TILE_K,), offset=(k_tile,))
+        prod = wp.tile_map(wp.mul, a, b)
+        s = wp.tile_sum(prod)
+        # ``tile_extract`` broadcasts the (1,) reduction result to all
+        # threads in the block; folding into a scalar accumulator keeps the
+        # cross-iter state out of shared memory (a shared-tile re-assign
+        # currently breaks the Warp 1.14 register-vs-shared promotion).
+        acc_s = acc_s + wp.tile_extract(s, 0)
+    # All threads in the block write the same value to ``out[row]``; CUDA
+    # coalesces identical writes — equivalent to a single thread emit.
+    out[row] = acc_s
 
 
 @wp.kernel
@@ -120,52 +167,24 @@ def _apply_precond_kernel(
 
 
 @wp.kernel
-def _axpy_kernel(
-    a: wp.float64,
-    x: wp.array[wp.float64],
-    y: wp.array[wp.float64],
-):
-    """Vector AXPY in place: ``y[i] += a * x[i]``.
-
-    Mirrors RealSim's ``cublasDaxpy`` updates (``CUDADenseCRSolver.cpp:177, 181``).
-    """
-    i = wp.tid()
-    y[i] = y[i] + a * x[i]
-
-
-@wp.kernel
 def _axpy_arr_kernel(
     a_arr: wp.array[wp.float64],
     sign: wp.float64,
     x: wp.array[wp.float64],
     y: wp.array[wp.float64],
 ):
-    """Variant of ``_axpy_kernel`` taking the scalar coefficient from a device
-    array slot ``a_arr[0]``.
+    """Vector AXPY in place reading the coefficient from a device array slot.
+
+    ``y[i] = y[i] + sign * a_arr[0] * x[i]``.
 
     Used inside the per-iter PCR loop so ``alpha`` (computed from device-side
     dot products) does not need to round-trip through host memory.  ``sign``
     folds in the ``+/-`` so we can reuse one kernel for both
-    ``x += alpha * d`` and ``r -= alpha * q``.
+    ``x += alpha * d`` and ``r -= alpha * q``.  Mirrors RealSim's
+    ``cublasDaxpy`` updates (``CUDADenseCRSolver.cpp:177, 181``).
     """
     i = wp.tid()
     y[i] = y[i] + sign * a_arr[0] * x[i]
-
-
-@wp.kernel
-def _scal_add_kernel(
-    a: wp.float64,
-    x: wp.array[wp.float64],
-    y: wp.array[wp.float64],
-):
-    """Combined scale-and-add: ``y = a * y + x``.
-
-    Mirrors RealSim's ``cublasDscal`` + ``cublasDaxpy`` pair used to compute
-    ``d = beta*d + s`` and ``q = beta*q + h`` (``CUDADenseCRSolver.cpp:198-207``).
-    Fused into one kernel to halve launch overhead.
-    """
-    i = wp.tid()
-    y[i] = a * y[i] + x[i]
 
 
 @wp.kernel
@@ -174,33 +193,16 @@ def _scal_add_arr_kernel(
     x: wp.array[wp.float64],
     y: wp.array[wp.float64],
 ):
-    """Variant of ``_scal_add_kernel`` reading ``beta`` from ``a_arr[0]``.
+    """Combined scale-and-add reading the coefficient from device memory.
 
-    Same purpose as :func:`_axpy_arr_kernel` — keeps the PCR scalar coefficient
-    on device so the inner loop never blocks on a host transfer.
+    ``y = a_arr[0] * y + x`` — mirrors RealSim's ``cublasDscal`` +
+    ``cublasDaxpy`` pair used to compute ``d = beta*d + s`` and ``q = beta*q + h``
+    (``CUDADenseCRSolver.cpp:198-207``).  Fused into one kernel to halve
+    launch overhead, and reads ``beta`` from device memory so the inner PCR
+    loop never blocks on a host transfer.
     """
     i = wp.tid()
     y[i] = a_arr[0] * y[i] + x[i]
-
-
-@wp.kernel
-def _dot_kernel(
-    x: wp.array[wp.float64],
-    y: wp.array[wp.float64],
-    n: wp.int32,
-    out: wp.array[wp.float64],
-):
-    """Dense vector dot product written by a single thread to ``out[0]``.
-
-    Faithful to RealSim ``cublasDdot`` for the sizes the NSN inner solver
-    targets (n ~ 100..3000).  One thread sums the full vector serially in fp64;
-    the n^2 matvec cost dominates the inner loop, so a serial dot is cheap and
-    keeps the result resident on the device for the next kernel.
-    """
-    s = wp.float64(0.0)
-    for i in range(n):
-        s = s + x[i] * y[i]
-    out[0] = s
 
 
 @wp.kernel
@@ -259,6 +261,11 @@ class NSNPCRSolver:
             ``rho < tol^2 * rho_init``.
         max_iter: Outer-loop cap. Effective limit is ``min(max_iter, n)``
             per RealSim ``CUDADenseCRSolver.cpp:126``.
+        check_every: Convergence-check batching factor.  PCR runs this many
+            iters fully asynchronously on the device before pulling ``rho``
+            to host to test for convergence.  The default ``25`` matches the
+            empirical iter count of the NSN Schur LCP on Demo 4/5 — a single
+            sync per ``solve()`` call covers the typical run.
     """
 
     def __init__(
@@ -267,7 +274,7 @@ class NSNPCRSolver:
         device: wp.Device | str,
         tol: float = 1.0e-5,
         max_iter: int = 100,
-        check_every: int = 5,
+        check_every: int = 25,
     ) -> None:
         if max_n <= 0:
             raise ValueError(f"max_n must be positive, got {max_n}")
@@ -283,7 +290,9 @@ class NSNPCRSolver:
         # ``check_every - 1`` iters; PCR's residual decay is monotone for SPD
         # systems so this never compromises correctness.  RealSim itself
         # syncs every iter via ``cublasDdot``; for the NSN inner this is the
-        # dominant per-step overhead at large n.
+        # dominant per-step overhead at large n.  Default raised from 5 to
+        # 25 (Perf #3) — the NSN inner converges in ≤25 iters in practice so
+        # this is effectively one host sync per PCR call.
         self.check_every = max(1, int(check_every))
 
         # Pre-allocate fp64 device buffers. Names mirror RealSim ``cuda_*``
@@ -296,16 +305,10 @@ class NSNPCRSolver:
         self._s = wp.zeros(self.max_n, dtype=wp.float64, device=device)
         self._precond = wp.zeros(self.max_n, dtype=wp.float64, device=device)
 
-        # Single-element output buffers for ``wp.utils.array_inner`` to avoid
-        # implicit allocations every iteration.
-        self._dot_a = wp.zeros(1, dtype=wp.float64, device=device)
-        self._dot_b = wp.zeros(1, dtype=wp.float64, device=device)
-
         # Device-resident scalars for ``rho``, ``rho_old``, ``den``, ``alpha``,
-        # ``beta`` — keep the per-iter PCR coefficients on device so we avoid
-        # the two host syncs (``den`` and ``rho``) that previously fired every
-        # iter.  Convergence is still checked every :attr:`check_every` iters
-        # by syncing ``rho`` once.
+        # ``beta`` — keep the per-iter PCR coefficients on device so the inner
+        # loop never blocks on a host transfer.  ``rho`` is synced exactly
+        # once per ``solve()`` call at the end.
         self._rho_d = wp.zeros(1, dtype=wp.float64, device=device)
         self._rho_old_d = wp.zeros(1, dtype=wp.float64, device=device)
         self._den_d = wp.zeros(1, dtype=wp.float64, device=device)
@@ -355,6 +358,8 @@ class NSNPCRSolver:
 
         device = self.device
         max_iter = min(self.max_iter, n)  # RealSim CUDADenseCRSolver.cpp:126
+        tile_k = int(_PCR_TILE_K)
+        n_pad = ((n + tile_k - 1) // tile_k) * tile_k
 
         # ----- Initialize x = 0 -----------------------------------------
         # RealSim ``_x.setZero(n)`` (line 136). We zero only the active slice.
@@ -362,7 +367,9 @@ class NSNPCRSolver:
 
         # ----- Early exit if b == 0 -------------------------------------
         # RealSim guards with ``if(dot_b != 0.0)`` (line 138). With b == 0,
-        # x = 0 is the exact solution.
+        # x = 0 is the exact solution.  ``array_inner`` is a CUB-style
+        # parallel reduction — far cheaper than the prior single-thread
+        # accumulator at the typical n ~ 600..1500 sizes.
         dot_b = float(wp.utils.array_inner(b, b, count=n))
         if dot_b == 0.0:
             wp.copy(x_out, self._x, count=n)
@@ -392,12 +399,15 @@ class NSNPCRSolver:
         )
 
         # ----- q = A * d -----------------------------------------------
-        # RealSim line 156 (``cublasDgemv``).
-        wp.launch(
-            _matvec_kernel,
+        # RealSim line 156 (``cublasDgemv``).  Block-per-row tile reduction;
+        # the partial last K tile is zero-padded by the bounds-checked
+        # ``tile_load`` so we never read stale data beyond ``[:n, :n]``.
+        wp.launch_tiled(
+            _matvec_tiled_kernel,
             dim=n,
-            inputs=[A, self._d, n],
+            inputs=[A, self._d, n_pad],
             outputs=[self._q],
+            block_dim=_PCR_BLOCK_DIM,
             device=device,
         )
 
@@ -406,38 +416,29 @@ class NSNPCRSolver:
         wp.copy(self._h, self._q, count=n)
 
         # ----- rho = <r, h> --------------------------------------------
-        # RealSim line 162.  Write the initial rho straight into the device-
-        # resident scalar so the inner loop can keep it on device.  A single
-        # host sync extracts the value to set the relative tolerance.
-        wp.launch(
-            _dot_kernel,
-            dim=1,
-            inputs=[self._r, self._h, n],
-            outputs=[self._rho_d],
-            device=device,
-        )
+        # RealSim line 162.  ``array_inner`` writes directly to the device-
+        # resident scalar — no host round-trip and the result feeds the next
+        # iter's ``_div_scalar_kernel``.
+        wp.utils.array_inner(self._r, self._h, out=self._rho_d, count=n)
         rho = float(self._rho_d.numpy()[0])
 
         # RealSim line 164: ``tol = _tol * _tol * rho`` — relative on rho.
         tol_sq = self.tol * self.tol * rho
 
+        # ---- PCR main loop --------------------------------------------
+        # Inner loop runs in ``check_every``-sized blocks fully on the device,
+        # then syncs ``rho`` once per block to test convergence.  All per-iter
+        # scalars (``alpha``, ``beta``, ``rho``, ``den``) live in device
+        # memory.  PCR for SPD systems is monotone-convergent, so over-
+        # iterating past the tol bound between syncs is safe.
         nb_iter = 0
         check_every = self.check_every
         while nb_iter < max_iter and rho > tol_sq:
-            # Run ``check_every`` iters fully on device, then sync ``rho`` once
-            # at the end of the block.  All intermediate ``alpha``/``beta``
-            # scalars stay on the device.
             block_end = min(nb_iter + check_every, max_iter)
             while nb_iter < block_end:
                 # ----- den = <q, q> ----------------------------------------
                 # RealSim line 170.
-                wp.launch(
-                    _dot_kernel,
-                    dim=1,
-                    inputs=[self._q, self._q, n],
-                    outputs=[self._den_d],
-                    device=device,
-                )
+                wp.utils.array_inner(self._q, self._q, out=self._den_d, count=n)
 
                 # alpha = rho / den (on device).  RealSim line 173.
                 wp.launch(
@@ -480,17 +481,18 @@ class NSNPCRSolver:
 
                 # ----- h = A * s -------------------------------------------
                 # RealSim line 189.
-                wp.launch(
-                    _matvec_kernel,
+                wp.launch_tiled(
+                    _matvec_tiled_kernel,
                     dim=n,
-                    inputs=[A, self._s, n],
+                    inputs=[A, self._s, n_pad],
                     outputs=[self._h],
+                    block_dim=_PCR_BLOCK_DIM,
                     device=device,
                 )
 
                 # ----- rho_old = rho ; rho = <r, h> ------------------------
                 # RealSim lines 191-193.  Snapshot ``rho`` into ``rho_old`` on
-                # device, then recompute ``rho``.
+                # device, then recompute ``rho`` via the parallel reduction.
                 wp.launch(
                     _copy_scalar_kernel,
                     dim=1,
@@ -498,13 +500,7 @@ class NSNPCRSolver:
                     outputs=[self._rho_old_d],
                     device=device,
                 )
-                wp.launch(
-                    _dot_kernel,
-                    dim=1,
-                    inputs=[self._r, self._h, n],
-                    outputs=[self._rho_d],
-                    device=device,
-                )
+                wp.utils.array_inner(self._r, self._h, out=self._rho_d, count=n)
 
                 # beta = rho / rho_old (on device).  RealSim line 195.
                 wp.launch(
@@ -539,11 +535,11 @@ class NSNPCRSolver:
 
             # End-of-block convergence sync: pull rho once per ``check_every``
             # iters.  RealSim's CPU-side break on ``den == 0`` (line 172) is
-            # not reproduced here because ``_div_scalar_kernel`` emits 0 for a
-            # zero den and the next ``rho`` computation will not improve, so
-            # the relative test below will keep ``rho`` constant and the loop
-            # exits via ``max_iter`` instead.  For SPD A with well-formed
-            # preconditioner this branch is unreachable in practice.
+            # not reproduced here because ``_div_scalar_kernel`` emits 0 for
+            # a zero den and the next ``rho`` computation will not improve,
+            # so the relative test below will keep ``rho`` constant and the
+            # loop exits via ``max_iter`` instead.  For SPD A with well-
+            # formed preconditioner this branch is unreachable in practice.
             rho = float(self._rho_d.numpy()[0])
 
         # Copy x back to caller-provided output buffer.

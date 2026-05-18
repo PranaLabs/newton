@@ -2169,6 +2169,13 @@ class SolverFBA(SolverBase):
 
         dt_w = wp.float64(dt)
         n_rows_w = wp.int32(M)
+        # Pad M up to the next multiple of the NSN matvec tile width so the
+        # tiled ``compute_penetration_kernel`` / ``compute_nsn_rhs_kernel``
+        # K-loop runs on whole tiles (the bounds-checked ``tile_load`` zero-
+        # pads the partial last tile).
+        tile_k = int(K._NSN_MATVEC_TILE_K)
+        n_rows_pad_w = wp.int32(((M + tile_k - 1) // tile_k) * tile_k)
+        block_dim_nsn = int(K._NSN_MATVEC_BLOCK_DIM)
 
         # Step 7-prep: precond = dt² · max(W_ii, 1e-12) (Stage A).
         wp.launch(
@@ -2181,7 +2188,7 @@ class SolverFBA(SolverBase):
 
         for _ in range(int(max_iters)):
             # Step 7: penetration = -r + dt²·W·(ω·λ).
-            wp.launch(
+            wp.launch_tiled(
                 K.compute_penetration_kernel,
                 dim=M,
                 inputs=[
@@ -2190,9 +2197,11 @@ class SolverFBA(SolverBase):
                     self._nsn_omega_d,
                     self._nsn_lam_d,
                     n_rows_w,
+                    n_rows_pad_w,
                     dt_w,
                 ],
                 outputs=[self._nsn_penetration_d],
+                block_dim=block_dim_nsn,
                 device=device,
             )
 
@@ -2230,7 +2239,7 @@ class SolverFBA(SolverBase):
             )
 
             # Step 8: rhs = (1/dt²) · (h - ω · J·x_corrected).
-            wp.launch(
+            wp.launch_tiled(
                 K.compute_nsn_rhs_kernel,
                 dim=M,
                 inputs=[
@@ -2241,9 +2250,11 @@ class SolverFBA(SolverBase):
                     W_d,
                     self._nsn_lam_d,
                     n_rows_w,
+                    n_rows_pad_w,
                     dt_w,
                 ],
                 outputs=[self._nsn_rhs_d],
+                block_dim=block_dim_nsn,
                 device=device,
             )
 
@@ -2452,6 +2463,9 @@ class SolverFBA(SolverBase):
 
         dt_w = wp.float64(dt)
         n_rows_w = wp.int32(n_rows)
+        tile_k = int(K._NSN_MATVEC_TILE_K)
+        n_rows_pad_w = wp.int32(((n_rows + tile_k - 1) // tile_k) * tile_k)
+        block_dim_nsn = int(K._NSN_MATVEC_BLOCK_DIM)
 
         # Stage B precond: dt²·W_ii for normal rows; dt·W_ii for tangents.
         wp.launch(
@@ -2463,7 +2477,7 @@ class SolverFBA(SolverBase):
         )
 
         for _ in range(int(max_iters)):
-            wp.launch(
+            wp.launch_tiled(
                 K.compute_penetration_kernel,
                 dim=n_rows,
                 inputs=[
@@ -2472,9 +2486,11 @@ class SolverFBA(SolverBase):
                     self._nsn_omega_d,
                     self._nsn_lam_d,
                     n_rows_w,
+                    n_rows_pad_w,
                     dt_w,
                 ],
                 outputs=[self._nsn_penetration_d],
+                block_dim=block_dim_nsn,
                 device=device,
             )
 
@@ -2509,7 +2525,7 @@ class SolverFBA(SolverBase):
                 device=device,
             )
 
-            wp.launch(
+            wp.launch_tiled(
                 K.compute_nsn_rhs_kernel,
                 dim=n_rows,
                 inputs=[
@@ -2520,9 +2536,11 @@ class SolverFBA(SolverBase):
                     W_d,
                     self._nsn_lam_d,
                     n_rows_w,
+                    n_rows_pad_w,
                     dt_w,
                 ],
                 outputs=[self._nsn_rhs_d],
+                block_dim=block_dim_nsn,
                 device=device,
             )
 

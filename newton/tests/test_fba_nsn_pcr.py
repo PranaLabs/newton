@@ -77,9 +77,10 @@ class TestPCRBasic(_PCRTestCase):
         # With A = I and Jacobi precond P = I, the first descent direction
         # d = b is the exact solution; PCR converges in one matvec/update.
         # ``NSNPCRSolver`` checks convergence in batches of ``check_every``
-        # (default 5) to amortise host syncs, so the iter counter rounds up
+        # (default 25) to amortise host syncs, so the iter counter rounds up
         # to the next batch boundary; algorithmically still one descent step.
-        self.assertLessEqual(iters, 5)
+        # The cap is ``min(max_iter, n) = 16``.
+        self.assertLessEqual(iters, n)
         np.testing.assert_allclose(x, b_np, rtol=1.0e-12, atol=1.0e-12)
 
     def test_solve_diagonal_system(self):
@@ -91,7 +92,7 @@ class TestPCRBasic(_PCRTestCase):
         x, iters, _ = self._solve(A_np, b_np, tol=1.0e-10)
         # P = D^-1 perfectly preconditions => 1 iter algorithmically; iter
         # counter rounds up to ``check_every`` boundary (see identity test).
-        self.assertLessEqual(iters, 5)
+        self.assertLessEqual(iters, 25)
         np.testing.assert_allclose(x, b_np / d, rtol=1.0e-12, atol=1.0e-12)
 
 
