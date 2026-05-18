@@ -3202,6 +3202,109 @@ def compute_wi_kernel(
         Wi[b, a] = acc
 
 
+# Tile sizes for the dense GEMM used by ``compute_wi_tiled_kernel``.
+# ``32 x 32 x 32`` with ``128`` threads per block was empirically fastest on
+# Demo 5 (k ~ 1200, N ~ 7000) on an RTX 5090 fp64 pipeline — see
+# ``scripts/profile_schur_w.py`` and the perf summary in
+# ``docs/superpowers/specs/2026-05-18-fba-realsim-perf-comparison.md``.
+_WI_TILE_M = wp.constant(32)
+_WI_TILE_N = wp.constant(32)
+_WI_TILE_K = wp.constant(32)
+_WI_TILE_THREADS = 128
+
+
+@wp.kernel
+def densify_S_iso_scaled_kernel(
+    ST_offsets: wp.array[wp.int32],
+    ST_columns: wp.array[wp.int32],
+    ST_values: wp.array[wp.float64],
+    D_inv: wp.array[wp.float64],
+    isodof_perm: wp.array[wp.int32],
+    S_iso_scaled: wp.array2d[wp.float64],
+):
+    """Densify selected columns of ``S`` (scaled by ``sqrt(D_inv)``) into ``(N_pad, k_pad)``.
+
+    Writes ``S_iso_scaled[i, a] = sqrt(D_inv[i]) * S[i, isodof_perm[a]]`` for
+    ``i`` in the nonzero support of column ``isodof_perm[a]`` of ``S``.
+
+    Companion to :func:`compute_wi_tiled_kernel`.  The output buffer must be
+    pre-zeroed (the kernel only writes to nonzero positions of S).  Padding
+    rows ``i >= N`` and padding columns ``a >= k`` are left as zero, so the
+    subsequent tile matmul reduces over the padded zeros without polluting
+    the result.
+
+    One thread per ``a`` in ``[0, k)``; the inner loop walks the CSR column
+    sequentially (``ST_offsets[ip..ip+1]``) — this is the densification path
+    that replaces the prior ``compute_wi_kernel`` two-pointer intersection.
+
+    Args:
+        ST_offsets: CSR row offsets of ``S^T`` (column offsets of ``S``),
+            length ``N + 1``, int32.
+        ST_columns: CSR column indices of ``S^T`` (row indices of ``S``),
+            length ``nnz(S)``, int32, sorted within each column.
+        ST_values: CSR values of ``S^T``, length ``nnz(S)``, float64.
+        D_inv: ``D^{-1}`` diagonal of the ``LDL^T`` factorization, length
+            ``N``, float64. ``A^{-1} = P · S^T · D^{-1} · S · P^T`` so the
+            sandwich form ``S^T · diag(D^{-1}) · S`` matches the per-particle
+            Schur scaling.
+        isodof_perm: ``perm[isodofs[a]]`` for ``a = 0..k-1``, length ``k``,
+            int32 — selects which columns of ``S`` to densify.
+        S_iso_scaled: Output dense buffer of shape ``(N_pad, k_pad)``, float64.
+            Must be zero-initialized before launch; only entries at nonzero
+            positions of the selected ``S`` columns are written.
+    """
+    a = wp.tid()
+    ip = isodof_perm[a]
+    beg = ST_offsets[ip]
+    end = ST_offsets[ip + 1]
+    for p in range(beg, end):
+        i = ST_columns[p]
+        S_iso_scaled[i, a] = wp.sqrt(D_inv[i]) * ST_values[p]
+
+
+@wp.kernel
+def compute_wi_tiled_kernel(
+    S_iso_scaled: wp.array2d[wp.float64],
+    Wi: wp.array2d[wp.float64],
+    N_pad: int,
+):
+    """Compute ``Wi = X^T · X`` via blocked dense GEMM where ``X = sqrt(D_inv) · S_iso``.
+
+    Replaces the O(k² · nnz_col) two-pointer ``compute_wi_kernel`` with a dense
+    blocked matrix-matrix multiply.  For Demo 5 (k≈1200, N≈7000, mean S column
+    nnz ≈ 1700 — i.e. ``S`` columns are ~24% dense) the densified GEMM is
+    >3x faster than the sparse intersection because the inner loop becomes a
+    streamed tile-mma instead of a per-(a,b) gather over ~1700 indirected
+    fp64 reads.
+
+    Computes the *full* ``(k x k)`` ``Wi`` matrix (not just the upper triangle),
+    so ``compose_W_from_wi_kernel`` can index it symmetrically without a
+    follow-up mirror pass.
+
+    Launched with ``wp.launch_tiled`` over a ``(k_pad/TILE_M, k_pad/TILE_N)``
+    grid; one CUDA block per output tile, ``_WI_TILE_THREADS`` threads per
+    block.
+
+    Args:
+        S_iso_scaled: Dense densified S-columns buffer of shape
+            ``(N_pad, k_pad)``, float64. ``S_iso_scaled[i, a] =
+            sqrt(D_inv[i]) * S[i, isodof_perm[a]]``. Padding (``i >= N``,
+            ``a >= k``) must be zero.
+        Wi: Output dense Schur factor block of shape ``(k_pad, k_pad)``,
+            float64.  Both upper and lower triangles are written.
+        N_pad: Padded row count of ``S_iso_scaled``; must be a multiple of
+            ``_WI_TILE_K``.
+    """
+    tile_i, tile_j = wp.tid()
+    acc = wp.tile_zeros(shape=(_WI_TILE_M, _WI_TILE_N), dtype=wp.float64)
+    for k_tile in range(0, N_pad, _WI_TILE_K):
+        a = wp.tile_load(S_iso_scaled, shape=(_WI_TILE_K, _WI_TILE_M), offset=(k_tile, tile_i * _WI_TILE_M))
+        b = wp.tile_load(S_iso_scaled, shape=(_WI_TILE_K, _WI_TILE_N), offset=(k_tile, tile_j * _WI_TILE_N))
+        a_T = wp.tile_transpose(a)
+        wp.tile_matmul(a_T, b, acc)
+    wp.tile_store(Wi, acc, offset=(tile_i * _WI_TILE_M, tile_j * _WI_TILE_N))
+
+
 @wp.kernel
 def compose_W_from_wi_kernel(
     contact_particle: wp.array[wp.int32],

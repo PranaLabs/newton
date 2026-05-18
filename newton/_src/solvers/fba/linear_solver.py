@@ -958,7 +958,8 @@ class FBALinearSolver:
         j_tangent1: wp.array | None = None,
         j_tangent2: wp.array | None = None,
         use_isodof: bool = True,
-    ) -> np.ndarray:
+        download: bool = True,
+    ) -> np.ndarray | None:
         """Build ``W = J · A⁻¹ · Jᵀ`` as a dense NumPy array (batched GPU implementation).
 
         Stage A (``j_tangent1`` and ``j_tangent2`` are ``None``): emits an ``(M, M)``
@@ -997,13 +998,22 @@ class FBALinearSolver:
             use_isodof: If ``True`` (default) use the isodof-restricted build
                 that skips the multi-RHS solve.  If ``False``, use the legacy
                 multi-RHS path (kept for regression testing).
+            download: If ``True`` (default) pull the result back as a NumPy
+                array.  Set ``False`` from callers that consume ``W`` directly
+                on device via :meth:`W_device_view` — this skips a multi-MB
+                device-to-host copy that dominates the Schur build cost on
+                large contact sets (see Demo 5).  When ``False`` the method
+                returns ``None``; the device-side ``W`` remains accessible
+                through :meth:`W_device_view`.
 
         Returns:
-            Dense float64 NumPy array of shape ``(M, M)`` (Stage A) or ``(3M, 3M)`` (Stage B).
+            Dense float64 NumPy array of shape ``(M, M)`` (Stage A) or
+            ``(3M, 3M)`` (Stage B) when ``download=True``; otherwise ``None``.
         """
         from .kernels import (  # noqa: PLC0415
             compose_W_from_wi_kernel,
-            compute_wi_kernel,
+            compute_wi_tiled_kernel,
+            densify_S_iso_scaled_kernel,
             pack_jacobian_3axis_kernel,
             unpack_to_A_inv_Jt_3axis_kernel,
         )
@@ -1108,8 +1118,10 @@ class FBALinearSolver:
                 row_dir_d,
                 row_alpha_d,
                 total_rows,
-                compute_wi_kernel,
+                compute_wi_tiled_kernel,
+                densify_S_iso_scaled_kernel,
                 compose_W_from_wi_kernel,
+                download=download,
             )
 
         # =====================================================================
@@ -1190,6 +1202,8 @@ class FBALinearSolver:
         # regression tests).  The GPU NSN drivers consume the device-resident
         # ``_W_device_d`` directly via :meth:`W_device_view`, avoiding the
         # per-PD-iter host -> device round trip.
+        if not download:
+            return None
         W = self._W_device_d.numpy()[:total_rows, :total_rows].copy()
 
         return W
@@ -1201,9 +1215,11 @@ class FBALinearSolver:
         row_dir_d: wp.array,
         row_alpha_d: wp.array,
         total_rows: int,
-        compute_wi_kernel,
+        compute_wi_tiled_kernel,
+        densify_S_iso_scaled_kernel,
         compose_W_from_wi_kernel,
-    ) -> np.ndarray:
+        download: bool = True,
+    ) -> np.ndarray | None:
         """Isodof-restricted Schur build.
 
         Mirrors RealSim ``addHAinvHT_gpu`` (CUDASparseInverseSolver.cpp:215-339):
@@ -1216,6 +1232,13 @@ class FBALinearSolver:
         The legacy multi-RHS solve over ``A`` is skipped entirely — for sparse
         meshes where ``k^2 * nnz_col(S) << M * nnz(S)``, this is the dominant
         speedup ("Task P", ~RealSim parity).
+
+        ``Wi`` is computed via blocked dense ``X^T X`` GEMM (``wp.tile_matmul``):
+        densify the selected columns of ``S`` into a padded ``(N_pad, k_pad)``
+        buffer with ``sqrt(D_inv)`` baked into the values, then run a tiled
+        SYRK-style matmul.  This replaces the prior two-pointer
+        ``compute_wi_kernel`` which was O(k² · nnz_col) and dominated the Schur
+        build on Demo 5 (Squeezing Ball) where ``nnz_col(S) ≈ 1700``.
         """
         N = self.n
         dev = self.device
@@ -1249,32 +1272,91 @@ class FBALinearSolver:
         isodof_perm_h = perm_h[isodofs_h].astype(np.int32)
 
         # --- Upload to device (allocate / reuse buffers) ---
-        if not hasattr(self, "_isodofs_cap") or self._isodofs_cap < k:
-            cap = max(k, int(getattr(self, "_isodofs_cap", 0) * 1.5) + 1)
-            self._isodofs_cap = cap
-            self._isodof_perm_d = wp.empty(cap, dtype=wp.int32, device=dev)
-            self._Wi_device_d = wp.empty(shape=(cap, cap), dtype=wp.float64, device=dev)
+        # ``Wi`` and ``S_iso_scaled`` are padded to multiples of the GEMM tile
+        # dimensions so the inner-loop ``wp.tile_matmul`` can step in fixed
+        # ``_WI_TILE_*`` strides without per-iteration bound checks.
+        from .kernels import _WI_TILE_K, _WI_TILE_M, _WI_TILE_N, _WI_TILE_THREADS  # noqa: PLC0415
+
+        tile_m = int(_WI_TILE_M)
+        tile_n = int(_WI_TILE_N)
+        tile_k = int(_WI_TILE_K)
+        k_pad = ((k + tile_m - 1) // tile_m) * tile_m
+        if k_pad == 0:
+            # No contacts touch any particle — nothing to compute.  Caller
+            # treats an empty ``W`` view as a zero matrix.
+            return None if not download else np.zeros((total_rows, total_rows), dtype=np.float64)
+        N_pad = ((N + tile_k - 1) // tile_k) * tile_k
+
+        # Wi buffer: padded ``(k_pad, k_pad)`` so the tiled GEMM writes a
+        # contiguous block.  The cap-based reuse grows by 1.5x to amortize
+        # reallocation when ``k`` climbs over a step.
+        if not hasattr(self, "_isodofs_cap") or self._isodofs_cap < k_pad:
+            cap_iso = max(k_pad, int(getattr(self, "_isodofs_cap", 0) * 1.5) + 1)
+            # Round cap up to a multiple of the tile size so ``Wi_v`` slicing
+            # below stays tile-aligned across resizes.
+            cap_iso = ((cap_iso + tile_m - 1) // tile_m) * tile_m
+            self._isodofs_cap = cap_iso
+            self._isodof_perm_d = wp.empty(cap_iso, dtype=wp.int32, device=dev)
+            self._Wi_device_d = wp.empty(shape=(cap_iso, cap_iso), dtype=wp.float64, device=dev)
+        # Densified ``S_iso_scaled`` buffer: padded ``(N_pad, k_pad)``.
+        # Width grows with a 1.5x headroom factor so a contact-count climb does
+        # not realloc every frame; height is fixed at ``N_pad`` (set by the
+        # immutable mesh DOF count).
+        if (
+            not hasattr(self, "_S_iso_scaled_d")
+            or self._S_iso_scaled_d.shape[0] < N_pad
+            or self._S_iso_scaled_d.shape[1] < k_pad
+        ):
+            cur_k = self._S_iso_scaled_d.shape[1] if hasattr(self, "_S_iso_scaled_d") else 0
+            cap_k = max(k_pad, int(cur_k * 1.5) + 1)
+            cap_k = ((cap_k + tile_m - 1) // tile_m) * tile_m
+            self._S_iso_scaled_d = wp.empty(shape=(N_pad, cap_k), dtype=wp.float64, device=dev)
         if not hasattr(self, "_isodof_rank_d") or self._isodof_rank_d.shape[0] != N:
             self._isodof_rank_d = wp.empty(N, dtype=wp.int32, device=dev)
+        # Upload host-prepared isodof arrays.
         self._isodof_perm_d.assign(isodof_perm_h)
         self._isodof_rank_d.assign(isodof_rank_h)
 
-        # Active sub-views of the Wi buffer (k x k).
-        Wi_v = wp.array(
-            ptr=self._Wi_device_d.ptr,
-            dtype=wp.float64,
-            shape=(k, k),
-            device=dev,
-        )
+        # Active sub-views of the Wi / S_iso_scaled buffers, sized to the
+        # padded extents the tiled GEMM expects.  ``Wi`` is materialized as
+        # a contiguous ``(k_pad, k_pad)`` block because the buffer was
+        # allocated at the same padded size (no stride trickery needed).
+        Wi_cap = int(self._Wi_device_d.shape[0])
+        if Wi_cap == k_pad:
+            Wi_v = self._Wi_device_d
+        else:
+            # Cap is larger than k_pad — slice a top-left ``(k_pad, k_pad)``
+            # view with explicit strides so tile_load reads the correct
+            # row stride (== Wi_cap, not k_pad).
+            Wi_v = wp.array(
+                ptr=self._Wi_device_d.ptr,
+                dtype=wp.float64,
+                shape=(k_pad, k_pad),
+                strides=(Wi_cap * 8, 8),
+                device=dev,
+            )
+        S_iso_cap_n = int(self._S_iso_scaled_d.shape[0])
+        S_iso_cap_k = int(self._S_iso_scaled_d.shape[1])
+        if S_iso_cap_n == N_pad and S_iso_cap_k == k_pad:
+            S_iso_v = self._S_iso_scaled_d
+        else:
+            S_iso_v = wp.array(
+                ptr=self._S_iso_scaled_d.ptr,
+                dtype=wp.float64,
+                shape=(N_pad, k_pad),
+                strides=(S_iso_cap_k * 8, 8),
+                device=dev,
+            )
 
-        # --- Compute Wi entries (only sums over column intersections) ---
-        # One thread per (a, b) pair; the kernel writes only a <= b and mirrors
-        # to (b, a). With the sparse-inverse factor S already on device as the
-        # CSR-of-S^T BSR (one row per S column), the inner loop is a sorted
-        # two-pointer intersection of two columns.
+        # --- Compute Wi = X^T · X where X = sqrt(D_inv) * S_iso ---
+        # Step 1: densify selected columns of S into ``S_iso_scaled`` with the
+        # sqrt(D_inv) factor baked in.  The buffer is zeroed first so padding
+        # rows/cols and untouched (zero) entries of S contribute zero to the
+        # subsequent dot products.
+        S_iso_v.zero_()
         wp.launch(
-            compute_wi_kernel,
-            dim=(k, k),
+            densify_S_iso_scaled_kernel,
+            dim=k,
             inputs=[
                 self._ST_bsr.offsets,
                 self._ST_bsr.columns,
@@ -1282,7 +1364,16 @@ class FBALinearSolver:
                 self._Dinv,
                 self._isodof_perm_d,
             ],
-            outputs=[Wi_v],
+            outputs=[S_iso_v],
+            device=dev,
+        )
+
+        # Step 2: tiled dense GEMM ``Wi = S_iso_scaled^T · S_iso_scaled``.
+        wp.launch_tiled(
+            compute_wi_tiled_kernel,
+            dim=(k_pad // tile_m, k_pad // tile_n),
+            inputs=[S_iso_v, Wi_v, N_pad],
+            block_dim=_WI_TILE_THREADS,
             device=dev,
         )
 
@@ -1304,6 +1395,11 @@ class FBALinearSolver:
         )
 
         # Single host pull for the (total_rows x total_rows) W matrix.
+        # Skipped when callers (e.g. the GPU NSN driver) consume ``W`` via
+        # :meth:`W_device_view` — a multi-MB copy of a padded dense buffer
+        # otherwise dominates the Schur build on Demo 5.
+        if not download:
+            return None
         W = self._W_device_d.numpy()[:total_rows, :total_rows].copy()
         return W
 

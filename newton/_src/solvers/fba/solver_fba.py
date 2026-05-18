@@ -367,7 +367,12 @@ class SolverFBA(SolverBase):
         # changes).  The cache is invalidated whenever either input could
         # change: by :meth:`update_contacts` (J change) and by
         # :meth:`notify_model_changed` / :meth:`_setup_pd_system` (A change).
-        self._cached_W: np.ndarray | None = None
+        # Sentinel: ``True`` once the device-resident ``W`` is up-to-date for
+        # the current contact set, ``None`` otherwise.  The numpy result is
+        # no longer cached (the GPU NSN driver reads ``W`` from device via
+        # :meth:`FBALinearSolver.W_device_view`); skipping the host pull is
+        # the largest single Schur-build optimization on Demo 5.
+        self._cached_W: bool | None = None
         # ``_A_inv_Jt_d`` itself lives on the :class:`FBALinearSolver` and
         # is reused by :meth:`~newton._src.solvers.fba.linear_solver.FBALinearSolver.apply_lambda_correction_combined`;
         # we only need to track whether that buffer is fresh for the current step.
@@ -1084,7 +1089,12 @@ class SolverFBA(SolverBase):
                         wp.synchronize_device()
                         _t_schur_0 = time.perf_counter()
                     if self._cached_W is None or not self._cached_A_inv_Jt_valid:
-                        self._cached_W = ls.build_schur_complement(
+                        # ``download=False``: the GPU NSN driver consumes ``W``
+                        # via :meth:`FBALinearSolver.W_device_view`, so the
+                        # device-to-host pull at the end of ``build_schur_complement``
+                        # is dead work — skipping it removes the dominant cost
+                        # on Demo 5 (Schur build was ~70% PCIe download time).
+                        ls.build_schur_complement(
                             M,
                             self._contact_particle_d,
                             self._contact_normal_d,
@@ -1092,7 +1102,9 @@ class SolverFBA(SolverBase):
                             self._contact_tangent1_d,
                             self._contact_tangent2_d,
                             use_isodof=self.use_isodof,
+                            download=False,
                         )
+                        self._cached_W = True
                         self._cached_A_inv_Jt_valid = True
                     if _perf_on:
                         wp.synchronize_device()
@@ -1167,13 +1179,18 @@ class SolverFBA(SolverBase):
                         wp.synchronize_device()
                         _t_schur_0 = time.perf_counter()
                     if self._cached_W is None or not self._cached_A_inv_Jt_valid:
-                        self._cached_W = ls.build_schur_complement(
+                        # ``download=False``: see Stage B branch above — the
+                        # GPU NSN driver reads ``W`` from device via
+                        # :meth:`FBALinearSolver.W_device_view`.
+                        ls.build_schur_complement(
                             M,
                             self._contact_particle_d,
                             self._contact_normal_d,
                             self._contact_alpha_d,
                             use_isodof=self.use_isodof,
+                            download=False,
                         )
+                        self._cached_W = True
                         self._cached_A_inv_Jt_valid = True
                     if _perf_on:
                         wp.synchronize_device()
