@@ -83,6 +83,27 @@ Perf optimization notes (Perf #4, 2026-05):
       tile_matmul and only Demo 5 Stage B (n ≈ 3M ≈ 3000) wins.
     * The fallback (pure Warp tile_matmul) path is preserved; FBA works
       identically without cupy installed.
+
+Perf optimization notes (Perf #5, 2026-05):
+    * The per-iter PCR body (matvec + dots + axpy + scale-add + precond)
+      issues ~10 kernel launches per iter; at Demo 5's typical 25 iters
+      per ``solve()`` call that's ~250 Python-side launch dispatches.
+      Each Warp ``wp.launch`` plus the CUDA driver call add ~3-6 us of
+      host overhead; CUDA graphs replay that batch with ~1 us per call.
+    * We now capture **one** PCR iter (lines RealSim 170-207) into a
+      :class:`warp.Graph` per ``(n, use_cublas)`` shape combination and
+      cache the graph keyed by that pair.  Subsequent solves at the
+      same shape replay the graph ``check_every`` times per convergence-
+      block — a single ``cuGraphLaunch`` per block on the device side.
+    * The cuBLAS DGEMV path is **not** graph-captureable: cuBLAS uses
+      the legacy stream internally for its workspace and pointer-mode
+      configuration on first call, which triggers
+      ``cudaErrorStreamCaptureImplicit``.  When the per-solve dispatch
+      decision routes through cuBLAS (n >= ``_CUBLAS_MIN_N``) we skip
+      capture and run the per-iter loop eagerly.  Below the threshold
+      (the common case for Demo 4/5 Stage A / B at typical sizes) the
+      pure-Warp matvec path captures cleanly and gives the launch-
+      overhead win.
 """
 
 from __future__ import annotations
@@ -384,6 +405,16 @@ class NSNPCRSolver:
         if self._use_cublas:
             self._cublas_handle = get_cublas_handle_for_stream(device)
 
+        # Perf #5: cache one ``wp.Graph`` per active (n, use_cublas_this_solve)
+        # combination so repeated solves at the same shape replay a pre-
+        # recorded CUDA graph for the inner PCR iter, eliminating per-launch
+        # Python+driver overhead.  Only the non-cuBLAS (pure Warp) path is
+        # captured -- cuBLAS DGEMV trips ``cudaErrorStreamCaptureImplicit``.
+        # Capture is attempted lazily on first solve at each shape; if it
+        # fails we fall back to the eager loop and remember the failure so
+        # we don't retry on every call.
+        self._pcr_graph_cache: dict[int, wp.Graph | None] = {}
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -517,111 +548,34 @@ class NSNPCRSolver:
         # scalars (``alpha``, ``beta``, ``rho``, ``den``) live in device
         # memory.  PCR for SPD systems is monotone-convergent, so over-
         # iterating past the tol bound between syncs is safe.
+        #
+        # Perf #5: when the cuBLAS path is *not* engaged we wrap one full
+        # PCR iter into a :class:`warp.Graph` and replay it ``check_every``
+        # times per block.  Replays issue a single ``cuGraphLaunch`` on the
+        # device side instead of ~10 individual ``wp.launch`` dispatches, so
+        # the Python+driver per-launch overhead drops from ~30-50 us/iter to
+        # ~2 us/iter at the n ~ 600..1500 sizes Demo 5 hits.
+        graph: wp.Graph | None = None
+        if not use_cublas_this_solve:
+            graph = self._get_or_build_pcr_iter_graph(A, n, n_pad, device)
+
         nb_iter = 0
         check_every = self.check_every
         while nb_iter < max_iter and rho > tol_sq:
             block_end = min(nb_iter + check_every, max_iter)
-            while nb_iter < block_end:
-                # ----- den = <q, q> ----------------------------------------
-                # RealSim line 170.
-                wp.utils.array_inner(self._q, self._q, out=self._den_d, count=n)
-
-                # alpha = rho / den (on device).  RealSim line 173.
-                wp.launch(
-                    _div_scalar_kernel,
-                    dim=1,
-                    inputs=[self._rho_d, self._den_d],
-                    outputs=[self._alpha_d],
-                    device=device,
-                )
-
-                # ----- x += alpha * d --------------------------------------
-                # RealSim line 177.  Coefficient sourced from ``_alpha_d[0]``.
-                wp.launch(
-                    _axpy_arr_kernel,
-                    dim=n,
-                    inputs=[self._alpha_d, wp.float64(1.0), self._d],
-                    outputs=[self._x],
-                    device=device,
-                )
-
-                # ----- r -= alpha * q --------------------------------------
-                # RealSim line 181 (``coeff = -alpha``).
-                wp.launch(
-                    _axpy_arr_kernel,
-                    dim=n,
-                    inputs=[self._alpha_d, wp.float64(-1.0), self._q],
-                    outputs=[self._r],
-                    device=device,
-                )
-
-                # ----- s = P * r -------------------------------------------
-                # RealSim line 186.
-                wp.launch(
-                    _apply_precond_kernel,
-                    dim=n,
-                    inputs=[self._r, self._precond],
-                    outputs=[self._s],
-                    device=device,
-                )
-
-                # ----- h = A * s -------------------------------------------
-                # RealSim line 189.  See ``q = A * d`` above for the cuBLAS
-                # vs tile_matmul dispatch rationale.
-                if use_cublas_this_solve:
-                    cublas_dgemv(A, self._s, self._h, device=device, handle=self._cublas_handle)
-                else:
-                    wp.launch_tiled(
-                        _matvec_tiled_kernel,
-                        dim=n,
-                        inputs=[A, self._s, n_pad],
-                        outputs=[self._h],
-                        block_dim=_PCR_BLOCK_DIM,
-                        device=device,
-                    )
-
-                # ----- rho_old = rho ; rho = <r, h> ------------------------
-                # RealSim lines 191-193.  Snapshot ``rho`` into ``rho_old`` on
-                # device, then recompute ``rho`` via the parallel reduction.
-                wp.launch(
-                    _copy_scalar_kernel,
-                    dim=1,
-                    inputs=[self._rho_d],
-                    outputs=[self._rho_old_d],
-                    device=device,
-                )
-                wp.utils.array_inner(self._r, self._h, out=self._rho_d, count=n)
-
-                # beta = rho / rho_old (on device).  RealSim line 195.
-                wp.launch(
-                    _div_scalar_kernel,
-                    dim=1,
-                    inputs=[self._rho_d, self._rho_old_d],
-                    outputs=[self._beta_d],
-                    device=device,
-                )
-
-                # ----- d = beta * d + s ------------------------------------
-                # RealSim lines 198-201.  Fused into one kernel.
-                wp.launch(
-                    _scal_add_arr_kernel,
-                    dim=n,
-                    inputs=[self._beta_d, self._s],
-                    outputs=[self._d],
-                    device=device,
-                )
-
-                # ----- q = beta * q + h ------------------------------------
-                # RealSim lines 204-207.
-                wp.launch(
-                    _scal_add_arr_kernel,
-                    dim=n,
-                    inputs=[self._beta_d, self._h],
-                    outputs=[self._q],
-                    device=device,
-                )
-
-                nb_iter += 1
+            block_iters = block_end - nb_iter
+            if graph is not None:
+                # Graph fast path: replay the captured single-iter graph
+                # ``block_iters`` times.  All PCR state lives in the pre-
+                # allocated device buffers captured at recording time, so
+                # the replays operate on the same memory as the eager path.
+                for _ in range(block_iters):
+                    wp.capture_launch(graph)
+                nb_iter = block_end
+            else:
+                while nb_iter < block_end:
+                    self._pcr_iter_eager(A, n, n_pad, use_cublas_this_solve, device)
+                    nb_iter += 1
 
             # End-of-block convergence sync: pull rho once per ``check_every``
             # iters.  RealSim's CPU-side break on ``den == 0`` (line 172) is
@@ -636,3 +590,170 @@ class NSNPCRSolver:
         wp.copy(x_out, self._x, count=n)
 
         return (nb_iter, rho)
+
+    # ------------------------------------------------------------------
+    # Per-iter body + graph capture (Perf #5)
+    # ------------------------------------------------------------------
+
+    def _pcr_iter_eager(
+        self,
+        A: wp.array2d[wp.float64],
+        n: int,
+        n_pad: int,
+        use_cublas_this_solve: bool,
+        device: wp.Device | str,
+    ) -> None:
+        """Issue one PCR iter's worth of launches on the active stream.
+
+        Mirrors RealSim ``CUDADenseCRSolver.cpp:170-207`` (Newton step body).
+        Reads ``self._q``, ``self._r``, ``self._d``, ``self._rho_d`` and writes
+        through ``self._x``, ``self._r``, ``self._d``, ``self._q``, ``self._h``,
+        ``self._s``, ``self._rho_d``, ``self._rho_old_d``, ``self._alpha_d``,
+        ``self._beta_d``, ``self._den_d``.  All launches are stream-ordered;
+        the function is safe to call inside a CUDA graph capture as long as
+        ``use_cublas_this_solve`` is ``False`` (cuBLAS DGEMV trips
+        ``cudaErrorStreamCaptureImplicit``).
+        """
+        # ----- den = <q, q> ----------------------------------------
+        # RealSim line 170.
+        wp.utils.array_inner(self._q, self._q, out=self._den_d, count=n)
+
+        # alpha = rho / den (on device).  RealSim line 173.
+        wp.launch(
+            _div_scalar_kernel,
+            dim=1,
+            inputs=[self._rho_d, self._den_d],
+            outputs=[self._alpha_d],
+            device=device,
+        )
+
+        # ----- x += alpha * d --------------------------------------
+        # RealSim line 177.  Coefficient sourced from ``_alpha_d[0]``.
+        wp.launch(
+            _axpy_arr_kernel,
+            dim=n,
+            inputs=[self._alpha_d, wp.float64(1.0), self._d],
+            outputs=[self._x],
+            device=device,
+        )
+
+        # ----- r -= alpha * q --------------------------------------
+        # RealSim line 181 (``coeff = -alpha``).
+        wp.launch(
+            _axpy_arr_kernel,
+            dim=n,
+            inputs=[self._alpha_d, wp.float64(-1.0), self._q],
+            outputs=[self._r],
+            device=device,
+        )
+
+        # ----- s = P * r -------------------------------------------
+        # RealSim line 186.
+        wp.launch(
+            _apply_precond_kernel,
+            dim=n,
+            inputs=[self._r, self._precond],
+            outputs=[self._s],
+            device=device,
+        )
+
+        # ----- h = A * s -------------------------------------------
+        # RealSim line 189.  See ``q = A * d`` above for the cuBLAS
+        # vs tile_matmul dispatch rationale.
+        if use_cublas_this_solve:
+            cublas_dgemv(A, self._s, self._h, device=device, handle=self._cublas_handle)
+        else:
+            wp.launch_tiled(
+                _matvec_tiled_kernel,
+                dim=n,
+                inputs=[A, self._s, n_pad],
+                outputs=[self._h],
+                block_dim=_PCR_BLOCK_DIM,
+                device=device,
+            )
+
+        # ----- rho_old = rho ; rho = <r, h> ------------------------
+        # RealSim lines 191-193.  Snapshot ``rho`` into ``rho_old`` on
+        # device, then recompute ``rho`` via the parallel reduction.
+        wp.launch(
+            _copy_scalar_kernel,
+            dim=1,
+            inputs=[self._rho_d],
+            outputs=[self._rho_old_d],
+            device=device,
+        )
+        wp.utils.array_inner(self._r, self._h, out=self._rho_d, count=n)
+
+        # beta = rho / rho_old (on device).  RealSim line 195.
+        wp.launch(
+            _div_scalar_kernel,
+            dim=1,
+            inputs=[self._rho_d, self._rho_old_d],
+            outputs=[self._beta_d],
+            device=device,
+        )
+
+        # ----- d = beta * d + s ------------------------------------
+        # RealSim lines 198-201.  Fused into one kernel.
+        wp.launch(
+            _scal_add_arr_kernel,
+            dim=n,
+            inputs=[self._beta_d, self._s],
+            outputs=[self._d],
+            device=device,
+        )
+
+        # ----- q = beta * q + h ------------------------------------
+        # RealSim lines 204-207.
+        wp.launch(
+            _scal_add_arr_kernel,
+            dim=n,
+            inputs=[self._beta_d, self._h],
+            outputs=[self._q],
+            device=device,
+        )
+
+    def _get_or_build_pcr_iter_graph(
+        self,
+        A: wp.array2d[wp.float64],
+        n: int,
+        n_pad: int,
+        device: wp.Device | str,
+    ) -> wp.Graph | None:
+        """Look up (or capture on first miss) the single-PCR-iter CUDA graph.
+
+        The graph is keyed by ``(n, A.ptr)`` -- ``n`` controls the launch
+        dimensions and ``A.ptr`` controls which matrix block the captured
+        matvec reads from.  When either changes between solve calls we
+        re-capture; PCR is called repeatedly with the same matrix view
+        within a Newton step so amortised capture overhead is near zero.
+
+        Returns ``None`` if capture is impossible on the active device
+        (e.g.  CPU device) so callers fall through to the eager loop.
+        """
+        # CUDA graphs require a CUDA device.
+        dev_obj = wp.get_device(device) if isinstance(device, str) else device
+        if not dev_obj.is_cuda:
+            return None
+
+        a_ptr = int(A.__cuda_array_interface__["data"][0])
+        # Cache hash combines ``n`` (drives launch dims + n_pad) and the
+        # matrix data pointer.  We use a simple tuple key in a dict --
+        # collisions are not a concern at the handful of distinct shapes
+        # FBA produces per session.
+        key = (n, a_ptr)
+        cached = self._pcr_graph_cache.get(key, "missing")
+        if cached == "missing":
+            # Capture lazily.  Failures are sticky -- we cache ``None`` so
+            # we don't retry capture every solve once it has failed (e.g.
+            # if some kernel inside the iter body issues an implicit host
+            # allocation that traps the capture).
+            try:
+                with wp.ScopedCapture(device=device) as cap:
+                    self._pcr_iter_eager(A, n, n_pad, False, device)
+                self._pcr_graph_cache[key] = cap.graph
+                return cap.graph
+            except Exception:
+                self._pcr_graph_cache[key] = None
+                return None
+        return cached

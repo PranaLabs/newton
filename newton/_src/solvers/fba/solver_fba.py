@@ -446,6 +446,25 @@ class SolverFBA(SolverBase):
         self._timing_linear_solve_ms_per_iter: list[float] = []
         self._timing_nsn_inner_ms_per_iter: list[float] = []
 
+        # Perf #5: cache the local-phase kernel symbols on the solver so the
+        # hot path avoids a per-step ``from .kernels import`` lookup.  The
+        # kernels module never changes after solver construction.
+        from . import kernels as _K  # noqa: PLC0415
+
+        self._k_zero_vec3 = _K.zero_vec3_kernel
+        self._k_add_inertia = _K.add_inertia_to_rhs_kernel
+        self._k_gather = _K.gather_per_particle_kernel
+        self._k_pin = _K.project_pin_kernel
+        self._k_bending = _K.project_bending_compute_kernel
+        self._k_tri_arap = _K.project_stretching_arap_compute_kernel
+        self._k_tet_arap = _K.project_stretching_arap_tet_compute_kernel
+        self._k_tri_corot = _K.project_stretching_corotational_compute_kernel
+        self._k_tet_corot = _K.project_stretching_corotational_tet_compute_kernel
+        self._k_tri_nh = _K.project_stretching_neohookean_compute_kernel
+        self._k_tri_nh_lbfgs = _K.project_stretching_neohookean_compute_kernel_lbfgs
+        self._k_tet_nh = _K.project_stretching_neohookean_tet_compute_kernel
+        self._k_tet_nh_lbfgs = _K.project_stretching_neohookean_tet_compute_kernel_lbfgs
+
     def reset_timing(self) -> None:
         """Clear all per-PD-iter timing buffers.
 
@@ -687,21 +706,8 @@ class SolverFBA(SolverBase):
                 step or when changed (PD Hessian depends on dt).
         """
         from .kernels import (  # noqa: PLC0415
-            add_inertia_to_rhs_kernel,
             compute_inertial_kernel,
-            gather_per_particle_kernel,
-            project_bending_compute_kernel,
-            project_pin_kernel,
-            project_stretching_arap_compute_kernel,
-            project_stretching_arap_tet_compute_kernel,
-            project_stretching_corotational_compute_kernel,
-            project_stretching_corotational_tet_compute_kernel,
-            project_stretching_neohookean_compute_kernel,
-            project_stretching_neohookean_compute_kernel_lbfgs,
-            project_stretching_neohookean_tet_compute_kernel,
-            project_stretching_neohookean_tet_compute_kernel_lbfgs,
             write_velocity_kernel,
-            zero_vec3_kernel,
         )
 
         # Diagnostic dump: increment step counter at the START so frame N
@@ -831,246 +837,50 @@ class SolverFBA(SolverBase):
 
         # 2) PD outer iterations.
         _perf_on = self.enable_perf_timing
+
+        # Perf #5: capture the PD local-phase + linear-solve sequence into a
+        # CUDA graph once per step.  All energies/pins active here are fixed
+        # by ``_setup_pd_system`` and the buffer pointers (``_rhs``, ``_x_cur``,
+        # ``_tri_contrib_d``, ...) are stable, so a single
+        # ``wp.capture_launch`` per PD iter replaces ~25-30 individual
+        # ``wp.launch`` dispatches.  We avoid the graph when ``_diag_active``
+        # (needs per-iter host downloads) or ``_perf_on`` (needs per-iter
+        # ``wp.synchronize_device`` brackets); both flags are stable for the
+        # duration of the call so the branch is cheap.
+        _use_lg_graph = (not _perf_on) and (not _diag_active) and wp.get_device(device).is_cuda
+        _lg_graph = self._get_or_build_lg_iter_graph(dt) if _use_lg_graph else None
+
         for _k in range(self.iterations):
             # ---- Local phase (energy projection + RHS assembly) ----
-            if _perf_on:
-                wp.synchronize_device()
-                _t_local_0 = time.perf_counter()
-            # Zero RHS.
-            wp.launch(zero_vec3_kernel, dim=N, inputs=[self._rhs], device=device)
-            # Inertia term.
-            wp.launch(
-                add_inertia_to_rhs_kernel,
-                dim=N,
-                inputs=[self._x_inertia, model.particle_mass, dt],
-                outputs=[self._rhs],
-                device=device,
-            )
-            # Pin projection.
-            if self._pin_indices_d is not None:
-                wp.launch(
-                    project_pin_kernel,
-                    dim=self._pin_indices_d.shape[0],
-                    inputs=[self._pin_indices_d, self._x_ref, self.pin_stiffness],
-                    outputs=[self._rhs],
-                    device=device,
-                )
-            # Tri (cloth) stretching projection — deterministic compute+gather.
-            if self._tri_indices_d is not None and model.tri_count > 0:
-                if self.stretching_model == "arap":
-                    wp.launch(
-                        project_stretching_arap_compute_kernel,
-                        dim=model.tri_count,
-                        inputs=[
-                            self._x_cur,
-                            self._tri_indices_d,
-                            self._tri_rest_inv_d,
-                            self._tri_weight_d,
-                        ],
-                        outputs=[self._tri_contrib_d],
-                        device=device,
-                    )
-                    wp.launch(
-                        gather_per_particle_kernel,
-                        dim=N,
-                        inputs=[
-                            self._tri_contrib_d,
-                            self._particle_tri_offsets_d,
-                            self._particle_tri_element_d,
-                            self._particle_tri_local_d,
-                        ],
-                        outputs=[self._rhs],
-                        device=device,
-                    )
-                elif self.stretching_model == "corotational":
-                    wp.launch(
-                        project_stretching_corotational_compute_kernel,
-                        dim=model.tri_count,
-                        inputs=[
-                            self._x_cur,
-                            self._tri_indices_d,
-                            self._tri_rest_inv_d,
-                            self._tri_weight_d,
-                            self._mu,
-                            self._lam,
-                        ],
-                        outputs=[self._tri_contrib_d],
-                        device=device,
-                    )
-                    wp.launch(
-                        gather_per_particle_kernel,
-                        dim=N,
-                        inputs=[
-                            self._tri_contrib_d,
-                            self._particle_tri_offsets_d,
-                            self._particle_tri_element_d,
-                            self._particle_tri_local_d,
-                        ],
-                        outputs=[self._rhs],
-                        device=device,
-                    )
-                elif self.stretching_model == "neohookean":
-                    nh_tri_kernel = (
-                        project_stretching_neohookean_compute_kernel_lbfgs
-                        if self.nh_solver == "lbfgs"
-                        else project_stretching_neohookean_compute_kernel
-                    )
-                    wp.launch(
-                        nh_tri_kernel,
-                        dim=model.tri_count,
-                        inputs=[
-                            self._x_cur,
-                            self._tri_indices_d,
-                            self._tri_rest_inv_d,
-                            self._tri_weight_d,
-                            self._mu,
-                            self._lam,
-                        ],
-                        outputs=[self._tri_contrib_d],
-                        device=device,
-                    )
-                    wp.launch(
-                        gather_per_particle_kernel,
-                        dim=N,
-                        inputs=[
-                            self._tri_contrib_d,
-                            self._particle_tri_offsets_d,
-                            self._particle_tri_element_d,
-                            self._particle_tri_local_d,
-                        ],
-                        outputs=[self._rhs],
-                        device=device,
-                    )
-            # Bending projection — deterministic (compute → gather) scatter.
-            if self._edge_indices_d is not None:
-                wp.launch(
-                    project_bending_compute_kernel,
-                    dim=self._edge_indices_d.shape[0],
-                    inputs=[
-                        self._x_cur,
-                        self._edge_indices_d,
-                        self._edge_quad_q_d,
-                        self._edge_weight_d,
-                        self._edge_norm_d,
-                    ],
-                    outputs=[self._edge_contrib_d],
-                    device=device,
-                )
-                wp.launch(
-                    gather_per_particle_kernel,
-                    dim=N,
-                    inputs=[
-                        self._edge_contrib_d,
-                        self._particle_edge_offsets_d,
-                        self._particle_edge_element_d,
-                        self._particle_edge_local_d,
-                    ],
-                    outputs=[self._rhs],
-                    device=device,
-                )
-            # Tet ARAP projection.
-            if self._tet_indices_d is not None and model.tet_count > 0:
-                if self.stretching_model == "arap":
-                    # Deterministic (compute → gather) tet ARAP scatter.
-                    wp.launch(
-                        project_stretching_arap_tet_compute_kernel,
-                        dim=model.tet_count,
-                        inputs=[
-                            self._x_cur,
-                            self._tet_indices_d,
-                            self._tet_rest_inv_d,
-                            self._tet_weight_d,
-                        ],
-                        outputs=[self._tet_contrib_d],
-                        device=device,
-                    )
-                    wp.launch(
-                        gather_per_particle_kernel,
-                        dim=N,
-                        inputs=[
-                            self._tet_contrib_d,
-                            self._particle_tet_offsets_d,
-                            self._particle_tet_element_d,
-                            self._particle_tet_local_d,
-                        ],
-                        outputs=[self._rhs],
-                        device=device,
-                    )
-                elif self.stretching_model == "corotational":
-                    # Deterministic (compute → gather) tet Corot scatter.
-                    wp.launch(
-                        project_stretching_corotational_tet_compute_kernel,
-                        dim=model.tet_count,
-                        inputs=[
-                            self._x_cur,
-                            self._tet_indices_d,
-                            self._tet_rest_inv_d,
-                            self._tet_weight_d,
-                            self._mu,
-                            self._lam,
-                        ],
-                        outputs=[self._tet_contrib_d],
-                        device=device,
-                    )
-                    wp.launch(
-                        gather_per_particle_kernel,
-                        dim=N,
-                        inputs=[
-                            self._tet_contrib_d,
-                            self._particle_tet_offsets_d,
-                            self._particle_tet_element_d,
-                            self._particle_tet_local_d,
-                        ],
-                        outputs=[self._rhs],
-                        device=device,
-                    )
-                elif self.stretching_model == "neohookean":
-                    # Deterministic (compute → gather) tet NH scatter.
-                    nh_tet_kernel = (
-                        project_stretching_neohookean_tet_compute_kernel_lbfgs
-                        if self.nh_solver == "lbfgs"
-                        else project_stretching_neohookean_tet_compute_kernel
-                    )
-                    wp.launch(
-                        nh_tet_kernel,
-                        dim=model.tet_count,
-                        inputs=[
-                            self._x_cur,
-                            self._tet_indices_d,
-                            self._tet_rest_inv_d,
-                            self._tet_weight_d,
-                            self._mu,
-                            self._lam,
-                        ],
-                        outputs=[self._tet_contrib_d],
-                        device=device,
-                    )
-                    wp.launch(
-                        gather_per_particle_kernel,
-                        dim=N,
-                        inputs=[
-                            self._tet_contrib_d,
-                            self._particle_tet_offsets_d,
-                            self._particle_tet_element_d,
-                            self._particle_tet_local_d,
-                        ],
-                        outputs=[self._rhs],
-                        device=device,
-                    )
-            if _diag_active:
-                self._diag_buffers[f"rhs_k{_k}"] = self._rhs.numpy().astype(np.float64).copy()
+            if _lg_graph is not None:
+                # Graph fast path replays both the local phase and the
+                # linear solve in a single ``cuGraphLaunch``.  All per-iter
+                # state is read from ``self._x_cur`` (the previous iter's
+                # result) and written through the same buffers.  Skipped
+                # when ``_perf_on`` (needs per-section syncs) or
+                # ``_diag_active`` (needs per-iter host downloads).
+                wp.capture_launch(_lg_graph)
+            else:
+                if _perf_on:
+                    wp.synchronize_device()
+                    _t_local_0 = time.perf_counter()
+                # Separate the local projections from the linear solve so the
+                # ``_perf_on`` path can time each section independently.
+                self._run_pd_local_phase_eager(N, dt, include_linear_solve=False)
+                if _diag_active:
+                    self._diag_buffers[f"rhs_k{_k}"] = self._rhs.numpy().astype(np.float64).copy()
 
-            if _perf_on:
-                wp.synchronize_device()
-                self._timing_local_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_local_0))
-                _t_lin_0 = time.perf_counter()
+                if _perf_on:
+                    wp.synchronize_device()
+                    self._timing_local_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_local_0))
+                    _t_lin_0 = time.perf_counter()
 
-            # Global linear solve: x_unc = A^-1 . rhs  (unconstrained).
-            self._linear_solver.solve(self._rhs, self._x_cur)
+                # Global linear solve: x_unc = A^-1 . rhs  (unconstrained).
+                self._linear_solver.solve(self._rhs, self._x_cur)
 
-            if _perf_on:
-                wp.synchronize_device()
-                self._timing_linear_solve_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_lin_0))
+                if _perf_on:
+                    wp.synchronize_device()
+                    self._timing_linear_solve_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_lin_0))
 
             if _diag_active:
                 self._diag_buffers[f"x_post_solve_k{_k}"] = self._x_cur.numpy().astype(np.float64).copy()
@@ -1291,6 +1101,274 @@ class SolverFBA(SolverBase):
                 f"[SolverFBA] wrote diagnostic dump for frame {self._diag_frame} "
                 f"to {self._diag_out_path} ({len(self._diag_buffers)} arrays)"
             )
+
+    def _run_pd_local_phase_eager(self, N: int, dt: float, include_linear_solve: bool = True) -> None:
+        """Issue the PD local-phase launches on the active stream.
+
+        Mirrors the body of one PD outer iter (RHS zero + inertia + pin +
+        stretching + bending; optionally followed by the linear solve).
+        Refactored out of :meth:`step` so the same launch sequence can be
+        invoked either eagerly or inside a CUDA graph capture (Perf #5).
+        All branches use cached kernel refs and device arrays -- no host
+        syncs, no allocations, no attribute lookups in the hot path --
+        so the function is safe to call inside ``wp.ScopedCapture``.
+
+        Args:
+            N: Particle count (used for the per-particle kernel launch
+                dimensions).  Equal to ``model.particle_count``.
+            dt: Timestep [s], passed into the inertia kernel.
+            include_linear_solve: When ``True`` (the default and the path
+                used inside ``wp.ScopedCapture``) the global linear solve
+                ``A^-1 . rhs`` is appended after the projections.  The
+                ``_perf_on`` path passes ``False`` so the caller can
+                bracket the local + linear sections separately for
+                per-section timing.
+        """
+        model = self.model
+        device = self._device
+        # Zero RHS.
+        wp.launch(self._k_zero_vec3, dim=N, inputs=[self._rhs], device=device)
+        # Inertia term.
+        wp.launch(
+            self._k_add_inertia,
+            dim=N,
+            inputs=[self._x_inertia, model.particle_mass, dt],
+            outputs=[self._rhs],
+            device=device,
+        )
+        # Pin projection.
+        if self._pin_indices_d is not None:
+            wp.launch(
+                self._k_pin,
+                dim=self._pin_indices_d.shape[0],
+                inputs=[self._pin_indices_d, self._x_ref, self.pin_stiffness],
+                outputs=[self._rhs],
+                device=device,
+            )
+        # Tri (cloth) stretching projection — deterministic compute+gather.
+        if self._tri_indices_d is not None and model.tri_count > 0:
+            if self.stretching_model == "arap":
+                wp.launch(
+                    self._k_tri_arap,
+                    dim=model.tri_count,
+                    inputs=[
+                        self._x_cur,
+                        self._tri_indices_d,
+                        self._tri_rest_inv_d,
+                        self._tri_weight_d,
+                    ],
+                    outputs=[self._tri_contrib_d],
+                    device=device,
+                )
+                wp.launch(
+                    self._k_gather,
+                    dim=N,
+                    inputs=[
+                        self._tri_contrib_d,
+                        self._particle_tri_offsets_d,
+                        self._particle_tri_element_d,
+                        self._particle_tri_local_d,
+                    ],
+                    outputs=[self._rhs],
+                    device=device,
+                )
+            elif self.stretching_model == "corotational":
+                wp.launch(
+                    self._k_tri_corot,
+                    dim=model.tri_count,
+                    inputs=[
+                        self._x_cur,
+                        self._tri_indices_d,
+                        self._tri_rest_inv_d,
+                        self._tri_weight_d,
+                        self._mu,
+                        self._lam,
+                    ],
+                    outputs=[self._tri_contrib_d],
+                    device=device,
+                )
+                wp.launch(
+                    self._k_gather,
+                    dim=N,
+                    inputs=[
+                        self._tri_contrib_d,
+                        self._particle_tri_offsets_d,
+                        self._particle_tri_element_d,
+                        self._particle_tri_local_d,
+                    ],
+                    outputs=[self._rhs],
+                    device=device,
+                )
+            elif self.stretching_model == "neohookean":
+                nh_tri_kernel = self._k_tri_nh_lbfgs if self.nh_solver == "lbfgs" else self._k_tri_nh
+                wp.launch(
+                    nh_tri_kernel,
+                    dim=model.tri_count,
+                    inputs=[
+                        self._x_cur,
+                        self._tri_indices_d,
+                        self._tri_rest_inv_d,
+                        self._tri_weight_d,
+                        self._mu,
+                        self._lam,
+                    ],
+                    outputs=[self._tri_contrib_d],
+                    device=device,
+                )
+                wp.launch(
+                    self._k_gather,
+                    dim=N,
+                    inputs=[
+                        self._tri_contrib_d,
+                        self._particle_tri_offsets_d,
+                        self._particle_tri_element_d,
+                        self._particle_tri_local_d,
+                    ],
+                    outputs=[self._rhs],
+                    device=device,
+                )
+        # Bending projection — deterministic (compute → gather) scatter.
+        if self._edge_indices_d is not None:
+            wp.launch(
+                self._k_bending,
+                dim=self._edge_indices_d.shape[0],
+                inputs=[
+                    self._x_cur,
+                    self._edge_indices_d,
+                    self._edge_quad_q_d,
+                    self._edge_weight_d,
+                    self._edge_norm_d,
+                ],
+                outputs=[self._edge_contrib_d],
+                device=device,
+            )
+            wp.launch(
+                self._k_gather,
+                dim=N,
+                inputs=[
+                    self._edge_contrib_d,
+                    self._particle_edge_offsets_d,
+                    self._particle_edge_element_d,
+                    self._particle_edge_local_d,
+                ],
+                outputs=[self._rhs],
+                device=device,
+            )
+        # Tet ARAP projection.
+        if self._tet_indices_d is not None and model.tet_count > 0:
+            if self.stretching_model == "arap":
+                wp.launch(
+                    self._k_tet_arap,
+                    dim=model.tet_count,
+                    inputs=[
+                        self._x_cur,
+                        self._tet_indices_d,
+                        self._tet_rest_inv_d,
+                        self._tet_weight_d,
+                    ],
+                    outputs=[self._tet_contrib_d],
+                    device=device,
+                )
+                wp.launch(
+                    self._k_gather,
+                    dim=N,
+                    inputs=[
+                        self._tet_contrib_d,
+                        self._particle_tet_offsets_d,
+                        self._particle_tet_element_d,
+                        self._particle_tet_local_d,
+                    ],
+                    outputs=[self._rhs],
+                    device=device,
+                )
+            elif self.stretching_model == "corotational":
+                wp.launch(
+                    self._k_tet_corot,
+                    dim=model.tet_count,
+                    inputs=[
+                        self._x_cur,
+                        self._tet_indices_d,
+                        self._tet_rest_inv_d,
+                        self._tet_weight_d,
+                        self._mu,
+                        self._lam,
+                    ],
+                    outputs=[self._tet_contrib_d],
+                    device=device,
+                )
+                wp.launch(
+                    self._k_gather,
+                    dim=N,
+                    inputs=[
+                        self._tet_contrib_d,
+                        self._particle_tet_offsets_d,
+                        self._particle_tet_element_d,
+                        self._particle_tet_local_d,
+                    ],
+                    outputs=[self._rhs],
+                    device=device,
+                )
+            elif self.stretching_model == "neohookean":
+                nh_tet_kernel = self._k_tet_nh_lbfgs if self.nh_solver == "lbfgs" else self._k_tet_nh
+                wp.launch(
+                    nh_tet_kernel,
+                    dim=model.tet_count,
+                    inputs=[
+                        self._x_cur,
+                        self._tet_indices_d,
+                        self._tet_rest_inv_d,
+                        self._tet_weight_d,
+                        self._mu,
+                        self._lam,
+                    ],
+                    outputs=[self._tet_contrib_d],
+                    device=device,
+                )
+                wp.launch(
+                    self._k_gather,
+                    dim=N,
+                    inputs=[
+                        self._tet_contrib_d,
+                        self._particle_tet_offsets_d,
+                        self._particle_tet_element_d,
+                        self._particle_tet_local_d,
+                    ],
+                    outputs=[self._rhs],
+                    device=device,
+                )
+        if include_linear_solve:
+            # Global linear solve: x_unc = A^-1 . rhs (mirrors RealSim
+            # ``LocalGlobalSolver::globalSolve``).
+            self._linear_solver.solve(self._rhs, self._x_cur)
+
+    def _get_or_build_lg_iter_graph(self, dt: float) -> wp.Graph | None:
+        """Look up (or capture lazily) the PD local-phase + linear-solve graph.
+
+        Cached keyed by the active ``dt`` and the linear solver instance.
+        Both change rarely (PD setup rebuild flips ``_dt_setup`` and
+        nulls ``_linear_solver``).  The graph captures buffer pointers
+        (``_rhs``, ``_x_cur``, ``_x_inertia``, ``_tri_contrib_d``, ...) but
+        not their contents; replays observe whatever the buffers hold at
+        replay time -- which is exactly the next PD iter's input.
+
+        Returns ``None`` on capture failure so the eager path remains the
+        fallback.
+        """
+        device = self._device
+        cache_key = (float(dt), id(self._linear_solver))
+        cached = getattr(self, "_lg_graph_cache", None)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+        # Re-record on shape / setup change.
+        N = self.model.particle_count
+        try:
+            with wp.ScopedCapture(device=device) as cap:
+                self._run_pd_local_phase_eager(N, dt)
+            graph = cap.graph
+        except Exception:
+            graph = None
+        self._lg_graph_cache = (cache_key, graph)
+        return graph
 
     def set_pin_targets(self, target_positions) -> None:
         """Update reference positions for pinned particles (dynamic pin).
