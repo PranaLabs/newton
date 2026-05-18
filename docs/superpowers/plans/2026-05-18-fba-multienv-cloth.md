@@ -151,23 +151,42 @@ Build the single-env scene mirroring `CudaTests/ParallelEnvTest/cloth0.json`:
 
 **Test:** runs for 300 frames at `--viewer null` with no NaN, particle bounding box stays reasonable (cloth descends from y=3.5 to ~y=0.5 or so, mass-conserving stays roughly flat afterward as it drapes on the sphere).
 
-### Step 1.2 — capture RealSim ground-truth trajectory
+### Step 1.2 — capture RealSim ground-truth trajectories (BOTH solver modes)
 
-Before writing the Newton example, capture the RealSim ParallelEnvTest single-env trajectory as the immovable reference:
+Algorithm-fair acceptance requires comparing **same-algorithm vs same-algorithm**. RealSim ParallelEnvTest defaults to LiteNSN; for Newton-full validation we need a RealSim-full reference too. Capture both, overriding the constraint solver:
 
 ```bash
-# Force num_env=1 (override parallelEnv config) and run offline, dumping .abc
-realsim --config CudaTests/ParallelEnvTest --override 'parallelEnv.matrix=[1,1,1]'
-# Stream the .abc via the existing dump_abc_traj binary:
-/tmp/dump_abc_traj /path/to/output.abc > /tmp/realsim_cloth_on_sphere.txt
+# Baseline A — RealSim FULL NSN, single env (for Phase 1 Newton-full validation)
+realsim --config CudaTests/ParallelEnvTest \
+        --override 'parallelEnv.matrix=[1,1,1]' \
+        --override 'constraintsolver.type=NonSmoothNewton_CUDA'
+# → scripts/realsim_baseline/cloth_on_sphere_full_ref.npz
+
+# Baseline B — RealSim LITE NSN, single env (for Phase 2.4 Newton-lite validation)
+realsim --config CudaTests/ParallelEnvTest \
+        --override 'parallelEnv.matrix=[1,1,1]'
+# → scripts/realsim_baseline/cloth_on_sphere_lite_ref.npz
+
+# Baseline C — RealSim LITE NSN, full N=25 (for Phase 3.5 multi-env validation)
+realsim --config CudaTests/ParallelEnvTest
+# → scripts/realsim_baseline/parallel_env_cloth_lite_ref.npz
 ```
 
-Pack into `scripts/realsim_baseline/cloth_on_sphere_ref.npz` containing:
-- `positions: (300, 1013, 3) float32` — particle positions per frame
-- `n_contacts: (300,) int32` — saturation curve per frame (from `LocalGlobalSolver::printTimer` parser)
-- `step_ms: (300,) float32` — RealSim per-step time
+Each `.npz` contains:
+- `positions` — particle positions per frame (single-env: `(300, 1013, 3)`; multi-env: `(300, 25, 1013, 3)`)
+- `n_contacts` — saturation curve per frame
+- `step_ms` — RealSim per-step time
 
-This single file is what every later phase compares against. If we can't reproduce it, the plan is blocked.
+**Newton-mode → RealSim-baseline pairing:**
+
+| Newton run | Compared against | Why |
+|---|---|---|
+| Phase 1.3 (Newton `"full"`) | Baseline A (RealSim full NSN) | apples-to-apples |
+| Phase 2.4 (Newton `"lite"`) | Baseline B (RealSim LiteNSN) | apples-to-apples |
+| Phase 3.5 (Newton `"lite"` × 25) | Baseline C (RealSim LiteNSN × 25) | apples-to-apples |
+| Newton `"full"` vs Newton `"lite"` | *not compared* | different algorithms; drift expected and not gated |
+
+If we can't reproduce any of A/B/C, the relevant phase is blocked. Capture all three upfront in Step 1.2.
 
 ### Step 1.3 — visual + numerical validation
 
@@ -175,15 +194,15 @@ Render Newton preview frames at 0 / 50 / 150 / 299; alongside, dump Newton's per
 
 **Acceptance gate (all must pass):**
 1. **Tier 1 binary** — cloth makes contact with sphere by frame ~50 (visible drape, particles below y < 3.0 cloth surface).
-2. **Tier 2 trajectory match vs RealSim** — per-particle position error on the *settled* frame (frame 200, after initial drape transient):
+2. **Tier 2 trajectory match — Newton `"full"` vs RealSim full NSN baseline (A)** — per-particle position error on the *settled* frame (frame 200, after initial drape transient):
    ```python
-   rs = np.load("scripts/realsim_baseline/cloth_on_sphere_ref.npz")["positions"][200]
-   fba = np.load("/tmp/fba_cloth_on_sphere.npz")["positions"][200]
+   rs = np.load("scripts/realsim_baseline/cloth_on_sphere_full_ref.npz")["positions"][200]
+   fba = np.load("/tmp/fba_cloth_on_sphere_full.npz")["positions"][200]
    per_particle_err = np.linalg.norm(rs - fba, axis=1)
    assert np.percentile(per_particle_err, 95) < 0.05, "Tier 2: p95 per-particle drift > 5cm"
    assert per_particle_err.max() < 0.15, "Tier 2: max per-particle drift > 15cm"
    ```
-   5 cm @ p95 / 15 cm max is calibrated to the **RealSim FBA verification tiers** memory (Demo 4-style drape, looser than Demo 5 contact). Tightens to 1-2 cm if achievable, but 5/15 is the gate.
+   Apples-to-apples (both sides use full NSN). 5 cm @ p95 / 15 cm max is calibrated to the **RealSim FBA verification tiers** memory (Demo 4-style drape, looser than Demo 5 contact). Tightens to 1-2 cm if achievable, but 5/15 is the gate.
 3. **Tier 3 diagnostics** — contact count saturates around frame 100 (cloth settled), doesn't grow indefinitely. Compare `n_contacts[150:300]` mean against RealSim's — should be within ±20% (cloth seating is sensitive to friction state, exact contact count not strict).
 
 ### Step 1.4 — perf baseline
@@ -257,13 +276,14 @@ LiteNSN is **scoped to cloth scenes only**; we do NOT test or claim correctness 
 
 ### Step 2.4 — single-env cloth-on-sphere LiteNSN parity validation
 
-Repeat Phase 1's full acceptance protocol with `nsn_schur_mode="lite"`. Same scene, same dt, same 300 frames, same RealSim baseline (`scripts/realsim_baseline/cloth_on_sphere_ref.npz` from Step 1.2).
+Same scene as Phase 1, same dt, same 300 frames. Compared against **RealSim LiteNSN baseline (B)** from Step 1.2 — apples-to-apples (both sides use LiteNSN).
+
+**Note on Newton self-consistency:** we explicitly do **not** require `"lite"` to match Newton's `"full"` output. LiteNSN's Schur (W = H · M⁻¹ · Hᵀ) is a mathematically distinct algorithm from full NSN's (W = H · A⁻¹ · Hᵀ), so drift between modes is expected and not a defect. Acceptance is keyed only on each Newton mode matching its same-algorithm RealSim counterpart.
 
 **Acceptance gate (all must pass):**
 1. **Tier 1 binary** — cloth contacts sphere by frame ~50 (same as Phase 1.3).
-2. **Tier 2a — LiteNSN vs full NSN (Newton self-consistency):** per-particle drift between `"lite"` and `"full"` modes at frame 200 — **p95 < 2 cm, max < 5 cm**. Tighter than the RealSim gate because both runs use the same Newton solver framework, only the Schur step differs.
-3. **Tier 2b — LiteNSN vs RealSim ground truth:** same per-particle gate as Phase 1.3 — **p95 < 5 cm, max < 15 cm** vs `cloth_on_sphere_ref.npz`. If `"full"` already passes this (Phase 1.3 acceptance), the transitive bound on `"lite"` is loose — but we need an explicit measurement to detect *systematic* drift introduced by the M⁻¹ approximation.
-4. **Tier 3 diagnostics** — log per-frame NSN outer iter count and PCR iter count. Expected: LiteNSN takes **more outer / PCR iters** than full NSN. Document the delta.
+2. **Tier 2 — Newton `"lite"` vs RealSim LiteNSN baseline (B):** per-particle drift on the settled frame (200) — **p95 < 5 cm, max < 15 cm** vs `cloth_on_sphere_lite_ref.npz`. Same budget as Phase 1.3 because both gates are same-algorithm comparisons.
+3. **Tier 3 diagnostics** — log per-frame NSN outer iter count and PCR iter count. Document the iter-count delta vs Phase 1.3's full-NSN run (informational; not gated).
 
 **Perf measurement:** vs Phase 1.4 baseline, document:
 - Schur build delta (expect much faster — sparse build)
@@ -302,14 +322,11 @@ Run with N ∈ {1, 4, 9, 16, 25}, both modes. Plot step_time vs N.
 2. `"full"` mode either OOMs above some N or scales O(N²) (expected, validates the motivation for the work).
 3. At N=25, `"lite"` step time matches RealSim ParallelEnvTest within 3×. (RealSim reference perf needs to be captured — see Step 3.3.)
 
-### Step 3.3 — RealSim ground-truth multi-env reference
+### Step 3.3 — RealSim ground-truth multi-env reference (Baseline C, captured in Step 1.2)
 
-Run `RealSim_py/simulation/config/CudaTests/ParallelEnvTest` offline at the full N=25 config. Capture:
-- Per-frame step time (from `LocalGlobalSolver::printTimer` output) — perf target for Step 3.2
-- Per-env particle positions over all 300 frames (from `output_abc/`)
-- N_contacts saturation curve
+This baseline is already captured in Step 1.2 (Baseline C: RealSim LiteNSN × 25, the default `ParallelEnvTest` config). Loaded here for the multi-env perf and trajectory acceptance gates below.
 
-Pack into `scripts/realsim_baseline/parallel_env_cloth_ref.npz`:
+`scripts/realsim_baseline/parallel_env_cloth_lite_ref.npz`:
 - `positions: (300, 25, 1013, 3) float32`
 - `n_contacts_per_env: (300, 25) int32` — if RealSim emits per-env counts; otherwise total
 - `step_ms: (300,) float32`
@@ -328,12 +345,12 @@ for i in range(1, 25):
 
 If this fails, it diagnoses a **world-coupling bug** — some kernel is incorrectly aggregating across worlds. Stop and find it.
 
-### Step 3.5 — RealSim trajectory parity per env
+### Step 3.5 — RealSim trajectory parity per env (apples-to-apples: lite vs lite)
 
-For each of the 25 envs, the Newton trajectory should match the RealSim reference (Step 3.3 capture) at frame 200 (settled state):
+For each of the 25 envs, the Newton-LiteNSN trajectory should match the RealSim-LiteNSN reference (Baseline C) at frame 200 (settled state). Same algorithm both sides:
 
 ```python
-ref = np.load("scripts/realsim_baseline/parallel_env_cloth_ref.npz")
+ref = np.load("scripts/realsim_baseline/parallel_env_cloth_lite_ref.npz")
 rs = ref["positions"][200]   # (25, 1013, 3)
 fba = state.particle_q.numpy().reshape(25, 1013, 3) - offsets[:, None, :]  # un-offset to local
 
@@ -345,9 +362,9 @@ assert per_env_p95.max() < 0.05, f"env-worst p95 drift {per_env_p95.max():.3f} >
 assert per_env_max.max() < 0.15, f"env-worst max drift {per_env_max.max():.3f} > 15 cm"
 ```
 
-**Acceptance budget reasoning:** identical to Phase 1.3 (per-env trajectory should match per-env RealSim within the same 5/15 cm budget). If LiteNSN's coupling loss caused systematic drift across all envs, this catches it; if it caught only one env, Step 3.4 should have caught it first. Both tests together pin down "Newton multi-env LiteNSN reproduces RealSim multi-env LiteNSN."
+**Acceptance budget reasoning:** identical to Phase 2.4 (same algorithm both sides, 5/15 cm budget). If a coupling-related drift were going to leak into LiteNSN at scale, Step 3.4 catches it as cross-env *inconsistency*; Step 3.5 catches it as RealSim divergence. Together they pin down "Newton multi-env LiteNSN reproduces RealSim multi-env LiteNSN."
 
-If Step 1.3 (single-env) passed but Step 3.5 fails *for env 0 only*: regression in the multi-env path. If it fails *uniformly across all envs*: LiteNSN coupling loss at scale; revisit Phase 2.4 single-env tolerance — that test may have been too forgiving.
+If Step 2.4 (single-env lite) passed but Step 3.5 fails *for env 0 only*: regression in the multi-env path. If it fails *uniformly across all envs*: numeric divergence at scale; profile and bisect.
 
 ## Out of scope (deferred to follow-up plans)
 
@@ -376,7 +393,7 @@ This plan is done when:
    - Step 1.3 Tier 1 (contact by frame 50)
    - Step 1.3 **Tier 2: per-particle drift vs RealSim ref at frame 200 — p95 < 5 cm, max < 15 cm**
    - Step 1.3 Tier 3 (contact saturation within ±20% of RealSim)
-3. ✅ `SolverFBA(nsn_schur_mode="lite")` is callable and passes Phase 2.4 cloth-on-sphere single-env gates: Tier 2a `"lite"` vs `"full"` p95 < 2 cm / max < 5 cm; Tier 2b `"lite"` vs RealSim p95 < 5 cm / max < 15 cm. (No softbody / non-cloth correctness claims are made or required.)
+3. ✅ `SolverFBA(nsn_schur_mode="lite")` is callable and passes Phase 2.4 cloth-on-sphere single-env Tier 2 (apples-to-apples: Newton-lite vs RealSim-LiteNSN baseline B, p95 < 5 cm / max < 15 cm). (No Newton-lite vs Newton-full self-consistency gate — different algorithms, drift expected. No softbody / non-cloth correctness claims.)
 4. ✅ Phase 3.2 scaling test: `"lite"` scales linearly in N up to 25, step time within 3× RealSim's ParallelEnvTest reference.
 5. ✅ Phase 3.4 cross-env consistency check passes (env-to-env divergence < 1e-3 relative).
 6. ✅ **Phase 3.5 RealSim trajectory parity at scale passes (per-env p95 < 5 cm, max < 15 cm vs RealSim ParallelEnvTest reference).**
