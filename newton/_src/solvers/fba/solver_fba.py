@@ -221,7 +221,6 @@ class SolverFBA(SolverBase):
         use_isodof: bool = True,
         shape_angular_velocity: dict[int, float] | None = None,
         nh_solver: Literal["newton5", "lbfgs"] = "lbfgs",
-        use_gpu_nsn: bool = True,
     ) -> None:
         """
         Args:
@@ -278,18 +277,6 @@ class SolverFBA(SolverBase):
                 legacy 5-iter fixed Newton (no line search, no convergence
                 check) for regression. Ignored unless
                 ``stretching_model="neohookean"``.
-            use_gpu_nsn: If ``True`` (default) dispatch the NSN inner solve
-                to the device-resident drivers
-                (:meth:`_solve_nsn_unilateral_gpu` /
-                :meth:`_solve_nsn_coulomb_gpu`) that execute the residual,
-                FB row, Schur-build, PCR solve, lambda update, and box-cone
-                clamp on the GPU. Set to ``False`` to fall back to the
-                host/numpy reference path
-                (:meth:`_solve_nsn_unilateral` / :meth:`_solve_nsn_coulomb`)
-                for regression bisection. The GPU path is functionally
-                equivalent; per-step performance still incurs host/device
-                marshaling of the Schur ``W`` matrix and per-PCR-iter
-                synchronizations (see the NSN GPU port plan, Step 12).
         """
         super().__init__(model)
 
@@ -332,7 +319,6 @@ class SolverFBA(SolverBase):
         self.nsn_iterations = int(nsn_iterations)
         self.lambda_cap = lambda_cap
         self.use_isodof = bool(use_isodof)
-        self.use_gpu_nsn = bool(use_gpu_nsn)
 
         # Per-shape kinematic angular velocity (rad/s about local +Z).  RealSim
         # parity for ``cylindercollisions.rollingvel``.
@@ -995,32 +981,23 @@ class SolverFBA(SolverBase):
                     pene0_b[0::3] = self._contact_offset_h[:M]
                     pene0_b[1::3] = self._contact_tangent1_offset_h[:M]
                     pene0_b[2::3] = self._contact_tangent2_offset_h[:M]
-                    if self.use_gpu_nsn:
-                        # Hot path: pass the device-resident Schur W view
-                        # directly so the NSN driver skips the per-PD-iter
-                        # cap*cap*8 host -> device upload.
-                        lam, omega_last, lam_apply = self._solve_nsn_coulomb_gpu(
-                            W,
-                            r,
-                            self._contact_mu_h[:M],
-                            pene0_b,
-                            max_iters=self.nsn_iterations,
-                            lam_init=self._lam_coulomb_persistent,
-                            omega_init=self._omega_coulomb_persistent,
-                            dt=dt,
-                            W_device=ls.W_device_view(),
-                        )
-                    else:
-                        lam, omega_last, lam_apply = self._solve_nsn_coulomb(
-                            W,
-                            r,
-                            self._contact_mu_h[:M],
-                            pene0_b,
-                            max_iters=self.nsn_iterations,
-                            lam_init=self._lam_coulomb_persistent,
-                            omega_init=self._omega_coulomb_persistent,
-                            dt=dt,
-                        )
+                    # Hot path: pass the device-resident Schur W view
+                    # directly so the NSN driver skips the per-PD-iter
+                    # cap*cap*8 host -> device upload.  GPU is the only
+                    # active path; the legacy CPU numpy driver remains
+                    # under ``_legacy_cpu_solve_nsn_coulomb`` for
+                    # parity-only testing.
+                    lam, omega_last, lam_apply = self._solve_nsn_coulomb_gpu(
+                        W,
+                        r,
+                        self._contact_mu_h[:M],
+                        pene0_b,
+                        max_iters=self.nsn_iterations,
+                        lam_init=self._lam_coulomb_persistent,
+                        omega_init=self._omega_coulomb_persistent,
+                        dt=dt,
+                        W_device=ls.W_device_view(),
+                    )
                     self._lam_coulomb_persistent = lam.copy()
                     self._omega_coulomb_persistent = omega_last.copy()
                     # RealSim in-iter combined-form correction (Task 1.3.g,
@@ -1047,27 +1024,19 @@ class SolverFBA(SolverBase):
                     x_unc_np = self._x_cur.numpy()  # (N, 3) float32
                     r = self._compute_contact_residual(x_unc_np)
                     pene0_a = self._contact_offset_h[:M].astype(np.float64, copy=True)
-                    if self.use_gpu_nsn:
-                        lam, omega_last, lam_apply = self._solve_nsn_unilateral_gpu(
-                            W,
-                            r,
-                            pene0_a,
-                            max_iters=self.nsn_iterations,
-                            lam_init=self._lam_unilateral_persistent,
-                            omega_init=self._omega_unilateral_persistent,
-                            dt=dt,
-                            W_device=ls.W_device_view(),
-                        )
-                    else:
-                        lam, omega_last, lam_apply = self._solve_nsn_unilateral(
-                            W,
-                            r,
-                            pene0_a,
-                            max_iters=self.nsn_iterations,
-                            lam_init=self._lam_unilateral_persistent,
-                            omega_init=self._omega_unilateral_persistent,
-                            dt=dt,
-                        )
+                    # GPU is the only active path; the legacy CPU numpy
+                    # driver remains under ``_legacy_cpu_solve_nsn_unilateral``
+                    # for parity-only testing.
+                    lam, omega_last, lam_apply = self._solve_nsn_unilateral_gpu(
+                        W,
+                        r,
+                        pene0_a,
+                        max_iters=self.nsn_iterations,
+                        lam_init=self._lam_unilateral_persistent,
+                        omega_init=self._omega_unilateral_persistent,
+                        dt=dt,
+                        W_device=ls.W_device_view(),
+                    )
                     self._lam_unilateral_persistent = lam.copy()
                     self._omega_unilateral_persistent = omega_last.copy()
                     # Symmetric magnitude guard, matching Stage B above and
@@ -1522,7 +1491,14 @@ class SolverFBA(SolverBase):
         omega_init: np.ndarray | None = None,
         dt: float = 0.01,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """RealSim NonSmoothNewton port for unilateral LCP (Stage A).
+        """Legacy CPU/numpy NSN driver for unilateral LCP (Stage A).
+
+        .. deprecated:: Step 13 (NSN GPU port)
+            No longer dispatched by :meth:`step`; the GPU driver
+            :meth:`_solve_nsn_unilateral_gpu` is unconditional.  Retained
+            only as a parity oracle for
+            ``newton.tests.test_fba_nsn_gpu_driver`` and
+            ``newton.tests.test_solver_fba``.  Do not call from new code.
 
         Returns ``(lam, omega, lam_apply)``:
           - ``lam`` (force units, for warm-start): RealSim's accumulated λ.
@@ -1612,7 +1588,16 @@ class SolverFBA(SolverBase):
         omega_init: np.ndarray | None = None,
         dt: float = 0.01,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """RealSim NonSmoothNewton port for the frictional LCP.
+        """Legacy CPU/numpy NSN driver for the frictional LCP (Stage B).
+
+        .. deprecated:: Step 13 (NSN GPU port)
+            No longer dispatched by :meth:`step`; the GPU driver
+            :meth:`_solve_nsn_coulomb_gpu` is unconditional.  Retained
+            only as a parity oracle for
+            ``newton.tests.test_fba_nsn_gpu_driver`` and
+            ``newton.tests.test_solver_fba``.  Do not call from new code.
+
+        RealSim NonSmoothNewton port for the frictional LCP.
 
         Implements the dλ-Newton update from ``NonSmoothNewton.cpp:102-170``
         + ``343-378``, with omega weighting and position-LCP coupling. λ
