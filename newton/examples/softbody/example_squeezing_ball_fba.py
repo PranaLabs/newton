@@ -41,7 +41,7 @@ _BALL_SCALE = 3.0
 _BALL_TRANS = np.array([0.0, 2.6, 0.0])
 
 _CYL_RADIUS = 1.0
-_CYL_HALF_HEIGHT = 3.0
+_CYL_HALF_HEIGHT = 3.6  # 1.2x of the CudaTests reference 3.0 (visual extent only)
 _FRICTION_MU = 0.5
 
 # (base, axis_world, omega_rad_s) per cylinder, in shape-index order.
@@ -130,9 +130,20 @@ def _cyl_xform(base: np.ndarray, axis: np.ndarray) -> wp.transform:
 
 _BALL_COLOR = (0.55, 0.42, 0.82)  # blue-purple
 _CYL_COLOR = (0.55, 0.55, 0.58)  # gray
-_MARKER_COLOR = (0.95, 0.30, 0.30)  # red stripe to show cylinder rotation
-_MARKER_RADIUS = 0.07
-_MARKER_OFFSET_Z = 0.0  # along cylinder axis (mid-length)
+_STRIPE_COLOR_A = (0.20, 0.20, 0.22)  # dark stripe
+_STRIPE_COLOR_B = (0.85, 0.85, 0.88)  # light stripe
+# Longitudinal stripe boxes attached to each cylinder surface.  We place
+# ``_N_STRIPES`` evenly around the cylinder at +radius offset; their
+# shape_transform is updated per step so they ride with the cylinder
+# rotation, producing a visible grid/striped texture.
+_N_STRIPES = 8
+_STRIPE_THICKNESS = 0.04  # radial half-extent (sticks slightly proud of cylinder surface)
+_STRIPE_HALF_WIDTH = 0.06  # tangential half-extent
+# Transverse ring marker rings at +/- 0.6 h_half along the axis, to give a
+# 2D-grid feel rather than just longitudinal lines.
+_N_RING_MARKERS = 6
+_RING_OFFSETS = (-0.66, 0.0, 0.66)  # multiples of half-height
+_RING_MARKER_RADIUS = 0.07
 
 
 class Example:
@@ -172,12 +183,20 @@ class Example:
             add_surface_mesh_edges=False,
         )
 
-        # Cylinders (gray) + a red marker sphere attached to each cylinder
-        # surface to visualize rotation.  Markers are sites (non-colliding).
+        # Cylinders (gray) + a grid of small site-shapes attached to each
+        # cylinder surface to visualize rotation.  Per cylinder we add:
+        #   - ``_N_STRIPES`` longitudinal stripe-boxes alternating dark/light
+        #     placed around the circumference at radius offset,
+        #   - 3 transverse marker-sphere rings at ±0.66·half_height and mid.
+        # All markers are sites (non-colliding) and their shape_transforms
+        # are advanced by ``omega * dt`` each step in ``_advance_cylinder_rotation``.
         self._cyl_shape_ids: list[int] = []
         self._cyl_init_xforms: list[wp.transform] = []
-        self._marker_shape_ids: list[int] = []
         self._cyl_angles: list[float] = []
+        # Per-cylinder lists of (shape_id, base_angle, axis_z_offset, kind),
+        # kind in {"stripe", "marker"}.  ``base_angle`` is the local angle
+        # at sim time 0; runtime angle = base_angle + cyl_angle[i].
+        self._marker_data: list[list[tuple[int, float, float, str]]] = []
 
         for base, axis, _omega in _CYLINDERS:
             xform = _cyl_xform(base, axis)
@@ -192,16 +211,45 @@ class Example:
             self._cyl_init_xforms.append(xform)
             self._cyl_angles.append(0.0)
 
-            # Initial marker at θ=0 on cylinder surface (local +X axis, mid-length).
-            marker_xform_init = self._marker_xform(xform, 0.0)
-            mk_id = builder.add_shape_sphere(
-                body=-1,
-                xform=marker_xform_init,
-                radius=_MARKER_RADIUS,
-                color=_MARKER_COLOR,
-                as_site=True,
-            )
-            self._marker_shape_ids.append(mk_id)
+            per_cyl: list[tuple[int, float, float, str]] = []
+
+            # Longitudinal stripes (alternating dark/light) around the circumference.
+            for k in range(_N_STRIPES):
+                theta = k * (2.0 * math.pi / _N_STRIPES)
+                color = _STRIPE_COLOR_A if (k % 2 == 0) else _STRIPE_COLOR_B
+                stripe_xf = self._stripe_xform(xform, theta, 0.0)
+                # Long thin box: along cylinder axis = local Z = world axis-direction.
+                # half_extents in box-local frame: (tangential, radial, axial)
+                # We build the orientation so the box's long axis follows the cylinder's Z.
+                sid = builder.add_shape_box(
+                    body=-1,
+                    xform=stripe_xf,
+                    hx=_STRIPE_HALF_WIDTH,
+                    hy=_STRIPE_THICKNESS,
+                    hz=_CYL_HALF_HEIGHT * 0.98,
+                    color=color,
+                    as_site=True,
+                )
+                per_cyl.append((sid, theta, 0.0, "stripe"))
+
+            # Transverse ring markers at three z offsets, ``_N_RING_MARKERS``
+            # per ring, alternating colors for visibility.
+            for z_mult in _RING_OFFSETS:
+                z_off = z_mult * _CYL_HALF_HEIGHT
+                for k in range(_N_RING_MARKERS):
+                    theta = (k + 0.5) * (2.0 * math.pi / _N_RING_MARKERS)
+                    color = _STRIPE_COLOR_B if (k % 2 == 0) else _STRIPE_COLOR_A
+                    marker_xf = self._marker_xform(xform, theta, z_off)
+                    mid = builder.add_shape_sphere(
+                        body=-1,
+                        xform=marker_xf,
+                        radius=_RING_MARKER_RADIUS,
+                        color=color,
+                        as_site=True,
+                    )
+                    per_cyl.append((mid, theta, z_off, "marker"))
+
+            self._marker_data.append(per_cyl)
 
         builder.add_shape_plane(
             plane=(0.0, 1.0, 0.0, 10.0),
@@ -253,12 +301,16 @@ class Example:
         self.viewer.show_triangles = False
         self.viewer.set_model(self.model)
 
-        # Camera centered on the squeeze zone.  Cylinders sit at y in
+        # Camera framed on the squeeze zone.  Cylinders sit at y in
         # [-1, -3.5]; the ball drops from y≈2.6 through the gap into the
         # plane at y=-10, so the centroid of activity is around y≈-3.
-        # ``set_camera(pos, pitch, yaw)`` — pitch tilts down from horizon,
-        # yaw rotates around the world up axis.
-        self.viewer.set_camera(wp.vec3(6.0, 0.0, 6.0), pitch=-15.0, yaw=-45.0)
+        # Use ``camera.look_at`` (sets pitch+yaw consistently for the
+        # requested target) so the scene shows up centered on first frame.
+        if hasattr(self.viewer, "camera"):
+            cam_pos = wp.vec3(7.0, 2.0, 7.0)
+            cam_target = wp.vec3(0.0, -3.0, 0.0)
+            self.viewer.camera.pos = self.viewer.camera._as_vec3(cam_pos)
+            self.viewer.camera.look_at(cam_target)
 
         # Cache the initial shape_transform array as a NumPy buffer; per-step
         # rotation updates write into a copy of this and assign in bulk.
@@ -268,60 +320,96 @@ class Example:
         self._ball_tri_indices = self.model.tri_indices.flatten()
 
     @staticmethod
-    def _marker_xform(cyl_xform: wp.transform, angle: float) -> wp.transform:
-        """Marker position: at θ on the cylinder surface (local +X rotated by
-        angle about local +Z), expressed in world frame."""
-        base = np.asarray(cyl_xform.p, dtype=np.float64)
-        q = np.asarray(cyl_xform.q, dtype=np.float64)  # (qx, qy, qz, qw)
-        # Radial point in cylinder-local frame, at half-length mid-Z.
-        rx_local = _CYL_RADIUS * math.cos(angle)
-        ry_local = _CYL_RADIUS * math.sin(angle)
-        rz_local = _MARKER_OFFSET_Z
-        local = np.array([rx_local, ry_local, rz_local], dtype=np.float64)
-        # Rotate local → world using cyl_xform quaternion.
+    def _quat_rotate_vec(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+        """Rotate vector ``v`` by quaternion ``q = (qx, qy, qz, qw)``."""
         qx, qy, qz, qw = q
-        # Standard quaternion-vector rotation.
-        t = 2.0 * np.cross([qx, qy, qz], local)
-        world_rel = local + qw * t + np.cross([qx, qy, qz], t)
-        world_pos = base + world_rel
+        t = 2.0 * np.cross([qx, qy, qz], v)
+        return v + qw * t + np.cross([qx, qy, qz], t)
+
+    @staticmethod
+    def _quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        """Hamilton product of two quats in (x, y, z, w) order: ``a ∘ b``."""
+        ax, ay, az, aw = a
+        bx, by, bz, bw = b
+        return np.array(
+            [
+                aw * bx + ax * bw + ay * bz - az * by,
+                aw * by - ax * bz + ay * bw + az * bx,
+                aw * bz + ax * by - ay * bx + az * bw,
+                aw * bw - ax * bx - ay * by - az * bz,
+            ],
+            dtype=np.float64,
+        )
+
+    @staticmethod
+    def _marker_xform(cyl_xform: wp.transform, angle: float, z_offset: float = 0.0) -> wp.transform:
+        """Sphere marker on the cylinder surface at local angle θ and axial
+        offset (along the cylinder's local +Z).  Returns world-space pose."""
+        base = np.asarray(cyl_xform.p, dtype=np.float64)
+        q = np.asarray(cyl_xform.q, dtype=np.float64)
+        local = np.array(
+            [_CYL_RADIUS * math.cos(angle), _CYL_RADIUS * math.sin(angle), z_offset],
+            dtype=np.float64,
+        )
+        world_pos = base + Example._quat_rotate_vec(q, local)
         return wp.transform(wp.vec3(*world_pos.tolist()), wp.quat_identity())
+
+    @staticmethod
+    def _stripe_xform(cyl_xform: wp.transform, angle: float, z_offset: float) -> wp.transform:
+        """Longitudinal stripe-box pose: positioned at cylinder surface at
+        angle θ (radially outward), oriented so its long axis follows the
+        cylinder's local +Z."""
+        base = np.asarray(cyl_xform.p, dtype=np.float64)
+        q_cyl = np.asarray(cyl_xform.q, dtype=np.float64)
+        # Position: radius·(cosθ, sinθ, 0) in cylinder-local; rotate to world.
+        local_pos = np.array(
+            [
+                (_CYL_RADIUS + _STRIPE_THICKNESS) * math.cos(angle),
+                (_CYL_RADIUS + _STRIPE_THICKNESS) * math.sin(angle),
+                z_offset,
+            ],
+            dtype=np.float64,
+        )
+        world_pos = base + Example._quat_rotate_vec(q_cyl, local_pos)
+        # Orientation: the box's local axes need to be aligned so that:
+        #   box_x = radial direction (cosθ, sinθ, 0 in cyl-local)
+        #   box_y = perpendicular to radial in the cyl-local XY plane
+        #   box_z = cylinder's local +Z (axial)
+        # Compose: world_quat = q_cyl ∘ q_local_angle_about_Z
+        half = angle * 0.5
+        sh = math.sin(half)
+        q_local = np.array([0.0, 0.0, sh, math.cos(half)], dtype=np.float64)
+        q_world = Example._quat_mul(q_cyl, q_local)
+        return wp.transform(wp.vec3(*world_pos.tolist()), wp.quat(*q_world.tolist()))
 
     def _advance_cylinder_rotation(self) -> None:
         """Update cylinder shape_transforms (rotation about local +Z) and
-        marker shape_transforms (position on cylinder surface)."""
+        marker / stripe shape_transforms (positions on cylinder surface)."""
         new_xforms = self._shape_transform_init_np.copy()
         for i, (_base, _axis, omega) in enumerate(_CYLINDERS):
             self._cyl_angles[i] += omega * self.frame_dt
             angle = self._cyl_angles[i]
             cyl_xform = self._cyl_init_xforms[i]
 
-            # Rotate the cylinder's quaternion by ``angle`` about local +Z.
-            # cos(θ/2) + sin(θ/2)·k.  Compose with the cylinder's init quat.
+            # Cylinder body itself: rotate quat about local +Z by ``angle``.
             half = angle * 0.5
             sh = math.sin(half)
-            local_rot = np.array([0.0, 0.0, sh, math.cos(half)], dtype=np.float64)
+            q_local = np.array([0.0, 0.0, sh, math.cos(half)], dtype=np.float64)
             base_q = np.asarray(cyl_xform.q, dtype=np.float64)
-            # Quaternion multiply: q_new = base_q ∘ local_rot.
-            bx, by, bz, bw = base_q
-            lx, ly, lz, lw = local_rot
-            new_q = np.array(
-                [
-                    bw * lx + bx * lw + by * lz - bz * ly,
-                    bw * ly - bx * lz + by * lw + bz * lx,
-                    bw * lz + bx * ly - by * lx + bz * lw,
-                    bw * lw - bx * lx - by * ly - bz * lz,
-                ],
-                dtype=np.float64,
-            )
+            new_q = self._quat_mul(base_q, q_local)
             cyl_id = self._cyl_shape_ids[i]
             new_xforms[cyl_id][:3] = np.asarray(cyl_xform.p, dtype=np.float64)
             new_xforms[cyl_id][3:] = new_q
 
-            # Marker — position rotates with angle on cylinder surface.
-            marker_xform = self._marker_xform(cyl_xform, angle)
-            mk_id = self._marker_shape_ids[i]
-            new_xforms[mk_id][:3] = np.asarray(marker_xform.p, dtype=np.float64)
-            new_xforms[mk_id][3:] = np.asarray(marker_xform.q, dtype=np.float64)
+            # Stripes + ring markers move with the cylinder rotation.
+            for sid, base_angle, z_off, kind in self._marker_data[i]:
+                theta = base_angle + angle
+                if kind == "stripe":
+                    xf = self._stripe_xform(cyl_xform, theta, z_off)
+                else:
+                    xf = self._marker_xform(cyl_xform, theta, z_off)
+                new_xforms[sid][:3] = np.asarray(xf.p, dtype=np.float64)
+                new_xforms[sid][3:] = np.asarray(xf.q, dtype=np.float64)
         self.model.shape_transform.assign(new_xforms.astype(np.float32))
 
     def step(self):
