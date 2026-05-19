@@ -133,19 +133,19 @@ _MAT1X1_F64 = wp.types.matrix((1, 1), wp.float64)
 
 @wp.kernel
 def _precond_from_bsr_diag_kernel(
-    diag_blocks: wp.array[_MAT1X1_F64],
+    diag: wp.array[wp.float64],
     precond: wp.array[wp.float64],
 ):
-    """Build ``precond[i] = 1/diag_blocks[i][0, 0]`` for the LiteNSN sparse Schur.
+    """Build ``precond[i] = 1/diag[i]`` for the LiteNSN sparse Schur.
 
-    The BSR Schur ``W`` produced by :meth:`FBALinearSolver.build_schur_lite` has
-    ``1×1`` block shape, so ``bsr_get_diag`` returns one ``mat1x1`` per row.
-    Mirrors :func:`_compute_precond_kernel` for the dense path: ``1/W[i,i]``,
-    with the standard zero-diagonal-zero-output guard so a degenerate row
-    yields a zero update instead of NaN.
+    ``warp.sparse`` collapses 1×1-block BSR storage to scalar fp64 values
+    automatically (verified empirically on Warp 1.14), so
+    :func:`warp.sparse.bsr_get_diag` returns an ``array[wp.float64]``
+    rather than ``array[mat1x1]``.  The zero-guard mirrors the dense
+    :func:`_compute_precond_kernel`.
     """
     i = wp.tid()
-    d = diag_blocks[i][0, 0]
+    d = diag[i]
     if d == wp.float64(0.0):
         precond[i] = wp.float64(0.0)
     else:
@@ -601,8 +601,14 @@ class NSNPCRSolver:
         )
 
         # ----- q = W * d -----------------------------------------------
-        # ``wps.bsr_mv(W, d, q)`` with the sparse W replacing the dense matvec.
-        wps.bsr_mv(W_bsr, self._d, self._q)
+        # ``wps.bsr_mv`` strictly checks that x.shape[0] == W.cols, so slice
+        # the pre-allocated scratch down to the active size ``n`` (W is sized
+        # to n, scratch is sized to max_n).
+        d_v = self._d[:n]
+        q_v = self._q[:n]
+        s_v = self._s[:n]
+        h_v_ = self._h[:n]
+        wps.bsr_mv(W_bsr, d_v, q_v)
 
         # ----- h = q ---------------------------------------------------
         wp.copy(self._h, self._q, count=n)
@@ -649,7 +655,7 @@ class NSNPCRSolver:
                     outputs=[self._s], device=device,
                 )
                 # h = W * s   (sparse matvec)
-                wps.bsr_mv(W_bsr, self._s, self._h)
+                wps.bsr_mv(W_bsr, s_v, h_v_)
                 # rho_old = rho ; rho = <r, h>
                 wp.launch(
                     _copy_scalar_kernel, dim=1,

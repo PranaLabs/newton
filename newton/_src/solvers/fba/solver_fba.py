@@ -224,6 +224,12 @@ class SolverFBA(SolverBase):
         nh_solver: Literal["newton5", "lbfgs"] = "lbfgs",
         enable_perf_timing: bool = False,
         nsn_schur_mode: Literal["full", "lite"] = "full",
+        self_contact_radius: float | None = None,
+        self_contact_margin: float = 0.04,
+        self_contact_friction: float = 0.25,
+        self_contact_topology_ring: int = 2,
+        self_contact_rest_exclusion_radius: float = 0.1,
+        self_contact_max_pairs: int | None = None,
     ) -> None:
         """
         Args:
@@ -308,6 +314,22 @@ class SolverFBA(SolverBase):
                 f"nsn_schur_mode={nsn_schur_mode!r} not supported; choose 'full' or 'lite'"
             )
         self.nsn_schur_mode = nsn_schur_mode
+
+        # Cloth self-contact (Phase 3 of the Franka plan).  Routed as a
+        # separate pass after the rigid NSN; uses the BSR + sparse-PCR
+        # pipeline regardless of nsn_schur_mode (self-contact rows have
+        # 2 nonzero blocks per H row, which the per-particle fused kernel
+        # cannot represent).
+        self.self_contact_radius = (
+            float(self_contact_radius) if self_contact_radius is not None else None
+        )
+        self.self_contact_margin = float(self_contact_margin)
+        self.self_contact_friction = float(self_contact_friction)
+        self.self_contact_topology_ring = int(self_contact_topology_ring)
+        self.self_contact_rest_exclusion_radius = float(self_contact_rest_exclusion_radius)
+        self.self_contact_max_pairs = self_contact_max_pairs
+        self._self_broadphase = None  # lazily constructed in _apply_self_contact_pass
+        self._self_buf_cap = 0
         if stretching_model in ("corotational", "neohookean"):
             if mu is None or lam is None:
                 raise ValueError(
@@ -983,44 +1005,81 @@ class SolverFBA(SolverBase):
                         device=device,
                     )
                     if use_lite_block_diag:
-                        # Warm-start ω: the dense path uses the persistent
-                        # device buffer to seed FB-Newton iter 0; replicate
-                        # that here by copying into _nsn_omega_d.
+                        # Warm-start ω + λ from the persistent device buffers
+                        # (same convention as the dense path).
                         wp.copy(self._nsn_omega_d, self._omega_coulomb_persistent_d, count=3 * M)
                         wp.copy(self._nsn_lam_d, self._lam_coulomb_persistent_d, count=3 * M)
-                        # Lambda cap: dense path post-clips after the FB loop;
-                        # we fold it into the kernel for one less launch.
+                        # Lambda cap (folded into both per-contact and per-particle kernels).
                         if self.lambda_cap is not None:
                             cap_internal = float(self.lambda_cap) / (dt * dt)
                             use_cap = 1
                         else:
-                            cap_internal = 0.0  # sentinel — gated by use_cap
+                            cap_internal = 0.0
                             use_cap = 0
-                        wp.launch(
-                            K_step.fb_newton_lite_coulomb_kernel,
-                            dim=M,
-                            inputs=[
-                                self._contact_particle_d,
-                                self._contact_normal_d,
-                                self._contact_tangent1_d,
-                                self._contact_tangent2_d,
-                                self._contact_alpha_d,
-                                self._contact_mu_d,
-                                self._nsn_r_d,
-                                self._nsn_pene0_d,
-                                ls._inv_mass_d,
-                                wp.float64(dt),
-                                wp.float64(cap_internal),
-                                wp.int32(use_cap),
-                                wp.int32(int(self.nsn_iterations)),
-                            ],
-                            outputs=[
-                                self._nsn_lam_d,
-                                self._nsn_omega_d,
-                                self._nsn_lam_apply_d,
-                            ],
-                            device=device,
+                        # Dispatch: Phase 1 (Franka plan) per-particle kernel
+                        # whenever any particle has more than 3 contact rows
+                        # (i.e. >1 contact in Stage B, since each contact owns
+                        # 3 rows).  Otherwise stick with the per-contact
+                        # kernel: it's the k_p==1 specialisation and avoids
+                        # the per-particle kernel's 12×12 register footprint
+                        # for what is the only common case in cloth-on-rigid.
+                        use_per_particle = (
+                            getattr(ls, "_isodof_max_k", 1) > 3
+                            and getattr(ls, "_isodof_unique_d", None) is not None
                         )
+                        if use_per_particle:
+                            wp.launch(
+                                K_step.fb_newton_lite_coulomb_per_particle_kernel,
+                                dim=ls._n_isodofs,
+                                inputs=[
+                                    ls._isodof_unique_d,
+                                    ls._isodof_row_offsets_d,
+                                    ls._isodof_row_indices_d,
+                                    ls._row_particle_d,
+                                    ls._row_dir_d,
+                                    ls._row_alpha_d,
+                                    self._contact_mu_d,
+                                    self._nsn_r_d,
+                                    self._nsn_pene0_d,
+                                    ls._inv_mass_d,
+                                    wp.float64(dt),
+                                    wp.float64(cap_internal),
+                                    wp.int32(use_cap),
+                                    wp.int32(int(self.nsn_iterations)),
+                                ],
+                                outputs=[
+                                    self._nsn_lam_d,
+                                    self._nsn_omega_d,
+                                    self._nsn_lam_apply_d,
+                                ],
+                                device=device,
+                            )
+                        else:
+                            wp.launch(
+                                K_step.fb_newton_lite_coulomb_kernel,
+                                dim=M,
+                                inputs=[
+                                    self._contact_particle_d,
+                                    self._contact_normal_d,
+                                    self._contact_tangent1_d,
+                                    self._contact_tangent2_d,
+                                    self._contact_alpha_d,
+                                    self._contact_mu_d,
+                                    self._nsn_r_d,
+                                    self._nsn_pene0_d,
+                                    ls._inv_mass_d,
+                                    wp.float64(dt),
+                                    wp.float64(cap_internal),
+                                    wp.int32(use_cap),
+                                    wp.int32(int(self.nsn_iterations)),
+                                ],
+                                outputs=[
+                                    self._nsn_lam_d,
+                                    self._nsn_omega_d,
+                                    self._nsn_lam_apply_d,
+                                ],
+                                device=device,
+                            )
                     else:
                         self._solve_nsn_coulomb_gpu(
                             None,
@@ -1125,7 +1184,20 @@ class SolverFBA(SolverBase):
                         wp.synchronize_device()
                         self._timing_nsn_inner_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_nsn_0))
 
-        # 3) Write velocity and update state_out.
+        # 3) Self-contact pass (Phase 3 of Franka plan) — only fires when
+        #    ``self_contact_radius`` was set at construction.  Runs AFTER the
+        #    rigid NSN so the BSR pass sees a state already corrected for
+        #    rigid contacts.  Modifies ``self._x_cur`` in place; velocity
+        #    write below picks up the corrected positions.
+        if self.self_contact_radius is not None:
+            # Wrap _x_cur in a state-like proxy for the existing pass API.
+            class _StateProxy:
+                pass
+            proxy = _StateProxy()
+            proxy.particle_q = self._x_cur
+            self._apply_self_contact_pass(proxy, dt)
+
+        # 4) Write velocity and update state_out.
         wp.copy(state_out.particle_q, self._x_cur)
         wp.launch(
             write_velocity_kernel,
@@ -1750,6 +1822,37 @@ class SolverFBA(SolverBase):
                 outputs=[self._contact_v_anchor_d],
                 device=device,
             )
+            # Phase 2 (Franka plan): when the contact's parent shape is attached
+            # to a moving rigid body, body-driven 6-DoF velocity supersedes the
+            # per-shape ``shape_angular_velocity``.  This kernel only writes
+            # contacts whose ``shape_body[s] >= 0``; static-shape contacts keep
+            # the value computed above by ``compute_v_anchor_kernel``.
+            body_qd_arr = (
+                self.model.body_qd
+                if hasattr(self.model, "body_qd") and self.model.body_qd is not None
+                else None
+            )
+            if (
+                has_shape_body == wp.int32(1)
+                and body_qd_arr is not None
+                and body_qd_arr.size > 0
+                and has_body_q == wp.int32(1)
+            ):
+                from .kernels import compute_v_anchor_from_body_kernel  # noqa: PLC0415
+
+                wp.launch(
+                    compute_v_anchor_from_body_kernel,
+                    dim=M,
+                    inputs=[
+                        self._contact_shape_d,
+                        shape_body_arr,
+                        body_q_arr,
+                        body_qd_arr,
+                        self._contact_world_anchor_d,
+                    ],
+                    outputs=[self._contact_v_anchor_d],
+                    device=device,
+                )
 
             # Host mirrors (transitional — Step 6 moves the friction
             # residual to GPU and we can drop most of these).
@@ -2128,6 +2231,358 @@ class SolverFBA(SolverBase):
     #
     # See ``docs/superpowers/plans/2026-05-17-fba-nsn-gpu-port.md`` for the
     # roll-out plan; RealSim reference is ``NonSmoothNewton.cpp:102-171``.
+
+    def _apply_self_contact_pass(self, state_inout, dt: float) -> int:
+        """Run one self-contact NSN sweep on the current ``state_inout``.
+
+        Sequence:
+        1. Broadphase: enumerate particle pairs within self-contact threshold,
+           filtered by topology + rest-pose exclusion.
+        2. Emit Stage B rows (normal + 2 tangents) per surviving pair.
+        3. Compute residual ``r`` and ``pene0`` for self-rows.
+        4. Call the BSR FB-Newton inner driver to solve for ``λ_self``.
+        5. Apply ``Δx = A⁻¹·Jᵀ·λ_apply`` to ``state_inout.particle_q``.
+
+        Returns the number of self-contact rows processed.  Zero pairs is the
+        no-op fast path (entire pass elided).
+        """
+        if self.self_contact_radius is None:
+            return 0
+        from .self_contact import SelfContactBroadphase  # noqa: PLC0415
+
+        # ---- Lazy broadphase setup ----
+        if self._self_broadphase is None:
+            threshold = 2.0 * float(self.self_contact_radius) + float(self.self_contact_margin)
+            self._self_broadphase = SelfContactBroadphase(
+                self.model,
+                threshold=threshold,
+                topology_ring=self.self_contact_topology_ring,
+                rest_exclusion_radius=self.self_contact_rest_exclusion_radius,
+                max_pairs=self.self_contact_max_pairs,
+            )
+        bp = self._self_broadphase
+
+        # ---- Broadphase ----
+        n_pairs = bp.find_pairs(state_inout.particle_q)
+        if n_pairs == 0:
+            return 0
+
+        device = self._device
+        n_rows = 3 * n_pairs
+
+        # ---- Allocate per-step scratch (one-shot at max capacity).  Resizing
+        # warp arrays mid-step risks use-after-free if a previously-launched
+        # kernel is still in flight; pre-allocating to ``3 * max_pairs`` once
+        # avoids the issue entirely.
+        if self._self_buf_cap == 0:
+            cap = max(48, 3 * bp.max_pairs)
+            self._self_buf_cap = cap
+            self._self_row_pa_d = wp.empty(cap, dtype=wp.int32, device=device)
+            self._self_row_pb_d = wp.empty(cap, dtype=wp.int32, device=device)
+            self._self_row_dir_d = wp.empty(cap, dtype=wp.vec3, device=device)
+            self._self_row_alpha_d = wp.empty(cap, dtype=wp.float32, device=device)
+            self._self_row_offset_d = wp.empty(cap, dtype=wp.float64, device=device)
+            # μ array sized to max pairs (cap/3 contacts).  Filled with the
+            # constant self-contact friction once here so per-step launches
+            # never touch it.
+            self._self_contact_mu_d = wp.array(
+                np.full(cap // 3, self.self_contact_friction, dtype=np.float64),
+                dtype=wp.float64, device=device,
+            )
+            self._self_r_d = wp.empty(cap, dtype=wp.float64, device=device)
+            self._self_lam_d = wp.zeros(cap, dtype=wp.float64, device=device)
+            self._self_omega_d = wp.zeros(cap, dtype=wp.float64, device=device)
+            self._self_lam_apply_d = wp.zeros(cap, dtype=wp.float64, device=device)
+            self._self_lam_apply_f32_d = wp.zeros(cap, dtype=wp.float32, device=device)
+            self._self_jt_lambda_d = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=device)
+            self._self_x_correction_d = wp.empty(self.model.particle_count, dtype=wp.vec3, device=device)
+
+        # ---- Emit self-contact rows ----
+        from . import kernels as K  # noqa: PLC0415
+
+        gap_threshold = 2.0 * float(self.self_contact_radius)
+        wp.launch(
+            K.emit_self_contact_rows_kernel,
+            dim=n_pairs,
+            inputs=[
+                wp.int32(n_pairs),
+                bp._pair_a_d,
+                bp._pair_b_d,
+                bp._pair_normal_d,
+                wp.float64(gap_threshold),
+                wp.int32(0),                       # row_offset_base
+            ],
+            outputs=[
+                self._self_row_pa_d,
+                self._self_row_pb_d,
+                self._self_row_dir_d,
+                self._self_row_alpha_d,
+                self._self_row_offset_d,
+                self._self_contact_mu_d,
+            ],
+            device=device,
+        )
+
+        # ---- Residual r ----
+        wp.launch(
+            K.compute_self_contact_residual_kernel,
+            dim=n_rows,
+            inputs=[
+                self._self_row_pa_d,
+                self._self_row_pb_d,
+                self._self_row_dir_d,
+                self._self_row_alpha_d,
+                self._self_row_offset_d,
+                state_inout.particle_q,
+            ],
+            outputs=[self._self_r_d],
+            device=device,
+        )
+
+        # ---- Warm-start: zero λ / ω for self-contact rows ----
+        self._self_lam_d[:n_rows].zero_()
+        self._self_omega_d[:n_rows].zero_()
+
+        # ---- BSR FB-Newton inner ----
+        if self.lambda_cap is not None:
+            cap_internal = float(self.lambda_cap) / (dt * dt)
+            use_cap = True
+        else:
+            cap_internal = 0.0
+            use_cap = False
+
+        self._solve_nsn_coulomb_lite_bsr(
+            M_total=n_pairs,
+            row_particle_a_d=self._self_row_pa_d,
+            row_particle_b_d=self._self_row_pb_d,
+            row_dir_d=self._self_row_dir_d,
+            row_alpha_d=self._self_row_alpha_d,
+            contact_mu_d=self._self_contact_mu_d,
+            r_d=self._self_r_d,
+            pene0_d=self._self_row_offset_d,
+            lam_init_d=self._self_lam_d,
+            omega_init_d=self._self_omega_d,
+            lam_out_d=self._self_lam_d,
+            omega_out_d=self._self_omega_d,
+            lam_apply_out_d=self._self_lam_apply_d,
+            dt=dt,
+            n_fb_iters=self.nsn_iterations,
+            cap_internal=cap_internal,
+            use_cap=use_cap,
+        )
+
+        # ---- Cast lam_apply to fp32 for the gather kernel ----
+        from .kernels import cast_fp64_to_fp32_kernel  # noqa: PLC0415
+
+        wp.launch(
+            cast_fp64_to_fp32_kernel,
+            dim=n_rows,
+            inputs=[self._self_lam_apply_d],
+            outputs=[self._self_lam_apply_f32_d],
+            device=device,
+        )
+
+        # ---- Build Jᵀ·λ at particles (2-particle scatter) ----
+        self._self_jt_lambda_d.zero_()
+        wp.launch(
+            K.scatter_jt_lambda_two_particle_kernel,
+            dim=n_rows,
+            inputs=[
+                wp.int32(n_rows),
+                self._self_row_pa_d,
+                self._self_row_pb_d,
+                self._self_row_dir_d,
+                self._self_row_alpha_d,
+                self._self_lam_apply_f32_d,
+            ],
+            outputs=[self._self_jt_lambda_d],
+            device=device,
+        )
+
+        # ---- Apply Δx = dt² · M⁻¹ · Jᵀ·λ (LiteNSN-consistent) ----
+        # Going through the full PD A⁻¹ diffuses the impulse via stretching/
+        # bending elasticity (measured 0.5mm Δx per step on 1013-particle
+        # cloth despite ~12k λ values), which the next step's PD solve
+        # then largely undoes.  Using the same mass-inverse diagonal that
+        # the LiteNSN Schur was built with localises the impulse to its
+        # target particle.
+        wp.launch(
+            K.apply_dt2_inv_mass_correction_kernel,
+            dim=self.model.particle_count,
+            inputs=[self._self_jt_lambda_d, self._linear_solver._inv_mass_d, wp.float64(dt)],
+            outputs=[state_inout.particle_q],
+            device=device,
+        )
+        return n_rows
+
+    def _solve_nsn_coulomb_lite_bsr(
+        self,
+        *,
+        M_total: int,
+        row_particle_a_d: wp.array,
+        row_particle_b_d: wp.array,
+        row_dir_d: wp.array,
+        row_alpha_d: wp.array,
+        contact_mu_d: wp.array,
+        r_d: wp.array,
+        pene0_d: wp.array,
+        lam_init_d: wp.array,
+        omega_init_d: wp.array,
+        lam_out_d: wp.array,
+        omega_out_d: wp.array,
+        lam_apply_out_d: wp.array,
+        dt: float,
+        n_fb_iters: int,
+        cap_internal: float,
+        use_cap: bool,
+    ) -> None:
+        """LiteNSN inner driver on the BSR + sparse-PCR path.
+
+        Handles **mixed rigid + self-contact** rows in a single FB-Newton
+        sweep.  Rigid rows carry ``row_particle_b[r] == -1``; self-contact
+        rows carry both ``row_particle_a`` and ``row_particle_b`` valid.
+
+        This is the consumer of ``FBALinearSolver.build_schur_lite_unified``
+        and ``build_a_schur_lite_bsr``, and of ``NSNPCRSolver.solve_sparse``
+        — all three were implemented as part of the multi-env plan but only
+        now have a hot-path caller (Phase 3.3 of the Franka plan).
+        """
+        import warp.sparse as wps  # noqa: PLC0415
+
+        from . import kernels as K  # noqa: PLC0415
+
+        n_rows = 3 * int(M_total)
+        device = self._device
+        dt_w = wp.float64(dt)
+        dt2 = float(dt) * float(dt)
+
+        ls = self._linear_solver
+
+        # Build the sparse Schur W (block-diagonal-by-particle for rigid-only,
+        # contact-graph-sparse with self-contact rows mixed in).
+        W_bsr = ls.build_schur_lite_unified(
+            n_rows, row_particle_a_d, row_particle_b_d, row_dir_d, row_alpha_d,
+        )
+        if W_bsr is None:
+            # Nothing to solve.
+            return
+
+        # PCR solver capacity check.
+        self._ensure_pcr_solver(n_rows)
+
+        # ---- Per-row scratch (1D fp64, sized to upper bound once).
+        # Resizing mid-run risks use-after-free under in-flight kernels.
+        if not hasattr(self, "_bsr_omega_lam"):
+            cap = max(n_rows, 48)
+            # Honor an explicit upper bound from the self-contact path if set.
+            cap = max(cap, getattr(self, "_self_buf_cap", 0))
+            self._bsr_buf_cap = cap
+            self._bsr_omega_lam = wp.zeros(cap, dtype=wp.float64, device=device)
+            self._bsr_w_omega_lam = wp.zeros(cap, dtype=wp.float64, device=device)
+            self._bsr_penetration = wp.zeros(cap, dtype=wp.float64, device=device)
+            self._bsr_compliance = wp.zeros(cap, dtype=wp.float64, device=device)
+            self._bsr_h = wp.zeros(cap, dtype=wp.float64, device=device)
+            self._bsr_rhs = wp.zeros(cap, dtype=wp.float64, device=device)
+            self._bsr_dlam = wp.zeros(cap, dtype=wp.float64, device=device)
+            self._bsr_precond = wp.zeros(cap, dtype=wp.float64, device=device)
+            self._bsr_lam = wp.zeros(cap, dtype=wp.float64, device=device)
+            self._bsr_omega = wp.zeros(cap, dtype=wp.float64, device=device)
+        elif self._bsr_omega_lam.size < n_rows:
+            # Hard fail — pre-allocate higher up.
+            raise RuntimeError(
+                f"BSR scratch undersized: have {self._bsr_omega_lam.size}, need {n_rows}. "
+                "Pre-allocate via _self_buf_cap before first call."
+            )
+
+        # Warm-start λ, ω from the persistent buffers.
+        wp.copy(self._bsr_lam, lam_init_d, count=n_rows)
+        wp.copy(self._bsr_omega, omega_init_d, count=n_rows)
+
+        # Slice the scratch arrays down to exactly ``n_rows`` so bsr_mv /
+        # bsr_get_diag size checks pass.  The underlying buffers are
+        # cap-sized; sub-array views share the same memory.
+        precond_v = self._bsr_precond[:n_rows]
+        omega_v = self._bsr_omega[:n_rows]
+        lam_v = self._bsr_lam[:n_rows]
+        omega_lam_v = self._bsr_omega_lam[:n_rows]
+        w_omega_lam_v = self._bsr_w_omega_lam[:n_rows]
+        penetration_v = self._bsr_penetration[:n_rows]
+        compliance_v = self._bsr_compliance[:n_rows]
+        h_v = self._bsr_h[:n_rows]
+        rhs_v = self._bsr_rhs[:n_rows]
+        dlam_v = self._bsr_dlam[:n_rows]
+
+        # Precond per row from W's diagonal.
+        W_diag = wps.bsr_get_diag(W_bsr)
+        wp.launch(
+            K.precond_from_bsr_diag_coulomb_kernel,
+            dim=n_rows,
+            inputs=[W_diag, dt_w],
+            outputs=[precond_v],
+            device=device,
+        )
+
+        for _it in range(int(n_fb_iters)):
+            wp.launch(
+                K.compute_omega_times_lam_kernel,
+                dim=n_rows,
+                inputs=[omega_v, lam_v],
+                outputs=[omega_lam_v],
+                device=device,
+            )
+            wps.bsr_mv(W_bsr, omega_lam_v, w_omega_lam_v)
+
+            wp.launch(
+                K.compute_penetration_sparse_kernel,
+                dim=n_rows,
+                inputs=[r_d, w_omega_lam_v, dt_w],
+                outputs=[penetration_v],
+                device=device,
+            )
+
+            wp.launch(
+                K.compute_frictional_fb_kernel,
+                dim=int(M_total),
+                inputs=[
+                    penetration_v, lam_v, contact_mu_d, precond_v, pene0_d, dt_w,
+                ],
+                outputs=[omega_v, compliance_v, h_v],
+                device=device,
+            )
+
+            A_bsr = ls.build_a_schur_lite_bsr(W_bsr, omega_v, compliance_v)
+            wp.launch(
+                K.compute_nsn_rhs_lite_bsr_kernel,
+                dim=n_rows,
+                inputs=[h_v, omega_v, pene0_d, r_d, w_omega_lam_v, dt_w],
+                outputs=[rhs_v],
+                device=device,
+            )
+            try:
+                self._pcr_solver.solve_sparse(A_bsr, rhs_v, dlam_v)
+            except Exception:
+                break
+
+            wp.launch(
+                K.axpy_lambda_kernel, dim=n_rows,
+                inputs=[dlam_v], outputs=[lam_v], device=device,
+            )
+
+        wp.launch(
+            K.coulomb_box_clamp_kernel, dim=int(M_total),
+            inputs=[contact_mu_d], outputs=[lam_v], device=device,
+        )
+        if use_cap:
+            wp.launch(
+                K.lambda_cap_clip_kernel, dim=n_rows,
+                inputs=[wp.float64(cap_internal)], outputs=[lam_v], device=device,
+            )
+        wp.launch(
+            K.compute_lam_apply_kernel, dim=n_rows,
+            inputs=[lam_v, omega_v, dt_w], outputs=[lam_apply_out_d], device=device,
+        )
+        wp.copy(lam_out_d, self._bsr_lam, count=n_rows)
+        wp.copy(omega_out_d, self._bsr_omega, count=n_rows)
 
     def _ensure_pcr_solver(self, max_n: int) -> None:
         """Lazily create / resize the NSN-Schur PCR solver."""

@@ -4142,6 +4142,584 @@ def fb_newton_lite_coulomb_kernel(
     lam_apply[i_t2] = dt2 * om_t2 * lam_t2
 
 
+# ----- BSR + sparse-PCR helpers for LiteNSN with self-contact (Phase 3) -----
+
+# Module-level type alias for the 1×1 fp64 BSR block — warp can only resolve
+# matrix types when they're statically named at module scope.
+_BSR_BLOCK_1X1_F64 = wp.types.matrix((1, 1), wp.float64)
+
+
+@wp.kernel
+def precond_from_bsr_diag_coulomb_kernel(
+    diag: wp.array[wp.float64],
+    dt: wp.float64,
+    precond: wp.array[wp.float64],
+):
+    """Compute Stage B precond (dt²·|W_ii| for normals, dt·|W_ii| for tangents)
+    directly from a BSR diagonal.  Companion to the dense
+    :func:`compute_precond_coulomb_kernel`.
+
+    ``warp.sparse.bsr_mm`` collapses a (1×1) block_type product into a
+    scalar fp64 BsrMatrix, so ``bsr_get_diag`` returns an
+    ``array[wp.float64]`` rather than ``array[mat1x1]``.
+    """
+    i = wp.tid()
+    w = wp.abs(diag[i])
+    if w < wp.float64(1.0e-12):
+        w = wp.float64(1.0e-12)
+    if (i % 3) == 0:
+        precond[i] = dt * dt * w
+    else:
+        precond[i] = dt * w
+
+
+@wp.kernel
+def compute_penetration_sparse_kernel(
+    r: wp.array[wp.float64],
+    w_omega_lam: wp.array[wp.float64],
+    dt: wp.float64,
+    penetration: wp.array[wp.float64],
+):
+    """Per-row ``penetration = -r + dt² · W·(ω·λ)`` for the sparse path.
+
+    Sparse equivalent of the matvec embedded in
+    :func:`compute_penetration_kernel`: caller supplies the precomputed
+    ``W·(ω·λ)`` (from ``wps.bsr_mv``) so this kernel is a trivial 1-line
+    fused multiply-add.
+    """
+    i = wp.tid()
+    penetration[i] = -r[i] + dt * dt * w_omega_lam[i]
+
+
+@wp.kernel
+def build_a_schur_lite_bsr_kernel(
+    w_offsets: wp.array[wp.int32],
+    w_columns: wp.array[wp.int32],
+    w_values: wp.array[wp.float64],          # collapsed scalar values for 1×1 BSR
+    omega: wp.array[wp.float64],
+    compliance: wp.array[wp.float64],
+    a_values: wp.array[wp.float64],          # output, same shape as w_values
+):
+    """Build A_schur = ωωᵀ ⊙ W + diag(c) in BSR with W's sparsity (scalar
+    values since ``warp.sparse`` collapses 1×1 block BSR to scalar storage).
+    """
+    i = wp.tid()
+    start = w_offsets[i]
+    end = w_offsets[i + 1]
+    om_i = omega[i]
+    c_i = compliance[i]
+    for k in range(start, end):
+        j = w_columns[k]
+        om_j = omega[j]
+        a_ij = om_i * om_j * w_values[k]
+        if i == j:
+            a_ij = a_ij + c_i
+        a_values[k] = a_ij
+
+
+@wp.kernel
+def compute_nsn_rhs_lite_bsr_kernel(
+    h: wp.array[wp.float64],
+    omega: wp.array[wp.float64],
+    pene0: wp.array[wp.float64],
+    r: wp.array[wp.float64],
+    w_omega_lam: wp.array[wp.float64],      # W · (ω · λ) precomputed via bsr_mv
+    dt: wp.float64,
+    rhs: wp.array[wp.float64],
+):
+    """Per-row RHS for the sparse LiteNSN PCR.
+
+    Mirrors the dense ``compute_nsn_rhs_kernel`` but takes a pre-computed
+    ``W · (ω · λ)`` vector (assembled by the caller via
+    ``wp.sparse.bsr_mv(W_bsr, omega_times_lam, w_omega_lam)``) instead of
+    inlining the matvec — that path is what makes the rhs build sparse
+    instead of dense.
+
+        J_x = (pene0 - r) + dt² · w_omega_lam
+        rhs = (1/dt²) · (h - omega · J_x)
+    """
+    i = wp.tid()
+    dt2 = dt * dt
+    Jx = (pene0[i] - r[i]) + dt2 * w_omega_lam[i]
+    rhs[i] = (wp.float64(1.0) / dt2) * (h[i] - omega[i] * Jx)
+
+
+@wp.kernel
+def compute_omega_times_lam_kernel(
+    omega: wp.array[wp.float64],
+    lam: wp.array[wp.float64],
+    out: wp.array[wp.float64],
+):
+    """Elementwise ``out[i] = omega[i] · lam[i]`` so we can feed ``bsr_mv``."""
+    i = wp.tid()
+    out[i] = omega[i] * lam[i]
+
+
+@wp.kernel
+def compute_self_contact_residual_kernel(
+    # Per-row inputs:
+    row_particle_a: wp.array[wp.int32],     # (3M_self,)
+    row_particle_b: wp.array[wp.int32],     # (3M_self,) all valid (≥0)
+    row_dir: wp.array[wp.vec3],             # (3M_self,)
+    row_alpha: wp.array[wp.float32],        # (3M_self,)
+    row_offset: wp.array[wp.float64],       # (3M_self,) = pene0[i]; gap threshold for n rows, 0 for tangents
+    x: wp.array[wp.vec3],                   # (N,) particle positions
+    # Output:
+    r: wp.array[wp.float64],                # (3M_self,)
+):
+    """Residual for self-contact rows: ``r[i] = offset[i] - α[i] · dot(dir[i], x[a] - x[b])``.
+
+    Same FB convention as :func:`compute_contact_residual_coulomb_kernel`:
+    positive r means "penetrating" (gap_threshold > current_signed_separation),
+    so the FB unilateral function drives ``λ > 0`` to push the pair apart.
+    """
+    i = wp.tid()
+    ia = row_particle_a[i]
+    ib = row_particle_b[i]
+    alpha = wp.float64(row_alpha[i])
+    diff = x[ia] - x[ib]
+    r[i] = row_offset[i] - alpha * wp.float64(wp.dot(row_dir[i], diff))
+
+
+@wp.kernel
+def apply_dt2_inv_mass_correction_kernel(
+    jt_lambda: wp.array[wp.vec3],
+    inv_mass: wp.array[wp.float64],
+    dt: wp.float64,
+    x_cur: wp.array[wp.vec3],
+):
+    """LiteNSN-consistent position correction ``x += dt² · inv_m · Jᵀ·λ``.
+
+    The full-NSN correction uses ``A⁻¹·Jᵀ·λ`` where ``A`` is the PD
+    prefactor (mass + stretching + bending stiffness).  Under the lite
+    approximation, the Schur was built with ``A_lite = M/dt²``, so for
+    consistency the correction must also use the same diagonal mass-inverse
+    rather than the full PD ``A``.  Using full ``A⁻¹`` here spreads the
+    self-contact impulse across the cloth via elastic coupling — for
+    1013-particle cloth this can shrink the per-step displacement by 20-50×,
+    which is why visual self-contact appeared to fail even though the
+    FB-Newton inner produced healthy λ values (~12k).
+    """
+    p = wp.tid()
+    dt2 = dt * dt
+    scale = dt2 * inv_mass[p]
+    j = jt_lambda[p]
+    x_cur[p] = x_cur[p] + wp.vec3(
+        wp.float32(scale * wp.float64(j[0])),
+        wp.float32(scale * wp.float64(j[1])),
+        wp.float32(scale * wp.float64(j[2])),
+    )
+
+
+@wp.kernel
+def scatter_jt_lambda_two_particle_kernel(
+    n_rows: wp.int32,
+    row_particle_a: wp.array[wp.int32],
+    row_particle_b: wp.array[wp.int32],
+    row_dir: wp.array[wp.vec3],
+    row_alpha: wp.array[wp.float32],
+    lam: wp.array[wp.float32],
+    out: wp.array[wp.vec3],            # atomic-add target, length N
+):
+    """Per-row atomic scatter of ``Jᵀ·λ`` for 2-particle rows.
+
+    For each row r:
+        out[particle_a] += +α[r] · λ[r] · dir[r]
+        out[particle_b] += -α[r] · λ[r] · dir[r]   (only if particle_b ≥ 0)
+
+    Atomic adds make this non-deterministic across runs, but for the small
+    n_self contributions this is much simpler than building a per-step CSR.
+    Caller is responsible for zeroing ``out`` (or seeding it with the rigid
+    contribution) before launch.
+    """
+    i = wp.tid()
+    if i >= n_rows:
+        return
+    pa = row_particle_a[i]
+    contrib = row_alpha[i] * lam[i] * row_dir[i]
+    wp.atomic_add(out, pa, contrib)
+    pb = row_particle_b[i]
+    if pb >= wp.int32(0):
+        wp.atomic_add(out, pb, -contrib)
+
+
+@wp.kernel
+def gather_jt_lambda_two_particle_kernel(
+    # Per-particle CSR: row_offsets[p+1] - row_offsets[p] = number of
+    # signed entries for particle p.
+    row_offsets: wp.array[wp.int32],       # (N+1,)
+    row_indices: wp.array[wp.int32],       # (E,) — row idx
+    row_signs: wp.array[wp.float32],       # (E,) — +1.0 or -1.0
+    # Per-row direction and alpha (length = total self-contact rows).
+    row_dir: wp.array[wp.vec3],
+    row_alpha: wp.array[wp.float32],
+    lam: wp.array[wp.float32],
+    out: wp.array[wp.vec3],
+):
+    """Particle-centred ``Jᵀ·λ`` gather over rows that touch 2 particles.
+
+    For each particle ``p``, sums ``sign · α[r] · λ[r] · dir[r]`` over the
+    rows in its CSR slot.  ``sign`` is ``+1`` for rows where ``p ==
+    row_particle_a[r]`` and ``-1`` for rows where ``p == row_particle_b[r]``,
+    mirroring the ``∂/∂q`` of a relative-position constraint.
+
+    Writes (NOT accumulates) into ``out`` — caller zeroes ``out`` only on
+    particles that have entries.  Particles with empty rows leave ``out[p]``
+    unchanged from its prior value (so this kernel can be composed with the
+    rigid-side gather without zeroing rigid-only particles).
+    """
+    p = wp.tid()
+    start = row_offsets[p]
+    end = row_offsets[p + 1]
+    if start == end:
+        return
+    acc = wp.vec3(0.0, 0.0, 0.0)
+    for k in range(start, end):
+        ri = row_indices[k]
+        s = row_signs[k]
+        acc = acc + s * row_alpha[ri] * lam[ri] * row_dir[ri]
+    out[p] = out[p] + acc
+
+
+@wp.kernel
+def emit_self_contact_rows_kernel(
+    n_pairs: wp.int32,
+    pair_a: wp.array[wp.int32],             # (n_pairs,)
+    pair_b: wp.array[wp.int32],             # (n_pairs,)
+    pair_normal: wp.array[wp.vec3],         # (n_pairs,) unit from b → a
+    gap_threshold: wp.float64,              # 2 · particle_radius
+    row_offset_base: wp.int32,              # where in the output arrays self rows start
+    row_particle_a: wp.array[wp.int32],
+    row_particle_b: wp.array[wp.int32],
+    row_dir: wp.array[wp.vec3],
+    row_alpha: wp.array[wp.float32],
+    row_offset: wp.array[wp.float64],
+    contact_mu: wp.array[wp.float64],       # (M_total,) per-contact μ — slot pair_to_contact_idx + p
+):
+    """Convert one broadphase pair into a Stage B contact (3 rows).
+
+    Tangent basis: build a stable orthonormal frame from the normal.  Pick
+    the world axis least aligned with ``n`` and Gram-Schmidt — avoids the
+    degeneracy of crossing ``n`` with itself when ``n`` happens to align
+    with a coordinate axis.
+
+    Friction μ is written by the host (single ``mu_d.fill_(self_friction_mu)``
+    call) — keeping it out of the kernel lets the caller pre-compose μ
+    arrays without re-launching this emit.
+    """
+    p = wp.tid()
+    if p >= n_pairs:
+        return
+    a = pair_a[p]
+    b = pair_b[p]
+    n = pair_normal[p]
+
+    ax = wp.float32(wp.abs(n[0]))
+    ay = wp.float32(wp.abs(n[1]))
+    az = wp.float32(wp.abs(n[2]))
+    if ax <= ay and ax <= az:
+        ref = wp.vec3(1.0, 0.0, 0.0)
+    elif ay <= az:
+        ref = wp.vec3(0.0, 1.0, 0.0)
+    else:
+        ref = wp.vec3(0.0, 0.0, 1.0)
+    t1 = wp.cross(n, ref)
+    t1 = t1 / wp.max(wp.length(t1), wp.float32(1.0e-9))
+    t2 = wp.cross(n, t1)
+
+    base = row_offset_base + 3 * p
+    row_particle_a[base + 0] = a
+    row_particle_b[base + 0] = b
+    row_dir[base + 0] = n
+    row_alpha[base + 0] = wp.float32(1.0)
+    row_offset[base + 0] = gap_threshold
+    row_particle_a[base + 1] = a
+    row_particle_b[base + 1] = b
+    row_dir[base + 1] = t1
+    row_alpha[base + 1] = wp.float32(1.0)
+    row_offset[base + 1] = wp.float64(0.0)
+    row_particle_a[base + 2] = a
+    row_particle_b[base + 2] = b
+    row_dir[base + 2] = t2
+    row_alpha[base + 2] = wp.float32(1.0)
+    row_offset[base + 2] = wp.float64(0.0)
+
+
+# ----- Per-particle fused FB-Newton kernel for LiteNSN (Phase 1 of Franka plan) -----
+#
+# Generalises ``fb_newton_lite_coulomb_kernel`` to handle ``k_p ∈ {1..4}``
+# contacts per particle.  Each thread processes one *unique-contacted* particle
+# end-to-end; the local 3·k_p × 3·k_p Schur block is constructed in registers
+# (fp64 ``mat12``) and solved via in-place Cholesky.  Sparsity stays
+# block-diagonal-by-particle — no BSR matrix, no SpGEMM.
+#
+# Particles with ``k_p > _MAX_KP_PER_PARTICLE`` are detected on the host side
+# and routed to the BSR + sparse-PCR path (the same one Phase 3 will use for
+# self-contact).  For the Franka cloth scene, the worst case is one cloth
+# vertex touching both finger pads + the table = 3, so k_max=4 leaves
+# headroom.  ``mat12`` is the largest type we materialise per thread.
+_MAX_KP_PER_PARTICLE = wp.constant(4)
+_MAX_ROWS_PER_PARTICLE = wp.constant(12)  # 3 · _MAX_KP_PER_PARTICLE
+_MAT12_F64 = wp.types.matrix((12, 12), wp.float64)
+_VEC12_F64 = wp.types.vector(12, wp.float64)
+
+
+@wp.kernel
+def fb_newton_lite_coulomb_per_particle_kernel(
+    # ---- per-isodof iteration metadata ----
+    isodof_unique: wp.array[wp.int32],     # (K,) unique contacted particle indices
+    isodof_row_offsets: wp.array[wp.int32], # (N+1,) CSR over ALL particles
+    isodof_row_indices: wp.array[wp.int32], # (total_rows,) row idx sorted by particle
+    # ---- per-row data (3M entries, interleaved [n, t1, t2] per contact) ----
+    row_particle: wp.array[wp.int32],       # (3M,) — particle index per row
+    row_dir: wp.array[wp.vec3],             # (3M,) — direction per row (fp32)
+    row_alpha: wp.array[wp.float32],        # (3M,) — Jacobian coef per row
+    # ---- per-contact data (M entries) ----
+    contact_mu: wp.array[wp.float64],       # (M,) — friction coef per contact
+    # ---- per-row force inputs (3M entries) ----
+    r: wp.array[wp.float64],                # (3M,)
+    pene0: wp.array[wp.float64],            # (3M,)
+    # ---- global state ----
+    inv_mass: wp.array[wp.float64],         # (N,)
+    dt: wp.float64,
+    cap_internal: wp.float64,               # lambda_cap / dt²
+    use_cap: wp.int32,
+    n_fb_iters: wp.int32,
+    # ---- inout / outputs ----
+    lam: wp.array[wp.float64],              # (3M,) inout
+    omega: wp.array[wp.float64],            # (3M,) inout
+    lam_apply: wp.array[wp.float64],        # (3M,) output
+):
+    """Per-particle fused FB-Newton for LiteNSN, Stage B (Coulomb), k_p ∈ {1..4}.
+
+    Each thread handles one unique-contacted particle ``p``.  Its ``k_p`` contact
+    rows live consecutively in ``isodof_row_indices[start:end]``; each row carries
+    its own ``(particle, dir, alpha)`` triple and its own (n, t1, t2) sub-triplet
+    in the global row arrays.  Under the lite approximation, ``W_lite`` is
+    block-diagonal-by-particle, so this thread is fully independent.
+
+    Local state lives in registers / L1 (warp ``mat12``).  Cholesky on a
+    ``3·k_p × 3·k_p`` PSD matrix runs in-place over the same buffer.
+
+    For ``k_p > _MAX_KP_PER_PARTICLE`` the kernel emits a sentinel (skips the
+    update; warm-start λ unchanged); host code re-runs that step through the BSR
+    path.  This branch is never taken in the cloth-on-rigid scenes covered by
+    the Franka plan.
+    """
+    iso = wp.tid()
+    p = isodof_unique[iso]
+    row_start = isodof_row_offsets[p]
+    row_end = isodof_row_offsets[p + 1]
+    k_total = row_end - row_start  # = 3 · k_p
+    if k_total <= 0:
+        return
+    if k_total > _MAX_ROWS_PER_PARTICLE:
+        # Defer to BSR path (host re-dispatches).  Don't touch λ / ω here.
+        return
+
+    inv_m = inv_mass[p]
+    dt2 = dt * dt
+
+    # Load up to 12 row indices and their per-row data into local arrays.
+    row_idx = _VEC12_F64(wp.float64(0.0))  # store as float for warp matrix-compat indexing
+    # Actually we want int row indices — use 12 separate locals (warp doesn't
+    # have small int vectors).  Materialise as a stack of fixed-size scalars.
+    # We can fall back to loading from the CSR each time we need the row index.
+
+    # Build local W (3k×3k) directly from (alpha, dir) triples.
+    # W[a, b] = α_a · α_b · dot(dir_a, dir_b) · dt² · inv_m
+    W = _MAT12_F64(wp.float64(0.0))
+    for ai in range(k_total):
+        ra = isodof_row_indices[row_start + ai]
+        alpha_a = wp.float64(row_alpha[ra])
+        dir_a = row_dir[ra]
+        for bi in range(k_total):
+            rb = isodof_row_indices[row_start + bi]
+            alpha_b = wp.float64(row_alpha[rb])
+            dir_b = row_dir[rb]
+            W[ai, bi] = alpha_a * alpha_b * wp.float64(wp.dot(dir_a, dir_b)) * dt2 * inv_m
+
+    # Load per-row state into vec12 locals.
+    lam_l = _VEC12_F64(wp.float64(0.0))
+    om_l = _VEC12_F64(wp.float64(0.0))
+    r_l = _VEC12_F64(wp.float64(0.0))
+    pene0_l = _VEC12_F64(wp.float64(0.0))
+    for ai in range(k_total):
+        ra = isodof_row_indices[row_start + ai]
+        lam_l[ai] = lam[ra]
+        om_l[ai] = omega[ra]
+        r_l[ai] = r[ra]
+        pene0_l[ai] = pene0[ra]
+
+    # Precond per row: dt²·|W_ii| for normals, dt·|W_ii| for tangents.
+    # Rows interleave (n, t1, t2) per contact => row_mod3 == 0 is normal.
+    eps = wp.float64(1.0e-12)
+    precond_l = _VEC12_F64(wp.float64(0.0))
+    for ai in range(k_total):
+        ra = isodof_row_indices[row_start + ai]
+        w_abs = wp.abs(W[ai, ai])
+        if w_abs < eps:
+            w_abs = eps
+        if (ra % 3) == 0:
+            precond_l[ai] = dt2 * w_abs
+        else:
+            precond_l[ai] = dt * w_abs
+
+    for _it in range(n_fb_iters):
+        # penetration = -r + dt²·W·(ω·λ).  3k_p dot products.
+        pen_l = _VEC12_F64(wp.float64(0.0))
+        for ai in range(k_total):
+            acc = wp.float64(0.0)
+            for bi in range(k_total):
+                acc = acc + W[ai, bi] * om_l[bi] * lam_l[bi]
+            pen_l[ai] = -r_l[ai] + dt2 * acc
+
+        # FB evaluation (rows interleave [n, t1, t2] within each contact; the
+        # tangent rows read lam_n from the same contact's normal).
+        c_l = _VEC12_F64(wp.float64(0.0))
+        h_l = _VEC12_F64(wp.float64(0.0))
+        for ai in range(k_total):
+            ra = isodof_row_indices[row_start + ai]
+            rmod = ra % 3
+            if rmod == 0:
+                # Normal row.
+                out_n = fb_unilateral_row_wp(pen_l[ai], lam_l[ai], precond_l[ai], dt, pene0_l[ai])
+                om_l[ai] = out_n[0]
+                c_l[ai] = out_n[1]
+                h_l[ai] = out_n[2]
+            else:
+                # Tangent row.  Find the companion normal row in this particle's
+                # local block — same contact c = ra // 3, normal row = 3·c.
+                # The normal might not be at local index ai-rmod because the
+                # local order = sorted-by-row order which preserves
+                # n,t1,t2 grouping (rows from one contact are consecutive,
+                # since they share a particle and are inserted contiguously).
+                # Find the local index of the companion normal row.
+                companion_global = 3 * (ra // 3)
+                # Linear scan over local rows (k_total ≤ 12) to find it.
+                lam_n_local = wp.float64(0.0)
+                for ci in range(k_total):
+                    if isodof_row_indices[row_start + ci] == companion_global:
+                        lam_n_local = lam_l[ci]
+                contact_idx = ra // 3
+                mu_c = contact_mu[contact_idx]
+                out_t = fb_frictional_row_wp(pen_l[ai], lam_l[ai], lam_n_local, mu_c, precond_l[ai], dt, pene0_l[ai])
+                om_l[ai] = out_t[0]
+                c_l[ai] = out_t[1]
+                h_l[ai] = out_t[2]
+
+        # A_schur = ωωᵀ ⊙ W + diag(c) — block-PSD by construction.
+        A = _MAT12_F64(wp.float64(0.0))
+        for ai in range(k_total):
+            for bi in range(k_total):
+                a_ij = om_l[ai] * om_l[bi] * W[ai, bi]
+                if ai == bi:
+                    a_ij = a_ij + c_l[ai]
+                A[ai, bi] = a_ij
+
+        # rhs = (1/dt²) · (h - ω · J_x) where J_x = pene0 + pen.
+        inv_dt2 = wp.float64(1.0) / dt2
+        rhs_l = _VEC12_F64(wp.float64(0.0))
+        for ai in range(k_total):
+            Jx = pene0_l[ai] + pen_l[ai]
+            rhs_l[ai] = inv_dt2 * (h_l[ai] - om_l[ai] * Jx)
+
+        # In-place Cholesky: A = L·Lᵀ.  L overwrites the lower triangle of A.
+        # PSD by construction; bail with sentinel diagonal (1) if a diagonal
+        # underflows so the subsequent solve produces zero update.
+        ok = wp.int32(1)
+        for j in range(k_total):
+            s = A[j, j]
+            for kk in range(j):
+                s = s - A[j, kk] * A[j, kk]
+            if s < eps:
+                ok = wp.int32(0)
+                # break early by setting all remaining diags to 1; rhs solve
+                # will then produce ~zero update.  Don't actually break — warp
+                # doesn't always promote early-return cleanly in nested loops.
+                A[j, j] = wp.float64(1.0)
+                continue
+            ljj = wp.sqrt(s)
+            A[j, j] = ljj
+            inv_ljj = wp.float64(1.0) / ljj
+            for ii in range(j + 1, k_total):
+                t = A[ii, j]
+                for kk in range(j):
+                    t = t - A[ii, kk] * A[j, kk]
+                A[ii, j] = t * inv_ljj
+
+        # Forward substitute L·y = rhs.
+        y_l = _VEC12_F64(wp.float64(0.0))
+        for ii in range(k_total):
+            t = rhs_l[ii]
+            for kk in range(ii):
+                t = t - A[ii, kk] * y_l[kk]
+            y_l[ii] = t / A[ii, ii]
+
+        # Back substitute Lᵀ·dlam = y.
+        dlam_l = _VEC12_F64(wp.float64(0.0))
+        for ii_rev in range(k_total):
+            ii = k_total - 1 - ii_rev
+            t = y_l[ii]
+            for kk in range(ii + 1, k_total):
+                t = t - A[kk, ii] * dlam_l[kk]
+            dlam_l[ii] = t / A[ii, ii]
+
+        # λ += dlam.  Skip the update for singular A (ok==0).
+        if ok == wp.int32(1):
+            for ai in range(k_total):
+                lam_l[ai] = lam_l[ai] + dlam_l[ai]
+
+    # Coulomb cone clamp per contact (each contact = 3 consecutive rows).
+    # Identify contact-c normal local index, clamp its t1 and t2.
+    for ai in range(k_total):
+        ra = isodof_row_indices[row_start + ai]
+        if (ra % 3) != 0:
+            continue
+        # Find t1, t2 local indices (ra+1, ra+2 global).
+        t1_g = ra + 1
+        t2_g = ra + 2
+        t1_local = wp.int32(-1)
+        t2_local = wp.int32(-1)
+        for ci in range(k_total):
+            rc = isodof_row_indices[row_start + ci]
+            if rc == t1_g:
+                t1_local = ci
+            elif rc == t2_g:
+                t2_local = ci
+        if t1_local >= wp.int32(0) and t2_local >= wp.int32(0):
+            lam_n_val = lam_l[ai]
+            contact_idx = ra // 3
+            mu_c = contact_mu[contact_idx]
+            upper = mu_c * lam_n_val
+            lower = -mu_c * lam_n_val
+            if lam_l[t1_local] > upper:
+                lam_l[t1_local] = upper
+            if lam_l[t1_local] < lower:
+                lam_l[t1_local] = lower
+            if lam_l[t2_local] > upper:
+                lam_l[t2_local] = upper
+            if lam_l[t2_local] < lower:
+                lam_l[t2_local] = lower
+
+    # Optional symmetric lambda cap.
+    if use_cap == wp.int32(1):
+        for ai in range(k_total):
+            v = lam_l[ai]
+            if v > cap_internal:
+                v = cap_internal
+            if v < -cap_internal:
+                v = -cap_internal
+            lam_l[ai] = v
+
+    # Write back λ, ω, lam_apply = dt² · ω · λ.
+    for ai in range(k_total):
+        ra = isodof_row_indices[row_start + ai]
+        lam[ra] = lam_l[ai]
+        omega[ra] = om_l[ai]
+        lam_apply[ra] = dt2 * om_l[ai] * lam_l[ai]
+
+
 @wp.kernel
 def axpy_lambda_kernel(
     dlam: wp.array[wp.float64],
@@ -4555,4 +5133,56 @@ def compute_v_anchor_kernel(
         -omega * wp.float64(cross_ar[0]),
         -omega * wp.float64(cross_ar[1]),
         -omega * wp.float64(cross_ar[2]),
+    )
+
+
+@wp.kernel
+def compute_v_anchor_from_body_kernel(
+    shape_idx: wp.array[wp.int32],          # (M,) shape index per contact
+    shape_body: wp.array[wp.int32],         # (n_shapes,) body index per shape (-1 = static)
+    body_q: wp.array[wp.transform],         # (n_bodies,) body world transforms
+    body_qd: wp.array[wp.spatial_vector],   # (n_bodies,) body spatial velocities (ω_world, v_world)
+    world_anchor: wp.array[wp.vec3],        # (M,) world-frame anchor
+    v_anchor: wp.array[wp.vec3d],           # (M,) inout — accumulate body-driven motion
+):
+    """Add body-driven kinematic anchor velocity for contacts whose rigid side
+    is parented to a dynamic body.
+
+    For each contact ``c``:
+      parent = shape_body[shape_idx[c]]
+      if parent < 0: skip (static collider — leave v_anchor as-is so the
+                              spinning-cylinder path from
+                              :func:`compute_v_anchor_kernel` survives).
+      else:
+        ω_body = wp.spatial_top(body_qd[parent])
+        v_body = wp.spatial_bottom(body_qd[parent])
+        r      = world_anchor[c] - body_q[parent].translation
+        v_anchor[c] = v_body + cross(ω_body, r)
+
+    Newton's :class:`wp.spatial_vector` packs the body spatial velocity as
+    ``(ω, v)`` per ``newton.utils.transform`` conventions:
+    ``spatial_top`` → angular, ``spatial_bottom`` → linear.
+
+    Designed to run **after** :func:`compute_v_anchor_kernel`: the spinning
+    path writes a value, this path overwrites it for body-parented shapes
+    (because per-shape ω no longer makes sense when the shape moves with a
+    body whose own ω drives the surface velocity).
+    """
+    c = wp.tid()
+    s = shape_idx[c]
+    parent = shape_body[s]
+    if parent < 0:
+        return
+    qd = body_qd[parent]
+    omega_body = wp.spatial_top(qd)
+    v_body = wp.spatial_bottom(qd)
+    body_xf = body_q[parent]
+    body_p = wp.transform_get_translation(body_xf)
+    a = world_anchor[c]
+    r = wp.vec3(a[0] - body_p[0], a[1] - body_p[1], a[2] - body_p[2])
+    cross_or = wp.cross(omega_body, r)
+    v_anchor[c] = wp.vec3d(
+        wp.float64(v_body[0] + cross_or[0]),
+        wp.float64(v_body[1] + cross_or[1]),
+        wp.float64(v_body[2] + cross_or[2]),
     )

@@ -1619,7 +1619,165 @@ class FBALinearSolver:
         self._isodof_row_offsets_d = wp.array(offsets, dtype=wp.int32, device=dev)
         self._isodof_row_indices_d = wp.array(order, dtype=wp.int32, device=dev)
 
+        # Phase 1 (Franka plan): per-particle fused kernel launches one thread
+        # per *unique* contacted particle, not per all-particles.  Stash the
+        # compact list of unique isodofs and the per-isodof contact count so
+        # the kernel can index its rows directly.
+        unique_isodofs = np.unique(row_particle).astype(np.int32)
+        # Per-isodof local count (k_p) and the row range within
+        # _isodof_row_indices_d.  The offsets in unique_isodofs index into the
+        # all-particles CSR _isodof_row_offsets_d above.
+        self._isodof_unique_d = wp.array(unique_isodofs, dtype=wp.int32, device=dev)
+        self._n_isodofs = int(unique_isodofs.size)
+        self._isodof_max_k = int(counts.max()) if unique_isodofs.size else 0
+
         return total_rows
+
+    def build_schur_lite_unified(
+        self,
+        total_rows: int,
+        row_particle_a_d: wp.array,    # (total_rows,) int32
+        row_particle_b_d: wp.array,    # (total_rows,) int32 — -1 sentinel for 1-particle rows
+        row_dir_d: wp.array,           # (total_rows,) vec3 (fp32)
+        row_alpha_d: wp.array,         # (total_rows,) float32
+    ) -> "wps.BsrMatrix":
+        """Build the LiteNSN sparse Schur for rows that touch **1 or 2 particles**.
+
+        Each row contributes its Jacobian entries to ``H``:
+        - 1 nonzero block at column ``particle_a`` with value ``+α·dir``
+        - if ``particle_b ≥ 0``: an extra nonzero block at ``particle_b`` with
+          value ``-α·dir`` (self-contact Jacobian: ``∂(p_a - p_b)/∂q_b = -I``)
+
+        Then ``W = H · (dt²·M⁻¹) · Hᵀ`` produces a (total_rows, total_rows)
+        BSR matrix whose sparsity is the contact-graph adjacency (rows i, j
+        share a nonzero iff they share at least one particle in either of
+        their ``particle_a/b`` slots).  This is the structural superset of
+        the strict block-diagonal sparsity from the 1-particle rigid-only case.
+
+        Used by Phase 3 of the Franka cloth plan when self-contact is enabled.
+        """
+        if not hasattr(self, "_M_inv_dt2_bsr") or self._M_inv_dt2_bsr is None:
+            raise RuntimeError(
+                "build_schur_lite_unified requires setup_lite_mass first."
+            )
+        if total_rows == 0:
+            return None
+        dev = self.device
+        n = self.n
+
+        if not hasattr(self, "_mat1x3_dtype"):
+            self._mat1x3_dtype = wp.types.matrix((1, 3), wp.float64)
+
+        # Pull arrays to host once to build triplets (size = up to 2·total_rows).
+        pa = row_particle_a_d.numpy()[:total_rows].astype(np.int32)
+        pb = row_particle_b_d.numpy()[:total_rows].astype(np.int32)
+        d = row_dir_d.numpy()[:total_rows].astype(np.float64)
+        alpha = row_alpha_d.numpy()[:total_rows].astype(np.float64)
+
+        has_b = pb >= 0
+        n_triplets_a = total_rows  # one triplet per row for particle_a
+        n_triplets_b = int(has_b.sum())
+        n_triplets = n_triplets_a + n_triplets_b
+
+        rows = np.empty(n_triplets, dtype=np.int32)
+        cols = np.empty(n_triplets, dtype=np.int32)
+        vals = np.empty((n_triplets, 1, 3), dtype=np.float64)
+
+        # First block of triplets: +α·dir at particle_a for every row.
+        rows[:total_rows] = np.arange(total_rows, dtype=np.int32)
+        cols[:total_rows] = pa
+        vals[:total_rows] = (alpha[:, None] * d).reshape(total_rows, 1, 3)
+
+        # Second block: -α·dir at particle_b only where particle_b ≥ 0.
+        if n_triplets_b > 0:
+            self_rows = np.where(has_b)[0].astype(np.int32)
+            rows[total_rows:] = self_rows
+            cols[total_rows:] = pb[has_b]
+            vals[total_rows:] = (
+                -alpha[has_b, None] * d[has_b]
+            ).reshape(n_triplets_b, 1, 3)
+
+        # Build H BSR fresh each call.  ``bsr_set_from_triplets`` writes into
+        # the destination's ``offsets`` buffer at length ``rows_of_blocks+1``,
+        # so reusing the same BsrMatrix with a different ``total_rows`` would
+        # require resizing offsets.  Allocating fresh is the safer pattern
+        # given typical call frequency (per FB-Newton step).
+        self._H_lite_uni_bsr = wps.bsr_zeros(
+            rows_of_blocks=total_rows,
+            cols_of_blocks=n,
+            block_type=self._mat1x3_dtype,
+            device=dev,
+        )
+        rows_d = wp.array(rows, dtype=wp.int32, device=dev)
+        cols_d = wp.array(cols, dtype=wp.int32, device=dev)
+        vals_d = wp.array(vals, dtype=self._mat1x3_dtype, device=dev)
+        wps.bsr_set_from_triplets(
+            self._H_lite_uni_bsr, rows_d, cols_d, vals_d, prune_numerical_zeros=False
+        )
+
+        HT = wps.bsr_transposed(self._H_lite_uni_bsr)
+        Minv_HT = wps.bsr_mm(self._M_inv_dt2_bsr, HT)
+        self._W_lite_uni_bsr = wps.bsr_mm(self._H_lite_uni_bsr, Minv_HT)
+        self._W_lite_uni_total_rows = total_rows
+        return self._W_lite_uni_bsr
+
+    def build_a_schur_lite_bsr(
+        self,
+        W_bsr: "wps.BsrMatrix",
+        omega_d: wp.array,         # (total_rows,) fp64
+        compliance_d: wp.array,    # (total_rows,) fp64
+    ) -> "wps.BsrMatrix":
+        """Construct ``A_schur = ωωᵀ ⊙ W + diag(c)`` in BSR (same sparsity as W).
+
+        ``warp.sparse`` collapses 1×1-block BSR storage to scalar fp64 values,
+        so ``W_bsr.values.dtype == wp.float64`` (not ``mat1x1``).  We allocate
+        the sibling A_schur matrix with the same convention.
+        """
+        from .kernels import build_a_schur_lite_bsr_kernel  # noqa: PLC0415
+
+        nnz = int(W_bsr.nnz)
+        n_rows = int(W_bsr.nrow)
+
+        if (
+            not hasattr(self, "_A_schur_lite_bsr")
+            or self._A_schur_lite_bsr is None
+            or int(self._A_schur_lite_bsr.values.shape[0]) < nnz
+        ):
+            # Allocate a placeholder via bsr_zeros (scalar block_type = fp64).
+            self._A_schur_lite_bsr = wps.bsr_zeros(
+                rows_of_blocks=n_rows,
+                cols_of_blocks=n_rows,
+                block_type=wp.float64,
+                device=self.device,
+            )
+            self._A_schur_lite_values_cap = max(nnz, 32)
+            self._A_schur_lite_bsr.values = wp.empty(
+                self._A_schur_lite_values_cap,
+                dtype=wp.float64,
+                device=self.device,
+            )
+
+        # Share W's pattern arrays (offsets + columns) — no copy.
+        self._A_schur_lite_bsr.nrow = n_rows
+        self._A_schur_lite_bsr.ncol = n_rows
+        self._A_schur_lite_bsr.nnz = nnz
+        self._A_schur_lite_bsr.offsets = W_bsr.offsets
+        self._A_schur_lite_bsr.columns = W_bsr.columns
+
+        wp.launch(
+            build_a_schur_lite_bsr_kernel,
+            dim=n_rows,
+            inputs=[
+                W_bsr.offsets,
+                W_bsr.columns,
+                W_bsr.values,
+                omega_d,
+                compliance_d,
+            ],
+            outputs=[self._A_schur_lite_bsr.values],
+            device=self.device,
+        )
+        return self._A_schur_lite_bsr
 
     def build_schur_lite_dense(
         self,
