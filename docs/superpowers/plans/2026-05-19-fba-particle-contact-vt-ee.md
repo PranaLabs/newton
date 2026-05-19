@@ -1,10 +1,31 @@
 # Plan: SolverFBA particle-contact — extend from v-v to v-t + e-e
 
-**Date:** 2026-05-19
-**Status:** Drafted, not started.
+**Date:** 2026-05-19 (revised same day after surveying Newton VBD's collision module).
+**Status:** Drafted, decisions locked, not started.
 **Owner:** TBD
-**Estimated effort:** ~2-3 weeks (Phase 0 BVH setup 2-3 d, Phase 1 v-t broadphase + 4-particle Jacobian 4-5 d, Phase 2 BSR extension 2-3 d, Phase 3 e-e 4-5 d, Phase 4 friction + Franka validation 4-5 d).
+**Estimated effort:** ~1.5-2 weeks after re-using Newton's existing
+`TriMeshCollisionDetector` (`newton/_src/solvers/vbd/tri_mesh_collision.py`)
+for the v-t and e-e broadphase.  Phase 0 (BVH setup) and the broadphase
+halves of Phase 1 / 3 collapse into "instantiate + configure the detector".
 **Target failure mode:** Vertex passes between the vertices of a triangle on another cloth surface, evading the current `ParticleContactBroadphase` (which only emits vertex-vertex pairs).
+
+## Reuse of Newton's `TriMeshCollisionDetector`
+
+`newton/_src/solvers/vbd/tri_mesh_collision.py` already implements:
+
+* Per-cloth triangle + edge ``wp.Bvh`` with refit (`refit_triangles`, `refit_edges`).
+* `vertex_triangle_collision_detection(query_radius)` — v-t broadphase, output
+  in a CSR per-vertex format (`vertex_colliding_triangles`,
+  `vertex_colliding_triangles_offsets`, etc.).
+* `edge_edge_collision_detection(query_radius)` — e-e broadphase with
+  parallel-edge degeneracy filter (`edge_edge_parallel_epsilon`).
+* Filtering lists for topology + custom exclusions
+  (`vertex_triangle_filtering_list` / `edge_filtering_list`).
+
+We **don't** reinvent any of the broadphase — Phase 0 becomes one
+``TriMeshCollisionDetector(...)`` construction; Phase 1 / 3 become "consume
+the CSR output and emit 4-particle FBA rows".  The novel work is entirely
+on the FBA-side: 4-particle Jacobian, BSR extension, scatter, validation.
 
 ---
 
@@ -50,6 +71,58 @@ The PD outer loop, A_FBA assembly, rigid-contact NSN inner, and the existing v-v
 ### LOCKED: 4-particle rows are the new max; never expand to 5+
 
 V-t has 4 particles (vertex + 3 triangle verts).  E-e has 4 (2 endpoints of each edge).  No physical cloth-cloth contact needs more.  The BSR H matrix gets a fixed cap of 4 nonzero blocks per row.
+
+### LOCKED (A): single ``TriMeshCollisionDetector`` covers all cloths
+
+`TriMeshCollisionDetector` reads a single ``model.tri_indices`` /
+``model.edge_indices``, so it naturally enumerates pairs across every
+cloth added to the same Model.  We do **not** create one detector per
+cloth.  Intra-cloth topological exclusion is handled by populating
+`vertex_triangle_filtering_list` / `edge_filtering_list` with the
+1-/2-ring neighbours of each query primitive.  Inter-cloth pairs are
+emitted naturally since filtering lists never reference across-cloth
+indices.
+
+### LOCKED (B): unified 4-slot row data structure
+
+All particle-contact rows — v-v (rigid-like 2-slot), v-t (4-slot),
+e-e (4-slot) — share a uniform layout:
+
+```
+row_particle_a, row_particle_b, row_particle_c, row_particle_d  int32
+row_weight_a,   row_weight_b,   row_weight_c,   row_weight_d    float32
+```
+
+Unused slots carry ``particle = -1`` and ``weight = 0`` sentinels.  All
+downstream code (BSR triplet emit, scatter, ``Jᵀ·λ`` accumulation)
+iterates the 4 slots uniformly and skips ``-1`` entries.  No special
+cases for v-v / v-t / e-e on the consumer side.
+
+### LOCKED (C): drop the v-v fast-path inside v-t
+
+Originally we considered detecting "barycentric weight at one triangle
+vertex == 1" and emitting a 2-particle v-v row in that case.  Dropped:
+the unified 4-slot layout (B) makes the special-case dispatch cost more
+than it saves.  v-t rows always carry 4 valid slots (or 3 valid + 1 zero
+when the closest point lies on a triangle edge — `(b1, b2, b3) = (1-α, α, 0)`).
+The Phase 3 v-v broadphase remains in code for ParticleContactBroadphase
+back-compat but the Franka plan's Phase 3 path is superseded by this
+plan's v-t emission.
+
+### LOCKED (G): two parallel broadphase pipelines
+
+* Rigid contacts (cloth-vs-static-shape, cloth-vs-rigid-body): unchanged
+  ``newton.CollisionPipeline`` path, lands in
+  ``self._contact_*_d`` as today.
+* Cloth-cloth contacts (v-t + e-e, intra and inter mesh):
+  ``TriMeshCollisionDetector`` path, lands in ``self._pc_row_*_d`` arrays
+  via this plan's emit kernels.
+
+The two pipelines run sequentially each step (rigid NSN first, then
+``_apply_particle_contact_pass``).  They share the same particle state
+``self._x_cur`` but not their row data.  No fundamental coupling at the
+LCP level — this is the same pattern Phase 3 of the Franka plan
+introduced for v-v cloth-particle contact.
 
 ### LOCKED: separate BVHs per cloth, queried across all clouths each step
 
