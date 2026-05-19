@@ -4745,6 +4745,179 @@ def emit_vt_rows_kernel(
 
 
 @wp.kernel
+def ee_count_hits_kernel(
+    # Per-edge clamped collision count = min(raw, buffer_sizes).
+    n_edges: wp.int32,
+    edge_colliding_edges_count: wp.array[wp.int32],
+    edge_colliding_edges_buffer_sizes: wp.array[wp.int32],
+    # Output (length n_edges): clamped count per edge.
+    clamped_count: wp.array[wp.int32],
+):
+    e = wp.tid()
+    if e >= n_edges:
+        return
+    raw = edge_colliding_edges_count[e]
+    cap = edge_colliding_edges_buffer_sizes[e]
+    clamped_count[e] = wp.min(raw, cap)
+
+
+@wp.kernel
+def emit_ee_rows_kernel(
+    # Flat job array: one thread per (edge, hit) pair.
+    n_hits: wp.int32,
+    # CSR over per-edge hit-job indices: thread tid -> edge e such that
+    # ee_hit_offsets[e] <= tid < ee_hit_offsets[e+1], local k = tid - offsets[e].
+    ee_hit_offsets: wp.array[wp.int32],     # (n_edges + 1,)
+    n_edges: wp.int32,
+    # Detector output (CSR per edge; 2 ints per hit: (query_edge_id, target_edge_id)).
+    edge_colliding_edges: wp.array[wp.int32],
+    edge_colliding_edges_offsets: wp.array[wp.int32],
+    # Edge topology + positions.
+    # Newton's bending-stencil edge_indices layout: columns (2, 3) are the
+    # two segment endpoints.
+    edge_indices: wp.array2d[wp.int32],     # (E, 4)
+    particle_q: wp.array[wp.vec3],          # (N,)
+    # Geometry.
+    threshold: wp.float32,
+    gap_threshold: wp.float64,
+    parallel_eps: wp.float32,
+    # Output emission counter (atomic).
+    contact_count: wp.array[wp.int32],      # (1,) — number of emitted contacts (vt+ee combined)
+    max_contacts: wp.int32,                 # capacity check (max_contacts = cap // 3)
+    row_offset_base: wp.int32,
+    # 4-slot output arrays.
+    row_pa: wp.array[wp.int32],
+    row_pb: wp.array[wp.int32],
+    row_pc: wp.array[wp.int32],
+    row_pd: wp.array[wp.int32],
+    row_wa: wp.array[wp.float32],
+    row_wb: wp.array[wp.float32],
+    row_wc: wp.array[wp.float32],
+    row_wd: wp.array[wp.float32],
+    row_dir: wp.array[wp.vec3],
+    row_alpha: wp.array[wp.float32],
+    row_offset: wp.array[wp.float64],
+    contact_mu: wp.array[wp.float64],
+    friction_mu: wp.float64,
+):
+    """One thread per (edge, hit). Emits 3 rows (n + t1 + t2) per e-e pair.
+
+    Per LOCKED-B 4-slot layout:
+        pa = a1, pb = a2, pc = b1, pd = b2
+        wa = +(1 - alpha),  wb = +alpha
+        wc = -(1 - beta),   wd = -beta
+    where (alpha, beta) are parametric positions on edges A and B such that
+    closest point on A is ``pa1 + alpha · (pa2 - pa1)`` and on B is
+    ``pb1 + beta · (pb2 - pb1)``.
+
+    Degenerate-parallel guard: if |cross(da, db)|² < parallel_eps² the pair
+    is skipped (the v-t path catches the contact via a vertex). Matches the
+    detector's own `edge_edge_parallel_epsilon` semantics — we re-test here
+    because the detector still records parallel pairs.
+    """
+    tid = wp.tid()
+    if tid >= n_hits:
+        return
+
+    # ---- Resolve (edge, local_hit_index) via binary search over CSR offsets. ----
+    lo = wp.int32(0)
+    hi = n_edges
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if ee_hit_offsets[mid + 1] <= tid:
+            lo = mid + 1
+        else:
+            hi = mid
+    e0 = lo
+    local = tid - ee_hit_offsets[e0]
+
+    csr_off = edge_colliding_edges_offsets[e0]
+    raw_e0 = edge_colliding_edges[2 * (csr_off + local) + 0]
+    e1 = edge_colliding_edges[2 * (csr_off + local) + 1]
+    if e1 < wp.int32(0):
+        return
+    _ = raw_e0  # unused (== e0 by construction)
+
+    # ---- Endpoints. ----
+    a1 = edge_indices[e0, 2]
+    a2 = edge_indices[e0, 3]
+    b1 = edge_indices[e1, 2]
+    b2 = edge_indices[e1, 3]
+    pa1 = particle_q[a1]
+    pa2 = particle_q[a2]
+    pb1 = particle_q[b1]
+    pb2 = particle_q[b2]
+    da = pa2 - pa1
+    db = pb2 - pb1
+
+    # ---- Degenerate parallel guard. ----
+    cross_v = wp.cross(da, db)
+    cross_sq = wp.dot(cross_v, cross_v)
+    pe = wp.float32(parallel_eps)
+    if cross_sq < pe * pe:
+        return
+
+    # ---- Closest points on the two segments. ----
+    st = wp.closest_point_edge_edge(pa1, pa2, pb1, pb2, parallel_eps)
+    alpha = st[0]
+    beta = st[1]
+    dist = st[2]
+    if dist < wp.float32(1.0e-9):
+        return
+    if dist > threshold:
+        return
+
+    cA = pa1 + alpha * da
+    cB = pb1 + beta * db
+    dvec = cA - cB
+    n = dvec / dist
+
+    # ---- Allocate a contact slot (shared atomic w/ v-t). ----
+    cid = wp.atomic_add(contact_count, 0, 1)
+    if cid >= max_contacts:
+        return
+    base = row_offset_base + 3 * cid
+
+    # ---- Tangent basis (stable in-plane, matches v-t emit). ----
+    ax_ = wp.float32(wp.abs(n[0]))
+    ay_ = wp.float32(wp.abs(n[1]))
+    az_ = wp.float32(wp.abs(n[2]))
+    if ax_ <= ay_ and ax_ <= az_:
+        ref = wp.vec3(1.0, 0.0, 0.0)
+    elif ay_ <= az_:
+        ref = wp.vec3(0.0, 1.0, 0.0)
+    else:
+        ref = wp.vec3(0.0, 0.0, 1.0)
+    tan1 = wp.cross(n, ref)
+    tan1 = tan1 / wp.max(wp.length(tan1), wp.float32(1.0e-9))
+    tan2 = wp.cross(n, tan1)
+
+    wa = wp.float32(1.0) - alpha
+    wb = alpha
+    wc = -(wp.float32(1.0) - beta)
+    wd = -beta
+
+    for k in range(3):
+        idx = base + k
+        row_pa[idx] = a1
+        row_pb[idx] = a2
+        row_pc[idx] = b1
+        row_pd[idx] = b2
+        row_wa[idx] = wa
+        row_wb[idx] = wb
+        row_wc[idx] = wc
+        row_wd[idx] = wd
+        row_alpha[idx] = wp.float32(1.0)
+    row_dir[base + 0] = n
+    row_offset[base + 0] = gap_threshold
+    row_dir[base + 1] = tan1
+    row_offset[base + 1] = wp.float64(0.0)
+    row_dir[base + 2] = tan2
+    row_offset[base + 2] = wp.float64(0.0)
+    contact_mu[cid] = friction_mu
+
+
+@wp.kernel
 def compute_particle_contact_residual_4slot_kernel(
     row_pa: wp.array[wp.int32],
     row_pb: wp.array[wp.int32],
