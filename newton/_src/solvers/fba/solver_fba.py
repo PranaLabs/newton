@@ -357,6 +357,10 @@ class SolverFBA(SolverBase):
         self._pc_hit_offsets_d = None  # CSR per-vertex hit offsets, vt mode
         self._pc_ee_hit_offsets_d = None  # CSR per-edge hit offsets, vt mode (Phase 3)
         self._pc_contact_count_d = None  # atomic emitted-contact counter, vt mode
+        # Diagnostic counters, always present so callers can probe them
+        # unconditionally (Tier 3 acceptance reporting).
+        self._pc_last_vt_hits = 0
+        self._pc_last_ee_hits = 0
         if stretching_model in ("corotational", "neohookean"):
             if mu is None or lam is None:
                 raise ValueError(
@@ -2476,6 +2480,11 @@ class SolverFBA(SolverBase):
             np.cumsum(ee_clamped_np, out=ee_offsets_np[1:])
             n_ee_hits = int(ee_offsets_np[-1])
 
+        # Diagnostic counters: always populated even when no contacts fire
+        # so downstream introspection (Tier 3 acceptance reporting) can read
+        # them unconditionally.
+        self._pc_last_vt_hits = n_vt_hits
+        self._pc_last_ee_hits = n_ee_hits
         if n_vt_hits == 0 and n_ee_hits == 0:
             return 0
 

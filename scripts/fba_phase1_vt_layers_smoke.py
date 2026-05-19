@@ -181,6 +181,11 @@ def main(argv=None):
         particle_contact_topology_ring=2,
         particle_contact_rest_exclusion_radius=0.1,
         particle_contact_mode="vt",
+        # This smoke is the v-t-only acceptance test; e-e (Phase 3) has its
+        # own dedicated smoke (``fba_phase3_ee_xcross_smoke``).  Disable
+        # here so the regression matches the original Phase 1 acceptance
+        # criteria.
+        particle_contact_ee=False,
     )
 
     pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.04)
