@@ -1640,21 +1640,35 @@ class FBALinearSolver:
         row_particle_b_d: wp.array,    # (total_rows,) int32 — -1 sentinel for 1-particle rows
         row_dir_d: wp.array,           # (total_rows,) vec3 (fp32)
         row_alpha_d: wp.array,         # (total_rows,) float32
+        # ---- Optional 4-slot extension (v-t / e-e contact rows). ----
+        # When supplied, the Jacobian per row is built from up to 4 particle
+        # slots with explicit per-slot weights.  When None, falls back to the
+        # legacy 2-slot semantics (``pa`` with weight +1, ``pb`` with weight -1
+        # iff ``pb >= 0``).  Mixing is allowed: a row with ``pc = pd = -1`` in
+        # the 4-slot path is identical to the 2-slot path (modulo wa/wb being
+        # explicit instead of implicit ±1).
+        row_particle_c_d: wp.array | None = None,
+        row_particle_d_d: wp.array | None = None,
+        row_wa_d: wp.array | None = None,
+        row_wb_d: wp.array | None = None,
+        row_wc_d: wp.array | None = None,
+        row_wd_d: wp.array | None = None,
     ) -> "wps.BsrMatrix":
-        """Build the LiteNSN sparse Schur for rows that touch **1 or 2 particles**.
+        """Build the LiteNSN sparse Schur for rows that touch **1, 2, or 4 particles**.
 
         Each row contributes its Jacobian entries to ``H``:
+
+        Legacy (2-slot) path:
         - 1 nonzero block at column ``particle_a`` with value ``+α·dir``
         - if ``particle_b ≥ 0``: an extra nonzero block at ``particle_b`` with
-          value ``-α·dir`` (self-contact Jacobian: ``∂(p_a - p_b)/∂q_b = -I``)
+          value ``-α·dir``.
+
+        4-slot path (when ``row_wa_d`` etc. are provided):
+        - Up to 4 nonzero blocks per row, one per slot ``k ∈ {a, b, c, d}`` with
+          ``p_k >= 0``, value ``+w_k · α · dir``.
 
         Then ``W = H · (dt²·M⁻¹) · Hᵀ`` produces a (total_rows, total_rows)
-        BSR matrix whose sparsity is the contact-graph adjacency (rows i, j
-        share a nonzero iff they share at least one particle in either of
-        their ``particle_a/b`` slots).  This is the structural superset of
-        the strict block-diagonal sparsity from the 1-particle rigid-only case.
-
-        Used by Phase 3 of the Franka cloth plan when self-contact is enabled.
+        BSR matrix whose sparsity is the contact-graph adjacency.
         """
         if not hasattr(self, "_M_inv_dt2_bsr") or self._M_inv_dt2_bsr is None:
             raise RuntimeError(
@@ -1668,34 +1682,86 @@ class FBALinearSolver:
         if not hasattr(self, "_mat1x3_dtype"):
             self._mat1x3_dtype = wp.types.matrix((1, 3), wp.float64)
 
-        # Pull arrays to host once to build triplets (size = up to 2·total_rows).
-        pa = row_particle_a_d.numpy()[:total_rows].astype(np.int32)
-        pb = row_particle_b_d.numpy()[:total_rows].astype(np.int32)
         d = row_dir_d.numpy()[:total_rows].astype(np.float64)
         alpha = row_alpha_d.numpy()[:total_rows].astype(np.float64)
 
-        has_b = pb >= 0
-        n_triplets_a = total_rows  # one triplet per row for particle_a
-        n_triplets_b = int(has_b.sum())
-        n_triplets = n_triplets_a + n_triplets_b
+        if row_wa_d is not None:
+            # ---- 4-slot path: build triplets across up to 4 slots per row. ----
+            pa = row_particle_a_d.numpy()[:total_rows].astype(np.int32)
+            pb = row_particle_b_d.numpy()[:total_rows].astype(np.int32)
+            pc = (
+                row_particle_c_d.numpy()[:total_rows].astype(np.int32)
+                if row_particle_c_d is not None
+                else np.full(total_rows, -1, dtype=np.int32)
+            )
+            pd = (
+                row_particle_d_d.numpy()[:total_rows].astype(np.int32)
+                if row_particle_d_d is not None
+                else np.full(total_rows, -1, dtype=np.int32)
+            )
+            wa = row_wa_d.numpy()[:total_rows].astype(np.float64)
+            wb = (
+                row_wb_d.numpy()[:total_rows].astype(np.float64)
+                if row_wb_d is not None
+                else np.zeros(total_rows, dtype=np.float64)
+            )
+            wc = (
+                row_wc_d.numpy()[:total_rows].astype(np.float64)
+                if row_wc_d is not None
+                else np.zeros(total_rows, dtype=np.float64)
+            )
+            wd = (
+                row_wd_d.numpy()[:total_rows].astype(np.float64)
+                if row_wd_d is not None
+                else np.zeros(total_rows, dtype=np.float64)
+            )
 
-        rows = np.empty(n_triplets, dtype=np.int32)
-        cols = np.empty(n_triplets, dtype=np.int32)
-        vals = np.empty((n_triplets, 1, 3), dtype=np.float64)
+            row_ids = np.arange(total_rows, dtype=np.int32)
+            triplet_rows = []
+            triplet_cols = []
+            triplet_vals = []
+            for ps, ws in ((pa, wa), (pb, wb), (pc, wc), (pd, wd)):
+                mask = (ps >= 0) & (ws != 0.0)
+                if not mask.any():
+                    continue
+                idx = np.where(mask)[0]
+                triplet_rows.append(row_ids[idx])
+                triplet_cols.append(ps[idx])
+                triplet_vals.append(
+                    (ws[idx, None] * alpha[idx, None] * d[idx]).reshape(-1, 1, 3)
+                )
+            if not triplet_rows:
+                return None
+            rows = np.concatenate(triplet_rows).astype(np.int32)
+            cols = np.concatenate(triplet_cols).astype(np.int32)
+            vals = np.concatenate(triplet_vals).astype(np.float64)
+        else:
+            # ---- Legacy 2-slot path. ----
+            pa = row_particle_a_d.numpy()[:total_rows].astype(np.int32)
+            pb = row_particle_b_d.numpy()[:total_rows].astype(np.int32)
 
-        # First block of triplets: +α·dir at particle_a for every row.
-        rows[:total_rows] = np.arange(total_rows, dtype=np.int32)
-        cols[:total_rows] = pa
-        vals[:total_rows] = (alpha[:, None] * d).reshape(total_rows, 1, 3)
+            has_b = pb >= 0
+            n_triplets_a = total_rows  # one triplet per row for particle_a
+            n_triplets_b = int(has_b.sum())
+            n_triplets = n_triplets_a + n_triplets_b
 
-        # Second block: -α·dir at particle_b only where particle_b ≥ 0.
-        if n_triplets_b > 0:
-            self_rows = np.where(has_b)[0].astype(np.int32)
-            rows[total_rows:] = self_rows
-            cols[total_rows:] = pb[has_b]
-            vals[total_rows:] = (
-                -alpha[has_b, None] * d[has_b]
-            ).reshape(n_triplets_b, 1, 3)
+            rows = np.empty(n_triplets, dtype=np.int32)
+            cols = np.empty(n_triplets, dtype=np.int32)
+            vals = np.empty((n_triplets, 1, 3), dtype=np.float64)
+
+            # First block of triplets: +α·dir at particle_a for every row.
+            rows[:total_rows] = np.arange(total_rows, dtype=np.int32)
+            cols[:total_rows] = pa
+            vals[:total_rows] = (alpha[:, None] * d).reshape(total_rows, 1, 3)
+
+            # Second block: -α·dir at particle_b only where particle_b ≥ 0.
+            if n_triplets_b > 0:
+                self_rows = np.where(has_b)[0].astype(np.int32)
+                rows[total_rows:] = self_rows
+                cols[total_rows:] = pb[has_b]
+                vals[total_rows:] = (
+                    -alpha[has_b, None] * d[has_b]
+                ).reshape(n_triplets_b, 1, 3)
 
         # Build H BSR fresh each call.  ``bsr_set_from_triplets`` writes into
         # the destination's ``offsets`` buffer at length ``rows_of_blocks+1``,
