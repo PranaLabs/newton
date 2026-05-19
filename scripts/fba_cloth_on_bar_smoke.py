@@ -183,11 +183,11 @@ def run(num_frames: int, render_out: Path | None, width: int = 1280, height: int
         # Smaller (1×r) lets penetration build up between broadphase
         # registrations; larger (3×r) collides with the rest-pose exclusion
         # and ends up with zero candidate pairs.
-        solver_kwargs["self_contact_radius"] = _PARTICLE_RADIUS * 2.0
-        solver_kwargs["self_contact_margin"] = 0.04
-        solver_kwargs["self_contact_friction"] = 0.25
-        solver_kwargs["self_contact_topology_ring"] = 2
-        solver_kwargs["self_contact_rest_exclusion_radius"] = 0.1
+        solver_kwargs["particle_contact_radius"] = _PARTICLE_RADIUS * 2.0
+        solver_kwargs["particle_contact_margin"] = 0.04
+        solver_kwargs["particle_contact_friction"] = 0.25
+        solver_kwargs["particle_contact_topology_ring"] = 2
+        solver_kwargs["particle_contact_rest_exclusion_radius"] = 0.1
     solver = SolverFBA(model, **solver_kwargs)
 
     pipeline = newton.CollisionPipeline(model, soft_contact_margin=_CONTACT_MARGIN)

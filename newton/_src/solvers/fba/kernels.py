@@ -4256,7 +4256,7 @@ def compute_omega_times_lam_kernel(
 
 
 @wp.kernel
-def compute_self_contact_residual_kernel(
+def compute_particle_contact_residual_kernel(
     # Per-row inputs:
     row_particle_a: wp.array[wp.int32],     # (3M_self,)
     row_particle_b: wp.array[wp.int32],     # (3M_self,) all valid (≥0)
@@ -4382,7 +4382,7 @@ def gather_jt_lambda_two_particle_kernel(
 
 
 @wp.kernel
-def emit_self_contact_rows_kernel(
+def emit_particle_contact_rows_kernel(
     n_pairs: wp.int32,
     pair_a: wp.array[wp.int32],             # (n_pairs,)
     pair_b: wp.array[wp.int32],             # (n_pairs,)

@@ -1,8 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-"""Cloth particle-particle self-contact broadphase + filter (Phase 3.1).
+"""Particle-particle contact broadphase + filter for SolverFBA.
 
-``SelfContactBroadphase`` owns:
+``ParticleContactBroadphase`` enumerates **all** particle pairs within
+``2·particle_radius + margin`` of each other — both intra-mesh
+(traditional cloth self-contact) and inter-mesh (e.g. two separate cloth
+instances stacking on the same obstacle).  Topology + rest-pose filters
+only ever exclude pairs that share connectivity within a single cloth's
+triangle / edge list, so cross-mesh pairs always pass through to the
+solver.  This matches RealSim's particle-particle contact model, where
+``self-contact`` is a misnomer in the strict physics sense but happens
+to be the field name the rest of the engine uses.
+
+Components:
 
 * The ``wp.HashGrid`` used to enumerate particle pairs within
   ``2·particle_radius + margin`` of each other.
@@ -18,9 +28,6 @@ Per-step output (device-resident, sorted by ``(a, b)`` for determinism):
 * ``pair_normal``                     — vec3 (from b to a, unit) per pair
 * ``pair_dist``                       — float32 distance per pair (≤ threshold)
 * ``pair_count``                      — int32[1] atomic counter for the call
-
-The output feeds Phase 3.2 (self-contact FB rows) and is consumed by
-the BSR path that lives in Phase 3.3.
 """
 
 from __future__ import annotations
@@ -35,7 +42,7 @@ import warp as wp
 
 
 @wp.kernel
-def find_self_contact_pairs_kernel(
+def find_particle_contact_pairs_kernel(
     grid_id: wp.uint64,
     positions: wp.array[wp.vec3],
     threshold: wp.float32,
@@ -116,7 +123,7 @@ def find_self_contact_pairs_kernel(
 # ---------------------------------------------------------------------------
 
 
-class SelfContactBroadphase:
+class ParticleContactBroadphase:
     """Particle-particle proximity enumerator with topology + rest filters.
 
     Args:
@@ -124,7 +131,7 @@ class SelfContactBroadphase:
             positions and cloth topology (``model.tri_indices``,
             ``model.edge_indices``).
         threshold: Distance below which a particle pair becomes a self-contact
-            candidate.  Typically ``2 * particle_radius + self_contact_margin``.
+            candidate.  Typically ``2 * particle_radius + particle_contact_margin``.
         topology_ring: Neighbour-ring depth to exclude (1 = direct mesh
             neighbours, 2 = neighbours of neighbours, ...).  VBD reference uses
             2; we match that.
@@ -146,7 +153,7 @@ class SelfContactBroadphase:
         max_pairs: int | None = None,
     ) -> None:
         if model.particle_count == 0:
-            raise ValueError("SelfContactBroadphase requires a non-zero particle_count")
+            raise ValueError("ParticleContactBroadphase requires a non-zero particle_count")
         self.model = model
         self.device = model.device
         self.n = int(model.particle_count)
@@ -265,7 +272,7 @@ class SelfContactBroadphase:
         self._pair_count_d.zero_()
         self._grid.build(points=particle_q, radius=self._cell_size)
         wp.launch(
-            find_self_contact_pairs_kernel,
+            find_particle_contact_pairs_kernel,
             dim=self.n,
             inputs=[
                 self._grid.id,

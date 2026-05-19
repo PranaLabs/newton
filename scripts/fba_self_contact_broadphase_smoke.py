@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-"""Phase 3.1 smoke: SelfContactBroadphase on the cloth-on-bar scene.
+"""Phase 3.1 smoke: ParticleContactBroadphase on the cloth-on-bar scene.
 
 Builds the cloth-on-bar baseline (which now produces a wrapped drape with
 two halves dangling below the bar), runs broadphase per frame, and prints
@@ -16,7 +16,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.fba.self_contact import SelfContactBroadphase
+from newton._src.solvers.fba.particle_contact import ParticleContactBroadphase
 from newton.solvers import SolverFBA
 
 # Reuse the baseline scene builder.
@@ -54,7 +54,7 @@ def main() -> int:
     # Threshold = 2 · particle_radius + a small margin (matches the
     # ``soft_contact_margin`` convention used for rigid contact).
     self_threshold = 2 * _PARTICLE_RADIUS + 0.04
-    bp = SelfContactBroadphase(
+    bp = ParticleContactBroadphase(
         model,
         threshold=self_threshold,
         topology_ring=2,
