@@ -74,6 +74,27 @@ RealSim's self-contact rows use the same Fischer-Burmeister unilateral + frictio
 
 FBA stays unitless — the user sets `gravity`, `tri_ke`, `pin_stiffness` consistent with their chosen units.  Phase 4 just re-tunes the Franka demo's coefficients for cm scale; no change to the solver.
 
+### LOCKED: single-env correctness before multi-env, every phase
+
+For every new kernel, code path, or contact mode introduced by this plan, **single-env correctness must be established and gate-checked before any multi-env validation runs**.  Multi-env scaling, cross-env consistency, and replicate-based regressions only kick in after the single-env Tier 2 gate passes for that feature.
+
+Reasoning:
+
+- A single-env Tier 2 miss is bisectable to one of: the new kernel's math, the FB residual, the sparse-vs-dense PCR equivalence, or the contact-pipeline data layout.
+- Adding ``replicate()`` on top of an unverified kernel folds in extra failure modes (per-world contact ordering, AMD reordering at scale, FP non-associativity across worlds) and makes the underlying bug unbisectable.
+- The multi-env plan's Phase 0 is already wired for the contact-free 2-env smoke; Phase-1 / Phase-3 work here gets the same treatment: a single-env regression must be green before its multi-env smoke is even spawned.
+
+Concretely this means every phase below adds a **single-env gate immediately preceding any multi-env step**, and the order is non-negotiable:
+
+| Phase | Single-env gate | Multi-env follow-up (if applicable) |
+|---|---|---|
+| Phase 1 (multi-contact / particle) | Step 1.4 (1-env, 2-obstacle, matches full NSN) | Multi-env regression via ``fba_multienv_cloth_bench.py`` after Step 1.4 passes |
+| Phase 2 (dynamic shape velocity) | Step 2.3 (1-env rolling-box-on-cloth) | Multi-env smoke only after Step 2.3 passes |
+| Phase 3 (cloth self-contact) | Step 3.6 (1-env self-folding cloth vs VBD) | Multi-env self-folding only after Step 3.6 passes |
+| Phase 4 (Franka demo) | Step 4.5 (1-env Franka, visual acceptance) | Multi-env Franka demo (if scoped at all) only after Step 4.5 passes |
+
+If any phase's single-env gate fails, the multi-env step is **skipped** for that phase and the failure goes back to the kernel author — not papered over with "maybe it averages out across worlds".
+
 ## Phase 0 — cm-scale single-env smoke (~0.5 day)
 
 **Goal:** Confirm `SolverFBA` runs at cm scale without precision loss.  Isolates the units question from every other piece of new code.
@@ -284,9 +305,11 @@ Numerical acceptance is **not** a strict trajectory match (different solvers; th
 
 This plan is done when:
 
-1. ✅ Phase 0 cm-scale port of `example_hanging_cloth_fba` matches the m-scale baseline within 1 mm p95 (after the uniform 100× scale-factor undo).
-2. ✅ Phase 1 multi-contact/particle 2-obstacle smoke matches the full-NSN reference at p95 < 5 cm / max < 15 cm @ frame 200, **without using dense W** (verified by allocator instrumentation: `_W_device_d` stays unallocated in lite mode).
-3. ✅ Phase 2 squeezing-ball regression unchanged + rolling-box-on-cloth smoke shows the cloth following the box laterally (friction-driven motion).
-4. ✅ Phase 3 self-folding-cloth smoke produces a visually correct fold with no layer penetration; particle bounding box and velocity remain finite for 300 frames.
-5. ✅ Phase 4 `example_cloth_franka_fba.py` runs the full Franka key-pose sequence to completion, producing a rendered video.  Visual acceptance: clean grasp, clean lift, layered fold (no obvious cloth-through-cloth artefacts).
+1. ✅ Phase 0 cm-scale port of `example_hanging_cloth_fba` matches the m-scale baseline within 1 mm p95 (after the uniform 100× scale-factor undo).  **Single-env only by construction.**
+2. ✅ Phase 1 multi-contact/particle 2-obstacle smoke matches the full-NSN reference at p95 < 5 cm / max < 15 cm @ frame 200, **without using dense W** (verified by allocator instrumentation: `_W_device_d` stays unallocated in lite mode).  **Single-env gate first; multi-env replicate regression only runs after this gate is green.**
+3. ✅ Phase 2 squeezing-ball regression unchanged + rolling-box-on-cloth smoke shows the cloth following the box laterally (friction-driven motion).  **Single-env gate first; multi-env smoke only after.**
+4. ✅ Phase 3 self-folding-cloth smoke produces a visually correct fold with no layer penetration; particle bounding box and velocity remain finite for 300 frames.  **Single-env gate first; any multi-env self-folding only after.**
+5. ✅ Phase 4 `example_cloth_franka_fba.py` runs the full Franka key-pose sequence to completion in single-env, producing a rendered video.  Visual acceptance: clean grasp, clean lift, layered fold (no obvious cloth-through-cloth artefacts).  **Multi-env Franka is explicitly out of scope unless and until this single-env gate passes.**
 6. ✅ Plan-level commit with the example, the new kernels, the self-contact code path, a side-by-side VBD-vs-FBA render, and a follow-up spec for two-way coupling.
+
+The ordering above is the same as the LOCKED "single-env correctness before multi-env" decision.  Any phase that fails its single-env gate blocks its own multi-env follow-up; it does not block earlier phases.
