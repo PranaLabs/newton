@@ -44,6 +44,11 @@ _TRANS = np.array([0.0, 3.5, 0.0])
 
 # Static sphere collider (ParallelEnvTest/scene.json sphereCollisions[0]).
 _SPHERE_RADIUS = 3.0
+_SPHERE_VISUAL_RADIUS = 2.90  # Slightly inside the collision surface so the
+# cloth visually rests on top of the rendered sphere instead of penetrating
+# into it (mirrors RealSim ParallelEnvTest's ``visualradius`` field, but
+# pulled in a touch further to absorb Newton's slightly thicker visual
+# rendering of the cloth triangles).
 _SPHERE_CENTER = np.array([0.0, 0.0, 0.0])
 _FRICTION_MU = 0.3
 _PIN_STIFFNESS = 1.0e10  # carried forward from Demo 5 (no pins, only used by Stage B residual)
@@ -137,14 +142,32 @@ def build_cloth_on_sphere_builder() -> newton.ModelBuilder:
         edge_kd=0.0,
     )
 
-    # Static sphere collider — body=-1 = world-frame static shape.
-    sphere_cfg = builder.default_shape_cfg.copy()
-    sphere_cfg.mu = _FRICTION_MU
+    # Split collision + visual: the collision sphere drives the physics at
+    # radius ``_SPHERE_RADIUS``, while a slightly smaller non-colliding visual
+    # sphere is what the viewer renders.  Without this split the cloth
+    # particles visibly sink ~``_SPHERE_RADIUS - _SPHERE_VISUAL_RADIUS`` into
+    # the rendered surface because contact is resolved at the *centre* of the
+    # cloth particle radius rather than at the surface mesh vertex.  RealSim's
+    # ``visualradius`` field uses the same trick.
+    xform_world = wp.transform(wp.vec3(*_SPHERE_CENTER.tolist()), wp.quat_identity())
+
+    cfg_collision = builder.default_shape_cfg.copy()
+    cfg_collision.mu = _FRICTION_MU
+    cfg_collision.is_visible = False
     builder.add_shape_sphere(
         body=-1,
-        xform=wp.transform(wp.vec3(*_SPHERE_CENTER.tolist()), wp.quat_identity()),
+        xform=xform_world,
         radius=_SPHERE_RADIUS,
-        cfg=sphere_cfg,
+        cfg=cfg_collision,
+    )
+
+    cfg_visual = builder.default_site_cfg.copy()
+    builder.add_shape_sphere(
+        body=-1,
+        xform=xform_world,
+        radius=_SPHERE_VISUAL_RADIUS,
+        cfg=cfg_visual,
+        as_site=True,
         color=_SPHERE_COLOR,
     )
 
