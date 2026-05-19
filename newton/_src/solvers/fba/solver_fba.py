@@ -230,6 +230,8 @@ class SolverFBA(SolverBase):
         particle_contact_topology_ring: int = 2,
         particle_contact_rest_exclusion_radius: float = 0.1,
         particle_contact_max_pairs: int | None = None,
+        particle_contact_mode: Literal["vv", "vt"] = "vt",
+        particle_contact_max_hits_per_vertex: int = 16,
     ) -> None:
         """
         Args:
@@ -328,8 +330,18 @@ class SolverFBA(SolverBase):
         self.particle_contact_topology_ring = int(particle_contact_topology_ring)
         self.particle_contact_rest_exclusion_radius = float(particle_contact_rest_exclusion_radius)
         self.particle_contact_max_pairs = particle_contact_max_pairs
+        if particle_contact_mode not in ("vv", "vt"):
+            raise ValueError(
+                f"particle_contact_mode={particle_contact_mode!r} not supported; "
+                "choose 'vv' or 'vt'"
+            )
+        self.particle_contact_mode = particle_contact_mode
+        self.particle_contact_max_hits_per_vertex = int(particle_contact_max_hits_per_vertex)
         self._particle_broadphase = None  # lazily constructed in _apply_particle_contact_pass
+        self._particle_contact_detector = None  # TriMeshCollisionDetector (vt mode)
         self._particle_contact_buf_cap = 0
+        self._pc_hit_offsets_d = None  # CSR per-vertex hit offsets, vt mode
+        self._pc_contact_count_d = None  # atomic emitted-contact counter, vt mode
         if stretching_model in ("corotational", "neohookean"):
             if mu is None or lam is None:
                 raise ValueError(
@@ -2233,21 +2245,64 @@ class SolverFBA(SolverBase):
     # roll-out plan; RealSim reference is ``NonSmoothNewton.cpp:102-171``.
 
     def _apply_particle_contact_pass(self, state_inout, dt: float) -> int:
-        """Run one self-contact NSN sweep on the current ``state_inout``.
+        """Run one particle-contact NSN sweep on the current ``state_inout``.
 
         Sequence:
-        1. Broadphase: enumerate particle pairs within self-contact threshold,
-           filtered by topology + rest-pose exclusion.
-        2. Emit Stage B rows (normal + 2 tangents) per surviving pair.
-        3. Compute residual ``r`` and ``pene0`` for self-rows.
-        4. Call the BSR FB-Newton inner driver to solve for ``λ_self``.
-        5. Apply ``Δx = A⁻¹·Jᵀ·λ_apply`` to ``state_inout.particle_q``.
+        1. Broadphase: enumerate particle-particle (v-v) or vertex-triangle
+           (v-t) contacts within the configured threshold.
+        2. Emit Stage B rows (normal + 2 tangents) per surviving contact in
+           the uniform 4-slot Jacobian layout.
+        3. Compute residual ``r`` for contact rows.
+        4. Call the BSR FB-Newton inner driver to solve for ``λ``.
+        5. Apply ``Δx = dt²·M⁻¹·Jᵀ·λ_apply`` to ``state_inout.particle_q``.
 
-        Returns the number of self-contact rows processed.  Zero pairs is the
-        no-op fast path (entire pass elided).
+        Returns the number of contact rows processed.
         """
         if self.particle_contact_radius is None:
             return 0
+        if self.particle_contact_mode == "vt":
+            return self._apply_particle_contact_pass_vt(state_inout, dt)
+        return self._apply_particle_contact_pass_vv(state_inout, dt)
+
+    def _ensure_particle_contact_buffers(self, cap: int) -> None:
+        """Allocate 4-slot per-row arrays + work buffers up to ``cap`` rows.
+
+        Grows with 1.5x headroom on each resize so a gradually-ramping contact
+        count (e.g. cloth-on-cloth stacking) doesn't realloc every step.
+        """
+        device = self._device
+        if self._particle_contact_buf_cap >= cap:
+            return
+        # 1.5x growth past the strict minimum.
+        cap = max(cap, int(self._particle_contact_buf_cap * 1.5) + 1, 48)
+        self._particle_contact_buf_cap = cap
+        # 4-slot per-row state.
+        self._pc_row_pa_d = wp.empty(cap, dtype=wp.int32, device=device)
+        self._pc_row_pb_d = wp.empty(cap, dtype=wp.int32, device=device)
+        self._pc_row_pc_d = wp.empty(cap, dtype=wp.int32, device=device)
+        self._pc_row_pd_d = wp.empty(cap, dtype=wp.int32, device=device)
+        self._pc_row_wa_d = wp.empty(cap, dtype=wp.float32, device=device)
+        self._pc_row_wb_d = wp.empty(cap, dtype=wp.float32, device=device)
+        self._pc_row_wc_d = wp.empty(cap, dtype=wp.float32, device=device)
+        self._pc_row_wd_d = wp.empty(cap, dtype=wp.float32, device=device)
+        self._pc_row_dir_d = wp.empty(cap, dtype=wp.vec3, device=device)
+        self._pc_row_alpha_d = wp.empty(cap, dtype=wp.float32, device=device)
+        self._pc_row_offset_d = wp.empty(cap, dtype=wp.float64, device=device)
+        self._pc_contact_mu_d = wp.array(
+            np.full(cap // 3, self.particle_contact_friction, dtype=np.float64),
+            dtype=wp.float64, device=device,
+        )
+        self._pc_r_d = wp.empty(cap, dtype=wp.float64, device=device)
+        self._pc_lam_d = wp.zeros(cap, dtype=wp.float64, device=device)
+        self._pc_omega_d = wp.zeros(cap, dtype=wp.float64, device=device)
+        self._pc_lam_apply_d = wp.zeros(cap, dtype=wp.float64, device=device)
+        self._pc_lam_apply_f32_d = wp.zeros(cap, dtype=wp.float32, device=device)
+        if not hasattr(self, "_pc_jt_lambda_d") or self._pc_jt_lambda_d is None:
+            self._pc_jt_lambda_d = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=device)
+            self._pc_x_correction_d = wp.empty(self.model.particle_count, dtype=wp.vec3, device=device)
+
+    def _apply_particle_contact_pass_vv(self, state_inout, dt: float) -> int:
+        """Legacy v-v contact pass (ParticleContactBroadphase + 4-slot rows)."""
         from .particle_contact import ParticleContactBroadphase  # noqa: PLC0415
 
         # ---- Lazy broadphase setup ----
@@ -2262,7 +2317,6 @@ class SolverFBA(SolverBase):
             )
         bp = self._particle_broadphase
 
-        # ---- Broadphase ----
         n_pairs = bp.find_pairs(state_inout.particle_q)
         if n_pairs == 0:
             return 0
@@ -2270,39 +2324,14 @@ class SolverFBA(SolverBase):
         device = self._device
         n_rows = 3 * n_pairs
 
-        # ---- Allocate per-step scratch (one-shot at max capacity).  Resizing
-        # warp arrays mid-step risks use-after-free if a previously-launched
-        # kernel is still in flight; pre-allocating to ``3 * max_pairs`` once
-        # avoids the issue entirely.
-        if self._particle_contact_buf_cap == 0:
-            cap = max(48, 3 * bp.max_pairs)
-            self._particle_contact_buf_cap = cap
-            self._pc_row_pa_d = wp.empty(cap, dtype=wp.int32, device=device)
-            self._pc_row_pb_d = wp.empty(cap, dtype=wp.int32, device=device)
-            self._pc_row_dir_d = wp.empty(cap, dtype=wp.vec3, device=device)
-            self._pc_row_alpha_d = wp.empty(cap, dtype=wp.float32, device=device)
-            self._pc_row_offset_d = wp.empty(cap, dtype=wp.float64, device=device)
-            # μ array sized to max pairs (cap/3 contacts).  Filled with the
-            # constant self-contact friction once here so per-step launches
-            # never touch it.
-            self._pc_contact_mu_d = wp.array(
-                np.full(cap // 3, self.particle_contact_friction, dtype=np.float64),
-                dtype=wp.float64, device=device,
-            )
-            self._pc_r_d = wp.empty(cap, dtype=wp.float64, device=device)
-            self._pc_lam_d = wp.zeros(cap, dtype=wp.float64, device=device)
-            self._pc_omega_d = wp.zeros(cap, dtype=wp.float64, device=device)
-            self._pc_lam_apply_d = wp.zeros(cap, dtype=wp.float64, device=device)
-            self._pc_lam_apply_f32_d = wp.zeros(cap, dtype=wp.float32, device=device)
-            self._pc_jt_lambda_d = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=device)
-            self._pc_x_correction_d = wp.empty(self.model.particle_count, dtype=wp.vec3, device=device)
+        cap = max(48, 3 * bp.max_pairs)
+        self._ensure_particle_contact_buffers(cap)
 
-        # ---- Emit self-contact rows ----
         from . import kernels as K  # noqa: PLC0415
 
         gap_threshold = 2.0 * float(self.particle_contact_radius)
         wp.launch(
-            K.emit_particle_contact_rows_kernel,
+            K.emit_pp_rows_uniform_kernel,
             dim=n_pairs,
             inputs=[
                 wp.int32(n_pairs),
@@ -2310,11 +2339,17 @@ class SolverFBA(SolverBase):
                 bp._pair_b_d,
                 bp._pair_normal_d,
                 wp.float64(gap_threshold),
-                wp.int32(0),                       # row_offset_base
+                wp.int32(0),
             ],
             outputs=[
                 self._pc_row_pa_d,
                 self._pc_row_pb_d,
+                self._pc_row_pc_d,
+                self._pc_row_pd_d,
+                self._pc_row_wa_d,
+                self._pc_row_wb_d,
+                self._pc_row_wc_d,
+                self._pc_row_wd_d,
                 self._pc_row_dir_d,
                 self._pc_row_alpha_d,
                 self._pc_row_offset_d,
@@ -2323,13 +2358,247 @@ class SolverFBA(SolverBase):
             device=device,
         )
 
+        return self._run_particle_contact_solve(state_inout, dt, n_pairs)
+
+    def _apply_particle_contact_pass_vt(self, state_inout, dt: float) -> int:
+        """V-t contact pass using TriMeshCollisionDetector + 4-slot Jacobian."""
+        # Lazy detector + filter list setup.
+        if self._particle_contact_detector is None:
+            self._init_particle_contact_detector()
+        detector = self._particle_contact_detector
+
+        device = self._device
+        threshold = 2.0 * float(self.particle_contact_radius) + float(self.particle_contact_margin)
+
+        # ---- Refit BVH + broadphase. ----
+        detector.refit(state_inout.particle_q)
+        detector.vertex_colliding_triangles_count.zero_()
+        detector.vertex_triangle_collision_detection(float(threshold))
+
+        # ---- Build per-vertex clamped-hit-count + prefix sum on host. ----
+        # Small particle count + Python overhead is acceptable for single-env.
+        from . import kernels as K  # noqa: PLC0415
+
+        n_particles = int(self.model.particle_count)
+        clamped = wp.empty(n_particles, dtype=wp.int32, device=device)
+        wp.launch(
+            K.vt_count_hits_kernel,
+            dim=n_particles,
+            inputs=[
+                wp.int32(n_particles),
+                detector.vertex_colliding_triangles_count,
+                detector.vertex_colliding_triangles_buffer_sizes,
+            ],
+            outputs=[clamped],
+            device=device,
+        )
+        # Cap per-vertex hit count at our user-set limit (defensive: detector's
+        # buffer sizes already cap, but the user may want a tighter bound).
+        clamped_np = clamped.numpy()
+        per_v_cap = int(self.particle_contact_max_hits_per_vertex)
+        np.minimum(clamped_np, per_v_cap, out=clamped_np)
+        offsets_np = np.zeros(n_particles + 1, dtype=np.int32)
+        np.cumsum(clamped_np, out=offsets_np[1:])
+        n_hits = int(offsets_np[-1])
+        if n_hits == 0:
+            return 0
+
+        # ---- Allocate buffers. ----
+        # Each hit emits 1 contact = 3 rows. Bound capacity at 3 * n_hits +
+        # a small safety margin.
+        cap = max(48, 3 * (n_hits + 64))
+        self._ensure_particle_contact_buffers(cap)
+
+        # Per-vertex job-offsets array.
+        if (
+            self._pc_hit_offsets_d is None
+            or int(self._pc_hit_offsets_d.size) < n_particles + 1
+        ):
+            self._pc_hit_offsets_d = wp.empty(n_particles + 1, dtype=wp.int32, device=device)
+        self._pc_hit_offsets_d.assign(offsets_np)
+
+        if self._pc_contact_count_d is None:
+            self._pc_contact_count_d = wp.zeros(1, dtype=wp.int32, device=device)
+        self._pc_contact_count_d.zero_()
+
+        gap_threshold = 2.0 * float(self.particle_contact_radius)
+        max_contacts = cap // 3
+
+        wp.launch(
+            K.emit_vt_rows_kernel,
+            dim=n_hits,
+            inputs=[
+                wp.int32(n_hits),
+                self._pc_hit_offsets_d,
+                wp.int32(n_particles),
+                detector.vertex_colliding_triangles,
+                detector.vertex_colliding_triangles_offsets,
+                self.model.tri_indices,
+                state_inout.particle_q,
+                wp.float32(threshold),
+                wp.float64(gap_threshold),
+                self._pc_contact_count_d,
+                wp.int32(max_contacts),
+                wp.int32(0),
+            ],
+            outputs=[
+                self._pc_row_pa_d,
+                self._pc_row_pb_d,
+                self._pc_row_pc_d,
+                self._pc_row_pd_d,
+                self._pc_row_wa_d,
+                self._pc_row_wb_d,
+                self._pc_row_wc_d,
+                self._pc_row_wd_d,
+                self._pc_row_dir_d,
+                self._pc_row_alpha_d,
+                self._pc_row_offset_d,
+                self._pc_contact_mu_d,
+                wp.float64(self.particle_contact_friction),
+            ],
+            device=device,
+        )
+
+        n_contacts = int(self._pc_contact_count_d.numpy()[0])
+        if n_contacts > max_contacts:
+            n_contacts = max_contacts
+        if n_contacts == 0:
+            return 0
+        return self._run_particle_contact_solve(state_inout, dt, n_contacts)
+
+    def _init_particle_contact_detector(self) -> None:
+        """Build the TriMeshCollisionDetector + topology-filter CSRs once."""
+        # Inline the helpers from scripts/fba_phase0_tri_mesh_detector_smoke.py.
+        from newton._src.solvers.vbd.particle_vbd_kernels import (  # noqa: PLC0415
+            ParticleForceElementAdjacencyInfo,
+            _count_num_adjacent_edges,
+            _count_num_adjacent_faces,
+            _fill_adjacent_edges,
+            _fill_adjacent_faces,
+            build_edge_n_ring_edge_collision_filter,
+            build_vertex_n_ring_tris_collision_filter,
+            set_to_csr,
+        )
+        from newton._src.solvers.vbd.tri_mesh_collision import (  # noqa: PLC0415
+            TriMeshCollisionDetector,
+        )
+
+        model = self.model
+
+        adj = ParticleForceElementAdjacencyInfo()
+        with wp.ScopedDevice("cpu"):
+            if model.edge_indices is not None and model.edge_indices.shape[0] > 0:
+                edges_cpu = model.edge_indices.to("cpu")
+                num_adj = wp.zeros(shape=(model.particle_count,), dtype=wp.int32)
+                wp.launch(_count_num_adjacent_edges, inputs=[edges_cpu, num_adj], dim=1, device="cpu")
+                num_adj_np = num_adj.numpy()
+                offsets = np.empty(model.particle_count + 1, dtype=wp.int32)
+                offsets[0] = 0
+                offsets[1:] = np.cumsum(2 * num_adj_np)
+                adj.v_adj_edges_offsets = wp.array(offsets, dtype=wp.int32)
+                fill_count = wp.zeros(shape=(model.particle_count,), dtype=wp.int32)
+                adj.v_adj_edges = wp.empty(shape=(int(2 * num_adj_np.sum()),), dtype=wp.int32)
+                wp.launch(
+                    _fill_adjacent_edges,
+                    inputs=[edges_cpu, adj.v_adj_edges_offsets, fill_count, adj.v_adj_edges],
+                    dim=1, device="cpu",
+                )
+            else:
+                adj.v_adj_edges_offsets = wp.empty(shape=(0,), dtype=wp.int32)
+                adj.v_adj_edges = wp.empty(shape=(0,), dtype=wp.int32)
+
+            if model.tri_indices is not None and model.tri_indices.shape[0] > 0:
+                tris_cpu = model.tri_indices.to("cpu")
+                num_adj = wp.zeros(shape=(model.particle_count,), dtype=wp.int32, device="cpu")
+                wp.launch(_count_num_adjacent_faces, inputs=[tris_cpu, num_adj], dim=1, device="cpu")
+                num_adj_np = num_adj.numpy()
+                offsets = np.empty(model.particle_count + 1, dtype=wp.int32)
+                offsets[0] = 0
+                offsets[1:] = np.cumsum(2 * num_adj_np)
+                adj.v_adj_faces_offsets = wp.array(offsets, dtype=wp.int32)
+                fill_count = wp.zeros(shape=(model.particle_count,), dtype=wp.int32)
+                adj.v_adj_faces = wp.empty(shape=(int(2 * num_adj_np.sum()),), dtype=wp.int32)
+                wp.launch(
+                    _fill_adjacent_faces,
+                    inputs=[tris_cpu, adj.v_adj_faces_offsets, fill_count, adj.v_adj_faces],
+                    dim=1, device="cpu",
+                )
+            else:
+                adj.v_adj_faces_offsets = wp.empty(shape=(0,), dtype=wp.int32)
+                adj.v_adj_faces = wp.empty(shape=(0,), dtype=wp.int32)
+
+            adj.v_adj_springs = wp.empty(shape=(0,), dtype=wp.int32)
+            adj.v_adj_springs_offsets = wp.empty(shape=(0,), dtype=wp.int32)
+            adj.v_adj_tets = wp.empty(shape=(0,), dtype=wp.int32)
+            adj.v_adj_tets_offsets = wp.empty(shape=(0,), dtype=wp.int32)
+
+        adjacency = adj.to(model.device)
+        ring = int(self.particle_contact_topology_ring)
+        v_tri_sets = None
+        edge_edge_sets = None
+        if ring >= 2:
+            if adjacency.v_adj_faces_offsets.size > 0:
+                v_tri_sets = build_vertex_n_ring_tris_collision_filter(
+                    ring,
+                    model.particle_count,
+                    model.edge_indices.numpy(),
+                    adjacency.v_adj_edges.numpy(),
+                    adjacency.v_adj_edges_offsets.numpy(),
+                    adjacency.v_adj_faces.numpy(),
+                    adjacency.v_adj_faces_offsets.numpy(),
+                )
+            if adjacency.v_adj_edges_offsets.size > 0:
+                edge_edge_sets = build_edge_n_ring_edge_collision_filter(
+                    ring,
+                    model.edge_indices.numpy(),
+                    adjacency.v_adj_edges.numpy(),
+                    adjacency.v_adj_edges_offsets.numpy(),
+                )
+
+        if v_tri_sets is None:
+            vt_flat = vt_offs = None
+        else:
+            vt_flat_np, vt_offs_np = set_to_csr(v_tri_sets)
+            vt_flat = wp.array(vt_flat_np, dtype=int, device=model.device)
+            vt_offs = wp.array(vt_offs_np, dtype=int, device=model.device)
+        if edge_edge_sets is None:
+            ee_flat = ee_offs = None
+        else:
+            ee_flat_np, ee_offs_np = set_to_csr(edge_edge_sets)
+            ee_flat = wp.array(ee_flat_np, dtype=int, device=model.device)
+            ee_offs = wp.array(ee_offs_np, dtype=int, device=model.device)
+
+        pre_alloc = max(8, int(self.particle_contact_max_hits_per_vertex))
+        detector = TriMeshCollisionDetector(
+            model,
+            vertex_collision_buffer_pre_alloc=pre_alloc,
+            edge_collision_buffer_pre_alloc=pre_alloc,
+            edge_edge_parallel_epsilon=1e-5,
+        )
+        detector.set_collision_filter_list(vt_flat, vt_offs, ee_flat, ee_offs)
+        self._particle_contact_detector = detector
+
+    def _run_particle_contact_solve(self, state_inout, dt: float, n_contacts: int) -> int:
+        """Shared post-emit path: residual → BSR FB-Newton → scatter → apply."""
+        from . import kernels as K  # noqa: PLC0415
+        from .kernels import cast_fp64_to_fp32_kernel  # noqa: PLC0415
+
+        device = self._device
+        n_rows = 3 * int(n_contacts)
+
         # ---- Residual r ----
         wp.launch(
-            K.compute_particle_contact_residual_kernel,
+            K.compute_particle_contact_residual_4slot_kernel,
             dim=n_rows,
             inputs=[
                 self._pc_row_pa_d,
                 self._pc_row_pb_d,
+                self._pc_row_pc_d,
+                self._pc_row_pd_d,
+                self._pc_row_wa_d,
+                self._pc_row_wb_d,
+                self._pc_row_wc_d,
+                self._pc_row_wd_d,
                 self._pc_row_dir_d,
                 self._pc_row_alpha_d,
                 self._pc_row_offset_d,
@@ -2339,11 +2608,9 @@ class SolverFBA(SolverBase):
             device=device,
         )
 
-        # ---- Warm-start: zero λ / ω for self-contact rows ----
         self._pc_lam_d[:n_rows].zero_()
         self._pc_omega_d[:n_rows].zero_()
 
-        # ---- BSR FB-Newton inner ----
         if self.lambda_cap is not None:
             cap_internal = float(self.lambda_cap) / (dt * dt)
             use_cap = True
@@ -2352,7 +2619,7 @@ class SolverFBA(SolverBase):
             use_cap = False
 
         self._solve_nsn_coulomb_lite_bsr(
-            M_total=n_pairs,
+            M_total=n_contacts,
             row_particle_a_d=self._pc_row_pa_d,
             row_particle_b_d=self._pc_row_pb_d,
             row_dir_d=self._pc_row_dir_d,
@@ -2369,10 +2636,13 @@ class SolverFBA(SolverBase):
             n_fb_iters=self.nsn_iterations,
             cap_internal=cap_internal,
             use_cap=use_cap,
+            row_particle_c_d=self._pc_row_pc_d,
+            row_particle_d_d=self._pc_row_pd_d,
+            row_wa_d=self._pc_row_wa_d,
+            row_wb_d=self._pc_row_wb_d,
+            row_wc_d=self._pc_row_wc_d,
+            row_wd_d=self._pc_row_wd_d,
         )
-
-        # ---- Cast lam_apply to fp32 for the gather kernel ----
-        from .kernels import cast_fp64_to_fp32_kernel  # noqa: PLC0415
 
         wp.launch(
             cast_fp64_to_fp32_kernel,
@@ -2382,15 +2652,20 @@ class SolverFBA(SolverBase):
             device=device,
         )
 
-        # ---- Build Jᵀ·λ at particles (2-particle scatter) ----
         self._pc_jt_lambda_d.zero_()
         wp.launch(
-            K.scatter_jt_lambda_two_particle_kernel,
+            K.scatter_jt_lambda_n_particle_kernel,
             dim=n_rows,
             inputs=[
                 wp.int32(n_rows),
                 self._pc_row_pa_d,
                 self._pc_row_pb_d,
+                self._pc_row_pc_d,
+                self._pc_row_pd_d,
+                self._pc_row_wa_d,
+                self._pc_row_wb_d,
+                self._pc_row_wc_d,
+                self._pc_row_wd_d,
                 self._pc_row_dir_d,
                 self._pc_row_alpha_d,
                 self._pc_lam_apply_f32_d,
@@ -2399,13 +2674,6 @@ class SolverFBA(SolverBase):
             device=device,
         )
 
-        # ---- Apply Δx = dt² · M⁻¹ · Jᵀ·λ (LiteNSN-consistent) ----
-        # Going through the full PD A⁻¹ diffuses the impulse via stretching/
-        # bending elasticity (measured 0.5mm Δx per step on 1013-particle
-        # cloth despite ~12k λ values), which the next step's PD solve
-        # then largely undoes.  Using the same mass-inverse diagonal that
-        # the LiteNSN Schur was built with localises the impulse to its
-        # target particle.
         wp.launch(
             K.apply_dt2_inv_mass_correction_kernel,
             dim=self.model.particle_count,
@@ -2435,6 +2703,13 @@ class SolverFBA(SolverBase):
         n_fb_iters: int,
         cap_internal: float,
         use_cap: bool,
+        # ---- Optional 4-slot Jacobian (v-t / e-e) ----
+        row_particle_c_d: wp.array | None = None,
+        row_particle_d_d: wp.array | None = None,
+        row_wa_d: wp.array | None = None,
+        row_wb_d: wp.array | None = None,
+        row_wc_d: wp.array | None = None,
+        row_wd_d: wp.array | None = None,
     ) -> None:
         """LiteNSN inner driver on the BSR + sparse-PCR path.
 
@@ -2462,6 +2737,12 @@ class SolverFBA(SolverBase):
         # contact-graph-sparse with self-contact rows mixed in).
         W_bsr = ls.build_schur_lite_unified(
             n_rows, row_particle_a_d, row_particle_b_d, row_dir_d, row_alpha_d,
+            row_particle_c_d=row_particle_c_d,
+            row_particle_d_d=row_particle_d_d,
+            row_wa_d=row_wa_d,
+            row_wb_d=row_wb_d,
+            row_wc_d=row_wc_d,
+            row_wd_d=row_wd_d,
         )
         if W_bsr is None:
             # Nothing to solve.
@@ -2488,11 +2769,21 @@ class SolverFBA(SolverBase):
             self._bsr_lam = wp.zeros(cap, dtype=wp.float64, device=device)
             self._bsr_omega = wp.zeros(cap, dtype=wp.float64, device=device)
         elif self._bsr_omega_lam.size < n_rows:
-            # Hard fail — pre-allocate higher up.
-            raise RuntimeError(
-                f"BSR scratch undersized: have {self._bsr_omega_lam.size}, need {n_rows}. "
-                "Pre-allocate via _particle_contact_buf_cap before first call."
-            )
+            # Grow with 1.5x headroom to avoid frequent reallocation when the
+            # contact count ramps up gradually (e.g. v-t broadphase warming).
+            new_cap = max(int(n_rows * 1.5), int(self._bsr_omega_lam.size) * 2)
+            new_cap = max(new_cap, getattr(self, "_particle_contact_buf_cap", 0))
+            self._bsr_buf_cap = new_cap
+            self._bsr_omega_lam = wp.zeros(new_cap, dtype=wp.float64, device=device)
+            self._bsr_w_omega_lam = wp.zeros(new_cap, dtype=wp.float64, device=device)
+            self._bsr_penetration = wp.zeros(new_cap, dtype=wp.float64, device=device)
+            self._bsr_compliance = wp.zeros(new_cap, dtype=wp.float64, device=device)
+            self._bsr_h = wp.zeros(new_cap, dtype=wp.float64, device=device)
+            self._bsr_rhs = wp.zeros(new_cap, dtype=wp.float64, device=device)
+            self._bsr_dlam = wp.zeros(new_cap, dtype=wp.float64, device=device)
+            self._bsr_precond = wp.zeros(new_cap, dtype=wp.float64, device=device)
+            self._bsr_lam = wp.zeros(new_cap, dtype=wp.float64, device=device)
+            self._bsr_omega = wp.zeros(new_cap, dtype=wp.float64, device=device)
 
         # Warm-start λ, ω from the persistent buffers.
         wp.copy(self._bsr_lam, lam_init_d, count=n_rows)

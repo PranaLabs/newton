@@ -5,6 +5,8 @@
 
 import warp as wp
 
+from newton._src.geometry.kernels import triangle_closest_point_barycentric
+
 # 3x2 matrix type (wp.mat32 is not available in Warp 1.14; use types.matrix).
 mat32 = wp.types.matrix(shape=(3, 2), dtype=wp.float32)
 
@@ -4443,6 +4445,388 @@ def emit_particle_contact_rows_kernel(
     row_dir[base + 2] = t2
     row_alpha[base + 2] = wp.float32(1.0)
     row_offset[base + 2] = wp.float64(0.0)
+
+
+# ===========================================================================
+# 4-slot (v-t/e-e) particle-contact kernels — Phase 1 + 2 of the v-t/e-e plan.
+#
+# LOCKED-B (uniform 4-slot row layout): all particle-contact rows carry
+# ``(pa, pb, pc, pd)`` int32 + ``(wa, wb, wc, wd)`` float32.  Sentinel
+# ``p* = -1`` (with matching ``w* = 0``) skips that slot in every consumer.
+#
+# Residual / Jacobian semantics:
+#   r = offset - sum_k wa..wd * dot(row_dir, x[p_k])    (for k where p_k >= 0)
+# Scatter:
+#   for each row r and each slot k with p_k >= 0:
+#     out[p_k] += w_k * alpha * dir * lambda
+# This generalises the existing 2-particle v-v formulation
+# (``pa=v1, pb=v2, wa=+1, wb=-1, pc=pd=-1, wc=wd=0``) directly.
+# ===========================================================================
+
+
+@wp.kernel
+def emit_pp_rows_uniform_kernel(
+    # 2-particle v-v broadphase pairs (existing ParticleContactBroadphase path).
+    n_pairs: wp.int32,
+    pair_a: wp.array[wp.int32],
+    pair_b: wp.array[wp.int32],
+    pair_normal: wp.array[wp.vec3],
+    gap_threshold: wp.float64,
+    row_offset_base: wp.int32,
+    # 4-slot output arrays.
+    row_pa: wp.array[wp.int32],
+    row_pb: wp.array[wp.int32],
+    row_pc: wp.array[wp.int32],
+    row_pd: wp.array[wp.int32],
+    row_wa: wp.array[wp.float32],
+    row_wb: wp.array[wp.float32],
+    row_wc: wp.array[wp.float32],
+    row_wd: wp.array[wp.float32],
+    row_dir: wp.array[wp.vec3],
+    row_alpha: wp.array[wp.float32],
+    row_offset: wp.array[wp.float64],
+    contact_mu: wp.array[wp.float64],
+):
+    """Emit a 2-particle v-v contact (3 rows) in the uniform 4-slot layout.
+
+    For each pair (a, b) with unit normal ``n`` (b → a), writes:
+      slot a:  pa = a, wa = +1
+      slot b:  pb = b, wb = -1
+      slots c/d: -1, 0 (unused)
+    """
+    p = wp.tid()
+    if p >= n_pairs:
+        return
+    a = pair_a[p]
+    b = pair_b[p]
+    n = pair_normal[p]
+
+    ax = wp.float32(wp.abs(n[0]))
+    ay = wp.float32(wp.abs(n[1]))
+    az = wp.float32(wp.abs(n[2]))
+    if ax <= ay and ax <= az:
+        ref = wp.vec3(1.0, 0.0, 0.0)
+    elif ay <= az:
+        ref = wp.vec3(0.0, 1.0, 0.0)
+    else:
+        ref = wp.vec3(0.0, 0.0, 1.0)
+    t1 = wp.cross(n, ref)
+    t1 = t1 / wp.max(wp.length(t1), wp.float32(1.0e-9))
+    t2 = wp.cross(n, t1)
+
+    base = row_offset_base + 3 * p
+
+    for k in range(3):
+        idx = base + k
+        row_pa[idx] = a
+        row_pb[idx] = b
+        row_pc[idx] = wp.int32(-1)
+        row_pd[idx] = wp.int32(-1)
+        row_wa[idx] = wp.float32(1.0)
+        row_wb[idx] = wp.float32(-1.0)
+        row_wc[idx] = wp.float32(0.0)
+        row_wd[idx] = wp.float32(0.0)
+        row_alpha[idx] = wp.float32(1.0)
+
+    row_dir[base + 0] = n
+    row_offset[base + 0] = gap_threshold
+    row_dir[base + 1] = t1
+    row_offset[base + 1] = wp.float64(0.0)
+    row_dir[base + 2] = t2
+    row_offset[base + 2] = wp.float64(0.0)
+
+
+@wp.kernel
+def vt_count_hits_kernel(
+    # Vertex-of-cloth count (= particle count for the cloth meshes the detector covers).
+    n_query_particles: wp.int32,
+    vertex_colliding_triangles_count: wp.array[wp.int32],
+    vertex_colliding_triangles_buffer_sizes: wp.array[wp.int32],
+    # Output (length n_query_particles): clamped count per vertex.
+    clamped_count: wp.array[wp.int32],
+):
+    v = wp.tid()
+    if v >= n_query_particles:
+        return
+    raw = vertex_colliding_triangles_count[v]
+    cap = vertex_colliding_triangles_buffer_sizes[v]
+    clamped_count[v] = wp.min(raw, cap)
+
+
+@wp.kernel
+def emit_vt_rows_kernel(
+    # Flat job array: one thread per (vertex, hit) pair.
+    n_hits: wp.int32,
+    # CSR over per-vertex hit job indices: for thread tid, find vertex v such
+    # that vt_hit_offsets[v] <= tid < vt_hit_offsets[v+1], then hit i = tid - offsets[v].
+    vt_hit_offsets: wp.array[wp.int32],     # (n_query_particles + 1,)
+    n_query_particles: wp.int32,
+    # Detector output (CSR per vertex; 2 ints per hit: (query_vertex, triangle_id)).
+    vertex_colliding_triangles: wp.array[wp.int32],
+    vertex_colliding_triangles_offsets: wp.array[wp.int32],
+    # Triangle topology + positions.
+    tri_indices: wp.array2d[wp.int32],      # (T, 3)
+    particle_q: wp.array[wp.vec3],          # (N,)
+    # Geometry.
+    threshold: wp.float32,
+    gap_threshold: wp.float64,
+    # Output emission counter (atomic).
+    contact_count: wp.array[wp.int32],      # (1,) — number of emitted contacts
+    max_contacts: wp.int32,                 # capacity check (max_contacts = cap // 3)
+    row_offset_base: wp.int32,
+    # 4-slot output arrays.
+    row_pa: wp.array[wp.int32],
+    row_pb: wp.array[wp.int32],
+    row_pc: wp.array[wp.int32],
+    row_pd: wp.array[wp.int32],
+    row_wa: wp.array[wp.float32],
+    row_wb: wp.array[wp.float32],
+    row_wc: wp.array[wp.float32],
+    row_wd: wp.array[wp.float32],
+    row_dir: wp.array[wp.vec3],
+    row_alpha: wp.array[wp.float32],
+    row_offset: wp.array[wp.float64],
+    contact_mu: wp.array[wp.float64],
+    friction_mu: wp.float64,
+):
+    """One thread per (vertex, hit). Emits 3 rows in the 4-slot layout.
+
+    Outputs a v-v special-case row when ``max(b1,b2,b3) > 1 - 1e-6`` (closest
+    point at a triangle vertex), else a 4-particle v-t row.  Skips when the
+    detector returned a sentinel (``triangle_id == -1``) or when the post-
+    refit distance exceeds ``threshold``.
+    """
+    tid = wp.tid()
+    if tid >= n_hits:
+        return
+
+    # ---- Resolve (vertex, local_hit_index) via binary search over CSR offsets. ----
+    lo = wp.int32(0)
+    hi = n_query_particles
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if vt_hit_offsets[mid + 1] <= tid:
+            lo = mid + 1
+        else:
+            hi = mid
+    v = lo
+    local = tid - vt_hit_offsets[v]
+
+    csr_off = vertex_colliding_triangles_offsets[v]
+    raw_v = vertex_colliding_triangles[2 * (csr_off + local) + 0]
+    tri_id = vertex_colliding_triangles[2 * (csr_off + local) + 1]
+    if tri_id < wp.int32(0):
+        return
+    # The detector stores (query_vertex, triangle_id); query_vertex == v.
+    _ = raw_v  # unused
+
+    # ---- Closest point on triangle. ----
+    t1i = tri_indices[tri_id, 0]
+    t2i = tri_indices[tri_id, 1]
+    t3i = tri_indices[tri_id, 2]
+    a = particle_q[t1i]
+    b = particle_q[t2i]
+    c = particle_q[t3i]
+    p = particle_q[v]
+    bary = triangle_closest_point_barycentric(a, b, c, p)
+    b1 = bary[0]
+    b2 = bary[1]
+    b3 = bary[2]
+    closest = b1 * a + b2 * b + b3 * c
+    diff = p - closest
+    dist = wp.length(diff)
+    if dist < wp.float32(1.0e-9):
+        return
+    if dist > threshold:
+        return
+    n = diff / dist
+
+    # ---- Allocate a contact slot. ----
+    cid = wp.atomic_add(contact_count, 0, 1)
+    if cid >= max_contacts:
+        return  # over capacity — silently drop (caller checks contact_count)
+
+    base = row_offset_base + 3 * cid
+
+    # ---- V-v fast path: closest at one triangle vertex. ----
+    max_bary = wp.max(wp.max(b1, b2), b3)
+    if max_bary > wp.float32(1.0) - wp.float32(1.0e-6):
+        # Pick which triangle vertex.
+        if b1 >= b2 and b1 >= b3:
+            pb_id = t1i
+        elif b2 >= b3:
+            pb_id = t2i
+        else:
+            pb_id = t3i
+        # Build tangent basis from n.
+        ax_ = wp.float32(wp.abs(n[0]))
+        ay_ = wp.float32(wp.abs(n[1]))
+        az_ = wp.float32(wp.abs(n[2]))
+        if ax_ <= ay_ and ax_ <= az_:
+            ref = wp.vec3(1.0, 0.0, 0.0)
+        elif ay_ <= az_:
+            ref = wp.vec3(0.0, 1.0, 0.0)
+        else:
+            ref = wp.vec3(0.0, 0.0, 1.0)
+        tan1 = wp.cross(n, ref)
+        tan1 = tan1 / wp.max(wp.length(tan1), wp.float32(1.0e-9))
+        tan2 = wp.cross(n, tan1)
+        for k in range(3):
+            idx = base + k
+            row_pa[idx] = v
+            row_pb[idx] = pb_id
+            row_pc[idx] = wp.int32(-1)
+            row_pd[idx] = wp.int32(-1)
+            row_wa[idx] = wp.float32(1.0)
+            row_wb[idx] = wp.float32(-1.0)
+            row_wc[idx] = wp.float32(0.0)
+            row_wd[idx] = wp.float32(0.0)
+            row_alpha[idx] = wp.float32(1.0)
+        row_dir[base + 0] = n
+        row_offset[base + 0] = gap_threshold
+        row_dir[base + 1] = tan1
+        row_offset[base + 1] = wp.float64(0.0)
+        row_dir[base + 2] = tan2
+        row_offset[base + 2] = wp.float64(0.0)
+        contact_mu[cid] = friction_mu
+        return
+
+    # ---- V-t row (4 slots). ----
+    # Build tangent basis from n.
+    ax_ = wp.float32(wp.abs(n[0]))
+    ay_ = wp.float32(wp.abs(n[1]))
+    az_ = wp.float32(wp.abs(n[2]))
+    if ax_ <= ay_ and ax_ <= az_:
+        ref = wp.vec3(1.0, 0.0, 0.0)
+    elif ay_ <= az_:
+        ref = wp.vec3(0.0, 1.0, 0.0)
+    else:
+        ref = wp.vec3(0.0, 0.0, 1.0)
+    tan1 = wp.cross(n, ref)
+    tan1 = tan1 / wp.max(wp.length(tan1), wp.float32(1.0e-9))
+    tan2 = wp.cross(n, tan1)
+
+    wa = wp.float32(1.0)
+    wb = -b1
+    wc = -b2
+    wd = -b3
+    # Slot whose bary == 0 → drop with -1 sentinel (matches "3 valid slots" case).
+    pb_id = t1i
+    pc_id = t2i
+    pd_id = t3i
+    if b1 < wp.float32(1.0e-7):
+        pb_id = wp.int32(-1)
+        wb = wp.float32(0.0)
+    if b2 < wp.float32(1.0e-7):
+        pc_id = wp.int32(-1)
+        wc = wp.float32(0.0)
+    if b3 < wp.float32(1.0e-7):
+        pd_id = wp.int32(-1)
+        wd = wp.float32(0.0)
+
+    for k in range(3):
+        idx = base + k
+        row_pa[idx] = v
+        row_pb[idx] = pb_id
+        row_pc[idx] = pc_id
+        row_pd[idx] = pd_id
+        row_wa[idx] = wa
+        row_wb[idx] = wb
+        row_wc[idx] = wc
+        row_wd[idx] = wd
+        row_alpha[idx] = wp.float32(1.0)
+    row_dir[base + 0] = n
+    row_offset[base + 0] = gap_threshold
+    row_dir[base + 1] = tan1
+    row_offset[base + 1] = wp.float64(0.0)
+    row_dir[base + 2] = tan2
+    row_offset[base + 2] = wp.float64(0.0)
+    contact_mu[cid] = friction_mu
+
+
+@wp.kernel
+def compute_particle_contact_residual_4slot_kernel(
+    row_pa: wp.array[wp.int32],
+    row_pb: wp.array[wp.int32],
+    row_pc: wp.array[wp.int32],
+    row_pd: wp.array[wp.int32],
+    row_wa: wp.array[wp.float32],
+    row_wb: wp.array[wp.float32],
+    row_wc: wp.array[wp.float32],
+    row_wd: wp.array[wp.float32],
+    row_dir: wp.array[wp.vec3],
+    row_alpha: wp.array[wp.float32],
+    row_offset: wp.array[wp.float64],
+    x: wp.array[wp.vec3],
+    r: wp.array[wp.float64],
+):
+    """4-slot residual: ``r[i] = offset[i] - α[i] · dot(dir[i], Σ_k w_k · x[p_k])``.
+
+    Sentinel ``p_k = -1`` (with matching ``w_k = 0``) skips that slot.  For
+    v-v rows (pa, pb valid, wa=+1, wb=-1, pc=pd=-1, wc=wd=0) this reduces
+    exactly to the original ``offset - α · dir · (x[a] - x[b])`` formula.
+    """
+    i = wp.tid()
+    alpha = wp.float64(row_alpha[i])
+    d = row_dir[i]
+
+    acc = wp.vec3(0.0, 0.0, 0.0)
+    pa = row_pa[i]
+    if pa >= wp.int32(0):
+        acc = acc + row_wa[i] * x[pa]
+    pb = row_pb[i]
+    if pb >= wp.int32(0):
+        acc = acc + row_wb[i] * x[pb]
+    pc = row_pc[i]
+    if pc >= wp.int32(0):
+        acc = acc + row_wc[i] * x[pc]
+    pd = row_pd[i]
+    if pd >= wp.int32(0):
+        acc = acc + row_wd[i] * x[pd]
+
+    r[i] = row_offset[i] - alpha * wp.float64(wp.dot(d, acc))
+
+
+@wp.kernel
+def scatter_jt_lambda_n_particle_kernel(
+    n_rows: wp.int32,
+    row_pa: wp.array[wp.int32],
+    row_pb: wp.array[wp.int32],
+    row_pc: wp.array[wp.int32],
+    row_pd: wp.array[wp.int32],
+    row_wa: wp.array[wp.float32],
+    row_wb: wp.array[wp.float32],
+    row_wc: wp.array[wp.float32],
+    row_wd: wp.array[wp.float32],
+    row_dir: wp.array[wp.vec3],
+    row_alpha: wp.array[wp.float32],
+    lam: wp.array[wp.float32],
+    out: wp.array[wp.vec3],
+):
+    """Per-row atomic scatter of ``Jᵀ·λ`` for 4-particle rows.
+
+    Per row r and each slot k with ``p_k >= 0 and w_k != 0``:
+        out[p_k] += w_k · α[r] · λ[r] · dir[r]
+
+    Caller is responsible for zeroing ``out`` before launch.
+    """
+    i = wp.tid()
+    if i >= n_rows:
+        return
+    contrib = row_alpha[i] * lam[i] * row_dir[i]
+
+    pa = row_pa[i]
+    if pa >= wp.int32(0):
+        wp.atomic_add(out, pa, row_wa[i] * contrib)
+    pb = row_pb[i]
+    if pb >= wp.int32(0):
+        wp.atomic_add(out, pb, row_wb[i] * contrib)
+    pc = row_pc[i]
+    if pc >= wp.int32(0):
+        wp.atomic_add(out, pc, row_wc[i] * contrib)
+    pd = row_pd[i]
+    if pd >= wp.int32(0):
+        wp.atomic_add(out, pd, row_wd[i] * contrib)
 
 
 # ----- Per-particle fused FB-Newton kernel for LiteNSN (Phase 1 of Franka plan) -----
