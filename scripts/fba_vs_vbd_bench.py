@@ -382,7 +382,6 @@ def phase1_calibrate_vbd(
 def phase1b_vbd_ref(
     out_dir: Path,
     calibration: dict,
-    anchor_meta: dict,
     n_frames: int = 800,
     n_warmup: int = 10,
     substeps: int = 40,
@@ -890,10 +889,16 @@ def write_report(
     max_sag = float(anchor_meta["max_sag"])
     lines.append("## Self-convergence (each solver vs its own converged reference)\n")
     lines.append(
-        "For each solver, the reference is its own high-iteration run at the\n"
-        "calibrated VBD parameters. Relative error = RMS-position-error per\n"
+        "For each solver, the reference is its own high-iteration run (FBA at iter=200; VBD at the calibrated (α*, β*) with substeps=40, iter=40).\n"
+        "Relative error = RMS-position-error per\n"
         f"frame divided by max sag of the FBA anchor ({max_sag:.4f} m).\n"
     )
+    if vbd_ref_meta is not None:
+        lines.append(
+            f"VBD self-reference: substeps={vbd_ref_meta['substeps']}, "
+            f"iterations={vbd_ref_meta['iterations']}, "
+            f"frames={vbd_ref_meta['n_frames']}.\n"
+        )
     lines.append("| Config | mean ms/frame | terminal rel_err |")
     lines.append("|---|---:|---:|")
     for s in sorted(sweep, key=lambda r: (r.config.solver, r.mean_ms)):
@@ -1021,13 +1026,13 @@ def main() -> int:
                 f"--frames={args.frames}; regenerating"
             )
             vbd_ref_meta = phase1b_vbd_ref(
-                out, calibration, anchor_meta, n_frames=args.frames, n_warmup=args.warmup
+                out, calibration, n_frames=args.frames, n_warmup=args.warmup
             )
         else:
             print("[phase 1b] reusing cached VBD self-ref")
     else:
         vbd_ref_meta = phase1b_vbd_ref(
-            out, calibration, anchor_meta, n_frames=args.frames, n_warmup=args.warmup
+            out, calibration, n_frames=args.frames, n_warmup=args.warmup
         )
 
     sweep = phase2_sweep(out, calibration, anchor_meta, n_frames=args.frames, n_warmup=args.warmup,
