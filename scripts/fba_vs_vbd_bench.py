@@ -554,10 +554,20 @@ def plot_pareto(out_dir: Path, sweep: list[SweepResult], calibration: dict) -> N
                label=f"floor = {calibration['floor_rms']:.4e} m")
     ax.set_xlabel("mean wall-clock per rendered frame (ms)")
     ax.set_ylabel("terminal RMS vs FBA anchor (m)")
+    from matplotlib.lines import Line2D  # noqa: PLC0415
+
+    solver_handles = [
+        Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:blue",
+               markersize=8, label="FBA", linestyle=""),
+        Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:orange",
+               markersize=8, label="VBD", linestyle=""),
+    ]
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_title("FBA vs VBD: wall-clock vs accuracy (lower-left is better)")
-    ax.legend(loc="best")
+    floor_line = ax.lines[0] if ax.lines else None
+    handles = solver_handles + ([floor_line] if floor_line is not None else [])
+    ax.legend(handles=handles, loc="best")
     ax.grid(True, which="both", alpha=0.3)
     fig.tight_layout()
     fig.savefig(out_dir / "pareto.png", dpi=120)
@@ -583,8 +593,15 @@ def plot_rms_over_time(out_dir: Path, sweep: list[SweepResult]) -> None:
 
 def plot_error_heatmaps(out_dir: Path, sweep: list[SweepResult], x_FBA_ref: np.ndarray) -> None:
     plt = _import_mpl()
-    fba_best = min((s for s in sweep if s.config.solver == "fba"), key=lambda s: s.terminal_rms)
-    vbd_best = min((s for s in sweep if s.config.solver == "vbd"), key=lambda s: s.terminal_rms)
+    fba_entries = [s for s in sweep if s.config.solver == "fba"]
+    vbd_entries = [s for s in sweep if s.config.solver == "vbd"]
+    if not fba_entries or not vbd_entries:
+        raise RuntimeError(
+            "plot_error_heatmaps requires both FBA and VBD entries in sweep; "
+            f"got {len(fba_entries)} FBA, {len(vbd_entries)} VBD"
+        )
+    fba_best = min(fba_entries, key=lambda s: s.terminal_rms)
+    vbd_best = min(vbd_entries, key=lambda s: s.terminal_rms)
     if fba_best.trajectory is None or vbd_best.trajectory is None:
         raise RuntimeError("error heatmaps require record_trajectories=True in phase2_sweep")
 
