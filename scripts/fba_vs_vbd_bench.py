@@ -682,29 +682,33 @@ def plot_rms_over_time(out_dir: Path, sweep: list[SweepResult]) -> None:
 
 
 def plot_pareto_self(out_dir: Path, sweep: list[SweepResult]) -> None:
-    """Pareto: mean wall-clock vs terminal relative error to each solver's own ref."""
+    """Pareto (line chart): mean wall-clock vs terminal relative error to each
+    solver's own ref. Each solver's points are connected in ascending wall-clock
+    order to show the cost–accuracy curve for that solver."""
     plt = _import_mpl()
-    from matplotlib.lines import Line2D  # noqa: PLC0415
 
     fig, ax = plt.subplots(figsize=(7, 5))
-    for s in sweep:
-        color = "tab:blue" if s.config.solver == "fba" else "tab:orange"
-        ax.scatter(s.mean_ms, s.terminal_rel_err, color=color, s=60)
-        ax.annotate(s.config.label, (s.mean_ms, s.terminal_rel_err),
-                    fontsize=8, xytext=(4, 4), textcoords="offset points")
-    solver_handles = [
-        Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:blue",
-               markersize=8, label="FBA", linestyle=""),
-        Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:orange",
-               markersize=8, label="VBD", linestyle=""),
-    ]
+    for solver_name, color in (("fba", "tab:blue"), ("vbd", "tab:orange")):
+        pts = sorted(
+            ((s.mean_ms, s.terminal_rel_err, s.config.label)
+             for s in sweep if s.config.solver == solver_name),
+            key=lambda p: p[0],
+        )
+        if not pts:
+            continue
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        ax.plot(xs, ys, marker="o", color=color, linewidth=1.6, markersize=8,
+                label=solver_name.upper())
+        for x, y, label in pts:
+            ax.annotate(label, (x, y), fontsize=8, xytext=(6, 6),
+                        textcoords="offset points")
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlabel("mean wall-clock per frame (ms)")
     ax.set_ylabel("terminal relative error (vs own converged ref) [‖Δx‖/max_sag]")
     ax.set_title("Self-convergence: each solver vs its own iter→large limit")
-    ax.legend(handles=solver_handles, loc="best")
-    ax.grid(True, which="both", alpha=0.3)
+    ax.legend(loc="best")
     fig.tight_layout()
     fig.savefig(out_dir / "pareto_self.png", dpi=120)
     plt.close(fig)
