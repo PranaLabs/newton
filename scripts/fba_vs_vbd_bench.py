@@ -376,6 +376,58 @@ def phase1_calibrate_vbd(
     return result
 
 
+# --- Phase 1b: VBD self-reference ---
+
+
+def phase1b_vbd_ref(
+    out_dir: Path,
+    calibration: dict,
+    anchor_meta: dict,
+    n_frames: int = 800,
+    n_warmup: int = 10,
+    substeps: int = 40,
+    iterations: int = 40,
+) -> dict:
+    """Run VBD at calibrated (α*, β*) with high substeps/iterations as its own converged ref.
+
+    Saves trajectory to ``out_dir / "x_VBD_ref.npy"`` and metadata to
+    ``out_dir / "vbd_ref.json"``.  Returns the metadata dict.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ref_path = out_dir / "x_VBD_ref.npy"
+
+    alpha_star = calibration["alpha_star"]
+    beta_star = calibration["beta_star"]
+
+    print(
+        f"[phase 1b] running VBD self-ref at α*, β*, substeps={substeps}, iter={iterations}"
+        f" for {n_frames} frames..."
+    )
+    t0 = time.perf_counter()
+    model = build_model_vbd(alpha=alpha_star, beta=beta_star)
+    solver = SolverVBD(model, iterations=iterations, particle_enable_self_contact=False)
+    res = run_solver(model, solver, n_frames=n_frames, substeps=substeps, n_warmup=n_warmup)
+    elapsed = time.perf_counter() - t0
+    print(f"[phase 1b] done in {elapsed:.1f} s")
+
+    np.save(ref_path, res.trajectory)
+
+    meta = {
+        "n_frames": n_frames,
+        "n_warmup": n_warmup,
+        "substeps": substeps,
+        "iterations": iterations,
+        "alpha_star": alpha_star,
+        "beta_star": beta_star,
+        "elapsed_s": elapsed,
+        "mean_ms_per_frame": float(res.wall_clock_ms[n_warmup:].mean()),
+        "ref_path": str(ref_path),
+    }
+    with open(out_dir / "vbd_ref.json", "w") as fh:
+        json.dump(meta, fh, indent=2)
+    return meta
+
+
 # --- Phase 2: Pareto sweep ---
 
 
@@ -400,8 +452,10 @@ class SweepResult:
     mean_ms: float
     p50_ms: float
     p95_ms: float
-    rms_over_time: np.ndarray  # (n_frames,)
-    terminal_rms: float
+    rms_over_time: np.ndarray          # vs shared FBA ref (existing semantics)
+    terminal_rms: float                # vs shared FBA ref
+    rel_err_over_time: np.ndarray      # vs OWN solver's converged ref / max_sag
+    terminal_rel_err: float            # vs own ref / max_sag
     trajectory: np.ndarray | None = field(default=None, repr=False)
     fba_timing_summary: dict | None = None
 
@@ -415,15 +469,25 @@ def _rms_per_frame(traj: np.ndarray, ref: np.ndarray) -> np.ndarray:
 def phase2_sweep(
     out_dir: Path,
     calibration: dict,
+    anchor_meta: dict,
     n_frames: int = 800,
     n_warmup: int = 10,
     record_trajectories: bool = True,
 ) -> list[SweepResult]:
-    """Run the FBA and VBD config sweeps; return per-config measurements."""
+    """Run the FBA and VBD config sweeps; return per-config measurements.
+
+    ``anchor_meta`` is required so we can read ``max_sag`` for the self-convergence
+    relative-error computation.
+    """
     x_FBA_ref = np.load(out_dir / "x_FBA_ref.npy")
     assert x_FBA_ref.shape[0] == n_frames, (
         f"x_FBA_ref has {x_FBA_ref.shape[0]} frames but sweep needs {n_frames}; re-run Phase 0 with matching n_frames"
     )
+    x_VBD_ref = np.load(out_dir / "x_VBD_ref.npy")
+    assert x_VBD_ref.shape[0] == n_frames, (
+        f"x_VBD_ref has {x_VBD_ref.shape[0]} frames but sweep needs {n_frames}; re-run Phase 1b with matching n_frames"
+    )
+    max_sag = float(anchor_meta["max_sag"])
 
     alpha_star = calibration["alpha_star"]
     beta_star = calibration["beta_star"]
@@ -447,6 +511,7 @@ def phase2_sweep(
             print(f"[phase 2] FBA iter={it} DIVERGED: {exc}")
             continue
         rms = _rms_per_frame(res.trajectory, x_FBA_ref)
+        rel_err = _rms_per_frame(res.trajectory, x_FBA_ref) / max(max_sag, 1e-9)
         sweep.append(
             SweepResult(
                 config=SweepConfig("fba", iterations=it, substeps=1, alpha=1.0, beta=1.0),
@@ -455,6 +520,8 @@ def phase2_sweep(
                 p95_ms=float(np.percentile(res.wall_clock_ms[n_warmup:], 95)),
                 rms_over_time=rms,
                 terminal_rms=float(rms[-1]),
+                rel_err_over_time=rel_err,
+                terminal_rel_err=float(rel_err[-1]),
                 trajectory=res.trajectory if record_trajectories else None,
                 fba_timing_summary=res.fba_timing_summary,
             )
@@ -471,6 +538,7 @@ def phase2_sweep(
             print(f"[phase 2] VBD substeps={sub} iter={it} DIVERGED: {exc}")
             continue
         rms = _rms_per_frame(res.trajectory, x_FBA_ref)
+        rel_err = _rms_per_frame(res.trajectory, x_VBD_ref) / max(max_sag, 1e-9)
         sweep.append(
             SweepResult(
                 config=SweepConfig("vbd", iterations=it, substeps=sub, alpha=alpha_star, beta=beta_star),
@@ -479,6 +547,8 @@ def phase2_sweep(
                 p95_ms=float(np.percentile(res.wall_clock_ms[n_warmup:], 95)),
                 rms_over_time=rms,
                 terminal_rms=float(rms[-1]),
+                rel_err_over_time=rel_err,
+                terminal_rel_err=float(rel_err[-1]),
                 trajectory=res.trajectory if record_trajectories else None,
             )
         )
@@ -502,6 +572,8 @@ def phase2_sweep(
                 "p95_ms": s.p95_ms,
                 "terminal_rms": s.terminal_rms,
                 "rms_over_time": s.rms_over_time.tolist(),
+                "rel_err_over_time": s.rel_err_over_time.tolist(),
+                "terminal_rel_err": s.terminal_rel_err,
                 "fba_timing_summary": s.fba_timing_summary,
             }
         )
@@ -607,6 +679,53 @@ def plot_rms_over_time(out_dir: Path, sweep: list[SweepResult]) -> None:
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(out_dir / "rms_over_time.png", dpi=120)
+    plt.close(fig)
+
+
+def plot_pareto_self(out_dir: Path, sweep: list[SweepResult]) -> None:
+    """Pareto: mean wall-clock vs terminal relative error to each solver's own ref."""
+    plt = _import_mpl()
+    from matplotlib.lines import Line2D  # noqa: PLC0415
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for s in sweep:
+        color = "tab:blue" if s.config.solver == "fba" else "tab:orange"
+        ax.scatter(s.mean_ms, s.terminal_rel_err, color=color, s=60)
+        ax.annotate(s.config.label, (s.mean_ms, s.terminal_rel_err),
+                    fontsize=8, xytext=(4, 4), textcoords="offset points")
+    solver_handles = [
+        Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:blue",
+               markersize=8, label="FBA", linestyle=""),
+        Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:orange",
+               markersize=8, label="VBD", linestyle=""),
+    ]
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("mean wall-clock per frame (ms)")
+    ax.set_ylabel("terminal relative error (vs own converged ref) [‖Δx‖/max_sag]")
+    ax.set_title("Self-convergence: each solver vs its own iter→large limit")
+    ax.legend(handles=solver_handles, loc="best")
+    ax.grid(True, which="both", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_dir / "pareto_self.png", dpi=120)
+    plt.close(fig)
+
+
+def plot_rms_over_time_self(out_dir: Path, sweep: list[SweepResult]) -> None:
+    """Per-frame relative error vs each solver's own ref, all configs."""
+    plt = _import_mpl()
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    for s in sweep:
+        color = "tab:blue" if s.config.solver == "fba" else "tab:orange"
+        ax.plot(s.rel_err_over_time, color=color, alpha=0.75, label=s.config.label)
+    ax.set_xlabel("frame")
+    ax.set_ylabel("relative error vs own converged ref [‖Δx‖/max_sag]")
+    ax.set_yscale("log")
+    ax.set_title("Self-convergence — per-frame relative error vs own converged ref")
+    ax.legend(fontsize=7, ncol=2)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_dir / "rms_over_time_self.png", dpi=120)
     plt.close(fig)
 
 
@@ -727,6 +846,7 @@ def write_report(
     calibration: dict,
     sweep: list[SweepResult],
     video_path: Path | None = None,
+    vbd_ref_meta: dict | None = None,
 ) -> Path:
     """Write report.md summarising calibration, sweep table, plots, and anchor metadata.
 
@@ -766,6 +886,23 @@ def write_report(
     lines.append("")
     lines.append("![pareto](pareto.png)\n")
     lines.append("![rms_over_time](rms_over_time.png)\n")
+
+    max_sag = float(anchor_meta["max_sag"])
+    lines.append("## Self-convergence (each solver vs its own converged reference)\n")
+    lines.append(
+        "For each solver, the reference is its own high-iteration run at the\n"
+        "calibrated VBD parameters. Relative error = RMS-position-error per\n"
+        f"frame divided by max sag of the FBA anchor ({max_sag:.4f} m).\n"
+    )
+    lines.append("| Config | mean ms/frame | terminal rel_err |")
+    lines.append("|---|---:|---:|")
+    for s in sorted(sweep, key=lambda r: (r.config.solver, r.mean_ms)):
+        lines.append(
+            f"| {s.config.label} | {s.mean_ms:.3f} | {s.terminal_rel_err:.4e} |"
+        )
+    lines.append("")
+    lines.append("![pareto_self](pareto_self.png)\n")
+    lines.append("![rms_over_time_self](rms_over_time_self.png)\n")
 
     lines.append("## Behavior — best-config terminal frame\n")
     fba_entries = [s for s in sweep if s.config.solver == "fba"]
@@ -829,6 +966,8 @@ def _parse_args() -> argparse.Namespace:
                    help="reuse x_FBA_ref.npy + anchor.json if present")
     p.add_argument("--skip-phase1", action="store_true",
                    help="reuse calibration.json if present")
+    p.add_argument("--skip-phase1b", action="store_true",
+                   help="reuse x_VBD_ref.npy + vbd_ref.json if present")
     p.add_argument("--skip-video", action="store_true",
                    help="skip three_up.mp4 render (still emits all PNGs and report)")
     p.add_argument("--video-width", type=int, default=640)
@@ -873,12 +1012,32 @@ def main() -> int:
     else:
         calibration = phase1_calibrate_vbd(out, anchor_meta, n_frames=args.frames)
 
-    sweep = phase2_sweep(out, calibration, n_frames=args.frames, n_warmup=args.warmup,
+    vbd_ref_json = out / "vbd_ref.json"
+    if args.skip_phase1b and vbd_ref_json.exists() and (out / "x_VBD_ref.npy").exists():
+        vbd_ref_meta = json.loads(vbd_ref_json.read_text())
+        if vbd_ref_meta["n_frames"] != args.frames:
+            print(
+                f"[phase 1b] cached vbd_ref has n_frames={vbd_ref_meta['n_frames']} but "
+                f"--frames={args.frames}; regenerating"
+            )
+            vbd_ref_meta = phase1b_vbd_ref(
+                out, calibration, anchor_meta, n_frames=args.frames, n_warmup=args.warmup
+            )
+        else:
+            print("[phase 1b] reusing cached VBD self-ref")
+    else:
+        vbd_ref_meta = phase1b_vbd_ref(
+            out, calibration, anchor_meta, n_frames=args.frames, n_warmup=args.warmup
+        )
+
+    sweep = phase2_sweep(out, calibration, anchor_meta, n_frames=args.frames, n_warmup=args.warmup,
                          record_trajectories=True)
 
     plot_calibration(out, calibration)
     plot_pareto(out, sweep, calibration)
     plot_rms_over_time(out, sweep)
+    plot_pareto_self(out, sweep)
+    plot_rms_over_time_self(out, sweep)
     x_FBA_ref = np.load(out / "x_FBA_ref.npy")
     plot_error_heatmaps(out, sweep, x_FBA_ref)
 
@@ -889,7 +1048,9 @@ def main() -> int:
         print("[phase 3] skipping three_up.mp4 (--skip-video)")
         video_path = None
 
-    report_path = write_report(out, anchor_meta, calibration, sweep, video_path=video_path)
+    report_path = write_report(
+        out, anchor_meta, calibration, sweep, video_path=video_path, vbd_ref_meta=vbd_ref_meta
+    )
     print(f"\nDone. Report: {report_path}")
     return 0
 
