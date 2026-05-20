@@ -195,6 +195,7 @@ def run(args):
         solver_kwargs["particle_contact_friction"] = 0.25
         solver_kwargs["particle_contact_topology_ring"] = 2
         solver_kwargs["particle_contact_rest_exclusion_radius"] = 0.1
+        solver_kwargs["particle_contact_ee"] = not args.no_ee
     solver = SolverFBA(model, **solver_kwargs)
 
     pipeline = newton.CollisionPipeline(model, soft_contact_margin=_CONTACT_MARGIN)
@@ -310,6 +311,8 @@ def main():
     p.add_argument("--height", type=int, default=720)
     p.add_argument("--self-contact", action="store_true",
                    help="Enable Phase 3 cloth self-contact (BSR + sparse-PCR).")
+    p.add_argument("--no-ee", action="store_true",
+                   help="Disable edge-edge contacts (v-t only).  Default: e-e ON.")
     args = p.parse_args()
     if args.no_render:
         args.render_out = None
