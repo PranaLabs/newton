@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FBA vs VBD — 32×32 Hanging Cloth Benchmark</title>
+<style>
+body {
+  max-width: 960px;
+  margin: auto;
+  padding: 1.5em;
+  font-family: system-ui, -apple-system, sans-serif;
+  line-height: 1.55;
+  color: #222;
+}
+h1, h2, h3, h4 {
+  border-bottom: 1px solid #ddd;
+  padding-bottom: 0.2em;
+}
+h1 { font-size: 1.7em; }
+h2 { font-size: 1.35em; margin-top: 2em; }
+h3 { font-size: 1.1em; margin-top: 1.5em; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1em 0;
+  font-size: 0.9em;
+}
+th {
+  background: #f0f0f0;
+  text-align: left;
+  padding: 0.45em 0.7em;
+  border-bottom: 2px solid #bbb;
+}
+td {
+  padding: 0.35em 0.7em;
+  font-variant-numeric: tabular-nums;
+  border-bottom: 1px solid #e4e4e4;
+}
+tr.even td { background: #f8f8f8; }
+figure { margin: 1em 0; }
+figcaption { font-style: italic; text-align: center; font-size: 0.88em; color: #555; margin-top: 0.3em; }
+.side-by-side { display: flex; gap: 1em; flex-wrap: wrap; }
+.side-by-side > figure { flex: 1; min-width: 320px; }
+img { max-width: 100%; height: auto; }
+pre {
+  background: #f5f5f5;
+  border: 1px solid #ddd;
+  padding: 1em;
+  overflow-x: auto;
+  font-size: 0.82em;
+  border-radius: 3px;
+}
+a { color: #0057a8; }
+
+</style>
+</head>
+<body>
+
+<h1>FBA vs VBD — 32×32 Hanging Cloth Benchmark</h1>
+<p><em>Generated 2026-05-21</em></p>
+
+<h2>1. Setup</h2>
+
+<p>Scene: 32×32 hanging cloth, cell size 0.05 m (rest configuration 1.6×1.6 m),
+Y-up gravity, two top corners pinned (particle_mass = 0), all other particles
+mass 0.1 kg. Constitutive model: Stable Neo-Hookean (Smith 2018),
+μ = λ = 10 000 Pa. Edge springs: edge_ke = 1.0. Time integration: implicit
+Euler, dt = 1/100 s, 800 frames (8 s total).</p>
+
+<table>
+<thead><tr><th>Parameter</th><th>Value</th></tr></thead>
+<tbody>
+<tr class="even"><td>n_frames</td><td>800</td></tr>
+<tr><td>iterations (FBA anchor)</td><td>200</td></tr>
+<tr class="even"><td>mu</td><td>10000</td></tr>
+<tr><td>lam</td><td>10000</td></tr>
+<tr class="even"><td>edge_ke</td><td>1.0</td></tr>
+<tr><td>frame_dt (s)</td><td>0.0100</td></tr>
+<tr class="even"><td>max_sag (m)</td><td>0.35049</td></tr>
+<tr><td>mean ms/frame (anchor)</td><td>148.217</td></tr>
+</tbody>
+</table>
+
+<h2>2. Method</h2>
+
+<h3>Step 1 — FBA anchor</h3>
+<p>FBA is run with iter = 200 for 800 frames, producing the trajectory
+<code>x_FBA_ref</code> (800 frames × 1 089 particles × 3).</p>
+
+<h3>Step 2 — VBD calibration</h3>
+<p>A 1-D grid search over α (scaling tri_ke in VBD) minimises the RMS distance
+between VBD's terminal shape at moderate budget and <code>x_FBA_ref[-1]</code>.
+If the 1-D minimum exceeds 0.5 % × max_sag, the search is extended to a 2-D
+grid over (α, β) where β scales edge_ke.</p>
+
+<table>
+<thead><tr><th>Parameter</th><th>Value</th></tr></thead>
+<tbody>
+<tr class="even"><td>α* (tri_ke scale)</td><td>0.5000</td></tr>
+<tr><td>β* (edge_ke scale)</td><td>2.0000</td></tr>
+<tr class="even"><td>2D search triggered</td><td>True</td></tr>
+<tr><td>Candidate substeps</td><td>10</td></tr>
+<tr class="even"><td>Candidate iterations</td><td>10</td></tr>
+<tr><td>Verify substeps</td><td>40</td></tr>
+<tr class="even"><td>Verify iterations</td><td>40</td></tr>
+<tr><td>Floor RMS (high-fid VBD vs FBA anchor, m)</td><td>8.422804e-02</td></tr>
+<tr class="even"><td>Floor threshold (frac of max_sag)</td><td>0.0050</td></tr>
+<tr><td>max_sag (m)</td><td>0.350489</td></tr>
+</tbody>
+</table>
+
+<figure>
+  <img src="calibration.png" alt="Calibration loss surface. Colour encodes terminal RMS (m) between VBD at candidate budget and x_FBA_ref[-1]. Star marks (α*, β*).">
+  <figcaption>Calibration loss surface. Colour encodes terminal RMS (m) between VBD at candidate budget and x_FBA_ref[-1]. Star marks (α*, β*).</figcaption>
+</figure>
+
+
+<h3>Step 3 — VBD self-reference</h3>
+<p>VBD is run at calibrated (α*, β*) with substeps = 40, iter = 40 for 800
+frames → <code>x_VBD_ref</code>. Timing below.</p>
+
+<table>
+<thead><tr><th>Parameter</th><th>Value</th></tr></thead>
+<tbody>
+<tr class="even"><td>substeps</td><td>40</td></tr>
+<tr><td>iterations</td><td>40</td></tr>
+<tr class="even"><td>α*</td><td>0.5000</td></tr>
+<tr><td>β*</td><td>2.0000</td></tr>
+<tr class="even"><td>n_frames</td><td>800</td></tr>
+<tr><td>elapsed_s</td><td>143.68</td></tr>
+<tr class="even"><td>mean ms/frame</td><td>179.538</td></tr>
+</tbody>
+</table>
+
+<h3>Step 4 — Sweep</h3>
+<p>Four FBA configs (iter ∈ (5, 10, 20, 40)) and four VBD configs
+((substeps, iter) ∈ ((2, 10), (5, 10), (10, 10), (10, 20))) are each run at
+calibrated (α*, β*) for 800 frames. Per-frame wall-clock time and per-frame
+RMS error against both references are recorded.</p>
+
+<h2>3. Convergence rate</h2>
+
+<p>Each solver is compared against its own high-iteration reference: FBA sweep
+configs versus <code>x_FBA_ref</code> (iter=200); VBD sweep configs versus
+<code>x_VBD_ref</code> (substeps=40, iter=40 at α*=0.50,
+β*=2.00). Relative error = per-frame RMS divided by max_sag of the
+FBA anchor (0.3505 m).</p>
+
+<table>
+<thead><tr><th>Config</th><th>mean ms/frame</th><th>terminal rel_err</th></tr></thead>
+<tbody>
+<tr class="even"><td>FBA iter=5</td><td>3.419</td><td>1.8714e-04</td></tr>
+<tr><td>FBA iter=10</td><td>6.835</td><td>8.8995e-06</td></tr>
+<tr class="even"><td>FBA iter=20</td><td>13.557</td><td>2.0509e-06</td></tr>
+<tr><td>FBA iter=40</td><td>27.021</td><td>2.4476e-06</td></tr>
+<tr class="even"><td>VBD 2x10</td><td>2.440</td><td>3.7428e-01</td></tr>
+<tr><td>VBD 5x10</td><td>6.057</td><td>4.3466e-02</td></tr>
+<tr class="even"><td>VBD 10x10</td><td>12.005</td><td>1.0468e-02</td></tr>
+<tr><td>VBD 10x20</td><td>23.306</td><td>1.0306e-02</td></tr>
+</tbody>
+</table>
+
+<figure>
+  <img src="pareto_self.png" alt="Pareto plot: mean ms/frame vs terminal relative error (vs own reference). FBA configs in blue; VBD configs in orange.">
+  <figcaption>Pareto plot: mean ms/frame vs terminal relative error (vs own reference). FBA configs in blue; VBD configs in orange.</figcaption>
+</figure>
+
+
+<figure>
+  <img src="rms_over_time_self.png" alt="Relative RMS error over 800 frames, each config vs its own high-iteration reference.">
+  <figcaption>Relative RMS error over 800 frames, each config vs its own high-iteration reference.</figcaption>
+</figure>
+
+
+<h3>Spatial residual structure</h3>
+<p>Per-vertex terminal-frame residual, each solver vs its own converged reference
+(best-budget sweep config for each solver).</p>
+
+<div class="side-by-side">
+<figure>
+  <img src="error_heatmap_fba_self.png" alt="Per-vertex |x_FBA_best − x_FBA_ref| at terminal frame (magma colormap).">
+  <figcaption>Per-vertex |x_FBA_best − x_FBA_ref| at terminal frame (magma colormap).</figcaption>
+</figure>
+
+<figure>
+  <img src="error_heatmap_vbd_self.png" alt="Per-vertex |x_VBD_best − x_VBD_ref| at terminal frame (magma colormap).">
+  <figcaption>Per-vertex |x_VBD_best − x_VBD_ref| at terminal frame (magma colormap).</figcaption>
+</figure>
+
+</div>
+
+
+<h2>4. Converged shapes</h2>
+
+<p>Terminal-frame particle positions (x–y plane) at each solver's high-iteration
+reference run.</p>
+
+<figure>
+  <img src="converged_shapes_side_by_side.png" alt="Left: FBA terminal frame (iter=200). Right: VBD terminal frame (substeps=40, iter=40, α*=0.50, β*=2.00). Identical axis limits across both panels.">
+  <figcaption>Left: FBA terminal frame (iter=200). Right: VBD terminal frame (substeps=40, iter=40, α*=0.50, β*=2.00). Identical axis limits across both panels.</figcaption>
+</figure>
+
+
+<figure>
+  <img src="converged_shapes_overlay.png" alt="FBA (blue) and VBD (orange) terminal-frame positions overlaid on the same axes.">
+  <figcaption>FBA (blue) and VBD (orange) terminal-frame positions overlaid on the same axes.</figcaption>
+</figure>
+
+
+<h3>Per-vertex distance between converged solutions</h3>
+
+<figure>
+  <img src="converged_diff_heatmap.png" alt="Per-vertex Euclidean distance ‖x_FBA_ref[-1] − x_VBD_ref[-1]‖ (max = 1.065e-01 m, mean = 8.180e-02 m). Positions from FBA terminal frame.">
+  <figcaption>Per-vertex Euclidean distance ‖x_FBA_ref[-1] − x_VBD_ref[-1]‖ (max = 1.065e-01 m, mean = 8.180e-02 m). Positions from FBA terminal frame.</figcaption>
+</figure>
+
+
+<p>RMS distance between FBA and VBD terminal frames: 0.0842 m.
+Max sag of FBA anchor: 0.3505 m.</p>
+
+<h2>Appendix — Sweep against shared FBA reference</h2>
+
+<p>For completeness, every sweep config is also compared against the FBA
+reference (<code>x_FBA_ref</code>), i.e. not the self-convergence view from
+Section 3.</p>
+
+<table>
+<thead><tr><th>Config</th><th>mean ms/frame</th><th>p50 ms</th><th>p95 ms</th><th>terminal RMS vs FBA ref (m)</th><th>rel_err</th></tr></thead>
+<tbody>
+<tr class="even"><td>FBA iter=5</td><td>3.419</td><td>3.289</td><td>3.990</td><td>6.5589e-05</td><td>1.8714e-04</td></tr>
+<tr><td>FBA iter=10</td><td>6.835</td><td>6.786</td><td>7.895</td><td>3.1192e-06</td><td>8.8995e-06</td></tr>
+<tr class="even"><td>FBA iter=20</td><td>13.557</td><td>13.635</td><td>15.099</td><td>7.1881e-07</td><td>2.0509e-06</td></tr>
+<tr><td>FBA iter=40</td><td>27.021</td><td>27.166</td><td>29.820</td><td>8.5785e-07</td><td>2.4476e-06</td></tr>
+<tr class="even"><td>VBD 2x10</td><td>2.440</td><td>2.414</td><td>2.506</td><td>1.0778e-01</td><td>3.7428e-01</td></tr>
+<tr><td>VBD 5x10</td><td>6.057</td><td>6.030</td><td>6.236</td><td>6.9382e-02</td><td>4.3466e-02</td></tr>
+<tr class="even"><td>VBD 10x10</td><td>12.005</td><td>11.981</td><td>12.252</td><td>8.0708e-02</td><td>1.0468e-02</td></tr>
+<tr><td>VBD 10x20</td><td>23.306</td><td>23.286</td><td>23.570</td><td>8.0762e-02</td><td>1.0306e-02</td></tr>
+</tbody>
+</table>
+
+<figure>
+  <img src="pareto.png" alt="Pareto plot: mean ms/frame vs terminal RMS against x_FBA_ref. FBA configs in blue; VBD configs in orange.">
+  <figcaption>Pareto plot: mean ms/frame vs terminal RMS against x_FBA_ref. FBA configs in blue; VBD configs in orange.</figcaption>
+</figure>
+
+
+<figure>
+  <img src="rms_over_time.png" alt="RMS error over 800 frames, each sweep config vs x_FBA_ref.">
+  <figcaption>RMS error over 800 frames, each sweep config vs x_FBA_ref.</figcaption>
+</figure>
+
+
+<div class="side-by-side">
+<figure>
+  <img src="error_heatmap_fba.png" alt="Per-vertex |x_FBA_best − x_FBA_ref| at terminal frame.">
+  <figcaption>Per-vertex |x_FBA_best − x_FBA_ref| at terminal frame.</figcaption>
+</figure>
+
+<figure>
+  <img src="error_heatmap_vbd.png" alt="Per-vertex |x_VBD_best − x_FBA_ref| at terminal frame.">
+  <figcaption>Per-vertex |x_VBD_best − x_FBA_ref| at terminal frame.</figcaption>
+</figure>
+
+</div>
+
+
+<h3>Visual replay</h3>
+
+<p>
+  <a href="three_up.mp4">three_up.mp4</a> — side-by-side video:
+  FBA-best | VBD-best | reference (FBA iter=200) over 8 s. 50 fps × 800 frames.
+</p>
+
+<h3>Anchor and VBD-ref metadata (raw JSON)</h3>
+
+<h4>anchor.json</h4>
+<pre>{
+  "n_frames": 800,
+  "n_warmup": 10,
+  "iterations": 200,
+  "mu": 10000.0,
+  "lam": 10000.0,
+  "edge_ke": 1.0,
+  "frame_dt": 0.01,
+  "elapsed_s": 118.86892490500031,
+  "mean_ms_per_frame": 148.21680829368637,
+  "terminal_min_y": 1.6485298871994019,
+  "initial_min_y": 1.9990190267562866,
+  "max_sag": 0.35048913955688477,
+  "fba_timing_summary": {
+    "local_ms": 0.6587703729906934,
+    "linear_solve_ms": 0.6511336273026245,
+    "schur_ms": null,
+    "nsn_inner_ms": null,
+    "n_samples": 10000
+  },
+  "ref_path": "/home/ziqiu/work/newton/scripts/fba_vs_vbd_bench_out/x_FBA_ref.npy"
+}</pre>
+
+<h4>vbd_ref.json</h4>
+<pre>{
+  "n_frames": 800,
+  "n_warmup": 10,
+  "substeps": 40,
+  "iterations": 40,
+  "alpha_star": 0.5,
+  "beta_star": 2.0,
+  "elapsed_s": 143.67619640600606,
+  "mean_ms_per_frame": 179.53827181150194,
+  "ref_path": "/home/ziqiu/work/newton/scripts/fba_vs_vbd_bench_out/x_VBD_ref.npy"
+}</pre>
+
+</body>
+</html>
