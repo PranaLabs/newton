@@ -6,6 +6,19 @@ Newton, ported from RealSim/CudaTests with full Warp + sparse-PCR
 plumbing. This README only covers what's new on this branch; see
 upstream `main` for general Newton documentation.
 
+<p align="center">
+  <img src="image/twisting_bar_checker.webp" width="48%" alt="Twisting bar (Demo 2)" />
+  <img src="image/stretching_cloth_checker.webp" width="48%" alt="Stretching cloth (Demo 3)" />
+</p>
+<p align="center">
+  <img src="image/pulling_wooper_checker.webp" width="48%" alt="Pulling wooper (Demo 4)" />
+  <img src="image/squeezing_ball_checker.webp" width="48%" alt="Squeezing ball (Demo 5)" />
+</p>
+<p align="center">
+  <img src="image/multienv25_v5.webp" width="96%" alt="25 parallel cloth envs on a sphere (single GPU, lite NSN)" />
+</p>
+<p align="center"><sub><em>Top row:</em> CudaTests / RealSim port — twisting bar, stretching cloth. <em>Middle:</em> pulling wooper, squeezing ball. <em>Bottom:</em> 25-env cloth-on-sphere replicated on a single GPU via lite-NSN Schur.</sub></p>
+
 ## Quickstart
 
 ```bash
