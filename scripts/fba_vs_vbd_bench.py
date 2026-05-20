@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import warp as wp
@@ -332,9 +333,7 @@ def phase1_calibrate_vbd(
         losses_2d = _eval_2d_loss(alphas, BETA_GRID_2D, x_FBA_star, n_frames, cand_substeps, cand_iterations)
         finite_2d = {k: v for k, v in losses_2d.items() if np.isfinite(v)}
         if not finite_2d:
-            raise RuntimeError(
-                "All (alpha, beta) candidates diverged in 2D calibration; check VBD stability."
-            )
+            raise RuntimeError("All (alpha, beta) candidates diverged in 2D calibration; check VBD stability.")
         (alpha_star, beta_star) = min(finite_2d, key=finite_2d.get)
         print(
             f"[phase 1] (α*, β*) (2D) = ({alpha_star:.4f}, {beta_star:.4f})  loss = {finite_2d[(alpha_star, beta_star)]:.6f}"  # noqa: RUF001
@@ -369,42 +368,172 @@ def phase1_calibrate_vbd(
     return result
 
 
+# --- Phase 2: Pareto sweep ---
+
+
+@dataclass
+class SweepConfig:
+    solver: Literal["fba", "vbd"]
+    iterations: int
+    substeps: int  # only meaningful for VBD; always 1 for FBA
+    alpha: float
+    beta: float
+
+    @property
+    def label(self) -> str:
+        if self.solver == "fba":
+            return f"FBA iter={self.iterations}"
+        return f"VBD {self.substeps}x{self.iterations}"
+
+
+@dataclass
+class SweepResult:
+    config: SweepConfig
+    mean_ms: float
+    p50_ms: float
+    p95_ms: float
+    rms_over_time: np.ndarray  # (n_frames,)
+    terminal_rms: float
+    trajectory: np.ndarray | None = field(default=None, repr=False)
+    fba_timing_summary: dict | None = None
+
+
+def _rms_per_frame(traj: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    """sqrt(mean over vertices of squared L2) per frame; both inputs (T, V, 3)."""
+    diff = traj - ref
+    return np.sqrt(np.mean(np.sum(diff * diff, axis=-1), axis=-1))
+
+
+def phase2_sweep(
+    out_dir: Path,
+    calibration: dict,
+    n_frames: int = 800,
+    n_warmup: int = 10,
+    record_trajectories: bool = True,
+) -> list[SweepResult]:
+    """Run the FBA and VBD config sweeps; return per-config measurements."""
+    x_FBA_ref = np.load(out_dir / "x_FBA_ref.npy")
+    assert x_FBA_ref.shape[0] == n_frames, (
+        f"x_FBA_ref has {x_FBA_ref.shape[0]} frames but sweep needs {n_frames}; re-run Phase 0 with matching n_frames"
+    )
+
+    alpha_star = calibration["alpha_star"]
+    beta_star = calibration["beta_star"]
+    sweep: list[SweepResult] = []
+
+    # FBA sweep
+    for it in FBA_SWEEP_ITERS:
+        print(f"[phase 2] FBA iter={it}")
+        model = build_model_fba()
+        solver = SolverFBA(
+            model,
+            iterations=it,
+            stretching_model="neohookean",
+            mu=FBA_MU,
+            lam=FBA_LAM,
+            enable_perf_timing=True,
+        )
+        res = run_solver(model, solver, n_frames=n_frames, substeps=1, n_warmup=n_warmup)
+        rms = _rms_per_frame(res.trajectory, x_FBA_ref)
+        sweep.append(
+            SweepResult(
+                config=SweepConfig("fba", iterations=it, substeps=1, alpha=1.0, beta=1.0),
+                mean_ms=float(res.wall_clock_ms[n_warmup:].mean()),
+                p50_ms=float(np.percentile(res.wall_clock_ms[n_warmup:], 50)),
+                p95_ms=float(np.percentile(res.wall_clock_ms[n_warmup:], 95)),
+                rms_over_time=rms,
+                terminal_rms=float(rms[-1]),
+                trajectory=res.trajectory if record_trajectories else None,
+                fba_timing_summary=res.fba_timing_summary,
+            )
+        )
+
+    # VBD sweep
+    for sub, it in VBD_SWEEP_CONFIGS:
+        print(f"[phase 2] VBD substeps={sub} iter={it}  (α={alpha_star:.3f}, β={beta_star:.3f})")  # noqa: RUF001
+        model = build_model_vbd(alpha=alpha_star, beta=beta_star)
+        solver = SolverVBD(model, iterations=it, particle_enable_self_contact=False)
+        res = run_solver(model, solver, n_frames=n_frames, substeps=sub, n_warmup=n_warmup)
+        rms = _rms_per_frame(res.trajectory, x_FBA_ref)
+        sweep.append(
+            SweepResult(
+                config=SweepConfig("vbd", iterations=it, substeps=sub, alpha=alpha_star, beta=beta_star),
+                mean_ms=float(res.wall_clock_ms[n_warmup:].mean()),
+                p50_ms=float(np.percentile(res.wall_clock_ms[n_warmup:], 50)),
+                p95_ms=float(np.percentile(res.wall_clock_ms[n_warmup:], 95)),
+                rms_over_time=rms,
+                terminal_rms=float(rms[-1]),
+                trajectory=res.trajectory if record_trajectories else None,
+            )
+        )
+
+    # Serialize (without trajectories — those stay in memory for video rendering).
+    serial = []
+    for s in sweep:
+        serial.append(
+            {
+                "label": s.config.label,
+                "solver": s.config.solver,
+                "iterations": s.config.iterations,
+                "substeps": s.config.substeps,
+                "alpha": s.config.alpha,
+                "beta": s.config.beta,
+                "mean_ms": s.mean_ms,
+                "p50_ms": s.p50_ms,
+                "p95_ms": s.p95_ms,
+                "terminal_rms": s.terminal_rms,
+                "rms_over_time": s.rms_over_time.tolist(),
+                "fba_timing_summary": s.fba_timing_summary,
+            }
+        )
+    with open(out_dir / "results.json", "w") as fh:
+        json.dump({"sweep": serial, "calibration": calibration}, fh, indent=2)
+    return sweep
+
+
 # --- Smoke check ---
 
 
 def _smoke():
     np.random.seed(0)  # noqa: NPY002
     out = Path("/tmp/fba_vs_vbd_smoke_out")
-    if (out / "x_FBA_ref.npy").exists() and (out / "anchor.json").exists():
-        # cache previous anchor to keep smoke fast
-        anchor_meta = json.loads((out / "anchor.json").read_text())
-    else:
-        anchor_meta = phase0_fba_anchor(out, n_frames=80, n_warmup=5)
-        (out / "anchor.json").write_text(json.dumps(anchor_meta, default=str))
+    n = 40
 
-    # Use a tiny alpha grid for speed; sufficient to exercise the loop.
-    global ALPHA_GRID_1D  # noqa: PLW0603
-    saved = ALPHA_GRID_1D
+    if not (out / "x_FBA_ref.npy").exists() or np.load(out / "x_FBA_ref.npy").shape[0] != n:
+        anchor_meta = phase0_fba_anchor(out, n_frames=n, n_warmup=5)
+        (out / "anchor.json").write_text(json.dumps(anchor_meta, default=str))
+    else:
+        anchor_meta = json.loads((out / "anchor.json").read_text())
+
+    global ALPHA_GRID_1D, FBA_SWEEP_ITERS, VBD_SWEEP_CONFIGS  # noqa: PLW0603
+    saved = (ALPHA_GRID_1D, FBA_SWEEP_ITERS, VBD_SWEEP_CONFIGS)
     ALPHA_GRID_1D = (0.85, 1.0, 1.15)
+    FBA_SWEEP_ITERS = (5, 10)
+    VBD_SWEEP_CONFIGS = ((2, 5), (5, 5))
     try:
-        result = phase1_calibrate_vbd(
+        calibration = phase1_calibrate_vbd(
             out,
             anchor_meta,
-            n_frames=80,
+            n_frames=n,
             cand_substeps=2,
             cand_iterations=5,
             verify_substeps=5,
             verify_iterations=10,
         )
+        sweep = phase2_sweep(out, calibration, n_frames=n, n_warmup=5, record_trajectories=True)
     finally:
-        ALPHA_GRID_1D = saved
+        (ALPHA_GRID_1D, FBA_SWEEP_ITERS, VBD_SWEEP_CONFIGS) = saved
 
-    # alpha_star may be below 0.5 in the smoke due to boundary extension on a
-    # tiny grid — the 3-candidate grid can push down to 0.85 * 0.5 = 0.425.
-    # In a full 800-frame run the optimum will land near 1.0.
-    assert result["alpha_star"] > 0.0, f"alpha_star={result['alpha_star']} should be positive"
-    assert result["floor_rms"] >= 0.0
-    print(f"OK: alpha*={result['alpha_star']:.3f}, floor_rms={result['floor_rms']:.5f}")
+    assert len(sweep) == 4
+    for s in sweep:
+        assert s.mean_ms > 0
+        assert s.rms_over_time.shape == (n,)
+        assert s.terminal_rms >= 0
+    print(
+        f"OK: sweep produced {len(sweep)} configs; "
+        f"FBA-best terminal_rms={min(s.terminal_rms for s in sweep if s.config.solver == 'fba'):.5f}; "
+        f"VBD-best terminal_rms={min(s.terminal_rms for s in sweep if s.config.solver == 'vbd'):.5f}"
+    )
 
 
 if __name__ == "__main__":
