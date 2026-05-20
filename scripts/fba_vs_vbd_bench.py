@@ -136,7 +136,7 @@ def run_solver(
     `n_warmup` frames are still recorded into the trajectory (we want them
     for completeness) but their wall-clock measurements are discarded by the
     caller — `run_solver` returns the full `wall_clock_ms` array; callers
-    slice off `[:n_warmup]` when computing mean/stddev.
+    slice off `[n_warmup:]` when computing mean/stddev.
     """
     state_in = model.state()
     state_out = model.state()
@@ -162,7 +162,9 @@ def run_solver(
     if hasattr(solver, "get_timing_summary"):
         try:
             fba_summary = solver.get_timing_summary()
-        except Exception:
+        except Exception as exc:
+            import warnings  # noqa: PLC0415
+            warnings.warn(f"get_timing_summary raised {exc!r}; fba_timing_summary will be None", stacklevel=2)
             fba_summary = None
 
     return RunResult(trajectory=trajectory, wall_clock_ms=wall, fba_timing_summary=fba_summary)
