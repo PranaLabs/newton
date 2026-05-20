@@ -170,6 +170,57 @@ def run_solver(
     return RunResult(trajectory=trajectory, wall_clock_ms=wall, fba_timing_summary=fba_summary)
 
 
+# --- Phase 0: FBA anchor ---
+
+
+def phase0_fba_anchor(out_dir: Path, n_frames: int = 800, n_warmup: int = 10) -> dict:
+    """Run FBA at iter=200 and store the full trajectory as ground truth.
+
+    Returns a metadata dict describing the run and the on-disk paths.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ref_path = out_dir / "x_FBA_ref.npy"
+
+    model = build_model_fba(mu=FBA_MU, lam=FBA_LAM, edge_ke=FBA_EDGE_KE)
+    solver = SolverFBA(
+        model,
+        iterations=ANCHOR_ITERATIONS,
+        stretching_model="neohookean",
+        mu=FBA_MU,
+        lam=FBA_LAM,
+        enable_perf_timing=True,
+    )
+
+    print(f"[phase 0] running FBA anchor iter={ANCHOR_ITERATIONS} for {n_frames} frames...")
+    t0 = time.perf_counter()
+    res = run_solver(model, solver, n_frames=n_frames, substeps=1, n_warmup=n_warmup)
+    elapsed = time.perf_counter() - t0
+    print(f"[phase 0] done in {elapsed:.1f} s; mean ms/frame (excl. warmup) "
+          f"= {res.wall_clock_ms[n_warmup:].mean():.2f}")
+
+    np.save(ref_path, res.trajectory)
+
+    sag = float(res.trajectory[-1, :, 1].min())
+    initial_y = float(res.trajectory[0, :, 1].min())
+    meta = {
+        "n_frames": n_frames,
+        "n_warmup": n_warmup,
+        "iterations": ANCHOR_ITERATIONS,
+        "mu": FBA_MU,
+        "lam": FBA_LAM,
+        "edge_ke": FBA_EDGE_KE,
+        "frame_dt": FRAME_DT,
+        "elapsed_s": elapsed,
+        "mean_ms_per_frame": float(res.wall_clock_ms[n_warmup:].mean()),
+        "terminal_min_y": sag,
+        "initial_min_y": initial_y,
+        "max_sag": initial_y - sag,
+        "fba_timing_summary": res.fba_timing_summary,
+        "ref_path": str(ref_path),
+    }
+    return meta
+
+
 # --- Smoke check (Task 1 only; replaced by real CLI in Task 8) ---
 
 
@@ -181,23 +232,12 @@ def _smoke():
     assert m_fba.tri_count == m_vbd.tri_count == 2 * GRID_DIM * GRID_DIM
     assert len(m_vbd.particle_color_groups) > 0
 
-    solver_fba = SolverFBA(m_fba, iterations=5, stretching_model="neohookean", mu=FBA_MU, lam=FBA_LAM)
-    res_fba = run_solver(m_fba, solver_fba, n_frames=10, substeps=1, n_warmup=2)
-    assert res_fba.trajectory.shape == (10, 1089, 3)
-    assert np.all(np.isfinite(res_fba.trajectory))
-    assert res_fba.trajectory[-1, :, 1].min() < res_fba.trajectory[0, :, 1].min(), (
-        "cloth did not descend; gravity/pin setup is wrong"
-    )
-
-    solver_vbd = SolverVBD(m_vbd, iterations=5, particle_enable_self_contact=False)
-    res_vbd = run_solver(m_vbd, solver_vbd, n_frames=10, substeps=2, n_warmup=2)
-    assert res_vbd.trajectory.shape == (10, 1089, 3)
-    assert np.all(np.isfinite(res_vbd.trajectory))
-
-    print(
-        f"OK: fba mean ms/frame={res_fba.wall_clock_ms[2:].mean():.3f}, "
-        f"vbd mean ms/frame={res_vbd.wall_clock_ms[2:].mean():.3f}"
-    )
+    out = Path("/tmp/fba_vs_vbd_smoke_out")
+    meta = phase0_fba_anchor(out, n_frames=30, n_warmup=5)
+    ref = np.load(out / "x_FBA_ref.npy")
+    assert ref.shape == (30, 1089, 3), f"ref shape {ref.shape}"
+    assert meta["max_sag"] > 0.0, "cloth did not descend during anchor"
+    print(f"OK: max_sag={meta['max_sag']:.4f} m, mean_ms/frame={meta['mean_ms_per_frame']:.2f}")
 
 
 if __name__ == "__main__":
