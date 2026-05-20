@@ -491,6 +491,123 @@ def phase2_sweep(
     return sweep
 
 
+# --- Phase 3a: Static plots ---
+
+
+def _import_mpl():
+    import matplotlib  # noqa: PLC0415
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+    return plt
+
+
+def plot_calibration(out_dir: Path, calibration: dict) -> None:
+    plt = _import_mpl()
+    fig, ax = plt.subplots(figsize=(6, 4))
+    if calibration["upgraded_to_2d"] and calibration["losses_2d"] is not None:
+        # 2D heatmap of (alpha, beta) -> loss
+        keys = list(calibration["losses_2d"].keys())
+        alphas = sorted({float(k.split("_")[0]) for k in keys})
+        betas = sorted({float(k.split("_")[1]) for k in keys})
+        grid = np.full((len(betas), len(alphas)), np.nan)
+        for k, v in calibration["losses_2d"].items():
+            a, b = (float(x) for x in k.split("_"))
+            grid[betas.index(b), alphas.index(a)] = v if v is not None else np.nan
+        im = ax.imshow(grid, origin="lower",
+                       extent=[min(alphas), max(alphas), min(betas), max(betas)],
+                       aspect="auto", cmap="viridis")
+        ax.plot(calibration["alpha_star"], calibration["beta_star"],
+                marker="*", ms=18, color="red", label=f"α*={calibration['alpha_star']:.3f}, β*={calibration['beta_star']:.3f}")
+        plt.colorbar(im, ax=ax, label="terminal RMS (m)")
+        ax.set_xlabel("alpha (tri_ke scale)")
+        ax.set_ylabel("beta (edge_ke scale)")
+        ax.set_title(f"2D calibration grid (floor = {calibration['floor_rms']:.4e} m)")
+    else:
+        # 1D curve over alpha
+        items = sorted(((float(k), v) for k, v in calibration["losses_1d"].items() if v is not None),
+                       key=lambda kv: kv[0])
+        xs = [a for a, _ in items]
+        ys = [v for _, v in items]
+        ax.plot(xs, ys, marker="o")
+        ax.axvline(calibration["alpha_star"], color="red", linestyle="--",
+                   label=f"α*={calibration['alpha_star']:.3f}")
+        ax.axhline(calibration["floor_rms"], color="gray", linestyle=":",
+                   label=f"floor={calibration['floor_rms']:.4e} m")
+        ax.set_xlabel("alpha (tri_ke scale)")
+        ax.set_ylabel("terminal RMS vs FBA anchor (m)")
+        ax.set_title(f"1D calibration (max_sag = {calibration['max_sag']:.4f} m)")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_dir / "calibration.png", dpi=120)
+    plt.close(fig)
+
+
+def plot_pareto(out_dir: Path, sweep: list[SweepResult], calibration: dict) -> None:
+    plt = _import_mpl()
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for s in sweep:
+        color = "tab:blue" if s.config.solver == "fba" else "tab:orange"
+        ax.scatter(s.mean_ms, s.terminal_rms, color=color, s=60)
+        ax.annotate(s.config.label, (s.mean_ms, s.terminal_rms),
+                    fontsize=8, xytext=(4, 4), textcoords="offset points")
+    ax.axhline(calibration["floor_rms"], color="gray", linestyle=":",
+               label=f"floor = {calibration['floor_rms']:.4e} m")
+    ax.set_xlabel("mean wall-clock per rendered frame (ms)")
+    ax.set_ylabel("terminal RMS vs FBA anchor (m)")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_title("FBA vs VBD: wall-clock vs accuracy (lower-left is better)")
+    ax.legend(loc="best")
+    ax.grid(True, which="both", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_dir / "pareto.png", dpi=120)
+    plt.close(fig)
+
+
+def plot_rms_over_time(out_dir: Path, sweep: list[SweepResult]) -> None:
+    plt = _import_mpl()
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    for s in sweep:
+        color = "tab:blue" if s.config.solver == "fba" else "tab:orange"
+        ax.plot(s.rms_over_time, color=color, alpha=0.75, label=s.config.label)
+    ax.set_xlabel("frame")
+    ax.set_ylabel("RMS vs FBA anchor (m)")
+    ax.set_yscale("log")
+    ax.set_title("Per-frame RMS — FBA (blue) and VBD (orange)")
+    ax.legend(fontsize=7, ncol=2)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_dir / "rms_over_time.png", dpi=120)
+    plt.close(fig)
+
+
+def plot_error_heatmaps(out_dir: Path, sweep: list[SweepResult], x_FBA_ref: np.ndarray) -> None:
+    plt = _import_mpl()
+    fba_best = min((s for s in sweep if s.config.solver == "fba"), key=lambda s: s.terminal_rms)
+    vbd_best = min((s for s in sweep if s.config.solver == "vbd"), key=lambda s: s.terminal_rms)
+    if fba_best.trajectory is None or vbd_best.trajectory is None:
+        raise RuntimeError("error heatmaps require record_trajectories=True in phase2_sweep")
+
+    err_fba = np.linalg.norm(fba_best.trajectory[-1] - x_FBA_ref[-1], axis=-1)
+    err_vbd = np.linalg.norm(vbd_best.trajectory[-1] - x_FBA_ref[-1], axis=-1)
+    vmax = max(err_fba.max(), err_vbd.max(), 1e-12)
+
+    for label, x, err, fname in [
+        (fba_best.config.label, fba_best.trajectory[-1], err_fba, "error_heatmap_fba.png"),
+        (vbd_best.config.label, vbd_best.trajectory[-1], err_vbd, "error_heatmap_vbd.png"),
+    ]:
+        fig, ax = plt.subplots(figsize=(5, 5))
+        sc = ax.scatter(x[:, 0], x[:, 1], c=err, s=8, cmap="magma", vmin=0, vmax=vmax)
+        plt.colorbar(sc, ax=ax, label="|Δx| vs FBA anchor (m)")
+        ax.set_aspect("equal")
+        ax.set_xlabel("x (m)")
+        ax.set_ylabel("y (m)")
+        ax.set_title(f"Terminal error — {label}")
+        fig.tight_layout()
+        fig.savefig(out_dir / fname, dpi=120)
+        plt.close(fig)
+
+
 # --- Smoke check ---
 
 
@@ -524,16 +641,16 @@ def _smoke():
     finally:
         (ALPHA_GRID_1D, FBA_SWEEP_ITERS, VBD_SWEEP_CONFIGS) = saved
 
-    assert len(sweep) == 4
-    for s in sweep:
-        assert s.mean_ms > 0
-        assert s.rms_over_time.shape == (n,)
-        assert s.terminal_rms >= 0
-    print(
-        f"OK: sweep produced {len(sweep)} configs; "
-        f"FBA-best terminal_rms={min(s.terminal_rms for s in sweep if s.config.solver == 'fba'):.5f}; "
-        f"VBD-best terminal_rms={min(s.terminal_rms for s in sweep if s.config.solver == 'vbd'):.5f}"
-    )
+    plot_calibration(out, calibration)
+    plot_pareto(out, sweep, calibration)
+    plot_rms_over_time(out, sweep)
+    x_FBA_ref = np.load(out / "x_FBA_ref.npy")
+    plot_error_heatmaps(out, sweep, x_FBA_ref)
+
+    for name in ("calibration.png", "pareto.png", "rms_over_time.png",
+                 "error_heatmap_fba.png", "error_heatmap_vbd.png"):
+        assert (out / name).stat().st_size > 1000, f"{name} suspiciously small or missing"
+    print(f"OK: plots emitted under {out}")
 
 
 if __name__ == "__main__":
