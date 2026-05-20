@@ -3,13 +3,19 @@
 """FBA vs VBD calibrated benchmark on a 32x32 hanging cloth.
 
 See docs/superpowers/specs/2026-05-20-fba-vs-vbd-bench-design.md for the
-design rationale. Run::
+design rationale.
+
+Requires imageio[ffmpeg] (install once with ``uv pip install "imageio[ffmpeg]"``)
+if you want the three_up.mp4 render. Pass --skip-video to avoid it.
+
+Run::
 
     uv run python scripts/fba_vs_vbd_bench.py --out-dir scripts/fba_vs_vbd_bench_out
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import time
 from dataclasses import dataclass, field
@@ -699,52 +705,153 @@ def render_three_up(
     return out_path
 
 
-# --- Smoke check ---
+# --- Phase 3c: Markdown report ---
 
 
-def _smoke():
-    np.random.seed(0)  # noqa: NPY002
-    out = Path("/tmp/fba_vs_vbd_smoke_out")
-    n = 40
+def write_report(out_dir: Path, anchor_meta: dict, calibration: dict, sweep: list[SweepResult]) -> Path:
+    """Write report.md summarising calibration, sweep table, plots, and anchor metadata.
 
-    if not (out / "x_FBA_ref.npy").exists() or np.load(out / "x_FBA_ref.npy").shape[0] != n:
-        anchor_meta = phase0_fba_anchor(out, n_frames=n, n_warmup=5)
-        (out / "anchor.json").write_text(json.dumps(anchor_meta, default=str))
-    else:
-        anchor_meta = json.loads((out / "anchor.json").read_text())
-
-    global ALPHA_GRID_1D, FBA_SWEEP_ITERS, VBD_SWEEP_CONFIGS  # noqa: PLW0603
-    saved = (ALPHA_GRID_1D, FBA_SWEEP_ITERS, VBD_SWEEP_CONFIGS)
-    ALPHA_GRID_1D = (0.85, 1.0, 1.15)
-    FBA_SWEEP_ITERS = (5, 10)
-    VBD_SWEEP_CONFIGS = ((2, 5), (5, 5))
-    try:
-        calibration = phase1_calibrate_vbd(
-            out,
-            anchor_meta,
-            n_frames=n,
-            cand_substeps=2,
-            cand_iterations=5,
-            verify_substeps=5,
-            verify_iterations=10,
+    Returns the path to the written file.
+    """
+    path = out_dir / "report.md"
+    lines: list[str] = []
+    lines.append("# FBA vs VBD — 32x32 hanging cloth\n")
+    lines.append("_Spec: docs/superpowers/specs/2026-05-20-fba-vs-vbd-bench-design.md_\n")
+    lines.append("\n## Calibration\n")
+    lines.append(f"- `α*` (tri_ke scale on VBD): **{calibration['alpha_star']:.4f}**")
+    if not calibration["upgraded_to_2d"]:
+        lines.append(
+            f"- `β*` (edge_ke scale on VBD): **{calibration['beta_star']:.4f}**  (1D pass only)"
         )
-        sweep = phase2_sweep(out, calibration, n_frames=n, n_warmup=5, record_trajectories=True)
-    finally:
-        (ALPHA_GRID_1D, FBA_SWEEP_ITERS, VBD_SWEEP_CONFIGS) = saved
+    else:
+        lines.append(
+            f"- `β*`: **{calibration['beta_star']:.4f}**  (2D upgrade triggered)"
+        )
+    lines.append(
+        f"- Floor RMS (high-fidelity VBD vs FBA anchor): **{calibration['floor_rms']:.4e} m**"
+    )
+    lines.append(f"- Max sag of FBA anchor: {calibration['max_sag']:.4f} m")
+    lines.append(
+        f"- Floor / max_sag: {calibration['floor_rms'] / max(calibration['max_sag'], 1e-9):.2%}"
+    )
+    lines.append("")
+    lines.append("![calibration](calibration.png)\n")
+
+    lines.append("## Sweep results\n")
+    lines.append("| Config | mean ms/frame | p50 | p95 | terminal RMS (m) |")
+    lines.append("|---|---:|---:|---:|---:|")
+    for s in sorted(sweep, key=lambda r: (r.config.solver, r.mean_ms)):
+        lines.append(
+            f"| {s.config.label} | {s.mean_ms:.3f} | {s.p50_ms:.3f} | {s.p95_ms:.3f} | {s.terminal_rms:.4e} |"
+        )
+    lines.append("")
+    lines.append("![pareto](pareto.png)\n")
+    lines.append("![rms_over_time](rms_over_time.png)\n")
+
+    lines.append("## Behavior — best-config terminal frame\n")
+    fba_best = min((s for s in sweep if s.config.solver == "fba"), key=lambda s: s.terminal_rms)
+    vbd_best = min((s for s in sweep if s.config.solver == "vbd"), key=lambda s: s.terminal_rms)
+    lines.append(
+        f"FBA-best: **{fba_best.config.label}** ({fba_best.mean_ms:.3f} ms, RMS {fba_best.terminal_rms:.4e} m)\n"
+    )
+    lines.append(
+        f"VBD-best: **{vbd_best.config.label}** ({vbd_best.mean_ms:.3f} ms, RMS {vbd_best.terminal_rms:.4e} m)\n"
+    )
+    lines.append("![heatmap FBA](error_heatmap_fba.png)  ![heatmap VBD](error_heatmap_vbd.png)\n")
+    lines.append("Side-by-side video: [`three_up.mp4`](three_up.mp4)\n")
+
+    lines.append("## Anchor metadata\n")
+    lines.append("```json")
+    lines.append(
+        json.dumps(
+            {
+                "iterations": anchor_meta["iterations"],
+                "mu": anchor_meta["mu"],
+                "lam": anchor_meta["lam"],
+                "edge_ke": anchor_meta["edge_ke"],
+                "frame_dt": anchor_meta["frame_dt"],
+                "n_frames": anchor_meta["n_frames"],
+                "max_sag": anchor_meta["max_sag"],
+                "mean_ms_per_frame": anchor_meta["mean_ms_per_frame"],
+            },
+            indent=2,
+        )
+    )
+    lines.append("```\n")
+
+    path.write_text("\n".join(lines))
+    return path
+
+
+# --- Main entry ---
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="FBA vs VBD calibrated cloth benchmark")
+    p.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path(__file__).resolve().parent / "fba_vs_vbd_bench_out",
+    )
+    p.add_argument("--frames", type=int, default=800,
+                   help="frames per phase (Phase 0/1/2 all share this)")
+    p.add_argument("--warmup", type=int, default=10)
+    p.add_argument("--skip-phase0", action="store_true",
+                   help="reuse x_FBA_ref.npy + anchor.json if present")
+    p.add_argument("--skip-phase1", action="store_true",
+                   help="reuse calibration.json if present")
+    p.add_argument("--skip-video", action="store_true",
+                   help="skip three_up.mp4 render (still emits all PNGs and report)")
+    p.add_argument("--video-width", type=int, default=640)
+    p.add_argument("--video-height", type=int, default=480)
+    return p.parse_args()
+
+
+def main() -> int:
+    args = _parse_args()
+    np.random.seed(0)  # noqa: NPY002
+    out = args.out_dir
+    out.mkdir(parents=True, exist_ok=True)
+
+    anchor_json = out / "anchor.json"
+    if args.skip_phase0 and anchor_json.exists() and (out / "x_FBA_ref.npy").exists():
+        print("[phase 0] reusing cached anchor")
+        anchor_meta = json.loads(anchor_json.read_text())
+        if anchor_meta["n_frames"] != args.frames:
+            raise SystemExit(
+                f"cached anchor has n_frames={anchor_meta['n_frames']} but --frames={args.frames}; "
+                "rerun without --skip-phase0"
+            )
+    else:
+        anchor_meta = phase0_fba_anchor(out, n_frames=args.frames, n_warmup=args.warmup)
+        anchor_json.write_text(json.dumps(anchor_meta, default=str))
+
+    calib_json = out / "calibration.json"
+    if args.skip_phase1 and calib_json.exists():
+        print("[phase 1] reusing cached calibration")
+        calibration = json.loads(calib_json.read_text())
+    else:
+        calibration = phase1_calibrate_vbd(out, anchor_meta, n_frames=args.frames)
+
+    sweep = phase2_sweep(out, calibration, n_frames=args.frames, n_warmup=args.warmup,
+                         record_trajectories=True)
 
     plot_calibration(out, calibration)
     plot_pareto(out, sweep, calibration)
     plot_rms_over_time(out, sweep)
     x_FBA_ref = np.load(out / "x_FBA_ref.npy")
     plot_error_heatmaps(out, sweep, x_FBA_ref)
-    video = render_three_up(out, sweep, x_FBA_ref, width=320, height=240, fps=30)
 
-    for name in ("calibration.png", "pareto.png", "rms_over_time.png",
-                 "error_heatmap_fba.png", "error_heatmap_vbd.png"):
-        assert (out / name).stat().st_size > 1000, f"{name} suspiciously small or missing"
-    assert video.stat().st_size > 1000, "three_up.mp4 not written"
-    print(f"OK: plots + video emitted under {out}")
+    if not args.skip_video:
+        render_three_up(out, sweep, x_FBA_ref,
+                        width=args.video_width, height=args.video_height, fps=50)
+    else:
+        print("[phase 3] skipping three_up.mp4 (--skip-video)")
+
+    report_path = write_report(out, anchor_meta, calibration, sweep)
+    print(f"\nDone. Report: {report_path}")
+    return 0
 
 
 if __name__ == "__main__":
-    _smoke()
+    raise SystemExit(main())
