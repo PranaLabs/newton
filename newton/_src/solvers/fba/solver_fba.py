@@ -361,6 +361,7 @@ class SolverFBA(SolverBase):
         # unconditionally (Tier 3 acceptance reporting).
         self._pc_last_vt_hits = 0
         self._pc_last_ee_hits = 0
+        self._pc_last_n_contacts = 0
         if stretching_model in ("corotational", "neohookean"):
             if mu is None or lam is None:
                 raise ValueError(
@@ -2337,6 +2338,10 @@ class SolverFBA(SolverBase):
         bp = self._particle_broadphase
 
         n_pairs = bp.find_pairs(state_inout.particle_q)
+        # Legacy v-v diagnostics (parity with the v-t path).
+        self._pc_last_vt_hits = int(n_pairs)
+        self._pc_last_ee_hits = 0
+        self._pc_last_n_contacts = int(n_pairs)
         if n_pairs == 0:
             return 0
 
@@ -2606,6 +2611,7 @@ class SolverFBA(SolverBase):
         # emit kernel by the post-broadphase distance / parallel-eps check.
         self._pc_last_vt_hits = n_vt_hits
         self._pc_last_ee_hits = n_ee_hits
+        self._pc_last_n_contacts = int(n_contacts)
         if n_contacts == 0:
             return 0
         return self._run_particle_contact_solve(state_inout, dt, n_contacts)
