@@ -721,7 +721,13 @@ def render_three_up(
 # --- Phase 3c: Markdown report ---
 
 
-def write_report(out_dir: Path, anchor_meta: dict, calibration: dict, sweep: list[SweepResult]) -> Path:
+def write_report(
+    out_dir: Path,
+    anchor_meta: dict,
+    calibration: dict,
+    sweep: list[SweepResult],
+    video_path: Path | None = None,
+) -> Path:
     """Write report.md summarising calibration, sweep table, plots, and anchor metadata.
 
     Returns the path to the written file.
@@ -778,7 +784,10 @@ def write_report(out_dir: Path, anchor_meta: dict, calibration: dict, sweep: lis
         f"VBD-best: **{vbd_best.config.label}** ({vbd_best.mean_ms:.3f} ms, RMS {vbd_best.terminal_rms:.4e} m)\n"
     )
     lines.append("![heatmap FBA](error_heatmap_fba.png)  ![heatmap VBD](error_heatmap_vbd.png)\n")
-    lines.append("Side-by-side video: [`three_up.mp4`](three_up.mp4)\n")
+    if video_path is not None:
+        lines.append(f"Side-by-side video: [`{video_path.name}`]({video_path.name})\n")
+    else:
+        lines.append("_(side-by-side video skipped via --skip-video)_\n")
 
     lines.append("## Anchor metadata\n")
     lines.append("```json")
@@ -874,12 +883,13 @@ def main() -> int:
     plot_error_heatmaps(out, sweep, x_FBA_ref)
 
     if not args.skip_video:
-        render_three_up(out, sweep, x_FBA_ref,
-                        width=args.video_width, height=args.video_height, fps=50)
+        video_path = render_three_up(out, sweep, x_FBA_ref,
+                                     width=args.video_width, height=args.video_height, fps=50)
     else:
         print("[phase 3] skipping three_up.mp4 (--skip-video)")
+        video_path = None
 
-    report_path = write_report(out, anchor_meta, calibration, sweep)
+    report_path = write_report(out, anchor_meta, calibration, sweep, video_path=video_path)
     print(f"\nDone. Report: {report_path}")
     return 0
 
