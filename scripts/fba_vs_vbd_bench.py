@@ -224,10 +224,9 @@ def phase0_fba_anchor(out_dir: Path, n_frames: int = 800, n_warmup: int = 10) ->
 # --- Phase 1: VBD calibration ---
 
 
-def _terminal_rms(x: np.ndarray, x_ref_terminal: np.ndarray) -> float:
-    """RMS over vertices of the L2 displacement between terminal frames."""
-    diff = x[-1] - x_ref_terminal
-    return float(np.sqrt(np.mean(np.sum(diff * diff, axis=-1))))
+def _json_safe_loss(v: float) -> float | None:
+    """Return v if finite, else None (JSON-serializable replacement for inf/nan)."""
+    return v if np.isfinite(v) else None
 
 
 def _vbd_terminal_run(alpha: float, beta: float, n_frames: int, substeps: int, iterations: int):
@@ -312,6 +311,11 @@ def phase1_calibrate_vbd(
             break
 
     finite_1d = {a: v for a, v in losses_1d.items() if np.isfinite(v)}
+    if not finite_1d:
+        raise RuntimeError(
+            "All alpha candidates diverged in 1D calibration; check VBD stability "
+            "(stiffness, dt, substep count) or widen the alpha range."
+        )
     alpha_star = min(finite_1d, key=finite_1d.get)
     beta_star = 1.0
     print(f"[phase 1] α* (1D) = {alpha_star:.4f}  loss = {finite_1d[alpha_star]:.6f}")  # noqa: RUF001
@@ -327,6 +331,10 @@ def phase1_calibrate_vbd(
         upgraded_to_2d = True
         losses_2d = _eval_2d_loss(alphas, BETA_GRID_2D, x_FBA_star, n_frames, cand_substeps, cand_iterations)
         finite_2d = {k: v for k, v in losses_2d.items() if np.isfinite(v)}
+        if not finite_2d:
+            raise RuntimeError(
+                "All (alpha, beta) candidates diverged in 2D calibration; check VBD stability."
+            )
         (alpha_star, beta_star) = min(finite_2d, key=finite_2d.get)
         print(
             f"[phase 1] (α*, β*) (2D) = ({alpha_star:.4f}, {beta_star:.4f})  loss = {finite_2d[(alpha_star, beta_star)]:.6f}"  # noqa: RUF001
@@ -342,8 +350,12 @@ def phase1_calibrate_vbd(
         "alpha_star": alpha_star,
         "beta_star": beta_star,
         "upgraded_to_2d": upgraded_to_2d,
-        "losses_1d": {f"{a:.4f}": v for a, v in losses_1d.items()},
-        "losses_2d": ({f"{a:.4f}_{b:.4f}": v for (a, b), v in losses_2d.items()} if losses_2d is not None else None),
+        "losses_1d": {f"{a:.4f}": _json_safe_loss(v) for a, v in losses_1d.items()},
+        "losses_2d": (
+            {f"{a:.4f}_{b:.4f}": _json_safe_loss(v) for (a, b), v in losses_2d.items()}
+            if losses_2d is not None
+            else None
+        ),
         "floor_rms": floor_rms,
         "floor_threshold_frac": floor_threshold_frac,
         "max_sag": max_sag,
