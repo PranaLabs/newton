@@ -54,8 +54,8 @@ def build_builder(tri_ke: float, tri_ka: float, edge_ke: float) -> newton.ModelB
     """Construct the 32x32 hanging cloth builder with corner-pin masses set.
 
     `tri_ke` and `tri_ka` map directly to the Stable Neo-Hookean (mu, lambda)
-    that VBD reads from `tri_materials`; FBA receives mu/lam via its
-    constructor and reads `tri_ke * area` as a per-triangle weight scale.
+    that VBD reads from `tri_materials`; FBA reads `(mu, lam)` from its own
+    constructor; the builder's `tri_ke`/`tri_ka` are consumed only by VBD.
     """
     builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=GRAVITY)
     builder.add_cloth_grid(
@@ -114,8 +114,9 @@ def _smoke():
     assert m_fba.tri_count == m_vbd.tri_count == 2 * GRID_DIM * GRID_DIM, (
         f"tri count mismatch: fba={m_fba.tri_count}, vbd={m_vbd.tri_count}"
     )
-    # VBD must have coloring populated; FBA must not (FBA does not consume it).
+    # VBD must have coloring populated.
     assert len(m_vbd.particle_color_groups) > 0, "VBD model is missing particle_color_groups"
+    assert len(m_fba.particle_color_groups) == 0, "FBA model should not be colored"
     print(
         f"OK: particle_count={m_fba.particle_count}, tri_count={m_fba.tri_count}, "
         f"vbd_colors={len(m_vbd.particle_color_groups)}"
