@@ -749,8 +749,15 @@ def write_report(out_dir: Path, anchor_meta: dict, calibration: dict, sweep: lis
     lines.append("![rms_over_time](rms_over_time.png)\n")
 
     lines.append("## Behavior — best-config terminal frame\n")
-    fba_best = min((s for s in sweep if s.config.solver == "fba"), key=lambda s: s.terminal_rms)
-    vbd_best = min((s for s in sweep if s.config.solver == "vbd"), key=lambda s: s.terminal_rms)
+    fba_entries = [s for s in sweep if s.config.solver == "fba"]
+    vbd_entries = [s for s in sweep if s.config.solver == "vbd"]
+    if not fba_entries or not vbd_entries:
+        raise RuntimeError(
+            "write_report requires both FBA and VBD entries in sweep; "
+            f"got {len(fba_entries)} FBA, {len(vbd_entries)} VBD"
+        )
+    fba_best = min(fba_entries, key=lambda s: s.terminal_rms)
+    vbd_best = min(vbd_entries, key=lambda s: s.terminal_rms)
     lines.append(
         f"FBA-best: **{fba_best.config.label}** ({fba_best.mean_ms:.3f} ms, RMS {fba_best.terminal_rms:.4e} m)\n"
     )
@@ -822,6 +829,13 @@ def main() -> int:
                 f"cached anchor has n_frames={anchor_meta['n_frames']} but --frames={args.frames}; "
                 "rerun without --skip-phase0"
             )
+        ref = np.load(out / "x_FBA_ref.npy")
+        if ref.shape != (args.frames, (GRID_DIM + 1) ** 2, 3):
+            raise SystemExit(
+                f"cached x_FBA_ref.npy has shape {ref.shape}; expected "
+                f"({args.frames}, {(GRID_DIM + 1) ** 2}, 3); rerun without --skip-phase0"
+            )
+        del ref  # don't keep two copies in memory
     else:
         anchor_meta = phase0_fba_anchor(out, n_frames=args.frames, n_warmup=args.warmup)
         anchor_json.write_text(json.dumps(anchor_meta, default=str))
@@ -830,6 +844,10 @@ def main() -> int:
     if args.skip_phase1 and calib_json.exists():
         print("[phase 1] reusing cached calibration")
         calibration = json.loads(calib_json.read_text())
+        if not (out / "x_FBA_ref.npy").exists():
+            raise SystemExit(
+                "--skip-phase1 set but x_FBA_ref.npy is missing; rerun without --skip-phase0 (or --skip-phase1) to regenerate"
+            )
     else:
         calibration = phase1_calibrate_vbd(out, anchor_meta, n_frames=args.frames)
 
