@@ -4639,6 +4639,14 @@ def emit_vt_rows_kernel(
         return
     if dist > threshold:
         return
+    # Penetration-only emit: only allocate an LCP row when the pair is
+    # actually penetrating (or within a tiny warm zone).  Pairs with
+    # signed_gap > warm_zone get λ = 0 from the LCP anyway, so emitting them
+    # only inflates W without contributing force — and makes the Schur
+    # complement rank-deficient on a folding cloth (where most broadphase
+    # hits are "near-rest" pairs).
+    if wp.float64(dist) > gap_threshold:
+        return
     n = diff / dist
 
     # ---- Allocate a contact slot. ----
@@ -4865,6 +4873,9 @@ def emit_ee_rows_kernel(
     if dist < wp.float32(1.0e-9):
         return
     if dist > threshold:
+        return
+    # Penetration-only emit (mirrors emit_vt_rows_kernel — see comment there).
+    if wp.float64(dist) > gap_threshold:
         return
 
     cA = pa1 + alpha * da
