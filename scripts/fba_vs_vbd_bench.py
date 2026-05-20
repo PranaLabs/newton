@@ -625,6 +625,80 @@ def plot_error_heatmaps(out_dir: Path, sweep: list[SweepResult], x_FBA_ref: np.n
         plt.close(fig)
 
 
+# --- Phase 3b: Three-up video render ---
+
+
+def _render_one_solver(
+    model,
+    trajectory: np.ndarray,
+    width: int,
+    height: int,
+):
+    """Replay a recorded trajectory through a headless ViewerGL and yield frames.
+
+    Yields HxWx3 uint8 numpy arrays. The viewer is closed when the generator
+    is exhausted.
+    """
+    import newton.viewer  # noqa: PLC0415
+
+    viewer = newton.viewer.ViewerGL(width=width, height=height, headless=True)
+    viewer.set_model(model)
+    state = model.state()
+    frame_buf = wp.empty(shape=(height, width, 3), dtype=wp.uint8, device=viewer.device)
+
+    try:
+        for t in range(trajectory.shape[0]):
+            state.particle_q.assign(trajectory[t])
+            viewer.begin_frame(float(t) * FRAME_DT)
+            viewer.log_state(state)
+            viewer.end_frame()
+            viewer.get_frame(target_image=frame_buf)
+            yield frame_buf.numpy().copy()
+    finally:
+        if hasattr(viewer, "close"):
+            viewer.close()
+
+
+def render_three_up(
+    out_dir: Path,
+    sweep: list[SweepResult],
+    x_FBA_ref: np.ndarray,
+    width: int = 640,
+    height: int = 480,
+    fps: int = 50,
+) -> Path:
+    """Render Reference | FBA-best | VBD-best as a horizontally-tiled MP4."""
+    import imageio.v2 as imageio  # noqa: PLC0415
+
+    fba_best = min((s for s in sweep if s.config.solver == "fba"), key=lambda s: s.terminal_rms)
+    vbd_best = min((s for s in sweep if s.config.solver == "vbd"), key=lambda s: s.terminal_rms)
+    assert fba_best.trajectory is not None and vbd_best.trajectory is not None, (
+        "three-up render needs trajectories recorded in Phase 2"
+    )
+    n = x_FBA_ref.shape[0]
+    assert fba_best.trajectory.shape[0] == n and vbd_best.trajectory.shape[0] == n
+
+    ref_model = build_model_fba()
+    fba_model = build_model_fba()
+    vbd_model = build_model_vbd(alpha=vbd_best.config.alpha, beta=vbd_best.config.beta)
+
+    out_path = out_dir / "three_up.mp4"
+    print(f"[phase 3] rendering three_up.mp4 ({n} frames at {width}x{height}, {fps} fps)")
+
+    gen_ref = _render_one_solver(ref_model, x_FBA_ref, width, height)
+    gen_fba = _render_one_solver(fba_model, fba_best.trajectory, width, height)
+    gen_vbd = _render_one_solver(vbd_model, vbd_best.trajectory, width, height)
+
+    with imageio.get_writer(str(out_path), fps=fps, codec="libx264",
+                            quality=8, macro_block_size=1) as writer:
+        for i, (a, b, c) in enumerate(zip(gen_ref, gen_fba, gen_vbd)):
+            combined = np.hstack([a, b, c])
+            writer.append_data(combined)
+            if i % 100 == 0:
+                print(f"  frame {i}/{n}")
+    return out_path
+
+
 # --- Smoke check ---
 
 
@@ -663,11 +737,13 @@ def _smoke():
     plot_rms_over_time(out, sweep)
     x_FBA_ref = np.load(out / "x_FBA_ref.npy")
     plot_error_heatmaps(out, sweep, x_FBA_ref)
+    video = render_three_up(out, sweep, x_FBA_ref, width=320, height=240, fps=30)
 
     for name in ("calibration.png", "pareto.png", "rms_over_time.png",
                  "error_heatmap_fba.png", "error_heatmap_vbd.png"):
         assert (out / name).stat().st_size > 1000, f"{name} suspiciously small or missing"
-    print(f"OK: plots emitted under {out}")
+    assert video.stat().st_size > 1000, "three_up.mp4 not written"
+    print(f"OK: plots + video emitted under {out}")
 
 
 if __name__ == "__main__":
