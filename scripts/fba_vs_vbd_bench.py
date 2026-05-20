@@ -33,9 +33,9 @@ GRID_DIM = 32
 CELL = 0.05
 MASS = 0.1
 GRAVITY = -9.81  # m/s²; scalar passed to ModelBuilder (up_axis=Y expands to (0, -9.81, 0))
-FBA_MU = 1000.0
-FBA_LAM = 1000.0
-FBA_EDGE_KE = 0.1
+FBA_MU = 10000.0
+FBA_LAM = 10000.0
+FBA_EDGE_KE = 1.0
 FRAME_DT = 1.0 / 100.0
 ANCHOR_ITERATIONS = 200
 
@@ -160,8 +160,10 @@ def run_solver(
         _sync()
         wall[f] = (time.perf_counter() - t0) * 1000.0
         trajectory[f] = state_in.particle_q.numpy()
-        if not np.all(np.isfinite(trajectory[f])):
-            raise RuntimeError(f"non-finite positions at frame {f}; solver diverged")
+        if not np.all(np.isfinite(trajectory[f])) or np.any(np.abs(trajectory[f]) > 100.0):
+            raise RuntimeError(
+                f"divergence detected at frame {f}: non-finite or |x|>100 m; solver diverged"
+            )
 
     fba_summary = None
     if hasattr(solver, "get_timing_summary"):
@@ -439,7 +441,11 @@ def phase2_sweep(
             lam=FBA_LAM,
             enable_perf_timing=True,
         )
-        res = run_solver(model, solver, n_frames=n_frames, substeps=1, n_warmup=n_warmup)
+        try:
+            res = run_solver(model, solver, n_frames=n_frames, substeps=1, n_warmup=n_warmup)
+        except RuntimeError as exc:
+            print(f"[phase 2] FBA iter={it} DIVERGED: {exc}")
+            continue
         rms = _rms_per_frame(res.trajectory, x_FBA_ref)
         sweep.append(
             SweepResult(
@@ -459,7 +465,11 @@ def phase2_sweep(
         print(f"[phase 2] VBD substeps={sub} iter={it}  (α={alpha_star:.3f}, β={beta_star:.3f})")  # noqa: RUF001
         model = build_model_vbd(alpha=alpha_star, beta=beta_star)
         solver = SolverVBD(model, iterations=it, particle_enable_self_contact=False)
-        res = run_solver(model, solver, n_frames=n_frames, substeps=sub, n_warmup=n_warmup)
+        try:
+            res = run_solver(model, solver, n_frames=n_frames, substeps=sub, n_warmup=n_warmup)
+        except RuntimeError as exc:
+            print(f"[phase 2] VBD substeps={sub} iter={it} DIVERGED: {exc}")
+            continue
         rms = _rms_per_frame(res.trajectory, x_FBA_ref)
         sweep.append(
             SweepResult(
@@ -472,6 +482,9 @@ def phase2_sweep(
                 trajectory=res.trajectory if record_trajectories else None,
             )
         )
+
+    if len(sweep) == 0:
+        raise RuntimeError("all sweep configs diverged")
 
     # Serialize (without trajectories — those stay in memory for video rendering).
     serial = []
