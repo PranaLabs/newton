@@ -762,6 +762,53 @@ def plot_error_heatmaps(out_dir: Path, sweep: list[SweepResult], x_FBA_ref: np.n
         plt.close(fig)
 
 
+def plot_error_heatmaps_self(
+    out_dir: Path,
+    sweep: list[SweepResult],
+    x_FBA_ref: np.ndarray,
+    x_VBD_ref: np.ndarray,
+) -> None:
+    """Per-vertex terminal-frame residual heatmap; each solver vs its own converged ref.
+
+    FBA is measured against ``x_FBA_ref``; VBD against ``x_VBD_ref``.
+    Color scales are independent — FBA's residual is ~1e-7 m while VBD's is
+    ~1e-2 m, so a shared scale would flatten the FBA panel to zero.
+
+    Saves ``error_heatmap_fba_self.png`` and ``error_heatmap_vbd_self.png``.
+    """
+    plt = _import_mpl()
+    fba_entries = [s for s in sweep if s.config.solver == "fba"]
+    vbd_entries = [s for s in sweep if s.config.solver == "vbd"]
+    if not fba_entries or not vbd_entries:
+        raise RuntimeError(
+            "plot_error_heatmaps_self requires both FBA and VBD entries in sweep; "
+            f"got {len(fba_entries)} FBA, {len(vbd_entries)} VBD"
+        )
+    fba_best = min(fba_entries, key=lambda s: s.terminal_rel_err)
+    vbd_best = min(vbd_entries, key=lambda s: s.terminal_rel_err)
+    if fba_best.trajectory is None or vbd_best.trajectory is None:
+        raise RuntimeError("error heatmaps require record_trajectories=True in phase2_sweep")
+
+    err_fba = np.linalg.norm(fba_best.trajectory[-1] - x_FBA_ref[-1], axis=-1)
+    err_vbd = np.linalg.norm(vbd_best.trajectory[-1] - x_VBD_ref[-1], axis=-1)
+
+    for label, x, err, fname in [
+        (fba_best.config.label, fba_best.trajectory[-1], err_fba, "error_heatmap_fba_self.png"),
+        (vbd_best.config.label, vbd_best.trajectory[-1], err_vbd, "error_heatmap_vbd_self.png"),
+    ]:
+        vmax = max(float(err.max()), 1e-12)
+        fig, ax = plt.subplots(figsize=(5, 5))
+        sc = ax.scatter(x[:, 0], x[:, 1], c=err, s=8, cmap="magma", vmin=0, vmax=vmax)
+        plt.colorbar(sc, ax=ax, label="|Δx| vs own ref (m)")
+        ax.set_aspect("equal")
+        ax.set_xlabel("x (m)")
+        ax.set_ylabel("y (m)")
+        ax.set_title(f"{label}\nmax |Δx| = {vmax:.2e} m")
+        fig.tight_layout()
+        fig.savefig(out_dir / fname, dpi=120)
+        plt.close(fig)
+
+
 # --- Phase 3b: Three-up video render ---
 
 
@@ -908,6 +955,8 @@ def write_report(
     lines.append("")
     lines.append("![pareto_self](pareto_self.png)\n")
     lines.append("![rms_over_time_self](rms_over_time_self.png)\n")
+    lines.append("Per-vertex terminal-frame residual (each solver vs its own converged ref):\n")
+    lines.append("![heatmap FBA self](error_heatmap_fba_self.png)  ![heatmap VBD self](error_heatmap_vbd_self.png)\n")
 
     lines.append("## Behavior — best-config terminal frame\n")
     fba_entries = [s for s in sweep if s.config.solver == "fba"]
@@ -1045,6 +1094,8 @@ def main() -> int:
     plot_rms_over_time_self(out, sweep)
     x_FBA_ref = np.load(out / "x_FBA_ref.npy")
     plot_error_heatmaps(out, sweep, x_FBA_ref)
+    x_VBD_ref = np.load(out / "x_VBD_ref.npy")
+    plot_error_heatmaps_self(out, sweep, x_FBA_ref, x_VBD_ref)
 
     if not args.skip_video:
         video_path = render_three_up(out, sweep, x_FBA_ref,
