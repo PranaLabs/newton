@@ -12,7 +12,7 @@ import numpy as np
 import warp as wp
 
 from ...geometry.types import GeoType
-from ...sim import Contacts, Control, Model, State
+from ...sim import BodyFlags, Contacts, Control, Model, State
 from ..solver import SolverBase
 
 
@@ -233,6 +233,7 @@ class SolverFBA(SolverBase):
         particle_contact_mode: Literal["vv", "vt"] = "vt",
         particle_contact_max_hits_per_vertex: int = 16,
         particle_contact_ee: bool = True,
+        integrate_with_external_rigid_solver: bool = False,
     ) -> None:
         """
         Args:
@@ -305,6 +306,11 @@ class SolverFBA(SolverBase):
                 within ``|cross|^2 < 1e-18`` are skipped (the v-t path catches
                 those contacts instead).  Set ``False`` to disable e-e and
                 fall back to v-t-only contact resolution.
+            integrate_with_external_rigid_solver: If ``True``, rigid bodies are
+                integrated by another solver: ``state_in`` holds their previous
+                state, ``state_out`` their current one, and FBA leaves both
+                untouched. Otherwise FBA integrates every dynamic body and
+                passes kinematic bodies through.
         """
         super().__init__(model)
 
@@ -382,6 +388,7 @@ class SolverFBA(SolverBase):
         self.nsn_iterations = int(nsn_iterations)
         self.lambda_cap = lambda_cap
         self.use_isodof = bool(use_isodof)
+        self.integrate_with_external_rigid_solver = bool(integrate_with_external_rigid_solver)
 
         # Per-shape kinematic angular velocity (rad/s about local +Z).  RealSim
         # parity for ``cylindercollisions.rollingvel``.
@@ -583,6 +590,77 @@ class SolverFBA(SolverBase):
         self._diag_out_path = Path(out_path)
         self._diag_buffers = {}
 
+    def _setup_rigid_system(self, dt: float) -> None:
+        """Factor the rigid block for the dynamic bodies this solver integrates."""
+        from .linear_solver import (  # noqa: PLC0415
+            FBALinearSolver,
+            build_rigid_system,
+            factorize_and_sparse_inverse,
+        )
+
+        self._rigid_linear_solver = None
+        model = self.model
+        if self.integrate_with_external_rigid_solver or model.body_count == 0:
+            return
+        bodies = np.flatnonzero(model.body_flags.numpy() & int(BodyFlags.DYNAMIC)).astype(np.int32)
+        if bodies.size == 0:
+            return
+        A = build_rigid_system(model, bodies, dt)
+        self._rigid_linear_solver = FBALinearSolver(factorize_and_sparse_inverse(A), device=self._device)
+        m = bodies.size
+        device = self._device
+        self._rigid_bodies_d = wp.array(bodies, dtype=wp.int32, device=device)
+        self._rigid_q_pin_d = wp.empty(m, dtype=wp.quatd, device=device)
+        self._rigid_x_prev_d = wp.empty(m, dtype=wp.vec3d, device=device)
+        self._rigid_b_d = wp.empty(6 * m, dtype=wp.float64, device=device)
+        self._rigid_u_d = wp.empty(6 * m, dtype=wp.float64, device=device)
+
+    def _step_rigid_bodies(self, state_in: State, state_out: State, dt: float) -> None:
+        """Advance the integrated bodies by one step; kinematic bodies pass through."""
+        from .rigid import prepare_rigid_step_kernel, retract_rigid_kernel  # noqa: PLC0415
+
+        wp.copy(state_out.body_q, state_in.body_q)
+        wp.copy(state_out.body_qd, state_in.body_qd)
+        ls = self._rigid_linear_solver
+        if ls is None:
+            return
+        model = self.model
+        m = self._rigid_bodies_d.shape[0]
+        wp.launch(
+            prepare_rigid_step_kernel,
+            dim=m,
+            inputs=[
+                self._rigid_bodies_d,
+                state_in.body_q,
+                state_in.body_qd,
+                state_in.body_f,
+                model.body_com,
+                model.body_mass,
+                model.body_inertia,
+                model.body_world,
+                model.gravity,
+                wp.float64(dt),
+            ],
+            outputs=[self._rigid_q_pin_d, self._rigid_x_prev_d, self._rigid_b_d],
+            device=self._device,
+        )
+        ls.solve_scalar(self._rigid_b_d, self._rigid_u_d)
+        wp.launch(
+            retract_rigid_kernel,
+            dim=m,
+            inputs=[
+                self._rigid_bodies_d,
+                self._rigid_u_d,
+                self._rigid_q_pin_d,
+                self._rigid_x_prev_d,
+                state_in.body_q,
+                model.body_com,
+                wp.float64(dt),
+            ],
+            outputs=[state_out.body_q, state_out.body_qd],
+            device=self._device,
+        )
+
     def _setup_pd_system(self, dt: float) -> None:
         """Build / rebuild the PD Hessian, factor it, and upload device data."""
         from .linear_solver import (  # noqa: PLC0415
@@ -594,6 +672,7 @@ class SolverFBA(SolverBase):
         A, meta = build_pd_system(self.model, dt=dt, pin_stiffness=self.pin_stiffness)
         fs = factorize_and_sparse_inverse(A)
         self._linear_solver = FBALinearSolver(fs, device=self._device)
+        self._setup_rigid_system(dt)
         # LiteNSN dense kernel + sparse BSR pipeline both consume the lite mass
         # matrix; build it once here so the per-step Schur dispatch is allocation-free.
         if self.nsn_schur_mode == "lite":
@@ -1231,6 +1310,8 @@ class SolverFBA(SolverBase):
             outputs=[state_out.particle_qd],
             device=device,
         )
+        if model.body_count > 0 and not self.integrate_with_external_rigid_solver:
+            self._step_rigid_bodies(state_in, state_out, dt)
 
         # End-of-step refresh of host-mirror persistent buffers. Done once
         # per step (not per PD outer iter) so tests / diagnostics that read

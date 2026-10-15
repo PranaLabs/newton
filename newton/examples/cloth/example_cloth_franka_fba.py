@@ -257,6 +257,8 @@ class Example:
                 stretching_model="arap",
                 pin_stiffness=1.0e10,
                 nsn_schur_mode="lite",
+                # The robot is stepped by Featherstone before the cloth.
+                integrate_with_external_rigid_solver=True,
                 # ``lambda_cap`` clamps the per-step impulse magnitude per
                 # contact row; without this the dense cloth-on-table contact
                 # set produces lambda values that occasionally diverge through

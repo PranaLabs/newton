@@ -137,5 +137,89 @@ class TestFBARigidKernels(unittest.TestCase):
         np.testing.assert_allclose(q_pin.numpy()[0], body["q0"] / np.linalg.norm(body["q0"]), rtol=0.0, atol=1e-15)
 
 
+class TestSolverFBARigidStep(unittest.TestCase):
+    """SolverFBA integrates dynamic bodies and passes kinematic ones through."""
+
+    @classmethod
+    def setUpClass(cls):
+        from scipy.spatial.transform import Rotation
+
+        wp.init()
+        cls.Rotation = Rotation
+
+    def _model(self, inertia, gravity=-9.81, kinematic=False):
+        import newton  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(gravity=gravity)
+        # SolverFBA still requires a deformable; keep it far from the body.
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 5.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=[wp.vec3(0.0, 0.0, 0.0), wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0, 1.0, 0.0), wp.vec3(1.0, 1.0, 0.0)],
+            indices=[0, 1, 2, 1, 3, 2],
+            density=1.0,
+            tri_ke=1.0e2,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0,
+            edge_kd=0.0,
+        )
+        builder.add_body(mass=MASS, com=wp.vec3(0.1, 0.0, 0.0), inertia=wp.mat33(inertia), lock_inertia=True)
+        builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)), is_kinematic=True)
+        return builder.finalize()
+
+    def _run(self, model, qd0, steps, **kwargs):
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        solver = SolverFBA(model, iterations=1, **kwargs)
+        s0, s1 = model.state(), model.state()
+        s0.body_qd.assign([wp.spatial_vector(*qd0), wp.spatial_vector(1.0, 2.0, 3.0, 0.1, 0.2, 0.3)])
+        for _ in range(steps):
+            solver.step(s0, s1, None, None, DT)
+            s0, s1 = s1, s0
+        return s0
+
+    def test_projectile_with_principal_spin(self):
+        """Semi-implicit Euler for the COM; constant spin about a principal axis."""
+        model = self._model(np.diag([0.1, 0.2, 0.3]))
+        v0, w0, n = np.array([1.0, 0.0, 2.0]), np.array([0.0, 0.0, 3.0]), 10
+        state = self._run(model, (*v0, *w0), n)
+
+        g = model.gravity.numpy()[0].astype(np.float64)
+        rot = self.Rotation.from_rotvec(w0 * n * DT)
+        com = np.array([0.1, 0.0, 0.0])
+        tf = state.body_q.numpy()[0]
+        x = tf[:3] + self.Rotation.from_quat(tf[3:]).apply(com)
+        np.testing.assert_allclose(x, com + n * DT * v0 + DT**2 * g * n * (n + 1) / 2, atol=1e-5)
+        np.testing.assert_allclose(self.Rotation.from_quat(tf[3:]).as_matrix(), rot.as_matrix(), atol=1e-5)
+        np.testing.assert_allclose(state.body_qd.numpy()[0], np.concatenate([v0 + n * DT * g, w0]), atol=1e-4)
+
+    def test_torque_free_tumbling_conserves_momentum(self):
+        inertia = np.diag([0.1, 0.2, 0.3])
+        w0 = np.array([0.3, 5.0, 0.2])  # near the unstable intermediate axis
+        state = self._run(self._model(inertia, gravity=0.0), (0.0, 0.0, 0.0, *w0), 100)
+
+        R = self.Rotation.from_quat(state.body_q.numpy()[0, 3:]).as_matrix()
+        w = state.body_qd.numpy()[0, 3:].astype(np.float64)
+        L0, L = inertia @ w0, R @ inertia @ R.T @ w
+        self.assertLess(np.linalg.norm(L - L0) / np.linalg.norm(L0), 5e-3)
+        self.assertLess(abs(w @ R @ inertia @ R.T @ w / (w0 @ inertia @ w0) - 1.0), 5e-3)
+
+    def test_kinematic_and_external_bodies_untouched(self):
+        model = self._model(np.diag([0.1, 0.2, 0.3]))
+        state = self._run(model, (1.0, 0.0, 0.0, 0.0, 0.0, 0.0), 1)
+        np.testing.assert_array_equal(state.body_q.numpy()[1], model.body_q.numpy()[1])
+
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        solver = SolverFBA(model, iterations=1, integrate_with_external_rigid_solver=True)
+        s0, s1 = model.state(), model.state()
+        s1.body_q.fill_(wp.transform(wp.vec3(7.0, 7.0, 7.0), wp.quat_identity()))
+        solver.step(s0, s1, None, None, DT)
+        np.testing.assert_array_equal(s1.body_q.numpy()[:, :3], 7.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
