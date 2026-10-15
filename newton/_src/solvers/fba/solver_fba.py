@@ -602,6 +602,7 @@ class SolverFBA(SolverBase):
 
         self._rigid_dt = dt
         self._rigid_linear_solver = None
+        self._joint_rows = None
         model = self.model
         if self.integrate_with_external_rigid_solver or model.body_count == 0:
             return
@@ -619,10 +620,30 @@ class SolverFBA(SolverBase):
         self._rigid_u_d = wp.empty(6 * m, dtype=wp.float64, device=device)
         self._rigid_x_live_d = wp.empty(m, dtype=wp.vec3d, device=device)
         self._rigid_q_live_d = wp.empty(m, dtype=wp.quatd, device=device)
+        self._setup_joints(bodies, A)
+
+    def _setup_joints(self, bodies: np.ndarray, A_rigid) -> None:
+        """Collect the joint rows on the integrated bodies and their Newton system."""
+        from .joints import BilateralSystem, build_joint_rows  # noqa: PLC0415
+
+        device = self._device
+        slot = np.full(self.model.body_count, -1, dtype=np.int32)
+        slot[bodies] = np.arange(bodies.size)
+        self._joint_rows = build_joint_rows(self.model, slot, device)
+        if self._joint_rows is None:
+            return
+        R = int(self._joint_rows.block_start[-1])
+        self._joint_system = BilateralSystem(self._joint_rows, slot, A_rigid, device)
+        self._body_slot_d = wp.array(slot, dtype=wp.int32, device=device)
+        self._joint_row_slot_d = wp.empty((R, 2), dtype=wp.int32, device=device)
+        self._joint_row_jac_d = wp.empty((R, 2), dtype=wp.spatial_vectord, device=device)
+        self._joint_residual_d = wp.empty(R, dtype=wp.float64, device=device)
+        self._joint_force_d = wp.empty(R, dtype=wp.float64, device=device)
+        self._rigid_b_joint_d = wp.empty(6 * bodies.size, dtype=wp.float64, device=device)
 
     def _step_rigid_bodies(self, state_in: State, state_out: State, dt: float) -> None:
         """Advance the integrated bodies by one step; kinematic bodies pass through."""
-        from .rigid import prepare_rigid_step_kernel, retract_rigid_kernel  # noqa: PLC0415
+        from .rigid import prepare_rigid_step_kernel  # noqa: PLC0415
 
         if self._rigid_dt is None or abs(self._rigid_dt - dt) > 1e-12:
             self._setup_rigid_system(dt)
@@ -652,21 +673,63 @@ class SolverFBA(SolverBase):
             device=self._device,
         )
         ls.solve_scalar(self._rigid_b_d, self._rigid_u_d)
+        self._retract_rigid(state_in, state_out, dt)
+        if self._joint_rows is not None:
+            self._solve_joints(state_in, state_out, dt)
+
+    def _retract_rigid(self, state_in: State, state_out: State, dt: float) -> None:
+        from .rigid import retract_rigid_kernel  # noqa: PLC0415
+
         wp.launch(
             retract_rigid_kernel,
-            dim=m,
+            dim=self._rigid_bodies_d.shape[0],
             inputs=[
                 self._rigid_bodies_d,
                 self._rigid_u_d,
                 self._rigid_q_pin_d,
                 self._rigid_x_prev_d,
                 state_in.body_q,
-                model.body_com,
+                self.model.body_com,
                 wp.float64(dt),
             ],
             outputs=[state_out.body_q, state_out.body_qd, self._rigid_x_live_d, self._rigid_q_live_d],
             device=self._device,
         )
+
+    def _solve_joints(self, state_in: State, state_out: State, dt: float) -> None:
+        """Enforce the joint rows with one Newton step per iteration.
+
+        The Jacobian and ``W`` are evaluated once at the pinned frame; each
+        iteration measures the residual at the live pose, updates the joint
+        forces ``f``, and re-solves ``A u = b + Jᵀ f`` before retracting.
+        """
+        from .joints import joint_jacobian_kernel, joint_residual_kernel  # noqa: PLC0415
+
+        rows, system, model = self._joint_rows, self._joint_system, self.model
+        R = self._joint_residual_d.shape[0]
+        row_args = [rows.row_joint, rows.row_angular, rows.row_dir, rows.parent, rows.child, rows.X_pj, rows.X_cj]
+        row_args.append(self._body_slot_d)
+        wp.launch(
+            joint_jacobian_kernel,
+            dim=R,
+            inputs=[*row_args, self._rigid_x_prev_d, self._rigid_q_pin_d, state_in.body_q, model.body_com],
+            outputs=[self._joint_row_slot_d, self._joint_row_jac_d],
+            device=self._device,
+        )
+        system.factor(self._joint_row_slot_d, self._joint_row_jac_d)
+        self._joint_force_d.zero_()
+        for _ in range(self.iterations):
+            wp.launch(
+                joint_residual_kernel,
+                dim=R,
+                inputs=[*row_args, self._rigid_x_live_d, self._rigid_q_live_d, state_in.body_q, model.body_com],
+                outputs=[self._joint_residual_d],
+                device=self._device,
+            )
+            system.update(self._joint_residual_d, self._joint_force_d)
+            system.apply_force(self._joint_row_jac_d, self._joint_force_d, self._rigid_b_d, self._rigid_b_joint_d)
+            self._rigid_linear_solver.solve_scalar(self._rigid_b_joint_d, self._rigid_u_d)
+            self._retract_rigid(state_in, state_out, dt)
 
     def _setup_pd_system(self, dt: float) -> None:
         """Build / rebuild the PD Hessian, factor it, and upload device data."""

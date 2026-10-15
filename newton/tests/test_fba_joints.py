@@ -256,5 +256,49 @@ class TestBilateralSystem(unittest.TestCase):
         np.testing.assert_allclose(b.numpy(), b_const + jac.T @ force.numpy(), rtol=1e-12)
 
 
+class TestSolverFBAJoints(unittest.TestCase):
+    """SolverFBA enforces joints in the rigid step."""
+
+    def _run(self, model, h, steps):
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        solver = SolverFBA(model, iterations=5)
+        s0, s1 = model.state(), model.state()
+        for _ in range(steps):
+            solver.step(s0, s1, None, None, h)
+            s0, s1 = s1, s0
+        return s0.body_q.numpy()[0].astype(np.float64)
+
+    def test_prismatic_matches_implicit_euler(self):
+        """Only the axis component of gravity acts; implicit Euler gives x_n = h² a n (n + 1) / 2."""
+        builder = newton.ModelBuilder()
+        link = _link(builder)
+        builder.add_articulation([builder.add_joint_prismatic(-1, link, axis=(1.0, 0.0, 0.0))])
+        model = builder.finalize()
+        model.gravity.assign([wp.vec3(1.0, -9.81, 0.5)])
+        h, n = 0.01, 20
+        np.testing.assert_allclose(self._run(model, h, n), [h * h * n * (n + 1) / 2, 0, 0, 0, 0, 0, 1], atol=1e-6)
+
+    def test_pendulum_converges_to_ode(self):
+        """A compound pendulum released horizontally converges at first order in h."""
+        from scipy.integrate import solve_ivp
+
+        T, I_pivot = 0.25, 2.0  # unit mass and inertia, COM 1 m from the pivot
+        ode = solve_ivp(lambda t, y: [y[1], -9.81 * np.sin(y[0]) / I_pivot], (0.0, T), [np.pi / 2, 0.0], rtol=1e-12)
+        errors = []
+        for h in (0.005, 0.0025):
+            builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+            link = _link(builder, xform=wp.transform((1.0, 0.0, 0.0)))
+            builder.add_articulation(
+                [builder.add_joint_revolute(-1, link, axis=(0.0, 0.0, 1.0), child_xform=wp.transform((-1.0, 0.0, 0.0)))]
+            )
+            tf = self._run(builder.finalize(), h, round(T / h))
+            anchor = tf[:3] + wp.quat_rotate(wp.quatd(*tf[3:]), wp.vec3d(-1.0, 0.0, 0.0))
+            np.testing.assert_allclose(anchor, 0.0, atol=1e-6)
+            errors.append(abs(np.arctan2(tf[0], -tf[1]) - ode.y[0, -1]))
+        self.assertLess(errors[0], 2e-2)
+        self.assertAlmostEqual(errors[0] / errors[1], 2.0, delta=0.2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
