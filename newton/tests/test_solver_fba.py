@@ -9,7 +9,12 @@ import warp as wp
 
 import newton
 from newton._src.solvers.fba import SolverFBA
-from newton._src.solvers.fba.linear_solver import build_pd_system
+from newton._src.solvers.fba.linear_solver import (
+    FBALinearSolver,
+    build_pd_system,
+    build_rigid_system,
+    factorize_and_sparse_inverse,
+)
 
 
 class TestSolverFBAImport(unittest.TestCase):
@@ -343,6 +348,55 @@ class TestFBALinearSolver(unittest.TestCase):
         wp.launch(apply_permutation_vec3_kernel, dim=n, inputs=[y, invperm_wp], outputs=[z], device=device)
 
         np.testing.assert_allclose(z.numpy(), x_np, atol=0.0)
+
+
+class TestBuildRigidSystem(unittest.TestCase):
+    """Rigid-body block of the PD system: ``diag(m·I₃, I) / dt²`` per body."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _model(self):
+        builder = newton.ModelBuilder()
+        # Body 0: products of inertia exceed I_xx (needs diagonal pivoting).
+        builder.add_body(mass=2.0, inertia=wp.mat33(0.1, 0.2, 0.0, 0.2, 0.5, 0.0, 0.0, 0.0, 0.3), lock_inertia=True)
+        builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)), is_kinematic=True)
+        builder.add_body(mass=3.0, inertia=wp.mat33(0.4, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.6), lock_inertia=True)
+        return builder.finalize()
+
+    def test_blocks(self):
+        model = self._model()
+        dt = 0.01
+        A = build_rigid_system(model, np.array([0, 2]), dt).toarray()
+
+        inertia = model.body_inertia.numpy().astype(np.float64)
+        expected = np.zeros((12, 12))
+        expected[0:3, 0:3] = 2.0 * np.eye(3)
+        expected[3:6, 3:6] = inertia[0]
+        expected[6:9, 6:9] = 3.0 * np.eye(3)
+        expected[9:12, 9:12] = inertia[2]
+        np.testing.assert_allclose(A, expected / dt**2, rtol=1e-12)
+        self.assertEqual(build_rigid_system(model, np.zeros(0, dtype=np.int32), dt).shape, (0, 0))
+
+    def test_solve_scalar_matches_dense(self):
+        A = build_rigid_system(self._model(), np.array([0, 2]), 0.01)
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        solver = FBALinearSolver(factorize_and_sparse_inverse(A), device=device)
+
+        b_np = np.random.default_rng(3).standard_normal(12)
+        b = wp.array(b_np, dtype=wp.float64, device=device)
+        x = wp.empty(12, dtype=wp.float64, device=device)
+        solver.solve_scalar(b, x)
+
+        x_ref = np.linalg.solve(A.toarray(), b_np)
+        np.testing.assert_allclose(x.numpy(), x_ref, rtol=1e-9, atol=1e-12 * np.abs(x_ref).max())
+
+    def test_rejects_massless_body(self):
+        builder = newton.ModelBuilder()
+        builder.add_body(mass=0.0)
+        with self.assertRaises(ValueError):
+            build_rigid_system(builder.finalize(), np.array([0]), 0.01)
 
 
 class TestARAPProjection(unittest.TestCase):

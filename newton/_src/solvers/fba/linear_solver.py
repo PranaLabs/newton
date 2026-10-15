@@ -266,6 +266,48 @@ def build_pd_system(
     return A, meta
 
 
+def build_rigid_system(model: Model, bodies: np.ndarray, dt: float) -> sp.csr_matrix:
+    """Assemble the constant rigid-body block of the PD system matrix.
+
+    Body ``bodies[k]`` owns DOFs ``6k .. 6k+5``: the translation ``chi`` and the
+    rotation vector ``rho``, both expressed in the body's pinned frame. Its block
+    is ``diag(m·I₃, I) / dt²`` with ``I`` the inertia about the COM in the body
+    frame, so the matrix stays constant while the body rotates and is factored
+    once like the deformable block.
+
+    Args:
+        model: The Newton model providing ``body_mass`` and ``body_inertia``.
+        bodies: Model body indices that own DOFs, shape ``[m]``.
+        dt: Time step [s].
+
+    Returns:
+        The ``6m x 6m`` symmetric positive definite CSR matrix.
+
+    Raises:
+        ValueError: If a body has non-positive mass or an inertia tensor that is
+            not positive definite.
+    """
+    import scipy.sparse as _sp
+
+    bodies = np.asarray(bodies, dtype=np.int32)
+    m = bodies.size
+    if m == 0:
+        return _sp.csr_matrix((0, 0), dtype=np.float64)
+    mass = model.body_mass.numpy()[bodies].astype(np.float64)
+    inertia = model.body_inertia.numpy()[bodies].astype(np.float64)
+    bad = (mass <= 0.0) | (np.linalg.eigvalsh(inertia)[:, 0] <= 0.0)
+    if np.any(bad):
+        raise ValueError(f"Bodies {bodies[bad].tolist()} need positive mass and a positive definite inertia tensor.")
+
+    blocks = np.zeros((m, 6, 6), dtype=np.float64)
+    blocks[:, :3, :3] = mass[:, None, None] * np.eye(3)
+    blocks[:, 3:, 3:] = inertia
+    blocks /= dt * dt
+    A = _sp.bsr_matrix((blocks, np.arange(m), np.arange(m + 1)), shape=(6 * m, 6 * m)).tocsr()
+    A.eliminate_zeros()
+    return A
+
+
 def _compute_rest_inv_from_positions(model: Model) -> np.ndarray:
     """Recompute the 2x2 rest-pose inverse per triangle from particle_q.
 
@@ -811,35 +853,26 @@ class FBALinearSolver:
         n = self.n
         dev = self.device
         for c in range(3):
-            # 1. Extract scalar component c from b.
             wp.launch(extract_component_kernel, dim=n, inputs=[b, c], outputs=[self._b_scalar], device=dev)
-            # 2. Apply inverse row permutation: b_perm[i] = b_scalar[invperm[i]].
-            #    The formula is A⁻¹ b = P_r⁻¹ · Sᵀ · D⁻¹ · S · P_r · b (see docstring).
-            #    The first permutation gathers b by invperm (un-applies the row reordering).
-            wp.launch(
-                apply_permutation_scalar_kernel,
-                dim=n,
-                inputs=[self._b_scalar, self._invperm],
-                outputs=[self._b_perm],
-                device=dev,
-            )
-            # 3. Multiply by S (lower-triangular inverse): Sb = S * b_perm.
-            wps.bsr_mv(self._S_bsr, self._b_perm, self._Sb)
-            # 4. Scale by D⁻¹: DSb[i] = Dinv[i] * Sb[i].
-            wp.launch(scale_by_diag_kernel, dim=n, inputs=[self._Sb, self._Dinv], outputs=[self._DSb], device=dev)
-            # 5. Multiply by Sᵀ: SDSb = Sᵀ * DSb.
-            wps.bsr_mv(self._ST_bsr, self._DSb, self._SDSb)
-            # 6. Apply row permutation: x_scalar[i] = SDSb[perm[i]].
-            #    The second permutation gathers by perm_r (re-applies the row ordering).
-            wp.launch(
-                apply_permutation_scalar_kernel,
-                dim=n,
-                inputs=[self._SDSb, self._perm],
-                outputs=[self._x_scalar],
-                device=dev,
-            )
-            # 7. Insert result into component c of output x.
+            self.solve_scalar(self._b_scalar, self._x_scalar)
             wp.launch(insert_component_kernel, dim=n, inputs=[self._x_scalar, c], outputs=[x], device=dev)
+
+    def solve_scalar(self, b: wp.array[wp.float64], x: wp.array[wp.float64]) -> None:
+        """Compute ``x = A⁻¹ · b`` for one scalar right-hand side.
+
+        Args:
+            b: Input right-hand side, shape ``[n]``. Not modified.
+            x: Output solution, shape ``[n]``. Must not alias ``b``.
+        """
+        n = self.n
+        dev = self.device
+        # A⁻¹ b = P_r⁻¹ · Sᵀ · D⁻¹ · S · P_r · b: gather by invperm, two SpMVs
+        # around the diagonal scale, then gather by perm.
+        wp.launch(apply_permutation_scalar_kernel, dim=n, inputs=[b, self._invperm], outputs=[self._b_perm], device=dev)
+        wps.bsr_mv(self._S_bsr, self._b_perm, self._Sb)
+        wp.launch(scale_by_diag_kernel, dim=n, inputs=[self._Sb, self._Dinv], outputs=[self._DSb], device=dev)
+        wps.bsr_mv(self._ST_bsr, self._DSb, self._SDSb)
+        wp.launch(apply_permutation_scalar_kernel, dim=n, inputs=[self._SDSb, self._perm], outputs=[x], device=dev)
 
     def _ensure_multi_rhs_buffers(self, R: int) -> None:
         """Allocate or grow multi-RHS scratch buffers to hold R right-hand sides."""
