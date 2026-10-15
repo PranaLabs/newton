@@ -315,9 +315,9 @@ class SolverFBA(SolverBase):
         super().__init__(model)
 
         # ---- Validate ----
-        if model.particle_count == 0:
-            raise ValueError("SolverFBA requires at least one particle")
-        if model.tri_count == 0 and (not hasattr(model, "tet_count") or model.tet_count == 0):
+        if model.particle_count == 0 and model.body_count == 0:
+            raise ValueError("SolverFBA requires deformable elements or rigid bodies")
+        if model.particle_count > 0 and model.tri_count == 0 and model.tet_count == 0:
             raise ValueError("SolverFBA requires at least one cloth triangle or tetrahedral element")
         if stretching_model not in ("arap", "corotational", "neohookean"):
             raise NotImplementedError(
@@ -389,6 +389,8 @@ class SolverFBA(SolverBase):
         self.lambda_cap = lambda_cap
         self.use_isodof = bool(use_isodof)
         self.integrate_with_external_rigid_solver = bool(integrate_with_external_rigid_solver)
+        self._rigid_dt: float | None = None
+        self._rigid_linear_solver = None
 
         # Per-shape kinematic angular velocity (rad/s about local +Z).  RealSim
         # parity for ``cylindercollisions.rollingvel``.
@@ -598,6 +600,7 @@ class SolverFBA(SolverBase):
             factorize_and_sparse_inverse,
         )
 
+        self._rigid_dt = dt
         self._rigid_linear_solver = None
         model = self.model
         if self.integrate_with_external_rigid_solver or model.body_count == 0:
@@ -619,6 +622,8 @@ class SolverFBA(SolverBase):
         """Advance the integrated bodies by one step; kinematic bodies pass through."""
         from .rigid import prepare_rigid_step_kernel, retract_rigid_kernel  # noqa: PLC0415
 
+        if self._rigid_dt is None or abs(self._rigid_dt - dt) > 1e-12:
+            self._setup_rigid_system(dt)
         wp.copy(state_out.body_q, state_in.body_q)
         wp.copy(state_out.body_qd, state_in.body_qd)
         ls = self._rigid_linear_solver
@@ -672,7 +677,6 @@ class SolverFBA(SolverBase):
         A, meta = build_pd_system(self.model, dt=dt, pin_stiffness=self.pin_stiffness)
         fs = factorize_and_sparse_inverse(A)
         self._linear_solver = FBALinearSolver(fs, device=self._device)
-        self._setup_rigid_system(dt)
         # LiteNSN dense kernel + sparse BSR pipeline both consume the lite mass
         # matrix; build it once here so the per-step Schur dispatch is allocation-free.
         if self.nsn_schur_mode == "lite":
@@ -828,14 +832,14 @@ class SolverFBA(SolverBase):
         contacts: Contacts | None,
         dt: float,
     ) -> None:
-        """Advance the cloth state by one implicit Euler step using PD.
+        """Advance deformables and rigid bodies by one implicit Euler step using PD.
 
         Args:
-            state_in: Input simulation state. ``particle_q`` and
-                ``particle_qd`` are read; ``particle_f`` provides external
-                per-particle forces [N].
-            state_out: Output simulation state. ``particle_q`` and
-                ``particle_qd`` are written; other fields are untouched.
+            state_in: Input simulation state. Particle and body positions and
+                velocities are read; ``particle_f`` and ``body_f`` provide
+                external forces [N] and torques [N·m].
+            state_out: Output simulation state. Particle and body positions and
+                velocities are written; other fields are untouched.
             control: Unused in MVP (cloth has no actuated joints).
             contacts: Unused in MVP (contact-aware FBA is future work).
             dt: Time step [s]. Triggers `_setup_pd_system` rebuild on first
@@ -856,6 +860,11 @@ class SolverFBA(SolverBase):
             self._diag_buffers = {
                 "x_pre": state_in.particle_q.numpy().astype(np.float64).copy(),
             }
+
+        if self.model.particle_count == 0:
+            if not self.integrate_with_external_rigid_solver:
+                self._step_rigid_bodies(state_in, state_out, dt)
+            return
 
         if self._linear_solver is None or self._dt_setup is None or abs(self._dt_setup - dt) > 1e-12:
             self._setup_pd_system(dt)

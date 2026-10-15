@@ -147,25 +147,30 @@ class TestSolverFBARigidStep(unittest.TestCase):
         wp.init()
         cls.Rotation = Rotation
 
-    def _model(self, inertia, gravity=-9.81, kinematic=False):
+    def _model(self, inertia, gravity=-9.81, cloth=True):
         import newton  # noqa: PLC0415
 
         builder = newton.ModelBuilder(gravity=gravity)
-        # SolverFBA still requires a deformable; keep it far from the body.
-        builder.add_cloth_mesh(
-            pos=wp.vec3(0.0, 0.0, 5.0),
-            rot=wp.quat_identity(),
-            scale=1.0,
-            vel=wp.vec3(0.0, 0.0, 0.0),
-            vertices=[wp.vec3(0.0, 0.0, 0.0), wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0, 1.0, 0.0), wp.vec3(1.0, 1.0, 0.0)],
-            indices=[0, 1, 2, 1, 3, 2],
-            density=1.0,
-            tri_ke=1.0e2,
-            tri_ka=0.0,
-            tri_kd=0.0,
-            edge_ke=1.0,
-            edge_kd=0.0,
-        )
+        if cloth:  # far from the body, so it never interacts
+            builder.add_cloth_mesh(
+                pos=wp.vec3(0.0, 0.0, 5.0),
+                rot=wp.quat_identity(),
+                scale=1.0,
+                vel=wp.vec3(0.0, 0.0, 0.0),
+                vertices=[
+                    wp.vec3(0.0, 0.0, 0.0),
+                    wp.vec3(1.0, 0.0, 0.0),
+                    wp.vec3(0.0, 1.0, 0.0),
+                    wp.vec3(1.0, 1.0, 0.0),
+                ],
+                indices=[0, 1, 2, 1, 3, 2],
+                density=1.0,
+                tri_ke=1.0e2,
+                tri_ka=0.0,
+                tri_kd=0.0,
+                edge_ke=1.0,
+                edge_kd=0.0,
+            )
         builder.add_body(mass=MASS, com=wp.vec3(0.1, 0.0, 0.0), inertia=wp.mat33(inertia), lock_inertia=True)
         builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)), is_kinematic=True)
         return builder.finalize()
@@ -195,6 +200,20 @@ class TestSolverFBARigidStep(unittest.TestCase):
         np.testing.assert_allclose(x, com + n * DT * v0 + DT**2 * g * n * (n + 1) / 2, atol=1e-5)
         np.testing.assert_allclose(self.Rotation.from_quat(tf[3:]).as_matrix(), rot.as_matrix(), atol=1e-5)
         np.testing.assert_allclose(state.body_qd.numpy()[0], np.concatenate([v0 + n * DT * g, w0]), atol=1e-4)
+
+    def test_rigid_only_model(self):
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._model(np.diag([0.1, 0.2, 0.3]), cloth=False)
+        v0, n = np.array([1.0, 0.0, 2.0]), 10
+        state = self._run(model, (*v0, 0.0, 0.0, 0.0), n)
+        g = model.gravity.numpy()[0].astype(np.float64)
+        np.testing.assert_allclose(state.body_qd.numpy()[0, :3], v0 + n * DT * g, atol=1e-4)
+
+        import newton  # noqa: PLC0415
+
+        with self.assertRaises(ValueError):
+            SolverFBA(newton.ModelBuilder().finalize())
 
     def test_torque_free_tumbling_conserves_momentum(self):
         inertia = np.diag([0.1, 0.2, 0.3])
