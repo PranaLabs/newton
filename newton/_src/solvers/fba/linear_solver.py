@@ -293,11 +293,15 @@ def _splu_extract_factors(
 ) -> tuple:
     """Wrap scipy.sparse.linalg.splu and return (L_csc, U_csc, Dinv, perm_r, perm_c).
 
-    For SPD A, splu effectively produces LU = L · U with U ≈ Dᵀ Lᵀ; we extract
+    For SPD A, splu effectively produces LU = L · U with U = D · Lᵀ; we extract
     the lower factor L (with unit diagonal), the diagonal D = diag(U), and the
-    permutation arrays. The factor satisfies P_r · A · P_cᵀ = L · D · Lᵀ
-    (modulo numerical asymmetry of SuperLU's pivoting for non-symmetric input,
-    which is unobservable on SPD input).
+    permutation arrays. The factor satisfies P · A · Pᵀ = L · D · Lᵀ with
+    ``perm_r == perm_c``.
+
+    SPD matrices admit LDLᵀ without pivoting, so diagonal pivots are forced.
+    SuperLU's default partial pivoting picks an off-diagonal pivot whenever it
+    is larger than the diagonal (bending stencils, rigid inertia with products
+    of inertia), which breaks the symmetric ``A⁻¹ = Pᵀ Sᵀ D⁻¹ S P`` form.
 
     Args:
         A: Sparse SPD matrix (CSC or CSR).
@@ -307,13 +311,15 @@ def _splu_extract_factors(
     """
     import scipy.sparse.linalg as spla
 
-    lu = spla.splu(A.tocsc(), permc_spec="COLAMD")
+    lu = spla.splu(A.tocsc(), permc_spec="COLAMD", diag_pivot_thresh=0.0, options={"SymmetricMode": True})
     L = lu.L.tocsc()  # lower-tri with unit diagonal
     L.sort_indices()  # SuperLU may return unsorted column indices; sort for alignment
     U = lu.U.tocsc()
     Dinv = 1.0 / U.diagonal()
     perm_r = lu.perm_r.astype(np.int32)
     perm_c = lu.perm_c.astype(np.int32)
+    if not np.array_equal(perm_r, perm_c):
+        raise RuntimeError("Off-diagonal pivot in the PD system factorization; A must be symmetric positive definite.")
     return L, U, Dinv, perm_r, perm_c
 
 

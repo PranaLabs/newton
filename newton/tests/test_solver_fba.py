@@ -248,6 +248,31 @@ class TestFBALinearSolver(unittest.TestCase):
             r = A.dot(x_np[:, c]) - b_np[:, c]
             self.assertLess(np.linalg.norm(r) / max(np.linalg.norm(b_np[:, c]), 1e-12), 1e-6)
 
+    def test_solve_spd_with_dominant_off_diagonal(self):
+        """SPD input whose off-diagonal entries exceed the diagonal must not
+        trigger off-diagonal pivoting, which breaks the symmetric
+        ``A⁻¹ = Pᵀ Sᵀ D⁻¹ S P`` form (e.g. bending stencils, rigid inertia)."""
+        import scipy.sparse as sp
+
+        from newton._src.solvers.fba.linear_solver import (  # noqa: PLC0415
+            FBALinearSolver,
+            factorize_and_sparse_inverse,
+        )
+
+        A_dense = np.array([[1.0, 2.0, 0.0], [2.0, 5.0, 0.0], [0.0, 0.0, 3.0]])
+        self.assertGreater(np.linalg.eigvalsh(A_dense).min(), 0.0)
+
+        fs = factorize_and_sparse_inverse(sp.csr_matrix(A_dense))
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        solver = FBALinearSolver(fs, device=device)
+
+        b_np = np.eye(3)
+        b = wp.array(b_np, dtype=wp.vec3, device=device)
+        x = wp.empty(3, dtype=wp.vec3, device=device)
+        solver.solve(b, x)
+
+        np.testing.assert_allclose(x.numpy(), np.linalg.solve(A_dense, b_np), rtol=1e-6, atol=1e-6)
+
     def test_solve_multi_rhs_matches_single_rhs(self):
         """solve_multi_rhs_scalar produces same result as R separate solve() calls."""
         import scipy.sparse as _sp
@@ -4040,22 +4065,22 @@ class SolverFBALambdaWarmStartTests(unittest.TestCase):
         pipeline = CollisionPipeline(model, soft_contact_margin=0.05)
         contacts = pipeline.contacts()
 
-        # Step a few times to let cloth settle into contact.
-        for _ in range(10):
+        # The flat cloth falls 0.15 m and lands on the plane at step 11; step
+        # past that so the contact is sustained.
+        for _ in range(14):
             s_in.clear_forces()
             pipeline.collide(s_in, contacts)
             solver.step(s_in, s_out, None, contacts, 1.0 / 60.0)
             s_in, s_out = s_out, s_in
 
-        # λ should be populated for the contact set
-        # (cloth bottom row resting on plane).
-        if solver._contact_count > 0:
-            self.assertIsNotNone(solver._lam_unilateral_persistent)
-            self.assertGreater(
-                float(np.abs(solver._lam_unilateral_persistent).max()),
-                0.0,
-                "λ should be non-zero after sustained contact",
-            )
+        self.assertTrue(np.all(np.isfinite(s_in.particle_q.numpy())))
+        self.assertGreater(solver._contact_count, 0)
+        self.assertIsNotNone(solver._lam_unilateral_persistent)
+        self.assertGreater(
+            float(np.abs(solver._lam_unilateral_persistent).max()),
+            0.0,
+            "λ should be non-zero after sustained contact",
+        )
 
 
 class SolverFBAKinematicCylinderTests(unittest.TestCase):
