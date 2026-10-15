@@ -576,5 +576,111 @@ class TestUpdateContactsIntegration(unittest.TestCase):
             self.assertAlmostEqual(float(np.dot(t1_d[c], t2_d[c])), 0.0, delta=1e-5)
 
 
+def _quat_rotate_np(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Rotate ``v`` by the unit quaternion ``q`` given as (x, y, z, w)."""
+    u, w = q[:3], q[3]
+    return v + 2.0 * np.cross(u, np.cross(u, v) + w * v)
+
+
+class TestComputeVAnchorFromBodyKernel(unittest.TestCase):
+    """Body-driven anchor velocity follows Newton's ``body_qd`` convention."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_v_anchor_uses_linear_angular_order_and_com(self):
+        # body_qd = (v_com, omega) in world frame; the lever arm starts at the
+        # world-frame COM, not at the body origin.
+        q = np.array([0.0, np.sin(0.3), 0.0, np.cos(0.3)])
+        p = np.array([0.2, -0.1, 0.4])
+        com = np.array([0.1, 0.05, -0.2])
+        v = np.array([0.3, -0.7, 1.1])
+        omega = np.array([2.0, -0.5, 1.5])
+        anchor = np.array([0.6, 0.3, -0.2])
+
+        v_anchor = wp.zeros(1, dtype=wp.vec3d)
+        wp.launch(
+            K.compute_v_anchor_from_body_kernel,
+            dim=1,
+            inputs=[
+                wp.array([0], dtype=wp.int32),
+                wp.array([0], dtype=wp.int32),
+                wp.array([_make_transform(tuple(p), tuple(q))], dtype=wp.transform),
+                wp.array([wp.spatial_vector(*v, *omega)], dtype=wp.spatial_vector),
+                wp.array([wp.vec3(*com)], dtype=wp.vec3),
+                wp.array([wp.vec3(*anchor)], dtype=wp.vec3),
+            ],
+            outputs=[v_anchor],
+        )
+
+        com_world = p + _quat_rotate_np(q, com)
+        expected = v + np.cross(omega, anchor - com_world)
+        np.testing.assert_allclose(v_anchor.numpy()[0], expected, atol=1e-5)
+
+
+class TestUpdateContactsMovingBody(unittest.TestCase):
+    """``update_contacts`` reads the body pose and velocity from ``state``."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_anchor_and_velocity_follow_state(self):
+        builder = newton.ModelBuilder()
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=[
+                wp.vec3(0.0, 0.0, 0.0),
+                wp.vec3(1.0, 0.0, 0.0),
+                wp.vec3(0.0, 0.0, 1.0),
+                wp.vec3(1.0, 0.0, 1.0),
+            ],
+            indices=[0, 1, 2, 1, 3, 2],
+            density=1.0,
+            tri_ke=1.0e2,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0,
+            edge_kd=0.0,
+        )
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.5, -2.0, 0.5), wp.quat_identity()))
+        builder.add_shape_sphere(body, radius=0.3)
+        model = builder.finalize()
+        com = np.array([0.1, 0.05, -0.2])
+        model.body_com.assign(np.array([com], dtype=np.float32))
+
+        solver = SolverFBA(model, iterations=1, pin_stiffness=1.0, friction=True)
+
+        # The model pose keeps the sphere far below the cloth; only the state
+        # pose and velocity place it in contact.
+        state = model.state()
+        q = np.array([0.0, np.sin(0.25), 0.0, np.cos(0.25)])
+        p = np.array([0.5, 0.2, 0.5])
+        v = np.array([0.4, -0.2, 0.1])
+        omega = np.array([0.0, 3.0, 1.0])
+        state.body_q.assign([_make_transform(tuple(p), tuple(q))])
+        state.body_qd.assign([wp.spatial_vector(*v, *omega)])
+
+        pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.5)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+        solver.update_contacts(contacts, state)
+
+        M = solver._contact_count
+        self.assertGreater(M, 0, "expected contacts between the cloth and the moved sphere")
+
+        body_pos = solver._contact_body_pos_d.numpy()[:M].astype(np.float64)
+        anchor_ref = p + np.array([_quat_rotate_np(q, b) for b in body_pos])
+        com_world = p + _quat_rotate_np(q, com)
+        v_ref = v + np.cross(omega, anchor_ref - com_world)
+
+        np.testing.assert_allclose(solver._contact_world_anchor_d.numpy()[:M], anchor_ref, atol=1e-5)
+        np.testing.assert_allclose(solver._contact_v_anchor_d.numpy()[:M], v_ref, atol=1e-5)
+
+
 if __name__ == "__main__":
     unittest.main()

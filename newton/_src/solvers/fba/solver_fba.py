@@ -1650,8 +1650,9 @@ class SolverFBA(SolverBase):
         Args:
             contacts: :class:`~newton.Contacts` populated by a prior
                 :meth:`~newton.CollisionPipeline.collide` call.
-            state: Optional current :class:`~newton.State`; unused in Stage A
-                (penetration offset derived purely from the contact anchor).
+            state: Current :class:`~newton.State`, the one passed to
+                ``collide``. Supplies ``body_q``/``body_qd`` for contacts on
+                moving bodies; falls back to the model when ``None``.
         """
         # Contact data is about to change → drop the Schur cache so the
         # next ``step()`` rebuilds ``W`` / ``A⁻¹·Jᵀ`` with fresh J.
@@ -1733,7 +1734,10 @@ class SolverFBA(SolverBase):
         # absent or empty we still pass a non-null dummy buffer through
         # the kernel and gate the lookup with a ``has_*`` flag, matching
         # the CPU branches that previously skipped these lookups.
-        body_q_arr = model.body_q if hasattr(model, "body_q") and model.body_q is not None else None
+        # The pose must match the one ``collide`` used to emit
+        # ``soft_contact_body_pos``, i.e. the current state, not the model.
+        body_src = state if state is not None else model
+        body_q_arr = body_src.body_q if getattr(body_src, "body_q", None) is not None else None
         has_body_q = wp.int32(1 if body_q_arr is not None and body_q_arr.size > 0 else 0)
         if body_q_arr is None or body_q_arr.size == 0:
             body_q_arr = wp.empty(1, dtype=wp.transform, device=device)
@@ -1852,9 +1856,7 @@ class SolverFBA(SolverBase):
             # per-shape ``shape_angular_velocity``.  This kernel only writes
             # contacts whose ``shape_body[s] >= 0``; static-shape contacts keep
             # the value computed above by ``compute_v_anchor_kernel``.
-            body_qd_arr = (
-                self.model.body_qd if hasattr(self.model, "body_qd") and self.model.body_qd is not None else None
-            )
+            body_qd_arr = body_src.body_qd if getattr(body_src, "body_qd", None) is not None else None
             if (
                 has_shape_body == wp.int32(1)
                 and body_qd_arr is not None
@@ -1871,6 +1873,7 @@ class SolverFBA(SolverBase):
                         shape_body_arr,
                         body_q_arr,
                         body_qd_arr,
+                        model.body_com,
                         self._contact_world_anchor_d,
                     ],
                     outputs=[self._contact_v_anchor_d],

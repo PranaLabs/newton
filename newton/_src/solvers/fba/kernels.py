@@ -5708,33 +5708,24 @@ def compute_v_anchor_kernel(
 def compute_v_anchor_from_body_kernel(
     shape_idx: wp.array[wp.int32],  # (M,) shape index per contact
     shape_body: wp.array[wp.int32],  # (n_shapes,) body index per shape (-1 = static)
-    body_q: wp.array[wp.transform],  # (n_bodies,) body world transforms
-    body_qd: wp.array[wp.spatial_vector],  # (n_bodies,) body spatial velocities (ω_world, v_world)
+    body_q: wp.array[wp.transform],  # (n_bodies,) body origin world transforms
+    body_qd: wp.array[wp.spatial_vector],  # (n_bodies,) (v_com, ω) in world frame
+    body_com: wp.array[wp.vec3],  # (n_bodies,) COM in the body frame
     world_anchor: wp.array[wp.vec3],  # (M,) world-frame anchor
     v_anchor: wp.array[wp.vec3d],  # (M,) inout — accumulate body-driven motion
 ):
     """Add body-driven kinematic anchor velocity for contacts whose rigid side
     is parented to a dynamic body.
 
-    For each contact ``c``:
-      parent = shape_body[shape_idx[c]]
-      if parent < 0: skip (static collider — leave v_anchor as-is so the
-                              spinning-cylinder path from
-                              :func:`compute_v_anchor_kernel` survives).
-      else:
-        ω_body = wp.spatial_top(body_qd[parent])
-        v_body = wp.spatial_bottom(body_qd[parent])
-        r      = world_anchor[c] - body_q[parent].translation
-        v_anchor[c] = v_body + cross(ω_body, r)
+    For each contact ``c`` with ``parent = shape_body[shape_idx[c]] >= 0``:
+    ``v_anchor[c] = v_com + cross(ω, world_anchor[c] - com_world)``, where
+    ``com_world = transform_point(body_q[parent], body_com[parent])``.
+    Contacts on static shapes (``parent < 0``) are left untouched so the
+    spinning-cylinder value from :func:`compute_v_anchor_kernel` survives.
 
-    Newton's :class:`wp.spatial_vector` packs the body spatial velocity as
-    ``(ω, v)`` per ``newton.utils.transform`` conventions:
-    ``spatial_top`` → angular, ``spatial_bottom`` → linear.
-
-    Designed to run **after** :func:`compute_v_anchor_kernel`: the spinning
-    path writes a value, this path overwrites it for body-parented shapes
-    (because per-shape ω no longer makes sense when the shape moves with a
-    body whose own ω drives the surface velocity).
+    Newton's ``body_qd`` stores ``(linear, angular)`` with the linear part
+    being the COM velocity, so ``spatial_top`` is ``v_com`` and
+    ``spatial_bottom`` is ``ω``.
     """
     c = wp.tid()
     s = shape_idx[c]
@@ -5742,15 +5733,8 @@ def compute_v_anchor_from_body_kernel(
     if parent < 0:
         return
     qd = body_qd[parent]
-    omega_body = wp.spatial_top(qd)
-    v_body = wp.spatial_bottom(qd)
-    body_xf = body_q[parent]
-    body_p = wp.transform_get_translation(body_xf)
-    a = world_anchor[c]
-    r = wp.vec3(a[0] - body_p[0], a[1] - body_p[1], a[2] - body_p[2])
-    cross_or = wp.cross(omega_body, r)
-    v_anchor[c] = wp.vec3d(
-        wp.float64(v_body[0] + cross_or[0]),
-        wp.float64(v_body[1] + cross_or[1]),
-        wp.float64(v_body[2] + cross_or[2]),
-    )
+    v_com = wp.spatial_top(qd)
+    omega = wp.spatial_bottom(qd)
+    com_world = wp.transform_point(body_q[parent], body_com[parent])
+    v = v_com + wp.cross(omega, world_anchor[c] - com_world)
+    v_anchor[c] = wp.vec3d(wp.float64(v[0]), wp.float64(v[1]), wp.float64(v[2]))
