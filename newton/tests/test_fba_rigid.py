@@ -92,6 +92,37 @@ class TestFBARigidKernels(unittest.TestCase):
         rho = DT * w + DT**2 * np.linalg.solve(inertia, -np.cross(w, inertia @ w) + Rp.T @ body["tau"])
         np.testing.assert_allclose(b.numpy(), self._rigid_matrix() @ np.concatenate([chi, rho]), rtol=1e-10)
 
+    def test_free_step_pose_and_velocity(self):
+        body = self._body()
+        bodies, body_q, q_pin, x_prev, b = self._prepare(body)
+        u = wp.array(np.linalg.solve(self._rigid_matrix(), b.numpy()), dtype=wp.float64, device=self.device)
+        q_out = wp.empty(1, dtype=wp.transform, device=self.device)
+        qd_out = wp.empty(1, dtype=wp.spatial_vector, device=self.device)
+        wp.launch(
+            rigid.retract_rigid_kernel,
+            dim=1,
+            inputs=[bodies, u, q_pin, x_prev, body_q, wp.array([wp.vec3(*body["com"])], dtype=wp.vec3), wp.float64(DT)],
+            outputs=[q_out, qd_out],
+            device=self.device,
+        )
+
+        # Reference: semi-implicit step with explicit gyroscopic torque in the
+        # pinned frame, retracted from the step-start orientation.
+        R0 = self.Rotation.from_quat(body["q0"])
+        Rp = (self.Rotation.from_rotvec(body["w0"] * DT) * R0).as_matrix()
+        inertia = _f32(INERTIA)
+        w = Rp.T @ body["w0"]
+        x0 = body["p0"] + R0.apply(body["com"])
+        v = body["v0"] + DT * (GRAVITY + body["f"] / MASS)
+        omega = Rp @ (w + DT * np.linalg.solve(inertia, -np.cross(w, inertia @ w) + Rp.T @ body["tau"]))
+        R_new = self.Rotation.from_rotvec(omega * DT) * R0
+        origin = x0 + DT * v - R_new.apply(body["com"])
+
+        tf = q_out.numpy()[0]
+        np.testing.assert_allclose(tf[:3], origin, rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(self.Rotation.from_quat(tf[3:]).as_matrix(), R_new.as_matrix(), atol=1e-6)
+        np.testing.assert_allclose(qd_out.numpy()[0], np.concatenate([v, omega]), rtol=1e-5, atol=1e-6)
+
     def test_pinned_rotation_is_clamped(self):
         body = self._body(w0=(0.0, 0.0, 100.0))  # |ω| dt = 1 rad > 0.5
         _, _, q_pin, _, _ = self._prepare(body)

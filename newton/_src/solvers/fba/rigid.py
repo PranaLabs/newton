@@ -7,8 +7,9 @@ Each integrated body owns six DOFs ``u = (chi, rho)`` in the PD system: ``chi``
 is the COM position and ``rho = dt * omega`` the step rotation vector, both in
 the body frame pinned once per step, ``R_pin = exp(dt [omega_prev]x) R_prev``.
 In that frame the rigid block ``diag(m I3, I) / dt^2`` stays constant (see
-:func:`~newton._src.solvers.fba.linear_solver.build_rigid_system`). Velocities
-follow Newton's convention, ``body_qd = (v_com, omega)`` in world frame.
+:func:`~newton._src.solvers.fba.linear_solver.build_rigid_system`). Poses are
+retracted from the step-start pose. Velocities follow Newton's convention,
+``body_qd = (v_com, omega)`` in world frame, and ``body_q`` is the body origin.
 """
 
 import warp as wp
@@ -86,3 +87,42 @@ def prepare_rigid_step_kernel(
     for c in range(3):
         b[6 * k + c] = b_trans[c]
         b[6 * k + 3 + c] = b_rot[c]
+
+
+@wp.kernel
+def retract_rigid_kernel(
+    bodies: wp.array[wp.int32],
+    u: wp.array[wp.float64],
+    q_pin: wp.array[wp.quatd],
+    x_prev: wp.array[wp.vec3d],
+    body_q_prev: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    dt: wp.float64,
+    # outputs
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+):
+    """Map the solved DOFs back to body poses and velocities.
+
+    The COM moves to ``R_pin chi``; the orientation is retracted from the
+    step-start one, ``q = exp(R_pin rho) q_prev``, with the rotation clamped
+    like the pinned frame. Velocities are ``v = (x - x_prev) / dt`` and
+    ``ω = R_pin rho / dt``.
+    """
+    k = wp.tid()
+    i = bodies[k]
+    qp = q_pin[k]
+    chi = wp.vec3d(u[6 * k], u[6 * k + 1], u[6 * k + 2])
+    rho = wp.vec3d(u[6 * k + 3], u[6 * k + 4], u[6 * k + 5])
+
+    x = wp.quat_rotate(qp, chi)
+    q = wp.normalize(wp.quatd(wp.transform_get_rotation(body_q_prev[i])))
+    omega = wp.vec3d(0.0, 0.0, 0.0)
+    if wp.length_sq(rho) >= _ROTATION_NOISE_SQ:
+        omega = wp.quat_rotate(qp, _clamp_step_rotation(rho / dt, dt))
+        q = _rotate_by(omega, dt, q)
+
+    v = (x - x_prev[k]) / dt
+    origin = x - wp.quat_rotate(q, wp.vec3d(body_com[i]))
+    body_q[i] = wp.transform(wp.vec3(origin), wp.quat(q))
+    body_qd[i] = wp.spatial_vector(wp.vec3(v), wp.vec3(omega))
