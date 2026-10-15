@@ -295,6 +295,26 @@ def bilateral_update_kernel(
     force[r] = force[r] + df[row_block[r], row_local[r]]
 
 
+@wp.kernel
+def joint_force_rhs_kernel(
+    slot_entry_start: wp.array[wp.int32],
+    entry_row: wp.array[wp.int32],
+    entry_side: wp.array[wp.int32],
+    row_jac: wp.array2d[wp.spatial_vectord],
+    force: wp.array[wp.float64],
+    b_const: wp.array[wp.float64],
+    # outputs
+    b: wp.array[wp.float64],
+):
+    """``b = b_const + Jᵀ f`` per body slot, gathered over the rows touching it."""
+    k = wp.tid()
+    acc = wp.spatial_vectord()
+    for e in range(slot_entry_start[k], slot_entry_start[k + 1]):
+        acc += force[entry_row[e]] * row_jac[entry_row[e], entry_side[e]]
+    for c in range(6):
+        b[6 * k + c] = b_const[6 * k + c] + acc[c]
+
+
 _TILE_KERNELS = {}
 
 
@@ -339,6 +359,19 @@ class BilateralSystem:
         row_block = np.repeat(np.arange(n_blocks), sizes)
         self.row_block = wp.array(row_block, dtype=wp.int32, device=device)
         self.row_local = wp.array(np.arange(R) - rows.block_start[row_block], dtype=wp.int32, device=device)
+        joint = rows.row_joint.numpy()
+        parent, child = rows.parent.numpy()[joint], rows.child.numpy()[joint]
+        slots = np.stack([np.where(parent >= 0, body_slot[np.maximum(parent, 0)], -1), body_slot[child]], axis=1)
+        entry_slot, entry_row, entry_side = (
+            a[slots.ravel() >= 0] for a in (slots.ravel(), np.repeat(np.arange(R), 2), np.tile([0, 1], R))
+        )
+        order = np.argsort(entry_slot, kind="stable")
+        self.slot_entry_start = wp.array(
+            np.searchsorted(entry_slot[order], np.arange(m + 1)), dtype=wp.int32, device=device
+        )
+        self.entry_row = wp.array(entry_row[order], dtype=wp.int32, device=device)
+        self.entry_side = wp.array(entry_side[order], dtype=wp.int32, device=device)
+
         self.block_start = wp.array(rows.block_start, dtype=wp.int32, device=device)
         self.W = wp.empty((n_blocks, self.tile, self.tile), dtype=wp.float64, device=device)
         self.L = wp.empty_like(self.W)
@@ -381,5 +414,15 @@ class BilateralSystem:
             dim=R,
             inputs=[self.row_block, self.row_local, self.df],
             outputs=[force],
+            device=self.device,
+        )
+
+    def apply_force(self, row_jac, force, b_const, b) -> None:
+        """``b = b_const + Jᵀ force``."""
+        wp.launch(
+            joint_force_rhs_kernel,
+            dim=self.slot_entry_start.shape[0] - 1,
+            inputs=[self.slot_entry_start, self.entry_row, self.entry_side, row_jac, force, b_const],
+            outputs=[b],
             device=self.device,
         )

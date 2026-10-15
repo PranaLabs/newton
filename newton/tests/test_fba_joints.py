@@ -223,7 +223,7 @@ class TestFBAJointKernels(unittest.TestCase):
 
 class TestBilateralSystem(unittest.TestCase):
     def test_matches_dense_algebra(self):
-        """W = J A⁻¹ Jᵀ per block and its Newton step against dense algebra."""
+        """W = J A⁻¹ Jᵀ per block, its Newton step and Jᵀ f against dense algebra."""
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
         builder = newton.ModelBuilder()
         _add_satisfied_chain(builder)
@@ -250,6 +250,10 @@ class TestBilateralSystem(unittest.TestCase):
         residual, force = rng.standard_normal(18), wp.zeros(18, dtype=wp.float64, device=device)
         system.update(wp.array(residual, dtype=wp.float64, device=device), force)
         np.testing.assert_allclose(force.numpy(), -np.linalg.solve(W, residual), rtol=1e-8)
+
+        b_const, b = rng.standard_normal(24), wp.empty(24, dtype=wp.float64, device=device)
+        system.apply_force(row_jac, force, wp.array(b_const, dtype=wp.float64, device=device), b)
+        np.testing.assert_allclose(b.numpy(), b_const + jac.T @ force.numpy(), rtol=1e-12)
 
 
 if __name__ == "__main__":
