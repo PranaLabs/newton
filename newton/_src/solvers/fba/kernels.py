@@ -3927,25 +3927,25 @@ def compute_frictional_fb_kernel(
 @wp.kernel
 def fb_newton_lite_coulomb_kernel(
     # ---- contact metadata (M entries each) ----
-    contact_particle: wp.array[wp.int32],   # (M,)
-    contact_normal: wp.array[wp.vec3],      # (M,)
-    contact_tangent1: wp.array[wp.vec3],    # (M,)
-    contact_tangent2: wp.array[wp.vec3],    # (M,)
-    contact_alpha: wp.array[wp.float32],    # (M,)
-    contact_mu: wp.array[wp.float64],       # (M,)
+    contact_particle: wp.array[wp.int32],  # (M,)
+    contact_normal: wp.array[wp.vec3],  # (M,)
+    contact_tangent1: wp.array[wp.vec3],  # (M,)
+    contact_tangent2: wp.array[wp.vec3],  # (M,)
+    contact_alpha: wp.array[wp.float32],  # (M,)
+    contact_mu: wp.array[wp.float64],  # (M,)
     # ---- per-row inputs (3M entries each) ----
-    r: wp.array[wp.float64],                # (3M,)
-    pene0: wp.array[wp.float64],            # (3M,)
+    r: wp.array[wp.float64],  # (3M,)
+    pene0: wp.array[wp.float64],  # (3M,)
     # ---- global state ----
-    inv_mass: wp.array[wp.float64],         # (N,)
+    inv_mass: wp.array[wp.float64],  # (N,)
     dt: wp.float64,
-    cap_internal: wp.float64,               # lambda_cap / dt² (or sentinel; see caller)
-    use_cap: wp.int32,                      # 1 = clip, 0 = no-op
-    n_fb_iters: wp.int32,                   # outer FB-Newton iter count
+    cap_internal: wp.float64,  # lambda_cap / dt² (or sentinel; see caller)
+    use_cap: wp.int32,  # 1 = clip, 0 = no-op
+    n_fb_iters: wp.int32,  # outer FB-Newton iter count
     # ---- inout / outputs ----
-    lam: wp.array[wp.float64],              # (3M,) inout
-    omega: wp.array[wp.float64],            # (3M,) inout — warm-started on entry, written on exit
-    lam_apply: wp.array[wp.float64],        # (3M,) output: dt² · ω · λ_final
+    lam: wp.array[wp.float64],  # (3M,) inout
+    omega: wp.array[wp.float64],  # (3M,) inout — warm-started on entry, written on exit
+    lam_apply: wp.array[wp.float64],  # (3M,) output: dt² · ω · λ_final
 ):
     """Fused per-contact FB-Newton step for LiteNSN, Stage B (Coulomb).
 
@@ -4197,10 +4197,10 @@ def compute_penetration_sparse_kernel(
 def build_a_schur_lite_bsr_kernel(
     w_offsets: wp.array[wp.int32],
     w_columns: wp.array[wp.int32],
-    w_values: wp.array[wp.float64],          # collapsed scalar values for 1×1 BSR
+    w_values: wp.array[wp.float64],  # collapsed scalar values for 1×1 BSR
     omega: wp.array[wp.float64],
     compliance: wp.array[wp.float64],
-    a_values: wp.array[wp.float64],          # output, same shape as w_values
+    a_values: wp.array[wp.float64],  # output, same shape as w_values
 ):
     """Build A_schur = ωωᵀ ⊙ W + diag(c) in BSR with W's sparsity (scalar
     values since ``warp.sparse`` collapses 1×1 block BSR to scalar storage).
@@ -4225,7 +4225,7 @@ def compute_nsn_rhs_lite_bsr_kernel(
     omega: wp.array[wp.float64],
     pene0: wp.array[wp.float64],
     r: wp.array[wp.float64],
-    w_omega_lam: wp.array[wp.float64],      # W · (ω · λ) precomputed via bsr_mv
+    w_omega_lam: wp.array[wp.float64],  # W · (ω · λ) precomputed via bsr_mv
     dt: wp.float64,
     rhs: wp.array[wp.float64],
 ):
@@ -4260,14 +4260,14 @@ def compute_omega_times_lam_kernel(
 @wp.kernel
 def compute_particle_contact_residual_kernel(
     # Per-row inputs:
-    row_particle_a: wp.array[wp.int32],     # (3M_self,)
-    row_particle_b: wp.array[wp.int32],     # (3M_self,) all valid (≥0)
-    row_dir: wp.array[wp.vec3],             # (3M_self,)
-    row_alpha: wp.array[wp.float32],        # (3M_self,)
-    row_offset: wp.array[wp.float64],       # (3M_self,) = pene0[i]; gap threshold for n rows, 0 for tangents
-    x: wp.array[wp.vec3],                   # (N,) particle positions
+    row_particle_a: wp.array[wp.int32],  # (3M_self,)
+    row_particle_b: wp.array[wp.int32],  # (3M_self,) all valid (≥0)
+    row_dir: wp.array[wp.vec3],  # (3M_self,)
+    row_alpha: wp.array[wp.float32],  # (3M_self,)
+    row_offset: wp.array[wp.float64],  # (3M_self,) = pene0[i]; gap threshold for n rows, 0 for tangents
+    x: wp.array[wp.vec3],  # (N,) particle positions
     # Output:
-    r: wp.array[wp.float64],                # (3M_self,)
+    r: wp.array[wp.float64],  # (3M_self,)
 ):
     """Residual for self-contact rows: ``r[i] = offset[i] - α[i] · dot(dir[i], x[a] - x[b])``.
 
@@ -4321,7 +4321,7 @@ def scatter_jt_lambda_two_particle_kernel(
     row_dir: wp.array[wp.vec3],
     row_alpha: wp.array[wp.float32],
     lam: wp.array[wp.float32],
-    out: wp.array[wp.vec3],            # atomic-add target, length N
+    out: wp.array[wp.vec3],  # atomic-add target, length N
 ):
     """Per-row atomic scatter of ``Jᵀ·λ`` for 2-particle rows.
 
@@ -4349,9 +4349,9 @@ def scatter_jt_lambda_two_particle_kernel(
 def gather_jt_lambda_two_particle_kernel(
     # Per-particle CSR: row_offsets[p+1] - row_offsets[p] = number of
     # signed entries for particle p.
-    row_offsets: wp.array[wp.int32],       # (N+1,)
-    row_indices: wp.array[wp.int32],       # (E,) — row idx
-    row_signs: wp.array[wp.float32],       # (E,) — +1.0 or -1.0
+    row_offsets: wp.array[wp.int32],  # (N+1,)
+    row_indices: wp.array[wp.int32],  # (E,) — row idx
+    row_signs: wp.array[wp.float32],  # (E,) — +1.0 or -1.0
     # Per-row direction and alpha (length = total self-contact rows).
     row_dir: wp.array[wp.vec3],
     row_alpha: wp.array[wp.float32],
@@ -4386,17 +4386,17 @@ def gather_jt_lambda_two_particle_kernel(
 @wp.kernel
 def emit_particle_contact_rows_kernel(
     n_pairs: wp.int32,
-    pair_a: wp.array[wp.int32],             # (n_pairs,)
-    pair_b: wp.array[wp.int32],             # (n_pairs,)
-    pair_normal: wp.array[wp.vec3],         # (n_pairs,) unit from b → a
-    gap_threshold: wp.float64,              # 2 · particle_radius
-    row_offset_base: wp.int32,              # where in the output arrays self rows start
+    pair_a: wp.array[wp.int32],  # (n_pairs,)
+    pair_b: wp.array[wp.int32],  # (n_pairs,)
+    pair_normal: wp.array[wp.vec3],  # (n_pairs,) unit from b → a
+    gap_threshold: wp.float64,  # 2 · particle_radius
+    row_offset_base: wp.int32,  # where in the output arrays self rows start
     row_particle_a: wp.array[wp.int32],
     row_particle_b: wp.array[wp.int32],
     row_dir: wp.array[wp.vec3],
     row_alpha: wp.array[wp.float32],
     row_offset: wp.array[wp.float64],
-    contact_mu: wp.array[wp.float64],       # (M_total,) per-contact μ — slot pair_to_contact_idx + p
+    contact_mu: wp.array[wp.float64],  # (M_total,) per-contact μ — slot pair_to_contact_idx + p
 ):
     """Convert one broadphase pair into a Stage B contact (3 rows).
 
@@ -4559,20 +4559,20 @@ def emit_vt_rows_kernel(
     n_hits: wp.int32,
     # CSR over per-vertex hit job indices: for thread tid, find vertex v such
     # that vt_hit_offsets[v] <= tid < vt_hit_offsets[v+1], then hit i = tid - offsets[v].
-    vt_hit_offsets: wp.array[wp.int32],     # (n_query_particles + 1,)
+    vt_hit_offsets: wp.array[wp.int32],  # (n_query_particles + 1,)
     n_query_particles: wp.int32,
     # Detector output (CSR per vertex; 2 ints per hit: (query_vertex, triangle_id)).
     vertex_colliding_triangles: wp.array[wp.int32],
     vertex_colliding_triangles_offsets: wp.array[wp.int32],
     # Triangle topology + positions.
-    tri_indices: wp.array2d[wp.int32],      # (T, 3)
-    particle_q: wp.array[wp.vec3],          # (N,)
+    tri_indices: wp.array2d[wp.int32],  # (T, 3)
+    particle_q: wp.array[wp.vec3],  # (N,)
     # Geometry.
     threshold: wp.float32,
     gap_threshold: wp.float64,
     # Output emission counter (atomic).
-    contact_count: wp.array[wp.int32],      # (1,) — number of emitted contacts
-    max_contacts: wp.int32,                 # capacity check (max_contacts = cap // 3)
+    contact_count: wp.array[wp.int32],  # (1,) — number of emitted contacts
+    max_contacts: wp.int32,  # capacity check (max_contacts = cap // 3)
     row_offset_base: wp.int32,
     # 4-slot output arrays.
     row_pa: wp.array[wp.int32],
@@ -4775,7 +4775,7 @@ def emit_ee_rows_kernel(
     n_hits: wp.int32,
     # CSR over per-edge hit-job indices: thread tid -> edge e such that
     # ee_hit_offsets[e] <= tid < ee_hit_offsets[e+1], local k = tid - offsets[e].
-    ee_hit_offsets: wp.array[wp.int32],     # (n_edges + 1,)
+    ee_hit_offsets: wp.array[wp.int32],  # (n_edges + 1,)
     n_edges: wp.int32,
     # Detector output (CSR per edge; 2 ints per hit: (query_edge_id, target_edge_id)).
     edge_colliding_edges: wp.array[wp.int32],
@@ -4783,15 +4783,15 @@ def emit_ee_rows_kernel(
     # Edge topology + positions.
     # Newton's bending-stencil edge_indices layout: columns (2, 3) are the
     # two segment endpoints.
-    edge_indices: wp.array2d[wp.int32],     # (E, 4)
-    particle_q: wp.array[wp.vec3],          # (N,)
+    edge_indices: wp.array2d[wp.int32],  # (E, 4)
+    particle_q: wp.array[wp.vec3],  # (N,)
     # Geometry.
     threshold: wp.float32,
     gap_threshold: wp.float64,
     parallel_eps: wp.float32,
     # Output emission counter (atomic).
-    contact_count: wp.array[wp.int32],      # (1,) — number of emitted contacts (vt+ee combined)
-    max_contacts: wp.int32,                 # capacity check (max_contacts = cap // 3)
+    contact_count: wp.array[wp.int32],  # (1,) — number of emitted contacts (vt+ee combined)
+    max_contacts: wp.int32,  # capacity check (max_contacts = cap // 3)
     row_offset_base: wp.int32,
     # 4-slot output arrays.
     row_pa: wp.array[wp.int32],
@@ -5035,28 +5035,28 @@ _VEC12_F64 = wp.types.vector(12, wp.float64)
 @wp.kernel
 def fb_newton_lite_coulomb_per_particle_kernel(
     # ---- per-isodof iteration metadata ----
-    isodof_unique: wp.array[wp.int32],     # (K,) unique contacted particle indices
-    isodof_row_offsets: wp.array[wp.int32], # (N+1,) CSR over ALL particles
-    isodof_row_indices: wp.array[wp.int32], # (total_rows,) row idx sorted by particle
+    isodof_unique: wp.array[wp.int32],  # (K,) unique contacted particle indices
+    isodof_row_offsets: wp.array[wp.int32],  # (N+1,) CSR over ALL particles
+    isodof_row_indices: wp.array[wp.int32],  # (total_rows,) row idx sorted by particle
     # ---- per-row data (3M entries, interleaved [n, t1, t2] per contact) ----
-    row_particle: wp.array[wp.int32],       # (3M,) — particle index per row
-    row_dir: wp.array[wp.vec3],             # (3M,) — direction per row (fp32)
-    row_alpha: wp.array[wp.float32],        # (3M,) — Jacobian coef per row
+    row_particle: wp.array[wp.int32],  # (3M,) — particle index per row
+    row_dir: wp.array[wp.vec3],  # (3M,) — direction per row (fp32)
+    row_alpha: wp.array[wp.float32],  # (3M,) — Jacobian coef per row
     # ---- per-contact data (M entries) ----
-    contact_mu: wp.array[wp.float64],       # (M,) — friction coef per contact
+    contact_mu: wp.array[wp.float64],  # (M,) — friction coef per contact
     # ---- per-row force inputs (3M entries) ----
-    r: wp.array[wp.float64],                # (3M,)
-    pene0: wp.array[wp.float64],            # (3M,)
+    r: wp.array[wp.float64],  # (3M,)
+    pene0: wp.array[wp.float64],  # (3M,)
     # ---- global state ----
-    inv_mass: wp.array[wp.float64],         # (N,)
+    inv_mass: wp.array[wp.float64],  # (N,)
     dt: wp.float64,
-    cap_internal: wp.float64,               # lambda_cap / dt²
+    cap_internal: wp.float64,  # lambda_cap / dt²
     use_cap: wp.int32,
     n_fb_iters: wp.int32,
     # ---- inout / outputs ----
-    lam: wp.array[wp.float64],              # (3M,) inout
-    omega: wp.array[wp.float64],            # (3M,) inout
-    lam_apply: wp.array[wp.float64],        # (3M,) output
+    lam: wp.array[wp.float64],  # (3M,) inout
+    omega: wp.array[wp.float64],  # (3M,) inout
+    lam_apply: wp.array[wp.float64],  # (3M,) output
 ):
     """Per-particle fused FB-Newton for LiteNSN, Stage B (Coulomb), k_p ∈ {1..4}.
 
@@ -5706,12 +5706,12 @@ def compute_v_anchor_kernel(
 
 @wp.kernel
 def compute_v_anchor_from_body_kernel(
-    shape_idx: wp.array[wp.int32],          # (M,) shape index per contact
-    shape_body: wp.array[wp.int32],         # (n_shapes,) body index per shape (-1 = static)
-    body_q: wp.array[wp.transform],         # (n_bodies,) body world transforms
-    body_qd: wp.array[wp.spatial_vector],   # (n_bodies,) body spatial velocities (ω_world, v_world)
-    world_anchor: wp.array[wp.vec3],        # (M,) world-frame anchor
-    v_anchor: wp.array[wp.vec3d],           # (M,) inout — accumulate body-driven motion
+    shape_idx: wp.array[wp.int32],  # (M,) shape index per contact
+    shape_body: wp.array[wp.int32],  # (n_shapes,) body index per shape (-1 = static)
+    body_q: wp.array[wp.transform],  # (n_bodies,) body world transforms
+    body_qd: wp.array[wp.spatial_vector],  # (n_bodies,) body spatial velocities (ω_world, v_world)
+    world_anchor: wp.array[wp.vec3],  # (M,) world-frame anchor
+    v_anchor: wp.array[wp.vec3d],  # (M,) inout — accumulate body-driven motion
 ):
     """Add body-driven kinematic anchor velocity for contacts whose rigid side
     is parented to a dynamic body.

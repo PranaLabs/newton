@@ -321,9 +321,7 @@ class SolverFBA(SolverBase):
         if nh_solver not in ("newton5", "lbfgs"):
             raise ValueError(f"nh_solver={nh_solver!r} not supported; choose 'newton5' or 'lbfgs'")
         if nsn_schur_mode not in ("full", "lite"):
-            raise ValueError(
-                f"nsn_schur_mode={nsn_schur_mode!r} not supported; choose 'full' or 'lite'"
-            )
+            raise ValueError(f"nsn_schur_mode={nsn_schur_mode!r} not supported; choose 'full' or 'lite'")
         self.nsn_schur_mode = nsn_schur_mode
 
         # Cloth self-contact (Phase 3 of the Franka plan).  Routed as a
@@ -331,19 +329,14 @@ class SolverFBA(SolverBase):
         # pipeline regardless of nsn_schur_mode (self-contact rows have
         # 2 nonzero blocks per H row, which the per-particle fused kernel
         # cannot represent).
-        self.particle_contact_radius = (
-            float(particle_contact_radius) if particle_contact_radius is not None else None
-        )
+        self.particle_contact_radius = float(particle_contact_radius) if particle_contact_radius is not None else None
         self.particle_contact_margin = float(particle_contact_margin)
         self.particle_contact_friction = float(particle_contact_friction)
         self.particle_contact_topology_ring = int(particle_contact_topology_ring)
         self.particle_contact_rest_exclusion_radius = float(particle_contact_rest_exclusion_radius)
         self.particle_contact_max_pairs = particle_contact_max_pairs
         if particle_contact_mode not in ("vv", "vt"):
-            raise ValueError(
-                f"particle_contact_mode={particle_contact_mode!r} not supported; "
-                "choose 'vv' or 'vt'"
-            )
+            raise ValueError(f"particle_contact_mode={particle_contact_mode!r} not supported; choose 'vv' or 'vt'")
         self.particle_contact_mode = particle_contact_mode
         self.particle_contact_max_hits_per_vertex = int(particle_contact_max_hits_per_vertex)
         # Phase 3 (e-e): independent toggle gating the edge-edge broadphase +
@@ -1056,8 +1049,7 @@ class SolverFBA(SolverBase):
                         # the per-particle kernel's 12×12 register footprint
                         # for what is the only common case in cloth-on-rigid.
                         use_per_particle = (
-                            getattr(ls, "_isodof_max_k", 1) > 3
-                            and getattr(ls, "_isodof_unique_d", None) is not None
+                            getattr(ls, "_isodof_max_k", 1) > 3 and getattr(ls, "_isodof_unique_d", None) is not None
                         )
                         if use_per_particle:
                             wp.launch(
@@ -1225,6 +1217,7 @@ class SolverFBA(SolverBase):
             # Wrap _x_cur in a state-like proxy for the existing pass API.
             class _StateProxy:
                 pass
+
             proxy = _StateProxy()
             proxy.particle_q = self._x_cur
             self._apply_particle_contact_pass(proxy, dt)
@@ -1860,9 +1853,7 @@ class SolverFBA(SolverBase):
             # contacts whose ``shape_body[s] >= 0``; static-shape contacts keep
             # the value computed above by ``compute_v_anchor_kernel``.
             body_qd_arr = (
-                self.model.body_qd
-                if hasattr(self.model, "body_qd") and self.model.body_qd is not None
-                else None
+                self.model.body_qd if hasattr(self.model, "body_qd") and self.model.body_qd is not None else None
             )
             if (
                 has_shape_body == wp.int32(1)
@@ -2310,7 +2301,8 @@ class SolverFBA(SolverBase):
         self._pc_row_offset_d = wp.empty(cap, dtype=wp.float64, device=device)
         self._pc_contact_mu_d = wp.array(
             np.full(cap // 3, self.particle_contact_friction, dtype=np.float64),
-            dtype=wp.float64, device=device,
+            dtype=wp.float64,
+            device=device,
         )
         self._pc_r_d = wp.empty(cap, dtype=wp.float64, device=device)
         self._pc_lam_d = wp.zeros(cap, dtype=wp.float64, device=device)
@@ -2415,8 +2407,7 @@ class SolverFBA(SolverBase):
         # a vertex doesn't normally lie close to a non-adjacent triangle
         # at rest.
         ee_enabled = bool(self.particle_contact_ee) and (
-            self.model.edge_indices is not None
-            and int(self.model.edge_count) > 0
+            self.model.edge_indices is not None and int(self.model.edge_count) > 0
         )
         if ee_enabled:
             detector.edge_colliding_edges_count.zero_()
@@ -2501,20 +2492,14 @@ class SolverFBA(SolverBase):
         self._ensure_particle_contact_buffers(cap)
 
         # Per-vertex job-offsets array (v-t).
-        if (
-            self._pc_hit_offsets_d is None
-            or int(self._pc_hit_offsets_d.size) < n_particles + 1
-        ):
+        if self._pc_hit_offsets_d is None or int(self._pc_hit_offsets_d.size) < n_particles + 1:
             self._pc_hit_offsets_d = wp.empty(n_particles + 1, dtype=wp.int32, device=device)
         if n_vt_hits > 0:
             self._pc_hit_offsets_d.assign(offsets_np)
 
         # Per-edge job-offsets array (e-e).
         if n_ee_hits > 0:
-            if (
-                self._pc_ee_hit_offsets_d is None
-                or int(self._pc_ee_hit_offsets_d.size) < n_edges + 1
-            ):
+            if self._pc_ee_hit_offsets_d is None or int(self._pc_ee_hit_offsets_d.size) < n_edges + 1:
                 self._pc_ee_hit_offsets_d = wp.empty(n_edges + 1, dtype=wp.int32, device=device)
             self._pc_ee_hit_offsets_d.assign(ee_offsets_np)
 
@@ -2651,7 +2636,8 @@ class SolverFBA(SolverBase):
                 wp.launch(
                     _fill_adjacent_edges,
                     inputs=[edges_cpu, adj.v_adj_edges_offsets, fill_count, adj.v_adj_edges],
-                    dim=1, device="cpu",
+                    dim=1,
+                    device="cpu",
                 )
             else:
                 adj.v_adj_edges_offsets = wp.empty(shape=(0,), dtype=wp.int32)
@@ -2671,7 +2657,8 @@ class SolverFBA(SolverBase):
                 wp.launch(
                     _fill_adjacent_faces,
                     inputs=[tris_cpu, adj.v_adj_faces_offsets, fill_count, adj.v_adj_faces],
-                    dim=1, device="cpu",
+                    dim=1,
+                    device="cpu",
                 )
             else:
                 adj.v_adj_faces_offsets = wp.empty(shape=(0,), dtype=wp.int32)
@@ -2886,7 +2873,11 @@ class SolverFBA(SolverBase):
         # Build the sparse Schur W (block-diagonal-by-particle for rigid-only,
         # contact-graph-sparse with self-contact rows mixed in).
         W_bsr = ls.build_schur_lite_unified(
-            n_rows, row_particle_a_d, row_particle_b_d, row_dir_d, row_alpha_d,
+            n_rows,
+            row_particle_a_d,
+            row_particle_b_d,
+            row_dir_d,
+            row_alpha_d,
             row_particle_c_d=row_particle_c_d,
             row_particle_d_d=row_particle_d_d,
             row_wa_d=row_wa_d,
@@ -2985,7 +2976,12 @@ class SolverFBA(SolverBase):
                 K.compute_frictional_fb_kernel,
                 dim=int(M_total),
                 inputs=[
-                    penetration_v, lam_v, contact_mu_d, precond_v, pene0_d, dt_w,
+                    penetration_v,
+                    lam_v,
+                    contact_mu_d,
+                    precond_v,
+                    pene0_d,
+                    dt_w,
                 ],
                 outputs=[omega_v, compliance_v, h_v],
                 device=device,
@@ -3005,22 +3001,34 @@ class SolverFBA(SolverBase):
                 break
 
             wp.launch(
-                K.axpy_lambda_kernel, dim=n_rows,
-                inputs=[dlam_v], outputs=[lam_v], device=device,
+                K.axpy_lambda_kernel,
+                dim=n_rows,
+                inputs=[dlam_v],
+                outputs=[lam_v],
+                device=device,
             )
 
         wp.launch(
-            K.coulomb_box_clamp_kernel, dim=int(M_total),
-            inputs=[contact_mu_d], outputs=[lam_v], device=device,
+            K.coulomb_box_clamp_kernel,
+            dim=int(M_total),
+            inputs=[contact_mu_d],
+            outputs=[lam_v],
+            device=device,
         )
         if use_cap:
             wp.launch(
-                K.lambda_cap_clip_kernel, dim=n_rows,
-                inputs=[wp.float64(cap_internal)], outputs=[lam_v], device=device,
+                K.lambda_cap_clip_kernel,
+                dim=n_rows,
+                inputs=[wp.float64(cap_internal)],
+                outputs=[lam_v],
+                device=device,
             )
         wp.launch(
-            K.compute_lam_apply_kernel, dim=n_rows,
-            inputs=[lam_v, omega_v, dt_w], outputs=[lam_apply_out_d], device=device,
+            K.compute_lam_apply_kernel,
+            dim=n_rows,
+            inputs=[lam_v, omega_v, dt_w],
+            outputs=[lam_apply_out_d],
+            device=device,
         )
         wp.copy(lam_out_d, self._bsr_lam, count=n_rows)
         wp.copy(omega_out_d, self._bsr_omega, count=n_rows)
