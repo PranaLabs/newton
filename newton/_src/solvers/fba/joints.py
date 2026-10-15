@@ -120,3 +120,66 @@ def build_joint_rows(model: Model, body_slot: np.ndarray, device) -> JointRows |
         row_dir=wp.array(np.array([r[3] for r in rows]), dtype=wp.vec3, device=device),
         block_start=block_start,
     )
+
+
+@wp.func
+def _com_frame(
+    b: int,
+    body_slot: wp.array[wp.int32],
+    slot_x: wp.array[wp.vec3d],
+    slot_q: wp.array[wp.quatd],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+):
+    """COM position and orientation of body ``b``: the per-slot pose for an
+    integrated body, the state pose otherwise, and the origin for the world."""
+    if b < 0:
+        return wp.vec3d(0.0, 0.0, 0.0), wp.quatd(0.0, 0.0, 0.0, 1.0)
+    s = body_slot[b]
+    if s >= 0:
+        return slot_x[s], slot_q[s]
+    q = wp.normalize(wp.quatd(wp.transform_get_rotation(body_q[b])))
+    return wp.vec3d(wp.transform_get_translation(body_q[b])) + wp.quat_rotate(q, wp.vec3d(body_com[b])), q
+
+
+@wp.func
+def _relative_rotation(q_ja: wp.quatd, q_jc: wp.quatd) -> wp.quatd:
+    """Short-arc quaternion of ``R_Jaᵀ R_Jc``."""
+    q = wp.quat_inverse(q_ja) * q_jc
+    if q[3] < 0.0:
+        q = q * wp.float64(-1.0)
+    return q
+
+
+@wp.kernel
+def joint_residual_kernel(
+    row_joint: wp.array[wp.int32],
+    row_angular: wp.array[wp.int32],
+    row_dir: wp.array[wp.vec3],
+    joint_parent: wp.array[wp.int32],
+    joint_child: wp.array[wp.int32],
+    X_pj: wp.array[wp.transform],
+    X_cj: wp.array[wp.transform],
+    body_slot: wp.array[wp.int32],
+    slot_x: wp.array[wp.vec3d],
+    slot_q: wp.array[wp.quatd],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    # outputs
+    residual: wp.array[wp.float64],
+):
+    """Violation of each row at the live pose: the anchor offset ``R_Jaᵀ (x_Jc - x_Ja)``
+    or the rotation ``2 nu`` along the locked direction, zero when satisfied."""
+    r = wp.tid()
+    j = row_joint[r]
+    xa, qa = _com_frame(joint_parent[j], body_slot, slot_x, slot_q, body_q, body_com)
+    xc, qc = _com_frame(joint_child[j], body_slot, slot_x, slot_q, body_q, body_com)
+    q_ja = qa * wp.quatd(wp.transform_get_rotation(X_pj[j]))
+    b = wp.vec3d(row_dir[r])
+    if row_angular[r] == 1:
+        q_rel = _relative_rotation(q_ja, qc * wp.quatd(wp.transform_get_rotation(X_cj[j])))
+        residual[r] = wp.float64(2.0) * wp.dot(b, wp.vec3d(q_rel[0], q_rel[1], q_rel[2]))
+    else:
+        x_ja = xa + wp.quat_rotate(qa, wp.vec3d(wp.transform_get_translation(X_pj[j])))
+        x_jc = xc + wp.quat_rotate(qc, wp.vec3d(wp.transform_get_translation(X_cj[j])))
+        residual[r] = wp.dot(b, wp.quat_rotate_inv(q_ja, x_jc - x_ja))

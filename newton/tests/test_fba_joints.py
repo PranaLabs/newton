@@ -10,6 +10,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.fba import joints as J
 from newton._src.solvers.fba.joints import build_joint_rows, locked_directions
 
 Dof = newton.ModelBuilder.JointDofConfig
@@ -82,6 +83,37 @@ class TestFBAJointRows(unittest.TestCase):
         builder.add_articulation([builder.add_joint_distance(-1, l0, min_distance=0.5, max_distance=1.0)])
         with self.assertRaises(NotImplementedError):
             _rows(builder.finalize())
+
+
+class TestFBAJointKernels(unittest.TestCase):
+    def _residual(self, model, rows):
+        """Row residuals at the model poses (no integrated slots: frames come from body_q)."""
+        R = rows.row_joint.shape[0]
+        none = wp.full(model.body_count, -1, dtype=wp.int32, device="cpu")
+        res = wp.empty(R, dtype=wp.float64, device="cpu")
+        args = [rows.row_joint, rows.row_angular, rows.row_dir, rows.parent, rows.child, rows.X_pj, rows.X_cj, none]
+        empty = [wp.empty(0, dtype=wp.vec3d, device="cpu"), wp.empty(0, dtype=wp.quatd, device="cpu")]
+        wp.launch(
+            J.joint_residual_kernel,
+            dim=R,
+            inputs=[*args, *empty, model.body_q, model.body_com],
+            outputs=[res],
+            device="cpu",
+        )
+        return res.numpy()
+
+    def test_residual_measures_violation(self):
+        """A revolute about z, turned by phi about x and offset by delta, reads delta and 2 sin(phi/2) x."""
+        phi, delta = 0.1, np.array([0.01, -0.02, 0.03])
+        q = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), phi)
+        builder = newton.ModelBuilder()
+        link = _link(builder, xform=wp.transform(wp.vec3(*delta) - wp.quat_rotate(q, wp.vec3(0.0, -0.5, 0.0)), q))
+        builder.add_articulation([builder.add_joint_revolute(-1, link, child_xform=wp.transform((0.0, -0.5, 0.0)))])
+        model = builder.finalize(device="cpu")
+        rows = _rows(model)
+        d, angular = rows.row_dir.numpy(), rows.row_angular.numpy() == 1
+        expected = np.where(angular, d @ [2.0 * np.sin(phi / 2.0), 0.0, 0.0], d @ delta)
+        np.testing.assert_allclose(self._residual(model, rows), expected, atol=1e-7)
 
 
 if __name__ == "__main__":

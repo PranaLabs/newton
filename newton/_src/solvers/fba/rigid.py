@@ -101,13 +101,15 @@ def retract_rigid_kernel(
     # outputs
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
+    x_live: wp.array[wp.vec3d],
+    q_live: wp.array[wp.quatd],
 ):
     """Map the solved DOFs back to body poses and velocities.
 
     The COM moves to ``R_pin chi``; the orientation is retracted from the
     step-start one, ``q = exp(R_pin rho) q_prev``, with the rotation clamped
     like the pinned frame. Velocities are ``v = (x - x_prev) / dt`` and
-    ``ω = R_pin rho / dt``.
+    ``ω = R_pin rho / dt``. The COM pose is also kept in float64 per slot.
     """
     k = wp.tid()
     i = bodies[k]
@@ -123,6 +125,8 @@ def retract_rigid_kernel(
         q = _rotate_by(omega, dt, q)
 
     v = (x - x_prev[k]) / dt
+    x_live[k] = x
+    q_live[k] = q
     origin = x - wp.quat_rotate(q, wp.vec3d(body_com[i]))
     body_q[i] = wp.transform(wp.vec3(origin), wp.quat(q))
     body_qd[i] = wp.spatial_vector(wp.vec3(v), wp.vec3(omega))

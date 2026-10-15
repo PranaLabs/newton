@@ -617,6 +617,8 @@ class SolverFBA(SolverBase):
         self._rigid_x_prev_d = wp.empty(m, dtype=wp.vec3d, device=device)
         self._rigid_b_d = wp.empty(6 * m, dtype=wp.float64, device=device)
         self._rigid_u_d = wp.empty(6 * m, dtype=wp.float64, device=device)
+        self._rigid_x_live_d = wp.empty(m, dtype=wp.vec3d, device=device)
+        self._rigid_q_live_d = wp.empty(m, dtype=wp.quatd, device=device)
 
     def _step_rigid_bodies(self, state_in: State, state_out: State, dt: float) -> None:
         """Advance the integrated bodies by one step; kinematic bodies pass through."""
@@ -662,7 +664,7 @@ class SolverFBA(SolverBase):
                 model.body_com,
                 wp.float64(dt),
             ],
-            outputs=[state_out.body_q, state_out.body_qd],
+            outputs=[state_out.body_q, state_out.body_qd, self._rigid_x_live_d, self._rigid_q_live_d],
             device=self._device,
         )
 
