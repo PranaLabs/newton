@@ -11,7 +11,8 @@ import warp as wp
 
 import newton
 from newton._src.solvers.fba import joints as J
-from newton._src.solvers.fba.joints import build_joint_rows, locked_directions
+from newton._src.solvers.fba.joints import BilateralSystem, build_joint_rows, locked_directions
+from newton._src.solvers.fba.linear_solver import build_rigid_system
 from newton._src.solvers.fba.rigid import retract_rigid_kernel
 
 Dof = newton.ModelBuilder.JointDofConfig
@@ -218,6 +219,37 @@ class TestFBAJointKernels(unittest.TestCase):
         eps = 1e-6
         fd = np.stack([(residual(u0 + eps * e) - residual(u0 - eps * e)) / (2 * eps) for e in np.eye(18)], axis=1)
         np.testing.assert_allclose(jac, fd, atol=1e-7)
+
+
+class TestBilateralSystem(unittest.TestCase):
+    def test_matches_dense_algebra(self):
+        """W = J A⁻¹ Jᵀ per block and its Newton step against dense algebra."""
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        builder = newton.ModelBuilder()
+        _add_satisfied_chain(builder)
+        pend = _link(builder, xform=wp.transform((2.0, 0.0, 0.0)))
+        x_pj, x_cj = wp.transform((2.0, 1.0, 0.0)), wp.transform((0.0, 1.0, 0.0))
+        builder.add_articulation([builder.add_joint_revolute(-1, pend, parent_xform=x_pj, child_xform=x_cj)])
+        model = builder.finalize(device=device)
+        slot = np.arange(4)
+        rows = build_joint_rows(model, slot, device)
+        np.testing.assert_array_equal(rows.block_start, [0, 13, 18])
+        A = build_rigid_system(model, slot, 0.01)
+        row_slot, row_jac, jac = _jacobian(
+            model, rows, wp.array(slot, dtype=wp.int32, device=device), *_com_poses(model), device
+        )
+        system = BilateralSystem(rows, slot, A, device)
+        system.factor(row_slot, row_jac)
+
+        W = jac @ np.linalg.solve(A.toarray(), jac.T)
+        np.testing.assert_allclose(W[:13, 13:], 0.0, atol=1e-14)  # independent blocks
+        for k, (s, e) in enumerate(itertools.pairwise(rows.block_start)):
+            np.testing.assert_allclose(system.W.numpy()[k, : e - s, : e - s], W[s:e, s:e], rtol=1e-10, atol=1e-14)
+
+        rng = np.random.default_rng(0)
+        residual, force = rng.standard_normal(18), wp.zeros(18, dtype=wp.float64, device=device)
+        system.update(wp.array(residual, dtype=wp.float64, device=device), force)
+        np.testing.assert_allclose(force.numpy(), -np.linalg.solve(W, residual), rtol=1e-8)
 
 
 if __name__ == "__main__":

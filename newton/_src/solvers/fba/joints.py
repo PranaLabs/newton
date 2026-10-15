@@ -243,3 +243,143 @@ def joint_residual_kernel(
         x_ja = xa + wp.quat_rotate(qa, wp.vec3d(wp.transform_get_translation(X_pj[j])))
         x_jc = xc + wp.quat_rotate(qc, wp.vec3d(wp.transform_get_translation(X_cj[j])))
         residual[r] = wp.dot(b, wp.quat_rotate_inv(q_ja, x_jc - x_ja))
+
+
+@wp.kernel
+def bilateral_delassus_kernel(
+    block_start: wp.array[wp.int32],
+    row_slot: wp.array2d[wp.int32],
+    row_jac: wp.array2d[wp.spatial_vectord],
+    slot_inv_mass: wp.array[wp.spatial_matrixd],
+    # outputs
+    W: wp.array3d[wp.float64],
+):
+    """Delassus block ``J A⁻¹ Jᵀ`` per independent block, padded with identity."""
+    k, i, j = wp.tid()
+    n = block_start[k + 1] - block_start[k]
+    if i >= n or j >= n:
+        W[k, i, j] = wp.where(i == j, wp.float64(1.0), wp.float64(0.0))
+        return
+    r = block_start[k] + i
+    s = block_start[k] + j
+    w = wp.float64(0.0)
+    for x in range(2):
+        for y in range(2):
+            sx = row_slot[r, x]
+            if sx >= 0 and sx == row_slot[s, y]:
+                w += wp.dot(row_jac[r, x], slot_inv_mass[sx] * row_jac[s, y])
+    W[k, i, j] = w
+
+
+@wp.kernel
+def bilateral_rhs_kernel(
+    row_block: wp.array[wp.int32],
+    row_local: wp.array[wp.int32],
+    residual: wp.array[wp.float64],
+    # outputs
+    rhs: wp.array2d[wp.float64],
+):
+    r = wp.tid()
+    rhs[row_block[r], row_local[r]] = -residual[r]
+
+
+@wp.kernel
+def bilateral_update_kernel(
+    row_block: wp.array[wp.int32],
+    row_local: wp.array[wp.int32],
+    df: wp.array2d[wp.float64],
+    # outputs
+    force: wp.array[wp.float64],
+):
+    r = wp.tid()
+    force[r] = force[r] + df[row_block[r], row_local[r]]
+
+
+_TILE_KERNELS = {}
+
+
+def _tile_kernels(tile: int):
+    """Cholesky factor and solve kernels for blocks padded to ``tile`` rows."""
+    if tile not in _TILE_KERNELS:
+
+        @wp.kernel(module="unique")
+        def factor(W: wp.array3d[wp.float64], L: wp.array3d[wp.float64]):
+            k = wp.tid()
+            wp.tile_store(L[k], wp.tile_cholesky(wp.tile_load(W[k], shape=(tile, tile))))
+
+        @wp.kernel(module="unique")
+        def solve(L: wp.array3d[wp.float64], rhs: wp.array2d[wp.float64], x: wp.array2d[wp.float64]):
+            k = wp.tid()
+            L_k = wp.tile_load(L[k], shape=(tile, tile))
+            wp.tile_store(x[k], wp.tile_cholesky_solve(L_k, wp.tile_load(rhs[k], shape=tile)))
+
+        _TILE_KERNELS[tile] = (factor, solve)
+    return _TILE_KERNELS[tile]
+
+
+class BilateralSystem:
+    """Newton system ``W df = -residual`` of the joint rows, ``W = J A⁻¹ Jᵀ``.
+
+    ``W`` is block diagonal over the independent blocks of :class:`JointRows`;
+    each block is Cholesky-factored once per step. ``A⁻¹`` comes from the 6x6
+    diagonal blocks of the rigid system matrix.
+    """
+
+    def __init__(self, rows: JointRows, body_slot: np.ndarray, A_rigid, device):
+        sizes = np.diff(rows.block_start)
+        self.tile = max(8, 1 << int(np.ceil(np.log2(sizes.max()))))
+        if self.tile > 128:
+            raise NotImplementedError(f"SolverFBA supports at most 128 joint rows per articulation, got {sizes.max()}")
+        n_blocks, R, m = len(sizes), int(rows.block_start[-1]), A_rigid.shape[0] // 6
+        bsr = A_rigid.tobsr(blocksize=(6, 6))
+        if not np.array_equal(bsr.indices, np.arange(m)):
+            raise ValueError("The rigid system matrix must be block diagonal")
+        self.slot_inv_mass = wp.array(np.linalg.inv(bsr.data), dtype=wp.spatial_matrixd, device=device)
+
+        row_block = np.repeat(np.arange(n_blocks), sizes)
+        self.row_block = wp.array(row_block, dtype=wp.int32, device=device)
+        self.row_local = wp.array(np.arange(R) - rows.block_start[row_block], dtype=wp.int32, device=device)
+        self.block_start = wp.array(rows.block_start, dtype=wp.int32, device=device)
+        self.W = wp.empty((n_blocks, self.tile, self.tile), dtype=wp.float64, device=device)
+        self.L = wp.empty_like(self.W)
+        self.rhs = wp.zeros((n_blocks, self.tile), dtype=wp.float64, device=device)
+        self.df = wp.zeros_like(self.rhs)
+        self.device = device
+
+    def factor(self, row_slot: wp.array2d[wp.int32], row_jac: wp.array2d[wp.spatial_vectord]) -> None:
+        """Assemble and factor ``W`` for this step's Jacobian."""
+        wp.launch(
+            bilateral_delassus_kernel,
+            dim=self.W.shape,
+            inputs=[self.block_start, row_slot, row_jac, self.slot_inv_mass],
+            outputs=[self.W],
+            device=self.device,
+        )
+        wp.launch_tiled(
+            _tile_kernels(self.tile)[0], dim=self.W.shape[0], inputs=[self.W, self.L], block_dim=64, device=self.device
+        )
+
+    def update(self, residual: wp.array[wp.float64], force: wp.array[wp.float64]) -> None:
+        """Newton step on hard rows: ``force += W⁻¹ (-residual)``."""
+        R = residual.shape[0]
+        wp.launch(
+            bilateral_rhs_kernel,
+            dim=R,
+            inputs=[self.row_block, self.row_local, residual],
+            outputs=[self.rhs],
+            device=self.device,
+        )
+        wp.launch_tiled(
+            _tile_kernels(self.tile)[1],
+            dim=self.W.shape[0],
+            inputs=[self.L, self.rhs, self.df],
+            block_dim=64,
+            device=self.device,
+        )
+        wp.launch(
+            bilateral_update_kernel,
+            dim=R,
+            inputs=[self.row_block, self.row_local, self.df],
+            outputs=[force],
+            device=self.device,
+        )
