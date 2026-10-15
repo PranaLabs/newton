@@ -143,12 +143,72 @@ def _com_frame(
 
 
 @wp.func
+def _spatial(lin: wp.vec3d, ang: wp.vec3d) -> wp.spatial_vectord:
+    return wp.spatial_vectord(lin[0], lin[1], lin[2], ang[0], ang[1], ang[2])
+
+
+@wp.func
 def _relative_rotation(q_ja: wp.quatd, q_jc: wp.quatd) -> wp.quatd:
     """Short-arc quaternion of ``R_Jaᵀ R_Jc``."""
     q = wp.quat_inverse(q_ja) * q_jc
     if q[3] < 0.0:
         q = q * wp.float64(-1.0)
     return q
+
+
+@wp.kernel
+def joint_jacobian_kernel(
+    row_joint: wp.array[wp.int32],
+    row_angular: wp.array[wp.int32],
+    row_dir: wp.array[wp.vec3],
+    joint_parent: wp.array[wp.int32],
+    joint_child: wp.array[wp.int32],
+    X_pj: wp.array[wp.transform],
+    X_cj: wp.array[wp.transform],
+    body_slot: wp.array[wp.int32],
+    slot_x: wp.array[wp.vec3d],
+    slot_q: wp.array[wp.quatd],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    # outputs
+    row_slot: wp.array2d[wp.int32],
+    row_jac: wp.array2d[wp.spatial_vectord],
+):
+    """Row coefficients on the DOFs ``(chi, rho)`` of the parent and child body.
+
+    Evaluated at the pinned frame. A translational row along ``d = R_Ja b`` acts
+    on the anchor velocities; a rotational row uses the direction
+    ``d = R_Ja (eta b + nu x b)`` of the relative rotation ``(eta, nu)``, which
+    makes it the exact derivative of the residual ``2 nu · b``. World
+    coefficients are rotated into each body's pinned frame.
+    """
+    r = wp.tid()
+    j = row_joint[r]
+    a = joint_parent[j]
+    c = joint_child[j]
+    _xa, qa = _com_frame(a, body_slot, slot_x, slot_q, body_q, body_com)
+    _xc, qc = _com_frame(c, body_slot, slot_x, slot_q, body_q, body_com)
+    q_ja = qa * wp.quatd(wp.transform_get_rotation(X_pj[j]))
+    b = wp.vec3d(row_dir[r])
+    lin = wp.vec3d(0.0, 0.0, 0.0)
+    ang_a = wp.vec3d(0.0, 0.0, 0.0)
+    ang_c = wp.vec3d(0.0, 0.0, 0.0)
+    if row_angular[r] == 1:
+        q_rel = _relative_rotation(q_ja, qc * wp.quatd(wp.transform_get_rotation(X_cj[j])))
+        d = wp.quat_rotate(q_ja, q_rel[3] * b + wp.cross(wp.vec3d(q_rel[0], q_rel[1], q_rel[2]), b))
+        ang_a = -d
+        ang_c = d
+    else:
+        lin = wp.quat_rotate(q_ja, b)
+        ang_a = -wp.cross(wp.quat_rotate(qa, wp.vec3d(wp.transform_get_translation(X_pj[j]))), lin)
+        ang_c = wp.cross(wp.quat_rotate(qc, wp.vec3d(wp.transform_get_translation(X_cj[j]))), lin)
+    sa = -1
+    if a >= 0:
+        sa = body_slot[a]
+    row_slot[r, 0] = sa
+    row_slot[r, 1] = body_slot[c]
+    row_jac[r, 0] = _spatial(-wp.quat_rotate_inv(qa, lin), wp.quat_rotate_inv(qa, ang_a))
+    row_jac[r, 1] = _spatial(wp.quat_rotate_inv(qc, lin), wp.quat_rotate_inv(qc, ang_c))
 
 
 @wp.kernel

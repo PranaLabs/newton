@@ -12,6 +12,7 @@ import warp as wp
 import newton
 from newton._src.solvers.fba import joints as J
 from newton._src.solvers.fba.joints import build_joint_rows, locked_directions
+from newton._src.solvers.fba.rigid import retract_rigid_kernel
 
 Dof = newton.ModelBuilder.JointDofConfig
 
@@ -114,6 +115,99 @@ class TestFBAJointKernels(unittest.TestCase):
         d, angular = rows.row_dir.numpy(), rows.row_angular.numpy() == 1
         expected = np.where(angular, d @ [2.0 * np.sin(phi / 2.0), 0.0, 0.0], d @ delta)
         np.testing.assert_allclose(self._residual(model, rows), expected, atol=1e-7)
+
+    def _satisfied_chain(self):
+        """Prismatic (world, slid 0.3) -> revolute (turned 40 deg) -> ball, all satisfied."""
+        builder = newton.ModelBuilder()
+        q1 = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), 0.7)
+        q2 = wp.quat_rpy(0.3, -0.5, 1.1)
+        x1 = wp.vec3(0.3, 0.5, 0.0) - wp.quat_rotate(q1, wp.vec3(0.0, -0.4, 0.0))
+        x2 = x1 + wp.quat_rotate(q1, wp.vec3(0.2, 0.3, 0.0)) - wp.quat_rotate(q2, wp.vec3(0.0, 0.1, 0.2))
+        l0 = _link(builder, xform=wp.transform((0.3, 0.0, 0.0)))
+        l1 = _link(builder, xform=wp.transform(x1, q1), com=wp.vec3(0.05, 0.0, 0.0))
+        l2 = _link(builder, xform=wp.transform(x2, q2))
+        joints = [
+            builder.add_joint_prismatic(-1, l0, axis=(1.0, 0.0, 0.0)),
+            builder.add_joint_revolute(
+                l0,
+                l1,
+                axis=(0.0, 0.0, 1.0),
+                parent_xform=wp.transform((0.0, 0.5, 0.0)),
+                child_xform=wp.transform((0.0, -0.4, 0.0)),
+            ),
+            builder.add_joint_ball(
+                l1, l2, parent_xform=wp.transform((0.2, 0.3, 0.0)), child_xform=wp.transform((0.0, 0.1, 0.2))
+            ),
+        ]
+        builder.add_articulation(joints)
+        return builder.finalize(device="cpu")
+
+    def test_jacobian_matches_finite_differences(self):
+        model = self._satisfied_chain()
+        rows, slot = _rows(model), wp.array(np.arange(3), dtype=wp.int32, device="cpu")
+        R = rows.row_joint.shape[0]
+        tf = model.body_q.numpy().astype(np.float64)
+        q0 = tf[:, 3:] / np.linalg.norm(tf[:, 3:], axis=1, keepdims=True)
+        x0 = np.array(
+            [wp.quat_rotate(wp.quatd(*q), wp.vec3d(*c)) for q, c in zip(q0, model.body_com.numpy(), strict=True)]
+        )
+        x0 += tf[:, :3]
+        x0_d, q0_d = wp.array(x0, dtype=wp.vec3d, device="cpu"), wp.array(q0, dtype=wp.quatd, device="cpu")
+        row_args = [rows.row_joint, rows.row_angular, rows.row_dir, rows.parent, rows.child, rows.X_pj, rows.X_cj, slot]
+
+        row_slot = wp.empty((R, 2), dtype=wp.int32, device="cpu")
+        row_jac = wp.empty((R, 2), dtype=wp.spatial_vectord, device="cpu")
+        wp.launch(
+            J.joint_jacobian_kernel,
+            dim=R,
+            inputs=[*row_args, x0_d, q0_d, model.body_q, model.body_com],
+            outputs=[row_slot, row_jac],
+            device="cpu",
+        )
+        jac = np.zeros((R, 18))
+        for r, (slots, coeffs) in enumerate(zip(row_slot.numpy(), row_jac.numpy(), strict=True)):
+            for s, c in zip(slots, coeffs, strict=True):
+                if s >= 0:
+                    jac[r, 6 * s : 6 * s + 6] += c
+
+        def residual(u):
+            x_live, q_live = wp.empty(3, dtype=wp.vec3d, device="cpu"), wp.empty(3, dtype=wp.quatd, device="cpu")
+            scratch = [
+                wp.empty(3, dtype=wp.transform, device="cpu"),
+                wp.empty(3, dtype=wp.spatial_vector, device="cpu"),
+            ]
+            wp.launch(
+                retract_rigid_kernel,
+                dim=3,
+                inputs=[
+                    slot,
+                    wp.array(u, dtype=wp.float64, device="cpu"),
+                    q0_d,
+                    x0_d,
+                    model.body_q,
+                    model.body_com,
+                    wp.float64(1.0),
+                ],
+                outputs=[*scratch, x_live, q_live],
+                device="cpu",
+            )
+            res = wp.empty(R, dtype=wp.float64, device="cpu")
+            wp.launch(
+                J.joint_residual_kernel,
+                dim=R,
+                inputs=[*row_args, x_live, q_live, model.body_q, model.body_com],
+                outputs=[res],
+                device="cpu",
+            )
+            return res.numpy()
+
+        u0 = np.zeros(18)
+        for k in range(3):  # chi = R_pinᵀ x with the pinned frame at the current pose
+            u0[6 * k : 6 * k + 3] = wp.quat_rotate_inv(wp.quatd(*q0[k]), wp.vec3d(*x0[k]))
+        np.testing.assert_allclose(residual(u0), 0.0, atol=1e-6)
+        eps = 1e-6
+        fd = np.stack([(residual(u0 + eps * e) - residual(u0 - eps * e)) / (2 * eps) for e in np.eye(18)], axis=1)
+        np.testing.assert_allclose(jac, fd, atol=1e-7)
 
 
 if __name__ == "__main__":
