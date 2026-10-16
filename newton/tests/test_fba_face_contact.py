@@ -186,7 +186,7 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
         if not wp.is_cuda_available():
             raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
 
-    def _run(self, face_contacts, pos, cells, steps):
+    def _run(self, face_contacts, pos, cells, steps, thickness=0.0):
         """Final particle positions, the largest particle speed and the solver."""
         builder = newton.ModelBuilder()
         cfg = newton.ModelBuilder.ShapeConfig(mu=0.6)
@@ -207,7 +207,9 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
             edge_ke=0.1,
         )
         model = builder.finalize()
-        solver = newton.solvers.SolverFBA(model, iterations=10, face_contacts=face_contacts)
+        solver = newton.solvers.SolverFBA(
+            model, iterations=10, face_contacts=face_contacts, soft_contact_thickness=thickness
+        )
         pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.05)
         contacts, s0, s1, speed = pipeline.contacts(), model.state(), model.state(), 0.0
         for _ in range(steps):
@@ -217,20 +219,32 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
             speed = max(speed, float(np.abs(s0.particle_qd.numpy()).max()))
         return s0.particle_q.numpy(), speed, solver
 
-    def test_box_edge_stays_out_of_the_faces(self):
-        """Draped over the top edge, the cloth keeps the edge out of its faces, not just off its particles."""
+    @staticmethod
+    def _deepest(x, solver):
+        """Signed distance of the deepest box point inside the cloth faces [m]."""
         u, v = np.mgrid[0.0:1.0:21j, 0.0:1.0:21j]
         grid = np.stack([1.0 - u - v, u, v], axis=-1).reshape(-1, 3)
-        grid = grid[grid[:, 0] >= 0.0]
+        faces = np.einsum("gk,tkd->tgd", grid[grid[:, 0] >= 0.0], x[solver.model.tri_indices.numpy()])
+        return _box_sdf(faces - [0.0, 0.0, 0.3], np.full(3, 0.3)).min()
+
+    def test_box_edge_stays_out_of_the_faces(self):
+        """Draped over the top edge, the cloth keeps the edge out of its faces, not just off its particles."""
         for face_contacts, bound in ((False, -5e-3), (True, -2.5e-3)):
             x, speed, solver = self._run(face_contacts, (0.0, -0.3, 0.65), 12, 240)
-            faces = np.einsum("gk,tkd->tgd", grid, x[solver.model.tri_indices.numpy()])
-            deepest = _box_sdf(faces - [0.0, 0.0, 0.3], np.full(3, 0.3)).min()
+            deepest = self._deepest(x, solver)
             if face_contacts:
                 self.assertGreater(deepest, bound)
             else:  # particle contacts alone let the edge 5 mm or more into the faces
                 self.assertLess(deepest, bound)
             self.assertLess(speed, 1.5)
+
+    def test_contact_thickness(self):
+        """The cloth rests the thickness above the top face, and draped over the edge it clears the edge."""
+        x, _, _ = self._run(True, (-0.1, -0.1, 0.62), 4, 60, thickness=3e-3)
+        np.testing.assert_allclose(x[:, 2] - 0.6, 3e-3, atol=1e-5)
+        x, speed, solver = self._run(True, (0.0, -0.3, 0.65), 12, 240, thickness=3e-3)
+        self.assertGreater(self._deepest(x, solver), 1e-3)
+        self.assertLess(speed, 1.5)
 
     def test_flat_contact_is_unchanged(self):
         """On a flat face every triangle is deepest at a vertex: no face contact, the same trajectory."""

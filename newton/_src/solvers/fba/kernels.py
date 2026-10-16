@@ -5663,6 +5663,16 @@ def compute_normal_offset_kernel(
 
 
 @wp.kernel
+def add_offset_kernel(
+    delta: wp.float64,
+    offset: wp.array[wp.float64],  # (M,) inout
+):
+    """``offset[c] += delta``: the contact stops ``delta`` outside the shape surface."""
+    c = wp.tid()
+    offset[c] = offset[c] + delta
+
+
+@wp.kernel
 def compute_tangent_basis_kernel(
     normal: wp.array[wp.vec3],  # (M,) world-frame unit normal per contact
     shape_idx: wp.array[wp.int32],  # (M,)

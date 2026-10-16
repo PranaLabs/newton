@@ -239,6 +239,7 @@ class SolverFBA(SolverBase):
         contact_regularization: float = 1.0e-2,
         face_contacts: bool = False,
         face_contact_edge_radius: float = 3.0e-3,
+        soft_contact_thickness: float = 0.0,
     ) -> None:
         """
         Args:
@@ -342,6 +343,11 @@ class SolverFBA(SolverBase):
                 triangle point that sinks into the edge flips its normal and
                 pushes the cloth sideways; the rounding keeps the normal
                 continuous, as RealSim's smoothed SDF does.
+            soft_contact_thickness: Distance [m] outside a shape surface at
+                which particle and face contacts stop, the thickness of the
+                deformable surface. It shifts their constraint planes along
+                the contact normal and leaves rigid contacts and friction
+                unchanged; with ``0`` the points stop on the surface.
         """
         super().__init__(model)
 
@@ -423,6 +429,7 @@ class SolverFBA(SolverBase):
         self.contact_regularization = float(contact_regularization)
         self.face_contacts = bool(face_contacts)
         self.face_contact_edge_radius = float(face_contact_edge_radius)
+        self.soft_contact_thickness = float(soft_contact_thickness)
         self._face_query, self._contact_extra = None, None
         if self.face_contacts:
             if not self.friction or nsn_schur_mode != "full" or not self.use_isodof or mu_per_pair_override is not None:
@@ -2318,6 +2325,16 @@ class SolverFBA(SolverBase):
             outputs=[self._contact_offset_d],
             device=device,
         )
+        if self.soft_contact_thickness != 0.0:
+            from .kernels import add_offset_kernel  # noqa: PLC0415
+
+            wp.launch(
+                add_offset_kernel,
+                dim=M,
+                inputs=[wp.float64(self.soft_contact_thickness)],
+                outputs=[self._contact_offset_d],
+                device=device,
+            )
 
         # Host mirrors of the basic contact fields are still consumed by
         # the CPU residual (``_compute_contact_residual*``); a follow-on
