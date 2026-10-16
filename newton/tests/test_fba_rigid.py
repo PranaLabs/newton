@@ -154,6 +154,60 @@ class TestFBARigidRows(unittest.TestCase):
         with self.assertRaises(ValueError):
             rigid_block_inverses(A.tocsr())
 
+    def test_delassus_and_gather_match_dense_algebra(self):
+        from scipy.linalg import block_diag
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        rng = np.random.default_rng(1)
+        m, n_soft = 3, 3
+        row_slot = np.array([[-1, -1], [-1, 0], [1, 2], [2, -1], [0, 1], [-1, -1], [2, 0], [1, -1]], dtype=np.int32)
+        n = row_slot.shape[0]
+        row_jac = rng.standard_normal((n, 2, 6))
+        inv_mass = rng.standard_normal((m, 6, 6))
+        inv_mass = inv_mass @ inv_mass.transpose(0, 2, 1) + np.eye(6)
+        W_soft = rng.standard_normal((n_soft, n_soft))
+        W_soft = W_soft @ W_soft.T
+        J = np.zeros((n, 6 * m))
+        for r, k in np.argwhere(row_slot >= 0):
+            J[r, 6 * row_slot[r, k] : 6 * row_slot[r, k] + 6] += row_jac[r, k]
+        expected = J @ block_diag(*inv_mass) @ J.T
+        expected[:n_soft, :n_soft] += W_soft
+
+        row_slot_d = wp.array(row_slot, dtype=wp.int32, device=device)
+        row_jac_d = wp.array(row_jac, dtype=wp.spatial_vectord, device=device)
+        W = wp.empty((n, n), dtype=wp.float64, device=device)
+        wp.launch(
+            rigid.rigid_delassus_kernel,
+            dim=(n, n),
+            inputs=[
+                wp.array(W_soft, dtype=wp.float64, device=device),
+                n_soft,
+                row_slot_d,
+                row_jac_d,
+                wp.array(inv_mass, dtype=wp.spatial_matrixd, device=device),
+            ],
+            outputs=[W],
+            device=device,
+        )
+        np.testing.assert_allclose(W.numpy(), expected, rtol=1e-12, atol=1e-12)
+
+        force, b_const = rng.standard_normal(n), rng.standard_normal(6 * m)
+        incidence = [wp.array(a, dtype=wp.int32, device=device) for a in rigid.row_incidence(row_slot, m)]
+        b = wp.empty(6 * m, dtype=wp.float64, device=device)
+        wp.launch(
+            rigid.row_force_rhs_kernel,
+            dim=m,
+            inputs=[
+                *incidence,
+                row_jac_d,
+                wp.array(force, dtype=wp.float64, device=device),
+                wp.array(b_const, dtype=wp.float64, device=device),
+            ],
+            outputs=[b],
+            device=device,
+        )
+        np.testing.assert_allclose(b.numpy(), b_const + J.T @ force, rtol=1e-12)
+
 
 class TestSolverFBARigidStep(unittest.TestCase):
     """SolverFBA integrates dynamic bodies and passes kinematic ones through."""
