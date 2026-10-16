@@ -10,8 +10,13 @@ In that frame the rigid block ``diag(m I3, I) / dt^2`` stays constant (see
 :func:`~newton._src.solvers.fba.linear_solver.build_rigid_system`). Poses are
 retracted from the step-start pose. Velocities follow Newton's convention,
 ``body_qd = (v_com, omega)`` in world frame, and ``body_q`` is the body origin.
+
+A constraint row acts on at most two integrated bodies. Side ``k`` of row ``r``
+names the body slot ``row_slot[r, k]`` (-1 for none) and its coefficients
+``row_jac[r, k]`` on that slot's DOFs.
 """
 
+import numpy as np
 import warp as wp
 
 # Stability clamp on the rotation per step, |omega| * dt <= 0.5 [rad].
@@ -130,3 +135,42 @@ def retract_rigid_kernel(
     origin = x - wp.quat_rotate(q, wp.vec3d(body_com[i]))
     body_q[i] = wp.transform(wp.vec3(origin), wp.quat(q))
     body_qd[i] = wp.spatial_vector(wp.vec3(v), wp.vec3(omega))
+
+
+def row_incidence(row_slot: np.ndarray, slot_count: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Rows touching each body slot, as a CSR over ``(row, side)`` entries.
+
+    Args:
+        row_slot: Body slot of both sides of each row, -1 for none, shape [row_count, 2].
+        slot_count: Number of body slots.
+
+    Returns:
+        ``(slot_entry_start, entry_row, entry_side)``; the entries of slot ``k``
+        are ``slot_entry_start[k]:slot_entry_start[k + 1]``.
+    """
+    n = row_slot.shape[0]
+    slots, rows, sides = row_slot.ravel(), np.repeat(np.arange(n), 2), np.tile([0, 1], n)
+    keep = slots >= 0
+    order = np.argsort(slots[keep], kind="stable")
+    start = np.searchsorted(slots[keep][order], np.arange(slot_count + 1))
+    return start.astype(np.int32), rows[keep][order].astype(np.int32), sides[keep][order].astype(np.int32)
+
+
+@wp.kernel
+def row_force_rhs_kernel(
+    slot_entry_start: wp.array[wp.int32],
+    entry_row: wp.array[wp.int32],
+    entry_side: wp.array[wp.int32],
+    row_jac: wp.array2d[wp.spatial_vectord],
+    force: wp.array[wp.float64],
+    b_const: wp.array[wp.float64],
+    # outputs
+    b: wp.array[wp.float64],
+):
+    """``b = b_const + Jᵀ f`` per body slot, gathered over the rows touching it."""
+    k = wp.tid()
+    acc = wp.spatial_vectord()
+    for e in range(slot_entry_start[k], slot_entry_start[k + 1]):
+        acc += force[entry_row[e]] * row_jac[entry_row[e], entry_side[e]]
+    for c in range(6):
+        b[6 * k + c] = b_const[6 * k + c] + acc[c]

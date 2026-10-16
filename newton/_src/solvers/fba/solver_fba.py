@@ -598,6 +598,7 @@ class SolverFBA(SolverBase):
             FBALinearSolver,
             build_rigid_system,
             factorize_and_sparse_inverse,
+            rigid_block_inverses,
         )
 
         self._rigid_dt = dt
@@ -614,15 +615,16 @@ class SolverFBA(SolverBase):
         m = bodies.size
         device = self._device
         self._rigid_bodies_d = wp.array(bodies, dtype=wp.int32, device=device)
+        self._slot_inv_mass_d = wp.array(rigid_block_inverses(A), dtype=wp.spatial_matrixd, device=device)
         self._rigid_q_pin_d = wp.empty(m, dtype=wp.quatd, device=device)
         self._rigid_x_prev_d = wp.empty(m, dtype=wp.vec3d, device=device)
         self._rigid_b_d = wp.empty(6 * m, dtype=wp.float64, device=device)
         self._rigid_u_d = wp.empty(6 * m, dtype=wp.float64, device=device)
         self._rigid_x_live_d = wp.empty(m, dtype=wp.vec3d, device=device)
         self._rigid_q_live_d = wp.empty(m, dtype=wp.quatd, device=device)
-        self._setup_joints(bodies, A)
+        self._setup_joints(bodies)
 
-    def _setup_joints(self, bodies: np.ndarray, A_rigid) -> None:
+    def _setup_joints(self, bodies: np.ndarray) -> None:
         """Collect the joint rows on the integrated bodies and their Newton system."""
         from .joints import BilateralSystem, build_joint_rows  # noqa: PLC0415
 
@@ -633,7 +635,7 @@ class SolverFBA(SolverBase):
         if self._joint_rows is None:
             return
         R = int(self._joint_rows.block_start[-1])
-        self._joint_system = BilateralSystem(self._joint_rows, slot, A_rigid, device)
+        self._joint_system = BilateralSystem(self._joint_rows, slot, self._slot_inv_mass_d, device)
         self._body_slot_d = wp.array(slot, dtype=wp.int32, device=device)
         self._joint_row_slot_d = wp.empty((R, 2), dtype=wp.int32, device=device)
         self._joint_row_jac_d = wp.empty((R, 2), dtype=wp.spatial_vectord, device=device)

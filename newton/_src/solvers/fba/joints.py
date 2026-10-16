@@ -15,6 +15,7 @@ import numpy as np
 import warp as wp
 
 from ...sim import JointType, Model
+from .rigid import row_force_rhs_kernel, row_incidence
 
 _CONSTRAINT_JOINTS = (JointType.PRISMATIC, JointType.REVOLUTE, JointType.BALL, JointType.FIXED, JointType.D6)
 
@@ -295,26 +296,6 @@ def bilateral_update_kernel(
     force[r] = force[r] + df[row_block[r], row_local[r]]
 
 
-@wp.kernel
-def joint_force_rhs_kernel(
-    slot_entry_start: wp.array[wp.int32],
-    entry_row: wp.array[wp.int32],
-    entry_side: wp.array[wp.int32],
-    row_jac: wp.array2d[wp.spatial_vectord],
-    force: wp.array[wp.float64],
-    b_const: wp.array[wp.float64],
-    # outputs
-    b: wp.array[wp.float64],
-):
-    """``b = b_const + Jᵀ f`` per body slot, gathered over the rows touching it."""
-    k = wp.tid()
-    acc = wp.spatial_vectord()
-    for e in range(slot_entry_start[k], slot_entry_start[k + 1]):
-        acc += force[entry_row[e]] * row_jac[entry_row[e], entry_side[e]]
-    for c in range(6):
-        b[6 * k + c] = b_const[6 * k + c] + acc[c]
-
-
 _TILE_KERNELS = {}
 
 
@@ -341,20 +322,17 @@ class BilateralSystem:
     """Newton system ``W df = -residual`` of the joint rows, ``W = J A⁻¹ Jᵀ``.
 
     ``W`` is block diagonal over the independent blocks of :class:`JointRows`;
-    each block is Cholesky-factored once per step. ``A⁻¹`` comes from the 6x6
-    diagonal blocks of the rigid system matrix.
+    each block is Cholesky-factored once per step. ``slot_inv_mass`` holds the
+    inverse 6x6 diagonal blocks of the rigid system matrix.
     """
 
-    def __init__(self, rows: JointRows, body_slot: np.ndarray, A_rigid, device):
+    def __init__(self, rows: JointRows, body_slot: np.ndarray, slot_inv_mass: wp.array, device):
         sizes = np.diff(rows.block_start)
         self.tile = max(8, 1 << int(np.ceil(np.log2(sizes.max()))))
         if self.tile > 128:
             raise NotImplementedError(f"SolverFBA supports at most 128 joint rows per articulation, got {sizes.max()}")
-        n_blocks, R, m = len(sizes), int(rows.block_start[-1]), A_rigid.shape[0] // 6
-        bsr = A_rigid.tobsr(blocksize=(6, 6))
-        if not np.array_equal(bsr.indices, np.arange(m)):
-            raise ValueError("The rigid system matrix must be block diagonal")
-        self.slot_inv_mass = wp.array(np.linalg.inv(bsr.data), dtype=wp.spatial_matrixd, device=device)
+        n_blocks, R = len(sizes), int(rows.block_start[-1])
+        self.slot_inv_mass = slot_inv_mass
 
         row_block = np.repeat(np.arange(n_blocks), sizes)
         self.row_block = wp.array(row_block, dtype=wp.int32, device=device)
@@ -362,15 +340,10 @@ class BilateralSystem:
         joint = rows.row_joint.numpy()
         parent, child = rows.parent.numpy()[joint], rows.child.numpy()[joint]
         slots = np.stack([np.where(parent >= 0, body_slot[np.maximum(parent, 0)], -1), body_slot[child]], axis=1)
-        entry_slot, entry_row, entry_side = (
-            a[slots.ravel() >= 0] for a in (slots.ravel(), np.repeat(np.arange(R), 2), np.tile([0, 1], R))
-        )
-        order = np.argsort(entry_slot, kind="stable")
-        self.slot_entry_start = wp.array(
-            np.searchsorted(entry_slot[order], np.arange(m + 1)), dtype=wp.int32, device=device
-        )
-        self.entry_row = wp.array(entry_row[order], dtype=wp.int32, device=device)
-        self.entry_side = wp.array(entry_side[order], dtype=wp.int32, device=device)
+        start, entry_row, entry_side = row_incidence(slots, slot_inv_mass.shape[0])
+        self.slot_entry_start = wp.array(start, dtype=wp.int32, device=device)
+        self.entry_row = wp.array(entry_row, dtype=wp.int32, device=device)
+        self.entry_side = wp.array(entry_side, dtype=wp.int32, device=device)
 
         self.block_start = wp.array(rows.block_start, dtype=wp.int32, device=device)
         self.W = wp.empty((n_blocks, self.tile, self.tile), dtype=wp.float64, device=device)
@@ -420,7 +393,7 @@ class BilateralSystem:
     def apply_force(self, row_jac, force, b_const, b) -> None:
         """``b = b_const + Jᵀ force``."""
         wp.launch(
-            joint_force_rhs_kernel,
+            row_force_rhs_kernel,
             dim=self.slot_entry_start.shape[0] - 1,
             inputs=[self.slot_entry_start, self.entry_row, self.entry_side, row_jac, force, b_const],
             outputs=[b],

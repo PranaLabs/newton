@@ -308,6 +308,22 @@ def build_rigid_system(model: Model, bodies: np.ndarray, dt: float) -> sp.csr_ma
     return A
 
 
+def rigid_block_inverses(A_rigid: sp.spmatrix) -> np.ndarray:
+    """Inverse of each 6x6 diagonal block of the rigid system matrix, shape [m, 6, 6].
+
+    Raises:
+        ValueError: If ``A_rigid`` is not block diagonal in 6x6 blocks.
+    """
+    import scipy.sparse as _sp
+
+    m = A_rigid.shape[0] // 6
+    bsr = _sp.bsr_matrix(A_rigid, blocksize=(6, 6))
+    bsr.sort_indices()
+    if not (np.array_equal(bsr.indptr, np.arange(m + 1)) and np.array_equal(bsr.indices, np.arange(m))):
+        raise ValueError("The rigid system matrix must be block diagonal")
+    return np.linalg.inv(bsr.data)
+
+
 def _compute_rest_inv_from_positions(model: Model) -> np.ndarray:
     """Recompute the 2x2 rest-pose inverse per triangle from particle_q.
 

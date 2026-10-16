@@ -9,6 +9,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.fba import rigid
+from newton._src.solvers.fba.linear_solver import rigid_block_inverses
 
 DT = 0.01
 GRAVITY = np.array([0.0, 0.0, -9.81], dtype=np.float32).astype(np.float64)
@@ -135,6 +136,23 @@ class TestFBARigidKernels(unittest.TestCase):
         body = self._body(w0=(1.0e-13, 0.0, 0.0))
         _, _, q_pin, _, _ = self._prepare(body)
         np.testing.assert_allclose(q_pin.numpy()[0], body["q0"] / np.linalg.norm(body["q0"]), rtol=0.0, atol=1e-15)
+
+
+class TestFBARigidRows(unittest.TestCase):
+    """Delassus assembly and force gather of constraint rows on body slots."""
+
+    def test_block_inverses(self):
+        import scipy.sparse as sp
+
+        rng = np.random.default_rng(0)
+        blocks = rng.standard_normal((3, 6, 6))
+        blocks = blocks @ blocks.transpose(0, 2, 1) + 6.0 * np.eye(6)
+        A = sp.block_diag(blocks, format="csr")
+        np.testing.assert_allclose(rigid_block_inverses(A), np.linalg.inv(blocks), rtol=1e-10)
+        A = A.tolil()
+        A[0, 6] = A[6, 0] = 1.0  # couples two bodies
+        with self.assertRaises(ValueError):
+            rigid_block_inverses(A.tocsr())
 
 
 class TestSolverFBARigidStep(unittest.TestCase):

@@ -12,7 +12,7 @@ import warp as wp
 import newton
 from newton._src.solvers.fba import joints as J
 from newton._src.solvers.fba.joints import BilateralSystem, build_joint_rows, locked_directions
-from newton._src.solvers.fba.linear_solver import build_rigid_system
+from newton._src.solvers.fba.linear_solver import build_rigid_system, rigid_block_inverses
 from newton._src.solvers.fba.rigid import retract_rigid_kernel
 
 Dof = newton.ModelBuilder.JointDofConfig
@@ -238,7 +238,8 @@ class TestBilateralSystem(unittest.TestCase):
         row_slot, row_jac, jac = _jacobian(
             model, rows, wp.array(slot, dtype=wp.int32, device=device), *_com_poses(model), device
         )
-        system = BilateralSystem(rows, slot, A, device)
+        inv_mass = wp.array(rigid_block_inverses(A), dtype=wp.spatial_matrixd, device=device)
+        system = BilateralSystem(rows, slot, inv_mass, device)
         system.factor(row_slot, row_jac)
 
         W = jac @ np.linalg.solve(A.toarray(), jac.T)
