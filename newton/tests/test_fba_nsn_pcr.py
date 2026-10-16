@@ -177,6 +177,35 @@ class TestPCRDiagnostics(_PCRTestCase):
         self.assertEqual(rho, 0.0)
 
 
+class TestPCRScaledAndSingular(_PCRTestCase):
+    """Systems from rigid contact rows: a widely spread diagonal, and redundant rows."""
+
+    def test_scaled_diagonal_converges(self):
+        """A well-conditioned matrix rescaled by a diagonal spanning seven decades."""
+        n = 120
+        rng = np.random.default_rng(7)
+        scale = np.sqrt(10.0 ** rng.uniform(-4.0, 3.0, n))
+        A = scale[:, None] * _make_spd(n, seed=7) * scale[None, :]
+        b = rng.standard_normal(n)
+        x, _, _ = self._solve(A, b)
+        self.assertLess(np.linalg.norm(b - A @ x) / np.linalg.norm(b), 1.0e-8)
+
+    def test_near_null_directions_are_refused(self):
+        """Redundant rows with an inconsistent right-hand side: the iterate stays bounded."""
+        n, k = 120, 80
+        rng = np.random.default_rng(11)
+        J = rng.standard_normal((n, k))
+        A = J @ J.T + 1.0e-11 * np.eye(n)
+        b = A @ rng.standard_normal(n) + 1.0e-3 * rng.standard_normal(n)
+        x, _, _ = self._solve(A, b)
+        c = np.sqrt(np.diag(A))
+        x_ls = np.linalg.lstsq(A, b, rcond=1.0e-9)[0]
+        # Chart gain |C x| / |C^-1 b| of the bounded least-squares solution, and at most a few times it.
+        gain = np.linalg.norm(c * x) / np.linalg.norm(b / c)
+        self.assertLess(gain, 3.0 * np.linalg.norm(c * x_ls) / np.linalg.norm(b / c))
+        self.assertLess(np.linalg.norm(b - A @ x), 3.0 * np.linalg.norm(b - A @ x_ls))
+
+
 class TestPCRReuse(_PCRTestCase):
     """Solver buffers persist across calls (NSN reuses the same solver)."""
 

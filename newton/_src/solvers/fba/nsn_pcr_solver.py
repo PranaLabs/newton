@@ -273,6 +273,43 @@ def _div_scalar_kernel(
 
 
 @wp.kernel
+def _diag_scale_kernel(
+    A: wp.array2d[wp.float64],
+    v: wp.array[wp.float64],
+    out: wp.array[wp.float64],
+):
+    """``out = diag(A) v``."""
+    i = wp.tid()
+    out[i] = A[i, i] * v[i]
+
+
+@wp.kernel
+def _protected_alpha_kernel(
+    rho: wp.array[wp.float64],
+    den: wp.array[wp.float64],
+    curvature: wp.array[wp.float64],
+    chart_norm: wp.array[wp.float64],
+    eta: wp.float64,
+    alpha: wp.array[wp.float64],
+    stopped: wp.array[wp.float64],
+):
+    """Step length ``rho / den``, or zero from the first refused direction on.
+
+    In the Jacobi chart ``C = sqrt(diag A)`` the direction ``p`` has curvature
+    ``pᵀ A p / pᵀ diag(A) p``. Below ``eta`` a step along it amplifies the
+    residual by more than ``1 / eta``: such near-null directions, a vanishing
+    denominator, and non-finite values freeze the iterate instead.
+    """
+    if stopped[0] == wp.float64(0.0):
+        if not (den[0] > wp.float64(0.0) and curvature[0] > eta * chart_norm[0]):
+            stopped[0] = wp.float64(1.0)
+    if stopped[0] != wp.float64(0.0):
+        alpha[0] = wp.float64(0.0)
+    else:
+        alpha[0] = rho[0] / den[0]
+
+
+@wp.kernel
 def _copy_scalar_kernel(
     src: wp.array[wp.float64],
     dst: wp.array[wp.float64],
@@ -289,8 +326,14 @@ def _copy_scalar_kernel(
 class NSNPCRSolver:
     """Jacobi-preconditioned Conjugate Residual solver for SPD systems.
 
-    Ports RealSim ``CUDADenseJacobiPCRSolver`` (``CUDADenseCRSolver.cpp:121-238``)
-    line-for-line. Used as the inner linear solver for the NSN Schur LCP system.
+    :meth:`solve` runs RealSim's symmetrically preconditioned recurrence
+    (``IterativePCR.h``): conjugate residuals on ``P^1/2 A P^1/2`` with the
+    step denominator ``(A p)ᵀ P (A p)``, which stays a Krylov method when the
+    diagonal of ``A`` spans decades. Like RealSim's protected Krylov core it
+    refuses near-null directions, so a singular ``A`` with an inconsistent
+    right-hand side returns a bounded least-squares iterate.
+    :meth:`solve_sparse` keeps the original ``CUDADenseCRSolver.cpp`` port.
+    Used as the inner linear solver for the NSN Schur LCP system.
 
     The solver is *stateless* between ``solve`` calls (the C++ class is too —
     ``solve_vec_gpu`` always re-initializes ``x = 0``). Device buffers are
@@ -301,10 +344,10 @@ class NSNPCRSolver:
         max_n: Maximum system dimension the solver will handle. Internal
             buffers are sized to this.
         device: Warp device for buffer allocation (typically ``"cuda:0"``).
-        tol: Relative tolerance on the *preconditioned* residual ``rho``.
-            RealSim default is ``1e-5``
-            (``CUDADenseJacobiPCRSolver.h:13``); the convergence test is
-            ``rho < tol^2 * rho_init``.
+        tol: Relative tolerance; :meth:`solve` stops once
+            ``|b - A x| < tol |b|`` and :meth:`solve_sparse` once the
+            preconditioned residual ``rho < tol^2 * rho_init``. RealSim
+            default is ``1e-5`` (``CUDADenseJacobiPCRSolver.h:13``).
         max_iter: Outer-loop cap. Effective limit is ``min(max_iter, n)``
             per RealSim ``CUDADenseCRSolver.cpp:126``.
         check_every: Convergence-check batching factor.  PCR runs this many
@@ -312,6 +355,9 @@ class NSNPCRSolver:
             to host to test for convergence.  The default ``25`` matches the
             empirical iter count of the NSN Schur LCP on Demo 4/5 — a single
             sync per ``solve()`` call covers the typical run.
+        max_inverse_gain: Largest amplification a step of :meth:`solve` may
+            carry; directions with chart curvature below its inverse are
+            refused. RealSim's protected Krylov default is ``1e6``.
     """
 
     def __init__(
@@ -321,6 +367,7 @@ class NSNPCRSolver:
         tol: float = 1.0e-5,
         max_iter: int = 100,
         check_every: int = 25,
+        max_inverse_gain: float = 1.0e6,
     ) -> None:
         if max_n <= 0:
             raise ValueError(f"max_n must be positive, got {max_n}")
@@ -340,6 +387,7 @@ class NSNPCRSolver:
         # 25 (Perf #3) — the NSN inner converges in ≤25 iters in practice so
         # this is effectively one host sync per PCR call.
         self.check_every = max(1, int(check_every))
+        self._eta = wp.float64(1.0 / max_inverse_gain)
 
         # Pre-allocate fp64 device buffers. Names mirror RealSim ``cuda_*``
         # buffers in ``CUDADenseCRSolver.h:44-48`` for ease of cross-reference.
@@ -360,6 +408,12 @@ class NSNPCRSolver:
         self._den_d = wp.zeros(1, dtype=wp.float64, device=device)
         self._alpha_d = wp.zeros(1, dtype=wp.float64, device=device)
         self._beta_d = wp.zeros(1, dtype=wp.float64, device=device)
+        # :meth:`solve` protection: chart curvature of each direction.
+        self._dd = wp.zeros(self.max_n, dtype=wp.float64, device=device)
+        self._curvature_d = wp.zeros(1, dtype=wp.float64, device=device)
+        self._chart_norm_d = wp.zeros(1, dtype=wp.float64, device=device)
+        self._stopped_d = wp.zeros(1, dtype=wp.float64, device=device)
+        self._r_norm_d = wp.zeros(1, dtype=wp.float64, device=device)
 
         # Perf #5: cache one ``wp.Graph`` per active ``n`` shape so repeated
         # solves at the same shape replay a pre-recorded CUDA graph for the
@@ -438,24 +492,12 @@ class NSNPCRSolver:
             device=device,
         )
 
-        # ----- r = b ----------------------------------------------------
-        # RealSim line 142 (``cublasDcopy(b, r)``).
+        # ----- Symmetric PCR start (RealSim IterativePCR.h) -------------
+        # Buffers: ``_s`` holds z = P r, ``_d`` the direction p = z, ``_q``
+        # holds A p, and ``_h`` the scratch t (P q, then A z).
         wp.copy(self._r, b, count=n)
-
-        # ----- d = P * r -----------------------------------------------
-        # RealSim line 147.
-        wp.launch(
-            _apply_precond_kernel,
-            dim=n,
-            inputs=[self._r, self._precond],
-            outputs=[self._d],
-            device=device,
-        )
-
-        # ----- q = A * d -----------------------------------------------
-        # RealSim line 156 (``cublasDgemv``).  Block-per-row tile reduction
-        # with bounds-checked ``tile_load`` so OOB elements load zero (last
-        # partial K-tile).
+        wp.launch(_apply_precond_kernel, dim=n, inputs=[self._r, self._precond], outputs=[self._s], device=device)
+        wp.copy(self._d, self._s, count=n)
         wp.launch_tiled(
             _matvec_tiled_kernel,
             dim=n,
@@ -464,27 +506,20 @@ class NSNPCRSolver:
             block_dim=_PCR_BLOCK_DIM,
             device=device,
         )
-
-        # ----- h = q ---------------------------------------------------
-        # RealSim line 159.
-        wp.copy(self._h, self._q, count=n)
-
-        # ----- rho = <r, h> --------------------------------------------
-        # RealSim line 162.  ``array_inner`` writes directly to the device-
-        # resident scalar — no host round-trip and the result feeds the next
-        # iter's ``_div_scalar_kernel``.
-        wp.utils.array_inner(self._r, self._h, out=self._rho_d, count=n)
+        wp.utils.array_inner(self._s, self._q, out=self._rho_d, count=n)
+        self._stopped_d.zero_()
         rho = float(self._rho_d.numpy()[0])
-
-        # RealSim line 164: ``tol = _tol * _tol * rho`` — relative on rho.
-        tol_sq = self.tol * self.tol * rho
+        tol_sq = self.tol * self.tol * dot_b
+        r_norm_sq = dot_b
 
         # ---- PCR main loop --------------------------------------------
         # Inner loop runs in ``check_every``-sized blocks fully on the device,
-        # then syncs ``rho`` once per block to test convergence.  All per-iter
-        # scalars (``alpha``, ``beta``, ``rho``, ``den``) live in device
-        # memory.  PCR for SPD systems is monotone-convergent, so over-
+        # then syncs the residual norm once per block to test convergence.  All
+        # per-iter scalars (``alpha``, ``beta``, ``rho``, ``den``) live in
+        # device memory.  PCR for SPD systems is monotone-convergent, so over-
         # iterating past the tol bound between syncs is safe.
+        # Iterations past convergence or past a refused direction leave the
+        # iterate unchanged (see :func:`_protected_alpha_kernel`).
         #
         # Perf #5: wrap one full PCR iter into a :class:`warp.Graph` and
         # replay it ``check_every`` times per block.  Replays issue a single
@@ -496,7 +531,7 @@ class NSNPCRSolver:
 
         nb_iter = 0
         check_every = self.check_every
-        while nb_iter < max_iter and rho > tol_sq:
+        while nb_iter < max_iter and r_norm_sq > tol_sq:
             block_end = min(nb_iter + check_every, max_iter)
             block_iters = block_end - nb_iter
             if graph is not None:
@@ -512,14 +547,11 @@ class NSNPCRSolver:
                     self._pcr_iter_eager(A, n, n_pad, device)
                     nb_iter += 1
 
-            # End-of-block convergence sync: pull rho once per ``check_every``
-            # iters.  RealSim's CPU-side break on ``den == 0`` (line 172) is
-            # not reproduced here because ``_div_scalar_kernel`` emits 0 for
-            # a zero den and the next ``rho`` computation will not improve,
-            # so the relative test below will keep ``rho`` constant and the
-            # loop exits via ``max_iter`` instead.  For SPD A with well-
-            # formed preconditioner this branch is unreachable in practice.
-            rho = float(self._rho_d.numpy()[0])
+            wp.utils.array_inner(self._r, self._r, out=self._r_norm_d, count=n)
+            r_norm_sq = float(self._r_norm_d.numpy()[0])
+            if self._stopped_d.numpy()[0] != 0.0:
+                break
+        rho = float(self._rho_d.numpy()[0])
 
         # Copy x back to caller-provided output buffer.
         wp.copy(x_out, self._x, count=n)
@@ -698,15 +730,27 @@ class NSNPCRSolver:
         n_pad: int,
         device: wp.Device | str,
     ) -> None:
-        """Issue one PCR iteration of :meth:`solve` on the active stream.
+        """Issue one symmetric PCR iteration of :meth:`solve` on the active stream.
 
-        All launches are stream-ordered and safe to call inside a CUDA graph
-        capture; the per-iteration scalars stay on the device.
+        Mirrors RealSim ``IterativePCR.h``. All launches are stream-ordered
+        and safe to call inside a CUDA graph capture.
         """
-        # alpha = rho / <q, q>, x += alpha d, r -= alpha q.
-        wp.utils.array_inner(self._q, self._q, out=self._den_d, count=n)
-        wp.launch(_div_scalar_kernel, dim=1, inputs=[self._rho_d, self._den_d], outputs=[self._alpha_d], device=device)
-        for vec, sign, out in ((self._d, 1.0, self._x), (self._q, -1.0, self._r)):
+        # t = P q, den = qᵀ P q.
+        wp.launch(_apply_precond_kernel, dim=n, inputs=[self._q, self._precond], outputs=[self._h], device=device)
+        wp.utils.array_inner(self._q, self._h, out=self._den_d, count=n)
+        # Chart curvature of p: pᵀ A p against pᵀ diag(A) p.
+        wp.launch(_diag_scale_kernel, dim=n, inputs=[A, self._d], outputs=[self._dd], device=device)
+        wp.utils.array_inner(self._d, self._q, out=self._curvature_d, count=n)
+        wp.utils.array_inner(self._d, self._dd, out=self._chart_norm_d, count=n)
+        wp.launch(
+            _protected_alpha_kernel,
+            dim=1,
+            inputs=[self._rho_d, self._den_d, self._curvature_d, self._chart_norm_d, self._eta],
+            outputs=[self._alpha_d, self._stopped_d],
+            device=device,
+        )
+        # x += alpha p, r -= alpha q, z -= alpha t.
+        for vec, sign, out in ((self._d, 1.0, self._x), (self._q, -1.0, self._r), (self._h, -1.0, self._s)):
             wp.launch(
                 _axpy_arr_kernel,
                 dim=n,
@@ -714,8 +758,7 @@ class NSNPCRSolver:
                 outputs=[out],
                 device=device,
             )
-        # s = P r, h = A s, rho = <r, h>, beta = rho / rho_old.
-        wp.launch(_apply_precond_kernel, dim=n, inputs=[self._r, self._precond], outputs=[self._s], device=device)
+        # t = A z, rho = zᵀ A z, beta = rho / rho_old.
         wp.launch_tiled(
             _matvec_tiled_kernel,
             dim=n,
@@ -725,7 +768,7 @@ class NSNPCRSolver:
             device=device,
         )
         wp.launch(_copy_scalar_kernel, dim=1, inputs=[self._rho_d], outputs=[self._rho_old_d], device=device)
-        wp.utils.array_inner(self._r, self._h, out=self._rho_d, count=n)
+        wp.utils.array_inner(self._s, self._h, out=self._rho_d, count=n)
         wp.launch(
             _div_scalar_kernel,
             dim=1,
@@ -733,7 +776,7 @@ class NSNPCRSolver:
             outputs=[self._beta_d],
             device=device,
         )
-        # d = beta d + s, q = beta q + h.
+        # p = z + beta p, q = t + beta q.
         wp.launch(_scal_add_arr_kernel, dim=n, inputs=[self._beta_d, self._s], outputs=[self._d], device=device)
         wp.launch(_scal_add_arr_kernel, dim=n, inputs=[self._beta_d, self._h], outputs=[self._q], device=device)
 
