@@ -3562,6 +3562,7 @@ class SolverFBA(SolverBase):
         omega_init_device: wp.array[wp.float64] | None = None,
         skip_download: bool = False,
         m_contacts: int | None = None,
+        n_bilateral: int = 0,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """GPU port of :meth:`_solve_nsn_coulomb` (Stage B NSN inner).
 
@@ -3602,6 +3603,10 @@ class SolverFBA(SolverBase):
                 read the device buffers directly.
             m_contacts: Override active contact count when only device
                 arrays are provided.
+            n_bilateral: Number of bilateral rows after the ``3M`` contact
+                rows; all row arrays then hold ``3M + n_bilateral`` rows.
+                They follow the identity law of :func:`bilateral_law_kernel`
+                and skip the cone clamp and ``lambda_cap``.
 
         Returns:
             ``(lam, omega, lam_apply)`` host fp64 arrays of shape ``(3M,)``.
@@ -3621,13 +3626,13 @@ class SolverFBA(SolverBase):
             M = int(mu_device.shape[0])
         else:
             M = 0
-        if M == 0:
+        n_rows = 3 * M + int(n_bilateral)
+        if n_rows == 0:
             return (
                 np.zeros(0, dtype=np.float64),
                 np.zeros(0, dtype=np.float64),
                 np.zeros(0, dtype=np.float64),
             )
-        n_rows = 3 * M
         device = self._device
 
         self._ensure_nsn_inner_buffers(n_rows)
@@ -3743,6 +3748,14 @@ class SolverFBA(SolverBase):
                 ],
                 device=device,
             )
+            if n_bilateral > 0:
+                wp.launch(
+                    K.bilateral_law_kernel,
+                    dim=n_bilateral,
+                    inputs=[pene0_d, wp.int32(3 * M)],
+                    outputs=[self._nsn_omega_d, self._nsn_compliance_d, self._nsn_h_d],
+                    device=device,
+                )
 
             wp.launch(
                 K.build_a_schur_kernel,
@@ -3804,7 +3817,7 @@ class SolverFBA(SolverBase):
             cap_internal = float(self.lambda_cap) / (dt * dt)
             wp.launch(
                 K.lambda_cap_clip_kernel,
-                dim=n_rows,
+                dim=3 * M,
                 inputs=[wp.float64(cap_internal)],
                 outputs=[self._nsn_lam_d],
                 device=device,

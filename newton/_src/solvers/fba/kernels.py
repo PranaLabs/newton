@@ -3925,6 +3925,27 @@ def compute_frictional_fb_kernel(
 
 
 @wp.kernel
+def bilateral_law_kernel(
+    pene0: wp.array[wp.float64],
+    row_offset: wp.int32,
+    # outputs
+    omega: wp.array[wp.float64],
+    compliance: wp.array[wp.float64],
+    h: wp.array[wp.float64],
+):
+    """Identity law of the bilateral rows starting at ``row_offset``.
+
+    With ``omega = 1``, no compliance and ``h = pene0``, the NSN step solves
+    ``W dλ = -penetration / dt²`` on these rows: a Newton step that drives
+    their violation to zero.
+    """
+    i = row_offset + wp.tid()
+    omega[i] = wp.float64(1.0)
+    compliance[i] = wp.float64(0.0)
+    h[i] = pene0[i]
+
+
+@wp.kernel
 def fb_newton_lite_coulomb_kernel(
     # ---- contact metadata (M entries each) ----
     contact_particle: wp.array[wp.int32],  # (M,)
