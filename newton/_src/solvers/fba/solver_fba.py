@@ -240,6 +240,7 @@ class SolverFBA(SolverBase):
         face_contacts: bool = False,
         face_contact_edge_radius: float = 3.0e-3,
         soft_contact_thickness: float = 0.0,
+        nsn_linear_iterations: int | None = None,
     ) -> None:
         """
         Args:
@@ -260,9 +261,7 @@ class SolverFBA(SolverBase):
                 ``NonSmoothNewton.cpp:102-171``. RealSim's scene.json
                 ``constraintsolver.iterations: 10`` is the **PCR Schur
                 LCP solver's** iterative-convergence cap, not a FB-Newton
-                outer loop count -- FBA uses a direct ``np.linalg.solve``
-                on the Schur block which is equivalent to PCR-to-
-                convergence on dense SPD systems. Values >1 add extra
+                outer loop count; see ``nsn_linear_iterations``. Values >1 add extra
                 FB-Newton linearizations beyond what RealSim does; useful
                 for stress-testing the FB residual but breaks 1:1 parity.
             lambda_cap: Optional per-step clamp on contact impulse magnitude in
@@ -348,6 +347,11 @@ class SolverFBA(SolverBase):
                 deformable surface. It shifts their constraint planes along
                 the contact normal and leaves rigid contacts and friction
                 unchanged; with ``0`` the points stop on the surface.
+            nsn_linear_iterations: Iteration cap of the conjugate residual
+                solve in each NSN step, RealSim's
+                ``constraintsolver.iterations``. ``None`` solves to a relative
+                residual of ``1e-10``. A capped step is inexact, and the next
+                LG iteration's NSN step continues from it.
         """
         super().__init__(model)
 
@@ -423,6 +427,7 @@ class SolverFBA(SolverBase):
             np.asarray(mu_per_pair_override, dtype=np.float64) if mu_per_pair_override is not None else None
         )
         self.nsn_iterations = int(nsn_iterations)
+        self.nsn_linear_iterations = None if nsn_linear_iterations is None else int(nsn_linear_iterations)
         self.lambda_cap = lambda_cap
         self.use_isodof = bool(use_isodof)
         self.integrate_with_external_rigid_solver = bool(integrate_with_external_rigid_solver)
@@ -3588,7 +3593,7 @@ class SolverFBA(SolverBase):
                 device=self._device,
                 # Tight tolerance so PCR ≈ ``np.linalg.solve`` to fp64 noise.
                 tol=1.0e-10,
-                max_iter=max(1000, 2 * max_n),
+                max_iter=max(1000, 2 * max_n) if self.nsn_linear_iterations is None else self.nsn_linear_iterations,
             )
 
     def _ensure_nsn_inner_buffers(self, n_rows: int, alloc_2d: bool = True) -> None:

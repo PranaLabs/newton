@@ -5,6 +5,7 @@
 
 import types
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -302,7 +303,7 @@ class TestSolverFBARigidContacts(unittest.TestCase):
         if not wp.is_cuda_available():
             raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
 
-    def _run(self, gravity, v0, steps):
+    def _run(self, gravity, v0, steps, **solver_args):
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
         cfg = newton.ModelBuilder.ShapeConfig(mu=self.MU)
@@ -311,7 +312,7 @@ class TestSolverFBARigidContacts(unittest.TestCase):
         builder.add_shape_box(builder.add_body(xform=wp.transform((0.0, 0.0, 0.5), wp.quat_identity())), cfg=cfg)
         model = builder.finalize()
         model.gravity.assign([wp.vec3(*gravity)])
-        solver = SolverFBA(model, iterations=10)
+        solver = SolverFBA(model, **{"iterations": 10, **solver_args})
         s0, s1 = model.state(), model.state()
         s0.body_qd.assign([[*v0, 0.0, 0.0, 0.0]])
         contacts, traj = model.contacts(), []
@@ -326,6 +327,28 @@ class TestSolverFBARigidContacts(unittest.TestCase):
         solver, model, traj = self._run((0.0, 0.0, -9.81), (0.0, 0.0, 0.0), 100)
         np.testing.assert_allclose(traj[:, :3], np.tile([0.0, 0.0, 0.5], (100, 1)), atol=1e-6)
         np.testing.assert_allclose(traj[:, 7:], 0.0, atol=1e-6)
+        rows = 3 * solver._rigid_contacts.count
+        weight = model.body_mass.numpy()[0] * 9.81
+        self.assertAlmostEqual(solver._nsn_lam_apply_d.numpy()[:rows:3].sum() / weight, 1.0, delta=1e-6)
+
+    def test_capped_linear_solve(self):
+        """Every conjugate residual solve stops at the cap, and the remaining LG iterations still hold the box."""
+        from newton._src.solvers.fba.nsn_pcr_solver import NSNPCRSolver  # noqa: PLC0415
+
+        counts, solve = [], NSNPCRSolver.solve
+
+        def recording(pcr, *args, **kwargs):
+            result = solve(pcr, *args, **kwargs)
+            counts.append(result[0])
+            return result
+
+        with mock.patch.object(NSNPCRSolver, "solve", recording):
+            solver, model, traj = self._run(
+                (0.0, 0.0, -9.81), (0.0, 0.0, 0.0), 100, iterations=5, nsn_linear_iterations=2
+            )
+        self.assertEqual(max(counts), 2)
+        np.testing.assert_allclose(traj[:, 2], 0.5, atol=1e-6)
+        np.testing.assert_allclose(traj[:, 7:], 0.0, atol=1e-5)
         rows = 3 * solver._rigid_contacts.count
         weight = model.body_mass.numpy()[0] * 9.81
         self.assertAlmostEqual(solver._nsn_lam_apply_d.numpy()[:rows:3].sum() / weight, 1.0, delta=1e-6)
