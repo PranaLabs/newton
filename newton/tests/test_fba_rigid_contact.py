@@ -260,5 +260,66 @@ class TestSolverFBARigidContacts(unittest.TestCase):
                 np.testing.assert_allclose(np.diff(traj[:, 7]), a * self.H, rtol=5e-3)
 
 
+class TestSolverFBAArticulationContacts(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not wp.is_cuda_available():
+            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
+
+    def test_hinged_plank_rests_on_ground(self):
+        """A frictionless plank hinged at one end rests its far end on the ground.
+
+        Its revolute rows join the contact NSN, and the normal force balances
+        the weight's moment about the hinge. A pendulum away from any contact
+        keeps the Cholesky joint solve.
+        """
+        from scipy.optimize import brentq
+
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        hx, hz, pivot = 0.5, 0.02, 0.3
+        alpha = brentq(lambda a: pivot - 2 * hx * np.sin(a) - hz * np.cos(a), 0.0, 1.0)  # far corner on the ground
+        q = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), float(alpha))
+        center = wp.vec3(0.0, 0.0, pivot) + wp.quat_rotate(q, wp.vec3(hx, 0.0, 0.0))
+        cfg = newton.ModelBuilder.ShapeConfig(mu=0.0)
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane(cfg=cfg)
+        plank = builder.add_link(xform=wp.transform(center, q))
+        builder.add_shape_box(plank, hx=hx, hy=0.1, hz=hz, cfg=cfg)
+        bob = builder.add_link(
+            xform=wp.transform((3.0, 0.0, 2.0)), mass=1.0, inertia=wp.mat33(np.eye(3)), lock_inertia=True
+        )
+        for link, p in ((plank, (0.0, 0.0, pivot)), (bob, (2.0, 0.0, 2.0))):
+            x_cj = wp.transform((-hx if link == plank else -1.0, 0.0, 0.0))
+            joint = builder.add_joint_revolute(
+                -1, link, axis=(0.0, 1.0, 0.0), parent_xform=wp.transform(p), child_xform=x_cj
+            )
+            builder.add_articulation([joint])
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=10)
+        s0, s1 = model.state(), model.state()
+        contacts = model.contacts()
+        for _ in range(50):
+            model.collide(s0, contacts)
+            solver.step(s0, s1, None, contacts, 0.01)
+            s0, s1 = s1, s0
+
+        tf = s0.body_q.numpy().astype(np.float64)
+        np.testing.assert_allclose(tf[0], [*center, *q], atol=1e-6)
+        np.testing.assert_allclose(s0.body_qd.numpy()[0], 0.0, atol=1e-5)
+        self.assertEqual(solver._rc_joint_rows_d.shape[0], 5)  # the plank's revolute only
+        for k, (anchor, pivot_world) in enumerate(
+            (((-hx, 0.0, 0.0), (0.0, 0.0, pivot)), ((-1.0, 0.0, 0.0), (2.0, 0.0, 2.0)))
+        ):
+            hinge = tf[k, :3] + wp.quat_rotate(wp.quatd(*tf[k, 3:]), wp.vec3d(*anchor))
+            np.testing.assert_allclose(hinge, pivot_world, atol=1e-6)
+        self.assertLess(tf[1, 2], 1.9)  # the pendulum swings
+
+        normal = solver._nsn_lam_apply_d.numpy()[: 3 * solver._rigid_contacts.count : 3].sum()
+        x_contact = 2 * hx * np.cos(alpha) - hz * np.sin(alpha)
+        weight = model.body_mass.numpy()[0] * 9.81
+        self.assertAlmostEqual(normal / (weight * hx * np.cos(alpha) / x_contact), 1.0, delta=1e-4)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -394,3 +394,46 @@ class BilateralSystem:
             outputs=[b],
             device=self.device,
         )
+
+
+@wp.kernel
+def select_rows_kernel(
+    index: wp.array[wp.int32],
+    src_slot: wp.array2d[wp.int32],
+    src_jac: wp.array2d[wp.spatial_vectord],
+    offset: int,
+    # outputs
+    dst_slot: wp.array2d[wp.int32],
+    dst_jac: wp.array2d[wp.spatial_vectord],
+):
+    """Copy rows ``index`` of one row set to rows ``offset + k`` of another."""
+    k = wp.tid()
+    for side in range(2):
+        dst_slot[offset + k, side] = src_slot[index[k], side]
+        dst_jac[offset + k, side] = src_jac[index[k], side]
+
+
+@wp.kernel
+def gather_values_kernel(
+    src: wp.array[wp.float64],
+    index: wp.array[wp.int32],
+    offset: int,
+    # outputs
+    dst: wp.array[wp.float64],
+):
+    """``dst[offset + k] = src[index[k]]``."""
+    k = wp.tid()
+    dst[offset + k] = src[index[k]]
+
+
+@wp.kernel
+def scatter_values_kernel(
+    src: wp.array[wp.float64],
+    offset: int,
+    index: wp.array[wp.int32],
+    # outputs
+    dst: wp.array[wp.float64],
+):
+    """``dst[index[k]] = src[offset + k]``."""
+    k = wp.tid()
+    dst[index[k]] = src[offset + k]

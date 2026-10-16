@@ -639,7 +639,13 @@ class SolverFBA(SolverBase):
             return
         R = int(self._joint_rows.block_start[-1])
         self._joint_system = BilateralSystem(self._joint_rows, slot, self._slot_inv_mass_d, device)
-        self._jointed_slots = np.flatnonzero(np.diff(self._joint_system.slot_entry_start.numpy()))
+        # Independent block of each joint row and of each slot it touches.
+        rows = self._joint_rows
+        self._joint_row_block = np.repeat(np.arange(len(rows.block_start) - 1), np.diff(rows.block_start))
+        start, entry_row = self._joint_system.slot_entry_start.numpy(), self._joint_system.entry_row.numpy()
+        self._slot_block = np.full(len(start) - 1, -1)
+        jointed = np.diff(start) > 0
+        self._slot_block[jointed] = self._joint_row_block[entry_row[start[:-1][jointed]]]
         self._joint_row_slot_d = wp.empty((R, 2), dtype=wp.int32, device=device)
         self._joint_row_jac_d = wp.empty((R, 2), dtype=wp.spatial_vectord, device=device)
         self._joint_residual_d = wp.empty(R, dtype=wp.float64, device=device)
@@ -707,7 +713,13 @@ class SolverFBA(SolverBase):
         return True
 
     def _begin_rigid_contacts(self, contacts: Contacts | None) -> None:
-        """Collect this step's rigid contacts and assemble their rows and ``W`` at the pinned frame."""
+        """Collect this step's rigid contacts and assemble their rows and ``W`` at the pinned frame.
+
+        The joint rows of every articulation a contact touches join the contact
+        rows, so one NSN solve couples them; other articulations keep their
+        Cholesky-factored joint system.
+        """
+        from .joints import select_rows_kernel  # noqa: PLC0415
         from .rigid import rigid_delassus_kernel, row_incidence  # noqa: PLC0415
         from .rigid_contact import gather_rigid_contacts, rigid_contact_jacobian_kernel  # noqa: PLC0415
 
@@ -720,9 +732,13 @@ class SolverFBA(SolverBase):
             raise NotImplementedError(
                 "SolverFBA solves rigid contacts only with friction=True and nsn_schur_mode='full'"
             )
-        if self._joint_rows is not None and np.isin(rc.slot, self._jointed_slots).any():
-            raise NotImplementedError("SolverFBA does not solve contacts on articulated bodies yet")
-        n = 3 * rc.count
+        joint_rows = np.empty(0, dtype=np.int32)
+        if self._joint_rows is not None:
+            blocks = self._slot_block[rc.slot[rc.slot >= 0]]
+            joint_rows = np.flatnonzero(np.isin(self._joint_row_block, blocks[blocks >= 0])).astype(np.int32)
+        self._rc_joint_rows_d = wp.array(joint_rows, dtype=wp.int32, device=device)
+        n_c = 3 * rc.count
+        n = n_c + joint_rows.size
         self._rc_row_slot_d = wp.empty((n, 2), dtype=wp.int32, device=device)
         self._rc_row_jac_d = wp.empty((n, 2), dtype=wp.spatial_vectord, device=device)
         wp.launch(
@@ -732,6 +748,14 @@ class SolverFBA(SolverBase):
             outputs=[self._rc_row_slot_d, self._rc_row_jac_d],
             device=device,
         )
+        if joint_rows.size:
+            wp.launch(
+                select_rows_kernel,
+                dim=joint_rows.size,
+                inputs=[self._rc_joint_rows_d, self._joint_row_slot_d, self._joint_row_jac_d, n_c],
+                outputs=[self._rc_row_slot_d, self._rc_row_jac_d],
+                device=device,
+            )
         self._rc_W_d = wp.empty((n, n), dtype=wp.float64, device=device)
         wp.launch(
             rigid_delassus_kernel,
@@ -759,12 +783,15 @@ class SolverFBA(SolverBase):
 
         The residual ``-g + J (u - u_free)`` makes the NSN prediction
         ``-r + dt² W (omega λ)`` reproduce the live gap ``g`` for the forces
-        that produced ``u``, while ``W`` and ``J`` stay at the pinned frame.
+        that produced ``u``, while ``W`` and ``J`` stay at the pinned frame. The
+        joint rows solved here get their forces written back to the joint forces.
         """
+        from .joints import gather_values_kernel, scatter_values_kernel  # noqa: PLC0415
         from .rigid import rigid_row_residual_kernel  # noqa: PLC0415
         from .rigid_contact import rigid_contact_gap_kernel  # noqa: PLC0415
 
         rc, device, n = self._rigid_contacts, self._device, self._rc_r_d.shape[0]
+        n_c, joint_rows = 3 * rc.count, self._rc_joint_rows_d
         wp.launch(
             rigid_contact_gap_kernel,
             dim=rc.count,
@@ -775,6 +802,14 @@ class SolverFBA(SolverBase):
             outputs=[self._rc_value_d],
             device=device,
         )
+        if n > n_c:
+            wp.launch(
+                gather_values_kernel,
+                dim=n - n_c,
+                inputs=[self._joint_residual_d, joint_rows, n_c],
+                outputs=[self._rc_value_d],
+                device=device,
+            )
         wp.launch(
             rigid_row_residual_kernel,
             dim=n,
@@ -797,9 +832,18 @@ class SolverFBA(SolverBase):
             omega_init_device=self._rc_omega_d,
             skip_download=True,
             m_contacts=rc.count,
+            n_bilateral=n - n_c,
         )
         wp.copy(self._rc_lam_d, self._nsn_lam_d, count=n)
         wp.copy(self._rc_omega_d, self._nsn_omega_d, count=n)
+        if n > n_c:
+            wp.launch(
+                scatter_values_kernel,
+                dim=n - n_c,
+                inputs=[self._nsn_lam_apply_d, n_c, joint_rows],
+                outputs=[self._joint_force_d],
+                device=device,
+            )
         return self._nsn_lam_apply_d
 
     def _retract_rigid(self, state_in: State, state_out: State, dt: float) -> None:
@@ -856,12 +900,12 @@ class SolverFBA(SolverBase):
                 outputs=[self._joint_residual_d],
                 device=self._device,
             )
-            system = self._joint_system
-            system.update(self._joint_residual_d, self._joint_force_d)
-            system.apply_force(self._joint_row_jac_d, self._joint_force_d, b, self._rigid_b_iter_d)
+            self._joint_system.update(self._joint_residual_d, self._joint_force_d)
+        force = None if self._rigid_contacts is None else self._solve_rigid_contacts(state_in, dt)
+        if self._joint_rows is not None:
+            self._joint_system.apply_force(self._joint_row_jac_d, self._joint_force_d, b, self._rigid_b_iter_d)
             b = self._rigid_b_iter_d
-        if self._rigid_contacts is not None:
-            force = self._solve_rigid_contacts(state_in, dt)
+        if force is not None:
             wp.launch(
                 row_force_rhs_kernel,
                 dim=self._rigid_bodies_d.shape[0],
