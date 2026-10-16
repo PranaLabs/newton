@@ -169,7 +169,9 @@ class FaceContactQuery:
                 device=device,
             )
         m = int(count.numpy()[0])
-        pair, bary, depth, body_pos, normal = (a.numpy()[:m] for a in out)
+        # The kernel emits in thread order; sort first so equal depths below break ties the same way every run.
+        order = np.argsort(out[0].numpy()[:m])
+        pair, bary, depth, body_pos, normal = (a.numpy()[:m][order] for a in out)
         face, shp = cand_face[pair], cand_shape[pair]
         # An edge optimum keeps one zero weight: key it by its shape and sorted endpoints.
         zero, rows = np.argmax(bary == 0.0, axis=1), np.arange(m)
@@ -178,5 +180,5 @@ class FaceContactQuery:
         key = np.where((bary == 0.0).any(axis=1), (shp * n + ends[:, 0]) * n + ends[:, 1], -1 - rows)
         by_key = np.lexsort((depth, key))
         deepest = by_key[np.diff(key[by_key], prepend=key[by_key][:1] - 1) != 0]
-        sel = deepest[np.argsort(pair[deepest])]
+        sel = np.sort(deepest)
         return face[sel], shp[sel], bary[sel], body_pos[sel], normal[sel]

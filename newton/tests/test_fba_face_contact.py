@@ -223,6 +223,11 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
         self.assertIsNone(runs[1][2]._contact_extra)
         np.testing.assert_array_equal(runs[0][0], runs[1][0])
 
+    def test_runs_are_deterministic(self):
+        """Two triangles can report the same edge optimum at the same depth; the kept one must not depend on emission order."""
+        runs = [self._run(True, (0.0, -0.3, 0.65), 12, 60)[0] for _ in range(2)]
+        np.testing.assert_array_equal(runs[0], runs[1])
+
     def test_needs_the_full_coulomb_mode(self):
         builder = newton.ModelBuilder()
         builder.add_cloth_grid(
