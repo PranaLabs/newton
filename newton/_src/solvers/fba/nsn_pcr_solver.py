@@ -698,61 +698,24 @@ class NSNPCRSolver:
         n_pad: int,
         device: wp.Device | str,
     ) -> None:
-        """Issue one PCR iter's worth of launches on the active stream.
+        """Issue one PCR iteration of :meth:`solve` on the active stream.
 
-        Mirrors RealSim ``CUDADenseCRSolver.cpp:170-207`` (Newton step body).
-        Reads ``self._q``, ``self._r``, ``self._d``, ``self._rho_d`` and writes
-        through ``self._x``, ``self._r``, ``self._d``, ``self._q``, ``self._h``,
-        ``self._s``, ``self._rho_d``, ``self._rho_old_d``, ``self._alpha_d``,
-        ``self._beta_d``, ``self._den_d``.  All launches are stream-ordered
-        and safe to call inside a CUDA graph capture.
+        All launches are stream-ordered and safe to call inside a CUDA graph
+        capture; the per-iteration scalars stay on the device.
         """
-        # ----- den = <q, q> ----------------------------------------
-        # RealSim line 170.
+        # alpha = rho / <q, q>, x += alpha d, r -= alpha q.
         wp.utils.array_inner(self._q, self._q, out=self._den_d, count=n)
-
-        # alpha = rho / den (on device).  RealSim line 173.
-        wp.launch(
-            _div_scalar_kernel,
-            dim=1,
-            inputs=[self._rho_d, self._den_d],
-            outputs=[self._alpha_d],
-            device=device,
-        )
-
-        # ----- x += alpha * d --------------------------------------
-        # RealSim line 177.  Coefficient sourced from ``_alpha_d[0]``.
-        wp.launch(
-            _axpy_arr_kernel,
-            dim=n,
-            inputs=[self._alpha_d, wp.float64(1.0), self._d],
-            outputs=[self._x],
-            device=device,
-        )
-
-        # ----- r -= alpha * q --------------------------------------
-        # RealSim line 181 (``coeff = -alpha``).
-        wp.launch(
-            _axpy_arr_kernel,
-            dim=n,
-            inputs=[self._alpha_d, wp.float64(-1.0), self._q],
-            outputs=[self._r],
-            device=device,
-        )
-
-        # ----- s = P * r -------------------------------------------
-        # RealSim line 186.
-        wp.launch(
-            _apply_precond_kernel,
-            dim=n,
-            inputs=[self._r, self._precond],
-            outputs=[self._s],
-            device=device,
-        )
-
-        # ----- h = A * s -------------------------------------------
-        # RealSim line 189.  Block-per-row tile reduction; see ``q = A * d``
-        # in :meth:`solve` for the kernel rationale.
+        wp.launch(_div_scalar_kernel, dim=1, inputs=[self._rho_d, self._den_d], outputs=[self._alpha_d], device=device)
+        for vec, sign, out in ((self._d, 1.0, self._x), (self._q, -1.0, self._r)):
+            wp.launch(
+                _axpy_arr_kernel,
+                dim=n,
+                inputs=[self._alpha_d, wp.float64(sign), vec],
+                outputs=[out],
+                device=device,
+            )
+        # s = P r, h = A s, rho = <r, h>, beta = rho / rho_old.
+        wp.launch(_apply_precond_kernel, dim=n, inputs=[self._r, self._precond], outputs=[self._s], device=device)
         wp.launch_tiled(
             _matvec_tiled_kernel,
             dim=n,
@@ -761,20 +724,8 @@ class NSNPCRSolver:
             block_dim=_PCR_BLOCK_DIM,
             device=device,
         )
-
-        # ----- rho_old = rho ; rho = <r, h> ------------------------
-        # RealSim lines 191-193.  Snapshot ``rho`` into ``rho_old`` on
-        # device, then recompute ``rho`` via the parallel reduction.
-        wp.launch(
-            _copy_scalar_kernel,
-            dim=1,
-            inputs=[self._rho_d],
-            outputs=[self._rho_old_d],
-            device=device,
-        )
+        wp.launch(_copy_scalar_kernel, dim=1, inputs=[self._rho_d], outputs=[self._rho_old_d], device=device)
         wp.utils.array_inner(self._r, self._h, out=self._rho_d, count=n)
-
-        # beta = rho / rho_old (on device).  RealSim line 195.
         wp.launch(
             _div_scalar_kernel,
             dim=1,
@@ -782,26 +733,9 @@ class NSNPCRSolver:
             outputs=[self._beta_d],
             device=device,
         )
-
-        # ----- d = beta * d + s ------------------------------------
-        # RealSim lines 198-201.  Fused into one kernel.
-        wp.launch(
-            _scal_add_arr_kernel,
-            dim=n,
-            inputs=[self._beta_d, self._s],
-            outputs=[self._d],
-            device=device,
-        )
-
-        # ----- q = beta * q + h ------------------------------------
-        # RealSim lines 204-207.
-        wp.launch(
-            _scal_add_arr_kernel,
-            dim=n,
-            inputs=[self._beta_d, self._h],
-            outputs=[self._q],
-            device=device,
-        )
+        # d = beta d + s, q = beta q + h.
+        wp.launch(_scal_add_arr_kernel, dim=n, inputs=[self._beta_d, self._s], outputs=[self._d], device=device)
+        wp.launch(_scal_add_arr_kernel, dim=n, inputs=[self._beta_d, self._h], outputs=[self._q], device=device)
 
     def _get_or_build_pcr_iter_graph(
         self,
