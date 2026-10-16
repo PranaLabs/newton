@@ -35,7 +35,7 @@ class TestFaceContactKernel(unittest.TestCase):
         inputs += [([body], wp.int32), ([int(GeoType.BOX)], wp.int32), ([HALF], wp.vec3)]
         outputs = [wp.zeros(1, dtype=t) for t in (wp.int32, wp.int32, wp.vec3, wp.float32, wp.vec3, wp.vec3)]
         inputs = [wp.array(a, dtype=t) for a, t in inputs]
-        wp.launch(face_contact_kernel, dim=1, inputs=[*inputs, 32, 0.02, edge_radius], outputs=outputs)
+        wp.launch(face_contact_kernel, dim=1, inputs=[*inputs, 128, edge_radius], outputs=outputs)
         n = int(outputs[0].numpy()[0])
         return [a.numpy()[:n] for a in outputs[2:]]
 

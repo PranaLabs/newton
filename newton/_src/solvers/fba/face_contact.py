@@ -6,7 +6,9 @@
 Particle contacts test only vertices, so a box edge can pass through a triangle between them. The
 point minimizes the shape's signed distance over the triangle with the Frank-Wolfe iteration of
 RealSim's face query (``SDFCollisionDevice.cuh``), from the deepest vertex. Vertex optima are left to
-the particle contacts; unselected vertices keep exactly zero weight, which marks edge optima.
+the particle contacts; unselected vertices keep exactly zero weight, which marks edge optima. A face
+contact appears as soon as the optimum leaves the vertices, where it coincides with that vertex's
+particle contact, so switching it on or off moves no constraint beyond the Frank-Wolfe accuracy.
 """
 
 import numpy as np
@@ -71,7 +73,6 @@ def face_contact_kernel(
     shape_type: wp.array[wp.int32],
     shape_scale: wp.array[wp.vec3],
     iterations: int,
-    depth_ratio: float,
     edge_radius: float,
     count: wp.array[wp.int32],
     pair: wp.array[wp.int32],
@@ -81,8 +82,8 @@ def face_contact_kernel(
     normal: wp.array[wp.vec3],
 ):
     """Deepest point of each candidate ``(triangle, shape)`` pair, emitted if it lies inside the triangle
-    or on an edge and ``depth_ratio`` times the triangle's size below every vertex. ``body_pos`` is the
-    closest surface point in the body frame, as ``Contacts.soft_contact_body_pos``.
+    or on an edge, below every vertex. ``body_pos`` is the closest surface point in the body frame, as
+    ``Contacts.soft_contact_body_pos``.
     """
     i = wp.tid()
     f = pair_face[i]
@@ -119,8 +120,7 @@ def face_contact_kernel(
             selected += 1
     x = w @ P
     sd = shape_sdf(geo, scale, x, r)
-    size = wp.max(wp.length(P[1] - P[0]), wp.max(wp.length(P[2] - P[1]), wp.length(P[0] - P[2])))
-    if selected < 2 or sd[0] >= wp.min(d) - depth_ratio * size:
+    if selected < 2 or sd[0] >= wp.min(d):
         return
     n = wp.normalize(wp.vec3(sd[1], sd[2], sd[3]))
     idx = wp.atomic_add(count, 0, 1)
@@ -155,8 +155,7 @@ class FaceContactQuery:
         particle,
         shape,
         edge_radius: float,
-        iterations: int = 32,
-        depth_ratio: float = 0.02,
+        iterations: int = 128,
     ):
         """Face contacts as ``(face, shape, bary, body_pos, normal)`` arrays, ordered by shape and triangle.
 
@@ -182,7 +181,7 @@ class FaceContactQuery:
                     *(wp.array(a.astype(np.int32), dtype=wp.int32, device=device) for a in (cand_face, cand_shape)),
                     self.no_bodies if body_q is None or not body_q.shape[0] else body_q,
                     *(model.shape_transform, model.shape_body, model.shape_type, model.shape_scale),
-                    *(iterations, depth_ratio, edge_radius),
+                    *(iterations, edge_radius),
                 ],
                 outputs=[count, *out],
                 device=device,
