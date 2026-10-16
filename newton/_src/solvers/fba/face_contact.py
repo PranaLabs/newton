@@ -17,22 +17,28 @@ from ...geometry.types import Axis, GeoType
 
 
 @wp.func
-def shape_sdf(geo_type: int, scale: wp.vec3, x: wp.vec3) -> wp.vec4:
-    """Signed distance [m] and its gradient at ``x`` in the shape frame; ``1e6`` for unsupported shapes."""
+def shape_sdf(geo_type: int, scale: wp.vec3, x: wp.vec3, edge_radius: float) -> wp.vec4:
+    """Signed distance [m] and its gradient at ``x`` in the shape frame; ``1e6`` for unsupported shapes.
+
+    Box and cylinder edges are rounded by ``edge_radius``: inside a sharp edge the gradient jumps
+    between the two faces, so a point that sinks into the edge would flip its normal.
+    """
     d = float(1.0e6)
     g = wp.vec3(0.0, 0.0, 1.0)
     if geo_type == GeoType.SPHERE:
         d = sdf.sdf_sphere(x, scale[0])
         g = sdf.sdf_sphere_grad(x, scale[0])
     elif geo_type == GeoType.BOX:
-        d = sdf.sdf_box(x, scale[0], scale[1], scale[2])
-        g = sdf.sdf_box_grad(x, scale[0], scale[1], scale[2])
+        r = wp.min(edge_radius, 0.5 * wp.min(scale[0], wp.min(scale[1], scale[2])))
+        d = sdf.sdf_box(x, scale[0] - r, scale[1] - r, scale[2] - r) - r
+        g = sdf.sdf_box_grad(x, scale[0] - r, scale[1] - r, scale[2] - r)
     elif geo_type == GeoType.CAPSULE:
         d = sdf.sdf_capsule(x, scale[0], scale[1], int(Axis.Z))
         g = sdf.sdf_capsule_grad(x, scale[0], scale[1], int(Axis.Z))
     elif geo_type == GeoType.CYLINDER:
-        d = sdf.sdf_cylinder(x, scale[0], scale[1], int(Axis.Z))
-        g = sdf.sdf_cylinder_grad(x, scale[0], scale[1], int(Axis.Z))
+        r = wp.min(edge_radius, 0.5 * wp.min(scale[0], scale[1]))
+        d = sdf.sdf_cylinder(x, scale[0] - r, scale[1] - r, int(Axis.Z)) - r
+        g = sdf.sdf_cylinder_grad(x, scale[0] - r, scale[1] - r, int(Axis.Z))
     elif geo_type == GeoType.CONE:
         d = sdf.sdf_cone(x, scale[0], scale[1], int(Axis.Z))
         g = sdf.sdf_cone_grad(x, scale[0], scale[1], int(Axis.Z))
@@ -66,6 +72,7 @@ def face_contact_kernel(
     shape_scale: wp.array[wp.vec3],
     iterations: int,
     depth_ratio: float,
+    edge_radius: float,
     count: wp.array[wp.int32],
     pair: wp.array[wp.int32],
     bary: wp.array[wp.vec3],
@@ -92,11 +99,12 @@ def face_contact_kernel(
     )
     geo = shape_type[s]
     scale = shape_scale[s]
-    d = wp.vec3(shape_sdf(geo, scale, P[0])[0], shape_sdf(geo, scale, P[1])[0], shape_sdf(geo, scale, P[2])[0])
+    r = edge_radius
+    d = wp.vec3(shape_sdf(geo, scale, P[0], r)[0], shape_sdf(geo, scale, P[1], r)[0], shape_sdf(geo, scale, P[2], r)[0])
     w = wp.vec3(0.0)
     w[min_index(d)] = 1.0
     for k in range(iterations):
-        sd = shape_sdf(geo, scale, w @ P)
+        sd = shape_sdf(geo, scale, w @ P, r)
         # Step toward the vertex with the lowest directional derivative until the Frank-Wolfe gap closes.
         a = P @ wp.vec3(sd[1], sd[2], sd[3])
         j = min_index(a)
@@ -110,7 +118,7 @@ def face_contact_kernel(
         if w[k] > 0.0:
             selected += 1
     x = w @ P
-    sd = shape_sdf(geo, scale, x)
+    sd = shape_sdf(geo, scale, x, r)
     size = wp.max(wp.length(P[1] - P[0]), wp.max(wp.length(P[2] - P[1]), wp.length(P[0] - P[2])))
     if selected < 2 or sd[0] >= wp.min(d) - depth_ratio * size:
         return
@@ -139,10 +147,21 @@ class FaceContactQuery:
         self.no_bodies = wp.empty(1, dtype=wp.transform, device=device)
         self.device = device
 
-    def query(self, model, particle_q, body_q, particle, shape, iterations: int = 32, depth_ratio: float = 0.02):
+    def query(
+        self,
+        model,
+        particle_q,
+        body_q,
+        particle,
+        shape,
+        edge_radius: float,
+        iterations: int = 32,
+        depth_ratio: float = 0.02,
+    ):
         """Face contacts as ``(face, shape, bary, body_pos, normal)`` arrays, ordered by shape and triangle.
 
-        ``particle`` and ``shape`` list the particle contacts. When two
+        ``particle`` and ``shape`` list the particle contacts; ``edge_radius``
+        rounds box and cylinder edges as in :func:`shape_sdf`. When two
         triangles report the same edge optimum, the deeper contact remains.
         """
         start, stop = self.offsets[particle], self.offsets[particle + 1]
@@ -163,7 +182,7 @@ class FaceContactQuery:
                     *(wp.array(a.astype(np.int32), dtype=wp.int32, device=device) for a in (cand_face, cand_shape)),
                     self.no_bodies if body_q is None or not body_q.shape[0] else body_q,
                     *(model.shape_transform, model.shape_body, model.shape_type, model.shape_scale),
-                    *(iterations, depth_ratio),
+                    *(iterations, depth_ratio, edge_radius),
                 ],
                 outputs=[count, *out],
                 device=device,

@@ -238,6 +238,7 @@ class SolverFBA(SolverBase):
         integrate_with_external_rigid_solver: bool = False,
         contact_regularization: float = 1.0e-2,
         face_contacts: bool = False,
+        face_contact_edge_radius: float = 3.0e-3,
     ) -> None:
         """
         Args:
@@ -334,6 +335,13 @@ class SolverFBA(SolverBase):
                 corners cannot pass through the triangle (RealSim's face
                 query). Needs ``friction=True``, ``nsn_schur_mode="full"``,
                 ``use_isodof=True`` and no ``mu_per_pair_override``.
+            face_contact_edge_radius: Radius [m] by which box and cylinder
+                edges are rounded in the signed distance the face contacts
+                minimize, at most half the shape's smallest extent. Inside a
+                sharp edge the gradient jumps between the two faces, so a
+                triangle point that sinks into the edge flips its normal and
+                pushes the cloth sideways; the rounding keeps the normal
+                continuous, as RealSim's smoothed SDF does.
         """
         super().__init__(model)
 
@@ -414,6 +422,7 @@ class SolverFBA(SolverBase):
         self.integrate_with_external_rigid_solver = bool(integrate_with_external_rigid_solver)
         self.contact_regularization = float(contact_regularization)
         self.face_contacts = bool(face_contacts)
+        self.face_contact_edge_radius = float(face_contact_edge_radius)
         self._face_query, self._contact_extra = None, None
         if self.face_contacts:
             if not self.friction or nsn_schur_mode != "full" or not self.use_isodof or mu_per_pair_override is not None:
@@ -2207,7 +2216,9 @@ class SolverFBA(SolverBase):
         alpha_h = np.ones(M, dtype=np.float32)
         if self._face_query is not None:
             src = state if state is not None else self.model
-            found = self._face_query.query(self.model, src.particle_q, src.body_q, particle_h, shape_h)
+            found = self._face_query.query(
+                self.model, src.particle_q, src.body_q, particle_h, shape_h, self.face_contact_edge_radius
+            )
             if len(found[0]):
                 tri, bary = self._face_query.tri[found[0]], found[2]
                 particle_h, alpha_h = np.concatenate([particle_h, tri[:, 0]]), np.concatenate([alpha_h, bary[:, 0]])

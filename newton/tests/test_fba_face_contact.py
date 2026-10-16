@@ -13,9 +13,9 @@ from newton._src.solvers.fba.face_contact import FaceContactQuery, face_contact_
 HALF = np.array([0.5, 0.5, 0.5])
 
 
-def _box_sdf(x, half=HALF):
-    q = np.abs(x) - half
-    return np.linalg.norm(np.maximum(q, 0.0), axis=-1) + np.minimum(q.max(axis=-1), 0.0)
+def _box_sdf(x, half=HALF, edge_radius=0.0):
+    q = np.abs(x) - (half - edge_radius)
+    return np.linalg.norm(np.maximum(q, 0.0), axis=-1) + np.minimum(q.max(axis=-1), 0.0) - edge_radius
 
 
 def _draped_triangle(scale=0.15):
@@ -27,7 +27,7 @@ def _draped_triangle(scale=0.15):
 class TestFaceContactKernel(unittest.TestCase):
     """Deepest points of triangles in a box with half extents 0.5 m."""
 
-    def _query(self, points, X_wb=None, X_bs=None):
+    def _query(self, points, X_wb=None, X_bs=None, edge_radius=0.0):
         """Bary, depth, body_pos and normal of the contacts between one triangle and the box."""
         X_bs, body = (wp.transform_identity(), -1) if X_wb is None else (X_bs, 0)
         inputs = [(points, wp.vec3), ([[0, 1, 2]], wp.int32), ([0], wp.int32), ([0], wp.int32)]
@@ -35,7 +35,7 @@ class TestFaceContactKernel(unittest.TestCase):
         inputs += [([body], wp.int32), ([int(GeoType.BOX)], wp.int32), ([HALF], wp.vec3)]
         outputs = [wp.zeros(1, dtype=t) for t in (wp.int32, wp.int32, wp.vec3, wp.float32, wp.vec3, wp.vec3)]
         inputs = [wp.array(a, dtype=t) for a, t in inputs]
-        wp.launch(face_contact_kernel, dim=1, inputs=[*inputs, 32, 0.02], outputs=outputs)
+        wp.launch(face_contact_kernel, dim=1, inputs=[*inputs, 32, 0.02, edge_radius], outputs=outputs)
         n = int(outputs[0].numpy()[0])
         return [a.numpy()[:n] for a in outputs[2:]]
 
@@ -53,6 +53,21 @@ class TestFaceContactKernel(unittest.TestCase):
         self.assertAlmostEqual(float(_box_sdf(bary[0] @ points)), float(depth[0]), delta=1e-6)
         np.testing.assert_allclose(body_pos[0], bary[0] @ points - depth[0] * normal[0], atol=1e-6)
         self.assertAlmostEqual(float(_box_sdf(body_pos[0])), 0.0, delta=1e-6)
+
+    def test_rounded_edge_keeps_the_normal_continuous(self):
+        """Sunk into a sharp edge the normal is one face's; rounding the edge turns it between both faces."""
+        points = _draped_triangle()
+        for edge_radius in (0.0, 0.01):
+            bary, depth, body_pos, normal = self._query(points, edge_radius=edge_radius)
+            n = normal[0]
+            if edge_radius == 0.0:
+                self.assertAlmostEqual(float(np.abs(n).max()), 1.0, delta=1e-6)
+            else:
+                self.assertGreater(float(min(n[0], n[2])), 0.3)
+            self.assertAlmostEqual(float(_box_sdf(body_pos[0], edge_radius=edge_radius)), 0.0, delta=1e-6)
+            self.assertAlmostEqual(
+                float(_box_sdf(bary[0] @ points, edge_radius=edge_radius)), float(depth[0]), delta=1e-6
+            )
 
     def test_triangle_on_face_has_no_face_contact(self):
         """A triangle 1 mm above the top face is deepest at a vertex, which particle contacts cover."""
@@ -89,7 +104,7 @@ class TestFaceContactQuery(unittest.TestCase):
         model = builder.finalize()
         query = FaceContactQuery(model.tri_indices.numpy(), model.particle_count, model.device)
         particles = np.array(contact_particles)
-        return query.query(model, model.particle_q, None, particles, np.zeros_like(particles))
+        return query.query(model, model.particle_q, None, particles, np.zeros_like(particles), 0.0)
 
     def test_shared_edge_reports_one_contact(self):
         """Both triangles find the optimum on their shared edge; one contact remains, on the sphere."""
