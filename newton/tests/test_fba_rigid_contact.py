@@ -413,6 +413,38 @@ class TestSolverFBAArticulationContacts(unittest.TestCase):
         weight = model.body_mass.numpy()[0] * 9.81
         self.assertAlmostEqual(normal / (weight * hx * np.cos(alpha) / x_contact), 1.0, delta=1e-4)
 
+    def test_heavy_chain_rests_on_ground(self):
+        """Eight links lying on the ground, each three times heavier than the last.
+
+        The joint rows join the contact NSN, and the 2000:1 mass ratio spreads
+        their block's spectrum; the joint block preconditioner keeps it solvable.
+        """
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        length, half_height, parent, joints = 0.4, 0.05, -1, []
+        for k in range(8):
+            link = builder.add_link(xform=wp.transform((k * length + length / 2, 0.0, half_height)))
+            cfg = newton.ModelBuilder.ShapeConfig(density=1000.0 * 3.0**k)
+            builder.add_shape_box(link, hx=length / 2, hy=0.05, hz=half_height, cfg=cfg)
+            x_pj = wp.transform((0.0, 0.0, half_height) if parent < 0 else (length / 2, 0.0, 0.0))
+            x_cj = wp.transform((-length / 2, 0.0, 0.0))
+            joints.append(
+                builder.add_joint_revolute(parent, link, axis=(0.0, 1.0, 0.0), parent_xform=x_pj, child_xform=x_cj)
+            )
+            parent = link
+        builder.add_articulation(joints)
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=10)
+        s0, s1 = model.state(), model.state()
+        contacts = model.contacts()
+        for _ in range(20):
+            model.collide(s0, contacts)
+            solver.step(s0, s1, None, contacts, 0.005)
+            s0, s1 = s1, s0
+        np.testing.assert_allclose(s0.body_q.numpy()[:, 2], half_height, atol=1e-6)
+
 
 class TestSolverFBATwoWayContacts(unittest.TestCase):
     """A cloth patch over a free box: particle contacts push on both."""

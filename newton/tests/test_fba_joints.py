@@ -256,6 +256,12 @@ class TestBilateralSystem(unittest.TestCase):
         system.apply_force(row_jac, force, wp.array(b_const, dtype=wp.float64, device=device), b)
         np.testing.assert_allclose(b.numpy(), b_const + jac.T @ force.numpy(), rtol=1e-12)
 
+        # Block solve on the second articulation's rows, placed at an offset.
+        v, out = rng.standard_normal(8), wp.zeros(8, dtype=wp.float64, device=device)
+        rows = wp.array(np.arange(13, 18), dtype=wp.int32, device=device)
+        system.solve_rows(rows, 3, wp.array(v, dtype=wp.float64, device=device), out)
+        np.testing.assert_allclose(out.numpy()[3:], np.linalg.solve(W[13:18, 13:18], v[3:]), rtol=1e-8)
+
 
 class TestSolverFBAJoints(unittest.TestCase):
     """SolverFBA enforces joints in the rigid step."""

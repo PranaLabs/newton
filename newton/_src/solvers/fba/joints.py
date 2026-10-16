@@ -291,6 +291,36 @@ def bilateral_update_kernel(
     force[r] = force[r] + df[row_block[r], row_local[r]]
 
 
+@wp.kernel
+def block_gather_kernel(
+    rows: wp.array[wp.int32],
+    row_block: wp.array[wp.int32],
+    row_local: wp.array[wp.int32],
+    v: wp.array[wp.float64],
+    offset: int,
+    # outputs
+    rhs: wp.array2d[wp.float64],
+):
+    """``rhs[block, local] = v[offset + k]`` for joint row ``rows[k]``."""
+    k = wp.tid()
+    rhs[row_block[rows[k]], row_local[rows[k]]] = v[offset + k]
+
+
+@wp.kernel
+def block_scatter_kernel(
+    rows: wp.array[wp.int32],
+    row_block: wp.array[wp.int32],
+    row_local: wp.array[wp.int32],
+    x: wp.array2d[wp.float64],
+    offset: int,
+    # outputs
+    out: wp.array[wp.float64],
+):
+    """``out[offset + k] = x[block, local]`` for joint row ``rows[k]``."""
+    k = wp.tid()
+    out[offset + k] = x[row_block[rows[k]], row_local[rows[k]]]
+
+
 _TILE_KERNELS = {}
 
 
@@ -383,6 +413,33 @@ class BilateralSystem:
             dim=R,
             inputs=[self.row_block, self.row_local, self.df],
             outputs=[force],
+            device=self.device,
+        )
+
+    def solve_rows(self, rows: wp.array[wp.int32], offset: int, v: wp.array, out: wp.array) -> None:
+        """Block solve ``out = W⁻¹ v`` on joint rows ``rows`` placed at ``offset + k`` in both vectors.
+
+        ``rows`` must cover whole blocks; the factor comes from :meth:`factor`.
+        """
+        wp.launch(
+            block_gather_kernel,
+            dim=rows.shape[0],
+            inputs=[rows, self.row_block, self.row_local, v, offset],
+            outputs=[self.rhs],
+            device=self.device,
+        )
+        wp.launch_tiled(
+            _tile_kernels(self.tile)[1],
+            dim=self.W.shape[0],
+            inputs=[self.L, self.rhs, self.df],
+            block_dim=64,
+            device=self.device,
+        )
+        wp.launch(
+            block_scatter_kernel,
+            dim=rows.shape[0],
+            inputs=[rows, self.row_block, self.row_local, self.df, offset],
+            outputs=[out],
             device=self.device,
         )
 

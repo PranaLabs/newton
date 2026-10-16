@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import functools
 import math
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 
@@ -887,6 +889,8 @@ class SolverFBA(SolverBase):
             skip_download=True,
             m_contacts=m_s + m_r,
             n_bilateral=n - n_c,
+            # The joint rows' block of A_schur is their W: Cholesky-factored per articulation.
+            block_precond=functools.partial(self._joint_system.solve_rows, joint_rows, n_c) if n > n_c else None,
         )
         wp.copy(self._rc_lam_d, self._nsn_lam_d, count=n)
         wp.copy(self._rc_omega_d, self._nsn_omega_d, count=n)
@@ -3840,6 +3844,7 @@ class SolverFBA(SolverBase):
         skip_download: bool = False,
         m_contacts: int | None = None,
         n_bilateral: int = 0,
+        block_precond: Callable[[wp.array, wp.array], None] | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """GPU port of :meth:`_solve_nsn_coulomb` (Stage B NSN inner).
 
@@ -3884,6 +3889,8 @@ class SolverFBA(SolverBase):
                 rows; all row arrays then hold ``3M + n_bilateral`` rows.
                 They follow the identity law of :func:`bilateral_law_kernel`
                 and skip the cone clamp and ``lambda_cap``.
+            block_precond: Optional block preconditioner of the bilateral
+                rows, passed to :meth:`NSNPCRSolver.solve`.
 
         Returns:
             ``(lam, omega, lam_apply)`` host fp64 arrays of shape ``(3M,)``.
@@ -4069,7 +4076,7 @@ class SolverFBA(SolverBase):
             rhs_view = self._nsn_rhs_d[:n_rows]
             dlam_view = self._nsn_dlam_d[:n_rows]
             try:
-                self._pcr_solver.solve(a_view, rhs_view, dlam_view)
+                self._pcr_solver.solve(a_view, rhs_view, dlam_view, block_precond=block_precond)
             except Exception:
                 break
 
