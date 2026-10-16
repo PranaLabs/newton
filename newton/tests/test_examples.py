@@ -771,6 +771,13 @@ add_example_test(
     test_options={"num-frames": 200},
     use_viewer=True,
 )
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_cloth_on_boxes_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 300},
+    use_viewer=True,
+)
 
 
 class TestSoftbodyExamples(unittest.TestCase):
