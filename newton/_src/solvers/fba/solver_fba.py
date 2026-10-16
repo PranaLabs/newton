@@ -467,6 +467,7 @@ class SolverFBA(SolverBase):
         self.face_contact_margin = None if face_contact_margin is None else float(face_contact_margin)
         self.soft_contact_thickness = float(soft_contact_thickness)
         self._face_query, self._contact_extra = None, None
+        self._constraint_rows = None  # set_particle_constraints: particles, coefficients, directions, targets
         if self.face_contacts:
             if not self.friction or nsn_schur_mode != "full" or not self.use_isodof or mu_per_pair_override is not None:
                 raise ValueError(
@@ -1086,6 +1087,13 @@ class SolverFBA(SolverBase):
             return {}
         return {"j_extra_indices": self._contact_extra[0], "j_extra_alpha": self._contact_extra[1]}
 
+    def _constraint_args(self) -> dict:
+        """Bilateral particle rows of :meth:`set_particle_constraints`, for ``build_schur_complement``."""
+        if self._constraint_rows is None:
+            return {}
+        particles, coefficients, directions, _ = self._constraint_rows
+        return {"bilateral_particles": particles, "bilateral_alpha": coefficients, "bilateral_dir": directions}
+
     def _contact_offsets(self) -> list:
         """Normal and shifted tangent offsets of the deformable contacts."""
         return [
@@ -1403,7 +1411,8 @@ class SolverFBA(SolverBase):
         # weighting so iter-0 of the next call can compute penetration at the
         # already-corrected position.
         M = self._contact_count
-        if M > 0:
+        n_b = 0 if self._constraint_rows is None else self._constraint_rows[0].shape[0]
+        if M > 0 or n_b:
             if self._lam_unilateral_persistent is None or self._lam_unilateral_persistent.shape != (M,):
                 self._lam_unilateral_persistent = np.zeros(M, dtype=np.float64)
             else:
@@ -1426,7 +1435,7 @@ class SolverFBA(SolverBase):
             # arrays above. The hot solver path keeps the device versions
             # authoritative across PD outer iters; the host arrays are
             # refreshed once at end-of-step for tests / diagnostics.
-            n_rows_max = 3 * M
+            n_rows_max = 3 * M + n_b
             need_alloc = (
                 not hasattr(self, "_lam_unilateral_persistent_d")
                 or self._lam_unilateral_persistent_d is None
@@ -1523,10 +1532,12 @@ class SolverFBA(SolverBase):
             if _diag_active:
                 self._diag_buffers[f"x_post_solve_k{_k}"] = self._x_cur.numpy().astype(np.float64).copy()
 
-            if has_contacts and not self._two_way:
+            if (has_contacts or n_b) and not self._two_way:
                 # --- Schur-complement NSN contact correction ---
                 M = self._contact_count
                 ls = self._linear_solver
+                if n_b:
+                    self._ensure_contact_buffers(1)
 
                 if self.friction and hasattr(self, "_contact_tangent1_d"):
                     # Stage B: 3M Schur complement with Coulomb cone projection.
@@ -1566,6 +1577,7 @@ class SolverFBA(SolverBase):
                                 use_isodof=self.use_isodof,
                                 download=False,
                                 **self._contact_extra_args(),
+                                **self._constraint_args(),
                             )
                         self._cached_W = True
                         self._cached_A_inv_Jt_valid = True
@@ -1576,11 +1588,19 @@ class SolverFBA(SolverBase):
                     # Bottleneck #2 fix: residual + pene0 + warm-start all
                     # device-resident. The PD outer iter now does ZERO
                     # host<->device transfers around the NSN call.
-                    self._ensure_nsn_inner_buffers(3 * M, alloc_2d=not use_lite_block_diag)
+                    self._ensure_nsn_inner_buffers(3 * M + n_b, alloc_2d=not use_lite_block_diag)
                     from . import kernels as K_step  # noqa: PLC0415
 
                     self._launch_contact_residual(self._nsn_r_d)
                     self._launch_contact_pene0(self._nsn_pene0_d)
+                    if n_b:
+                        wp.launch(
+                            K_step.particle_constraint_residual_kernel,
+                            dim=n_b,
+                            inputs=[*self._constraint_rows, self._x_cur, wp.int32(3 * M)],
+                            outputs=[self._nsn_r_d, self._nsn_pene0_d],
+                            device=device,
+                        )
                     if use_lite_block_diag:
                         # Warm-start ω + λ from the persistent device buffers
                         # (same convention as the dense path).
@@ -1672,12 +1692,13 @@ class SolverFBA(SolverBase):
                             omega_init_device=self._omega_coulomb_persistent_d,
                             skip_download=True,
                             m_contacts=M,
+                            n_bilateral=n_b,
                             # Face contacts act on particles that also carry particle contacts.
                             contact_regularization=0.0 if self._contact_extra is None else self.contact_regularization,
                         )
                     # Persist device-resident lam / omega for next PD iter.
-                    wp.copy(self._lam_coulomb_persistent_d, self._nsn_lam_d, count=3 * M)
-                    wp.copy(self._omega_coulomb_persistent_d, self._nsn_omega_d, count=3 * M)
+                    wp.copy(self._lam_coulomb_persistent_d, self._nsn_lam_d, count=3 * M + n_b)
+                    wp.copy(self._omega_coulomb_persistent_d, self._nsn_omega_d, count=3 * M + n_b)
                     # RealSim in-iter combined-form correction (Task 1.3.g,
                     # A-tier alignment): mirrors NonSmoothNewton.cpp:151-167's
                     # ``applyConstraintCorrection``. The magnitude guard was
@@ -2111,6 +2132,33 @@ class SolverFBA(SolverBase):
             self._x_ref.assign(target_positions)
         else:
             self._x_ref.assign(np.asarray(target_positions, dtype=np.float32))
+
+    def set_particle_constraints(self, particles, coefficients, directions, targets) -> None:
+        """Hold linear combinations of particle positions in the following steps.
+
+        Row ``r`` requires ``sum_k coefficients[r, k] * dot(directions[r], x[particles[r, k]]) == targets[r]``.
+        The rows are bilateral and solved with the contacts in each NSN step, so
+        their multipliers carry the forces that hold them; the direction stays
+        fixed within a step. Unused slots have particle ``-1``; slot 0 must be
+        used. ``None`` removes the rows.
+
+        Args:
+            particles: Particle indices, shape ``(R, K)``.
+            coefficients: Their coefficients, shape ``(R, K)``.
+            directions: Row directions, shape ``(R, 3)``.
+            targets: Row values [m], shape ``(R,)``.
+        """
+        self._invalidate_schur_cache()
+        if particles is None or len(particles) == 0:
+            self._constraint_rows = None
+            return
+        if not self.friction or self.nsn_schur_mode != "full" or not self.use_isodof:
+            raise ValueError("particle constraints need friction=True, nsn_schur_mode='full' and use_isodof=True")
+        if self.model.body_count > 0 and not self.integrate_with_external_rigid_solver:
+            raise NotImplementedError("particle constraints are not solved with rigid bodies yet")
+        arrays = [(particles, np.int32, wp.int32), (coefficients, np.float32, wp.float32)]
+        arrays += [(directions, np.float32, wp.vec3), (targets, np.float64, wp.float64)]
+        self._constraint_rows = [wp.array(np.asarray(a, dtype=n), dtype=t, device=self._device) for a, n, t in arrays]
 
     def notify_model_changed(self, flags: int) -> None:
         # On any geometry/inertial change, force a full re-setup at the next step.

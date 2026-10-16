@@ -3508,6 +3508,28 @@ def subtract_slot_residual_kernel(
             r[3 * c + 2] = r[3 * c + 2] - w * wp.float64(wp.dot(contact_t2[c], x[p]))
 
 
+@wp.kernel
+def particle_constraint_residual_kernel(
+    particles: wp.array2d[wp.int32],  # (B, K), -1 when unused
+    coefficients: wp.array2d[wp.float32],  # (B, K)
+    direction: wp.array[wp.vec3],
+    target: wp.array[wp.float64],
+    x: wp.array[wp.vec3],
+    row_offset: wp.int32,
+    r: wp.array[wp.float64],  # out, rows from row_offset
+    pene0: wp.array[wp.float64],  # out, rows from row_offset
+):
+    """Residual ``target - sum_k c_k dot(d, x[p_k])`` and anchor value ``target`` of bilateral particle rows."""
+    b = wp.tid()
+    s = wp.float64(0.0)
+    for k in range(particles.shape[1]):
+        p = particles[b, k]
+        if p >= 0:
+            s += wp.float64(coefficients[b, k]) * wp.float64(wp.dot(direction[b], x[p]))
+    r[row_offset + b] = target[b] - s
+    pene0[row_offset + b] = target[b]
+
+
 # ---------------------------------------------------------------------------
 # NSN inner LCP — Fischer-Burmeister rows + Schur build (Option C, fp64).
 #

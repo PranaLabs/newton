@@ -1022,6 +1022,9 @@ class FBALinearSolver:
         download: bool = True,
         j_extra_indices: wp.array | None = None,
         j_extra_alpha: wp.array | None = None,
+        bilateral_particles: wp.array | None = None,
+        bilateral_alpha: wp.array | None = None,
+        bilateral_dir: wp.array | None = None,
     ) -> np.ndarray | None:
         """Build ``W = J · A⁻¹ · Jᵀ`` as a dense NumPy array (batched GPU implementation).
 
@@ -1073,6 +1076,11 @@ class FBALinearSolver:
                 contact then acts on ``alpha_k`` times its direction on each
                 of its ``K`` particles. Needs ``use_isodof=True``.
             j_extra_alpha: Their Jacobian coefficients, shape ``[M, K - 1]``, dtype float32.
+            bilateral_particles: Optional particles of bilateral rows that
+                follow the contact rows, shape ``[B, K]``, dtype int32, ``-1``
+                when unused; slot 0 must be used. Needs ``use_isodof=True``.
+            bilateral_alpha: Their coefficients, shape ``[B, K]``, dtype float32.
+            bilateral_dir: Direction of each bilateral row, shape ``[B]``, dtype vec3.
 
         Returns:
             Dense float64 NumPy array of shape ``(M, M)`` (Stage A) or
@@ -1125,13 +1133,33 @@ class FBALinearSolver:
             row_dir[:] = n_np
             row_alpha[:] = a_np
 
-        # Rows on several particles keep their extra slots and a CSR from particle to ``row * K + slot``.
-        self._row_slots, isodof_particles = None, row_particle
+        extra_p = extra_a = None
         if j_extra_indices is not None and (j_extra_indices.numpy()[:M] >= 0).any():
-            if not use_isodof:
-                raise NotImplementedError("contact rows on several particles need use_isodof=True")
             extra_p = np.repeat(j_extra_indices.numpy()[:M], rows_per_contact, axis=0)
             extra_a = np.repeat(j_extra_alpha.numpy()[:M], rows_per_contact, axis=0)
+        if bilateral_particles is not None and bilateral_particles.shape[0]:
+            # Bilateral rows follow the contact rows; their first particle takes slot 0.
+            if not use_isodof:
+                raise NotImplementedError("bilateral rows need use_isodof=True")
+            b_p, b_a = bilateral_particles.numpy(), bilateral_alpha.numpy()
+            k = max(b_p.shape[1], 1 if extra_p is None else extra_p.shape[1] + 1) - 1
+            if extra_p is None:
+                extra_p, extra_a = np.full((total_rows, 0), -1, np.int32), np.zeros((total_rows, 0), np.float32)
+            pad = [(0, 0), (0, k - extra_p.shape[1])], [(0, 0), (0, k + 1 - b_p.shape[1])]
+            extra_p = np.vstack(
+                [np.pad(extra_p, pad[0], constant_values=-1), np.pad(b_p[:, 1:], pad[1], constant_values=-1)]
+            )
+            extra_a = np.vstack([np.pad(extra_a, pad[0]), np.pad(b_a[:, 1:], pad[1])])
+            row_particle = np.concatenate([row_particle, b_p[:, 0]]).astype(np.int32)
+            row_dir = np.concatenate([row_dir, bilateral_dir.numpy()]).astype(np.float32)
+            row_alpha = np.concatenate([row_alpha, b_a[:, 0]]).astype(np.float32)
+            total_rows += len(b_p)
+
+        # Rows on several particles keep their extra slots and a CSR from particle to ``row * K + slot``.
+        self._row_slots, isodof_particles = None, row_particle
+        if extra_p is not None and (extra_p >= 0).any():
+            if not use_isodof:
+                raise NotImplementedError("rows on several particles need use_isodof=True")
             rows, slots = np.nonzero(extra_p >= 0)
             width = extra_p.shape[1] + 1
             order = np.argsort(extra_p[rows, slots], kind="stable")
