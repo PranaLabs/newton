@@ -199,5 +199,66 @@ class TestRigidContactRows(unittest.TestCase):
         np.testing.assert_allclose(jac, fd.T, atol=1e-8)
 
 
+class TestSolverFBARigidContacts(unittest.TestCase):
+    """A 1 m box on the ground; tilting gravity turns the ground into an incline."""
+
+    MU, H = 0.5, 0.01
+
+    @classmethod
+    def setUpClass(cls):
+        if not wp.is_cuda_available():
+            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
+
+    def _run(self, gravity, v0, steps):
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        cfg = newton.ModelBuilder.ShapeConfig(mu=self.MU)
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane(cfg=cfg)
+        builder.add_shape_box(builder.add_body(xform=wp.transform((0.0, 0.0, 0.5), wp.quat_identity())), cfg=cfg)
+        model = builder.finalize()
+        model.gravity.assign([wp.vec3(*gravity)])
+        solver = SolverFBA(model, iterations=10)
+        s0, s1 = model.state(), model.state()
+        s0.body_qd.assign([[*v0, 0.0, 0.0, 0.0]])
+        contacts, traj = model.contacts(), []
+        for _ in range(steps):
+            model.collide(s0, contacts)
+            solver.step(s0, s1, None, contacts, self.H)
+            s0, s1 = s1, s0
+            traj.append(np.concatenate([s0.body_q.numpy()[0], s0.body_qd.numpy()[0]]))
+        return solver, model, np.array(traj)
+
+    def test_box_rests_on_ground(self):
+        solver, model, traj = self._run((0.0, 0.0, -9.81), (0.0, 0.0, 0.0), 100)
+        np.testing.assert_allclose(traj[:, :3], np.tile([0.0, 0.0, 0.5], (100, 1)), atol=1e-6)
+        np.testing.assert_allclose(traj[:, 7:], 0.0, atol=1e-6)
+        rows = 3 * solver._rigid_contacts.count
+        weight = model.body_mass.numpy()[0] * 9.81
+        self.assertAlmostEqual(solver._nsn_lam_apply_d.numpy()[:rows:3].sum() / weight, 1.0, delta=1e-6)
+
+    def test_sliding_box_decelerates_at_mu_g(self):
+        g, v0, n = 9.81, 2.0, 60
+        _, _, traj = self._run((0.0, 0.0, -g), (v0, 0.0, 0.0), n)
+        t = self.H * np.arange(1, n + 1)
+        sliding = t < v0 / (self.MU * g) - 2 * self.H
+        np.testing.assert_allclose(traj[sliding, 7], v0 - self.MU * g * t[sliding], atol=5e-3)
+        np.testing.assert_allclose(traj[-10:, 7:10], 0.0, atol=1e-6)  # static friction holds it
+        self.assertAlmostEqual(traj[-1, 0], v0 * v0 / (2.0 * self.MU * g), delta=v0 * self.H)
+
+    def test_incline_sticks_below_friction_angle(self):
+        n = 50
+        for tan_theta in (0.3, 0.8):
+            theta = np.arctan(tan_theta)
+            _, _, traj = self._run(9.81 * np.array([np.sin(theta), 0.0, -np.cos(theta)]), (0.0, 0.0, 0.0), n)
+            if tan_theta < self.MU:
+                self.assertLess(abs(traj[-1, 0]), 1e-4)
+            else:
+                a = 9.81 * (np.sin(theta) - self.MU * np.cos(theta))
+                # Breaking away from rest is the slowest step for the FB-Newton iteration.
+                self.assertAlmostEqual(traj[0, 7] / (a * self.H), 1.0, delta=0.05)
+                np.testing.assert_allclose(np.diff(traj[:, 7]), a * self.H, rtol=5e-3)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

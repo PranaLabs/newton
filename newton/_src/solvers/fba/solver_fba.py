@@ -622,6 +622,7 @@ class SolverFBA(SolverBase):
         self._rigid_u_d = wp.empty(6 * m, dtype=wp.float64, device=device)
         self._rigid_x_live_d = wp.empty(m, dtype=wp.vec3d, device=device)
         self._rigid_q_live_d = wp.empty(m, dtype=wp.quatd, device=device)
+        self._rigid_u_free_d = wp.empty(6 * m, dtype=wp.float64, device=device)
         self._rigid_b_iter_d = wp.empty(6 * m, dtype=wp.float64, device=device)
         self._body_slot_h = np.full(model.body_count, -1, dtype=np.int32)
         self._body_slot_h[bodies] = np.arange(m)
@@ -638,12 +639,13 @@ class SolverFBA(SolverBase):
             return
         R = int(self._joint_rows.block_start[-1])
         self._joint_system = BilateralSystem(self._joint_rows, slot, self._slot_inv_mass_d, device)
+        self._jointed_slots = np.flatnonzero(np.diff(self._joint_system.slot_entry_start.numpy()))
         self._joint_row_slot_d = wp.empty((R, 2), dtype=wp.int32, device=device)
         self._joint_row_jac_d = wp.empty((R, 2), dtype=wp.spatial_vectord, device=device)
         self._joint_residual_d = wp.empty(R, dtype=wp.float64, device=device)
         self._joint_force_d = wp.empty(R, dtype=wp.float64, device=device)
 
-    def _begin_rigid_step(self, state_in: State, state_out: State, dt: float) -> bool:
+    def _begin_rigid_step(self, state_in: State, state_out: State, contacts: Contacts | None, dt: float) -> bool:
         """Start the step of the integrated bodies at their free-flight solution.
 
         Kinematic bodies pass through. The joint Jacobian and ``W`` are
@@ -683,6 +685,7 @@ class SolverFBA(SolverBase):
             device=self._device,
         )
         ls.solve_scalar(self._rigid_b_d, self._rigid_u_d)
+        wp.copy(self._rigid_u_free_d, self._rigid_u_d)
         self._retract_rigid(state_in, state_out, dt)
         if self._joint_rows is not None:
             wp.launch(
@@ -700,7 +703,104 @@ class SolverFBA(SolverBase):
             )
             self._joint_system.factor(self._joint_row_slot_d, self._joint_row_jac_d)
             self._joint_force_d.zero_()
+        self._begin_rigid_contacts(contacts)
         return True
+
+    def _begin_rigid_contacts(self, contacts: Contacts | None) -> None:
+        """Collect this step's rigid contacts and assemble their rows and ``W`` at the pinned frame."""
+        from .rigid import rigid_delassus_kernel, row_incidence  # noqa: PLC0415
+        from .rigid_contact import gather_rigid_contacts, rigid_contact_jacobian_kernel  # noqa: PLC0415
+
+        model, device = self.model, self._device
+        rc = None if contacts is None else gather_rigid_contacts(model, contacts, self._body_slot_h, device)
+        self._rigid_contacts = rc
+        if rc is None:
+            return
+        if not self.friction or self.nsn_schur_mode != "full":
+            raise NotImplementedError(
+                "SolverFBA solves rigid contacts only with friction=True and nsn_schur_mode='full'"
+            )
+        if self._joint_rows is not None and np.isin(rc.slot, self._jointed_slots).any():
+            raise NotImplementedError("SolverFBA does not solve contacts on articulated bodies yet")
+        n = 3 * rc.count
+        self._rc_row_slot_d = wp.empty((n, 2), dtype=wp.int32, device=device)
+        self._rc_row_jac_d = wp.empty((n, 2), dtype=wp.spatial_vectord, device=device)
+        wp.launch(
+            rigid_contact_jacobian_kernel,
+            dim=(rc.count, 3),
+            inputs=[rc.body, rc.anchor, rc.normal, self._body_slot_d, self._rigid_q_pin_d, 0],
+            outputs=[self._rc_row_slot_d, self._rc_row_jac_d],
+            device=device,
+        )
+        self._rc_W_d = wp.empty((n, n), dtype=wp.float64, device=device)
+        wp.launch(
+            rigid_delassus_kernel,
+            dim=(n, n),
+            inputs=[
+                wp.empty((0, 0), dtype=wp.float64, device=device),
+                0,
+                self._rc_row_slot_d,
+                self._rc_row_jac_d,
+                self._slot_inv_mass_d,
+            ],
+            outputs=[self._rc_W_d],
+            device=device,
+        )
+        incidence = row_incidence(np.repeat(rc.slot, 3, axis=0), self._rigid_bodies_d.shape[0])
+        self._rc_incidence = [wp.array(a, dtype=wp.int32, device=device) for a in incidence]
+        self._rc_value_d = wp.empty(n, dtype=wp.float64, device=device)
+        self._rc_r_d = wp.empty(n, dtype=wp.float64, device=device)
+        self._rc_pene0_d = wp.zeros(n, dtype=wp.float64, device=device)
+        self._rc_lam_d = wp.zeros(n, dtype=wp.float64, device=device)
+        self._rc_omega_d = wp.zeros(n, dtype=wp.float64, device=device)
+
+    def _solve_rigid_contacts(self, state_in: State, dt: float) -> wp.array[wp.float64]:
+        """Solve the NSN of the rigid contact rows from their live residual; returns the row forces [N].
+
+        The residual ``-g + J (u - u_free)`` makes the NSN prediction
+        ``-r + dt² W (omega λ)`` reproduce the live gap ``g`` for the forces
+        that produced ``u``, while ``W`` and ``J`` stay at the pinned frame.
+        """
+        from .rigid import rigid_row_residual_kernel  # noqa: PLC0415
+        from .rigid_contact import rigid_contact_gap_kernel  # noqa: PLC0415
+
+        rc, device, n = self._rigid_contacts, self._device, self._rc_r_d.shape[0]
+        wp.launch(
+            rigid_contact_gap_kernel,
+            dim=rc.count,
+            inputs=[
+                *(rc.body, rc.anchor, rc.normal, self._body_slot_d, self._rigid_x_live_d, self._rigid_q_live_d),
+                *(self._rigid_x_prev_d, state_in.body_q, state_in.body_qd, self.model.body_com, wp.float64(dt), 0),
+            ],
+            outputs=[self._rc_value_d],
+            device=device,
+        )
+        wp.launch(
+            rigid_row_residual_kernel,
+            dim=n,
+            inputs=[self._rc_value_d, self._rc_row_slot_d, self._rc_row_jac_d, self._rigid_u_d, self._rigid_u_free_d],
+            outputs=[self._rc_r_d],
+            device=device,
+        )
+        self._solve_nsn_coulomb_gpu(
+            None,
+            None,
+            None,
+            None,
+            max_iters=self.nsn_iterations,
+            dt=dt,
+            W_device=self._rc_W_d,
+            r_device=self._rc_r_d,
+            pene0_device=self._rc_pene0_d,
+            mu_device=rc.mu,
+            lam_init_device=self._rc_lam_d,
+            omega_init_device=self._rc_omega_d,
+            skip_download=True,
+            m_contacts=rc.count,
+        )
+        wp.copy(self._rc_lam_d, self._nsn_lam_d, count=n)
+        wp.copy(self._rc_omega_d, self._nsn_omega_d, count=n)
+        return self._nsn_lam_apply_d
 
     def _retract_rigid(self, state_in: State, state_out: State, dt: float) -> None:
         from .rigid import retract_rigid_kernel  # noqa: PLC0415
@@ -737,10 +837,12 @@ class SolverFBA(SolverBase):
     def _rigid_iteration(self, state_in: State, state_out: State, dt: float) -> None:
         """One LG iteration of the integrated bodies.
 
-        Measures the joint residual at the live pose, takes a Newton step on the
-        joint forces ``f``, and re-solves ``A u = b + Jᵀ f`` before retracting.
+        Takes a Newton step on the joint forces and solves the contact NSN, both
+        from the residual at the live pose, then re-solves ``A u = b + Jᵀ f``
+        with all row forces ``f`` and retracts.
         """
         from .joints import joint_residual_kernel  # noqa: PLC0415
+        from .rigid import row_force_rhs_kernel  # noqa: PLC0415
 
         b = self._rigid_b_d
         if self._joint_rows is not None:
@@ -757,6 +859,16 @@ class SolverFBA(SolverBase):
             system = self._joint_system
             system.update(self._joint_residual_d, self._joint_force_d)
             system.apply_force(self._joint_row_jac_d, self._joint_force_d, b, self._rigid_b_iter_d)
+            b = self._rigid_b_iter_d
+        if self._rigid_contacts is not None:
+            force = self._solve_rigid_contacts(state_in, dt)
+            wp.launch(
+                row_force_rhs_kernel,
+                dim=self._rigid_bodies_d.shape[0],
+                inputs=[*self._rc_incidence, self._rc_row_jac_d, force, b],
+                outputs=[self._rigid_b_iter_d],
+                device=self._device,
+            )
             b = self._rigid_b_iter_d
         if b is self._rigid_b_d:
             return
@@ -959,7 +1071,7 @@ class SolverFBA(SolverBase):
             }
 
         rigid = self.model.body_count > 0 and not self.integrate_with_external_rigid_solver
-        rigid = rigid and self._begin_rigid_step(state_in, state_out, dt)
+        rigid = rigid and self._begin_rigid_step(state_in, state_out, contacts, dt)
         if self.model.particle_count == 0:
             for _ in range(self.iterations if rigid else 0):
                 self._rigid_iteration(state_in, state_out, dt)
