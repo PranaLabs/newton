@@ -622,26 +622,26 @@ class SolverFBA(SolverBase):
         self._rigid_u_d = wp.empty(6 * m, dtype=wp.float64, device=device)
         self._rigid_x_live_d = wp.empty(m, dtype=wp.vec3d, device=device)
         self._rigid_q_live_d = wp.empty(m, dtype=wp.quatd, device=device)
-        self._setup_joints(bodies)
+        self._rigid_b_iter_d = wp.empty(6 * m, dtype=wp.float64, device=device)
+        self._body_slot_h = np.full(model.body_count, -1, dtype=np.int32)
+        self._body_slot_h[bodies] = np.arange(m)
+        self._body_slot_d = wp.array(self._body_slot_h, dtype=wp.int32, device=device)
+        self._setup_joints()
 
-    def _setup_joints(self, bodies: np.ndarray) -> None:
+    def _setup_joints(self) -> None:
         """Collect the joint rows on the integrated bodies and their Newton system."""
         from .joints import BilateralSystem, build_joint_rows  # noqa: PLC0415
 
-        device = self._device
-        slot = np.full(self.model.body_count, -1, dtype=np.int32)
-        slot[bodies] = np.arange(bodies.size)
+        device, slot = self._device, self._body_slot_h
         self._joint_rows = build_joint_rows(self.model, slot, device)
         if self._joint_rows is None:
             return
         R = int(self._joint_rows.block_start[-1])
         self._joint_system = BilateralSystem(self._joint_rows, slot, self._slot_inv_mass_d, device)
-        self._body_slot_d = wp.array(slot, dtype=wp.int32, device=device)
         self._joint_row_slot_d = wp.empty((R, 2), dtype=wp.int32, device=device)
         self._joint_row_jac_d = wp.empty((R, 2), dtype=wp.spatial_vectord, device=device)
         self._joint_residual_d = wp.empty(R, dtype=wp.float64, device=device)
         self._joint_force_d = wp.empty(R, dtype=wp.float64, device=device)
-        self._rigid_b_joint_d = wp.empty(6 * bodies.size, dtype=wp.float64, device=device)
 
     def _begin_rigid_step(self, state_in: State, state_out: State, dt: float) -> bool:
         """Start the step of the integrated bodies at their free-flight solution.
@@ -742,25 +742,25 @@ class SolverFBA(SolverBase):
         """
         from .joints import joint_residual_kernel  # noqa: PLC0415
 
-        if self._joint_rows is None:
+        b = self._rigid_b_d
+        if self._joint_rows is not None:
+            wp.launch(
+                joint_residual_kernel,
+                dim=self._joint_residual_d.shape[0],
+                inputs=[
+                    *self._joint_row_args(),
+                    *(self._rigid_x_live_d, self._rigid_q_live_d, state_in.body_q, self.model.body_com),
+                ],
+                outputs=[self._joint_residual_d],
+                device=self._device,
+            )
+            system = self._joint_system
+            system.update(self._joint_residual_d, self._joint_force_d)
+            system.apply_force(self._joint_row_jac_d, self._joint_force_d, b, self._rigid_b_iter_d)
+            b = self._rigid_b_iter_d
+        if b is self._rigid_b_d:
             return
-        wp.launch(
-            joint_residual_kernel,
-            dim=self._joint_residual_d.shape[0],
-            inputs=[
-                *self._joint_row_args(),
-                self._rigid_x_live_d,
-                self._rigid_q_live_d,
-                state_in.body_q,
-                self.model.body_com,
-            ],
-            outputs=[self._joint_residual_d],
-            device=self._device,
-        )
-        system = self._joint_system
-        system.update(self._joint_residual_d, self._joint_force_d)
-        system.apply_force(self._joint_row_jac_d, self._joint_force_d, self._rigid_b_d, self._rigid_b_joint_d)
-        self._rigid_linear_solver.solve_scalar(self._rigid_b_joint_d, self._rigid_u_d)
+        self._rigid_linear_solver.solve_scalar(b, self._rigid_u_d)
         self._retract_rigid(state_in, state_out, dt)
 
     def _setup_pd_system(self, dt: float) -> None:
