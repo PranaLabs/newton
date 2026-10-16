@@ -280,6 +280,21 @@ class TestSolverFBAJoints(unittest.TestCase):
         h, n = 0.01, 20
         np.testing.assert_allclose(self._run(model, h, n), [h * h * n * (n + 1) / 2, 0, 0, 0, 0, 0, 1], atol=1e-6)
 
+    def test_rejects_articulations_beyond_one_tile(self):
+        """Thirteen revolute joints in one chain make 65 rows, more than one tile Cholesky factors."""
+        builder = newton.ModelBuilder()
+        links = [_link(builder, xform=wp.transform((float(k), 0.0, 0.0))) for k in range(13)]
+        x_cj = wp.transform((-0.5, 0.0, 0.0))
+        parents = [-1, *links[:-1]]
+        builder.add_articulation(
+            [
+                builder.add_joint_revolute(p, c, axis=(0.0, 0.0, 1.0), child_xform=x_cj)
+                for p, c in zip(parents, links, strict=True)
+            ]
+        )
+        with self.assertRaises(NotImplementedError):
+            self._run(builder.finalize(), 0.01, 1)
+
     def test_pendulum_converges_to_ode(self):
         """A compound pendulum released horizontally converges at first order in h."""
         from scipy.integrate import solve_ivp

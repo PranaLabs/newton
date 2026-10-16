@@ -324,8 +324,9 @@ class BilateralSystem:
     def __init__(self, rows: JointRows, body_slot: np.ndarray, slot_inv_mass: wp.array, device):
         sizes = np.diff(rows.block_start)
         self.tile = max(8, 1 << int(np.ceil(np.log2(sizes.max()))))
-        if self.tile > 128:
-            raise NotImplementedError(f"SolverFBA supports at most 128 joint rows per articulation, got {sizes.max()}")
+        # An fp64 tile Cholesky of 128 rows needs more shared memory than GPUs provide.
+        if self.tile > 64:
+            raise NotImplementedError(f"SolverFBA supports at most 64 joint rows per articulation, got {sizes.max()}")
         n_blocks, R = len(sizes), int(rows.block_start[-1])
         self.slot_inv_mass = slot_inv_mass
 
