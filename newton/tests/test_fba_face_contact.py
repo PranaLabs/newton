@@ -163,5 +163,81 @@ class TestContactRowsOnSeveralParticles(unittest.TestCase):
         np.testing.assert_allclose(r.numpy(), offsets - self.J @ x.ravel(), rtol=1e-5, atol=1e-6)
 
 
+class TestSolverFBAFaceContacts(unittest.TestCase):
+    """A cloth of 5 cm cells on a static box with half extents 0.3 m."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not wp.is_cuda_available():
+            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
+
+    def _run(self, face_contacts, pos, cells, steps):
+        """Final particle positions, the largest particle speed and the solver."""
+        builder = newton.ModelBuilder()
+        cfg = newton.ModelBuilder.ShapeConfig(mu=0.6)
+        builder.add_shape_box(
+            -1, xform=wp.transform((0.0, 0.0, 0.3), wp.quat_identity()), hx=0.3, hy=0.3, hz=0.3, cfg=cfg
+        )
+        builder.add_cloth_grid(
+            pos=wp.vec3(*pos),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=cells,
+            dim_y=cells,
+            cell_x=0.05,
+            cell_y=0.05,
+            mass=0.002,
+            tri_ke=5.0e3,
+            tri_ka=5.0e3,
+            edge_ke=0.1,
+        )
+        model = builder.finalize()
+        solver = newton.solvers.SolverFBA(model, iterations=10, face_contacts=face_contacts)
+        pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.05)
+        contacts, s0, s1, speed = pipeline.contacts(), model.state(), model.state(), 0.0
+        for _ in range(steps):
+            pipeline.collide(s0, contacts)
+            solver.step(s0, s1, None, contacts, 1.0 / 120.0)
+            s0, s1 = s1, s0
+            speed = max(speed, float(np.abs(s0.particle_qd.numpy()).max()))
+        return s0.particle_q.numpy(), speed, solver
+
+    def test_box_edge_stays_out_of_the_faces(self):
+        """Draped over the top edge, the cloth keeps the edge out of its faces, not just off its particles."""
+        u, v = np.mgrid[0.0:1.0:21j, 0.0:1.0:21j]
+        grid = np.stack([1.0 - u - v, u, v], axis=-1).reshape(-1, 3)
+        grid = grid[grid[:, 0] >= 0.0]
+        for face_contacts, bound in ((False, -5e-3), (True, -2.5e-3)):
+            x, speed, solver = self._run(face_contacts, (0.0, -0.3, 0.65), 12, 240)
+            faces = np.einsum("gk,tkd->tgd", grid, x[solver.model.tri_indices.numpy()])
+            deepest = _box_sdf(faces - [0.0, 0.0, 0.3], np.full(3, 0.3)).min()
+            if face_contacts:
+                self.assertGreater(deepest, bound)
+            else:  # particle contacts alone let the edge 5 mm or more into the faces
+                self.assertLess(deepest, bound)
+            self.assertLess(speed, 1.5)
+
+    def test_flat_contact_is_unchanged(self):
+        """On a flat face every triangle is deepest at a vertex: no face contact, the same trajectory."""
+        runs = [self._run(face_contacts, (-0.1, -0.1, 0.62), 4, 40) for face_contacts in (False, True)]
+        self.assertIsNone(runs[1][2]._contact_extra)
+        np.testing.assert_array_equal(runs[0][0], runs[1][0])
+
+    def test_needs_the_full_coulomb_mode(self):
+        builder = newton.ModelBuilder()
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=1,
+            dim_y=1,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+        )
+        with self.assertRaises(ValueError):
+            newton.solvers.SolverFBA(builder.finalize(), friction=False, face_contacts=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
