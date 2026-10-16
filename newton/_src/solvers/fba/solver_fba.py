@@ -651,7 +651,7 @@ class SolverFBA(SolverBase):
         self._joint_residual_d = wp.empty(R, dtype=wp.float64, device=device)
         self._joint_force_d = wp.empty(R, dtype=wp.float64, device=device)
 
-    def _begin_rigid_step(self, state_in: State, state_out: State, contacts: Contacts | None, dt: float) -> bool:
+    def _begin_rigid_step(self, state_in: State, state_out: State, dt: float) -> bool:
         """Start the step of the integrated bodies at their free-flight solution.
 
         Kinematic bodies pass through. The joint Jacobian and ``W`` are
@@ -709,7 +709,6 @@ class SolverFBA(SolverBase):
             )
             self._joint_system.factor(self._joint_row_slot_d, self._joint_row_jac_d)
             self._joint_force_d.zero_()
-        self._begin_rigid_contacts(contacts)
         return True
 
     def _begin_rigid_contacts(self, contacts: Contacts | None) -> None:
@@ -919,6 +918,52 @@ class SolverFBA(SolverBase):
         self._rigid_linear_solver.solve_scalar(b, self._rigid_u_d)
         self._retract_rigid(state_in, state_out, dt)
 
+    def _contact_row_args(self) -> list:
+        """Particle, normal, alpha and tangents of the deformable contacts."""
+        return [
+            self._contact_particle_d,
+            self._contact_normal_d,
+            self._contact_alpha_d,
+            self._contact_tangent1_d,
+            self._contact_tangent2_d,
+        ]
+
+    def _contact_offsets(self) -> list:
+        """Normal and shifted tangent offsets of the deformable contacts."""
+        return [
+            self._contact_offset_d,
+            self._contact_tangent1_offset_shifted_d,
+            self._contact_tangent2_offset_shifted_d,
+        ]
+
+    def _launch_contact_residual(self, r: wp.array[wp.float64]) -> None:
+        """Residual of the deformable contact rows ``[n, t1, t2]`` at the current particle positions."""
+        from . import kernels as K  # noqa: PLC0415
+
+        wp.launch(
+            K.compute_contact_residual_coulomb_kernel,
+            dim=self._contact_count,
+            inputs=[
+                *self._contact_offsets(),
+                *(self._contact_alpha_d, self._contact_normal_d, self._contact_tangent1_d),
+                *(self._contact_tangent2_d, self._contact_particle_d, self._x_cur),
+            ],
+            outputs=[r],
+            device=self._device,
+        )
+
+    def _launch_contact_pene0(self, pene0: wp.array[wp.float64]) -> None:
+        """Anchor projections of the deformable contact rows ``[n, t1, t2]``."""
+        from . import kernels as K  # noqa: PLC0415
+
+        wp.launch(
+            K.build_coulomb_pene0_kernel,
+            dim=self._contact_count,
+            inputs=self._contact_offsets(),
+            outputs=[pene0],
+            device=self._device,
+        )
+
     def _setup_pd_system(self, dt: float) -> None:
         """Build / rebuild the PD Hessian, factor it, and upload device data."""
         from .linear_solver import (  # noqa: PLC0415
@@ -1115,8 +1160,10 @@ class SolverFBA(SolverBase):
             }
 
         rigid = self.model.body_count > 0 and not self.integrate_with_external_rigid_solver
-        rigid = rigid and self._begin_rigid_step(state_in, state_out, contacts, dt)
+        rigid = rigid and self._begin_rigid_step(state_in, state_out, dt)
         if self.model.particle_count == 0:
+            if rigid:
+                self._begin_rigid_contacts(contacts)
             for _ in range(self.iterations if rigid else 0):
                 self._rigid_iteration(state_in, state_out, dt)
             return
@@ -1212,6 +1259,10 @@ class SolverFBA(SolverBase):
         model = self.model
         N = model.particle_count
         device = self._device
+
+        # Rigid contact rows are assembled after the deformable contacts they may share bodies with.
+        if rigid:
+            self._begin_rigid_contacts(contacts)
 
         # 1) Compute inertial prediction x_inertia.
         wp.launch(
@@ -1323,14 +1374,7 @@ class SolverFBA(SolverBase):
                             )
                         else:
                             ls.build_schur_complement(
-                                M,
-                                self._contact_particle_d,
-                                self._contact_normal_d,
-                                self._contact_alpha_d,
-                                self._contact_tangent1_d,
-                                self._contact_tangent2_d,
-                                use_isodof=self.use_isodof,
-                                download=False,
+                                M, *self._contact_row_args(), use_isodof=self.use_isodof, download=False
                             )
                         self._cached_W = True
                         self._cached_A_inv_Jt_valid = True
@@ -1344,34 +1388,8 @@ class SolverFBA(SolverBase):
                     self._ensure_nsn_inner_buffers(3 * M, alloc_2d=not use_lite_block_diag)
                     from . import kernels as K_step  # noqa: PLC0415
 
-                    wp.launch(
-                        K_step.compute_contact_residual_coulomb_kernel,
-                        dim=M,
-                        inputs=[
-                            self._contact_offset_d,
-                            self._contact_tangent1_offset_shifted_d,
-                            self._contact_tangent2_offset_shifted_d,
-                            self._contact_alpha_d,
-                            self._contact_normal_d,
-                            self._contact_tangent1_d,
-                            self._contact_tangent2_d,
-                            self._contact_particle_d,
-                            self._x_cur,
-                        ],
-                        outputs=[self._nsn_r_d],
-                        device=device,
-                    )
-                    wp.launch(
-                        K_step.build_coulomb_pene0_kernel,
-                        dim=M,
-                        inputs=[
-                            self._contact_offset_d,
-                            self._contact_tangent1_offset_shifted_d,
-                            self._contact_tangent2_offset_shifted_d,
-                        ],
-                        outputs=[self._nsn_pene0_d],
-                        device=device,
-                    )
+                    self._launch_contact_residual(self._nsn_r_d)
+                    self._launch_contact_pene0(self._nsn_pene0_d)
                     if use_lite_block_diag:
                         # Warm-start ω + λ from the persistent device buffers
                         # (same convention as the dense path).
