@@ -445,6 +445,48 @@ class TestSolverFBAArticulationContacts(unittest.TestCase):
             s0, s1 = s1, s0
         np.testing.assert_allclose(s0.body_q.numpy()[:, 2], half_height, atol=1e-6)
 
+    def test_plank_leaning_on_box_stays_at_rest(self):
+        """A hinged plank leans on the top edge of a box that rests on the ground.
+
+        The hinge, the edge contacts and the ground contacts close a loop, which
+        makes the contact NSN's Newton matrix nearly singular. With its contact
+        rows regularized the plank and the box settle instead of being thrown.
+        """
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        cfg = newton.ModelBuilder.ShapeConfig(mu=0.6)
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane(cfg=cfg)
+        box = builder.add_body(xform=wp.transform((0.0, 0.0, 0.25)))
+        builder.add_shape_box(box, hx=0.4, hy=0.4, hz=0.25, cfg=cfg)
+        hinge, half = wp.vec3(1.1, 0.0, 0.05), wp.vec3(0.04, 0.3, 0.6)
+        lean = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), -0.95)  # just above the box's edge
+        plank = builder.add_link(xform=wp.transform(hinge + wp.quat_rotate(lean, wp.vec3(0.0, 0.0, half[2])), lean))
+        builder.add_shape_box(plank, hx=half[0], hy=half[1], hz=half[2], cfg=cfg)
+        joint = builder.add_joint_revolute(
+            -1,
+            plank,
+            axis=(0.0, 1.0, 0.0),
+            parent_xform=wp.transform(hinge),
+            child_xform=wp.transform((0, 0, -half[2])),
+        )
+        builder.add_articulation([joint])
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=10)
+        s0, s1 = model.state(), model.state()
+        start = s0.body_q.numpy()[:, :3]
+        contacts = model.contacts()
+        speed = []
+        for _ in range(60):
+            model.collide(s0, contacts)
+            solver.step(s0, s1, None, contacts, 1.0 / 120.0)
+            s0, s1 = s1, s0
+            speed.append(np.abs(s0.body_qd.numpy()).max())
+
+        self.assertEqual(solver._rc_joint_rows_d.shape[0], 5)
+        self.assertLess(max(speed[20:]), 1e-3)
+        np.testing.assert_allclose(s0.body_q.numpy()[:, :3], start, atol=2e-3)
+
 
 class TestSolverFBATwoWayContacts(unittest.TestCase):
     """A cloth patch over a free box: particle contacts push on both."""

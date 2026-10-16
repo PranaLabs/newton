@@ -236,6 +236,7 @@ class SolverFBA(SolverBase):
         particle_contact_max_hits_per_vertex: int = 16,
         particle_contact_ee: bool = True,
         integrate_with_external_rigid_solver: bool = False,
+        rigid_contact_regularization: float = 1.0e-2,
     ) -> None:
         """
         Args:
@@ -313,6 +314,17 @@ class SolverFBA(SolverBase):
                 state, ``state_out`` their current one, and FBA leaves both
                 untouched. Otherwise FBA integrates every dynamic body and
                 passes kinematic bodies through.
+            rigid_contact_regularization: Relative regularization ``gamma``
+                of the contact rows in the NSN Newton steps that involve
+                integrated bodies: each step solves with
+                ``A_cc + gamma diag(A_cc)``. Contacts and joints that close a
+                loop, such as a hinged plank leaning on a box that rests on
+                the ground, make the Newton matrix nearly singular, and an
+                unregularized step answers a sub-micrometer inconsistency
+                there with forces far above the bodies' weights. The term
+                bounds the gain along contact directions by ``1 / gamma``
+                and leaves the complementarity conditions unchanged.
+                Deformable-only contacts are not regularized.
         """
         super().__init__(model)
 
@@ -391,6 +403,7 @@ class SolverFBA(SolverBase):
         self.lambda_cap = lambda_cap
         self.use_isodof = bool(use_isodof)
         self.integrate_with_external_rigid_solver = bool(integrate_with_external_rigid_solver)
+        self.rigid_contact_regularization = float(rigid_contact_regularization)
         self._rigid_dt: float | None = None
         self._rigid_linear_solver = None
 
@@ -891,6 +904,7 @@ class SolverFBA(SolverBase):
             n_bilateral=n - n_c,
             # The joint rows' block of A_schur is their W: Cholesky-factored per articulation.
             block_precond=functools.partial(self._joint_system.solve_rows, joint_rows, n_c) if n > n_c else None,
+            contact_regularization=self.rigid_contact_regularization,
         )
         wp.copy(self._rc_lam_d, self._nsn_lam_d, count=n)
         wp.copy(self._rc_omega_d, self._nsn_omega_d, count=n)
@@ -3845,6 +3859,7 @@ class SolverFBA(SolverBase):
         m_contacts: int | None = None,
         n_bilateral: int = 0,
         block_precond: Callable[[wp.array, wp.array], None] | None = None,
+        contact_regularization: float = 0.0,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """GPU port of :meth:`_solve_nsn_coulomb` (Stage B NSN inner).
 
@@ -3891,6 +3906,10 @@ class SolverFBA(SolverBase):
                 and skip the cone clamp and ``lambda_cap``.
             block_precond: Optional block preconditioner of the bilateral
                 rows, passed to :meth:`NSNPCRSolver.solve`.
+            contact_regularization: Relative regularization ``gamma`` of the
+                ``3M`` contact rows of each Newton system,
+                ``A_cc += gamma diag(A_cc)`` (RealSim
+                ``applyContactRegularization``).
 
         Returns:
             ``(lam, omega, lam_apply)`` host fp64 arrays of shape ``(3M,)``.
@@ -4052,6 +4071,14 @@ class SolverFBA(SolverBase):
                 outputs=[self._nsn_a_schur_d],
                 device=device,
             )
+            if contact_regularization > 0.0:
+                wp.launch(
+                    K.scale_diagonal_kernel,
+                    dim=3 * M,
+                    inputs=[wp.float64(1.0 + contact_regularization)],
+                    outputs=[self._nsn_a_schur_d],
+                    device=device,
+                )
 
             wp.launch_tiled(
                 K.compute_nsn_rhs_kernel,

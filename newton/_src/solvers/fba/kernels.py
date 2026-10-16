@@ -3946,6 +3946,16 @@ def bilateral_law_kernel(
 
 
 @wp.kernel
+def scale_diagonal_kernel(
+    scale: wp.float64,
+    a: wp.array2d[wp.float64],  # inout
+):
+    """``a[i, i] *= scale`` on the launched rows."""
+    i = wp.tid()
+    a[i, i] = a[i, i] * scale
+
+
+@wp.kernel
 def fb_newton_lite_coulomb_kernel(
     # ---- contact metadata (M entries each) ----
     contact_particle: wp.array[wp.int32],  # (M,)
