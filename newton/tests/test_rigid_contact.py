@@ -170,10 +170,13 @@ def test_shapes_on_plane(test, device, solver_fn):
     control = model.control()
     contacts = model.contacts() if not isinstance(solver, newton.solvers.SolverMuJoCo) else None
 
-    use_cuda_graph = device.is_cuda and wp.is_mempool_enabled(device)
+    # SolverFBA reads contacts back to the host every step, which rules out graph capture;
+    # being implicit, it is stable at a larger time step.
+    is_fba = isinstance(solver, newton.solvers.SolverFBA)
+    use_cuda_graph = device.is_cuda and wp.is_mempool_enabled(device) and not is_fba
     # Increased substeps for better stability (more substeps = smaller time steps = more stable)
     # More substeps help reduce contact oscillations
-    substeps = 30  # Increased from 10 for better contact stability
+    substeps = 2 if is_fba else 30  # Increased from 10 for better contact stability
     sim_dt = 1.0 / 60.0
     if use_cuda_graph:
         # ensure data is allocated and modules are loaded before graph capture
@@ -840,6 +843,7 @@ solvers = {
     "mujoco_warp": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=False, njmax=150),
     "xpbd": lambda model: newton.solvers.SolverXPBD(model, iterations=2),
     "semi_implicit": newton.solvers.SolverSemiImplicit,
+    "fba": lambda model: newton.solvers.SolverFBA(model, iterations=10),
 }
 
 
@@ -849,7 +853,7 @@ class TestRigidContact(unittest.TestCase):
 
 for device in devices:
     for solver_name, solver_fn in solvers.items():
-        if device.is_cpu and solver_name == "mujoco_warp":
+        if device.is_cpu and solver_name in ("mujoco_warp", "fba"):
             continue
         if device.is_cuda and solver_name == "mujoco_cpu":
             continue
@@ -886,12 +890,12 @@ add_function_test(
     devices=cuda_devices,
 )
 
-# Register box drop tests for MuJoCo and XPBD solvers
+# Register box drop tests for MuJoCo, XPBD and FBA solvers
 for device in devices:
     for solver_name, solver_fn in solvers.items():
-        if solver_name not in ("mujoco_cpu", "mujoco_warp", "xpbd"):
+        if solver_name not in ("mujoco_cpu", "mujoco_warp", "xpbd", "fba"):
             continue
-        if device.is_cpu and solver_name == "mujoco_warp":
+        if device.is_cpu and solver_name in ("mujoco_warp", "fba"):
             continue
         if device.is_cuda and solver_name == "mujoco_cpu":
             continue
