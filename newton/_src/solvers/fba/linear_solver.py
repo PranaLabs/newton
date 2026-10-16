@@ -1068,11 +1068,11 @@ class FBALinearSolver:
                 large contact sets (see Demo 5).  When ``False`` the method
                 returns ``None``; the device-side ``W`` remains accessible
                 through :meth:`W_device_view`.
-            j_extra_indices: Optional second and third particle of each
-                contact, shape ``[M, 2]``, dtype int32, ``-1`` when unused.
-                A contact then acts on ``alpha_k`` times its direction on
-                each of its particles. Needs ``use_isodof=True``.
-            j_extra_alpha: Their Jacobian coefficients, shape ``[M, 2]``, dtype float32.
+            j_extra_indices: Optional further particles of each contact,
+                shape ``[M, K - 1]``, dtype int32, ``-1`` when unused. A
+                contact then acts on ``alpha_k`` times its direction on each
+                of its ``K`` particles. Needs ``use_isodof=True``.
+            j_extra_alpha: Their Jacobian coefficients, shape ``[M, K - 1]``, dtype float32.
 
         Returns:
             Dense float64 NumPy array of shape ``(M, M)`` (Stage A) or
@@ -1125,7 +1125,7 @@ class FBALinearSolver:
             row_dir[:] = n_np
             row_alpha[:] = a_np
 
-        # Rows on several particles keep their extra slots and a CSR from particle to ``row * 3 + slot``.
+        # Rows on several particles keep their extra slots and a CSR from particle to ``row * K + slot``.
         self._row_slots, isodof_particles = None, row_particle
         if j_extra_indices is not None and (j_extra_indices.numpy()[:M] >= 0).any():
             if not use_isodof:
@@ -1133,6 +1133,7 @@ class FBALinearSolver:
             extra_p = np.repeat(j_extra_indices.numpy()[:M], rows_per_contact, axis=0)
             extra_a = np.repeat(j_extra_alpha.numpy()[:M], rows_per_contact, axis=0)
             rows, slots = np.nonzero(extra_p >= 0)
+            width = extra_p.shape[1] + 1
             order = np.argsort(extra_p[rows, slots], kind="stable")
             offsets = np.zeros(n + 1, dtype=np.int32)
             offsets[1:] = np.cumsum(np.bincount(extra_p[rows, slots], minlength=n))
@@ -1140,7 +1141,7 @@ class FBALinearSolver:
                 wp.array(np.column_stack([row_particle, extra_p]), dtype=wp.int32, device=dev),
                 wp.array(np.column_stack([row_alpha, extra_a]), dtype=wp.float32, device=dev),
                 wp.array(offsets, dtype=wp.int32, device=dev),
-                wp.array((rows * 3 + slots + 1)[order].astype(np.int32), dtype=wp.int32, device=dev),
+                wp.array((rows * width + slots + 1)[order].astype(np.int32), dtype=wp.int32, device=dev),
             )
             isodof_particles = np.concatenate([row_particle, extra_p[rows, slots]])
 

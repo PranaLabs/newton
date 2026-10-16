@@ -171,7 +171,7 @@ class TestFaceContactQuery(unittest.TestCase):
 
 
 class TestContactRowsOnSeveralParticles(unittest.TestCase):
-    """Two particle contacts and one contact on three particles against dense ``J A⁻¹ Jᵀ`` algebra."""
+    """Two particle contacts and one contact on eight particles against dense ``J A⁻¹ Jᵀ`` algebra."""
 
     def setUp(self):
         import scipy.sparse as sp
@@ -184,7 +184,10 @@ class TestContactRowsOnSeveralParticles(unittest.TestCase):
         self.A_inv = np.kron(np.linalg.inv(A.toarray()), np.eye(3))
         self.solver = FBALinearSolver(factorize_and_sparse_inverse(A), device=wp.get_device())
         particle, alpha = np.array([1, 5, 8]), np.array([1.0, 1.0, 0.5])
-        extra, extra_alpha = np.array([[-1, -1], [-1, -1], [9, 3]]), np.array([[0.0, 0.0], [0.0, 0.0], [0.3, 0.2]])
+        extra = np.full((3, 7), -1)
+        extra[2] = [9, 3, 5, 11, 2, 7, 4]  # shares particle 5 with the second contact
+        extra_alpha = np.zeros((3, 7))
+        extra_alpha[2] = [0.3, 0.2, -0.25, 0.1, -0.15, 0.05, 0.4]
         frames = np.linalg.qr(rng.standard_normal((3, 3, 3)))[0]  # rows: normal, t1, t2
         self.J = np.zeros((9, 3 * n))
         for c in range(3):
