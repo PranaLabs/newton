@@ -199,3 +199,106 @@ def rigid_contact_gap_kernel(
     gap[row_offset + 3 * c] = wp.dot(n, live1 - live0)
     gap[row_offset + 3 * c + 1] = wp.dot(_row_direction(n, 1), slip)
     gap[row_offset + 3 * c + 2] = wp.dot(_row_direction(n, 2), slip)
+
+
+@wp.func
+def _particle_row_direction(c: int, k: int, normal: wp.array[wp.vec3], t1: wp.array[wp.vec3], t2: wp.array[wp.vec3]):
+    if k == 0:
+        return wp.vec3d(normal[c])
+    if k == 1:
+        return wp.vec3d(t1[c])
+    return wp.vec3d(t2[c])
+
+
+@wp.func
+def _particle_contact_body(c: int, contact_shape: wp.array[wp.int32], shape_body: wp.array[wp.int32]) -> wp.int32:
+    """Body of a particle contact's shape, -1 for a static shape."""
+    s = contact_shape[c]
+    if s < 0:
+        return wp.int32(-1)
+    return shape_body[s]
+
+
+@wp.kernel
+def particle_contact_body_jacobian_kernel(
+    contact_shape: wp.array[wp.int32],
+    contact_body_pos: wp.array[wp.vec3],
+    normal: wp.array[wp.vec3],
+    tangent1: wp.array[wp.vec3],
+    tangent2: wp.array[wp.vec3],
+    shape_body: wp.array[wp.int32],
+    body_slot: wp.array[wp.int32],
+    body_com: wp.array[wp.vec3],
+    q_pin: wp.array[wp.quatd],
+    # outputs
+    row_slot: wp.array2d[wp.int32],
+    row_jac: wp.array2d[wp.spatial_vectord],
+):
+    """Body side of rows ``3c + k`` of particle contacts, at the pinned frame.
+
+    A row along ``d`` measures ``alpha d · x - d · a`` for the particle ``x``
+    and the anchor ``a`` on the shape's body, so an integrated body adds
+    ``-(R_pinᵀ d, r x R_pinᵀ d)`` with ``r`` the anchor relative to its COM.
+    Contacts on other shapes get no body side.
+    """
+    c, k = wp.tid()
+    b = _particle_contact_body(c, contact_shape, shape_body)
+    s = wp.int32(-1)
+    if b >= 0:
+        s = body_slot[b]
+    row = 3 * c + k
+    row_slot[row, 0] = s
+    row_slot[row, 1] = -1
+    coeffs = wp.spatial_vectord()
+    if s >= 0:
+        d_loc = wp.quat_rotate_inv(q_pin[s], _particle_row_direction(c, k, normal, tangent1, tangent2))
+        r = wp.vec3d(contact_body_pos[c] - body_com[b])
+        coeffs = -slot_coefficients(d_loc, wp.cross(r, d_loc))
+    row_jac[row, 0] = coeffs
+    row_jac[row, 1] = wp.spatial_vectord()
+
+
+@wp.kernel
+def particle_contact_body_residual_kernel(
+    contact_shape: wp.array[wp.int32],
+    contact_body_pos: wp.array[wp.vec3],
+    normal: wp.array[wp.vec3],
+    tangent1: wp.array[wp.vec3],
+    tangent2: wp.array[wp.vec3],
+    world_anchor: wp.array[wp.vec3],
+    v_anchor: wp.array[wp.vec3d],
+    shape_body: wp.array[wp.int32],
+    body_slot: wp.array[wp.int32],
+    body_com: wp.array[wp.vec3],
+    slot_x: wp.array[wp.vec3d],
+    slot_q: wp.array[wp.quatd],
+    row_jac: wp.array2d[wp.spatial_vectord],
+    u: wp.array[wp.float64],
+    u_free: wp.array[wp.float64],
+    dt: wp.float64,
+    # outputs
+    r: wp.array[wp.float64],
+):
+    """Move the anchor of particle contacts on integrated bodies with the body.
+
+    The deformable residual measures from the step-start anchor ``a0``, moved
+    by ``dt v`` in the friction rows. On an integrated body the anchor follows
+    the live pose instead, ``r += d · (a - a0) - dt d · v`` in friction rows,
+    plus the shift ``J_body (u - u_free)`` back to the free-flight DOFs.
+    """
+    c, k = wp.tid()
+    b = _particle_contact_body(c, contact_shape, shape_body)
+    if b < 0:
+        return
+    s = body_slot[b]
+    if s < 0:
+        return
+    d = _particle_row_direction(c, k, normal, tangent1, tangent2)
+    a = slot_x[s] + wp.quat_rotate(slot_q[s], wp.vec3d(contact_body_pos[c] - body_com[b]))
+    delta = wp.dot(d, a - wp.vec3d(world_anchor[c]))
+    if k > 0:
+        delta -= dt * wp.dot(d, v_anchor[c])
+    row = 3 * c + k
+    for i in range(6):
+        delta += row_jac[row, 0][i] * (u[6 * s + i] - u_free[6 * s + i])
+    r[row] += delta

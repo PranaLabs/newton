@@ -199,6 +199,99 @@ class TestRigidContactRows(unittest.TestCase):
         np.testing.assert_allclose(jac, fd.T, atol=1e-8)
 
 
+class TestParticleContactBodyRows(unittest.TestCase):
+    """Body side of particle contacts on two integrated bodies and on the static ground."""
+
+    def setUp(self):
+        scope = wp.ScopedDevice("cpu")
+        scope.__enter__()
+        self.addCleanup(scope.__exit__, None, None, None)
+        builder = newton.ModelBuilder()
+        shapes = [builder.add_ground_plane()]
+        for p, rpy in (((0.2, 0.1, 0.5), (0.3, -0.2, 0.4)), ((0.3, -0.2, 1.4), (-0.6, 0.1, 0.9))):
+            body = builder.add_body(xform=wp.transform(p, wp.quat_rpy(*rpy)), com=wp.vec3(0.05, -0.02, 0.0))
+            shapes.append(builder.add_shape_box(body))
+        self.model = model = builder.finalize(device="cpu")
+        rng = np.random.default_rng(3)
+        frame = np.linalg.qr(rng.standard_normal((3, 3, 3)))[0]  # per contact: normal, t1, t2
+        body_pos = rng.uniform(-0.5, 0.5, (3, 3))
+        tf = model.body_q.numpy().astype(np.float64)
+        world = [wp.transform_point(wp.transform(*np.split(tf[k], [3])), wp.vec3(*body_pos[k])) for k in range(2)]
+        self.contact = [
+            wp.array(shapes[1:] + shapes[:1], dtype=wp.int32),
+            wp.array(body_pos, dtype=wp.vec3),
+            *(wp.array(frame[:, :, k], dtype=wp.vec3) for k in range(3)),
+        ]
+        self.world_anchor = wp.array([*world, body_pos[2]], dtype=wp.vec3)
+        self.v_anchor = wp.array(rng.standard_normal((3, 3)), dtype=wp.vec3d)
+        self.slot = wp.array([0, 1], dtype=wp.int32)
+        self.bodies = [model.shape_body, self.slot, model.body_com]
+        self.q0 = tf[:, 3:] / np.linalg.norm(tf[:, 3:], axis=1, keepdims=True)
+        com = model.body_com.numpy()
+        self.x0 = tf[:, :3] + [wp.quat_rotate(wp.quatd(*q), wp.vec3d(*c)) for q, c in zip(self.q0, com, strict=True)]
+
+    def _residual(self, u, u_free, row_jac, dt=0.01):
+        x, q = wp.empty(2, dtype=wp.vec3d), wp.empty(2, dtype=wp.quatd)
+        scratch = [wp.empty(2, dtype=wp.transform), wp.empty(2, dtype=wp.spatial_vector)]
+        x0, q0 = wp.array(self.x0, dtype=wp.vec3d), wp.array(self.q0, dtype=wp.quatd)
+        wp.launch(
+            retract_rigid_kernel,
+            dim=2,
+            inputs=[self.slot, wp.array(u, dtype=wp.float64), q0, x0, self.model.body_q, self.model.body_com, 1.0],
+            outputs=[*scratch, x, q],
+        )
+        r = wp.zeros(9, dtype=wp.float64)
+        wp.launch(
+            RC.particle_contact_body_residual_kernel,
+            dim=(3, 3),
+            inputs=[
+                *(*self.contact, self.world_anchor, self.v_anchor, *self.bodies, x, q, row_jac),
+                *(wp.array(u, dtype=wp.float64), wp.array(u_free, dtype=wp.float64), wp.float64(dt)),
+            ],
+            outputs=[r],
+        )
+        return r.numpy()
+
+    def test_anchor_follows_body(self):
+        row_slot, row_jac = wp.empty((9, 2), dtype=wp.int32), wp.empty((9, 2), dtype=wp.spatial_vectord)
+        q_pin = wp.array(self.q0, dtype=wp.quatd)
+        wp.launch(
+            RC.particle_contact_body_jacobian_kernel,
+            dim=(3, 3),
+            inputs=[*self.contact, *self.bodies, q_pin],
+            outputs=[row_slot, row_jac],
+        )
+        np.testing.assert_array_equal(row_slot.numpy(), [[0, -1]] * 3 + [[1, -1]] * 3 + [[-1, -1]] * 3)
+        jac = np.zeros((9, 12))
+        for r, s in enumerate(row_slot.numpy()[:6, 0]):
+            jac[r, 6 * s : 6 * s + 6] = row_jac.numpy()[r, 0]
+        u0 = np.zeros(12)
+        for k in range(2):
+            u0[6 * k : 6 * k + 3] = wp.quat_rotate_inv(wp.quatd(*self.q0[k]), wp.vec3d(*self.x0[k]))
+        no_jac = wp.zeros((9, 2), dtype=wp.spatial_vectord)
+
+        # At the step start only the friction rows on bodies drop the dt v shift (float32 anchors).
+        dt, v = 0.01, self.v_anchor.numpy()
+        frame = np.stack([a.numpy() for a in self.contact[2:]], axis=1)  # [contact, row, xyz]
+        expected = np.where(np.arange(9) % 3 > 0, -dt * np.einsum("crx,cx->cr", frame, v).ravel(), 0.0)
+        expected[6:] = 0.0
+        np.testing.assert_allclose(self._residual(u0, u0, no_jac, dt), expected, atol=2e-7)
+
+        # The anchor moves with the body: d(residual)/du = -J_body.
+        eps = 1e-6
+        fd = [
+            (self._residual(u0 + eps * e, u0, no_jac) - self._residual(u0 - eps * e, u0, no_jac)) / (2 * eps)
+            for e in np.eye(12)
+        ]
+        np.testing.assert_allclose(np.stack(fd, axis=1), -jac, atol=1e-8)
+
+        # The shift adds J (u - u_free).
+        rng = np.random.default_rng(5)
+        u, u_free = u0 + 1e-3 * rng.standard_normal(12), u0 + 1e-3 * rng.standard_normal(12)
+        shift = self._residual(u, u_free, row_jac) - self._residual(u, u_free, no_jac)
+        np.testing.assert_allclose(shift, jac @ (u - u_free), atol=1e-14)
+
+
 class TestSolverFBARigidContacts(unittest.TestCase):
     """A 1 m box on the ground; tilting gravity turns the ground into an incline."""
 
