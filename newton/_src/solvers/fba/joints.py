@@ -21,7 +21,12 @@ _CONSTRAINT_JOINTS = (JointType.PRISMATIC, JointType.REVOLUTE, JointType.BALL, J
 
 @dataclass
 class JointRows:
-    """Bilateral rows of the joints that constrain integrated bodies."""
+    """Bilateral rows of the joints that constrain integrated bodies.
+
+    Rows are grouped into independent blocks: connected components of the
+    integrated bodies under these joints. Block ``k`` owns rows
+    ``block_start[k]:block_start[k + 1]``.
+    """
 
     parent: wp.array[wp.int32]
     """Parent body per joint, -1 for the world, shape [joint_count]."""
@@ -37,6 +42,8 @@ class JointRows:
     """1 for a rotational row, 0 for a translational row, shape [row_count]."""
     row_dir: wp.array[wp.vec3]
     """Locked direction in the joint frame, shape [row_count]."""
+    block_start: np.ndarray
+    """Row range per independent block, shape [block_count + 1]."""
 
 
 def locked_directions(free_axes: np.ndarray) -> np.ndarray:
@@ -74,13 +81,29 @@ def build_joint_rows(model: Model, body_slot: np.ndarray, device) -> JointRows |
     for t in set(jtype[joints]) - set(_CONSTRAINT_JOINTS):
         raise NotImplementedError(f"SolverFBA does not support {JointType(t).name} joints")
 
+    # Union-find: each connected component of integrated bodies is one block.
+    root = np.arange(body_slot.max() + 1)
+
+    def find(i):
+        while root[i] != i:
+            root[i] = root[root[i]]
+            i = root[i]
+        return i
+
+    for j in joints[(pslot[joints] >= 0) & (cslot[joints] >= 0)]:
+        root[find(pslot[j])] = find(cslot[j])
+
     axis, qd_start, dof_dim = model.joint_axis.numpy(), model.joint_qd_start.numpy(), model.joint_dof_dim.numpy()
-    rows = []  # (local joint index, angular, direction)
+    rows = []  # (block, local joint index, angular, direction)
     for k, j in enumerate(joints):
         n_lin, n_ang = dof_dim[j]
         axes = axis[qd_start[j] : qd_start[j] + n_lin + n_ang]
-        rows += [(k, 0, d) for d in locked_directions(axes[:n_lin])]
-        rows += [(k, 1, d) for d in locked_directions(axes[n_lin:])]
+        block = find(max(pslot[j], cslot[j]))
+        rows += [(block, k, 0, d) for d in locked_directions(axes[:n_lin])]
+        rows += [(block, k, 1, d) for d in locked_directions(axes[n_lin:])]
+    rows.sort(key=lambda r: r[0])
+    blocks = np.array([r[0] for r in rows])
+    block_start = np.flatnonzero(np.r_[True, blocks[1:] != blocks[:-1], True]).astype(np.int32)
 
     com = model.body_com.numpy()
     p, c = parent[joints], child[joints]
@@ -92,7 +115,8 @@ def build_joint_rows(model: Model, body_slot: np.ndarray, device) -> JointRows |
         child=wp.array(c, dtype=wp.int32, device=device),
         X_pj=wp.array(X_pj, dtype=wp.transform, device=device),
         X_cj=wp.array(X_cj, dtype=wp.transform, device=device),
-        row_joint=wp.array([r[0] for r in rows], dtype=wp.int32, device=device),
-        row_angular=wp.array([r[1] for r in rows], dtype=wp.int32, device=device),
-        row_dir=wp.array(np.array([r[2] for r in rows]), dtype=wp.vec3, device=device),
+        row_joint=wp.array([r[1] for r in rows], dtype=wp.int32, device=device),
+        row_angular=wp.array([r[2] for r in rows], dtype=wp.int32, device=device),
+        row_dir=wp.array(np.array([r[3] for r in rows]), dtype=wp.vec3, device=device),
+        block_start=block_start,
     )

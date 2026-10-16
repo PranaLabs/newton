@@ -58,10 +58,11 @@ class TestFBAJointRows(unittest.TestCase):
         d = rows.row_dir.numpy()
         np.testing.assert_allclose(d[(joint == 1) & (angular == 1)] @ [0.0, 0.0, 1.0], 0.0, atol=1e-12)
         np.testing.assert_allclose(np.abs(d[(joint == 2) & (angular == 0)]), [[0.0, 1.0, 0.0]], atol=1e-12)
+        np.testing.assert_array_equal(rows.block_start, [0, 11])
         # Anchors are stored relative to the child COM.
         np.testing.assert_allclose(rows.X_cj.numpy()[1, :3], [0.0, 0.5, 0.0])
 
-    def test_skipped_joints(self):
+    def test_blocks_and_skipped_joints(self):
         builder = newton.ModelBuilder()
         chain = [_link(builder) for _ in range(4)]
         l4, kin = _link(builder), _link(builder, is_kinematic=True)
@@ -72,6 +73,7 @@ class TestFBAJointRows(unittest.TestCase):
         builder.add_articulation([builder.add_joint_revolute(-1, kin)])  # no integrated body
         builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))  # free joint
         rows = _rows(builder.finalize())
+        np.testing.assert_array_equal(rows.block_start, [0, 21, 26])
         np.testing.assert_array_equal(rows.row_joint.numpy(), np.repeat(np.arange(5), [6, 5, 5, 5, 5]))
 
     def test_rejects_distance_joint(self):
