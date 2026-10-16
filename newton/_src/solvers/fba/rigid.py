@@ -41,6 +41,12 @@ def _rotate_by(omega: wp.vec3d, dt: wp.float64, q: wp.quatd) -> wp.quatd:
     return wp.normalize(dq * q)
 
 
+@wp.func
+def slot_coefficients(lin: wp.vec3d, ang: wp.vec3d) -> wp.spatial_vectord:
+    """Row coefficients on the DOFs ``(chi, rho)`` of a slot from their two halves."""
+    return wp.spatial_vectord(lin[0], lin[1], lin[2], ang[0], ang[1], ang[2])
+
+
 @wp.kernel
 def prepare_rigid_step_kernel(
     bodies: wp.array[wp.int32],

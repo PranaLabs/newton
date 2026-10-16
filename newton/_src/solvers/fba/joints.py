@@ -15,7 +15,7 @@ import numpy as np
 import warp as wp
 
 from ...sim import JointType, Model
-from .rigid import row_force_rhs_kernel, row_incidence
+from .rigid import row_force_rhs_kernel, row_incidence, slot_coefficients
 
 _CONSTRAINT_JOINTS = (JointType.PRISMATIC, JointType.REVOLUTE, JointType.BALL, JointType.FIXED, JointType.D6)
 
@@ -144,11 +144,6 @@ def _com_frame(
 
 
 @wp.func
-def _spatial(lin: wp.vec3d, ang: wp.vec3d) -> wp.spatial_vectord:
-    return wp.spatial_vectord(lin[0], lin[1], lin[2], ang[0], ang[1], ang[2])
-
-
-@wp.func
 def _relative_rotation(q_ja: wp.quatd, q_jc: wp.quatd) -> wp.quatd:
     """Short-arc quaternion of ``R_Jaᵀ R_Jc``."""
     q = wp.quat_inverse(q_ja) * q_jc
@@ -208,8 +203,8 @@ def joint_jacobian_kernel(
         sa = body_slot[a]
     row_slot[r, 0] = sa
     row_slot[r, 1] = body_slot[c]
-    row_jac[r, 0] = _spatial(-wp.quat_rotate_inv(qa, lin), wp.quat_rotate_inv(qa, ang_a))
-    row_jac[r, 1] = _spatial(wp.quat_rotate_inv(qc, lin), wp.quat_rotate_inv(qc, ang_c))
+    row_jac[r, 0] = slot_coefficients(-wp.quat_rotate_inv(qa, lin), wp.quat_rotate_inv(qa, ang_a))
+    row_jac[r, 1] = slot_coefficients(wp.quat_rotate_inv(qc, lin), wp.quat_rotate_inv(qc, ang_c))
 
 
 @wp.kernel

@@ -179,6 +179,25 @@ class TestRigidContactRows(unittest.TestCase):
         tangential = slip - np.dot(slip, normal[2]) * normal[2]
         self.assertAlmostEqual(np.linalg.norm(gap[2, 1:]), np.linalg.norm(tangential), delta=1e-9)
 
+    def test_jacobian_matches_finite_differences(self):
+        row_slot, row_jac = wp.empty((9, 2), dtype=wp.int32), wp.empty((9, 2), dtype=wp.spatial_vectord)
+        q_pin = wp.array(self.q0[:2], dtype=wp.quatd)
+        wp.launch(
+            RC.rigid_contact_jacobian_kernel,
+            dim=(3, 3),
+            inputs=[self.rc.body, self.rc.anchor, self.rc.normal, self.slot, q_pin, 0],
+            outputs=[row_slot, row_jac],
+            device="cpu",
+        )
+        np.testing.assert_array_equal(row_slot.numpy(), [[-1, 0]] * 3 + [[0, 1]] * 3 + [[1, -1]] * 3)
+        jac = np.zeros((9, 12))
+        for r, k in np.argwhere(row_slot.numpy() >= 0):
+            s = row_slot.numpy()[r, k]
+            jac[r, 6 * s : 6 * s + 6] += row_jac.numpy()[r, k]
+        u0, eps = self._u0(), 1e-6
+        fd = np.stack([(self._gap(u0 + eps * e, 0.01) - self._gap(u0 - eps * e, 0.01)) / (2 * eps) for e in np.eye(12)])
+        np.testing.assert_allclose(jac, fd.T, atol=1e-8)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

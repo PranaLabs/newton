@@ -16,6 +16,7 @@ import numpy as np
 import warp as wp
 
 from ...sim import Contacts, Model
+from .rigid import slot_coefficients
 
 
 @dataclass
@@ -99,6 +100,41 @@ def _row_direction(n: wp.vec3d, k: int) -> wp.vec3d:
     if k == 1:
         return t1
     return wp.cross(n, t1)
+
+
+@wp.kernel
+def rigid_contact_jacobian_kernel(
+    body: wp.array2d[wp.int32],
+    anchor: wp.array2d[wp.vec3],
+    normal: wp.array[wp.vec3],
+    body_slot: wp.array[wp.int32],
+    q_pin: wp.array[wp.quatd],
+    row_offset: int,
+    # outputs
+    row_slot: wp.array2d[wp.int32],
+    row_jac: wp.array2d[wp.spatial_vectord],
+):
+    """Coefficients of rows ``row_offset + 3c + k`` on the DOFs ``(chi, rho)`` of both sides.
+
+    The row along the world direction ``d`` measures ``d · (a1 - a0)``. At the
+    pinned frame, side ``k`` contributes ``±(R_pinᵀ d, r x R_pinᵀ d)`` with ``r``
+    its anchor relative to the COM, negative for side 0.
+    """
+    c, k = wp.tid()
+    d = _row_direction(wp.vec3d(normal[c]), k)
+    r = row_offset + 3 * c + k
+    for side in range(2):
+        s = wp.int32(-1)
+        if body[c, side] >= 0:
+            s = body_slot[body[c, side]]
+        row_slot[r, side] = s
+        coeffs = wp.spatial_vectord()
+        if s >= 0:
+            d_loc = wp.quat_rotate_inv(q_pin[s], d)
+            coeffs = slot_coefficients(d_loc, wp.cross(wp.vec3d(anchor[c, side]), d_loc))
+            if side == 0:
+                coeffs = -coeffs
+        row_jac[r, side] = coeffs
 
 
 @wp.func
