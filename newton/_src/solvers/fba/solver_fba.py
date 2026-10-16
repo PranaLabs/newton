@@ -16,6 +16,7 @@ import warp as wp
 from ...geometry.types import GeoType
 from ...sim import BodyFlags, Contacts, Control, Model, State
 from ..solver import SolverBase
+from .cable import Cable
 
 
 def fb_unilateral_row(
@@ -221,6 +222,9 @@ class SolverFBA(SolverBase):
         :class:`~newton.solvers.SolverStyle3D` — Newton's other PD cloth
         solver with different sparse-matrix layout (ELL + PCG).
     """
+
+    Cable = Cable
+    """A cable through a tetrahedral body, driven through :meth:`set_particle_constraints`."""
 
     def __init__(
         self,
