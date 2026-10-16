@@ -812,10 +812,10 @@ class NSNPCRSolver:
     ) -> wp.Graph | None:
         """Look up (or capture on first miss) the single-PCR-iter CUDA graph.
 
-        The graph is keyed by ``(n, A.ptr)`` -- ``n`` controls the launch
-        dimensions and ``A.ptr`` controls which matrix block the captured
-        matvec reads from.  When either changes between solve calls we
-        re-capture; PCR is called repeatedly with the same matrix view
+        The graph is keyed by ``(n, A.ptr, A.strides)`` -- ``n`` controls the
+        launch dimensions, and the pointer and strides control which matrix
+        block the captured matvec reads from.  When any of them changes
+        between solve calls we re-capture; PCR is called repeatedly with the same matrix view
         within a Newton step so amortised capture overhead is near zero.
 
         Returns ``None`` if capture is impossible on the active device
@@ -828,10 +828,9 @@ class NSNPCRSolver:
 
         a_ptr = int(A.__cuda_array_interface__["data"][0])
         # Cache hash combines ``n`` (drives launch dims + n_pad) and the
-        # matrix data pointer.  We use a simple tuple key in a dict --
-        # collisions are not a concern at the handful of distinct shapes
-        # FBA produces per session.
-        key = (n, a_ptr)
+        # matrix data pointer and strides: a reallocated buffer can return
+        # at the same address with a different row pitch.
+        key = (n, a_ptr, tuple(A.strides))
         cached = self._pcr_graph_cache.get(key, "missing")
         if cached == "missing":
             # Capture lazily.  Failures are sticky -- we cache ``None`` so

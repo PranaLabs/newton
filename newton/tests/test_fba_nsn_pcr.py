@@ -203,6 +203,24 @@ class TestPCRReuse(_PCRTestCase):
                 msg=f"n={n}: rel_err={rel_err}, iters={iters}",
             )
 
+    def test_reinterpreted_matrix_buffer(self):
+        """A matrix view with the same pointer and size but other strides must not reuse a cached graph."""
+        n, cap = 40, 64
+        solver = NSNPCRSolver(max_n=n, device=self.device, tol=1.0e-12, max_iter=500)
+        buf = wp.zeros((cap, cap), dtype=wp.float64, device=self.device)
+        b_np = np.random.default_rng(3).standard_normal(n)
+        b = wp.from_numpy(b_np, dtype=wp.float64, device=self.device)
+        x_out = wp.zeros(n, dtype=wp.float64, device=self.device)
+        for k, strides in enumerate(((cap * 8, 8), (n * 8, 8))):
+            A_np = _make_spd(n, seed=300 + k)
+            flat = buf.numpy().ravel()
+            rows = np.arange(n)[:, None] * (strides[0] // 8) + np.arange(n)[None, :]
+            flat[rows] = A_np
+            buf.assign(flat.reshape(cap, cap))
+            A = wp.array(ptr=buf.ptr, dtype=wp.float64, shape=(n, n), strides=strides, device=self.device)
+            solver.solve(A, b, x_out)
+            np.testing.assert_allclose(x_out.numpy(), np.linalg.solve(A_np, b_np), rtol=1.0e-6)
+
     def test_invalid_size_raises(self):
         solver = NSNPCRSolver(max_n=10, device=self.device, tol=1.0e-8, max_iter=50)
         A = wp.zeros((20, 20), dtype=wp.float64, device=self.device)
