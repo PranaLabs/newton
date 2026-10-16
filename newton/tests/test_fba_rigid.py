@@ -138,6 +138,13 @@ class TestFBARigidKernels(unittest.TestCase):
         np.testing.assert_allclose(q_pin.numpy()[0], body["q0"] / np.linalg.norm(body["q0"]), rtol=0.0, atol=1e-15)
 
 
+def _dense_jacobian(row_slot, row_jac, slot_count):
+    J = np.zeros((row_slot.shape[0], 6 * slot_count))
+    for r, k in np.argwhere(row_slot >= 0):
+        J[r, 6 * row_slot[r, k] : 6 * row_slot[r, k] + 6] += row_jac[r, k]
+    return J
+
+
 class TestFBARigidRows(unittest.TestCase):
     """Delassus assembly and force gather of constraint rows on body slots."""
 
@@ -167,9 +174,7 @@ class TestFBARigidRows(unittest.TestCase):
         inv_mass = inv_mass @ inv_mass.transpose(0, 2, 1) + np.eye(6)
         W_soft = rng.standard_normal((n_soft, n_soft))
         W_soft = W_soft @ W_soft.T
-        J = np.zeros((n, 6 * m))
-        for r, k in np.argwhere(row_slot >= 0):
-            J[r, 6 * row_slot[r, k] : 6 * row_slot[r, k] + 6] += row_jac[r, k]
+        J = _dense_jacobian(row_slot, row_jac, m)
         expected = J @ block_diag(*inv_mass) @ J.T
         expected[:n_soft, :n_soft] += W_soft
 
@@ -207,6 +212,28 @@ class TestFBARigidRows(unittest.TestCase):
             device=device,
         )
         np.testing.assert_allclose(b.numpy(), b_const + J.T @ force, rtol=1e-12)
+
+    def test_row_residual_shifts_to_free_dofs(self):
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        rng = np.random.default_rng(4)
+        row_slot = np.array([[-1, 0], [1, 2], [2, -1], [-1, -1]], dtype=np.int32)
+        row_jac, value = rng.standard_normal((4, 2, 6)), rng.standard_normal(4)
+        u, u_free = rng.standard_normal(18), rng.standard_normal(18)
+        r = wp.empty(4, dtype=wp.float64, device=device)
+        wp.launch(
+            rigid.rigid_row_residual_kernel,
+            dim=4,
+            inputs=[
+                wp.array(value, dtype=wp.float64, device=device),
+                wp.array(row_slot, dtype=wp.int32, device=device),
+                wp.array(row_jac, dtype=wp.spatial_vectord, device=device),
+                wp.array(u, dtype=wp.float64, device=device),
+                wp.array(u_free, dtype=wp.float64, device=device),
+            ],
+            outputs=[r],
+            device=device,
+        )
+        np.testing.assert_allclose(r.numpy(), -value + _dense_jacobian(row_slot, row_jac, 3) @ (u - u_free), rtol=1e-12)
 
 
 class TestSolverFBARigidStep(unittest.TestCase):

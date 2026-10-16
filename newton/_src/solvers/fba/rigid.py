@@ -209,3 +209,29 @@ def rigid_delassus_kernel(
                 if row_slot[j, y] == s:
                     w += wp.dot(row_jac[i, x], slot_inv_mass[s] * row_jac[j, y])
     W[i, j] = w
+
+
+@wp.kernel
+def rigid_row_residual_kernel(
+    value: wp.array[wp.float64],
+    row_slot: wp.array2d[wp.int32],
+    row_jac: wp.array2d[wp.spatial_vectord],
+    u: wp.array[wp.float64],
+    u_free: wp.array[wp.float64],
+    # outputs
+    r: wp.array[wp.float64],
+):
+    """NSN residual ``r = -value + J (u - u_free)`` of rows on rigid bodies.
+
+    ``value`` is each row's constraint value at the live pose of ``u``; the
+    shift moves it back to the free-flight DOFs ``u_free`` along the pinned
+    ``J``, where the NSN linear model starts.
+    """
+    i = wp.tid()
+    acc = -value[i]
+    for side in range(2):
+        s = row_slot[i, side]
+        if s >= 0:
+            for c in range(6):
+                acc += row_jac[i, side][c] * (u[6 * s + c] - u_free[6 * s + c])
+    r[i] = acc
