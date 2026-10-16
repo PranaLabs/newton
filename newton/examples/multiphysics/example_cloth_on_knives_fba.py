@@ -92,9 +92,8 @@ class Example:
         builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.0))
         builder.add_shape_mesh(-1, mesh=knife_mesh(), cfg=newton.ModelBuilder.ShapeConfig(mu=0.3))
 
-        # RealSim's membrane: young 37500 and poisson 0.4, its PD Neo-Hookean gauge
-        # (x 8/3 at poisson 0.4) giving young 1e5; 1000 kg spread evenly over the particles.
-        young, poisson = 1.0e5, 0.4
+        # RealSim's membrane, young 37500 and poisson 0.4; 1000 kg spread evenly over the particles.
+        young, poisson = 37500.0, 0.4
         mu = young / (2.0 * (1.0 + poisson))
         lam = young * poisson / ((1.0 + poisson) * (1.0 - 2.0 * poisson))
         pos, tris = cloth_mesh()

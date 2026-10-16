@@ -40,6 +40,8 @@ def build_pd_system(
     model: Model,
     dt: float,
     pin_stiffness: float,
+    tri_weight_scale: float = 1.0,
+    tet_weight_scale: float = 1.0,
 ) -> tuple[sp.csr_matrix, dict[str, Any]]:
     """Assemble the constant scalar PD Hessian ``A`` for cloth.
 
@@ -49,6 +51,8 @@ def build_pd_system(
             ``particle_inv_mass == 0``.
         dt: Time step [s]. Enters as ``m_i / dt^2`` on the diagonal.
         pin_stiffness: PD soft-pin weight ``w_pin``. Larger means harder pin.
+        tri_weight_scale: Factor on every triangle's stretching weight.
+        tet_weight_scale: Factor on every tetrahedron's stretching weight.
 
     Returns:
         A tuple ``(A, meta)`` where ``A`` is an ``N x N`` symmetric PSD CSR
@@ -116,7 +120,7 @@ def build_pd_system(
         # tri_materials column 0 is ke (area-weighted stretching stiffness).
         tri_materials = model.tri_materials.numpy().astype(np.float64)
         ke = tri_materials[:, 0]
-        tri_weight = ke * tri_area
+        tri_weight = ke * tri_area * tri_weight_scale
 
         # Vectorized 3x3 stencil scatter: G_t = ST @ Dm_inv_t, K_t = G_t @ G_t.T.
         # Then for each triangle we contribute w_t * K_t[a,b] to A[v_a, v_b]
@@ -190,7 +194,7 @@ def build_pd_system(
         tet_materials = model.tet_materials.numpy().astype(np.float64)
         mu_tet = tet_materials[:, 0]
         # PD weight: w = 2*mu * volume  (ARAP: singular values project to 1)
-        tet_weight = 2.0 * mu_tet * tet_volume
+        tet_weight = 2.0 * mu_tet * tet_volume * tet_weight_scale
 
         # Stencil selector ST is 4x3 (row = which edge coefficient for each tet vertex).
         ST_tet = np.array(

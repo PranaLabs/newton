@@ -187,6 +187,19 @@ class SolverFBA(SolverBase):
       on singular values of F (2x2 for cloth, 3x3 cofactor inverse for tets).
       Requires ``mu`` and ``lam`` (first and second Lame parameters [Pa]).
 
+    Corotational and Neo-Hookean take the true Lamé parameters. Projective
+    dynamics drops the dual variable of the local projection, so its fixed
+    point reacts to the stress at the projected deformation rather than at
+    ``F`` and comes out softer than the material: with the projection weight
+    ``2 * mu`` the small-strain modulus falls by ``c = 2 + nu`` for
+    tetrahedra, ``nu = lam / (2 * (lam + mu))``, and by
+    ``c = (4 * mu + 3 * lam) / (2 * mu + lam)`` for triangles. SolverFBA
+    scales ``mu``, ``lam`` and the stretching weights of these models by
+    ``c``, as RealSim does, which restores the modulus: at every strain for
+    corotational elasticity, at small strain for Neo-Hookean. Set ``tri_ke``
+    to ``2 * mu`` for triangles and ``k_mu`` to ``mu`` for tetrahedra, the
+    weight the correction assumes. ARAP is exact and unscaled.
+
     Notes:
         - Float32 ``particle_q`` output: the interior linear solver
           operates in float64, but ``state_out.particle_q`` (vec3) is
@@ -249,8 +262,9 @@ class SolverFBA(SolverBase):
             iterations: Number of PD local-global iterations per step.
             pin_stiffness: Soft-pin stiffness [N/m].
             stretching_model: Stretching model — ``"arap"``, ``"corotational"``, or ``"neohookean"``.
-            mu: First Lamé parameter [Pa]; required for ``"corotational"``/``"neohookean"``.
-            lam: Second Lamé parameter [Pa]; required for ``"corotational"``/``"neohookean"``.
+            mu: First Lamé parameter [Pa] of the material; required for ``"corotational"``/``"neohookean"``,
+                which scale it by the gauge in the class notes.
+            lam: Second Lamé parameter [Pa] of the material; required for ``"corotational"``/``"neohookean"``.
             friction: If ``True`` (default) use Stage B Coulomb friction NSN solver;
                 otherwise use Stage A unilateral NSN.
             mu_per_pair_override: Optional ``(num_pairs,)`` array of friction
@@ -431,6 +445,13 @@ class SolverFBA(SolverBase):
         self.nh_solver = nh_solver
         self._mu = float(mu) if mu is not None else None
         self._lam = float(lam) if lam is not None else None
+        # Dropped-dual gauge of the corotational and Neo-Hookean projections (see the class notes).
+        self._tri_gauge = self._tet_gauge = 1.0
+        if stretching_model in ("corotational", "neohookean"):
+            self._tri_gauge = (4.0 * self._mu + 3.0 * self._lam) / (2.0 * self._mu + self._lam)
+            self._tet_gauge = 2.0 + self._lam / (2.0 * (self._lam + self._mu))
+            self._tri_lame = (self._mu * self._tri_gauge, self._lam * self._tri_gauge)
+            self._tet_lame = (self._mu * self._tet_gauge, self._lam * self._tet_gauge)
         self.friction = bool(friction)
         self._mu_per_pair_override = (
             np.asarray(mu_per_pair_override, dtype=np.float64) if mu_per_pair_override is not None else None
@@ -1131,7 +1152,13 @@ class SolverFBA(SolverBase):
             factorize_and_sparse_inverse,
         )
 
-        A, meta = build_pd_system(self.model, dt=dt, pin_stiffness=self.pin_stiffness)
+        A, meta = build_pd_system(
+            self.model,
+            dt=dt,
+            pin_stiffness=self.pin_stiffness,
+            tri_weight_scale=self._tri_gauge,
+            tet_weight_scale=self._tet_gauge,
+        )
         fs = factorize_and_sparse_inverse(A)
         self._linear_solver = FBALinearSolver(fs, device=self._device)
         # LiteNSN dense kernel + sparse BSR pipeline both consume the lite mass
@@ -1883,8 +1910,7 @@ class SolverFBA(SolverBase):
                         self._tri_indices_d,
                         self._tri_rest_inv_d,
                         self._tri_weight_d,
-                        self._mu,
-                        self._lam,
+                        *self._tri_lame,
                     ],
                     outputs=[self._tri_contrib_d],
                     device=device,
@@ -1911,8 +1937,7 @@ class SolverFBA(SolverBase):
                         self._tri_indices_d,
                         self._tri_rest_inv_d,
                         self._tri_weight_d,
-                        self._mu,
-                        self._lam,
+                        *self._tri_lame,
                     ],
                     outputs=[self._tri_contrib_d],
                     device=device,
@@ -1992,8 +2017,7 @@ class SolverFBA(SolverBase):
                         self._tet_indices_d,
                         self._tet_rest_inv_d,
                         self._tet_weight_d,
-                        self._mu,
-                        self._lam,
+                        *self._tet_lame,
                     ],
                     outputs=[self._tet_contrib_d],
                     device=device,
@@ -2020,8 +2044,7 @@ class SolverFBA(SolverBase):
                         self._tet_indices_d,
                         self._tet_rest_inv_d,
                         self._tet_weight_d,
-                        self._mu,
-                        self._lam,
+                        *self._tet_lame,
                     ],
                     outputs=[self._tet_contrib_d],
                     device=device,

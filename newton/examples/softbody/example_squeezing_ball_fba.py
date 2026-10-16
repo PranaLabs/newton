@@ -33,7 +33,7 @@ _PD_ITER = 10  # RealSim's offline binding overrides scene LocalGlobal_CUDA=5 to
 _NSN_ITER = 1
 _GRAVITY = -10.0  # Y-down
 
-_YOUNG = 1.0e4
+_YOUNG = 1.0e4 / 2.4  # RealSim's material modulus; SolverFBA's tet gauge 2 + nu scales it back to 1e4
 _POISSON = 0.4
 _OBJ_MASS = 1000.0
 

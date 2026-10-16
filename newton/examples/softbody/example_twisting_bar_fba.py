@@ -30,7 +30,7 @@ _PD_ITER = 10  # RealSim's offline binding overrides scene LocalGlobal_CUDA=5 to
 _GRAVITY = 0.0
 _TOTAL_MASS = 1000.0
 
-_YOUNG = 1.0e9
+_YOUNG = 1.0e9 / 2.45  # material modulus; SolverFBA's tet gauge 2 + nu scales it back to 1e9
 _NU = 0.45
 
 _PIN_AVEL_DEG_PER_S = 10.0

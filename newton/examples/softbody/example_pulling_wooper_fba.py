@@ -31,7 +31,7 @@ _PD_ITER = 10
 _NSN_ITER = 1
 _GRAVITY = 0.0  # PullingWooper scene.json sets gravity = 0
 
-_YOUNG = 1.0e7
+_YOUNG = 1.0e7 / 2.3  # RealSim's material modulus; SolverFBA's tet gauge 2 + nu scales it back to 1e7
 _POISSON = 0.3
 _OBJ_MASS = 1000.0
 

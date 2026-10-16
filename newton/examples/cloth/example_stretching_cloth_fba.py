@@ -31,7 +31,7 @@ _PD_ITER = 10
 _NSN_ITER = 1
 _GRAVITY = -1.0  # Y-up, RealSim scene.json gravity=[0,-1,0]
 
-_YOUNG = 1.0e5
+_YOUNG = 35483.87096774193  # RealSim's material modulus; SolverFBA's tri gauge scales it back to 1e5
 _POISSON = 0.45
 _OBJ_MASS = 1000.0
 

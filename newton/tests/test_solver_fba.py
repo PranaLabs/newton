@@ -1890,12 +1890,12 @@ class TestFBARealSimAgreementNH(unittest.TestCase):
     DT = 0.01
     N_FRAMES = 50
     N_ITER = 5
-    # E=1e4, nu=0.4 → mu = E/(2*(1+nu)) ≈ 3571.4286; lambda = E*nu/((1+nu)*(1-2*nu)) ≈ 14285.714
-    # tri_ke = 2*mu ≈ 7142.857 (used only to build the PD Hessian A; NH uses mu/lam directly)
-    TRI_KE = 7142.857
+    # RealSim's ElasticEnergy received E=1e4, nu=0.4. SolverFBA scales the material modulus by the
+    # triangle gauge (4 mu + 3 lam) / (2 mu + lam) = 8/3, so the material is E = 3750.
+    MU = 3750.0 / (2.0 * 1.4)
+    LAM = 3750.0 * 0.4 / (1.4 * 0.2)
+    TRI_KE = 2.0 * MU  # the projection weight, used only to build the PD Hessian A
     EDGE_KE = 0.1
-    MU = 3571.4285714285716
-    LAM = 14285.71428571429
     PIN_STIFFNESS = 1e10
     PIN_BOXES = (
         (-1.1, 0.9, -0.1, -0.9, 1.1, 0.1),
@@ -5199,6 +5199,43 @@ class TestNeoHookeanLBFGS(unittest.TestCase):
         model = builder.finalize()
         with self.assertRaises(ValueError):
             SolverFBA(model, stretching_model="neohookean", mu=100.0, lam=200.0, nh_solver="bogus")
+
+
+class TestDroppedDualGauge(unittest.TestCase):
+    """A bar of tetrahedra and a strip of triangles hang 10 N; their extension gives the small-strain modulus."""
+
+    def _modulus_ratio(self, tetrahedra, stretching_model, young=1.0e6, poisson=0.4):
+        mu, lam = young / (2 * (1 + poisson)), young * poisson / ((1 + poisson) * (1 - 2 * poisson))
+        builder = newton.ModelBuilder(gravity=-10.0)
+        if tetrahedra:  # 0.1 x 0.1 x 0.8 m
+            builder.add_soft_grid(
+                wp.vec3(0.0), wp.quat_identity(), wp.vec3(0.0), 2, 2, 16, 0.05, 0.05, 0.05, 1.0, mu, lam, 0.0
+            )
+            modulus, width = young, 0.01
+        else:  # 0.1 x 0.8 m, plane-stress membrane modulus [N/m]
+            rot = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.5 * np.pi)
+            builder.add_cloth_grid(wp.vec3(0.0), rot, wp.vec3(0.0), 4, 32, 0.025, 0.025, 1.0e-4, tri_ke=2.0 * mu)
+            modulus, width = 4 * mu * (mu + lam) / (2 * mu + lam), 0.1
+        model = builder.finalize()
+        z = model.particle_q.numpy()[:, 2]
+        top, bottom = np.isclose(z, z.max()), np.isclose(z, z.min())
+        mass = np.where(top, 0.0, np.where(bottom, 1.0 / bottom.sum(), model.particle_mass.numpy()))
+        model.particle_mass.assign(mass)
+        model.particle_inv_mass.assign(np.divide(1.0, mass, out=np.zeros_like(mass), where=mass > 0))
+        solver = SolverFBA(model, iterations=50, stretching_model=stretching_model, mu=mu, lam=lam)
+        s0, s1 = model.state(), model.state()
+        for _ in range(30):  # implicit steps much longer than the 56 ms period settle the load
+            solver.step(s0, s1, None, None, 0.1)
+            s0, s1 = s1, s0
+        extension = z[bottom].mean() - s0.particle_q.numpy()[bottom, 2].mean()
+        return 10.0 * 0.8 / (width * extension) / modulus
+
+    def test_small_strain_modulus_is_the_material_modulus(self):
+        """Without the gauge the moduli come out 1 / (2 + nu) and (2 mu + lam) / (4 mu + 3 lam) as large."""
+        for tetrahedra in (True, False):
+            for stretching_model in ("corotational", "neohookean"):
+                with self.subTest(tetrahedra=tetrahedra, stretching_model=stretching_model):
+                    self.assertAlmostEqual(self._modulus_ratio(tetrahedra, stretching_model), 1.0, delta=0.03)
 
 
 if __name__ == "__main__":
