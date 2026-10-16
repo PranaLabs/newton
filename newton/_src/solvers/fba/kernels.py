@@ -3439,6 +3439,74 @@ def gather_jt_lambda_kernel(
     out[p] = s
 
 
+@wp.kernel
+def add_slot_terms_W_kernel(
+    slot_particle: wp.array2d[wp.int32],  # (total_rows, 3) particles of each row, -1 when unused
+    slot_alpha: wp.array2d[wp.float32],  # (total_rows, 3) their Jacobian coefficients
+    contact_dir: wp.array[wp.vec3],
+    isodof_rank: wp.array[wp.int32],
+    Wi: wp.array2d[wp.float64],
+    W: wp.array2d[wp.float64],  # inout
+):
+    """Add the slot pairs other than ``(0, 0)`` of rows that act on up to three particles.
+
+    A row ``a`` with particles ``p_ai`` and coefficients ``w_ai`` has the
+    Jacobian ``sum_i w_ai dir_a`` on particle ``p_ai``, so
+    ``W[a, b] = (dir_a . dir_b) sum_ij w_ai w_bj Wi[p_ai, p_bj]``;
+    :func:`compose_W_from_wi_kernel` wrote the ``(0, 0)`` term.
+    """
+    a, b = wp.tid()
+    s = wp.float64(0.0)
+    for i in range(3):
+        pa = slot_particle[a, i]
+        for j in range(3):
+            pb = slot_particle[b, j]
+            if pa >= 0 and pb >= 0 and i + j > 0:
+                w = wp.float64(slot_alpha[a, i]) * wp.float64(slot_alpha[b, j])
+                s += w * Wi[isodof_rank[pa], isodof_rank[pb]]
+    W[a, b] = W[a, b] + wp.float64(wp.dot(contact_dir[a], contact_dir[b])) * s
+
+
+@wp.kernel
+def gather_jt_lambda_slots_kernel(
+    slot_offsets: wp.array[wp.int32],  # (N + 1,) CSR offsets into slot_entries
+    slot_entries: wp.array[wp.int32],  # row * 3 + slot for slots 1 and 2 of each particle
+    contact_dir: wp.array[wp.vec3],
+    slot_alpha: wp.array2d[wp.float32],
+    lam: wp.array[wp.float32],
+    out: wp.array[wp.vec3],  # inout
+):
+    """Add the slots 1 and 2 of the contact rows to ``out[p]``, after :func:`gather_jt_lambda_kernel`."""
+    p = wp.tid()
+    s = wp.vec3(0.0, 0.0, 0.0)
+    for k in range(slot_offsets[p], slot_offsets[p + 1]):
+        r = slot_entries[k] // 3
+        s = s + (slot_alpha[r, slot_entries[k] % 3] * lam[r]) * contact_dir[r]
+    out[p] = out[p] + s
+
+
+@wp.kernel
+def subtract_slot_residual_kernel(
+    extra_particle: wp.array2d[wp.int32],  # (M, 2) second and third particle of each contact, -1 when unused
+    extra_alpha: wp.array2d[wp.float32],  # (M, 2)
+    contact_normal: wp.array[wp.vec3],
+    contact_t1: wp.array[wp.vec3],
+    contact_t2: wp.array[wp.vec3],
+    x: wp.array[wp.vec3],
+    r: wp.array[wp.float64],  # inout, (3M,)
+):
+    """Subtract ``alpha * dot(axis, x[p])`` of the extra particles from the residual of
+    :func:`compute_contact_residual_coulomb_kernel`."""
+    c = wp.tid()
+    for i in range(2):
+        p = extra_particle[c, i]
+        if p >= 0:
+            w = wp.float64(extra_alpha[c, i])
+            r[3 * c + 0] = r[3 * c + 0] - w * wp.float64(wp.dot(contact_normal[c], x[p]))
+            r[3 * c + 1] = r[3 * c + 1] - w * wp.float64(wp.dot(contact_t1[c], x[p]))
+            r[3 * c + 2] = r[3 * c + 2] - w * wp.float64(wp.dot(contact_t2[c], x[p]))
+
+
 # ---------------------------------------------------------------------------
 # NSN inner LCP — Fischer-Burmeister rows + Schur build (Option C, fp64).
 #

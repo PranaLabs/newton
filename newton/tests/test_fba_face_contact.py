@@ -105,5 +105,63 @@ class TestFaceContactQuery(unittest.TestCase):
         self.assertEqual(self._query([1, 5], mirrored=True)[0].tolist(), [0, 1])
 
 
+class TestContactRowsOnSeveralParticles(unittest.TestCase):
+    """Two particle contacts and one contact on three particles against dense ``J A⁻¹ Jᵀ`` algebra."""
+
+    def setUp(self):
+        import scipy.sparse as sp
+
+        from newton._src.solvers.fba.linear_solver import FBALinearSolver, factorize_and_sparse_inverse  # noqa: PLC0415
+
+        rng = np.random.default_rng(7)
+        n, off = 12, rng.uniform(-0.3, 0.3, 11)
+        A = sp.diags([off, rng.uniform(5.0, 15.0, n), off], [-1, 0, 1], format="csr")
+        self.A_inv = np.kron(np.linalg.inv(A.toarray()), np.eye(3))
+        self.solver = FBALinearSolver(factorize_and_sparse_inverse(A), device=wp.get_device())
+        particle, alpha = np.array([1, 5, 8]), np.array([1.0, 1.0, 0.5])
+        extra, extra_alpha = np.array([[-1, -1], [-1, -1], [9, 3]]), np.array([[0.0, 0.0], [0.0, 0.0], [0.3, 0.2]])
+        frames = np.linalg.qr(rng.standard_normal((3, 3, 3)))[0]  # rows: normal, t1, t2
+        self.J = np.zeros((9, 3 * n))
+        for c in range(3):
+            for p, w in zip([particle[c], *extra[c]], [alpha[c], *extra_alpha[c]], strict=True):
+                if p >= 0:
+                    self.J[3 * c : 3 * c + 3, 3 * p : 3 * p + 3] += w * frames[c].T
+        args = [(particle, wp.int32), (frames[:, :, 0], wp.vec3), (alpha, wp.float32)]
+        args += [(frames[:, :, 1], wp.vec3), (frames[:, :, 2], wp.vec3)]
+        self.args = [wp.array(a, dtype=t) for a, t in args]
+        self.extra = [wp.array(extra, dtype=wp.int32), wp.array(extra_alpha, dtype=wp.float32)]
+        self.solver.build_schur_complement(
+            3, *self.args, download=False, j_extra_indices=self.extra[0], j_extra_alpha=self.extra[1]
+        )
+
+    def test_delassus(self):
+        np.testing.assert_allclose(
+            self.solver.W_device_view().numpy(), self.J @ self.A_inv @ self.J.T, rtol=1e-5, atol=1e-8
+        )
+
+    def test_correction(self):
+        """``x = A⁻¹ (rhs + Jᵀ λ)`` gathers ``Jᵀ λ`` over every particle of a row."""
+        rng = np.random.default_rng(3)
+        rhs, lam = rng.standard_normal((12, 3)), rng.standard_normal(9)
+        rhs_d, x_d = wp.array(rhs, dtype=wp.vec3), wp.zeros(12, dtype=wp.vec3)
+        self.solver.apply_lambda_correction_combined(lam, rhs_d, x_d)
+        np.testing.assert_allclose(
+            x_d.numpy().ravel(), self.A_inv @ (rhs.ravel() + self.J.T @ lam), rtol=1e-4, atol=1e-6
+        )
+
+    def test_residual(self):
+        """``offset - J x`` with the extra particles subtracted after the one-particle residual."""
+        from newton._src.solvers.fba import kernels as K  # noqa: PLC0415
+
+        rng = np.random.default_rng(5)
+        x, offsets = rng.standard_normal((12, 3)), rng.standard_normal(9)
+        x_d, r = wp.array(x, dtype=wp.vec3), wp.zeros(9, dtype=wp.float64)
+        particle, normal, alpha, t1, t2 = self.args
+        offset_d = [wp.array(offsets[k::3], dtype=wp.float64) for k in range(3)]
+        wp.launch(K.compute_contact_residual_coulomb_kernel, 3, [*offset_d, alpha, normal, t1, t2, particle, x_d], [r])
+        wp.launch(K.subtract_slot_residual_kernel, 3, [*self.extra, normal, t1, t2, x_d], [r])
+        np.testing.assert_allclose(r.numpy(), offsets - self.J @ x.ravel(), rtol=1e-5, atol=1e-6)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
