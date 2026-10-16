@@ -241,6 +241,7 @@ class SolverFBA(SolverBase):
         face_contact_edge_radius: float = 3.0e-3,
         soft_contact_thickness: float = 0.0,
         nsn_linear_iterations: int | None = None,
+        face_contact_margin: float | None = None,
     ) -> None:
         """
         Args:
@@ -355,6 +356,11 @@ class SolverFBA(SolverBase):
                 ``constraintsolver.iterations``. ``None`` solves to a relative
                 residual of ``1e-10``. A capped step is inexact, and the next
                 LG iteration's NSN step continues from it.
+            face_contact_margin: Distance [m] within which every triangle is
+                also tested for face contacts, RealSim's collision alarm.
+                ``None`` tests only the triangles next to particle contacts,
+                which misses a shape tip or edge poking into a triangle whose
+                particles all lie beyond the particle contact margin.
         """
         super().__init__(model)
 
@@ -437,6 +443,7 @@ class SolverFBA(SolverBase):
         self.contact_regularization = float(contact_regularization)
         self.face_contacts = bool(face_contacts)
         self.face_contact_edge_radius = float(face_contact_edge_radius)
+        self.face_contact_margin = None if face_contact_margin is None else float(face_contact_margin)
         self.soft_contact_thickness = float(soft_contact_thickness)
         self._face_query, self._contact_extra = None, None
         if self.face_contacts:
@@ -2181,8 +2188,10 @@ class SolverFBA(SolverBase):
         self._invalidate_schur_cache()
         self._contact_extra = None
 
+        # With a face contact margin, triangles can touch shapes that no particle touches.
+        faces_only = self._face_query is not None and self.face_contact_margin is not None
         M_raw = int(contacts.soft_contact_count.numpy()[0])
-        if M_raw == 0:
+        if M_raw == 0 and not faces_only:
             self._contact_count = 0
             return
 
@@ -2209,7 +2218,7 @@ class SolverFBA(SolverBase):
         normal_h = normal_h[valid_mask]
         M = int(particle_h.shape[0])
 
-        if M == 0:
+        if M == 0 and not faces_only:
             self._contact_count = 0
             return
 
@@ -2232,7 +2241,13 @@ class SolverFBA(SolverBase):
         if self._face_query is not None:
             src = state if state is not None else self.model
             found = self._face_query.query(
-                self.model, src.particle_q, src.body_q, particle_h, shape_h, self.face_contact_edge_radius
+                self.model,
+                src.particle_q,
+                src.body_q,
+                particle_h,
+                shape_h,
+                self.face_contact_edge_radius,
+                self.face_contact_margin,
             )
             if len(found[0]):
                 tri, bary = self._face_query.tri[found[0]], found[2]
@@ -2243,6 +2258,9 @@ class SolverFBA(SolverBase):
                 extra = [np.concatenate([extra[0], tri[:, 1:]]), np.concatenate([extra[1], bary[:, 1:]])]
                 self._contact_extra = [wp.array(a, device=self._device) for a in extra]
                 M = len(particle_h)
+        if M == 0:
+            self._contact_count = 0
+            return
 
         self._ensure_contact_buffers(M)
 

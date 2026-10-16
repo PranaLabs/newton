@@ -15,6 +15,7 @@ import numpy as np
 import warp as wp
 
 from ...geometry import kernels as sdf
+from ...geometry.flags import ShapeFlags
 from ...geometry.types import Axis, GeoType
 
 
@@ -143,11 +144,53 @@ def face_contact_kernel(
     normal[idx] = wp.transform_vector(X_ws, n)
 
 
+@wp.kernel
+def near_face_kernel(
+    particle_q: wp.array[wp.vec3],
+    tri_indices: wp.array2d[wp.int32],
+    particle_world: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[wp.int32],
+    shape_type: wp.array[wp.int32],
+    shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
+    shape_flags: wp.array[wp.int32],
+    shape_world: wp.array[wp.int32],
+    margin: float,
+    edge_radius: float,
+    count: wp.array[wp.int32],
+    pair: wp.array[wp.int64],
+):
+    """``shape * tri_count + face`` of each pair whose triangle may come within ``margin`` of the shape: the
+    signed distance changes no faster than the point moves, so no triangle point is closer than the
+    centroid's distance minus the triangle's radius about the centroid."""
+    f, s = wp.tid()
+    world = shape_world[s]
+    if (shape_flags[s] & ShapeFlags.COLLIDE_PARTICLES) == 0 or (
+        world >= 0 and world != particle_world[tri_indices[f, 0]]
+    ):
+        return
+    X_ws = shape_transform[s]
+    if shape_body[s] >= 0:
+        X_ws = wp.transform_multiply(body_q[shape_body[s]], X_ws)
+    X_sw = wp.transform_inverse(X_ws)
+    a = wp.transform_point(X_sw, particle_q[tri_indices[f, 0]])
+    b = wp.transform_point(X_sw, particle_q[tri_indices[f, 1]])
+    c = wp.transform_point(X_sw, particle_q[tri_indices[f, 2]])
+    o = (a + b + c) / 3.0
+    radius = wp.max(wp.length(a - o), wp.max(wp.length(b - o), wp.length(c - o)))
+    d = shape_sdf(shape_type[s], shape_scale[s], shape_source_ptr[s], o, edge_radius)[0]
+    if d - radius <= margin:
+        pair[wp.atomic_add(count, 0, 1)] = wp.int64(s) * wp.int64(tri_indices.shape[0]) + wp.int64(f)
+
+
 class FaceContactQuery:
     """Face contacts of the triangles around a step's particle contacts.
 
-    A triangle is tested against a shape when one of its particles touches
-    the shape, so the particle contact margin also bounds this search.
+    A triangle is tested against a shape when one of its particles touches the shape or, given a margin,
+    when the triangle may come within that margin of the shape; a shape tip or edge can poke into a
+    triangle whose particles all lie beyond the particle contact margin.
     """
 
     def __init__(self, tri_indices: np.ndarray, particle_count: int, device):
@@ -167,18 +210,37 @@ class FaceContactQuery:
         particle,
         shape,
         edge_radius: float,
+        margin: float | None = None,
         iterations: int = 128,
     ):
         """Face contacts as ``(face, shape, bary, body_pos, normal)`` arrays, ordered by shape and triangle.
 
         ``particle`` and ``shape`` list the particle contacts; ``edge_radius``
-        rounds box and cylinder edges as in :func:`shape_sdf`. When two
-        triangles report the same edge optimum, the deeper contact remains.
+        rounds box and cylinder edges as in :func:`shape_sdf`. A ``margin``
+        [m] also tests every triangle that may come that close to a shape.
+        When two triangles report the same edge optimum, the deeper contact
+        remains.
         """
         start, stop = self.offsets[particle], self.offsets[particle + 1]
         counts, n_tri, device = stop - start, len(self.tri), self.device
         faces = self.incident[np.repeat(start - np.cumsum(counts) + counts, counts) + np.arange(counts.sum())]
         candidates = np.unique(np.repeat(np.asarray(shape, dtype=np.int64), counts) * n_tri + faces)
+        bodies = self.no_bodies if body_q is None or not body_q.shape[0] else body_q
+        if margin is not None and model.shape_count:
+            near_count = wp.zeros(1, dtype=wp.int32, device=device)
+            near = wp.empty(n_tri * model.shape_count, dtype=wp.int64, device=device)
+            wp.launch(
+                near_face_kernel,
+                dim=(n_tri, model.shape_count),
+                inputs=[
+                    *(particle_q, self.tri_d, model.particle_world, bodies),
+                    *(model.shape_transform, model.shape_body, model.shape_type, model.shape_scale),
+                    *(model.shape_source_ptr, model.shape_flags, model.shape_world, margin, edge_radius),
+                ],
+                outputs=[near_count, near],
+                device=device,
+            )
+            candidates = np.union1d(candidates, near.numpy()[: int(near_count.numpy()[0])])
         cand_shape, cand_face = np.divmod(candidates, n_tri)
         count = wp.zeros(1, dtype=wp.int32, device=device)
         out = [
@@ -191,7 +253,7 @@ class FaceContactQuery:
                 inputs=[
                     *(particle_q, self.tri_d),
                     *(wp.array(a.astype(np.int32), dtype=wp.int32, device=device) for a in (cand_face, cand_shape)),
-                    self.no_bodies if body_q is None or not body_q.shape[0] else body_q,
+                    bodies,
                     *(model.shape_transform, model.shape_body, model.shape_type),
                     *(model.shape_scale, model.shape_source_ptr),
                     *(iterations, edge_radius),

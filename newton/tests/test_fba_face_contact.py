@@ -32,6 +32,19 @@ def _deepest_on(points, half=HALF):
     return _box_sdf(grid[grid[:, 0] >= 0.0] @ points, half).min()
 
 
+def _pyramid_mesh():
+    """A closed square pyramid 0.1 m tall with its tip at the origin."""
+    verts = [[0.0, 0.0, 0.0], [-0.05, -0.05, -0.1], [0.05, -0.05, -0.1], [0.05, 0.05, -0.1], [-0.05, 0.05, -0.1]]
+    return newton.Mesh(np.array(verts), np.ravel([(0, 1, 2), (0, 2, 3), (0, 3, 4), (0, 4, 1), (1, 3, 2), (1, 4, 3)]))
+
+
+def _add_triangle_over_tip(builder):
+    """A triangle of circumradius 0.15 m centered 4 mm above the origin; its particles are 0.13 m from the pyramid."""
+    for a in np.deg2rad([0.0, 120.0, 240.0]):
+        builder.add_particle(wp.vec3(0.15 * np.cos(a), 0.15 * np.sin(a), 0.004), wp.vec3(0.0), 0.01, radius=0.002)
+    builder.add_triangle(0, 1, 2)
+
+
 def _draped_triangle(scale=0.15):
     """A triangle over the box's top edge at ``x = z = 0.5``: its vertices are outside, the edge pokes through."""
     corner = np.array([0.5, 0.0, 0.5])
@@ -142,6 +155,19 @@ class TestFaceContactQuery(unittest.TestCase):
         """A triangle reaching into the sphere is tested only when one of its particles has a contact."""
         self.assertEqual(self._query([1], mirrored=True)[0].tolist(), [0])
         self.assertEqual(self._query([1, 5], mirrored=True)[0].tolist(), [0, 1])
+
+    def test_margin_reaches_a_tip_inside_a_large_triangle(self):
+        """No particle touches the pyramid under the triangle; only the margin finds its tip."""
+        builder = newton.ModelBuilder()
+        builder.add_shape_mesh(-1, mesh=_pyramid_mesh())
+        _add_triangle_over_tip(builder)
+        model = builder.finalize()
+        query, none = FaceContactQuery(model.tri_indices.numpy(), model.particle_count, model.device), np.zeros(0, int)
+        self.assertEqual(len(query.query(model, model.particle_q, None, none, none, 0.0)[0]), 0)
+        face, _shape, _bary, body_pos, normal = query.query(model, model.particle_q, None, none, none, 0.0, 0.01)
+        self.assertEqual(len(face), 1)
+        np.testing.assert_allclose(body_pos[0], 0.0, atol=1e-5)
+        self.assertGreater(float(normal[0][2]), 0.9)
 
 
 class TestContactRowsOnSeveralParticles(unittest.TestCase):
@@ -287,6 +313,30 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
                 self.assertLess(speed, 1.5)
             else:
                 self.assertLess(x[:, 2].max(), 0.0)
+
+    def test_face_contact_margin(self):
+        """A triangle falls onto a pyramid tip under its middle and rests on it only with the margin."""
+        for margin in (None, 0.01):
+            builder = newton.ModelBuilder()
+            builder.add_shape_mesh(-1, mesh=_pyramid_mesh(), cfg=newton.ModelBuilder.ShapeConfig(mu=0.6))
+            _add_triangle_over_tip(builder)
+            model = builder.finalize()
+            solver = newton.solvers.SolverFBA(
+                model, iterations=10, face_contacts=True, soft_contact_thickness=3e-3, face_contact_margin=margin
+            )
+            pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.01)
+            contacts, s0, s1 = pipeline.contacts(), model.state(), model.state()
+            for _ in range(30):
+                pipeline.collide(s0, contacts)
+                solver.step(s0, s1, None, contacts, 1.0 / 120.0)
+                s0, s1 = s1, s0
+            x = s0.particle_q.numpy()
+            normal = np.cross(x[1] - x[0], x[2] - x[0])
+            height = float(np.dot(x[0], normal / np.linalg.norm(normal)))  # of the triangle plane above the tip
+            if margin is None:
+                self.assertLess(height, 0.0)
+            else:
+                self.assertGreater(height, 2e-3)
 
     def test_flat_contact_is_unchanged(self):
         """On a flat face every triangle is deepest at a vertex: no face contact, the same trajectory."""
