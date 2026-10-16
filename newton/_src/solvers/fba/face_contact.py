@@ -19,15 +19,24 @@ from ...geometry.types import Axis, GeoType
 
 
 @wp.func
-def shape_sdf(geo_type: int, scale: wp.vec3, x: wp.vec3, edge_radius: float) -> wp.vec4:
+def shape_sdf(geo_type: int, scale: wp.vec3, mesh: wp.uint64, x: wp.vec3, edge_radius: float) -> wp.vec4:
     """Signed distance [m] and its gradient at ``x`` in the shape frame; ``1e6`` for unsupported shapes.
 
     Box and cylinder edges are rounded by ``edge_radius``: inside a sharp edge the gradient jumps
-    between the two faces, so a point that sinks into the edge would flip its normal.
+    between the two faces, so a point that sinks into the edge would flip its normal. Meshes use the
+    closest point and sign of Warp's query, scaled as in Newton's particle contacts.
     """
     d = float(1.0e6)
     g = wp.vec3(0.0, 0.0, 1.0)
-    if geo_type == GeoType.SPHERE:
+    if geo_type == GeoType.MESH or geo_type == GeoType.CONVEX_MESH:
+        q = wp.mesh_query_point_sign_normal(mesh, wp.cw_div(x, scale), 1.0e6)
+        if q.result:
+            delta = x - wp.cw_mul(wp.mesh_eval_position(mesh, q.face, q.u, q.v), scale)
+            d = q.sign * wp.length(delta)
+            g = wp.mesh_eval_face_normal(mesh, q.face)
+            if wp.length(delta) > 0.0:
+                g = q.sign * wp.normalize(delta)
+    elif geo_type == GeoType.SPHERE:
         d = sdf.sdf_sphere(x, scale[0])
         g = sdf.sdf_sphere_grad(x, scale[0])
     elif geo_type == GeoType.BOX:
@@ -72,6 +81,7 @@ def face_contact_kernel(
     shape_body: wp.array[wp.int32],
     shape_type: wp.array[wp.int32],
     shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
     iterations: int,
     edge_radius: float,
     count: wp.array[wp.int32],
@@ -98,14 +108,16 @@ def face_contact_kernel(
         wp.transform_point(X_sw, particle_q[tri_indices[f, 1]]),
         wp.transform_point(X_sw, particle_q[tri_indices[f, 2]]),
     )
-    geo = shape_type[s]
-    scale = shape_scale[s]
-    r = edge_radius
-    d = wp.vec3(shape_sdf(geo, scale, P[0], r)[0], shape_sdf(geo, scale, P[1], r)[0], shape_sdf(geo, scale, P[2], r)[0])
+    geo, scale, mesh, r = shape_type[s], shape_scale[s], shape_source_ptr[s], edge_radius
+    d = wp.vec3(
+        shape_sdf(geo, scale, mesh, P[0], r)[0],
+        shape_sdf(geo, scale, mesh, P[1], r)[0],
+        shape_sdf(geo, scale, mesh, P[2], r)[0],
+    )
     w = wp.vec3(0.0)
     w[min_index(d)] = 1.0
     for k in range(iterations):
-        sd = shape_sdf(geo, scale, w @ P, r)
+        sd = shape_sdf(geo, scale, mesh, w @ P, r)
         # Step toward the vertex with the lowest directional derivative until the Frank-Wolfe gap closes.
         a = P @ wp.vec3(sd[1], sd[2], sd[3])
         j = min_index(a)
@@ -119,7 +131,7 @@ def face_contact_kernel(
         if w[k] > 0.0:
             selected += 1
     x = w @ P
-    sd = shape_sdf(geo, scale, x, r)
+    sd = shape_sdf(geo, scale, mesh, x, r)
     if selected < 2 or sd[0] >= wp.min(d):
         return
     n = wp.normalize(wp.vec3(sd[1], sd[2], sd[3]))
@@ -180,7 +192,8 @@ class FaceContactQuery:
                     *(particle_q, self.tri_d),
                     *(wp.array(a.astype(np.int32), dtype=wp.int32, device=device) for a in (cand_face, cand_shape)),
                     self.no_bodies if body_q is None or not body_q.shape[0] else body_q,
-                    *(model.shape_transform, model.shape_body, model.shape_type, model.shape_scale),
+                    *(model.shape_transform, model.shape_body, model.shape_type),
+                    *(model.shape_scale, model.shape_source_ptr),
                     *(iterations, edge_radius),
                 ],
                 outputs=[count, *out],

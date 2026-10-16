@@ -334,7 +334,10 @@ class SolverFBA(SolverBase):
                 that point lies between its particles, so shape edges and
                 corners cannot pass through the triangle (RealSim's face
                 query). Needs ``friction=True``, ``nsn_schur_mode="full"``,
-                ``use_isodof=True`` and no ``mu_per_pair_override``.
+                ``use_isodof=True`` and no ``mu_per_pair_override``. Mesh
+                and convex hull shapes must be closed. Warp's sign query
+                treats faces within 1e-3 of the mean edge length as equally
+                close, so parts thinner than that need a finer mesh.
             face_contact_edge_radius: Radius [m] by which box and cylinder
                 edges are rounded in the signed distance the face contacts
                 minimize, at most half the shape's smallest extent. Inside a

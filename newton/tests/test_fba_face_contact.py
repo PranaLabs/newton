@@ -18,6 +18,20 @@ def _box_sdf(x, half=HALF, edge_radius=0.0):
     return np.linalg.norm(np.maximum(q, 0.0), axis=-1) + np.minimum(q.max(axis=-1), 0.0) - edge_radius
 
 
+def _box_mesh(half):
+    """The box as a closed triangle mesh with outward winding."""
+    corners = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]) * half
+    quads = [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1), (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)]
+    return newton.Mesh(corners, np.ravel([t for a, b, c, d in quads for t in ((a, b, c), (a, c, d))]))
+
+
+def _deepest_on(points, half=HALF):
+    """Brute-force minimum of the box signed distance over a triangle."""
+    u, v = np.mgrid[0.0:1.0:401j, 0.0:1.0:401j]
+    grid = np.stack([1.0 - u - v, u, v], axis=-1).reshape(-1, 3)
+    return _box_sdf(grid[grid[:, 0] >= 0.0] @ points, half).min()
+
+
 def _draped_triangle(scale=0.15):
     """A triangle over the box's top edge at ``x = z = 0.5``: its vertices are outside, the edge pokes through."""
     corner = np.array([0.5, 0.0, 0.5])
@@ -27,12 +41,13 @@ def _draped_triangle(scale=0.15):
 class TestFaceContactKernel(unittest.TestCase):
     """Deepest points of triangles in a box with half extents 0.5 m."""
 
-    def _query(self, points, X_wb=None, X_bs=None, edge_radius=0.0):
-        """Bary, depth, body_pos and normal of the contacts between one triangle and the box."""
+    def _query(self, points, X_wb=None, X_bs=None, edge_radius=0.0, half=HALF, mesh=None):
+        """Bary, depth, body_pos and normal of the contacts between one triangle and the box or its ``mesh``."""
         X_bs, body = (wp.transform_identity(), -1) if X_wb is None else (X_bs, 0)
+        geo, scale, mesh_id = (GeoType.BOX, half, 0) if mesh is None else (GeoType.MESH, np.ones(3), mesh.finalize())
         inputs = [(points, wp.vec3), ([[0, 1, 2]], wp.int32), ([0], wp.int32), ([0], wp.int32)]
         inputs += [([X_bs if X_wb is None else X_wb], wp.transform), ([X_bs], wp.transform)]
-        inputs += [([body], wp.int32), ([int(GeoType.BOX)], wp.int32), ([HALF], wp.vec3)]
+        inputs += [([body], wp.int32), ([int(geo)], wp.int32), ([scale], wp.vec3), ([mesh_id], wp.uint64)]
         outputs = [wp.zeros(1, dtype=t) for t in (wp.int32, wp.int32, wp.vec3, wp.float32, wp.vec3, wp.vec3)]
         inputs = [wp.array(a, dtype=t) for a, t in inputs]
         wp.launch(face_contact_kernel, dim=1, inputs=[*inputs, 128, edge_radius], outputs=outputs)
@@ -44,9 +59,7 @@ class TestFaceContactKernel(unittest.TestCase):
         points = _draped_triangle()
         bary, depth, body_pos, normal = self._query(points)
         self.assertEqual(len(depth), 1)
-        u, v = np.mgrid[0.0:1.0:401j, 0.0:1.0:401j]
-        grid = np.stack([1.0 - u - v, u, v], axis=-1).reshape(-1, 3)
-        deepest = _box_sdf(grid[grid[:, 0] >= 0.0] @ points).min()
+        deepest = _deepest_on(points)
         self.assertLess(deepest, -5e-3)
         self.assertGreater(_box_sdf(points).min(), 0.0)
         self.assertAlmostEqual(float(depth[0]), deepest, delta=2e-4)
@@ -68,6 +81,17 @@ class TestFaceContactKernel(unittest.TestCase):
             self.assertAlmostEqual(
                 float(_box_sdf(bary[0] @ points, edge_radius=edge_radius)), float(depth[0]), delta=1e-6
             )
+
+    def test_closed_mesh(self):
+        """A closed mesh of the box gives the box's contact; around a 2 mm plate both sides are outside."""
+        plate = np.array([[-0.05, -0.04, 0.204], [0.05, -0.04, 0.206], [0.0, 0.04, 0.208]])
+        for half, points in ((HALF, _draped_triangle()), (np.array([0.2, 0.001, 0.2]), plate)):
+            bary, depth, body_pos, normal = self._query(points, half=half, mesh=_box_mesh(half))
+            self.assertEqual(len(depth), 1)
+            self.assertAlmostEqual(float(depth[0]), _deepest_on(points, half), delta=2e-4)
+            self.assertAlmostEqual(float(_box_sdf(bary[0] @ points, half)), float(depth[0]), delta=1e-6)
+            self.assertAlmostEqual(float(_box_sdf(body_pos[0], half)), 0.0, delta=1e-6)
+            np.testing.assert_allclose(body_pos[0], bary[0] @ points - depth[0] * normal[0], atol=1e-6)
 
     def test_triangle_on_face_has_no_face_contact(self):
         """A triangle 1 mm above the top face is deepest at a vertex, which particle contacts cover."""
@@ -186,19 +210,24 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
         if not wp.is_cuda_available():
             raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
 
-    def _run(self, face_contacts, pos, cells, steps, thickness=0.0):
-        """Final particle positions, the largest particle speed and the solver."""
+    def _run(self, face_contacts, pos, cells, steps, thickness=0.0, mesh_half=None):
+        """Final particle positions, the largest particle speed and the solver; ``mesh_half`` swaps the box for
+        a closed mesh box with these half extents, its base also at ``z = 0``."""
         builder = newton.ModelBuilder()
         cfg = newton.ModelBuilder.ShapeConfig(mu=0.6)
-        builder.add_shape_box(
-            -1, xform=wp.transform((0.0, 0.0, 0.3), wp.quat_identity()), hx=0.3, hy=0.3, hz=0.3, cfg=cfg
-        )
+        if mesh_half is None:
+            builder.add_shape_box(
+                -1, xform=wp.transform((0.0, 0.0, 0.3), wp.quat_identity()), hx=0.3, hy=0.3, hz=0.3, cfg=cfg
+            )
+        else:
+            xform = wp.transform((0.0, 0.0, mesh_half[2]), wp.quat_identity())
+            builder.add_shape_mesh(-1, xform=xform, mesh=_box_mesh(mesh_half), cfg=cfg)
         builder.add_cloth_grid(
             pos=wp.vec3(*pos),
             rot=wp.quat_identity(),
             vel=wp.vec3(0.0),
-            dim_x=cells,
-            dim_y=cells,
+            dim_x=np.atleast_1d(cells)[0],
+            dim_y=np.atleast_1d(cells)[-1],
             cell_x=0.05,
             cell_y=0.05,
             mass=0.002,
@@ -220,12 +249,12 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
         return s0.particle_q.numpy(), speed, solver
 
     @staticmethod
-    def _deepest(x, solver):
-        """Signed distance of the deepest box point inside the cloth faces [m]."""
+    def _deepest(x, solver, half=(0.3, 0.3, 0.3)):
+        """Signed distance of the deepest point of the box with its base at ``z = 0`` inside the cloth faces [m]."""
         u, v = np.mgrid[0.0:1.0:21j, 0.0:1.0:21j]
         grid = np.stack([1.0 - u - v, u, v], axis=-1).reshape(-1, 3)
         faces = np.einsum("gk,tkd->tgd", grid[grid[:, 0] >= 0.0], x[solver.model.tri_indices.numpy()])
-        return _box_sdf(faces - [0.0, 0.0, 0.3], np.full(3, 0.3)).min()
+        return _box_sdf(faces - [0.0, 0.0, half[2]], np.asarray(half)).min()
 
     def test_box_edge_stays_out_of_the_faces(self):
         """Draped over the top edge, the cloth keeps the edge out of its faces, not just off its particles."""
@@ -245,6 +274,19 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
         x, speed, solver = self._run(True, (0.0, -0.3, 0.65), 12, 240, thickness=3e-3)
         self.assertGreater(self._deepest(x, solver), 1e-3)
         self.assertLess(speed, 1.5)
+
+    def test_thin_mesh_blade(self):
+        """A closed 2 mm blade under the gap between two particle rows cuts through a cloth held by particle
+        contacts alone; with face contacts the cloth folds over its edge and the edge stays out of its faces."""
+        half = np.array([0.3, 0.001, 0.15])
+        for face_contacts in (False, True):
+            x, speed, solver = self._run(face_contacts, (-0.3, -0.325, 0.32), (12, 13), 120, 3e-3, mesh_half=half)
+            if face_contacts:
+                self.assertGreater(self._deepest(x, solver, half), 2e-3)
+                self.assertGreater(x[:, 2].max(), 0.3)
+                self.assertLess(speed, 1.5)
+            else:
+                self.assertLess(x[:, 2].max(), 0.0)
 
     def test_flat_contact_is_unchanged(self):
         """On a flat face every triangle is deepest at a vertex: no face contact, the same trajectory."""
