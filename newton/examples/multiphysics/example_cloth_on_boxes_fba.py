@@ -6,9 +6,10 @@
 #
 # A cloth drops onto two stacked boxes while a plank hinged next to them
 # tips over onto the stack. SolverFBA integrates the cloth and the rigid
-# bodies in one step: particle contacts push on the boxes, the boxes rest
-# on each other and on the ground, and the hinge holds the plank on its
-# axis while it lies on the boxes.
+# bodies in one step: particle and face contacts push on the boxes, so box
+# edges stay out of the cloth, the boxes rest on each other and on the
+# ground, and the hinge holds the plank on its axis while it lies on the
+# boxes.
 #
 # Command: uv run -m newton.examples cloth_on_boxes_fba
 ###########################################################################
@@ -74,7 +75,7 @@ class Example:
         )
 
         self.model = builder.finalize()
-        self.solver = SolverFBA(self.model, iterations=10)
+        self.solver = SolverFBA(self.model, iterations=10, face_contacts=True)
         self.pipeline = newton.CollisionPipeline(self.model, soft_contact_margin=0.05)
         self.contacts = self.pipeline.contacts()
         self.state_0 = self.model.state()
