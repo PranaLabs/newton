@@ -75,7 +75,7 @@ class Example:
         )
 
         self.model = builder.finalize()
-        self.solver = SolverFBA(self.model, iterations=10, face_contacts=True)
+        self.solver = SolverFBA(self.model, iterations=10, face_contacts=True, soft_contact_thickness=3.0e-3)
         self.pipeline = newton.CollisionPipeline(self.model, soft_contact_margin=0.05)
         self.contacts = self.pipeline.contacts()
         self.state_0 = self.model.state()
