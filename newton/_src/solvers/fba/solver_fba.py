@@ -717,6 +717,7 @@ class SolverFBA(SolverBase):
         The joint rows of every articulation a contact touches join the contact
         rows, so one NSN solve couples them; other articulations keep their
         Cholesky-factored joint system.
+        Deformable contact rows lead when one of them touches an integrated body.
         """
         from .joints import select_rows_kernel  # noqa: PLC0415
         from .rigid import rigid_delassus_kernel, row_incidence  # noqa: PLC0415
@@ -725,7 +726,17 @@ class SolverFBA(SolverBase):
         model, device = self.model, self._device
         rc = None if contacts is None else gather_rigid_contacts(model, contacts, self._body_slot_h, device)
         self._rigid_contacts = rc
-        if rc is None:
+        m_s, m_r = 0, 0 if rc is None else rc.count
+        slots = np.empty((0, 2), dtype=np.int32) if rc is None else rc.slot
+        if model.particle_count > 0 and self._contact_count > 0:
+            shape = self._contact_shape_d.numpy()[: self._contact_count]
+            body = np.where(shape >= 0, model.shape_body.numpy()[np.maximum(shape, 0)], -1)
+            soft_slot = np.where(body >= 0, self._body_slot_h[np.maximum(body, 0)], -1)
+            if (soft_slot >= 0).any():
+                m_s = self._contact_count
+                slots = np.concatenate([np.stack([soft_slot, np.full(m_s, -1)], axis=1), slots])
+        self._two_way, self._rc_counts, self._rc_n = m_s > 0, (m_s, m_r), 0
+        if m_s + m_r == 0:
             return
         if not self.friction or self.nsn_schur_mode != "full":
             raise NotImplementedError(
@@ -733,25 +744,46 @@ class SolverFBA(SolverBase):
             )
         joint_rows = np.empty(0, dtype=np.int32)
         if self._joint_rows is not None:
-            blocks = self._slot_block[rc.slot[rc.slot >= 0]]
+            blocks = self._slot_block[slots[slots >= 0]]
             joint_rows = np.flatnonzero(np.isin(self._joint_row_block, blocks[blocks >= 0])).astype(np.int32)
         self._rc_joint_rows_d = wp.array(joint_rows, dtype=wp.int32, device=device)
-        n_c = 3 * rc.count
-        n = n_c + joint_rows.size
+        n_s, n_c = 3 * m_s, 3 * m_r
+        n = self._rc_n = n_s + n_c + joint_rows.size
         self._rc_row_slot_d = wp.empty((n, 2), dtype=wp.int32, device=device)
         self._rc_row_jac_d = wp.empty((n, 2), dtype=wp.spatial_vectord, device=device)
-        wp.launch(
-            rigid_contact_jacobian_kernel,
-            dim=(rc.count, 3),
-            inputs=[rc.body, rc.anchor, rc.normal, self._body_slot_d, self._rigid_q_pin_d, 0],
-            outputs=[self._rc_row_slot_d, self._rc_row_jac_d],
-            device=device,
-        )
+        self._rc_pene0_d = wp.zeros(n, dtype=wp.float64, device=device)
+        self._rc_mu_d = wp.empty(m_s + m_r, dtype=wp.float64, device=device)
+        W_soft = wp.empty((0, 0), dtype=wp.float64, device=device)
+        if m_s:
+            from .rigid_contact import particle_contact_body_jacobian_kernel  # noqa: PLC0415
+
+            wp.launch(
+                particle_contact_body_jacobian_kernel,
+                dim=(m_s, 3),
+                inputs=[*self._particle_contact_args(), self._body_slot_d, model.body_com, self._rigid_q_pin_d],
+                outputs=[self._rc_row_slot_d, self._rc_row_jac_d],
+                device=device,
+            )
+            ls = self._linear_solver
+            ls.build_schur_complement(m_s, *self._contact_row_args(), use_isodof=self.use_isodof, download=False)
+            self._cached_W, self._cached_A_inv_Jt_valid = True, True
+            W_soft = ls.W_device_view()
+            self._launch_contact_pene0(self._rc_pene0_d)
+            wp.copy(self._rc_mu_d, self._contact_mu_d, count=m_s)
+        if m_r:
+            wp.launch(
+                rigid_contact_jacobian_kernel,
+                dim=(m_r, 3),
+                inputs=[rc.body, rc.anchor, rc.normal, self._body_slot_d, self._rigid_q_pin_d, n_s],
+                outputs=[self._rc_row_slot_d, self._rc_row_jac_d],
+                device=device,
+            )
+            wp.copy(self._rc_mu_d, rc.mu, dest_offset=m_s, count=m_r)
         if joint_rows.size:
             wp.launch(
                 select_rows_kernel,
                 dim=joint_rows.size,
-                inputs=[self._rc_joint_rows_d, self._joint_row_slot_d, self._joint_row_jac_d, n_c],
+                inputs=[self._rc_joint_rows_d, self._joint_row_slot_d, self._joint_row_jac_d, n_s + n_c],
                 outputs=[self._rc_row_slot_d, self._rc_row_jac_d],
                 device=device,
             )
@@ -760,8 +792,8 @@ class SolverFBA(SolverBase):
             rigid_delassus_kernel,
             dim=(n, n),
             inputs=[
-                wp.empty((0, 0), dtype=wp.float64, device=device),
-                0,
+                W_soft,
+                n_s,
                 self._rc_row_slot_d,
                 self._rc_row_jac_d,
                 self._slot_inv_mass_d,
@@ -769,11 +801,10 @@ class SolverFBA(SolverBase):
             outputs=[self._rc_W_d],
             device=device,
         )
-        incidence = row_incidence(np.repeat(rc.slot, 3, axis=0), self._rigid_bodies_d.shape[0])
+        incidence = row_incidence(np.repeat(slots, 3, axis=0), self._rigid_bodies_d.shape[0])
         self._rc_incidence = [wp.array(a, dtype=wp.int32, device=device) for a in incidence]
         self._rc_value_d = wp.empty(n, dtype=wp.float64, device=device)
         self._rc_r_d = wp.empty(n, dtype=wp.float64, device=device)
-        self._rc_pene0_d = wp.zeros(n, dtype=wp.float64, device=device)
         self._rc_lam_d = wp.zeros(n, dtype=wp.float64, device=device)
         self._rc_omega_d = wp.zeros(n, dtype=wp.float64, device=device)
 
@@ -784,23 +815,43 @@ class SolverFBA(SolverBase):
         ``-r + dt² W (omega λ)`` reproduce the live gap ``g`` for the forces
         that produced ``u``, while ``W`` and ``J`` stay at the pinned frame. The
         joint rows solved here get their forces written back to the joint forces.
+        Deformable rows also correct the particle positions.
         """
         from .joints import gather_values_kernel, scatter_values_kernel  # noqa: PLC0415
         from .rigid import rigid_row_residual_kernel  # noqa: PLC0415
         from .rigid_contact import rigid_contact_gap_kernel  # noqa: PLC0415
 
-        rc, device, n = self._rigid_contacts, self._device, self._rc_r_d.shape[0]
-        n_c, joint_rows = 3 * rc.count, self._rc_joint_rows_d
-        wp.launch(
-            rigid_contact_gap_kernel,
-            dim=rc.count,
-            inputs=[
-                *(rc.body, rc.anchor, rc.normal, self._body_slot_d, self._rigid_x_live_d, self._rigid_q_live_d),
-                *(self._rigid_x_prev_d, state_in.body_q, state_in.body_qd, self.model.body_com, wp.float64(dt), 0),
-            ],
-            outputs=[self._rc_value_d],
-            device=device,
-        )
+        rc, device, n = self._rigid_contacts, self._device, self._rc_n
+        (m_s, m_r), joint_rows = self._rc_counts, self._rc_joint_rows_d
+        n_s, n_c = 3 * m_s, 3 * m_s + 3 * m_r
+        live = [self._rigid_x_live_d, self._rigid_q_live_d]
+        if m_s:
+            from .rigid_contact import particle_contact_body_residual_kernel  # noqa: PLC0415
+
+            self._launch_contact_residual(self._rc_r_d)
+            wp.launch(
+                particle_contact_body_residual_kernel,
+                dim=(m_s, 3),
+                inputs=[
+                    *self._particle_contact_args()[:5],
+                    *(self._contact_world_anchor_d, self._contact_v_anchor_d, self.model.shape_body),
+                    *(self._body_slot_d, self.model.body_com, *live, self._rc_row_jac_d),
+                    *(self._rigid_u_d, self._rigid_u_free_d, wp.float64(dt)),
+                ],
+                outputs=[self._rc_r_d],
+                device=device,
+            )
+        if m_r:
+            wp.launch(
+                rigid_contact_gap_kernel,
+                dim=m_r,
+                inputs=[
+                    *(rc.body, rc.anchor, rc.normal, self._body_slot_d, *live, self._rigid_x_prev_d),
+                    *(state_in.body_q, state_in.body_qd, self.model.body_com, wp.float64(dt), n_s),
+                ],
+                outputs=[self._rc_value_d],
+                device=device,
+            )
         if n > n_c:
             wp.launch(
                 gather_values_kernel,
@@ -809,13 +860,17 @@ class SolverFBA(SolverBase):
                 outputs=[self._rc_value_d],
                 device=device,
             )
-        wp.launch(
-            rigid_row_residual_kernel,
-            dim=n,
-            inputs=[self._rc_value_d, self._rc_row_slot_d, self._rc_row_jac_d, self._rigid_u_d, self._rigid_u_free_d],
-            outputs=[self._rc_r_d],
-            device=device,
-        )
+        if n > n_s:
+            wp.launch(
+                rigid_row_residual_kernel,
+                dim=n - n_s,
+                inputs=[
+                    *(self._rc_value_d[n_s:], self._rc_row_slot_d[n_s:], self._rc_row_jac_d[n_s:]),
+                    *(self._rigid_u_d, self._rigid_u_free_d),
+                ],
+                outputs=[self._rc_r_d[n_s:]],
+                device=device,
+            )
         self._solve_nsn_coulomb_gpu(
             None,
             None,
@@ -826,15 +881,19 @@ class SolverFBA(SolverBase):
             W_device=self._rc_W_d,
             r_device=self._rc_r_d,
             pene0_device=self._rc_pene0_d,
-            mu_device=rc.mu,
+            mu_device=self._rc_mu_d,
             lam_init_device=self._rc_lam_d,
             omega_init_device=self._rc_omega_d,
             skip_download=True,
-            m_contacts=rc.count,
+            m_contacts=m_s + m_r,
             n_bilateral=n - n_c,
         )
         wp.copy(self._rc_lam_d, self._nsn_lam_d, count=n)
         wp.copy(self._rc_omega_d, self._nsn_omega_d, count=n)
+        if m_s:
+            self._linear_solver.apply_lambda_correction_combined(self._nsn_lam_apply_d, self._rhs, self._x_cur)
+            wp.copy(self._lam_coulomb_persistent_d, self._rc_lam_d, count=n_s)
+            wp.copy(self._omega_coulomb_persistent_d, self._rc_omega_d, count=n_s)
         if n > n_c:
             wp.launch(
                 scatter_values_kernel,
@@ -900,7 +959,7 @@ class SolverFBA(SolverBase):
                 device=self._device,
             )
             self._joint_system.update(self._joint_residual_d, self._joint_force_d)
-        force = None if self._rigid_contacts is None else self._solve_rigid_contacts(state_in, dt)
+        force = self._solve_rigid_contacts(state_in, dt) if self._rc_n else None
         if self._joint_rows is not None:
             self._joint_system.apply_force(self._joint_row_jac_d, self._joint_force_d, b, self._rigid_b_iter_d)
             b = self._rigid_b_iter_d
@@ -934,6 +993,17 @@ class SolverFBA(SolverBase):
             self._contact_offset_d,
             self._contact_tangent1_offset_shifted_d,
             self._contact_tangent2_offset_shifted_d,
+        ]
+
+    def _particle_contact_args(self) -> list:
+        """Shape, anchor and row directions of the deformable contacts, then the shape bodies."""
+        return [
+            self._contact_shape_d,
+            self._contact_body_pos_d,
+            self._contact_normal_d,
+            self._contact_tangent1_d,
+            self._contact_tangent2_d,
+            self.model.shape_body,
         ]
 
     def _launch_contact_residual(self, r: wp.array[wp.float64]) -> None:
@@ -1159,6 +1229,7 @@ class SolverFBA(SolverBase):
                 "x_pre": state_in.particle_q.numpy().astype(np.float64).copy(),
             }
 
+        self._two_way = False
         rigid = self.model.body_count > 0 and not self.integrate_with_external_rigid_solver
         rigid = rigid and self._begin_rigid_step(state_in, state_out, dt)
         if self.model.particle_count == 0:
@@ -1336,7 +1407,7 @@ class SolverFBA(SolverBase):
             if _diag_active:
                 self._diag_buffers[f"x_post_solve_k{_k}"] = self._x_cur.numpy().astype(np.float64).copy()
 
-            if has_contacts:
+            if has_contacts and not self._two_way:
                 # --- Schur-complement NSN contact correction ---
                 M = self._contact_count
                 ls = self._linear_solver

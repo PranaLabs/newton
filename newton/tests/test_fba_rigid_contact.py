@@ -414,5 +414,55 @@ class TestSolverFBAArticulationContacts(unittest.TestCase):
         self.assertAlmostEqual(normal / (weight * hx * np.cos(alpha) / x_contact), 1.0, delta=1e-4)
 
 
+class TestSolverFBATwoWayContacts(unittest.TestCase):
+    """A cloth patch over a free box: particle contacts push on both."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not wp.is_cuda_available():
+            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
+
+    def _run(self, gravity, cloth_z, v_cloth, box_density, particle_mass, steps, ground=False):
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(gravity=gravity)
+        if ground:
+            builder.add_ground_plane()
+        box = builder.add_body(xform=wp.transform((0.0, 0.0, 0.5), wp.quat_identity()))
+        builder.add_shape_box(box, cfg=newton.ModelBuilder.ShapeConfig(density=box_density))
+        grid = {"dim_x": 4, "dim_y": 4, "cell_x": 0.1, "cell_y": 0.1, "tri_ke": 1.0e3, "tri_ka": 1.0e3, "edge_ke": 1.0}
+        pos, vel = wp.vec3(-0.2, -0.2, cloth_z), wp.vec3(0.0, 0.0, v_cloth)
+        builder.add_cloth_grid(pos=pos, rot=wp.quat_identity(), vel=vel, mass=particle_mass, **grid)
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=10)
+        s0, s1 = model.state(), model.state()
+        contacts, momentum = model.contacts(), []
+        m_p, m_b = model.particle_mass.numpy(), model.body_mass.numpy()[0]
+        for _ in range(steps):
+            model.collide(s0, contacts)
+            solver.step(s0, s1, None, contacts, 0.005)
+            s0, s1 = s1, s0
+            momentum.append(m_p @ s0.particle_qd.numpy() + m_b * s0.body_qd.numpy()[0, :3])
+        return solver, s0, np.array(momentum), m_p.sum(), m_b
+
+    def test_collision_conserves_momentum(self):
+        """Without gravity a 0.5 kg cloth hits a 1 kg box at 1 m/s and both move on at 1/3 m/s."""
+        solver, state, momentum, m_cloth, m_box = self._run(0.0, 1.05, -1.0, 1.0, 0.02, 60)
+        self.assertTrue(solver._two_way)
+        # Each step rounds the float32 particle positions, by up to m_cloth ulp(1) / dt of momentum.
+        np.testing.assert_allclose(momentum[:20], np.tile([0.0, 0.0, -m_cloth], (20, 1)), atol=5e-5)
+        self.assertAlmostEqual(state.body_qd.numpy()[0, 2], -m_cloth / (m_cloth + m_box), delta=1e-3)
+
+    def test_box_carries_cloth_weight(self):
+        """A cloth resting on a box on the ground: the ground holds both weights."""
+        solver, state, _, m_cloth, m_box = self._run(-9.81, 1.005, 0.0, 100.0, 0.2, 200, ground=True)
+        m_s, m_r = solver._rc_counts
+        rows = slice(3 * m_s, 3 * (m_s + m_r), 3)
+        ground = solver._nsn_lam_apply_d.numpy()[rows].sum()
+        self.assertAlmostEqual(ground / ((m_box + m_cloth) * 9.81), 1.0, delta=1e-4)
+        np.testing.assert_allclose(state.body_q.numpy()[0], [0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 1.0], atol=1e-6)
+        np.testing.assert_allclose(state.particle_q.numpy()[:, 2], 1.0, atol=1e-5)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
