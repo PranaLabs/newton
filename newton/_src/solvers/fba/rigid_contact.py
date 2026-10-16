@@ -85,3 +85,81 @@ def gather_rigid_contacts(model: Model, contacts: Contacts, body_slot: np.ndarra
         normal=wp.array(normal[order], dtype=wp.vec3, device=device),
         mu=wp.array(mu, dtype=wp.float64, device=device),
     )
+
+
+@wp.func
+def _row_direction(n: wp.vec3d, k: int) -> wp.vec3d:
+    """Direction of row ``k`` of a contact: the normal, then two tangents."""
+    if k == 0:
+        return n
+    a = wp.vec3d(1.0, 0.0, 0.0)
+    if wp.abs(n[0]) > 0.5:
+        a = wp.vec3d(0.0, 1.0, 0.0)
+    t1 = wp.normalize(wp.cross(n, a))
+    if k == 1:
+        return t1
+    return wp.cross(n, t1)
+
+
+@wp.func
+def _side_anchor(
+    b: int,
+    r: wp.vec3d,
+    body_slot: wp.array[wp.int32],
+    slot_x: wp.array[wp.vec3d],
+    slot_q: wp.array[wp.quatd],
+    slot_x0: wp.array[wp.vec3d],
+    body_q0: wp.array[wp.transform],
+    body_qd0: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    dt: wp.float64,
+):
+    """World anchor at the step start, at the live pose, and its friction target.
+
+    A body the solver does not integrate keeps its pose; only its friction
+    target follows the body velocity, as for deformable contacts.
+    """
+    if b < 0:
+        return r, r, r
+    q0 = wp.normalize(wp.quatd(wp.transform_get_rotation(body_q0[b])))
+    s = body_slot[b]
+    if s >= 0:
+        a = slot_x[s] + wp.quat_rotate(slot_q[s], r)
+        return slot_x0[s] + wp.quat_rotate(q0, r), a, a
+    x0 = wp.vec3d(wp.transform_get_translation(body_q0[b])) + wp.quat_rotate(q0, wp.vec3d(body_com[b]))
+    a0 = x0 + wp.quat_rotate(q0, r)
+    v = wp.vec3d(wp.spatial_top(body_qd0[b])) + wp.cross(wp.vec3d(wp.spatial_bottom(body_qd0[b])), a0 - x0)
+    return a0, a0, a0 + dt * v
+
+
+@wp.kernel
+def rigid_contact_gap_kernel(
+    body: wp.array2d[wp.int32],
+    anchor: wp.array2d[wp.vec3],
+    normal: wp.array[wp.vec3],
+    body_slot: wp.array[wp.int32],
+    slot_x: wp.array[wp.vec3d],
+    slot_q: wp.array[wp.quatd],
+    slot_x0: wp.array[wp.vec3d],
+    body_q0: wp.array[wp.transform],
+    body_qd0: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    dt: wp.float64,
+    row_offset: int,
+    # outputs
+    gap: wp.array[wp.float64],
+):
+    """Row values at the live pose: the normal gap ``n · (a1 - a0)`` and the
+    tangential slip ``t · ((a1 - a1⁰) - (a0 - a0⁰))`` over the step [m]."""
+    c = wp.tid()
+    n = wp.vec3d(normal[c])
+    start0, live0, target0 = _side_anchor(
+        body[c, 0], wp.vec3d(anchor[c, 0]), body_slot, slot_x, slot_q, slot_x0, body_q0, body_qd0, body_com, dt
+    )
+    start1, live1, target1 = _side_anchor(
+        body[c, 1], wp.vec3d(anchor[c, 1]), body_slot, slot_x, slot_q, slot_x0, body_q0, body_qd0, body_com, dt
+    )
+    slip = (target1 - start1) - (target0 - start0)
+    gap[row_offset + 3 * c] = wp.dot(n, live1 - live0)
+    gap[row_offset + 3 * c + 1] = wp.dot(_row_direction(n, 1), slip)
+    gap[row_offset + 3 * c + 2] = wp.dot(_row_direction(n, 2), slip)

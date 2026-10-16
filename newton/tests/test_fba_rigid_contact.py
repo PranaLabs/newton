@@ -10,6 +10,8 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.fba import rigid_contact as RC
+from newton._src.solvers.fba.rigid import retract_rigid_kernel
 from newton._src.solvers.fba.rigid_contact import gather_rigid_contacts
 
 _FIELDS = ("shape0", "shape1", "point0", "point1", "offset0", "offset1", "normal")
@@ -79,6 +81,103 @@ class TestGatherRigidContacts(unittest.TestCase):
     def test_no_integrated_body(self):
         model, _, contacts = _box_scene(self.device)
         self.assertIsNone(gather_rigid_contacts(model, contacts, np.full(model.body_count, -1), self.device))
+
+
+class TestRigidContactRows(unittest.TestCase):
+    """Rows of a static-dynamic, a dynamic-dynamic and a dynamic-kinematic contact."""
+
+    def setUp(self):
+        scope = wp.ScopedDevice("cpu")
+        scope.__enter__()
+        self.addCleanup(scope.__exit__, None, None, None)
+        builder = newton.ModelBuilder()
+        poses = [
+            ((0.2, 0.1, 0.5), (0.3, -0.2, 0.4)),
+            ((0.3, -0.2, 1.4), (-0.6, 0.1, 0.9)),
+            ((1.5, 0.0, 0.5), (0.0, 0.0, 1.0)),
+        ]
+        for k, (p, rpy) in enumerate(poses):
+            builder.add_body(
+                xform=wp.transform(p, wp.quat_rpy(*rpy)),
+                com=wp.vec3(0.05, -0.02, 0.0),
+                mass=1.0,
+                inertia=wp.mat33(np.eye(3)),
+                lock_inertia=True,
+                is_kinematic=k == 2,
+            )
+        self.model = builder.finalize(device="cpu")
+        self.state = self.model.state()
+        self.v_kin = np.array([0.4, -0.3, 0.2, 0.5, 0.1, -0.7])
+        self.state.body_qd.assign([[0.0] * 6, [0.0] * 6, self.v_kin])
+        rng = np.random.default_rng(2)
+        normal = rng.standard_normal((3, 3))
+        self.rc = types.SimpleNamespace(
+            body=wp.array([[-1, 0], [0, 1], [1, 2]], dtype=wp.int32, device="cpu"),
+            anchor=wp.array(rng.uniform(-0.5, 0.5, (3, 2, 3)), dtype=wp.vec3, device="cpu"),
+            normal=wp.array(normal / np.linalg.norm(normal, axis=1, keepdims=True), dtype=wp.vec3, device="cpu"),
+        )
+        self.slot = wp.array([0, 1, -1], dtype=wp.int32, device="cpu")
+        tf = self.state.body_q.numpy().astype(np.float64)
+        self.q0 = tf[:, 3:] / np.linalg.norm(tf[:, 3:], axis=1, keepdims=True)
+        com = self.model.body_com.numpy()
+        self.x0 = tf[:, :3] + [wp.quat_rotate(wp.quatd(*q), wp.vec3d(*c)) for q, c in zip(self.q0, com, strict=True)]
+
+    def _world(self, body, r):
+        """World anchor of a side at the step start."""
+        if body < 0:
+            return np.asarray(r, dtype=np.float64)
+        return self.x0[body] + wp.quat_rotate(wp.quatd(*self.q0[body]), wp.vec3d(*r))
+
+    def _gap(self, u, dt):
+        x0, q0 = wp.array(self.x0[:2], dtype=wp.vec3d), wp.array(self.q0[:2], dtype=wp.quatd)
+        x, q = wp.empty(2, dtype=wp.vec3d), wp.empty(2, dtype=wp.quatd)
+        scratch = [wp.empty(2, dtype=wp.transform), wp.empty(2, dtype=wp.spatial_vector)]
+        wp.launch(
+            retract_rigid_kernel,
+            dim=2,
+            inputs=[
+                wp.array([0, 1], dtype=wp.int32),
+                wp.array(u, dtype=wp.float64),
+                q0,
+                x0,
+                self.state.body_q,
+                self.model.body_com,
+                wp.float64(1.0),
+            ],
+            outputs=[*scratch, x, q],
+            device="cpu",
+        )
+        gap, rc, state = wp.empty(9, dtype=wp.float64), self.rc, self.state
+        wp.launch(
+            RC.rigid_contact_gap_kernel,
+            dim=3,
+            inputs=[
+                *(rc.body, rc.anchor, rc.normal, self.slot, x, q, x0),
+                *(state.body_q, state.body_qd, self.model.body_com, wp.float64(dt), 0),
+            ],
+            outputs=[gap],
+            device="cpu",
+        )
+        return gap.numpy()
+
+    def _u0(self):
+        """DOFs of the step-start pose, with the pinned frame there."""
+        u0 = np.zeros(12)
+        for k in range(2):
+            u0[6 * k : 6 * k + 3] = wp.quat_rotate_inv(wp.quatd(*self.q0[k]), wp.vec3d(*self.x0[k]))
+        return u0
+
+    def test_gap_at_step_start(self):
+        """Gaps are n · (a1 - a0); only the kinematic side slips, by dt times its anchor velocity."""
+        dt = 0.01
+        gap = self._gap(self._u0(), dt).reshape(3, 3)
+        body, anchor, normal = self.rc.body.numpy(), self.rc.anchor.numpy(), self.rc.normal.numpy()
+        world = np.array([[self._world(b, r) for b, r in zip(body[c], anchor[c], strict=True)] for c in range(3)])
+        np.testing.assert_allclose(gap[:, 0], np.einsum("ij,ij->i", normal, world[:, 1] - world[:, 0]), atol=1e-6)
+        np.testing.assert_allclose(gap[:2, 1:], 0.0, atol=1e-12)
+        slip = dt * (self.v_kin[:3] + np.cross(self.v_kin[3:], world[2, 1] - self.x0[2]))
+        tangential = slip - np.dot(slip, normal[2]) * normal[2]
+        self.assertAlmostEqual(np.linalg.norm(gap[2, 1:]), np.linalg.norm(tangential), delta=1e-9)
 
 
 if __name__ == "__main__":
