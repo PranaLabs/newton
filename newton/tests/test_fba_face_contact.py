@@ -6,8 +6,9 @@ import unittest
 import numpy as np
 import warp as wp
 
+import newton
 from newton._src.geometry.types import GeoType
-from newton._src.solvers.fba.face_contact import face_contact_kernel
+from newton._src.solvers.fba.face_contact import FaceContactQuery, face_contact_kernel
 
 HALF = np.array([0.5, 0.5, 0.5])
 
@@ -71,6 +72,37 @@ class TestFaceContactKernel(unittest.TestCase):
         np.testing.assert_allclose(moved[1], depth, atol=1e-5)
         np.testing.assert_allclose(moved[2][0], wp.transform_point(X_bs, wp.vec3(*body_pos[0])), atol=1e-5)
         np.testing.assert_allclose(moved[3][0], wp.transform_vector(X_ws, wp.vec3(*normal[0])), atol=1e-5)
+
+
+class TestFaceContactQuery(unittest.TestCase):
+    """Triangles folded up from an edge that passes 1 cm inside a sphere of radius 2 cm."""
+
+    def _query(self, contact_particles, mirrored):
+        builder = newton.ModelBuilder()
+        center = np.array([0.0, 0.0, -0.01])
+        builder.add_shape_sphere(-1, xform=wp.transform(center, wp.quat_identity()), radius=0.02)
+        tent = np.array([[-0.05, 0.0, 0.04], [0.0, -0.05, 0.01], [0.0, 0.05, 0.01], [0.05, 0.0, 0.04]])
+        for p in np.concatenate([tent, tent[:3] * [1.0, 1.0, -1.0]]) + center:
+            builder.add_particle(wp.vec3(*p), wp.vec3(0.0), 0.01)
+        builder.add_triangle(0, 1, 2)
+        builder.add_triangle(*((4, 5, 6) if mirrored else (3, 2, 1)))
+        model = builder.finalize()
+        query = FaceContactQuery(model.tri_indices.numpy(), model.particle_count, model.device)
+        particles = np.array(contact_particles)
+        return query.query(model, model.particle_q, None, particles, np.zeros_like(particles))
+
+    def test_shared_edge_reports_one_contact(self):
+        """Both triangles find the optimum on their shared edge; one contact remains, on the sphere."""
+        face, _shape, bary, body_pos, normal = self._query([1], mirrored=False)
+        self.assertEqual(len(face), 1)
+        self.assertEqual(int(np.count_nonzero(bary[0] == 0.0)), 1)
+        self.assertAlmostEqual(float(np.linalg.norm(body_pos[0] - [0.0, 0.0, -0.01])), 0.02, delta=1e-6)
+        self.assertGreater(float(normal[0][2]), 0.95)
+
+    def test_candidates_come_from_particle_contacts(self):
+        """A triangle reaching into the sphere is tested only when one of its particles has a contact."""
+        self.assertEqual(self._query([1], mirrored=True)[0].tolist(), [0])
+        self.assertEqual(self._query([1, 5], mirrored=True)[0].tolist(), [0, 1])
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ RealSim's face query (``SDFCollisionDevice.cuh``), from the deepest vertex. Vert
 the particle contacts; unselected vertices keep exactly zero weight, which marks edge optima.
 """
 
+import numpy as np
 import warp as wp
 
 from ...geometry import kernels as sdf
@@ -120,3 +121,62 @@ def face_contact_kernel(
     depth[idx] = sd[0]
     body_pos[idx] = wp.transform_point(X_bs, x - sd[0] * n)
     normal[idx] = wp.transform_vector(X_ws, n)
+
+
+class FaceContactQuery:
+    """Face contacts of the triangles around a step's particle contacts.
+
+    A triangle is tested against a shape when one of its particles touches
+    the shape, so the particle contact margin also bounds this search.
+    """
+
+    def __init__(self, tri_indices: np.ndarray, particle_count: int, device):
+        self.tri = np.asarray(tri_indices, dtype=np.int32).reshape(-1, 3)
+        order = np.argsort(self.tri.ravel(), kind="stable")
+        self.offsets = np.searchsorted(self.tri.ravel()[order], np.arange(particle_count + 1))
+        self.incident = (order // 3).astype(np.int64)
+        self.tri_d = wp.array(self.tri, dtype=wp.int32, device=device)
+        self.no_bodies = wp.empty(1, dtype=wp.transform, device=device)
+        self.device = device
+
+    def query(self, model, particle_q, body_q, particle, shape, iterations: int = 32, depth_ratio: float = 0.02):
+        """Face contacts as ``(face, shape, bary, body_pos, normal)`` arrays, ordered by shape and triangle.
+
+        ``particle`` and ``shape`` list the particle contacts. When two
+        triangles report the same edge optimum, the deeper contact remains.
+        """
+        start, stop = self.offsets[particle], self.offsets[particle + 1]
+        counts, n_tri, device = stop - start, len(self.tri), self.device
+        faces = self.incident[np.repeat(start - np.cumsum(counts) + counts, counts) + np.arange(counts.sum())]
+        candidates = np.unique(np.repeat(np.asarray(shape, dtype=np.int64), counts) * n_tri + faces)
+        cand_shape, cand_face = np.divmod(candidates, n_tri)
+        count = wp.zeros(1, dtype=wp.int32, device=device)
+        out = [
+            wp.empty(len(candidates), dtype=t, device=device) for t in (wp.int32, wp.vec3, wp.float32, wp.vec3, wp.vec3)
+        ]
+        if len(candidates):
+            wp.launch(
+                face_contact_kernel,
+                dim=len(candidates),
+                inputs=[
+                    *(particle_q, self.tri_d),
+                    *(wp.array(a.astype(np.int32), dtype=wp.int32, device=device) for a in (cand_face, cand_shape)),
+                    self.no_bodies if body_q is None or not body_q.shape[0] else body_q,
+                    *(model.shape_transform, model.shape_body, model.shape_type, model.shape_scale),
+                    *(iterations, depth_ratio),
+                ],
+                outputs=[count, *out],
+                device=device,
+            )
+        m = int(count.numpy()[0])
+        pair, bary, depth, body_pos, normal = (a.numpy()[:m] for a in out)
+        face, shp = cand_face[pair], cand_shape[pair]
+        # An edge optimum keeps one zero weight: key it by its shape and sorted endpoints.
+        zero, rows = np.argmax(bary == 0.0, axis=1), np.arange(m)
+        ends = np.sort(np.stack([self.tri[face, (zero + 1) % 3], self.tri[face, (zero + 2) % 3]], axis=1), axis=1)
+        n = len(self.offsets)
+        key = np.where((bary == 0.0).any(axis=1), (shp * n + ends[:, 0]) * n + ends[:, 1], -1 - rows)
+        by_key = np.lexsort((depth, key))
+        deepest = by_key[np.diff(key[by_key], prepend=key[by_key][:1] - 1) != 0]
+        sel = deepest[np.argsort(pair[deepest])]
+        return face[sel], shp[sel], bary[sel], body_pos[sel], normal[sel]
