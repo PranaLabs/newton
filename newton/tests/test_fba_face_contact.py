@@ -286,13 +286,16 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
         return _box_sdf(faces - [0.0, 0.0, half[2]], np.asarray(half)).min()
 
     def test_box_edge_stays_out_of_the_faces(self):
-        """Draped over the top edge, the cloth keeps the edge out of its faces, not just off its particles."""
-        for face_contacts, bound in ((False, -5e-3), (True, -2.5e-3)):
-            x, speed, solver = self._run(face_contacts, (0.0, -0.3, 0.65), 12, 240)
+        """Draped over the top edge, the cloth keeps the edge out of its faces, not just off its particles.
+
+        A third of the cloth hangs over the edge. With half of it hanging, the cloth slid off the edge in a
+        third or more of starts moved by 10 um, and which ones changed with float32 rounding."""
+        for face_contacts, bound in ((False, -3e-3), (True, -1e-3)):
+            x, speed, solver = self._run(face_contacts, (-0.1, -0.3, 0.65), 12, 240)
             deepest = self._deepest(x, solver)
             if face_contacts:
                 self.assertGreater(deepest, bound)
-            else:  # particle contacts alone let the edge 5 mm or more into the faces
+            else:  # particle contacts alone let the edge 4 mm or more into the faces
                 self.assertLess(deepest, bound)
             self.assertLess(speed, 1.5)
 
