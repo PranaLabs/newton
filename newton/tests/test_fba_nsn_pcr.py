@@ -190,6 +190,24 @@ class TestPCRScaledAndSingular(_PCRTestCase):
         x, _, _ = self._solve(A, b)
         self.assertLess(np.linalg.norm(b - A @ x) / np.linalg.norm(b), 1.0e-8)
 
+    def test_sparse_scaled_diagonal_converges(self):
+        """The same system as a BSR matrix, as the lite NSN builds it: solve_sparse runs the iteration of solve."""
+        import warp.sparse as wps  # noqa: PLC0415
+
+        n = 120
+        rng = np.random.default_rng(7)
+        scale = np.sqrt(10.0 ** rng.uniform(-4.0, 3.0, n))
+        A = scale[:, None] * _make_spd(n, seed=7) * scale[None, :]
+        b = rng.standard_normal(n)
+        rows, cols = (wp.array(a, dtype=wp.int32, device=self.device) for a in np.nonzero(np.ones((n, n))))
+        values = wp.array(A.ravel(), dtype=wp.float64, device=self.device)
+        W = wps.bsr_from_triplets(n, n, rows, cols, values)
+        x = wp.zeros(n, dtype=wp.float64, device=self.device)
+        solver = NSNPCRSolver(max_n=n, device=self.device, tol=1.0e-10, max_iter=1000)
+        solver.solve_sparse(W, wp.array(b, dtype=wp.float64, device=self.device), x)
+        self.assertLess(np.linalg.norm(b - A @ x.numpy()) / np.linalg.norm(b), 1.0e-8)
+        np.testing.assert_allclose(x.numpy(), self._solve(A, b)[0], rtol=1.0e-6, atol=1.0e-12)
+
     def test_near_null_directions_are_refused(self):
         """Redundant rows with an inconsistent right-hand side: the iterate stays bounded."""
         n, k = 120, 80

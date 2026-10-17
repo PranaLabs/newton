@@ -631,102 +631,32 @@ class NSNPCRSolver:
             device=device,
         )
 
-        # ----- r = b ---------------------------------------------------
+        # ----- Symmetric PCR, as in :meth:`solve` -------------------------
+        # ``wps.bsr_mv`` checks that x.shape[0] == W.cols, so the scratch
+        # buffers (sized to max_n) are sliced to the active size ``n``.
+        self._block_precond = None
         wp.copy(self._r, b, count=n)
-
-        # ----- d = P * r -----------------------------------------------
-        wp.launch(
-            _apply_precond_kernel,
-            dim=n,
-            inputs=[self._r, self._precond],
-            outputs=[self._d],
-            device=device,
-        )
-
-        # ----- q = W * d -----------------------------------------------
-        # ``wps.bsr_mv`` strictly checks that x.shape[0] == W.cols, so slice
-        # the pre-allocated scratch down to the active size ``n`` (W is sized
-        # to n, scratch is sized to max_n).
-        d_v = self._d[:n]
-        q_v = self._q[:n]
-        s_v = self._s[:n]
-        h_v_ = self._h[:n]
-        wps.bsr_mv(W_bsr, d_v, q_v)
-
-        # ----- h = q ---------------------------------------------------
-        wp.copy(self._h, self._q, count=n)
-
-        # ----- rho = <r, h> --------------------------------------------
-        wp.utils.array_inner(self._r, self._h, out=self._rho_d, count=n)
-        rho = float(self._rho_d.numpy()[0])
-        tol_sq = self.tol * self.tol * rho
-
-        # ---- PCR main loop --------------------------------------------
-        # No CUDA-graph capture here: bsr_mv currently issues internal
-        # allocations on shape change that defeat capture. The eager loop is
-        # still fully async between syncs; ``check_every`` bounds the host
-        # round-trips per solve. If profiling shows the launch overhead
-        # dominates LiteNSN at scale, revisit and add capture support.
+        wp.launch(_apply_precond_kernel, dim=n, inputs=[self._r, self._precond], outputs=[self._s], device=device)
+        wp.copy(self._d, self._s, count=n)
+        wps.bsr_mv(W_bsr, self._d[:n], self._q[:n])
+        wp.utils.array_inner(self._s, self._q, out=self._rho_d, count=n)
+        self._stopped_d.zero_()
+        tol_sq = self.tol * self.tol * dot_b
+        r_norm_sq = dot_b
+        # No CUDA-graph capture here: bsr_mv issues internal allocations on
+        # shape change that defeat capture; ``check_every`` bounds the host
+        # round-trips per solve.
         nb_iter = 0
-        check_every = self.check_every
-        while nb_iter < max_iter and rho > tol_sq:
-            block_end = min(nb_iter + check_every, max_iter)
+        while nb_iter < max_iter and r_norm_sq > tol_sq:
+            block_end = min(nb_iter + self.check_every, max_iter)
             while nb_iter < block_end:
-                # ----- den = <q, q> ---------------------------------
-                wp.utils.array_inner(self._q, self._q, out=self._den_d, count=n)
-                wp.launch(
-                    _div_scalar_kernel, dim=1,
-                    inputs=[self._rho_d, self._den_d],
-                    outputs=[self._alpha_d], device=device,
-                )
-                # x += alpha * d
-                wp.launch(
-                    _axpy_arr_kernel, dim=n,
-                    inputs=[self._alpha_d, wp.float64(1.0), self._d],
-                    outputs=[self._x], device=device,
-                )
-                # r -= alpha * q
-                wp.launch(
-                    _axpy_arr_kernel, dim=n,
-                    inputs=[self._alpha_d, wp.float64(-1.0), self._q],
-                    outputs=[self._r], device=device,
-                )
-                # s = P * r
-                wp.launch(
-                    _apply_precond_kernel, dim=n,
-                    inputs=[self._r, self._precond],
-                    outputs=[self._s], device=device,
-                )
-                # h = W * s   (sparse matvec)
-                wps.bsr_mv(W_bsr, s_v, h_v_)
-                # rho_old = rho ; rho = <r, h>
-                wp.launch(
-                    _copy_scalar_kernel, dim=1,
-                    inputs=[self._rho_d],
-                    outputs=[self._rho_old_d], device=device,
-                )
-                wp.utils.array_inner(self._r, self._h, out=self._rho_d, count=n)
-                wp.launch(
-                    _div_scalar_kernel, dim=1,
-                    inputs=[self._rho_d, self._rho_old_d],
-                    outputs=[self._beta_d], device=device,
-                )
-                # d = beta*d + s
-                wp.launch(
-                    _scal_add_arr_kernel, dim=n,
-                    inputs=[self._beta_d, self._s],
-                    outputs=[self._d], device=device,
-                )
-                # q = beta*q + h
-                wp.launch(
-                    _scal_add_arr_kernel, dim=n,
-                    inputs=[self._beta_d, self._h],
-                    outputs=[self._q], device=device,
-                )
+                self._pcr_iter_eager(None, n, n, device, W_bsr=W_bsr, diag=diag_blocks)
                 nb_iter += 1
-
-            rho = float(self._rho_d.numpy()[0])
-
+            wp.utils.array_inner(self._r, self._r, out=self._r_norm_d, count=n)
+            r_norm_sq = float(self._r_norm_d.numpy()[0])
+            if self._stopped_d.numpy()[0] != 0.0:
+                break
+        rho = float(self._rho_d.numpy()[0])
         wp.copy(x_out, self._x, count=n)
         return (nb_iter, rho)
 
@@ -736,15 +666,19 @@ class NSNPCRSolver:
 
     def _pcr_iter_eager(
         self,
-        A: wp.array2d[wp.float64],
+        A: wp.array2d[wp.float64] | None,
         n: int,
         n_pad: int,
         device: wp.Device | str,
+        W_bsr=None,
+        diag: wp.array[wp.float64] | None = None,
     ) -> None:
         """Issue one symmetric PCR iteration of :meth:`solve` on the active stream.
 
         Mirrors RealSim ``IterativePCR.h``. All launches are stream-ordered
-        and safe to call inside a CUDA graph capture.
+        and safe to call inside a CUDA graph capture. With ``W_bsr`` and its
+        ``diag``, the iteration of :meth:`solve_sparse` multiplies by the
+        sparse matrix instead of ``A``.
         """
         # t = P q, den = qᵀ P q.
         wp.launch(_apply_precond_kernel, dim=n, inputs=[self._q, self._precond], outputs=[self._h], device=device)
@@ -752,7 +686,10 @@ class NSNPCRSolver:
             self._block_precond(self._q, self._h)
         wp.utils.array_inner(self._q, self._h, out=self._den_d, count=n)
         # Chart curvature of p: pᵀ A p against pᵀ diag(A) p.
-        wp.launch(_diag_scale_kernel, dim=n, inputs=[A, self._d], outputs=[self._dd], device=device)
+        if W_bsr is None:
+            wp.launch(_diag_scale_kernel, dim=n, inputs=[A, self._d], outputs=[self._dd], device=device)
+        else:
+            wp.launch(_apply_precond_kernel, dim=n, inputs=[self._d, diag], outputs=[self._dd], device=device)
         wp.utils.array_inner(self._d, self._q, out=self._curvature_d, count=n)
         wp.utils.array_inner(self._d, self._dd, out=self._chart_norm_d, count=n)
         wp.launch(
@@ -772,14 +709,19 @@ class NSNPCRSolver:
                 device=device,
             )
         # t = A z, rho = zᵀ A z, beta = rho / rho_old.
-        wp.launch_tiled(
-            _matvec_tiled_kernel,
-            dim=n,
-            inputs=[A, self._s, n_pad],
-            outputs=[self._h],
-            block_dim=_PCR_BLOCK_DIM,
-            device=device,
-        )
+        if W_bsr is None:
+            wp.launch_tiled(
+                _matvec_tiled_kernel,
+                dim=n,
+                inputs=[A, self._s, n_pad],
+                outputs=[self._h],
+                block_dim=_PCR_BLOCK_DIM,
+                device=device,
+            )
+        else:
+            import warp.sparse as wps  # noqa: PLC0415
+
+            wps.bsr_mv(W_bsr, self._s[:n], self._h[:n])
         wp.launch(_copy_scalar_kernel, dim=1, inputs=[self._rho_d], outputs=[self._rho_old_d], device=device)
         wp.utils.array_inner(self._s, self._h, out=self._rho_d, count=n)
         wp.launch(
