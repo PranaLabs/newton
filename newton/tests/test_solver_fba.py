@@ -667,8 +667,8 @@ class SolverFBABendingCurvedRestTests(unittest.TestCase):
         """
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=0.0)
-        builder.add_cloth_grid(
+        grid = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        grid.add_cloth_grid(
             pos=wp.vec3(0.0, 0.0, 0.0),
             rot=wp.quat_identity(),
             vel=wp.vec3(0.0, 0.0, 0.0),
@@ -677,6 +677,21 @@ class SolverFBABendingCurvedRestTests(unittest.TestCase):
             cell_x=0.5,
             cell_y=0.5,
             mass=1.0,
+        )
+        # Curve the rest: lift the centre vertex out of the plane, so the rest
+        # angles make ``‖q·x_rest‖ > 0`` on every interior edge. The (2, 2)
+        # grid has 9 particles; the centre vertex is at index 4.
+        vertices = np.array(grid.particle_q)
+        vertices[4, 2] += 0.2
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=0.0)
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=[wp.vec3(v) for v in vertices],
+            indices=np.array(grid.tri_indices).reshape(-1),
+            density=1.0,
             tri_ke=1.0e2,
             tri_ka=1.0e2,
             tri_kd=0.0,
@@ -684,14 +699,6 @@ class SolverFBABendingCurvedRestTests(unittest.TestCase):
             edge_kd=0.0,
         )
         model = builder.finalize(device="cpu")
-
-        # Curve the rest: lift the centre vertex out of the plane before the
-        # solver captures ``particle_q`` as the bending reference.  This makes
-        # ``‖q·x_rest‖ > 0`` on every interior edge.
-        q_np = model.particle_q.numpy().copy()
-        # The (2, 2) grid has 9 particles; the centre vertex is at index 4.
-        q_np[4, 2] += 0.2
-        model.particle_q = wp.array(q_np, dtype=wp.vec3, device=model.device)
 
         # Pin all four corners so the strip is anchored but the interior
         # vertices stay free.
@@ -718,6 +725,48 @@ class SolverFBABendingCurvedRestTests(unittest.TestCase):
         # but together with the unit tests above this guards the integration.
         self.assertGreater(pos_final[4, 2], 0.1, "centre vertex collapsed below rest curvature")
         self.assertLess(pos_final[4, 2], 0.3, "centre vertex blew up past rest curvature")
+
+    def test_rest_angle_sets_the_rest_curvature(self) -> None:
+        """A free hinge folded 60 deg keeps its fold at its rest angle, and unfolds once the rest angle
+        is zeroed, as a model of a cloth folded in its rest pose does to make it rest flat."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        def angle_after(zero_rest: bool, steps: int) -> float:
+            h, fold = np.sqrt(3.0) / 2.0, np.radians(60.0)
+            builder = newton.ModelBuilder(gravity=0.0)
+            builder.add_cloth_mesh(
+                pos=wp.vec3(0.0),
+                rot=wp.quat_identity(),
+                scale=1.0,
+                vel=wp.vec3(0.0),
+                vertices=[
+                    wp.vec3(0.0, 0.0, 0.0),
+                    wp.vec3(1.0, 0.0, 0.0),
+                    wp.vec3(0.5, h, 0.0),
+                    wp.vec3(0.5, -h * np.cos(fold), -h * np.sin(fold)),
+                ],
+                indices=[0, 1, 2, 1, 0, 3],
+                density=1.0,
+                tri_ke=1.0e3,
+                tri_ka=1.0e3,
+                edge_ke=1.0,
+            )
+            model = builder.finalize()
+            if zero_rest:
+                model.edge_rest_angle.zero_()
+            solver = SolverFBA(model, iterations=10)
+            s0, s1 = model.state(), model.state()
+            for _ in range(steps):
+                solver.step(s0, s1, None, None, 1.0 / 60.0)
+                s0, s1 = s1, s0
+            x = s0.particle_q.numpy()
+            n0 = np.cross(x[1] - x[0], x[2] - x[0])
+            n1 = np.cross(x[3] - x[0], x[1] - x[0])
+            return float(np.degrees(np.arccos(np.dot(n0, n1) / np.linalg.norm(n0) / np.linalg.norm(n1))))
+
+        self.assertAlmostEqual(angle_after(False, 0), 60.0, places=4)
+        self.assertAlmostEqual(angle_after(False, 60), 60.0, delta=0.01)
+        self.assertLess(angle_after(True, 10), 15.0)
 
 
 class TestPublicAPI(unittest.TestCase):

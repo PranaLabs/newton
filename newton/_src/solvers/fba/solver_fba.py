@@ -1256,17 +1256,21 @@ class SolverFBA(SolverBase):
                 dtype=wp.float32,
                 device=device,
             )
-            # Rest curvature magnitude per edge: ``‖q·x_rest‖``. The local
-            # projection pulls ``q·x_cur`` back to this magnitude (not all the
-            # way to a flat configuration), matching RealSim
-            # ``PDIsometricBendingEnergy::computeRestBendingEnergy`` which
-            # caches ``_norm[i]`` at init. Computed here from the cotangent
-            # stencil and rest positions so the meta dict stays geometry-only.
+            # Rest curvature magnitude per edge: ``‖q·x‖`` of the hinge at its
+            # rest angle ``model.edge_rest_angle``. The local projection pulls
+            # ``q·x_cur`` back to this magnitude (not all the way to a flat
+            # configuration), like RealSim's
+            # ``PDIsometricBendingEnergy::computeRestBendingEnergy``. ``q·x``
+            # vanishes on a flat hinge, and folding it by ``θ`` about the shared
+            # edge moves the opposite vertex v3 by ``2 h3 sin(θ / 2)``, with h3
+            # its distance from the edge.
+            ei = self.model.edge_indices.numpy()
+            rest_angle = self.model.edge_rest_angle.numpy()[(ei[:, 0] >= 0) & (ei[:, 1] >= 0)].astype(np.float64)
             x_rest = self.model.particle_q.numpy().astype(np.float64)
-            q = meta["edge_quad_q"]
-            stencil_rest = x_rest[meta["edge_indices"]]  # (E, 4, 3)
-            qTx_rest = (q[:, :, None] * stencil_rest).sum(axis=1)  # (E, 3)
-            edge_norm = np.linalg.norm(qTx_rest, axis=1)  # (E,)
+            v0, v1, v3 = (x_rest[meta["edge_indices"][:, k]] for k in (0, 1, 3))
+            e_len = np.maximum(np.linalg.norm(v1 - v0, axis=1), 1.0e-20)
+            h3 = np.linalg.norm(np.cross(v1 - v0, v3 - v0), axis=1) / e_len
+            edge_norm = np.abs(meta["edge_quad_q"][:, 3]) * 2.0 * h3 * np.abs(np.sin(0.5 * rest_angle))
             self._edge_norm_d = wp.array(
                 edge_norm.astype(np.float32),
                 dtype=wp.float32,
