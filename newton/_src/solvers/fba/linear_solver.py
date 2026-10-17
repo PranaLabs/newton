@@ -1087,7 +1087,6 @@ class FBALinearSolver:
             ``(3M, 3M)`` (Stage B) when ``download=True``; otherwise ``None``.
         """
         from .kernels import (  # noqa: PLC0415
-            compose_W_from_wi_kernel,
             compute_wi_tiled_kernel,
             densify_S_iso_scaled_kernel,
             pack_jacobian_3axis_kernel,
@@ -1236,7 +1235,6 @@ class FBALinearSolver:
                 total_rows,
                 compute_wi_tiled_kernel,
                 densify_S_iso_scaled_kernel,
-                compose_W_from_wi_kernel,
                 download=download,
             )
 
@@ -1333,7 +1331,6 @@ class FBALinearSolver:
         total_rows: int,
         compute_wi_tiled_kernel,
         densify_S_iso_scaled_kernel,
-        compose_W_from_wi_kernel,
         download: bool = True,
     ) -> np.ndarray | None:
         """Isodof-restricted Schur build.
@@ -1493,32 +1490,8 @@ class FBALinearSolver:
             device=dev,
         )
 
-        # --- Compose W[c', c] = alpha[c']*alpha[c] * dot(dir[c'], dir[c]) * Wi[r', r] ---
-        # The (total_rows x total_rows) W is written densely; one thread per
-        # (c', c) pair. ``isodof_rank[N]`` provides the rank lookup per particle.
-        wp.launch(
-            compose_W_from_wi_kernel,
-            dim=(total_rows, total_rows),
-            inputs=[
-                row_particle_d,
-                row_dir_d,
-                row_alpha_d,
-                self._isodof_rank_d,
-                Wi_v,
-            ],
-            outputs=[self._W_device_d],
-            device=dev,
-        )
-        if self._row_slots is not None:
-            from .kernels import add_slot_terms_W_kernel  # noqa: PLC0415
-
-            wp.launch(
-                add_slot_terms_W_kernel,
-                dim=(total_rows, total_rows),
-                inputs=[*self._row_slots[:2], row_dir_d, self._isodof_rank_d, Wi_v],
-                outputs=[self._W_device_d],
-                device=dev,
-            )
+        self._Wi_v = Wi_v
+        self._compose_schur()
 
         # Single host pull for the (total_rows x total_rows) W matrix.
         # Skipped when callers (e.g. the GPU NSN driver) consume ``W`` via
@@ -1528,6 +1501,38 @@ class FBALinearSolver:
             return None
         W = self._W_device_d.numpy()[:total_rows, :total_rows].copy()
         return W
+
+    def _compose_schur(self) -> None:
+        """Compose ``W`` from ``Wi`` and the row particles, directions and coefficients."""
+        from .kernels import add_slot_terms_W_kernel, compose_W_from_wi_kernel  # noqa: PLC0415
+
+        n = self._row_total
+        # W[c', c] = alpha[c'] * alpha[c] * dot(dir[c'], dir[c]) * Wi[r', r], written densely; one thread per
+        # (c', c) pair. ``isodof_rank[N]`` provides the rank lookup per particle.
+        wp.launch(
+            compose_W_from_wi_kernel,
+            dim=(n, n),
+            inputs=[self._row_particle_d, self._row_dir_d, self._row_alpha_d, self._isodof_rank_d, self._Wi_v],
+            outputs=[self._W_device_d],
+            device=self.device,
+        )
+        if self._row_slots is not None:
+            wp.launch(
+                add_slot_terms_W_kernel,
+                dim=(n, n),
+                inputs=[*self._row_slots[:2], self._row_dir_d, self._isodof_rank_d, self._Wi_v],
+                outputs=[self._W_device_d],
+                device=self.device,
+            )
+
+    def update_row_directions(self, directions: wp.array, offset: int) -> None:
+        """Set the directions of the rows from ``offset`` on and recompose ``W``.
+
+        Reuses the ``A⁻¹`` entries of the last isodof :meth:`build_schur_complement`, so new directions cost
+        one composition of ``W`` instead of a build. The lambda correction uses them too.
+        """
+        wp.copy(self._row_dir_d, directions, dest_offset=offset, count=directions.shape[0])
+        self._compose_schur()
 
     def setup_lite_mass(self, inv_mass_d: wp.array, dt: float) -> None:
         """Cache the LiteNSN mass matrix ``M_inv_dt2 = diag(dt² · inv_mass) ⊗ I₃``.

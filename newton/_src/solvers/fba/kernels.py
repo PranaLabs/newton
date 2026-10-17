@@ -3530,6 +3530,23 @@ def particle_constraint_residual_kernel(
     pene0[row_offset + b] = target[b]
 
 
+@wp.kernel
+def particle_constraint_direction_kernel(
+    particles: wp.array2d[wp.int32],  # (B, K), -1 when unused
+    coefficients: wp.array2d[wp.float32],  # (B, K)
+    x: wp.array[wp.vec3],
+    direction: wp.array[wp.vec3],  # out
+):
+    """Direction of ``sum_k c_k x[p_k]`` of bilateral particle rows that hold a length."""
+    b = wp.tid()
+    v = wp.vec3(0.0)
+    for k in range(particles.shape[1]):
+        p = particles[b, k]
+        if p >= 0:
+            v += coefficients[b, k] * x[p]
+    direction[b] = wp.normalize(v)
+
+
 # ---------------------------------------------------------------------------
 # NSN inner LCP — Fischer-Burmeister rows + Schur build (Option C, fp64).
 #

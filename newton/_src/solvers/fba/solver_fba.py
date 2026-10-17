@@ -471,6 +471,7 @@ class SolverFBA(SolverBase):
         self.soft_contact_thickness = float(soft_contact_thickness)
         self._face_query, self._contact_extra = None, None
         self._constraint_rows = None  # set_particle_constraints: particles, coefficients, directions, targets
+        self._constraint_lengths = False  # the rows hold |sum_k c_k x_k|, along its direction at each iteration
         if self.face_contacts:
             if not self.friction or nsn_schur_mode != "full" or not self.use_isodof or mu_per_pair_override is not None:
                 raise ValueError(
@@ -1552,7 +1553,19 @@ class SolverFBA(SolverBase):
                         _t_schur_0 = time.perf_counter()
 
                     use_lite_block_diag = self.nsn_schur_mode == "lite"
+                    from . import kernels as K_step  # noqa: PLC0415
 
+                    if n_b and self._constraint_lengths:
+                        # Length rows act along the current direction of their combination.
+                        wp.launch(
+                            K_step.particle_constraint_direction_kernel,
+                            dim=n_b,
+                            inputs=[*self._constraint_rows[:2], self._x_cur],
+                            outputs=[self._constraint_rows[2]],
+                            device=device,
+                        )
+                        if self._cached_W is not None and self._cached_A_inv_Jt_valid:
+                            ls.update_row_directions(self._constraint_rows[2], 3 * M)
                     if self._cached_W is None or not self._cached_A_inv_Jt_valid:
                         # ``download=False``: the GPU NSN driver consumes ``W``
                         # via :meth:`FBALinearSolver.W_device_view`, so the
@@ -1592,7 +1605,6 @@ class SolverFBA(SolverBase):
                     # device-resident. The PD outer iter now does ZERO
                     # host<->device transfers around the NSN call.
                     self._ensure_nsn_inner_buffers(3 * M + n_b, alloc_2d=not use_lite_block_diag)
-                    from . import kernels as K_step  # noqa: PLC0415
 
                     self._launch_contact_residual(self._nsn_r_d)
                     self._launch_contact_pene0(self._nsn_pene0_d)
@@ -2136,20 +2148,22 @@ class SolverFBA(SolverBase):
         else:
             self._x_ref.assign(np.asarray(target_positions, dtype=np.float32))
 
-    def set_particle_constraints(self, particles, coefficients, directions, targets) -> None:
-        """Hold linear combinations of particle positions in the following steps.
+    def set_particle_constraints(self, particles, coefficients, targets, directions=None) -> None:
+        """Hold lengths or linear combinations of particle positions in the following steps.
 
-        Row ``r`` requires ``sum_k coefficients[r, k] * dot(directions[r], x[particles[r, k]]) == targets[r]``.
-        The rows are bilateral and solved with the contacts in each NSN step, so
-        their multipliers carry the forces that hold them; the direction stays
-        fixed within a step. Unused slots have particle ``-1``; slot 0 must be
-        used. ``None`` removes the rows.
+        Row ``r`` combines ``v_r = sum_k coefficients[r, k] * x[particles[r, k]]``. Without ``directions``
+        it holds the length ``|v_r| == targets[r]``; with them, ``dot(directions[r], v_r) == targets[r]``.
+        The rows are bilateral and solved with the contacts in each NSN step, so their multipliers carry
+        the forces that hold them. A length row acts along the direction of ``v_r`` at every iteration, so
+        at tension ``T`` it keeps the transverse stiffness ``T / |v_r|`` of a taut segment; a direction
+        fixed for the step drops it, and a body that chained rows compress beyond its buckling load then
+        flutters. Unused slots have particle ``-1``; slot 0 must be used. ``None`` removes the rows.
 
         Args:
             particles: Particle indices, shape ``(R, K)``.
             coefficients: Their coefficients, shape ``(R, K)``.
-            directions: Row directions, shape ``(R, 3)``.
             targets: Row values [m], shape ``(R,)``.
+            directions: Row directions, shape ``(R, 3)``, or ``None`` for length rows.
         """
         self._invalidate_schur_cache()
         if particles is None or len(particles) == 0:
@@ -2159,6 +2173,9 @@ class SolverFBA(SolverBase):
             raise ValueError("particle constraints need friction=True, nsn_schur_mode='full' and use_isodof=True")
         if self.model.body_count > 0 and not self.integrate_with_external_rigid_solver:
             raise NotImplementedError("particle constraints are not solved with rigid bodies yet")
+        self._constraint_lengths = directions is None
+        if directions is None:
+            directions = np.zeros((len(targets), 3))
         arrays = [(particles, np.int32, wp.int32), (coefficients, np.float32, wp.float32)]
         arrays += [(directions, np.float32, wp.vec3), (targets, np.float64, wp.float64)]
         self._constraint_rows = [wp.array(np.asarray(a, dtype=n), dtype=t, device=self._device) for a, n, t in arrays]

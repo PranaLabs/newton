@@ -93,13 +93,13 @@ class Example:
         self.viewer.set_camera(pos=wp.vec3(0.07, -0.28, 0.2), pitch=-12.0, yaw=104.0)
 
     def simulate(self):
-        # Ramp the cables like RealSim's controller: a sudden pull swings the chained segments slowly.
+        # Ramp the cables like RealSim's cable controller.
         ratio = cable_ratio(self.sim_time)
         rows = []
         for cable in self.cables:
             cable.length = ratio * cable.rest_length
-            rows.append(cable.rows(self.state_0.particle_q))
-        self.solver.set_particle_constraints(*(np.concatenate([r[k] for r in rows]) for k in range(4)))
+            rows.append(cable.rows())
+        self.solver.set_particle_constraints(*(np.concatenate([r[k] for r in rows]) for k in range(3)))
         self.state_0.clear_forces()
         self.viewer.apply_forces(self.state_0)
         self.pipeline.collide(self.state_0, self.contacts)

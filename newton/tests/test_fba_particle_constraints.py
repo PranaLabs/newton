@@ -59,12 +59,12 @@ class TestParticleConstraints(unittest.TestCase):
         rows = (
             [CORNERS, [24, 0, -1, -1]],
             [[0.25] * 4, [1.0, -1.0, 0.0, 0.0]],
-            [[0.0, 0.0, 1.0], diagonal],
             [x0[CORNERS, 2].mean(), np.linalg.norm(x0[24] - x0[0])],
+            [[0.0, 0.0, 1.0], diagonal],
         )
         held = self._run(model, rows)
         self.assertAlmostEqual(float(held[CORNERS, 2].mean()), 1.0, delta=1e-5)
-        self.assertAlmostEqual(float(np.dot(diagonal, held[24] - held[0])), float(rows[3][1]), delta=1e-5)
+        self.assertAlmostEqual(float(np.dot(diagonal, held[24] - held[0])), float(rows[2][1]), delta=1e-5)
         self.assertLess(float(held[12, 2]), 0.98)  # the middle sags onto the sphere top at 0.97
         self.assertGreater(float(held[12, 2]), 0.968)
         self.assertLess(float(self._run(model)[CORNERS, 2].mean()), 0.95)
@@ -72,7 +72,7 @@ class TestParticleConstraints(unittest.TestCase):
     def test_needs_the_full_coulomb_mode(self):
         solver = newton.solvers.SolverFBA(self._model(), friction=False)
         with self.assertRaises(ValueError):
-            solver.set_particle_constraints([[0]], [[1.0]], [[0.0, 0.0, 1.0]], [1.0])
+            solver.set_particle_constraints([[0]], [[1.0]], [1.0])
 
 
 if __name__ == "__main__":

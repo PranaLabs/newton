@@ -11,11 +11,10 @@ class Cable:
 
     The cable is a list of segments: segment ``s`` joins ``points[2 * s]`` and ``points[2 * s + 1]``, each
     embedded at the rest pose in the tetrahedron that contains it. :meth:`rows` turns every segment into
-    one row for :meth:`SolverFBA.set_particle_constraints` along the segment's current direction, whose
-    value is the segment's share of :attr:`length` in proportion to the rest lengths. The rows are hard and
-    their multipliers are the segment tensions. :attr:`length` is clamped to ``[min_ratio, 1]`` times the
-    rest length, so the cable pulls but does not push. Concatenate the rows of several cables to drive
-    them together.
+    one length row for :meth:`SolverFBA.set_particle_constraints`, whose value is the segment's share of
+    :attr:`length` in proportion to the rest lengths. The rows are hard and their multipliers are the
+    segment tensions. :attr:`length` is clamped to ``[min_ratio, 1]`` times the rest length, so the cable
+    pulls but does not push. Concatenate the rows of several cables to drive them together.
 
     Args:
         model: The model whose tetrahedra hold the cable.
@@ -48,13 +47,9 @@ class Cable:
         self.length = self.rest_length
         """Commanded cable length [m]."""
 
-    def rows(self, particle_q):
-        """Rows ``(particles, coefficients, directions, targets)`` of the segments at the positions ``particle_q``."""
-        x = np.asarray(particle_q.numpy() if hasattr(particle_q, "numpy") else particle_q, dtype=np.float64)
-        p = np.einsum("pk,pkd->pd", self.weights, x[self.particles])
-        direction = p[1::2] - p[0::2]
-        direction /= np.linalg.norm(direction, axis=1, keepdims=True)
+    def rows(self):
+        """Length rows ``(particles, coefficients, targets)`` of the segments."""
         length = np.clip(self.length, self.min_ratio * self.rest_length, self.rest_length)
         particles = np.hstack([self.particles[0::2], self.particles[1::2]])
         coefficients = np.hstack([-self.weights[0::2], self.weights[1::2]])
-        return particles, coefficients, direction, length * self.share
+        return particles, coefficients, length * self.share
