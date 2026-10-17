@@ -10,6 +10,14 @@ import newton
 from newton._src.solvers.fba.self_contact import SelfContact, particle_rings
 
 
+def _closest_on_triangle(p, a, b, c):
+    """Closest point of a triangle to ``p`` by dense sampling of barycentric coordinates [m]."""
+    u, v = np.mgrid[0.0:1.0:201j, 0.0:1.0:201j]
+    keep = u + v <= 1.0
+    points = np.outer(1.0 - u[keep] - v[keep], a) + np.outer(u[keep], b) + np.outer(v[keep], c)
+    return points[np.argmin(np.linalg.norm(points - p, axis=1))]
+
+
 class TestSelfContactDetection(unittest.TestCase):
     """Two sheets of 2 cm cells, the second 1 cm over the first and shifted 3 mm along x and y."""
 
@@ -27,6 +35,23 @@ class TestSelfContactDetection(unittest.TestCase):
                 mass=0.01,
             )
         return builder.finalize()
+
+    def test_vertex_face_takes_the_nearest_triangle(self):
+        """Each particle has one contact, with its nearest triangle of the other sheet, along the direction from
+        the closest point to the particle."""
+        model = self._sheets()
+        q, tris = model.particle_q.numpy(), model.tri_indices.numpy()
+        particles, alpha, normal = SelfContact(model, "vertex_face", 0.015).detect(model.particle_q)
+        np.testing.assert_array_equal(particles[:, 0], np.arange(model.particle_count))
+        half = model.particle_count // 2
+        for k in range(0, len(particles), 17):
+            v = particles[k, 0]
+            other = tris[(tris >= half).all(axis=1) if v < half else (tris < half).all(axis=1)]
+            closest = [_closest_on_triangle(q[v], *q[t]) for t in other]
+            nearest = closest[np.argmin([np.linalg.norm(q[v] - c) for c in closest])]
+            point = -(alpha[k, 1:] @ q[particles[k, 1:]])
+            np.testing.assert_allclose(point, nearest, atol=2e-4)
+            np.testing.assert_allclose(normal[k], (q[v] - point) / np.linalg.norm(q[v] - point), atol=1e-5)
 
     def test_vertex_vertex_pairs_once(self):
         """Every pair of particles within the margin is one contact; a sheet's own particles lie 2 cm apart, so
