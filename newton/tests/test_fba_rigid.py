@@ -187,6 +187,7 @@ class TestFBARigidRows(unittest.TestCase):
             inputs=[
                 wp.array(W_soft, dtype=wp.float64, device=device),
                 n_soft,
+                n,
                 row_slot_d,
                 row_jac_d,
                 wp.array(inv_mass, dtype=wp.spatial_matrixd, device=device),

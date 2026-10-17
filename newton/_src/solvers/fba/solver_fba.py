@@ -813,7 +813,7 @@ class SolverFBA(SolverBase):
         Deformable contact rows lead when one of them touches an integrated body.
         """
         from .joints import select_rows_kernel  # noqa: PLC0415
-        from .rigid import rigid_delassus_kernel, row_incidence  # noqa: PLC0415
+        from .rigid import row_incidence  # noqa: PLC0415
         from .rigid_contact import gather_rigid_contacts, rigid_contact_jacobian_kernel  # noqa: PLC0415
 
         model, device = self.model, self._device
@@ -840,13 +840,15 @@ class SolverFBA(SolverBase):
             blocks = self._slot_block[slots[slots >= 0]]
             joint_rows = np.flatnonzero(np.isin(self._joint_row_block, blocks[blocks >= 0])).astype(np.int32)
         self._rc_joint_rows_d = wp.array(joint_rows, dtype=wp.int32, device=device)
+        # Particle constraint rows follow the joint rows when the deformable rows join this solve.
+        n_b = self._rc_n_b = 0 if self._constraint_rows is None or not m_s else self._constraint_rows[0].shape[0]
         n_s, n_c = 3 * m_s, 3 * m_r
-        n = self._rc_n = n_s + n_c + joint_rows.size
-        self._rc_row_slot_d = wp.empty((n, 2), dtype=wp.int32, device=device)
-        self._rc_row_jac_d = wp.empty((n, 2), dtype=wp.spatial_vectord, device=device)
+        n = self._rc_n = n_s + n_c + joint_rows.size + n_b
+        self._rc_row_slot_d = wp.full((n, 2), -1, dtype=wp.int32, device=device)
+        self._rc_row_jac_d = wp.zeros((n, 2), dtype=wp.spatial_vectord, device=device)
+        self._rc_lam_soft_d = wp.empty(n_s + n_b, dtype=wp.float64, device=device) if n_b else None
         self._rc_pene0_d = wp.zeros(n, dtype=wp.float64, device=device)
         self._rc_mu_d = wp.empty(m_s + m_r, dtype=wp.float64, device=device)
-        W_soft = wp.empty((0, 0), dtype=wp.float64, device=device)
         if m_s:
             from .rigid_contact import particle_contact_body_jacobian_kernel  # noqa: PLC0415
 
@@ -859,10 +861,14 @@ class SolverFBA(SolverBase):
             )
             ls = self._linear_solver
             ls.build_schur_complement(
-                m_s, *self._contact_row_args(), use_isodof=self.use_isodof, download=False, **self._contact_extra_args()
+                m_s,
+                *self._contact_row_args(),
+                use_isodof=self.use_isodof,
+                download=False,
+                **self._contact_extra_args(),
+                **(self._constraint_args() if n_b else {}),
             )
             self._cached_W, self._cached_A_inv_Jt_valid = True, True
-            W_soft = ls.W_device_view()
             self._launch_contact_pene0(self._rc_pene0_d)
             wp.copy(self._rc_mu_d, self._contact_mu_d, count=m_s)
         if m_r:
@@ -883,25 +889,40 @@ class SolverFBA(SolverBase):
                 device=device,
             )
         self._rc_W_d = wp.empty((n, n), dtype=wp.float64, device=device)
-        wp.launch(
-            rigid_delassus_kernel,
-            dim=(n, n),
-            inputs=[
-                W_soft,
-                n_s,
-                self._rc_row_slot_d,
-                self._rc_row_jac_d,
-                self._slot_inv_mass_d,
-            ],
-            outputs=[self._rc_W_d],
-            device=device,
-        )
+        self._compose_rigid_delassus()
         incidence = row_incidence(np.repeat(slots, 3, axis=0), self._rigid_bodies_d.shape[0])
         self._rc_incidence = [wp.array(a, dtype=wp.int32, device=device) for a in incidence]
         self._rc_value_d = wp.empty(n, dtype=wp.float64, device=device)
         self._rc_r_d = wp.empty(n, dtype=wp.float64, device=device)
         self._rc_lam_d = wp.zeros(n, dtype=wp.float64, device=device)
         self._rc_omega_d = wp.zeros(n, dtype=wp.float64, device=device)
+
+    def _compose_rigid_delassus(self) -> None:
+        """Compose the two-way ``W`` from the deformable block and the body slots of the rows."""
+        from .rigid import rigid_delassus_kernel  # noqa: PLC0415
+
+        n, n_s, device = self._rc_n, 3 * self._rc_counts[0], self._device
+        W_soft = self._linear_solver.W_device_view() if n_s else wp.empty((0, 0), dtype=wp.float64, device=device)
+        wp.launch(
+            rigid_delassus_kernel,
+            dim=(n, n),
+            inputs=[W_soft, n_s, n - self._rc_n_b, self._rc_row_slot_d, self._rc_row_jac_d, self._slot_inv_mass_d],
+            outputs=[self._rc_W_d],
+            device=device,
+        )
+
+    def _point_length_rows(self, x: wp.array) -> None:
+        """Point the length rows of :meth:`set_particle_constraints` along their combination at ``x``."""
+        from .kernels import particle_constraint_direction_kernel  # noqa: PLC0415
+
+        particles, coefficients, directions, _ = self._constraint_rows
+        wp.launch(
+            particle_constraint_direction_kernel,
+            dim=directions.shape[0],
+            inputs=[particles, coefficients, x],
+            outputs=[directions],
+            device=self._device,
+        )
 
     def _solve_rigid_contacts(self, state_in: State, dt: float) -> wp.array[wp.float64]:
         """Solve the NSN of the rigid contact rows from their live residual; returns the row forces [N].
@@ -913,12 +934,17 @@ class SolverFBA(SolverBase):
         Deformable rows also correct the particle positions.
         """
         from .joints import gather_values_kernel, scatter_values_kernel  # noqa: PLC0415
+        from .kernels import particle_constraint_residual_kernel  # noqa: PLC0415
         from .rigid import rigid_row_residual_kernel  # noqa: PLC0415
         from .rigid_contact import rigid_contact_gap_kernel  # noqa: PLC0415
 
         rc, device, n = self._rigid_contacts, self._device, self._rc_n
-        (m_s, m_r), joint_rows = self._rc_counts, self._rc_joint_rows_d
-        n_s, n_c = 3 * m_s, 3 * m_s + 3 * m_r
+        (m_s, m_r), joint_rows, n_b = self._rc_counts, self._rc_joint_rows_d, self._rc_n_b
+        n_s, n_c, n_j = 3 * m_s, 3 * m_s + 3 * m_r, joint_rows.shape[0]
+        if n_b and self._constraint_lengths:
+            self._point_length_rows(self._x_cur)
+            self._linear_solver.update_row_directions(self._constraint_rows[2], n_s)
+            self._compose_rigid_delassus()
         live = [self._rigid_x_live_d, self._rigid_q_live_d]
         if m_s:
             from .rigid_contact import particle_contact_body_residual_kernel  # noqa: PLC0415
@@ -947,23 +973,31 @@ class SolverFBA(SolverBase):
                 outputs=[self._rc_value_d],
                 device=device,
             )
-        if n > n_c:
+        if n_j:
             wp.launch(
                 gather_values_kernel,
-                dim=n - n_c,
+                dim=n_j,
                 inputs=[self._joint_residual_d, joint_rows, n_c],
                 outputs=[self._rc_value_d],
                 device=device,
             )
-        if n > n_s:
+        if n - n_b > n_s:
             wp.launch(
                 rigid_row_residual_kernel,
-                dim=n - n_s,
+                dim=n - n_b - n_s,
                 inputs=[
                     *(self._rc_value_d[n_s:], self._rc_row_slot_d[n_s:], self._rc_row_jac_d[n_s:]),
                     *(self._rigid_u_d, self._rigid_u_free_d),
                 ],
                 outputs=[self._rc_r_d[n_s:]],
+                device=device,
+            )
+        if n_b:
+            wp.launch(
+                particle_constraint_residual_kernel,
+                dim=n_b,
+                inputs=[*self._constraint_rows, self._x_cur, wp.int32(n - n_b)],
+                outputs=[self._rc_r_d, self._rc_pene0_d],
                 device=device,
             )
         self._solve_nsn_coulomb_gpu(
@@ -983,19 +1017,25 @@ class SolverFBA(SolverBase):
             m_contacts=m_s + m_r,
             n_bilateral=n - n_c,
             # The joint rows' block of A_schur is their W: Cholesky-factored per articulation.
-            block_precond=functools.partial(self._joint_system.solve_rows, joint_rows, n_c) if n > n_c else None,
+            block_precond=functools.partial(self._joint_system.solve_rows, joint_rows, n_c) if n_j else None,
             contact_regularization=self.contact_regularization,
         )
         wp.copy(self._rc_lam_d, self._nsn_lam_d, count=n)
         wp.copy(self._rc_omega_d, self._nsn_omega_d, count=n)
         if m_s:
-            self._linear_solver.apply_lambda_correction_combined(self._nsn_lam_apply_d, self._rhs, self._x_cur)
+            # W_soft orders the deformable rows as the contact rows, then the particle constraint rows.
+            lam_soft = self._nsn_lam_apply_d
+            if n_b:
+                lam_soft = self._rc_lam_soft_d
+                wp.copy(lam_soft, self._nsn_lam_apply_d, count=n_s)
+                wp.copy(lam_soft, self._nsn_lam_apply_d, dest_offset=n_s, src_offset=n - n_b, count=n_b)
+            self._linear_solver.apply_lambda_correction_combined(lam_soft, self._rhs, self._x_cur)
             wp.copy(self._lam_coulomb_persistent_d, self._rc_lam_d, count=n_s)
             wp.copy(self._omega_coulomb_persistent_d, self._rc_omega_d, count=n_s)
-        if n > n_c:
+        if n_j:
             wp.launch(
                 scatter_values_kernel,
-                dim=n - n_c,
+                dim=n_j,
                 inputs=[self._nsn_lam_apply_d, n_c, joint_rows],
                 outputs=[self._joint_force_d],
                 device=device,
@@ -1557,13 +1597,7 @@ class SolverFBA(SolverBase):
 
                     if n_b and self._constraint_lengths:
                         # Length rows act along the current direction of their combination.
-                        wp.launch(
-                            K_step.particle_constraint_direction_kernel,
-                            dim=n_b,
-                            inputs=[*self._constraint_rows[:2], self._x_cur],
-                            outputs=[self._constraint_rows[2]],
-                            device=device,
-                        )
+                        self._point_length_rows(self._x_cur)
                         if self._cached_W is not None and self._cached_A_inv_Jt_valid:
                             ls.update_row_directions(self._constraint_rows[2], 3 * M)
                     if self._cached_W is None or not self._cached_A_inv_Jt_valid:
@@ -2171,8 +2205,6 @@ class SolverFBA(SolverBase):
             return
         if not self.friction or self.nsn_schur_mode != "full" or not self.use_isodof:
             raise ValueError("particle constraints need friction=True, nsn_schur_mode='full' and use_isodof=True")
-        if self.model.body_count > 0 and not self.integrate_with_external_rigid_solver:
-            raise NotImplementedError("particle constraints are not solved with rigid bodies yet")
         self._constraint_lengths = directions is None
         if directions is None:
             directions = np.zeros((len(targets), 3))
