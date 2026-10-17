@@ -5597,8 +5597,8 @@ def cast_fp64_to_fp32_kernel(
 # Step 5.5 — update_contacts per-contact bookkeeping ported to GPU.
 #
 # CPU implementation pulled six per-contact buffers to host every step and
-# ran a Python ``for`` loop to evaluate the body transform, sphere/cylinder
-# cushion, and (Stage B) the tangent basis / kinematic anchor velocity.
+# ran a Python ``for`` loop to evaluate the body transform, the normal
+# offset, and (Stage B) the tangent basis / kinematic anchor velocity.
 # These kernels move that loop on-device; only the lexsort (intentional S.1
 # for determinism) and the singleton ``soft_contact_count`` read still hit
 # the host. See :meth:`newton._src.solvers.fba.solver_fba.SolverFBA.update_contacts`.
@@ -5650,39 +5650,17 @@ def compute_world_anchor_kernel(
 def compute_normal_offset_kernel(
     normal: wp.array[wp.vec3],  # (M,) world-frame unit normal per contact
     world_anchor: wp.array[wp.vec3],  # (M,) world-frame contact anchor
-    shape_idx: wp.array[wp.int32],  # (M,)
-    shape_type: wp.array[wp.int32],  # (n_shapes,)
-    has_shape_type: wp.int32,
-    sphere_geo_type: wp.int32,  # GeoType.SPHERE value
-    cylinder_geo_type: wp.int32,  # GeoType.CYLINDER value
     offset: wp.array[wp.float64],  # (M,) OUTPUT
 ):
-    """Compute ``offset[c] = n·world_anchor`` plus sphere/cylinder cushion.
-
-    Matches the CPU loop in
-    :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA.update_contacts`:
-    apply the 0.01 m RealSim interpenetration cushion to sphere and
-    cylinder normal rows (``SphereCollision.cpp:121``,
-    ``CylinderCollision.cpp:84``); plane and mesh contacts have no cushion.
+    """Compute ``offset[c] = n·world_anchor``: the contact plane through the closest shape point.
 
     Args:
         normal: Per-contact unit normal, shape ``[M]``.
         world_anchor: Per-contact world-frame anchor, shape ``[M]``.
-        shape_idx: Per-contact shape index, shape ``[M]``.
-        shape_type: Geometry type per shape, shape ``[n_shapes]``.
-        has_shape_type: ``1`` when ``shape_type`` is populated.
-        sphere_geo_type: Integer value of :class:`~newton.geometry.GeoType.SPHERE`.
-        cylinder_geo_type: Integer value of :class:`~newton.geometry.GeoType.CYLINDER`.
-        offset: Output ``n·anchor`` (with cushion if applicable), shape ``[M]``.
+        offset: Output ``n·anchor``, shape ``[M]``.
     """
     c = wp.tid()
-    val = wp.float64(wp.dot(normal[c], world_anchor[c]))
-    s = shape_idx[c]
-    if has_shape_type == 1 and s >= 0:
-        st = shape_type[s]
-        if st == sphere_geo_type or st == cylinder_geo_type:
-            val = val - wp.float64(0.01)
-    offset[c] = val
+    offset[c] = wp.float64(wp.dot(normal[c], world_anchor[c]))
 
 
 @wp.kernel

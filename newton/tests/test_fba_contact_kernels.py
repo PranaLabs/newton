@@ -121,97 +121,21 @@ class TestComputeWorldAnchorKernel(unittest.TestCase):
 
 
 class TestComputeNormalOffsetKernel(unittest.TestCase):
-    """Verify normal offset + sphere/cylinder cushion."""
+    """Verify the normal offset ``n·anchor``."""
 
     @classmethod
     def setUpClass(cls):
         wp.init()
 
-    def test_normal_offset_sphere_cylinder_cushion(self):
-        # 4 contacts: shape types plane (1), sphere (3), cylinder (6), mesh
-        # (15 ≠ sphere or cylinder). Only sphere and cylinder receive
-        # the -0.01 cushion.
-        normals_np = np.array(
-            [
-                [0.0, 0.0, 1.0],
-                [0.0, 1.0, 0.0],
-                [1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=np.float32,
-        )
-        anchors_np = np.array(
-            [
-                [0.0, 0.0, 0.5],
-                [0.0, 2.0, 0.0],
-                [1.5, 0.0, 0.0],
-                [0.0, 0.0, 0.25],
-            ],
-            dtype=np.float32,
-        )
-        shape_idx_np = np.array([0, 1, 2, 3], dtype=np.int32)
-        shape_type_np = np.array(
-            [
-                int(GeoType.PLANE),
-                int(GeoType.SPHERE),
-                int(GeoType.CYLINDER),
-                15,  # arbitrary non-sphere/cylinder type
-            ],
-            dtype=np.int32,
-        )
-
-        M = 4
-        normals = wp.array(normals_np, dtype=wp.vec3)
-        anchors = wp.array(anchors_np, dtype=wp.vec3)
-        shape_idx = wp.array(shape_idx_np, dtype=wp.int32)
-        shape_type = wp.array(shape_type_np, dtype=wp.int32)
-        offset = wp.zeros(M, dtype=wp.float64)
-
+    def test_normal_offset(self):
+        # Plane, sphere, cylinder and mesh contacts all take the plane through their anchor.
+        normals = wp.array(np.array([[0, 0, 1], [0, 1, 0], [1, 0, 0], [0, 0, 1]], dtype=np.float32), dtype=wp.vec3)
+        anchors = np.array([[0.0, 0.0, 0.5], [0.0, 2.0, 0.0], [1.5, 0.0, 0.0], [0.0, 0.0, 0.25]], dtype=np.float32)
+        offset = wp.zeros(4, dtype=wp.float64)
         wp.launch(
-            K.compute_normal_offset_kernel,
-            dim=M,
-            inputs=[
-                normals,
-                anchors,
-                shape_idx,
-                shape_type,
-                wp.int32(1),
-                wp.int32(int(GeoType.SPHERE)),
-                wp.int32(int(GeoType.CYLINDER)),
-            ],
-            outputs=[offset],
+            K.compute_normal_offset_kernel, dim=4, inputs=[normals, wp.array(anchors, dtype=wp.vec3)], outputs=[offset]
         )
-
-        got = offset.numpy()
-        # Plane: dot(n, anchor) = 0.5; no cushion → 0.5
-        # Sphere: dot = 2.0 -0.01 → 1.99
-        # Cylinder: dot = 1.5 -0.01 → 1.49
-        # Mesh: dot = 0.25 (no cushion)
-        np.testing.assert_allclose(got, np.array([0.5, 1.99, 1.49, 0.25]), atol=1e-7)
-
-    def test_normal_offset_sentinel_shape_idx(self):
-        # shape_idx = -1 → no cushion regardless of shape_type.
-        normals = wp.array(np.array([[0.0, 0.0, 1.0]], dtype=np.float32), dtype=wp.vec3)
-        anchors = wp.array(np.array([[0.0, 0.0, 0.3]], dtype=np.float32), dtype=wp.vec3)
-        shape_idx = wp.array(np.array([-1], dtype=np.int32), dtype=wp.int32)
-        shape_type = wp.array(np.array([int(GeoType.SPHERE)], dtype=np.int32), dtype=wp.int32)
-        offset = wp.zeros(1, dtype=wp.float64)
-
-        wp.launch(
-            K.compute_normal_offset_kernel,
-            dim=1,
-            inputs=[
-                normals,
-                anchors,
-                shape_idx,
-                shape_type,
-                wp.int32(1),
-                wp.int32(int(GeoType.SPHERE)),
-                wp.int32(int(GeoType.CYLINDER)),
-            ],
-            outputs=[offset],
-        )
-        self.assertAlmostEqual(float(offset.numpy()[0]), 0.3, delta=1e-7)
+        np.testing.assert_allclose(offset.numpy(), [0.5, 2.0, 1.5, 0.25], atol=1e-7)
 
 
 class TestComputeTangentBasisKernel(unittest.TestCase):
@@ -545,8 +469,7 @@ class TestUpdateContactsIntegration(unittest.TestCase):
         # The plane is static so world_anchor = body_pos.
         np.testing.assert_allclose(world_anchor_d.astype(np.float64), bpos_sorted, atol=1e-5)
 
-        # offset_ref = dot(n, anchor); apply cushion if sphere or cylinder.
-        # In this model the only shape is a plane → no cushion.
+        # offset_ref = dot(n, anchor).
         offset_ref = np.einsum("ij,ij->i", normal_sorted, bpos_sorted)
         np.testing.assert_allclose(offset_d, offset_ref, atol=1e-6)
         # Normals must round-trip through device storage with full fidelity.

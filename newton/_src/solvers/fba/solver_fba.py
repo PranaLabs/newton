@@ -13,7 +13,6 @@ from typing import Literal
 import numpy as np
 import warp as wp
 
-from ...geometry.types import GeoType
 from ...sim import BodyFlags, Contacts, Control, Model, State
 from ..solver import SolverBase
 from .cable import Cable
@@ -2379,11 +2378,6 @@ class SolverFBA(SolverBase):
         if shape_body_arr is None or shape_body_arr.size == 0:
             shape_body_arr = wp.empty(1, dtype=wp.int32, device=device)
 
-        shape_type_arr = model.shape_type if hasattr(model, "shape_type") and model.shape_type is not None else None
-        has_shape_type = wp.int32(1 if shape_type_arr is not None and shape_type_arr.size > 0 else 0)
-        if shape_type_arr is None or shape_type_arr.size == 0:
-            shape_type_arr = wp.empty(1, dtype=wp.int32, device=device)
-
         shape_transform_arr = (
             model.shape_transform if hasattr(model, "shape_transform") and model.shape_transform is not None else None
         )
@@ -2410,19 +2404,11 @@ class SolverFBA(SolverBase):
             device=device,
         )
 
-        # Kernel 2: normal offset with sphere/cylinder cushion.
+        # Kernel 2: normal offset n·anchor.
         wp.launch(
             compute_normal_offset_kernel,
             dim=M,
-            inputs=[
-                self._contact_normal_d,
-                self._contact_world_anchor_d,
-                self._contact_shape_d,
-                shape_type_arr,
-                has_shape_type,
-                wp.int32(int(GeoType.SPHERE)),
-                wp.int32(int(GeoType.CYLINDER)),
-            ],
+            inputs=[self._contact_normal_d, self._contact_world_anchor_d],
             outputs=[self._contact_offset_d],
             device=device,
         )

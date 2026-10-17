@@ -3006,15 +3006,11 @@ class TestPhase4StageAContact(unittest.TestCase):
             err_msg="Isodof W diverges from dense-path W",
         )
 
-    def test_contact_offset_cushion_per_shape_type(self):
-        """Sphere/cylinder normal offsets get a 0.01 m cushion; plane/mesh do not.
+    def test_contact_offset_per_shape_type(self):
+        """Sphere, plane and cylinder contacts all take the plane through their anchor, ``n·anchor``.
 
-        Ports RealSim ``SphereCollision.cpp:121`` / ``CylinderCollision.cpp:84``,
-        which shift the contact anchor inward by ``0.01 * normal`` when
-        building the normal-row ``pene0``.  Because ``|n| = 1``, this is
-        equivalent to subtracting ``0.01`` from ``dot(n, world_anchor)``.
-        ``PlaneCollision.cpp`` has no such shift, so plane contacts must keep
-        the unshifted offset.
+        The anchor is the closest shape point, so every contact stops on the
+        shape surface; ``soft_contact_thickness`` moves them all outward alike.
         """
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
         # One free particle (needed so the solver has at least one DOF).
@@ -3079,30 +3075,10 @@ class TestPhase4StageAContact(unittest.TestCase):
         sorted_shapes = sorted([sphere_shape, plane_shape, cylinder_shape])
         slot_of = {s: sorted_shapes.index(s) for s in (sphere_shape, plane_shape, cylinder_shape)}
 
-        # ``soft_contact_body_pos`` is stored float32, so the dot product
-        # round-trip through host has ~1e-7 precision.  Tolerance is well
-        # below the 0.01 cushion magnitude so a missing/incorrect cushion is
-        # detected unambiguously.
-        atol = 1e-6
+        # ``soft_contact_body_pos`` is stored float32: the dot product round-trips with ~1e-7 precision.
         base = float(np.dot(np.asarray(normal, dtype=np.float64), np.asarray(anchor, dtype=np.float64)))
-        self.assertAlmostEqual(
-            float(offsets[slot_of[sphere_shape]]),
-            base - 0.01,
-            delta=atol,
-            msg="Sphere normal offset must include the -0.01 m cushion",
-        )
-        self.assertAlmostEqual(
-            float(offsets[slot_of[plane_shape]]),
-            base,
-            delta=atol,
-            msg="Plane normal offset must NOT include any cushion",
-        )
-        self.assertAlmostEqual(
-            float(offsets[slot_of[cylinder_shape]]),
-            base - 0.01,
-            delta=atol,
-            msg="Cylinder normal offset must include the -0.01 m cushion",
-        )
+        for shape in (sphere_shape, plane_shape, cylinder_shape):
+            self.assertAlmostEqual(float(offsets[slot_of[shape]]), base, delta=1e-6)
 
 
 class TestPhase4StageBFriction(unittest.TestCase):
