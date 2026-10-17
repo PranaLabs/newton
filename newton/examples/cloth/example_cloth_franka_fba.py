@@ -7,8 +7,10 @@
 # Same coupled robot-cloth simulation as ``example_cloth_franka.py`` but with
 # ``SolverFBA(nsn_schur_mode="lite")`` standing in for ``SolverVBD``.
 #
-# Vertex-triangle self-contact (``particle_contact_mode='vt'``) keeps the
-# folded layers of the shirt apart.
+# The contacts carry the 0.8 cm particle radius as a contact thickness, so
+# the shirt rests on the table like SolverVBD's. The rigid fingers slide over
+# the flat shirt instead of pinching it: SolverVBD's penalty contacts let the
+# fingertips sink into the cloth, which the hard contacts here do not.
 #
 # Command: python -m newton.examples cloth_franka_fba
 #
@@ -93,6 +95,7 @@ class Example:
         self.viz_scale = 0.01  # cm → m for the viewer
 
         # Body-cloth contact margin (cm).
+        self.cloth_particle_radius = 0.8
         self.cloth_body_contact_margin = 0.8
 
         # Robot-side contact materials (cm scale, copied from VBD reference;
@@ -169,7 +172,7 @@ class Example:
                 tri_kd=self.tri_kd,
                 edge_ke=self.bending_ke,
                 edge_kd=self.bending_kd,
-                particle_radius=0.8,
+                particle_radius=self.cloth_particle_radius,
             )
             self.scene.color()
 
@@ -241,14 +244,11 @@ class Example:
 
         # Cloth solver: SolverFBA with the lite NSN, whose per-particle kernel
         # handles several contacts per particle from the gripper fingers and
-        # the table. Vertex-triangle self-contact keeps the folded layers apart.
+        # the table.
         self.cloth_solver: SolverFBA | None = None
         if self.add_cloth:
-            # Particle radius is in cm (the cloth was built at cm scale with
-            # particle_radius=0.8 above); margin ~half-particle keeps the
-            # broadphase from over-counting at rest.  Friction for cloth-vs-
-            # robot is taken from ``shape_material_mu`` (set to
-            # ``robot_contact_mu`` above) — no per-pair override needed.
+            # Friction for cloth-vs-robot is taken from ``shape_material_mu``
+            # (set to ``robot_contact_mu`` above), no per-pair override needed.
             self.cloth_solver = SolverFBA(
                 self.model,
                 iterations=self.pd_iterations,
@@ -259,31 +259,17 @@ class Example:
                 nsn_schur_mode="lite",
                 # The robot is stepped by Featherstone before the cloth.
                 integrate_with_external_rigid_solver=True,
-                # ``lambda_cap`` clamps the per-step impulse magnitude per
-                # contact row; without this the dense cloth-on-table contact
-                # set produces lambda values that occasionally diverge through
-                # the Schur preconditioner, NaN-ing the simulation by frame
-                # ~250.  1.0 N·s is well above any physical impulse on a 0.5
-                # kg cloth at gravity, and gates only the numerical outliers.
-                lambda_cap=1.0,
-                # Self-contact, tuned for the cm-scale T-shirt: per-vertex hit cap=4 + ``rest_exclusion=1.0
-                # cm`` (5x the contact radius) prevents the broadphase from
-                # latching on adjacent panels at rest, which would otherwise
-                # produce O(10⁵) contacts on the first folding moment and
-                # overflow the LCP buffers.
-                particle_contact_radius=0.2,  # cm
-                particle_contact_margin=0.05,  # cm — tight, only catches imminent contact
-                particle_contact_friction=0.25,
-                particle_contact_topology_ring=2,
-                particle_contact_rest_exclusion_radius=1.0,  # cm
-                particle_contact_mode="vt",
-                # e-e disabled for this scene: with this T-shirt mesh, e-e
-                # broadphase fires O(10⁴) pairs as soon as the cloth begins
-                # to fold (frames 10-15), saturating the NSN-PCR solver and
-                # producing NaN.  v-t alone provides cloth-cloth separation
-                # adequate for the Franka pick-place trajectory.
-                particle_contact_ee=False,
-                particle_contact_max_hits_per_vertex=4,
+                # The cloth particles' radius, as SolverVBD's contacts use it: the
+                # shirt rests 0.8 cm over the table.
+                soft_contact_thickness=self.cloth_particle_radius,
+                # Cloth squeezed between the closing rigid fingers or between them
+                # and the table has no solution; this force limit per contact row,
+                # 200 N in this cm-kg-s scene, bounds it. A particle resting on the
+                # table needs 0.14 N, a landing one 18 N.
+                lambda_cap=2.0e4,
+                # Cloth self-contact is off: on the flattened shirt, the lite
+                # self-contact solve of thousands of two-way vertex-triangle pairs
+                # moves particles by up to 18 cm in one pass.
             )
 
         self.viewer.set_model(self.model)
@@ -496,7 +482,6 @@ class Example:
                 )
 
             self.state_0, self.state_1 = self.state_1, self.state_0
-            self.sim_time += self.sim_dt
 
     def render(self):
         if self.viewer is None:
