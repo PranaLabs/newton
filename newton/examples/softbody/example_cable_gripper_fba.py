@@ -4,11 +4,12 @@
 ###########################################################################
 # Example Cable Gripper FBA
 #
-# Two soft fingers hang from a fixed palm on either side of a rod. A cable
-# runs down the inner side of each finger, embedded in its tetrahedra;
-# pulling it shorter curls the finger around the rod, and releasing it
-# lets the finger straighten, as in SOFA SoftRobots' cable-driven fingers.
-# SolverFBA solves the cable rows with the contacts on the rod.
+# Two soft fingers hang from a palm on either side of a box on the ground.
+# A cable runs down the inner side of each finger, embedded in its
+# tetrahedra; pulling it shorter curls the fingers onto the box, the palm
+# lifts the box and sets it down, and the released fingers open, as in
+# SOFA SoftRobots' cable-driven grippers. SolverFBA integrates the box as a
+# rigid body and solves the cable rows with the contacts on it.
 #
 # Command: uv run -m newton.examples cable_gripper_fba
 ###########################################################################
@@ -21,16 +22,19 @@ import newton.examples
 from newton.solvers import SolverFBA
 
 CELL = 0.005  # [m], fingers of 4 x 4 x 20 cells
-TOP = 0.2  # palm height [m]
-ROD = (0.115, 0.02, 0.04)  # axis height, radius, half length along y [m]
+BOTTOM = 0.003  # finger tips over the ground [m]
+BOX = 0.02  # half extent of the box [m]
+GAP = 0.008  # between the box and each finger [m]
+LIFT = 0.05  # [m]
 CONTACT_THICKNESS = 0.002
 
 
-def cable_ratio(t):
-    """Commanded cable length over the rest length: pull for 1.5 s, hold 1 s, release for 1.5 s, rest 0.5 s."""
-    t = t % 4.5
-    pull = min(t / 1.5, 1.0, max(0.0, (4.0 - t) / 1.5))
-    return 1.0 - 0.18 * pull
+def schedule(t):
+    """Cable length over the rest length and palm lift [m] in a 7.5 s cycle: close, lift, hold, lower, open."""
+    t = t % 7.5
+    close = min(t / 1.5, 1.0, max(0.0, 7.0 - t))
+    lift = min(max(t - 2.0, 0.0) / 1.5, 1.0, max(0.0, (6.0 - t) / 1.5))
+    return 1.0 - 0.15 * close, LIFT * lift
 
 
 class Example:
@@ -45,32 +49,33 @@ class Example:
         mu = young / (2.0 * (1.0 + poisson))
         lam = young * poisson / ((1.0 + poisson) * (1.0 - 2.0 * poisson))
         builder = newton.ModelBuilder()
-        builder.add_ground_plane()
-        cfg = newton.ModelBuilder.ShapeConfig(mu=0.5)
-        along_y = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.5 * np.pi)
-        rod = wp.transform((0.0, 0.0, ROD[0]), along_y)
-        builder.add_shape_capsule(-1, xform=rod, radius=ROD[1], half_height=ROD[2], cfg=cfg)
+        builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
+        # A 64 g box; silicone grips with a friction coefficient near 1.
+        self.box = builder.add_body(xform=wp.transform((0.0, 0.0, BOX), wp.quat_identity()))
+        cfg = newton.ModelBuilder.ShapeConfig(mu=1.0, density=1000.0)
+        builder.add_shape_box(self.box, hx=BOX, hy=BOX, hz=BOX, cfg=cfg)
         for side in (-1.0, 1.0):
-            inner = side * (ROD[1] + 0.01)
+            inner = side * (BOX + GAP)
             builder.add_soft_grid(
-                wp.vec3(min(inner, inner + side * 4 * CELL), -2 * CELL, TOP - 20 * CELL),
+                wp.vec3(min(inner, inner + side * 4 * CELL), -2 * CELL, BOTTOM),
                 wp.quat_identity(),
                 wp.vec3(0.0),
                 *(4, 4, 20, CELL, CELL, CELL, 1100.0, mu, lam, 0.0),
                 particle_radius=0.002,
             )
         self.model = builder.finalize()
-        # The palm holds the top faces.
-        x = self.model.particle_q.numpy()
-        mass = np.where(np.isclose(x[:, 2], TOP), 0.0, self.model.particle_mass.numpy())
+        # The palm holds the top faces and moves them through set_pin_targets.
+        self.x0 = self.model.particle_q.numpy()
+        self.palm = np.isclose(self.x0[:, 2], BOTTOM + 20 * CELL)
+        mass = np.where(self.palm, 0.0, self.model.particle_mass.numpy())
         self.model.particle_mass.assign(mass)
         self.model.particle_inv_mass.assign(np.divide(1.0, mass, out=np.zeros_like(mass), where=mass > 0))
 
         # Each cable: nine 1 cm segments 3 mm inside the inner face.
-        z = np.arange(TOP - 0.005, TOP - 20 * CELL, -0.01)
+        z = np.arange(BOTTOM + 0.095, BOTTOM, -0.01)
         self.cables = []
         for side in (-1.0, 1.0):
-            points = np.array([[side * (ROD[1] + 0.013), 0.0, h] for h in z])
+            points = np.array([[side * (BOX + GAP + 0.003), 0.0, h] for h in z])
             self.cables.append(SolverFBA.Cable(self.model, np.stack([points[:-1], points[1:]], axis=1), min_ratio=0.8))
 
         self.solver = SolverFBA(
@@ -82,6 +87,9 @@ class Example:
             face_contacts=True,
             soft_contact_thickness=CONTACT_THICKNESS,
             face_contact_margin=0.01,
+            # The box squeezed on the ground closes contact loops whose Newton steps rock the light box by
+            # 41 rad/s at the default 1e-2; damping them by 0.1 leaves 1.3 rad/s.
+            contact_regularization=0.1,
         )
         self.pipeline = newton.CollisionPipeline(self.model, soft_contact_margin=0.01)
         self.contacts = self.pipeline.contacts()
@@ -90,11 +98,15 @@ class Example:
         self.control = self.model.control()
 
         self.viewer.set_model(self.model)
-        self.viewer.set_camera(pos=wp.vec3(0.07, -0.28, 0.2), pitch=-12.0, yaw=104.0)
+        self.viewer.set_camera(pos=wp.vec3(0.07, -0.3, 0.1), pitch=-6.0, yaw=104.0)
+        self.lifted = 0.0
 
     def simulate(self):
-        # Ramp the cables like RealSim's cable controller.
-        ratio = cable_ratio(self.sim_time)
+        # Ramp the cables like RealSim's cable controller and move the palm.
+        ratio, lift = schedule(self.sim_time)
+        target = self.x0.copy()
+        target[self.palm, 2] += lift
+        self.solver.set_pin_targets(target)
         rows = []
         for cable in self.cables:
             cable.length = ratio * cable.rest_length
@@ -113,15 +125,17 @@ class Example:
     def test_post_step(self):
         speed = np.abs(self.state_0.particle_qd.numpy()).max()
         assert speed < 1.0, f"particle speed {speed:.2f} m/s at t={self.sim_time:.2f} s"
-        x = self.state_0.particle_q.numpy()
-        gap = np.hypot(x[:, 0], x[:, 2] - ROD[0]).min() - ROD[1]
-        assert gap > 0.5 * CONTACT_THICKNESS, f"a particle is {gap * 1e3:.2f} mm from the rod"
+        body_q, body_qd = self.state_0.body_q.numpy()[self.box], self.state_0.body_qd.numpy()[self.box]
+        assert np.abs(body_qd).max() < 5.0, f"box velocity {body_qd} at t={self.sim_time:.2f} s"
+        # Signed distance of every particle to the box.
+        rotation = np.array(wp.quat_to_matrix(wp.quat(*body_q[3:]))).reshape(3, 3)
+        d = np.abs((self.state_0.particle_q.numpy() - body_q[:3]) @ rotation) - BOX
+        gap = (np.linalg.norm(np.maximum(d, 0.0), axis=1) + np.minimum(d.max(axis=1), 0.0)).min()
+        assert gap > 0.5 * CONTACT_THICKNESS, f"a particle is {gap * 1e3:.2f} mm from the box"
+        self.lifted = max(self.lifted, float(body_q[2]) - BOX)
 
     def test_final(self):
-        # After a full cycle the released fingers hang straight again.
-        x, x0 = self.state_0.particle_q.numpy(), self.model.particle_q.numpy()
-        assert np.all(np.isfinite(x)), "non-finite particle positions"
-        assert np.abs(x - x0).max() < 5e-3, f"fingers off their rest shape by {np.abs(x - x0).max() * 1e3:.1f} mm"
+        assert self.lifted > 0.9 * LIFT, f"the box rose by {self.lifted * 1e3:.1f} mm"
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
