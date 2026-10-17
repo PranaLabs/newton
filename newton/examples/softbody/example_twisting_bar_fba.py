@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import math
-from pathlib import Path
 
 import numpy as np
 import warp as wp
@@ -22,8 +21,6 @@ import warp as wp
 import newton
 import newton.examples
 from newton.solvers import SolverFBA
-
-_MESH_PATH = Path("/home/ziqiu/work/RealSim_py/realsim_py/resources/mesh/volume/cube_volume_11340P.mesh")
 
 _DT = 0.01
 _PD_ITER = 10  # RealSim's offline binding overrides scene LocalGlobal_CUDA=5 to 10
@@ -54,52 +51,27 @@ def _make_checker_texture(size: int = 64) -> np.ndarray:
     half = size // 2
     dark = np.array([int(255 * c) for c in _CHECKER_DARK], dtype=np.uint8)
     light = np.array([int(255 * c) for c in _CHECKER_LIGHT], dtype=np.uint8)
-    img[:half, :half] = dark; img[:half, half:] = light
-    img[half:, :half] = light; img[half:, half:] = dark
+    img[:half, :half] = dark
+    img[:half, half:] = light
+    img[half:, :half] = light
+    img[half:, half:] = dark
     return img
 
 
-def _load_medit_mesh(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Minimal Medit ``.mesh`` parser (text format, 1-indexed tets)."""
-    vertices: list[tuple[float, float, float]] = []
-    tets: list[tuple[int, int, int, int]] = []
-    state = None
-    n_verts = n_tets = vc = tc = 0
-    with open(path) as fh:
-        for raw in fh:
-            line = raw.strip()
-            if not line:
-                continue
-            if line.startswith("Vertices"):
-                state = "vc"; continue
-            if line.startswith("Tetrahedra"):
-                state = "tc"; continue
-            if line in ("End", "End\n"):
-                break
-            if line.startswith(("MeshVersionFormatted", "Dimension", "Triangles", "Edges", "Normals")):
-                state = "skip" if not line.startswith(("MeshVersionFormatted", "Dimension")) else "h"
-                continue
-            if state == "vc":
-                n_verts = int(line); state = "v"; continue
-            if state == "tc":
-                n_tets = int(line); state = "t"; continue
-            if state == "v":
-                if vc < n_verts:
-                    p = line.split()
-                    vertices.append((float(p[0]), float(p[1]), float(p[2])))
-                    vc += 1
-                    if vc == n_verts:
-                        state = None
-                continue
-            if state == "t":
-                if tc < n_tets:
-                    p = line.split()
-                    tets.append((int(p[0]) - 1, int(p[1]) - 1, int(p[2]) - 1, int(p[3]) - 1))
-                    tc += 1
-                    if tc == n_tets:
-                        state = None
-                continue
-    return np.asarray(vertices, dtype=np.float64), np.asarray(tets, dtype=np.int32)
+def _bar_mesh(nx: int = 18, ny: int = 35, nz: int = 18, size=(2.0, 4.0, 2.0)) -> tuple[np.ndarray, np.ndarray]:
+    """Vertices [m] and tetrahedra of a box grid of ``nx x ny x nz`` vertices centered at the origin.
+
+    Vertices are numbered with x fastest, then y and z; each cell is split into the same six tetrahedra.
+    """
+    x, y, z = (np.linspace(-0.5 * s, 0.5 * s, n) for s, n in zip(size, (nx, ny, nz), strict=True))
+    vertices = np.stack(np.meshgrid(x, y, z, indexing="ij"), -1).transpose(2, 1, 0, 3).reshape(-1, 3)
+    sx, sy, sz = 1, nx, nx * ny
+    k, j, i = np.meshgrid(np.arange(nz - 1), np.arange(ny - 1), np.arange(nx - 1), indexing="ij")
+    base = (i * sx + j * sy + k * sz).ravel()
+    xyz = sx + sy + sz
+    cell = [(0, sx + sz, sx, xyz), (0, sx, sy, xyz), (sx, sy, xyz, sx + sy)]
+    cell += [(xyz, sy, 0, sy + sz), (xyz, sy + sz, 0, sx + sz), (sy + sz, sx + sz, sz, 0)]
+    return vertices, (base[:, None, None] + np.array(cell)[None]).reshape(-1, 4)
 
 
 def _lame_from_young_poisson(young: float, poisson: float) -> tuple[float, float]:
@@ -120,12 +92,7 @@ class Example:
         self.frame_dt = _DT
         self.sim_time = 0.0
 
-        if not _MESH_PATH.exists():
-            raise FileNotFoundError(
-                f"Cube mesh not found at {_MESH_PATH}.  Update _MESH_PATH at the top of this example."
-            )
-        verts, tets = _load_medit_mesh(_MESH_PATH)
-        n_verts = len(verts)
+        verts, tets = _bar_mesh()  # 11340 particles
 
         # Pin caps along +/-Y edges of the bar.
         y = verts[:, 1]
@@ -161,9 +128,7 @@ class Example:
 
         # Uniform mass lumping per RealSim Mass.cpp:12-21.
         uniform_mass = _TOTAL_MASS / self.model.particle_count
-        self.model.particle_mass.assign(
-            np.full(self.model.particle_count, uniform_mass, dtype=np.float32)
-        )
+        self.model.particle_mass.assign(np.full(self.model.particle_count, uniform_mass, dtype=np.float32))
         inv = np.full(self.model.particle_count, 1.0 / uniform_mass, dtype=np.float32)
         inv[top_pins] = 0.0
         inv[bot_pins] = 0.0
@@ -202,12 +167,8 @@ class Example:
         self._bar_uvs = wp.array(uv_np, dtype=wp.vec2)
         self._bar_texture = _make_checker_texture()
 
-        # Camera framing the +Y-up bar from the front-right.
-        if hasattr(self.viewer, "camera"):
-            cam_pos = wp.vec3(4.5, 1.5, 4.5)
-            cam_target = wp.vec3(0.0, 0.0, 0.0)
-            self.viewer.camera.pos = self.viewer.camera._as_vec3(cam_pos)
-            self.viewer.camera.look_at(cam_target)
+        # Camera framing the +Y-up bar from the front-right, toward the origin.
+        self.viewer.set_camera(pos=wp.vec3(4.5, 1.5, 4.5), pitch=-13.3, yaw=-135.0)
 
     def step(self):
         # Advance to "after frame f+1" (RealSim 1-indexed convention):
@@ -244,9 +205,23 @@ class Example:
         )
         self.viewer.end_frame()
 
+    def test_post_step(self):
+        speed = np.linalg.norm(self.state_0.particle_qd.numpy(), axis=1).max()
+        assert speed < 5.0, f"particle speed {speed:.2f} m/s at t={self.sim_time:.2f} s"
+
     def test_final(self):
-        q = self.state_0.particle_q.numpy()
+        # The caps turn by +/-theta at y = +/-2 m; along the bar the twist is linear, theta y / 2, as for a
+        # prismatic bar in Saint-Venant torsion: after 3 s, 7.22 deg at y = 0.47 m against 7.06 deg.
+        q, q0 = self.state_0.particle_q.numpy().astype(np.float64), self._verts_init
         assert np.all(np.isfinite(q)), "non-finite particle positions"
+        theta = min(_PIN_AVEL * self._frame * self.frame_dt, _MAX_ANGLE)
+        for y in np.unique(np.round(q0[:, 1], 6)):
+            ring = np.isclose(q0[:, 1], y) & (np.hypot(q0[:, 0], q0[:, 2]) > 0.5)
+            turn = np.arctan2(q[ring, 0], q[ring, 2]) - np.arctan2(q0[ring, 0], q0[ring, 2])
+            twist = np.angle(np.exp(1j * turn)).mean()
+            assert abs(twist - 0.5 * theta * y) < math.radians(1.0), (
+                f"twist {math.degrees(twist):.2f} deg at y = {y:.2f} m"
+            )
 
 
 if __name__ == "__main__":

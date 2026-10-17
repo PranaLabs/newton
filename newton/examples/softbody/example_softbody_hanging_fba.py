@@ -65,16 +65,22 @@ class Example:
         self.viewer.log_state(self.state_0)
         self.viewer.end_frame()
 
+    def test_post_step(self):
+        speed = np.linalg.norm(self.state_0.particle_qd.numpy(), axis=1).max()
+        assert speed < 10.0, f"particle speed {speed:.2f} m/s at t={self.sim_time:.2f} s"
+
     def test_final(self):
-        q = self.state_0.particle_q.numpy()
+        # After 5 s the soft 0.4 m cube, held by its left face, droops: its free face hangs 0.34 m low and
+        # moves at 0.2 m/s.
+        q, q0 = self.state_0.particle_q.numpy(), self.model.particle_q.numpy()
         assert np.all(np.isfinite(q)), "non-finite particle positions"
-        # Free (unpinned) particles must have moved from initial rest positions.
-        q_rest = self.model.particle_q.numpy()
-        inv_mass = self.model.particle_inv_mass.numpy()
-        free_mask = inv_mass > 0.0
-        if free_mask.any():
-            displacement = np.abs(q[free_mask] - q_rest[free_mask]).max()
-            assert displacement > 1e-3, f"softbody did not deform: max displacement={displacement:.4f} m"
+        fixed = self.model.particle_inv_mass.numpy() == 0.0
+        assert np.abs(q[fixed] - q0[fixed]).max() < 1.0e-5, "the held face moved"
+        tip = np.isclose(q0[:, 0], q0[:, 0].max())
+        sag = float(np.mean(q0[tip, 2] - q[tip, 2]))
+        assert 0.2 < sag < 0.45, f"the free face sags {sag:.3f} m"
+        speed = np.linalg.norm(self.state_0.particle_qd.numpy(), axis=1).max()
+        assert speed < 1.0, f"the body still moves at {speed:.2f} m/s"
 
 
 if __name__ == "__main__":

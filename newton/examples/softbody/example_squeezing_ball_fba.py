@@ -14,8 +14,8 @@
 
 from __future__ import annotations
 
+import itertools
 import math
-from pathlib import Path
 
 import numpy as np
 import warp as wp
@@ -23,9 +23,6 @@ import warp as wp
 import newton
 import newton.examples
 from newton.solvers import SolverFBA
-
-# RealSim ball mesh; falls back gracefully when the asset is absent.
-_MESH_PATH = Path("/home/ziqiu/work/RealSim_py/realsim_py/resources/mesh/volume/ball_volume_7129P.mesh")
 
 # Simulation parameters (CudaTests/SqueezingBall/ball_7k.json).
 _DT = 0.01
@@ -58,56 +55,35 @@ _CYLINDERS: list[tuple[np.ndarray, np.ndarray, float]] = [
 ]
 
 
-def _load_medit_mesh(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Minimal Medit ``.mesh`` parser (text format, 1-indexed tets)."""
-    vertices: list[tuple[float, float, float]] = []
-    tets: list[tuple[int, int, int, int]] = []
-    state = None
-    n_verts = 0
-    n_tets = 0
-    vcount = 0
-    tcount = 0
-    with open(path) as fh:
-        for raw in fh:
-            line = raw.strip()
-            if not line:
-                continue
-            if line.startswith("Vertices"):
-                state = "vcount"
-                continue
-            if line.startswith("Tetrahedra"):
-                state = "tcount"
-                continue
-            if line in ("End", "End\n"):
-                break
-            if line.startswith(("MeshVersionFormatted", "Dimension", "Triangles", "Edges", "Normals")):
-                state = "skip" if not line.startswith(("MeshVersionFormatted", "Dimension")) else "header"
-                continue
-            if state == "vcount":
-                n_verts = int(line)
-                state = "verts"
-                continue
-            if state == "tcount":
-                n_tets = int(line)
-                state = "tets"
-                continue
-            if state == "verts":
-                if vcount < n_verts:
-                    parts = line.split()
-                    vertices.append((float(parts[0]), float(parts[1]), float(parts[2])))
-                    vcount += 1
-                    if vcount == n_verts:
-                        state = None
-                continue
-            if state == "tets":
-                if tcount < n_tets:
-                    parts = line.split()
-                    tets.append((int(parts[0]) - 1, int(parts[1]) - 1, int(parts[2]) - 1, int(parts[3]) - 1))
-                    tcount += 1
-                    if tcount == n_tets:
-                        state = None
-                continue
-    return np.asarray(vertices, dtype=np.float64), np.asarray(tets, dtype=np.int32)
+def _ball_mesh(n: int = 19) -> tuple[np.ndarray, np.ndarray]:
+    """Vertices and tetrahedra of the unit ball, from an ``n^3`` grid on the cube ``[-1, 1]^3``.
+
+    Each cell is split into six tetrahedra around its diagonal that points away from the center, mirrored
+    per octant so that neighbors share their faces, and every cube shell ``|p|_inf = r`` is mapped onto the
+    sphere of radius ``r``.
+    """
+    a = np.linspace(-1.0, 1.0, n)
+    p = np.stack(np.meshgrid(a, a, a, indexing="ij"), -1).reshape(-1, 3)
+    cell = np.stack([c.ravel() for c in np.meshgrid(*(np.arange(n - 1),) * 3, indexing="ij")], axis=1)
+    start = cell + (cell < (n - 1) / 2)  # the corner nearest the center
+    step = np.where(start > cell, -1, 1)
+    tets = []
+    for order in itertools.permutations(range(3)):
+        corner, corners = start.copy(), [start]
+        for axis in order:
+            corner = corner.copy()
+            corner[:, axis] += step[:, axis]
+            corners.append(corner)
+        tets.append(np.stack([(c[:, 0] * n + c[:, 1]) * n + c[:, 2] for c in corners], axis=1))
+    tets = np.concatenate(tets)
+    r = np.abs(p).max(axis=1, keepdims=True)
+    x2, y2, z2 = (np.divide(p, r, out=np.zeros_like(p), where=r > 0) ** 2).T
+    s = 1.0 - 0.5 * np.column_stack([y2 + z2, x2 + z2, x2 + y2]) + np.column_stack([y2 * z2, x2 * z2, x2 * y2]) / 3.0
+    vertices = p * np.sqrt(s)
+    e = vertices[tets]
+    flip = np.einsum("ij,ij->i", np.cross(e[:, 1] - e[:, 0], e[:, 2] - e[:, 0]), e[:, 3] - e[:, 0]) < 0
+    tets[flip] = tets[flip][:, [0, 2, 1, 3]]
+    return vertices, tets
 
 
 def _lame_from_young_poisson(young: float, poisson: float) -> tuple[float, float]:
@@ -210,11 +186,7 @@ class Example:
         self.frame_dt = _DT
         self.sim_time = 0.0
 
-        if not _MESH_PATH.exists():
-            raise FileNotFoundError(
-                f"Ball mesh not found at {_MESH_PATH}.  Update _MESH_PATH at the top of this example."
-            )
-        verts_local, tets = _load_medit_mesh(_MESH_PATH)
+        verts_local, tets = _ball_mesh()  # 6859 particles
         verts_world = verts_local * _BALL_SCALE + _BALL_TRANS
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=_GRAVITY)
@@ -317,9 +289,7 @@ class Example:
 
         n_max_contacts = self.model.particle_count
         mu_override = np.full(n_max_contacts, _FRICTION_MU, dtype=np.float64)
-        shape_omega = {
-            self._cyl_collision_ids[i]: _CYLINDERS[i][2] for i in range(len(_CYLINDERS))
-        }
+        shape_omega = {self._cyl_collision_ids[i]: _CYLINDERS[i][2] for i in range(len(_CYLINDERS))}
 
         self.solver = SolverFBA(
             self.model,
@@ -349,13 +319,8 @@ class Example:
         # Camera framed on the squeeze zone.  Cylinders sit at y in
         # [-1, -3.5]; the ball drops from y≈2.6 through the gap into the
         # plane at y=-10, so the centroid of activity is around y≈-3.
-        # Use ``camera.look_at`` (sets pitch+yaw consistently for the
-        # requested target) so the scene shows up centered on first frame.
-        if hasattr(self.viewer, "camera"):
-            cam_pos = wp.vec3(13.0, 3.0, 13.0)
-            cam_target = wp.vec3(0.0, -3.0, 0.0)
-            self.viewer.camera.pos = self.viewer.camera._as_vec3(cam_pos)
-            self.viewer.camera.look_at(cam_target)
+        # The camera looks toward (0, -3, 0).
+        self.viewer.set_camera(pos=wp.vec3(13.0, 3.0, 13.0), pitch=-18.1, yaw=-135.0)
 
         # Cache the initial shape_transform array as a NumPy buffer; per-step
         # rotation updates write into a copy of this and assign in bulk.
@@ -428,9 +393,26 @@ class Example:
         self.viewer.log_contacts(self.contacts, self.state_0)
         self.viewer.end_frame()
 
+    def test_post_step(self):
+        speed = np.linalg.norm(self.state_0.particle_qd.numpy(), axis=1).max()
+        assert speed < 40.0, f"particle speed {speed:.2f} m/s at t={self.sim_time:.2f} s"
+
     def test_final(self):
+        # After 1.5 s the 6 m ball is squeezed through the 1 m gap of the upper cylinders (1.06 m wide there,
+        # 6.3 m along them), which hold its centroid at y = 0.3 m where free fall would reach -8.7 m.
         q = self.state_0.particle_q.numpy()
         assert np.all(np.isfinite(q)), "non-finite particle positions"
+        for base, axis, _omega in _CYLINDERS:
+            d = q - base
+            along = d @ axis
+            near = np.abs(along) < _CYL_HALF_HEIGHT
+            depth = _CYL_RADIUS - np.linalg.norm(d[near] - np.outer(along[near], axis), axis=1).min(initial=np.inf)
+            assert depth < 5.0e-3, f"a particle is {depth * 1e3:.1f} mm inside the cylinder at {base}"
+        if 1.0 < self.sim_time < 2.0:
+            gap = np.abs(q[:, 1] + 1.0) < 0.25
+            assert 0.95 < np.ptp(q[gap, 2]) < 1.2, f"the ball is {np.ptp(q[gap, 2]):.2f} m wide in the gap"
+            assert np.ptp(q[gap, 0]) > 6.0, f"the ball spreads {np.ptp(q[gap, 0]):.2f} m along the cylinders"
+            assert -1.0 < q[:, 1].mean() < 2.0, f"the ball's centroid is at y = {q[:, 1].mean():.2f} m"
 
 
 if __name__ == "__main__":
