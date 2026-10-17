@@ -1619,6 +1619,7 @@ class SolverFBA(SolverBase):
                                 self._contact_alpha_d,
                                 self._contact_tangent1_d,
                                 self._contact_tangent2_d,
+                                bilateral=self._lite_constraint_rows() if n_b else None,
                             )
                         else:
                             ls.build_schur_complement(
@@ -1653,8 +1654,8 @@ class SolverFBA(SolverBase):
                     if use_lite_block_diag:
                         # Warm-start ω + λ from the persistent device buffers
                         # (same convention as the dense path).
-                        wp.copy(self._nsn_omega_d, self._omega_coulomb_persistent_d, count=3 * M)
-                        wp.copy(self._nsn_lam_d, self._lam_coulomb_persistent_d, count=3 * M)
+                        wp.copy(self._nsn_omega_d, self._omega_coulomb_persistent_d, count=3 * M + n_b)
+                        wp.copy(self._nsn_lam_d, self._lam_coulomb_persistent_d, count=3 * M + n_b)
                         # Lambda cap (folded into both per-contact and per-particle kernels).
                         if self.lambda_cap is not None:
                             cap_internal = float(self.lambda_cap) / (dt * dt)
@@ -1669,7 +1670,7 @@ class SolverFBA(SolverBase):
                         # kernel: it's the k_p==1 specialisation and avoids
                         # the per-particle kernel's 12×12 register footprint
                         # for what is the only common case in cloth-on-rigid.
-                        use_per_particle = (
+                        use_per_particle = n_b or (
                             getattr(ls, "_isodof_max_k", 1) > 3 and getattr(ls, "_isodof_unique_d", None) is not None
                         )
                         if use_per_particle:
@@ -1691,6 +1692,7 @@ class SolverFBA(SolverBase):
                                     wp.float64(cap_internal),
                                     wp.int32(use_cap),
                                     wp.int32(int(self.nsn_iterations)),
+                                    wp.int32(3 * M),
                                 ],
                                 outputs=[
                                     self._nsn_lam_d,
@@ -2193,6 +2195,12 @@ class SolverFBA(SolverBase):
         fixed for the step drops it, and a body that chained rows compress beyond its buckling load then
         flutters. Unused slots have particle ``-1``; slot 0 must be used. ``None`` removes the rows.
 
+        The lite NSN solves each particle's rows on their own, so with ``nsn_schur_mode="lite"`` every
+        row needs a direction and one particle. Rows along three directions hold a particle at a point,
+        and its contacts then carry no force. Like the contacts, the rows see the particle's mass alone,
+        ``dt^2 / m`` in place of its block of ``A^-1``, and lag their targets by the share of the
+        stiffness in that block.
+
         Args:
             particles: Particle indices, shape ``(R, K)``.
             coefficients: Their coefficients, shape ``(R, K)``.
@@ -2203,14 +2211,21 @@ class SolverFBA(SolverBase):
         if particles is None or len(particles) == 0:
             self._constraint_rows = None
             return
-        if not self.friction or self.nsn_schur_mode != "full" or not self.use_isodof:
-            raise ValueError("particle constraints need friction=True, nsn_schur_mode='full' and use_isodof=True")
+        if not self.friction or (self.nsn_schur_mode == "full" and not self.use_isodof):
+            raise ValueError("particle constraints need friction=True, and use_isodof=True in the full NSN")
+        if self.nsn_schur_mode == "lite" and (directions is None or (np.asarray(particles)[:, 1:] >= 0).any()):
+            raise ValueError("the lite NSN holds only rows with a direction on one particle")
         self._constraint_lengths = directions is None
         if directions is None:
             directions = np.zeros((len(targets), 3))
         arrays = [(particles, np.int32, wp.int32), (coefficients, np.float32, wp.float32)]
         arrays += [(directions, np.float32, wp.vec3), (targets, np.float64, wp.float64)]
         self._constraint_rows = [wp.array(np.asarray(a, dtype=n), dtype=t, device=self._device) for a, n, t in arrays]
+
+    def _lite_constraint_rows(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Particles, directions and coefficients of the bilateral rows, each on one particle."""
+        particles, coefficients, directions, _ = self._constraint_rows
+        return particles.numpy()[:, 0], directions.numpy(), coefficients.numpy()[:, 0]
 
     def notify_model_changed(self, flags: int) -> None:
         # On any geometry/inertial change, force a full re-setup at the next step.

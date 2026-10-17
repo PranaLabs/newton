@@ -5202,6 +5202,7 @@ def fb_newton_lite_coulomb_per_particle_kernel(
     cap_internal: wp.float64,  # lambda_cap / dt²
     use_cap: wp.int32,
     n_fb_iters: wp.int32,
+    n_contact_rows: wp.int32,  # 3M; the rows after them are bilateral
     # ---- inout / outputs ----
     lam: wp.array[wp.float64],  # (3M,) inout
     omega: wp.array[wp.float64],  # (3M,) inout
@@ -5218,10 +5219,11 @@ def fb_newton_lite_coulomb_per_particle_kernel(
     Local state lives in registers / L1 (warp ``mat12``).  Cholesky on a
     ``3·k_p × 3·k_p`` PSD matrix runs in-place over the same buffer.
 
-    For ``k_p > _MAX_KP_PER_PARTICLE`` the kernel emits a sentinel (skips the
-    update; warm-start λ unchanged); host code re-runs that step through the BSR
-    path.  This branch is never taken in the cloth-on-rigid scenes covered by
-    the Franka plan.
+    Rows from ``n_contact_rows`` on are bilateral rows on one particle each, with
+    the identity law of :func:`bilateral_law_kernel`. A particle whose bilateral
+    rows span all three directions is held at a point, and its contact rows carry
+    no force: their law gives no update to their zero multipliers. The rows of a
+    particle with more than ``_MAX_ROWS_PER_PARTICLE`` keep their multipliers.
     """
     iso = wp.tid()
     p = isodof_unique[iso]
@@ -5230,12 +5232,13 @@ def fb_newton_lite_coulomb_per_particle_kernel(
     k_total = row_end - row_start  # = 3 · k_p
     if k_total <= 0:
         return
-    if k_total > _MAX_ROWS_PER_PARTICLE:
-        # Defer to BSR path (host re-dispatches).  Don't touch λ / ω here.
-        return
-
     inv_m = inv_mass[p]
     dt2 = dt * dt
+    if k_total > _MAX_ROWS_PER_PARTICLE:
+        for ai in range(k_total):
+            ra = isodof_row_indices[row_start + ai]
+            lam_apply[ra] = dt2 * omega[ra] * lam[ra]
+        return
 
     # Load up to 12 row indices and their per-row data into local arrays.
     row_idx = _VEC12_F64(wp.float64(0.0))  # store as float for warp matrix-compat indexing
@@ -5255,6 +5258,23 @@ def fb_newton_lite_coulomb_per_particle_kernel(
             alpha_b = wp.float64(row_alpha[rb])
             dir_b = row_dir[rb]
             W[ai, bi] = alpha_a * alpha_b * wp.float64(wp.dot(dir_a, dir_b)) * dt2 * inv_m
+
+    # Rank of the bilateral row directions, by Gram-Schmidt.
+    e0 = wp.vec3(0.0)
+    e1 = wp.vec3(0.0)
+    rank = wp.int32(0)
+    for ai in range(k_total):
+        ra = isodof_row_indices[row_start + ai]
+        if ra >= n_contact_rows:
+            u = row_dir[ra]
+            u = u - wp.dot(u, e0) * e0 - wp.dot(u, e1) * e1
+            if wp.length(u) > 1.0e-3 * wp.length(row_dir[ra]):
+                if rank == wp.int32(0):
+                    e0 = wp.normalize(u)
+                elif rank == wp.int32(1):
+                    e1 = wp.normalize(u)
+                rank += wp.int32(1)
+    held = rank >= wp.int32(3)
 
     # Load per-row state into vec12 locals.
     lam_l = _VEC12_F64(wp.float64(0.0))
@@ -5298,7 +5318,16 @@ def fb_newton_lite_coulomb_per_particle_kernel(
         for ai in range(k_total):
             ra = isodof_row_indices[row_start + ai]
             rmod = ra % 3
-            if rmod == 0:
+            if ra >= n_contact_rows:
+                om_l[ai] = wp.float64(1.0)
+                c_l[ai] = wp.float64(0.0)
+                h_l[ai] = pene0_l[ai]
+            elif held:
+                # rhs = 0 and a decoupled pivot: no update.
+                om_l[ai] = wp.float64(0.0)
+                c_l[ai] = wp.float64(1.0)
+                h_l[ai] = wp.float64(0.0)
+            elif rmod == 0:
                 # Normal row.
                 out_n = fb_unilateral_row_wp(pen_l[ai], lam_l[ai], precond_l[ai], dt, pene0_l[ai])
                 om_l[ai] = out_n[0]
@@ -5391,7 +5420,7 @@ def fb_newton_lite_coulomb_per_particle_kernel(
     # Identify contact-c normal local index, clamp its t1 and t2.
     for ai in range(k_total):
         ra = isodof_row_indices[row_start + ai]
-        if (ra % 3) != 0:
+        if ra >= n_contact_rows or (ra % 3) != 0:
             continue
         # Find t1, t2 local indices (ra+1, ra+2 global).
         t1_g = ra + 1
@@ -5419,9 +5448,11 @@ def fb_newton_lite_coulomb_per_particle_kernel(
             if lam_l[t2_local] < lower:
                 lam_l[t2_local] = lower
 
-    # Optional symmetric lambda cap.
+    # Optional symmetric lambda cap on the contact rows.
     if use_cap == wp.int32(1):
         for ai in range(k_total):
+            if isodof_row_indices[row_start + ai] >= n_contact_rows:
+                continue
             v = lam_l[ai]
             if v > cap_internal:
                 v = cap_internal

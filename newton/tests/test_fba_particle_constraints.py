@@ -125,6 +125,40 @@ class TestParticleConstraints(unittest.TestCase):
         with self.assertRaises(ValueError):
             solver.set_particle_constraints([[0]], [[1.0]], [1.0])
 
+    def test_lite_rows_hold_a_particle_at_a_point(self):
+        """Three rows of the lite NSN hold the middle particle of a cloth on the ground, first 2 mm into the
+        ground, then 5 cm over it while they drag it at 0.2 m/s. Their Delassus block dt^2 / m is within 2 % of
+        the particle's block of A^-1 here (1 kg particles, soft cloth), so they hold it to 0.1 mm, and its
+        contacts carry no force."""
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        grid = {"dim_x": 4, "dim_y": 4, "cell_x": 0.1, "cell_y": 0.1, "tri_ke": 1.0, "tri_ka": 1.0, "edge_ke": 0.01}
+        builder.add_cloth_grid(pos=wp.vec3(-0.2, -0.2, 0.0), rot=wp.quat_identity(), vel=wp.vec3(0.0), mass=1.0, **grid)
+        model = builder.finalize()
+        solver = newton.solvers.SolverFBA(model, iterations=10, nsn_schur_mode="lite")
+        contacts, s0, s1 = model.contacts(), model.state(), model.state()
+        x0 = model.particle_q.numpy()[12]
+        for k in range(60):
+            target = x0 + ([0.0, 0.0, -0.002] if k < 30 else [0.2 * (k - 29) / 60.0, 0.0, 0.05])
+            solver.set_particle_constraints([[12]] * 3, [[1.0]] * 3, target, np.eye(3))
+            model.collide(s0, contacts)
+            solver.step(s0, s1, None, contacts, 1.0 / 60.0)
+            s0, s1 = s1, s0
+            if k in (29, 59):
+                np.testing.assert_allclose(s0.particle_q.numpy()[12], target, atol=1e-4)
+            if k == 29:
+                m = solver._contact_count
+                rows = np.flatnonzero(solver._linear_solver._row_particle_d.numpy()[: 3 * m] == 12)
+                self.assertEqual(len(rows), 3)
+                np.testing.assert_array_equal(solver._nsn_lam_apply_d.numpy()[rows], 0.0)
+
+    def test_lite_rows_take_a_direction_and_one_particle(self):
+        solver = newton.solvers.SolverFBA(self._model(), nsn_schur_mode="lite")
+        with self.assertRaises(ValueError):
+            solver.set_particle_constraints([[0]], [[1.0]], [1.0])
+        with self.assertRaises(ValueError):
+            solver.set_particle_constraints([[0, 1]], [[1.0, -1.0]], [0.0], [[0.0, 0.0, 1.0]])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1700,6 +1700,7 @@ class FBALinearSolver:
         j_alpha: wp.array,
         j_tangent1: wp.array | None = None,
         j_tangent2: wp.array | None = None,
+        bilateral: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
     ) -> int:
         """Populate per-row metadata for LiteNSN paths without building ``W``.
 
@@ -1713,7 +1714,11 @@ class FBALinearSolver:
         going through :meth:`build_schur_lite_dense` (which would allocate the
         dense ``W`` buffer — defeating the lite memory win at large ``M``).
 
-        Returns ``total_rows`` (``M`` for Stage A, ``3M`` for Stage B).
+        ``bilateral`` appends rows on one particle each, as ``(particles,
+        directions, coefficients)``.
+
+        Returns ``total_rows`` (``M`` for Stage A, ``3M`` for Stage B, plus the
+        bilateral rows).
         """
         has_friction = j_tangent1 is not None and j_tangent2 is not None
         rows_per_contact = 3 if has_friction else 1
@@ -1736,6 +1741,11 @@ class FBALinearSolver:
             row_alpha[0::3] = a_np; row_alpha[1::3] = a_np; row_alpha[2::3] = a_np
         else:
             row_particle[:] = idx_np; row_dir[:] = n_np; row_alpha[:] = a_np
+        if bilateral is not None:
+            row_particle = np.concatenate([row_particle, np.asarray(bilateral[0], dtype=np.int32)])
+            row_dir = np.concatenate([row_dir, np.asarray(bilateral[1], dtype=np.float32)])
+            row_alpha = np.concatenate([row_alpha, np.asarray(bilateral[2], dtype=np.float32)])
+            total_rows = row_particle.size
 
         self._row_particle_d = wp.array(row_particle, dtype=wp.int32, device=dev)
         self._row_dir_d = wp.array(row_dir, dtype=wp.vec3, device=dev)
@@ -2109,7 +2119,7 @@ class FBALinearSolver:
         underlying buffer has capacity ``(cap, cap)`` (with ``cap >= M`` and
         ``cap`` grown by the 1.5x headroom factor), the view is non-contiguous
         in its outer dimension and explicit strides matching the parent buffer
-        are passed; without them the default contiguous strides would mis-index
+        are passed; without them the default contiguous strides would misplace
         every row beyond the first.
 
         Returns:
