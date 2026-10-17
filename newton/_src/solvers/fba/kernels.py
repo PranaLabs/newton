@@ -201,34 +201,44 @@ def write_velocity_kernel(
 
 @wp.func
 def svd_3x2(F: mat32) -> mat32:
-    """ARAP projection: SVD-clamp 3x2 deformation gradient to nearest rotation.
+    """ARAP projection: the 3x2 matrix with orthonormal columns nearest to the deformation gradient ``F``.
 
-    Reduces 3x2 SVD to a 2x2 symmetric eigenproblem on F^T F and uses Warp's
-    built-in ``wp.svd2``. ``svd2(FtF)`` returns the singular values of FtF,
-    which equal the squared singular values of F (since FtF is symmetric PSD).
-    ARAP clamps singular values to 1, yielding the nearest rigid map
-    ``P = U V^T`` (3x2).
+    The right singular vectors ``v_i`` of ``F`` come from the 2x2 eigenproblem of ``F^T F`` (``wp.svd2``),
+    and ``P = u_a v_a^T + u_b v_b^T``. ``u_a = F v_a / |F v_a|`` takes the larger of the two images, and
+    ``u_b`` is ``F v_b`` made orthogonal to ``u_a`` and normalized rather than divided by its singular
+    value: when a triangle is crushed, that singular value vanishes and float32 ``F^T F`` resolves it no
+    better than ``1e-4`` of the larger one, so the division amplified rounding noise into a huge
+    projection. Below ``1e-5`` of the larger image, ``u_b`` is any unit vector orthogonal to ``u_a``,
+    equally near, and ``F = 0`` takes an arbitrary rigid placement.
 
     Note: ``wp.mat32`` is absent in Warp 1.14; ``mat32`` is defined at module
     level as ``wp.types.matrix(shape=(3, 2), dtype=wp.float32)``.
     """
     FtF = wp.transpose(F) * F  # 2x2 symmetric PSD
-
-    # wp.svd2 of symmetric PSD: U == V (up to sign); use V as right singular vectors of F
-    _U2, sigma_sq, V2 = wp.svd2(FtF)
-
-    s0 = wp.sqrt(wp.max(sigma_sq[0], 1.0e-20))
-    s1 = wp.sqrt(wp.max(sigma_sq[1], 1.0e-20))
-
-    # U columns of the 3x2 SVD: u_i = F v_i / s_i
-    v0 = wp.vec2(V2[0, 0], V2[1, 0])
-    v1 = wp.vec2(V2[0, 1], V2[1, 1])
-    u0 = (F * v0) / s0  # 3-vector
-    u1 = (F * v1) / s1  # 3-vector
-
-    # ARAP projection: P = U V^T (3x2) with singular values clamped to 1.
-    p_col0 = u0 * V2[0, 0] + u1 * V2[0, 1]
-    p_col1 = u0 * V2[1, 0] + u1 * V2[1, 1]
+    _U2, _sigma_sq, V2 = wp.svd2(FtF)
+    va = wp.vec2(V2[0, 0], V2[1, 0])
+    vb = wp.vec2(V2[0, 1], V2[1, 1])
+    a = F * va
+    b = F * vb
+    if wp.length(b) > wp.length(a):
+        va, vb = vb, va
+        a, b = b, a
+    na = wp.length(a)
+    ua = wp.vec3(1.0, 0.0, 0.0)
+    if na > 1.0e-12:
+        ua = a / na
+    b = b - wp.dot(b, ua) * ua
+    nb = wp.length(b)
+    ub = wp.vec3(0.0)
+    if nb > 1.0e-5 * na and nb > 1.0e-12:
+        ub = b / nb
+    else:
+        axis = wp.vec3(0.0, 1.0, 0.0)
+        if wp.abs(ua[1]) > 0.9:
+            axis = wp.vec3(0.0, 0.0, 1.0)
+        ub = wp.normalize(wp.cross(axis, ua))
+    p_col0 = ua * va[0] + ub * vb[0]
+    p_col1 = ua * va[1] + ub * vb[1]
     return mat32(
         p_col0[0],
         p_col1[0],

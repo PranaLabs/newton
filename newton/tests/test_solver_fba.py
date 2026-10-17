@@ -406,6 +406,39 @@ class TestARAPProjection(unittest.TestCase):
     def setUpClass(cls):
         wp.init()
 
+    def test_projection_of_crushed_triangles(self):
+        """svd_3x2 returns the nearest 3x2 matrix with orthonormal columns, also for crushed triangles.
+
+        With one singular value at 1e-6 of the other, the former division by it turned float32 rounding of
+        F^T F into projections of order 1e3 and blew up a cloth piled on a table.
+        """
+        from newton._src.solvers.fba.kernels import mat32, svd_3x2  # noqa: PLC0415
+
+        @wp.kernel
+        def project(F: wp.array[mat32], P: wp.array[mat32]):
+            i = wp.tid()
+            P[i] = svd_3x2(F[i])
+
+        rng = np.random.default_rng(3)
+        cases = [rng.standard_normal((3, 2)) for _ in range(8)]
+        for s1 in (1.0e-3, 1.0e-6, 0.0):
+            for _ in range(8):
+                U = np.linalg.qr(rng.standard_normal((3, 2)))[0]
+                V = np.linalg.qr(rng.standard_normal((2, 2)))[0]
+                cases.append(U @ np.diag([rng.uniform(0.5, 2.0), s1]) @ V.T)
+        cases.append(np.zeros((3, 2)))
+        F = np.array(cases)
+        out = wp.zeros(len(F), dtype=mat32)
+        wp.launch(project, dim=len(F), inputs=[wp.array(F.astype(np.float32), dtype=mat32)], outputs=[out])
+        P = out.numpy().astype(np.float64)
+        np.testing.assert_allclose(
+            np.einsum("nki,nkj->nij", P, P), np.broadcast_to(np.eye(2), (len(F), 2, 2)), atol=1e-5
+        )
+        U, sigma, Vt = np.linalg.svd(F, full_matrices=False)
+        nearest = np.sum((sigma - 1.0) ** 2, axis=1)
+        np.testing.assert_allclose(np.sum((F - P) ** 2, axis=(1, 2)), nearest, atol=1e-5)
+        np.testing.assert_allclose(P[:8], (U @ Vt)[:8], atol=1e-5)
+
     def test_identity_F_zero_after_assembly_bias(self):
         """Rest configuration ⇒ P=identity; verify scatter values match the
         formula (Dm_inv @ P^T) with Dm_inv = I₂ analytically.
