@@ -5897,6 +5897,8 @@ def compute_v_anchor_from_body_kernel(
     """
     c = wp.tid()
     s = shape_idx[c]
+    if s < 0:
+        return
     parent = shape_body[s]
     if parent < 0:
         return

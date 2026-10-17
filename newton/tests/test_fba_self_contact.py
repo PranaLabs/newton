@@ -8,6 +8,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.fba.self_contact import SelfContact, particle_rings
+from newton._src.solvers.vbd.tri_mesh_collision import TriMeshCollisionDetector
 
 
 def _closest_on_triangle(p, a, b, c):
@@ -89,6 +90,58 @@ class TestSelfContactDetection(unittest.TestCase):
         self.assertGreater(len(particles), 0)
         for a, b in particles[:, :2]:
             self.assertNotIn(b, ring[offsets[a] : offsets[a + 1]])
+
+
+class TestSelfContactSolve(unittest.TestCase):
+    """A sheet of 2 cm cells, shifted 4 mm along x and y, falls from a few cm onto a like sheet on a box."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not wp.is_cuda_available():
+            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
+
+    def _drop(self, start_gap, **self_contact):
+        """Largest number of intersecting triangle pairs over 1 s, then the gap between the sheets [m]."""
+        builder = newton.ModelBuilder()
+        builder.add_shape_box(-1, xform=wp.transform((0.0, 0.0, 0.25), wp.quat_identity()), hx=0.25, hy=0.25, hz=0.25)
+        grid = {"dim_x": 10, "dim_y": 10, "cell_x": 0.02, "cell_y": 0.02, "mass": 0.004, "tri_ke": 1e3, "tri_ka": 1e3}
+        for z, shift in ((0.5, 0.0), (0.5 + start_gap, 0.004)):
+            builder.add_cloth_grid(
+                pos=wp.vec3(shift - 0.1, shift - 0.1, z), rot=wp.quat_identity(), vel=wp.vec3(0.0), **grid
+            )
+        model = builder.finalize()
+        solver = newton.solvers.SolverFBA(model, iterations=10, **self_contact)
+        pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.01)
+        detector = TriMeshCollisionDetector(model)
+        contacts, s0, s1, worst = pipeline.contacts(), model.state(), model.state(), 0
+        for _ in range(60):
+            pipeline.collide(s0, contacts)
+            solver.step(s0, s1, None, contacts, 1.0 / 60.0)
+            s0, s1 = s1, s0
+            detector.refit(s0.particle_q)
+            detector.triangle_triangle_intersection_detection()
+            worst = max(worst, int(detector.triangle_intersecting_triangles_count.numpy().sum()))
+        z = s0.particle_q.numpy()[:, 2]
+        return worst, z[model.particle_count // 2 :].mean() - z[: model.particle_count // 2].mean()
+
+    def test_vertex_face_holds_the_radius(self):
+        """The upper sheet comes to rest 5 mm over the lower one without a single crossing triangle; without self
+        contact it falls into it. The 2.5 cm margin exceeds the 1.25 cm the sheet falls in its last step."""
+        self.assertGreater(self._drop(0.03)[0], 100)
+        kw = {"particle_self_contact_radius": 0.005, "particle_self_contact_margin": 0.025}
+        worst, gap = self._drop(0.03, particle_enable_self_contact=True, **kw)
+        self.assertEqual(worst, 0)
+        self.assertAlmostEqual(gap, 0.005, delta=2e-4)
+
+    def test_vertex_vertex_holds_the_radius(self):
+        """Particles 3 cm apart cover the 2.8 cm longest edges; the upper sheet nests between the lower particles,
+        2.65 to 3 cm over them, without a crossing triangle. With friction the tilted rows need 5 NSN iterations."""
+        kw = {"particle_self_contact_mode": "vertex_vertex", "particle_self_contact_radius": 0.03}
+        kw |= {"particle_self_contact_margin": 0.0315, "nsn_iterations": 5}
+        worst, gap = self._drop(0.035, particle_enable_self_contact=True, **kw)
+        self.assertEqual(worst, 0)
+        self.assertGreater(gap, 0.0265)
+        self.assertLess(gap, 0.030)
 
 
 if __name__ == "__main__":

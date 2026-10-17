@@ -258,6 +258,11 @@ class SolverFBA(SolverBase):
         soft_contact_thickness: float = 0.0,
         nsn_linear_iterations: int | None = None,
         face_contact_margin: float | None = None,
+        particle_enable_self_contact: bool = False,
+        particle_self_contact_mode: Literal["vertex_face", "vertex_vertex"] = "vertex_face",
+        particle_self_contact_radius: float = 2.0e-3,
+        particle_self_contact_margin: float | None = None,
+        particle_topological_contact_filter_threshold: int = 2,
     ) -> None:
         """
         Args:
@@ -378,6 +383,26 @@ class SolverFBA(SolverBase):
                 ``None`` tests only the triangles next to particle contacts,
                 which misses a shape tip or edge poking into a triangle whose
                 particles all lie beyond the particle contact margin.
+            particle_enable_self_contact: If ``True``, the triangles collide with
+                themselves through contacts found once per step on its start
+                positions, solved with the other contacts. Needs
+                ``friction=True``, ``nsn_schur_mode="full"``, ``use_isodof=True``
+                and no ``mu_per_pair_override``; friction takes
+                ``model.particle_mu``.
+            particle_self_contact_mode: ``"vertex_face"`` keeps each particle
+                ``particle_self_contact_radius`` from its nearest triangle, which
+                covers crossing edges only when the radius reaches half of the
+                longest edge. ``"vertex_vertex"`` keeps particles that radius
+                apart, which covers the surface when it reaches the longest edge
+                (twice the largest circumradius of acute triangles), and leaves
+                a bumpy contact surface.
+            particle_self_contact_radius: Contact distance [m].
+            particle_self_contact_margin: Detection distance [m], at least the
+                radius, twice it by default; it bounds the relative motion per
+                step that cannot pass a contact.
+            particle_topological_contact_filter_threshold: Mesh edges within
+                which particles do not collide with each other or with
+                triangles that have such a particle.
         """
         super().__init__(model)
 
@@ -472,6 +497,21 @@ class SolverFBA(SolverBase):
         self._face_query, self._contact_extra = None, None
         self._constraint_rows = None  # set_particle_constraints: particles, coefficients, directions, targets
         self._constraint_lengths = False  # the rows hold |sum_k c_k x_k|, along its direction at each iteration
+        self._self_contact = None
+        if particle_enable_self_contact:
+            if not self.friction or nsn_schur_mode != "full" or not self.use_isodof or mu_per_pair_override is not None:
+                raise ValueError(
+                    "self contact needs friction=True, nsn_schur_mode='full', use_isodof=True and no mu_per_pair_override"
+                )
+            margin = particle_self_contact_margin
+            margin = 2.0 * particle_self_contact_radius if margin is None else margin
+            if margin < particle_self_contact_radius:
+                raise ValueError("particle_self_contact_margin is smaller than particle_self_contact_radius")
+            from .self_contact import SelfContact  # noqa: PLC0415
+
+            self.particle_self_contact_radius = float(particle_self_contact_radius)
+            filter_rings = particle_topological_contact_filter_threshold
+            self._self_contact = SelfContact(model, particle_self_contact_mode, margin, filter_rings)
         if self.face_contacts:
             if not self.friction or nsn_schur_mode != "full" or not self.use_isodof or mu_per_pair_override is not None:
                 raise ValueError(
@@ -1415,7 +1455,7 @@ class SolverFBA(SolverBase):
             self._setup_pd_system(dt)
 
         # Ingest contact data once per step (if provided).
-        if contacts is not None:
+        if contacts is not None or self._self_contact is not None:
             self.update_contacts(contacts, state_in)
         # Note: if contacts is None, self._contact_count retains its previous value (0 by default).
         # Call with contacts=None to keep existing behaviour; explicitly pass contacts to activate.
@@ -2331,9 +2371,10 @@ class SolverFBA(SolverBase):
         self._contact_extra = None
 
         # With a face contact margin, triangles can touch shapes that no particle touches.
-        faces_only = self._face_query is not None and self.face_contact_margin is not None
-        M_raw = int(contacts.soft_contact_count.numpy()[0])
-        if M_raw == 0 and not faces_only:
+        other_contacts = self._face_query is not None and self.face_contact_margin is not None
+        other_contacts = other_contacts or self._self_contact is not None
+        M_raw = 0 if contacts is None else int(contacts.soft_contact_count.numpy()[0])
+        if M_raw == 0 and not other_contacts:
             self._contact_count = 0
             return
 
@@ -2343,14 +2384,18 @@ class SolverFBA(SolverBase):
         # ``wp.atomic_add(soft_contact_count, 0, 1)`` so per-frame order
         # depends on GPU thread scheduling — downstream Gauss-Seidel and
         # atomic ``J^T λ`` accumulation are order-sensitive, hence we sort.
-        particle_h = contacts.soft_contact_particle.numpy()[:M_raw]
-        shape_h = contacts.soft_contact_shape.numpy()[:M_raw]
-        # soft_contact_body_pos convention (from create_soft_contacts kernel):
-        #   - body_index >= 0 (dynamic body): contact point in body-local frame.
-        #   - body_index  < 0 (static shape): contact point already in world frame
-        #     (because X_wb = identity so X_ws = X_bs, and body_pos = X_bs * x_local).
-        body_pos_h = contacts.soft_contact_body_pos.numpy()[:M_raw]
-        normal_h = contacts.soft_contact_normal.numpy()[:M_raw]  # world frame
+        if contacts is None:
+            particle_h, shape_h = np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.int32)
+            body_pos_h, normal_h = np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
+        else:
+            particle_h = contacts.soft_contact_particle.numpy()[:M_raw]
+            shape_h = contacts.soft_contact_shape.numpy()[:M_raw]
+            # soft_contact_body_pos convention (from create_soft_contacts kernel):
+            #   - body_index >= 0 (dynamic body): contact point in body-local frame.
+            #   - body_index  < 0 (static shape): contact point already in world frame
+            #     (because X_wb = identity so X_ws = X_bs, and body_pos = X_bs * x_local).
+            body_pos_h = contacts.soft_contact_body_pos.numpy()[:M_raw]
+            normal_h = contacts.soft_contact_normal.numpy()[:M_raw]  # world frame
 
         # Filter out sentinel entries (particle == -1).
         valid_mask = particle_h >= 0
@@ -2360,7 +2405,7 @@ class SolverFBA(SolverBase):
         normal_h = normal_h[valid_mask]
         M = int(particle_h.shape[0])
 
-        if M == 0 and not faces_only:
+        if M == 0 and not other_contacts:
             self._contact_count = 0
             return
 
@@ -2379,7 +2424,7 @@ class SolverFBA(SolverBase):
         normal_h = normal_h[order]
 
         # Face contacts follow the particle contacts: slot 0 holds their first particle.
-        alpha_h = np.ones(M, dtype=np.float32)
+        alpha_h, extra = np.ones(M, dtype=np.float32), None
         if self._face_query is not None:
             src = state if state is not None else self.model
             found = self._face_query.query(
@@ -2398,8 +2443,25 @@ class SolverFBA(SolverBase):
                 normal_h = np.concatenate([normal_h, found[4]])
                 extra = [np.full((M, 2), -1, dtype=np.int32), np.zeros((M, 2), dtype=np.float32)]
                 extra = [np.concatenate([extra[0], tri[:, 1:]]), np.concatenate([extra[1], bary[:, 1:]])]
-                self._contact_extra = [wp.array(a, device=self._device) for a in extra]
                 M = len(particle_h)
+        # Self contacts follow, with a static anchor at the contact radius along their normal: their rows hold
+        # n . sum_k alpha_k x_k >= radius and start without tangential offset.
+        shape_contacts = M
+        if self._self_contact is not None:
+            src = state if state is not None else self.model
+            sp, sa, sn = self._self_contact.detect(src.particle_q)
+            if len(sp):
+                particle_h, alpha_h = np.concatenate([particle_h, sp[:, 0]]), np.concatenate([alpha_h, sa[:, 0]])
+                shape_h, normal_h = np.concatenate([shape_h, np.full(len(sp), -1)]), np.concatenate([normal_h, sn])
+                body_pos_h = np.concatenate([body_pos_h, self.particle_self_contact_radius * sn])
+                if extra is None:
+                    extra = [np.full((M, 3), -1, dtype=np.int32), np.zeros((M, 3), dtype=np.float32)]
+                else:
+                    extra = [np.pad(extra[0], ((0, 0), (0, 1)), constant_values=-1), np.pad(extra[1], ((0, 0), (0, 1)))]
+                extra = [np.concatenate([extra[0], sp[:, 1:]]), np.concatenate([extra[1], sa[:, 1:]])]
+                M = len(particle_h)
+        if extra is not None:
+            self._contact_extra = [wp.array(a, device=self._device) for a in extra]
         if M == 0:
             self._contact_count = 0
             return
@@ -2485,7 +2547,7 @@ class SolverFBA(SolverBase):
 
             wp.launch(
                 add_offset_kernel,
-                dim=M,
+                dim=shape_contacts,
                 inputs=[wp.float64(self.soft_contact_thickness)],
                 outputs=[self._contact_offset_d],
                 device=device,
