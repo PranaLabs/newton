@@ -11,13 +11,12 @@ upstream `main` for general Newton documentation.
   <img src="image/stretching_cloth_checker.webp" width="48%" alt="Stretching cloth (Demo 3)" />
 </p>
 <p align="center">
-  <img src="image/pulling_wooper_checker.webp" width="48%" alt="Pulling wooper (Demo 4)" />
   <img src="image/squeezing_ball_checker.webp" width="48%" alt="Squeezing ball (Demo 5)" />
 </p>
 <p align="center">
   <img src="image/multienv25_v5.webp" width="96%" alt="25 parallel cloth envs on a sphere (single GPU, lite NSN)" />
 </p>
-<p align="center"><sub><em>Top row:</em> CudaTests / RealSim port — twisting bar, stretching cloth. <em>Middle:</em> pulling wooper, squeezing ball. <em>Bottom:</em> 25-env cloth-on-sphere replicated on a single GPU via lite-NSN Schur.</sub></p>
+<p align="center"><sub><em>Top row:</em> CudaTests / RealSim port — twisting bar, stretching cloth. <em>Middle:</em> squeezing ball. <em>Bottom:</em> 25-env cloth-on-sphere replicated on a single GPU via lite-NSN Schur.</sub></p>
 
 ## Quickstart
 
@@ -75,7 +74,6 @@ port line-by-line against RealSim.
 |---|---|
 | Demo 2 — twisting bar | `uv run python -m newton.examples twisting_bar_fba` |
 | Demo 3 — stretching cloth | `uv run python -m newton.examples stretching_cloth_fba` |
-| Demo 4 — pulling wooper | `uv run python -m newton.examples pulling_wooper_fba` |
 | Demo 5 — squeezing ball | `uv run python -m newton.examples squeezing_ball_fba` |
 | RealSim cloth-on-sphere | `uv run python -m scripts.fba_cloth_on_sphere_realsim_baseline` |
 | Hanging cloth (m / cm scale) | `uv run python -m newton.examples cloth_hanging_fba` |
@@ -134,7 +132,7 @@ history (`git log --oneline ziqiu/fba-solver-design --not origin/main`).
 
 3. **FBA examples added under `newton/examples/`**: `cloth_hanging_fba`,
    `cloth_on_sphere_fba`, `cloth_franka_fba`, `stretching_cloth_fba`,
-   `twisting_bar_fba`, `pulling_wooper_fba`, `softbody_hanging_fba`,
+   `twisting_bar_fba`, `softbody_hanging_fba`,
    `squeezing_ball_fba`, and the cm-scale `example_hanging_cloth_fba_cm.py`.
 
 4. **Diagnostics**: `_pc_last_vt_hits` (v-t broadphase candidates),

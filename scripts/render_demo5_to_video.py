@@ -119,8 +119,7 @@ def main() -> None:
         "--example",
         type=str,
         default="squeezing_ball_fba",
-        help="Newton example module under newton.examples.softbody to drive "
-        "(e.g. squeezing_ball_fba, pulling_wooper_fba).",
+        help="Newton example module under newton.examples.softbody to drive (e.g. squeezing_ball_fba).",
     )
     args = parser.parse_args()
 

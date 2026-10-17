@@ -120,8 +120,8 @@ def _make_ill_conditioned_tet(seed: int = 0) -> tuple[np.ndarray, np.ndarray, np
 
     Builds Dm_inv via a regular unit-edge tet and stretches the deformed tet
     to give ``F = diag(stretch)`` with the smallest singular value at 1e-4.
-    Mirrors the wooper tail-tip regime where one direction is highly extended
-    and one is squashed (per the Demo 4 root-cause spec).
+    Mirrors a thin tip stretched far along one direction and squashed along
+    another.
     """
     rest = np.array(
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],

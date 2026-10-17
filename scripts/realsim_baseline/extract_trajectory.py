@@ -38,10 +38,6 @@ def _make_offline_scene(scene_path: Path, max_frame: int | None) -> Path:
     # ``simulation/output_abc/<DemoName>`` regardless of scene-json setting.
     # Fixes per-scene drift:
     #   - StretchingCloth has no ``output_abc`` field → inject default.
-    #   - PullingWooper has absolute path ``/simulation/.../PullingWooper/output``
-    #     (leading slash points at fs root + extra ``/output`` subdir, so
-    #     RealSim either fails Permission Denied or writes one level too
-    #     deep for extract_abc to find).
     demo_name = scene_path.parent.name
     cfg["output_abc"] = f"simulation/output_abc/{demo_name}"
     fd, tmp_path = tempfile.mkstemp(prefix=f"realsim_{scene_path.parent.name}_", suffix=".json")

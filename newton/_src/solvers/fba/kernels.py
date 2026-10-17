@@ -281,8 +281,8 @@ def project_arap_3x3_d(F: wp.mat33d) -> wp.mat33d:
     """fp64 variant of :func:`project_arap_3x3`.
 
     Lifts the SVD and reflection-handling rotation projection to ``wp.float64``
-    so that ill-conditioned ``F`` (large condition number, e.g. extreme
-    stretching of a wooper tail tip) does not lose accuracy through the fp32
+    so that ill-conditioned ``F`` (large condition number, e.g. a thin tip
+    stretched far along one axis) does not lose accuracy through the fp32
     SVD core. Mirrors RealSim's ``signedEigenSVD`` (``SVD.cpp:7-29``) which
     runs an Eigen JacobiSVD in ``double``; the reflection branch here flips
     column 2 of U to keep R a proper rotation.

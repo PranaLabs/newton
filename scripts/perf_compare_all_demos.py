@@ -6,7 +6,6 @@ For each of the four flagship CudaTests demos --
 
 * ``TwistingBarNH``      (NeoHookean, no contacts)
 * ``StretchingCloth``    (NeoHookean cloth, no contacts)
-* ``PullingWooper``      (NeoHookean tet, unilateral contacts)
 * ``SqueezingBall``      (NeoHookean tet, frictional contacts + rolling cyls)
 
 -- this script runs both Newton FBA (with :class:`SolverFBA` instantiated with
@@ -193,71 +192,6 @@ def _run_fba_stretching_cloth(n_frames: int, warmup: int) -> dict:
     return _pack_fba(summary, step_times, setup_ms, warmup, n_frames)
 
 
-def _run_fba_pulling_wooper(n_frames: int, warmup: int) -> dict:
-    from newton.solvers import SolverFBA  # noqa: PLC0415
-    from scripts.fba_demo4_pulling_wooper import (  # noqa: PLC0415
-        DT,
-        NSN_ITERATIONS,
-        PD_ITERATIONS,
-        PIN_DIR,
-        PIN_MAXLENGTH,
-        PIN_VEL,
-        build_model,
-    )
-
-    model, pipeline, contacts, verts_world, pin_idx, mu, lam = build_model()
-
-    t_setup0 = time.perf_counter()
-    solver = SolverFBA(
-        model,
-        iterations=PD_ITERATIONS,
-        nsn_iterations=NSN_ITERATIONS,
-        friction=False,
-        stretching_model="neohookean",
-        mu=mu,
-        lam=lam,
-        lambda_cap=1.0e12,
-        pin_stiffness=1.0e10,
-        enable_perf_timing=True,
-    )
-    s_in = model.state()
-    s_out = model.state()
-    s_in.clear_forces()
-    pipeline.collide(s_in, contacts)
-    solver.step(s_in, s_out, None, contacts, DT)
-    if wp.is_cuda_available():
-        wp.synchronize()
-    setup_ms = (time.perf_counter() - t_setup0) * 1000.0
-
-    s_in = model.state()
-    s_out = model.state()
-    pin_init = verts_world[pin_idx].copy()
-    targets = verts_world.copy().astype(np.float32)
-    pulled = 0.0
-    step_times = []
-    for f in range(n_frames):
-        delta = PIN_VEL * DT
-        if pulled + delta > PIN_MAXLENGTH:
-            delta = max(0.0, PIN_MAXLENGTH - pulled)
-        pulled += delta
-        targets[pin_idx] = pin_init + (PIN_DIR * pulled).astype(np.float32)
-        solver.set_pin_targets(targets)
-        if wp.is_cuda_available():
-            wp.synchronize()
-        if f == warmup:
-            solver.reset_timing()
-        t0 = time.perf_counter()
-        s_in.clear_forces()
-        pipeline.collide(s_in, contacts)
-        solver.step(s_in, s_out, None, contacts, DT)
-        if wp.is_cuda_available():
-            wp.synchronize()
-        step_times.append((time.perf_counter() - t0) * 1000.0)
-        s_in, s_out = s_out, s_in
-    summary = solver.get_timing_summary(last_n_steps=None)
-    return _pack_fba(summary, step_times, setup_ms, warmup, n_frames)
-
-
 def _run_fba_squeezing_ball(n_frames: int, warmup: int) -> dict:
     from newton.solvers import SolverFBA  # noqa: PLC0415
     from scripts.fba_demo5_squeezing_ball import (  # noqa: PLC0415
@@ -339,7 +273,6 @@ def _pack_fba(summary: dict, step_times_ms: list[float], setup_ms: float, warmup
 FBA_RUNNERS = {
     "TwistingBarNH": _run_fba_twisting_bar_nh,
     "StretchingCloth": _run_fba_stretching_cloth,
-    "PullingWooper": _run_fba_pulling_wooper,
     "SqueezingBall": _run_fba_squeezing_ball,
 }
 
@@ -528,7 +461,7 @@ def main() -> None:
     ap.add_argument("--realsim-timer", type=int, default=None, help="Override scene.json::timer for RealSim runs")
     args = ap.parse_args()
 
-    demos = args.demos or ["TwistingBarNH", "StretchingCloth", "PullingWooper", "SqueezingBall"]
+    demos = args.demos or ["TwistingBarNH", "StretchingCloth", "SqueezingBall"]
     wp.init()
 
     results: list[DemoResult] = []

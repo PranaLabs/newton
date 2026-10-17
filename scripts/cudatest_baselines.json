@@ -38,19 +38,6 @@
     "returncode": -6,
     "clean_exit": false
   },
-  "PullingWooper": {
-    "demo": "PullingWooper",
-    "status": "ok",
-    "frames_timed": 24,
-    "mean_ms": 24.082,
-    "median_ms": 28.784,
-    "p95_ms": 31.508,
-    "wall_s": 13.2,
-    "scene": "/home/ziqiu/work/RealSim_py/realsim_py/simulation/config/CudaTests/PullingWooper/scene.json",
-    "max_frame": 500,
-    "returncode": -6,
-    "clean_exit": false
-  },
   "CrossingGingerbreadman": {
     "demo": "CrossingGingerbreadman",
     "status": "ok",

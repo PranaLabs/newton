@@ -7,7 +7,7 @@ shape ``(frames, particles, 3)``) and emits a 3-tier verdict per
 ``docs/superpowers/specs/2026-05-17-fba-verification-criteria.md``.
 
 Tier 1 (BINARY, must pass):
-    - Per-demo physical event (e.g. wooper drops past gap)
+    - Per-demo physical event (e.g. the stretched cloth widens by 1.5 m)
     - Stability sentinels (no NaN/Inf, no particle outside 10x scene bbox)
 
 Tier 2 (QUANTITATIVE, target -- investigate if missed):
@@ -15,7 +15,6 @@ Tier 2 (QUANTITATIVE, target -- investigate if missed):
     target per demo:
         TwistingBarNH     1e-3 m
         StretchingCloth   1e-3 m
-        PullingWooper     1e-2 m
         SqueezingBall     5e-2 m
 
 Tier 3 (diagnostics, always reported, never auto-fail):
@@ -64,11 +63,6 @@ DEMO_SPECS: dict[str, DemoSpec] = {
         name="StretchingCloth",
         tier2_threshold_m=1e-3,
         physical_event="cloth x-bbox expands by >= 1.5 m without NaN",
-    ),
-    "PullingWooper": DemoSpec(
-        name="PullingWooper",
-        tier2_threshold_m=1e-2,
-        physical_event="wooper min_y <= -7.0 m without NaN",
     ),
     "SqueezingBall": DemoSpec(
         name="SqueezingBall",
@@ -211,16 +205,6 @@ def _physical_event_stretching_cloth(fba: np.ndarray) -> tuple[bool, dict]:
     }
 
 
-def _physical_event_pulling_wooper(fba: np.ndarray) -> tuple[bool, dict]:
-    final_min_y = float(fba[-1, :, 1].min())
-    has_nan = bool(np.isnan(fba).any())
-    return (final_min_y <= -7.0 and not has_nan), {
-        "final_min_y_m": final_min_y,
-        "threshold_max_min_y_m": -7.0,
-        "fba_has_nan": has_nan,
-    }
-
-
 def _physical_event_squeezing_ball(fba: np.ndarray) -> tuple[bool, dict]:
     final_mean_y = float(fba[-1, :, 1].mean())
     # No-scatter sentinel: no particle ever further than 50 m from origin.
@@ -245,8 +229,6 @@ def _physical_event(demo: str, fba: np.ndarray) -> tuple[bool, dict]:
         return _physical_event_twisting_bar(fba)
     if demo == "StretchingCloth":
         return _physical_event_stretching_cloth(fba)
-    if demo == "PullingWooper":
-        return _physical_event_pulling_wooper(fba)
     if demo == "SqueezingBall":
         return _physical_event_squeezing_ball(fba)
     raise ValueError(f"unknown demo: {demo}")

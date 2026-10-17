@@ -47,19 +47,6 @@
       "constraintsolver_maxforce": null,
       "notes": "No 'constraintsolver' block (no contacts; pure FEM stretching). Single object, obj_mass=1000."
     },
-    "PullingWooper": {
-      "scene_path": "simulation/config/CudaTests/PullingWooper/scene.json",
-      "object_configs": ["simulation/config/CudaTests/PullingWooper/wooper_5k.json"],
-      "total_mass": 1000,
-      "total_mass_field": "mechanical_props.obj_mass",
-      "total_mass_per_object": {"object_0": 1000},
-      "constraintsolver_type": "NonSmoothNewton_CUDA",
-      "constraintsolver_iterations": 10,
-      "constraintsolver_maxforce": 1000000000000.0,
-      "constraintsolver_tolerance": 1e-09,
-      "constraintsolver_function": "FB",
-      "notes": "Matches plan expectation (maxforce=1e12, iters=10)."
-    },
     "SqueezingBall": {
       "scene_path": "simulation/config/CudaTests/SqueezingBall/scene.json",
       "object_configs": ["simulation/config/CudaTests/SqueezingBall/ball_7k.json"],
@@ -152,7 +139,6 @@
         ["TwistingBar", 1000, null, null],
         ["TwistingBarNH", 1000, null, null],
         ["StretchingCloth", 1000, null, null],
-        ["PullingWooper", 1000, 10, 1e12],
         ["SqueezingBall", 1000, 10, 1e12],
         ["CrossingGingerbreadman", 1000, 10, 1e15],
         ["SharpCorner", 1000, 10, 100],
