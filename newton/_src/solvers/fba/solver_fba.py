@@ -497,12 +497,10 @@ class SolverFBA(SolverBase):
         self._face_query, self._contact_extra = None, None
         self._constraint_rows = None  # set_particle_constraints: particles, coefficients, directions, targets
         self._constraint_lengths = False  # the rows hold |sum_k c_k x_k|, along its direction at each iteration
-        self._self_contact = None
+        self._self_contact, self._lite_slot_rows = None, None
         if particle_enable_self_contact:
-            if not self.friction or nsn_schur_mode != "full" or not self.use_isodof or mu_per_pair_override is not None:
-                raise ValueError(
-                    "self contact needs friction=True, nsn_schur_mode='full', use_isodof=True and no mu_per_pair_override"
-                )
+            if not self.friction or not self.use_isodof or mu_per_pair_override is not None:
+                raise ValueError("self contact needs friction=True, use_isodof=True and no mu_per_pair_override")
             margin = particle_self_contact_margin
             margin = 2.0 * particle_self_contact_radius if margin is None else margin
             if margin < particle_self_contact_radius:
@@ -1656,6 +1654,10 @@ class SolverFBA(SolverBase):
                             # below builds each ``3×3`` local W on-the-fly.
                             # Only the row-metadata CSR is needed so the
                             # ``apply_lambda_correction_combined`` gather can run.
+                            if n_b and self._contact_extra is not None:
+                                raise NotImplementedError(
+                                    "the lite NSN does not yet hold particle constraints with self or face contacts"
+                                )
                             ls.setup_lite_row_meta(
                                 M,
                                 self._contact_particle_d,
@@ -1664,7 +1666,9 @@ class SolverFBA(SolverBase):
                                 self._contact_tangent1_d,
                                 self._contact_tangent2_d,
                                 bilateral=self._lite_constraint_rows() if n_b else None,
+                                **self._contact_extra_args(),
                             )
+                            self._lite_slot_rows = None if self._contact_extra is None else self._slot_rows(M)
                         else:
                             ls.build_schur_complement(
                                 M,
@@ -1717,7 +1721,35 @@ class SolverFBA(SolverBase):
                         use_per_particle = n_b or (
                             getattr(ls, "_isodof_max_k", 1) > 3 and getattr(ls, "_isodof_unique_d", None) is not None
                         )
-                        if use_per_particle:
+                        if self._lite_slot_rows is not None:
+                            # Rows on several particles couple them: the sparse lite NSN.
+                            (pa, pb, pc, pd), (wa, wb, wc, wd), ones = self._lite_slot_rows
+                            self._solve_nsn_coulomb_lite_bsr(
+                                M_total=M,
+                                row_particle_a_d=pa,
+                                row_particle_b_d=pb,
+                                row_dir_d=ls._row_dir_d,
+                                row_alpha_d=ones,
+                                contact_mu_d=self._contact_mu_d,
+                                r_d=self._nsn_r_d,
+                                pene0_d=self._nsn_pene0_d,
+                                lam_init_d=self._lam_coulomb_persistent_d,
+                                omega_init_d=self._omega_coulomb_persistent_d,
+                                lam_out_d=self._nsn_lam_d,
+                                omega_out_d=self._nsn_omega_d,
+                                lam_apply_out_d=self._nsn_lam_apply_d,
+                                dt=dt,
+                                n_fb_iters=int(self.nsn_iterations),
+                                cap_internal=cap_internal,
+                                use_cap=bool(use_cap),
+                                row_particle_c_d=pc,
+                                row_particle_d_d=pd,
+                                row_wa_d=wa,
+                                row_wb_d=wb,
+                                row_wc_d=wc,
+                                row_wd_d=wd,
+                            )
+                        elif use_per_particle:
                             wp.launch(
                                 K_step.fb_newton_lite_coulomb_per_particle_kernel,
                                 dim=ls._n_isodofs,
@@ -2265,6 +2297,17 @@ class SolverFBA(SolverBase):
         arrays = [(particles, np.int32, wp.int32), (coefficients, np.float32, wp.float32)]
         arrays += [(directions, np.float32, wp.vec3), (targets, np.float64, wp.float64)]
         self._constraint_rows = [wp.array(np.asarray(a, dtype=n), dtype=t, device=self._device) for a, n, t in arrays]
+
+    def _slot_rows(self, M: int) -> tuple[list, list, wp.array]:
+        """Particles and coefficients of the rows of the ``M`` contacts in four slots, and unit row scales, for the
+        sparse lite NSN."""
+        extra_p, extra_a = (a.numpy()[:M] for a in self._contact_extra)
+        pad = ((0, 0), (0, 3 - extra_p.shape[1]))
+        p = np.column_stack([self._contact_particle_h[:M], np.pad(extra_p, pad, constant_values=-1)]).repeat(3, axis=0)
+        w = np.column_stack([self._contact_alpha_h[:M], np.pad(extra_a, pad)]).repeat(3, axis=0)
+        particles = [wp.array(np.ascontiguousarray(p[:, k]), dtype=wp.int32, device=self._device) for k in range(4)]
+        weights = [wp.array(np.ascontiguousarray(w[:, k]), dtype=wp.float32, device=self._device) for k in range(4)]
+        return particles, weights, wp.array(np.ones(3 * M, dtype=np.float32), device=self._device)
 
     def _lite_constraint_rows(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Particles, directions and coefficients of the bilateral rows, each on one particle."""
@@ -3749,6 +3792,10 @@ class SolverFBA(SolverBase):
             )
 
             A_bsr = ls.build_a_schur_lite_bsr(W_bsr, omega_v, compliance_v)
+            # The right-hand side takes the constraint value under the updated weights, as the dense driver does.
+            inputs = [omega_v, lam_v]
+            wp.launch(K.compute_omega_times_lam_kernel, dim=n_rows, inputs=inputs, outputs=[omega_lam_v], device=device)
+            wps.bsr_mv(W_bsr, omega_lam_v, w_omega_lam_v)
             wp.launch(
                 K.compute_nsn_rhs_lite_bsr_kernel,
                 dim=n_rows,

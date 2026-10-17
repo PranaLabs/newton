@@ -100,23 +100,22 @@ class TestSelfContactSolve(unittest.TestCase):
         if not wp.is_cuda_available():
             raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
 
-    def _drop(self, start_gap, **self_contact):
-        """Largest number of intersecting triangle pairs over 1 s, then the gap between the sheets [m]."""
+    def _drop(self, start_gap, cells=10, fps=60, steps=60, **solver_args):
+        """Largest number of intersecting triangle pairs over the steps, then the gap between the sheets [m]."""
         builder = newton.ModelBuilder()
         builder.add_shape_box(-1, xform=wp.transform((0.0, 0.0, 0.25), wp.quat_identity()), hx=0.25, hy=0.25, hz=0.25)
-        grid = {"dim_x": 10, "dim_y": 10, "cell_x": 0.02, "cell_y": 0.02, "mass": 0.004, "tri_ke": 1e3, "tri_ka": 1e3}
+        grid = {"dim_x": cells, "dim_y": cells, "cell_x": 0.02, "cell_y": 0.02, "mass": 0.004, "tri_ke": 1e3}
         for z, shift in ((0.5, 0.0), (0.5 + start_gap, 0.004)):
-            builder.add_cloth_grid(
-                pos=wp.vec3(shift - 0.1, shift - 0.1, z), rot=wp.quat_identity(), vel=wp.vec3(0.0), **grid
-            )
+            corner = wp.vec3(shift - 0.01 * cells, shift - 0.01 * cells, z)
+            builder.add_cloth_grid(pos=corner, rot=wp.quat_identity(), vel=wp.vec3(0.0), tri_ka=1e3, **grid)
         model = builder.finalize()
-        solver = newton.solvers.SolverFBA(model, iterations=10, **self_contact)
+        solver = newton.solvers.SolverFBA(model, iterations=10, **solver_args)
         pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.01)
         detector = TriMeshCollisionDetector(model)
         contacts, s0, s1, worst = pipeline.contacts(), model.state(), model.state(), 0
-        for _ in range(60):
+        for _ in range(steps):
             pipeline.collide(s0, contacts)
-            solver.step(s0, s1, None, contacts, 1.0 / 60.0)
+            solver.step(s0, s1, None, contacts, 1.0 / fps)
             s0, s1 = s1, s0
             detector.refit(s0.particle_q)
             detector.triangle_triangle_intersection_detection()
@@ -142,6 +141,19 @@ class TestSelfContactSolve(unittest.TestCase):
         self.assertEqual(worst, 0)
         self.assertGreater(gap, 0.0265)
         self.assertLess(gap, 0.030)
+
+    def test_lite_nsn_holds_the_radius(self):
+        """In the lite NSN, rows on several particles join a sparse solve, and both modes hold their radius as in
+        the full NSN, at steps of 1/600 s where the lite Delassus approximation holds for this cloth."""
+        vertex_face = {"particle_self_contact_radius": 0.005, "particle_self_contact_margin": 0.01}
+        vertex_vertex = {"particle_self_contact_mode": "vertex_vertex", "particle_self_contact_radius": 0.03}
+        vertex_vertex["particle_self_contact_margin"] = 0.0315
+        for kw, start, low, high in ((vertex_face, 0.015, 0.0049, 0.0051), (vertex_vertex, 0.035, 0.0265, 0.030)):
+            lite = {"particle_enable_self_contact": True, "nsn_schur_mode": "lite"}
+            worst, gap = self._drop(start, cells=6, fps=600, steps=80, **kw, **lite)
+            self.assertEqual(worst, 0)
+            self.assertGreater(gap, low)
+            self.assertLess(gap, high)
 
 
 if __name__ == "__main__":

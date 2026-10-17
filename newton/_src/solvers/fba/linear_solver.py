@@ -1154,23 +1154,9 @@ class FBALinearSolver:
             row_alpha = np.concatenate([row_alpha, b_a[:, 0]]).astype(np.float32)
             total_rows += len(b_p)
 
-        # Rows on several particles keep their extra slots and a CSR from particle to ``row * K + slot``.
-        self._row_slots, isodof_particles = None, row_particle
-        if extra_p is not None and (extra_p >= 0).any():
-            if not use_isodof:
-                raise NotImplementedError("rows on several particles need use_isodof=True")
-            rows, slots = np.nonzero(extra_p >= 0)
-            width = extra_p.shape[1] + 1
-            order = np.argsort(extra_p[rows, slots], kind="stable")
-            offsets = np.zeros(n + 1, dtype=np.int32)
-            offsets[1:] = np.cumsum(np.bincount(extra_p[rows, slots], minlength=n))
-            self._row_slots = (
-                wp.array(np.column_stack([row_particle, extra_p]), dtype=wp.int32, device=dev),
-                wp.array(np.column_stack([row_alpha, extra_a]), dtype=wp.float32, device=dev),
-                wp.array(offsets, dtype=wp.int32, device=dev),
-                wp.array((rows * width + slots + 1)[order].astype(np.int32), dtype=wp.int32, device=dev),
-            )
-            isodof_particles = np.concatenate([row_particle, extra_p[rows, slots]])
+        if extra_p is not None and (extra_p >= 0).any() and not use_isodof:
+            raise NotImplementedError("rows on several particles need use_isodof=True")
+        isodof_particles = self._set_row_slots(row_particle, row_alpha, extra_p, extra_a)
 
         # Upload direction arrays to device.
         row_particle_d = wp.array(row_particle, dtype=wp.int32, device=dev)
@@ -1692,6 +1678,28 @@ class FBALinearSolver:
         self._row_alpha_h = row_alpha
         return self._W_lite_bsr
 
+    def _set_row_slots(self, row_particle, row_alpha, extra_p, extra_a) -> np.ndarray:
+        """Keep the extra slots of rows on several particles, with a CSR from particle to ``row * K + slot``.
+
+        Returns every particle of the rows, the first slots first.
+        """
+        self._row_slots = None
+        if extra_p is None or not (extra_p >= 0).any():
+            return row_particle
+        dev, n = self.device, self.n
+        rows, slots = np.nonzero(extra_p >= 0)
+        width = extra_p.shape[1] + 1
+        order = np.argsort(extra_p[rows, slots], kind="stable")
+        offsets = np.zeros(n + 1, dtype=np.int32)
+        offsets[1:] = np.cumsum(np.bincount(extra_p[rows, slots], minlength=n))
+        self._row_slots = (
+            wp.array(np.column_stack([row_particle, extra_p]), dtype=wp.int32, device=dev),
+            wp.array(np.column_stack([row_alpha, extra_a]), dtype=wp.float32, device=dev),
+            wp.array(offsets, dtype=wp.int32, device=dev),
+            wp.array((rows * width + slots + 1)[order].astype(np.int32), dtype=wp.int32, device=dev),
+        )
+        return np.concatenate([row_particle, extra_p[rows, slots]])
+
     def setup_lite_row_meta(
         self,
         num_contacts: int,
@@ -1701,6 +1709,8 @@ class FBALinearSolver:
         j_tangent1: wp.array | None = None,
         j_tangent2: wp.array | None = None,
         bilateral: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+        j_extra_indices: wp.array | None = None,
+        j_extra_alpha: wp.array | None = None,
     ) -> int:
         """Populate per-row metadata for LiteNSN paths without building ``W``.
 
@@ -1715,7 +1725,9 @@ class FBALinearSolver:
         dense ``W`` buffer — defeating the lite memory win at large ``M``).
 
         ``bilateral`` appends rows on one particle each, as ``(particles,
-        directions, coefficients)``.
+        directions, coefficients)``. ``j_extra_indices`` and ``j_extra_alpha``
+        hold further particles of the contacts, shape ``[M, K - 1]``, as in
+        :meth:`build_schur_complement`.
 
         Returns ``total_rows`` (``M`` for Stage A, ``3M`` for Stage B, plus the
         bilateral rows).
@@ -1741,11 +1753,20 @@ class FBALinearSolver:
             row_alpha[0::3] = a_np; row_alpha[1::3] = a_np; row_alpha[2::3] = a_np
         else:
             row_particle[:] = idx_np; row_dir[:] = n_np; row_alpha[:] = a_np
+        extra_p = extra_a = None
+        if j_extra_indices is not None:
+            extra_p = np.repeat(j_extra_indices.numpy()[:M], rows_per_contact, axis=0)
+            extra_a = np.repeat(j_extra_alpha.numpy()[:M], rows_per_contact, axis=0)
         if bilateral is not None:
             row_particle = np.concatenate([row_particle, np.asarray(bilateral[0], dtype=np.int32)])
             row_dir = np.concatenate([row_dir, np.asarray(bilateral[1], dtype=np.float32)])
             row_alpha = np.concatenate([row_alpha, np.asarray(bilateral[2], dtype=np.float32)])
+            if extra_p is not None:
+                pad = row_particle.size - total_rows
+                extra_p = np.vstack([extra_p, np.full((pad, extra_p.shape[1]), -1, dtype=np.int32)])
+                extra_a = np.vstack([extra_a, np.zeros((pad, extra_a.shape[1]), dtype=np.float32)])
             total_rows = row_particle.size
+        self._set_row_slots(row_particle, row_alpha, extra_p, extra_a)
 
         self._row_particle_d = wp.array(row_particle, dtype=wp.int32, device=dev)
         self._row_dir_d = wp.array(row_dir, dtype=wp.vec3, device=dev)
