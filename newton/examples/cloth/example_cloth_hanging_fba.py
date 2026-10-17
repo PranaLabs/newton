@@ -12,6 +12,7 @@
 #
 ###########################################################################
 
+import numpy as np
 import warp as wp
 
 import newton
@@ -54,6 +55,7 @@ class Example:
         top_right = dim * (dim + 1) + dim
         builder.particle_mass[top_left] = 0.0
         builder.particle_mass[top_right] = 0.0
+        self.pins = [top_left, top_right]
 
         self.model = builder.finalize()
         self.solver = SolverFBA(self.model, iterations=10)
@@ -73,16 +75,17 @@ class Example:
         self.viewer.log_state(self.state_0)
         self.viewer.end_frame()
 
-    def test_final(self):
-        import numpy as np  # noqa: PLC0415
+    def test_post_step(self):
+        speed = np.linalg.norm(self.state_0.particle_qd.numpy(), axis=1).max()
+        assert speed < 5.0, f"particle speed {speed:.2f} m/s at t={self.sim_time:.2f} s"
 
-        q = self.state_0.particle_q.numpy()
+    def test_final(self):
+        # After 5 s the 1.6 m sheet hangs from its two top corners at y = 3.6 m down to y = 1.8 m.
+        q, q0 = self.state_0.particle_q.numpy(), self.model.particle_q.numpy()
         assert np.all(np.isfinite(q)), "non-finite particle positions detected"
-        # Verify the cloth has moved under gravity: at least some particles
-        # should have descended well below the initial height of 2.8 m.
-        assert q[:, 1].min() < 2.0, "cloth did not descend under gravity"
-        # The cloth should not have exploded — bounded within [-10, 10] in y.
-        assert q[:, 1].min() > -10.0, f"cloth exploded: min y={q[:, 1].min():.4f}"
+        assert np.abs(q[self.pins] - q0[self.pins]).max() < 1.0e-6, "pinned corners moved"
+        assert 1.6 < q[:, 1].min() < 2.0, f"the sheet hangs down to y = {q[:, 1].min():.3f} m"
+        assert q[:, 1].mean() < 3.0, f"the sheet's centroid is at y = {q[:, 1].mean():.3f} m"
 
 
 if __name__ == "__main__":

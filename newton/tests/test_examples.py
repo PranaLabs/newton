@@ -352,6 +352,41 @@ add_example_test(
     test_options={"num-frames": 200},
     use_viewer=True,
 )
+add_example_test(
+    TestClothExamples,
+    name="cloth.example_cloth_hanging_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 300},
+    use_viewer=True,
+)
+add_example_test(
+    TestClothExamples,
+    name="cloth.example_hanging_cloth_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 200},
+    use_viewer=True,
+)
+add_example_test(
+    TestClothExamples,
+    name="cloth.example_hanging_cloth_fba_cm",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 200},
+    use_viewer=True,
+)
+add_example_test(
+    TestClothExamples,
+    name="cloth.example_cloth_on_sphere_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 300},
+    use_viewer=True,
+)
+add_example_test(
+    TestClothExamples,
+    name="cloth.example_stretching_cloth_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 300},
+    use_viewer=True,
+)
 
 
 class TestRobotExamples(unittest.TestCase):

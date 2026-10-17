@@ -24,8 +24,6 @@ import newton
 import newton.examples
 from newton.solvers import SolverFBA
 
-_MESH_PATH = Path("/home/ziqiu/work/RealSim_py/realsim_py/resources/mesh/cloth/square_1013P.obj")
-
 # ParallelEnvTest/scene.json + cloth0.json
 _DT = 0.01
 _PD_ITER = 5  # scene.json LocalGlobal = 5
@@ -62,20 +60,16 @@ _CHECKER_TILES = 16.0  # uv-tile multiplier across the cloth bounding box
 _SPHERE_COLOR = (0.55, 0.55, 0.65)
 
 
-def _load_obj(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    verts: list[list[float]] = []
-    tris: list[list[int]] = []
-    with open(path) as f:
-        for line in f:
-            tokens = line.split()
-            if not tokens:
-                continue
-            if tokens[0] == "v":
-                verts.append([float(t) for t in tokens[1:4]])
-            elif tokens[0] == "f":
-                idx = [int(t.split("/")[0]) - 1 for t in tokens[1:4]]
-                tris.append(idx)
-    return np.array(verts, dtype=np.float32), np.array(tris, dtype=np.int32)
+def _square_cloth(n: int) -> tuple[np.ndarray, np.ndarray]:
+    """An ``n x n`` grid on ``[-1, 1]^2`` in the ``z = 0`` plane with a vertex at each cell center, four triangles per cell."""
+    g = np.linspace(-1.0, 1.0, n + 1)
+    c = 0.5 * (g[1:] + g[:-1])
+    uv = np.vstack([np.stack(np.meshgrid(a, a, indexing="ij"), -1).reshape(-1, 2) for a in (g, c)])
+    i, j = (a.ravel() for a in np.meshgrid(np.arange(n), np.arange(n), indexing="ij"))
+    quad = np.stack([i * (n + 1) + j, (i + 1) * (n + 1) + j, (i + 1) * (n + 1) + j + 1, i * (n + 1) + j + 1], axis=1)
+    center = (n + 1) ** 2 + i * n + j
+    tris = np.concatenate([np.stack([quad[:, k], quad[:, (k + 1) % 4], center], axis=1) for k in range(4)])
+    return np.column_stack([uv, np.zeros(len(uv))]).astype(np.float32), tris.astype(np.int32)
 
 
 def _rot_x(deg: float) -> np.ndarray:
@@ -108,11 +102,7 @@ def build_cloth_on_sphere_builder() -> newton.ModelBuilder:
     Used both by the user-facing :class:`Example` and by the multi-env
     benchmark harness (``scripts/fba_multienv_cloth_bench.py``).
     """
-    if not _MESH_PATH.exists():
-        raise FileNotFoundError(
-            f"Cloth mesh not found at {_MESH_PATH}.  Update _MESH_PATH at the top of this example."
-        )
-    verts_local, tris = _load_obj(_MESH_PATH)
+    verts_local, tris = _square_cloth(22)  # 1013 particles
 
     # Rx(90°) then scale then translate (matches RealSim transformation block).
     verts_world = ((verts_local * _SCALE) @ _rot_x(_ROT_X_DEG).T + _TRANS).astype(np.float32)
@@ -192,37 +182,22 @@ class Example:
 
         # Uniform mass lumping (RealSim Mass.cpp:12-21 parity).
         uniform_mass = _OBJ_MASS / self.model.particle_count
-        self.model.particle_mass.assign(
-            np.full(self.model.particle_count, uniform_mass, dtype=np.float32)
-        )
-        self.model.particle_inv_mass.assign(
-            np.full(self.model.particle_count, 1.0 / uniform_mass, dtype=np.float32)
-        )
+        self.model.particle_mass.assign(np.full(self.model.particle_count, uniform_mass, dtype=np.float32))
+        self.model.particle_inv_mass.assign(np.full(self.model.particle_count, 1.0 / uniform_mass, dtype=np.float32))
 
         n_max_contacts = self.model.particle_count
         mu_override = np.full(n_max_contacts, _FRICTION_MU, dtype=np.float64)
 
-        mu, lam = _lame_from_young_poisson(_YOUNG, _POISSON)
-
-        # Phase 2.3 adds `nsn_schur_mode` to SolverFBA.  Until then the kwarg
-        # only goes through when supported, so Phase 1 (this file's initial
-        # validation pass) keeps working against pre-Phase-2 commits.
-        solver_kwargs = dict(
+        self.solver = SolverFBA(
+            self.model,
             iterations=_PD_ITER,
             nsn_iterations=_NSN_ITER,
             friction=True,
             stretching_model="arap",
             mu_per_pair_override=mu_override,
             pin_stiffness=_PIN_STIFFNESS,
+            nsn_schur_mode=self.schur_mode,
         )
-        try:
-            self.solver = SolverFBA(self.model, **solver_kwargs, nsn_schur_mode=self.schur_mode)
-        except TypeError:
-            if self.schur_mode != "full":
-                raise NotImplementedError(
-                    "nsn_schur_mode='lite' requires SolverFBA Phase 2.3 changes"
-                )
-            self.solver = SolverFBA(self.model, **solver_kwargs)
 
         self.pipeline = newton.CollisionPipeline(self.model, soft_contact_margin=0.05)
         self.contacts = self.pipeline.contacts()
@@ -252,11 +227,8 @@ class Example:
         self._cloth_uvs = wp.array(uv, dtype=wp.vec2)
         self._cloth_texture = _make_checker_texture()
 
-        if hasattr(self.viewer, "camera"):
-            cam_pos = wp.vec3(6.5, 4.0, 6.5)
-            cam_target = wp.vec3(0.0, 1.0, 0.0)
-            self.viewer.camera.pos = self.viewer.camera._as_vec3(cam_pos)
-            self.viewer.camera.look_at(cam_target)
+        # Camera toward (0, 1, 0).
+        self.viewer.set_camera(pos=wp.vec3(6.5, 4.0, 6.5), pitch=-18.1, yaw=-135.0)
 
     def step(self):
         self.state_0.clear_forces()
@@ -267,9 +239,11 @@ class Example:
 
         if self._dump_npz is not None:
             self._traj.append(self.state_0.particle_q.numpy().copy())
-            n_c = int(self.contacts.soft_contact_count.numpy()[0]) if (
-                hasattr(self.contacts, "soft_contact_count") and self.contacts.soft_contact_count is not None
-            ) else 0
+            n_c = (
+                int(self.contacts.soft_contact_count.numpy()[0])
+                if (hasattr(self.contacts, "soft_contact_count") and self.contacts.soft_contact_count is not None)
+                else 0
+            )
             self._n_contacts_per_frame.append(n_c)
 
     def render(self):
@@ -286,9 +260,24 @@ class Example:
         )
         self.viewer.end_frame()
 
+    def test_post_step(self):
+        # The corners whip at up to 15 m/s as the sheet wraps the sphere, 1.7 times their free-fall speed.
+        speed = np.linalg.norm(self.state_0.particle_qd.numpy(), axis=1).max()
+        assert speed < 30.0, f"particle speed {speed:.2f} m/s at t={self.sim_time:.2f} s"
+
     def test_final(self):
+        # After 3 s the 7 m sheet lies on the sphere top with its corners hanging past the equator, settling at
+        # 0.4 m/s, and no particle is inside the sphere.
         q = self.state_0.particle_q.numpy()
         assert np.all(np.isfinite(q)), "non-finite particle positions"
+        depth = _SPHERE_RADIUS - np.linalg.norm(q - _SPHERE_CENTER, axis=1).min()
+        assert depth < 5.0e-3, f"a particle is {depth * 1e3:.1f} mm inside the sphere"
+        assert _SPHERE_RADIUS <= q[:, 1].max() < _SPHERE_RADIUS + 0.1, (
+            f"the sheet's top is at y = {q[:, 1].max():.3f} m"
+        )
+        assert q[:, 1].min() < 0.5, f"the sheet's corners stay above y = {q[:, 1].min():.2f} m"
+        speed = np.linalg.norm(self.state_0.particle_qd.numpy(), axis=1).max()
+        assert speed < 1.0, f"the sheet still moves at {speed:.2f} m/s"
         if self._dump_npz is not None and self._traj:
             self._dump_npz.parent.mkdir(parents=True, exist_ok=True)
             np.savez(

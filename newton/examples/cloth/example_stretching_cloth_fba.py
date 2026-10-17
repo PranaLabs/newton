@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import math
-from pathlib import Path
 
 import numpy as np
 import warp as wp
@@ -23,8 +22,6 @@ import warp as wp
 import newton
 import newton.examples
 from newton.solvers import SolverFBA
-
-_MESH_PATH = Path("/home/ziqiu/work/RealSim_py/realsim_py/resources/mesh/cloth/square_20201P.obj")
 
 _DT = 0.01
 _PD_ITER = 10
@@ -39,9 +36,11 @@ _ROT_X_DEG = 90.0
 _TRANS = np.array([0.0, 0.0, 0.0])
 
 # Pin AABBs (world coords after Rx(90)).
-_PIN0_LO = (0.99, -0.1, -1.1); _PIN0_HI = (1.1, 0.1, 1.1)
+_PIN0_LO = (0.99, -0.1, -1.1)
+_PIN0_HI = (1.1, 0.1, 1.1)
 _PIN0_DIR = np.array([1.0, 0.0, 0.0])
-_PIN1_LO = (-1.1, -0.1, -1.1); _PIN1_HI = (-0.99, 0.1, 1.1)
+_PIN1_LO = (-1.1, -0.1, -1.1)
+_PIN1_HI = (-0.99, 0.1, 1.1)
 _PIN1_DIR = np.array([-1.0, 0.0, 0.0])
 _PIN_VEL = 0.1
 _PIN_MAXLENGTH = 1.0
@@ -54,24 +53,21 @@ _CHECKER_LIGHT = (0.85, 0.85, 0.88)
 _CLOTH_CHECKER_TILES = 8.0
 
 
-def _load_obj(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    verts: list[list[float]] = []
-    tris: list[list[int]] = []
-    with open(path) as f:
-        for line in f:
-            tokens = line.split()
-            if not tokens:
-                continue
-            if tokens[0] == "v":
-                verts.append([float(t) for t in tokens[1:4]])
-            elif tokens[0] == "f":
-                idx = [int(t.split("/")[0]) - 1 for t in tokens[1:4]]
-                tris.append(idx)
-    return np.array(verts, dtype=np.float32), np.array(tris, dtype=np.int32)
+def _square_cloth(n: int) -> tuple[np.ndarray, np.ndarray]:
+    """An ``n x n`` grid on ``[-1, 1]^2`` in the ``z = 0`` plane with a vertex at each cell center, four triangles per cell."""
+    g = np.linspace(-1.0, 1.0, n + 1)
+    c = 0.5 * (g[1:] + g[:-1])
+    uv = np.vstack([np.stack(np.meshgrid(a, a, indexing="ij"), -1).reshape(-1, 2) for a in (g, c)])
+    i, j = (a.ravel() for a in np.meshgrid(np.arange(n), np.arange(n), indexing="ij"))
+    quad = np.stack([i * (n + 1) + j, (i + 1) * (n + 1) + j, (i + 1) * (n + 1) + j + 1, i * (n + 1) + j + 1], axis=1)
+    center = (n + 1) ** 2 + i * n + j
+    tris = np.concatenate([np.stack([quad[:, k], quad[:, (k + 1) % 4], center], axis=1) for k in range(4)])
+    return np.column_stack([uv, np.zeros(len(uv))]).astype(np.float32), tris.astype(np.int32)
 
 
 def _rot_x(deg: float) -> np.ndarray:
-    a = math.radians(deg); c, s = math.cos(a), math.sin(a)
+    a = math.radians(deg)
+    c, s = math.cos(a), math.sin(a)
     return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]], dtype=np.float64)
 
 
@@ -83,7 +79,8 @@ def _lame_from_young_poisson(young: float, poisson: float) -> tuple[float, float
 
 def _select_in_aabb(points: np.ndarray, lo: tuple, hi: tuple) -> np.ndarray:
     p = np.asarray(points)
-    lo = np.asarray(lo, dtype=p.dtype); hi = np.asarray(hi, dtype=p.dtype)
+    lo = np.asarray(lo, dtype=p.dtype)
+    hi = np.asarray(hi, dtype=p.dtype)
     return np.where(np.all((p >= lo) & (p <= hi), axis=1))[0].astype(np.int32)
 
 
@@ -92,8 +89,10 @@ def _make_checker_texture(size: int = 64) -> np.ndarray:
     half = size // 2
     dark = np.array([int(255 * c) for c in _CHECKER_DARK], dtype=np.uint8)
     light = np.array([int(255 * c) for c in _CHECKER_LIGHT], dtype=np.uint8)
-    img[:half, :half] = dark; img[:half, half:] = light
-    img[half:, :half] = light; img[half:, half:] = dark
+    img[:half, :half] = dark
+    img[:half, half:] = light
+    img[half:, :half] = light
+    img[half:, half:] = dark
     return img
 
 
@@ -104,11 +103,7 @@ class Example:
         self.frame_dt = _DT
         self.sim_time = 0.0
 
-        if not _MESH_PATH.exists():
-            raise FileNotFoundError(
-                f"Cloth mesh not found at {_MESH_PATH}.  Update _MESH_PATH at the top of this example."
-            )
-        verts_local, tris = _load_obj(_MESH_PATH)
+        verts_local, tris = _square_cloth(100)  # 20201 particles
         verts_world = (verts_local @ _rot_x(_ROT_X_DEG).T + _TRANS).astype(np.float32)
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=_GRAVITY)
@@ -143,7 +138,8 @@ class Example:
         uniform_mass = _OBJ_MASS / self.model.particle_count
         self.model.particle_mass.assign(np.full(self.model.particle_count, uniform_mass, np.float32))
         inv = np.full(self.model.particle_count, 1.0 / uniform_mass, np.float32)
-        inv[pin0_idx] = 0.0; inv[pin1_idx] = 0.0
+        inv[pin0_idx] = 0.0
+        inv[pin1_idx] = 0.0
         self.model.particle_inv_mass.assign(inv)
 
         self.solver = SolverFBA(
@@ -181,12 +177,8 @@ class Example:
         self.viewer.show_triangles = False
         self.viewer.set_model(self.model)
 
-        # Camera: side/overhead view from +x +y +z so the stretching is visible.
-        if hasattr(self.viewer, "camera"):
-            cam_pos = wp.vec3(1.5, 3.0, 3.0)
-            cam_target = wp.vec3(0.0, -0.3, 0.0)
-            self.viewer.camera.pos = self.viewer.camera._as_vec3(cam_pos)
-            self.viewer.camera.look_at(cam_target)
+        # Camera: side/overhead view from +x +y +z toward (0, -0.3, 0), so the stretching is visible.
+        self.viewer.set_camera(pos=wp.vec3(1.5, 3.0, 3.0), pitch=-44.5, yaw=-116.6)
 
     def step(self):
         delta = _PIN_VEL * self.frame_dt
@@ -216,9 +208,21 @@ class Example:
         )
         self.viewer.end_frame()
 
+    def test_post_step(self):
+        speed = np.linalg.norm(self.state_0.particle_qd.numpy(), axis=1).max()
+        assert speed < 5.0, f"particle speed {speed:.2f} m/s at t={self.sim_time:.2f} s"
+
     def test_final(self):
-        q = self.state_0.particle_q.numpy()
+        # Pulled 0.3 m per side in 3 s, the sheet spans 2.6 m, its middle narrows from 2 m to 1.83 m and it
+        # sags 6 cm under gravity 1 m/s^2.
+        q, q0 = self.state_0.particle_q.numpy(), self.model.particle_q.numpy()
         assert np.all(np.isfinite(q)), "non-finite particle positions"
+        pins = np.concatenate([self._pin0_idx, self._pin1_idx])
+        assert np.abs(q[pins] - self._targets[pins]).max() < 1.0e-4, "pinned edges off their targets"
+        middle = np.abs(q0[:, 0]) < 0.01
+        width = q[middle, 2].max() - q[middle, 2].min()
+        assert 1.6 < width < 1.95, f"the middle of the sheet is {width:.3f} m wide"
+        assert q[:, 1].min() > -0.2, f"the sheet sags to y = {q[:, 1].min():.3f} m"
 
 
 if __name__ == "__main__":
