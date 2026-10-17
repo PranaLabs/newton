@@ -122,7 +122,10 @@ class Example:
         # via the PD damping channel when set.
         self.tri_kd = 1.5e-6
 
-        self.bending_ke = 5.0
+        # Per unit edge_ke, FBA's isometric bending of a hinge of this mesh (1 cm edges) is 3.7 times as stiff
+        # as SolverVBD's dihedral bending. Three times the reference's 5 still halves the creasing of the
+        # resting shirt: its hinges bend 9 deg on average, against 14 deg at 5 and 18 deg in the reference.
+        self.bending_ke = 15.0
         # FBA's PD prefactor lacks an explicit damping channel; mirror the VBD
         # reference's bending kd anyway (read by other code paths) but keep
         # tri_kd at 0 since the ARAP stretch step takes its place.
