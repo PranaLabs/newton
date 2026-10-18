@@ -263,6 +263,7 @@ class SolverFBA(SolverBase):
         particle_self_contact_radius: float = 2.0e-3,
         particle_self_contact_margin: float | None = None,
         particle_topological_contact_filter_threshold: int = 2,
+        particle_rest_shape_contact_exclusion_radius: float = 0.0,
     ) -> None:
         """
         Args:
@@ -379,9 +380,8 @@ class SolverFBA(SolverBase):
             particle_enable_self_contact: If ``True``, the triangles collide with
                 themselves through contacts found once per step on its start
                 positions, solved with the other contacts. Needs
-                ``friction=True``, ``nsn_schur_mode="full"``, ``use_isodof=True``
-                and no ``mu_per_pair_override``; friction takes
-                ``model.particle_mu``.
+                ``friction=True``, ``use_isodof=True`` and no
+                ``mu_per_pair_override``; friction takes ``model.particle_mu``.
             particle_self_contact_mode: ``"vertex_face"`` keeps each particle
                 ``particle_self_contact_radius`` from its nearest triangle, which
                 covers crossing edges only when the radius reaches half of the
@@ -396,6 +396,10 @@ class SolverFBA(SolverBase):
             particle_topological_contact_filter_threshold: Mesh edges within
                 which particles do not collide with each other or with
                 triangles that have such a particle.
+            particle_rest_shape_contact_exclusion_radius: Distance [m] in
+                ``model.particle_q`` within which a particle does not collide
+                with a triangle or particle, so that a fold can close only
+                between parts that start apart.
         """
         super().__init__(model)
 
@@ -501,7 +505,8 @@ class SolverFBA(SolverBase):
 
             self.particle_self_contact_radius = float(particle_self_contact_radius)
             filter_rings = particle_topological_contact_filter_threshold
-            self._self_contact = SelfContact(model, particle_self_contact_mode, margin, filter_rings)
+            rest_radius = particle_rest_shape_contact_exclusion_radius
+            self._self_contact = SelfContact(model, particle_self_contact_mode, margin, filter_rings, rest_radius)
         if self.face_contacts:
             if not self.friction or nsn_schur_mode != "full" or not self.use_isodof or mu_per_pair_override is not None:
                 raise ValueError(

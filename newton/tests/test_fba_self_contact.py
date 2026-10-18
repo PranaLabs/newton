@@ -91,6 +91,36 @@ class TestSelfContactDetection(unittest.TestCase):
         for a, b in particles[:, :2]:
             self.assertNotIn(b, ring[offsets[a] : offsets[a + 1]])
 
+    def test_rest_radius_drops_contacts_near_at_rest(self):
+        """On a flat sheet of 2 cm cells, particles find triangles outside their first ring within 3 cm, which a rest
+        radius of 3 cm drops. Folded at its middle line 1 cm over itself, the sheet keeps the contacts between parts
+        3 cm or more apart at rest."""
+        builder = newton.ModelBuilder()
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=8,
+            dim_y=4,
+            cell_x=0.02,
+            cell_y=0.02,
+            mass=0.01,
+        )
+        model = builder.finalize()
+        rest, tris = model.particle_q.numpy(), model.tri_indices.numpy()
+        self.assertGreater(len(SelfContact(model, "vertex_face", 0.03, rings=1).detect(model.particle_q)[0]), 0)
+        contact = SelfContact(model, "vertex_face", 0.03, rings=1, rest_radius=0.03)
+        self.assertEqual(len(contact.detect(model.particle_q)[0]), 0)
+        folded = rest.copy()
+        right = folded[:, 0] > 0.08
+        folded[right, 0], folded[right, 2] = 0.16 - folded[right, 0], 0.01
+        particles, _, _ = contact.detect(wp.array(folded, dtype=wp.vec3))
+        self.assertGreater(len(particles), 10)
+        for v, a, b, c in particles:
+            t = next(i for i, tri in enumerate(tris) if {a, b, c} == set(tri))
+            point = _closest_on_triangle(rest[v], *rest[tris[t]])
+            self.assertGreaterEqual(np.linalg.norm(rest[v] - point), 0.03 - 2e-4)
+
 
 class TestSelfContactSolve(unittest.TestCase):
     """A sheet of 2 cm cells, shifted 4 mm along x and y, falls from a few cm onto a like sheet on a box."""
