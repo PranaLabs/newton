@@ -4064,6 +4064,25 @@ def bilateral_law_kernel(
 
 
 @wp.kernel
+def held_contact_law_kernel(
+    held: wp.array[wp.int32],  # (M,) 1 when a particle of the contact is held at a point
+    # inout
+    omega: wp.array[wp.float64],
+    compliance: wp.array[wp.float64],
+    h: wp.array[wp.float64],
+):
+    """Contacts on a particle that bilateral rows hold at a point carry no force: without weight or target, and
+    with unit compliance, the NSN step leaves their zero multipliers unchanged."""
+    c = wp.tid()
+    if held[c] == 0:
+        return
+    for k in range(3):
+        omega[3 * c + k] = wp.float64(0.0)
+        compliance[3 * c + k] = wp.float64(1.0)
+        h[3 * c + k] = wp.float64(0.0)
+
+
+@wp.kernel
 def scale_diagonal_kernel(
     scale: wp.float64,
     a: wp.array2d[wp.float64],  # inout

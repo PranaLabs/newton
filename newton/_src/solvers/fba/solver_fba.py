@@ -1654,10 +1654,6 @@ class SolverFBA(SolverBase):
                             # below builds each ``3×3`` local W on-the-fly.
                             # Only the row-metadata CSR is needed so the
                             # ``apply_lambda_correction_combined`` gather can run.
-                            if n_b and self._contact_extra is not None:
-                                raise NotImplementedError(
-                                    "the lite NSN does not yet hold particle constraints with self or face contacts"
-                                )
                             ls.setup_lite_row_meta(
                                 M,
                                 self._contact_particle_d,
@@ -1668,7 +1664,7 @@ class SolverFBA(SolverBase):
                                 bilateral=self._lite_constraint_rows() if n_b else None,
                                 **self._contact_extra_args(),
                             )
-                            self._lite_slot_rows = None if self._contact_extra is None else self._slot_rows(M)
+                            self._lite_slot_rows = None if self._contact_extra is None else self._slot_rows(M, ls, n_b)
                         else:
                             ls.build_schur_complement(
                                 M,
@@ -1723,7 +1719,7 @@ class SolverFBA(SolverBase):
                         )
                         if self._lite_slot_rows is not None:
                             # Rows on several particles couple them: the sparse lite NSN.
-                            (pa, pb, pc, pd), (wa, wb, wc, wd), ones = self._lite_slot_rows
+                            (pa, pb, pc, pd), (wa, wb, wc, wd), ones, W_bsr, held_d = self._lite_slot_rows
                             self._solve_nsn_coulomb_lite_bsr(
                                 M_total=M,
                                 row_particle_a_d=pa,
@@ -1748,6 +1744,9 @@ class SolverFBA(SolverBase):
                                 row_wb_d=wb,
                                 row_wc_d=wc,
                                 row_wd_d=wd,
+                                W_bsr=W_bsr,
+                                n_bilateral=n_b,
+                                held_d=held_d,
                             )
                         elif use_per_particle:
                             wp.launch(
@@ -2298,16 +2297,30 @@ class SolverFBA(SolverBase):
         arrays += [(directions, np.float32, wp.vec3), (targets, np.float64, wp.float64)]
         self._constraint_rows = [wp.array(np.asarray(a, dtype=n), dtype=t, device=self._device) for a, n, t in arrays]
 
-    def _slot_rows(self, M: int) -> tuple[list, list, wp.array]:
-        """Particles and coefficients of the rows of the ``M`` contacts in four slots, and unit row scales, for the
-        sparse lite NSN."""
+    def _slot_rows(self, M: int, ls, n_b: int) -> tuple:
+        """Particles and coefficients of the rows of the ``M`` contacts and ``n_b`` bilateral rows in four slots,
+        unit row scales, their sparse lite Delassus matrix, which holds for the step, and the contacts on a
+        particle that the bilateral rows hold at a point, for the sparse lite NSN."""
         extra_p, extra_a = (a.numpy()[:M] for a in self._contact_extra)
         pad = ((0, 0), (0, 3 - extra_p.shape[1]))
-        p = np.column_stack([self._contact_particle_h[:M], np.pad(extra_p, pad, constant_values=-1)]).repeat(3, axis=0)
+        contact_p = np.column_stack([self._contact_particle_h[:M], np.pad(extra_p, pad, constant_values=-1)])
+        p = contact_p.repeat(3, axis=0)
         w = np.column_stack([self._contact_alpha_h[:M], np.pad(extra_a, pad)]).repeat(3, axis=0)
+        held_d = None
+        if n_b:
+            b_p, b_dir, b_alpha = self._lite_constraint_rows()
+            p = np.vstack([p, np.column_stack([b_p, np.full((n_b, 3), -1)])]).astype(np.int32)
+            w = np.vstack([w, np.column_stack([b_alpha, np.zeros((n_b, 3))])]).astype(np.float32)
+            held = [q for q in np.unique(b_p) if np.linalg.matrix_rank(b_dir[b_p == q], tol=1e-3) >= 3]
+            held_contact = np.isin(contact_p, held).any(axis=1)
+            held_d = wp.array(held_contact.astype(np.int32), dtype=wp.int32, device=self._device)
         particles = [wp.array(np.ascontiguousarray(p[:, k]), dtype=wp.int32, device=self._device) for k in range(4)]
         weights = [wp.array(np.ascontiguousarray(w[:, k]), dtype=wp.float32, device=self._device) for k in range(4)]
-        return particles, weights, wp.array(np.ones(3 * M, dtype=np.float32), device=self._device)
+        ones = wp.array(np.ones(3 * M + n_b, dtype=np.float32), device=self._device)
+        slots = {f"row_particle_{c}_d": particles[i] for i, c in ((2, "c"), (3, "d"))}
+        slots |= {f"row_w{c}_d": weights[i] for i, c in enumerate("abcd")}
+        W = ls.build_schur_lite_unified(3 * M + n_b, particles[0], particles[1], ls._row_dir_d, ones, **slots)
+        return particles, weights, ones, W, held_d
 
     def _lite_constraint_rows(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Particles, directions and coefficients of the bilateral rows, each on one particle."""
@@ -3651,6 +3664,9 @@ class SolverFBA(SolverBase):
         row_wb_d: wp.array | None = None,
         row_wc_d: wp.array | None = None,
         row_wd_d: wp.array | None = None,
+        W_bsr=None,
+        n_bilateral: int = 0,
+        held_d: wp.array | None = None,
     ) -> None:
         """LiteNSN inner driver on the BSR + sparse-PCR path.
 
@@ -3667,7 +3683,7 @@ class SolverFBA(SolverBase):
 
         from . import kernels as K  # noqa: PLC0415
 
-        n_rows = 3 * int(M_total)
+        n_rows = 3 * int(M_total) + int(n_bilateral)
         device = self._device
         dt_w = wp.float64(dt)
         dt2 = float(dt) * float(dt)
@@ -3675,20 +3691,21 @@ class SolverFBA(SolverBase):
         ls = self._linear_solver
 
         # Build the sparse Schur W (block-diagonal-by-particle for rigid-only,
-        # contact-graph-sparse with self-contact rows mixed in).
-        W_bsr = ls.build_schur_lite_unified(
-            n_rows,
-            row_particle_a_d,
-            row_particle_b_d,
-            row_dir_d,
-            row_alpha_d,
-            row_particle_c_d=row_particle_c_d,
-            row_particle_d_d=row_particle_d_d,
-            row_wa_d=row_wa_d,
-            row_wb_d=row_wb_d,
-            row_wc_d=row_wc_d,
-            row_wd_d=row_wd_d,
-        )
+        # contact-graph-sparse with self-contact rows mixed in), unless given.
+        if W_bsr is None:
+            W_bsr = ls.build_schur_lite_unified(
+                n_rows,
+                row_particle_a_d,
+                row_particle_b_d,
+                row_dir_d,
+                row_alpha_d,
+                row_particle_c_d=row_particle_c_d,
+                row_particle_d_d=row_particle_d_d,
+                row_wa_d=row_wa_d,
+                row_wb_d=row_wb_d,
+                row_wc_d=row_wc_d,
+                row_wd_d=row_wd_d,
+            )
         if W_bsr is None:
             # Nothing to solve.
             return
@@ -3790,6 +3807,14 @@ class SolverFBA(SolverBase):
                 outputs=[omega_v, compliance_v, h_v],
                 device=device,
             )
+            # Bilateral rows follow the contact rows; contacts on a particle they hold at a point carry no force.
+            if n_bilateral:
+                inputs = [pene0_d, wp.int32(3 * int(M_total))]
+                law_out = [omega_v, compliance_v, h_v]
+                wp.launch(K.bilateral_law_kernel, dim=int(n_bilateral), inputs=inputs, outputs=law_out, device=device)
+            if held_d is not None:
+                law_out = [omega_v, compliance_v, h_v]
+                wp.launch(K.held_contact_law_kernel, dim=int(M_total), inputs=[held_d], outputs=law_out, device=device)
 
             A_bsr = ls.build_a_schur_lite_bsr(W_bsr, omega_v, compliance_v)
             # The right-hand side takes the constraint value under the updated weights, as the dense driver does.
@@ -3826,7 +3851,7 @@ class SolverFBA(SolverBase):
         if use_cap:
             wp.launch(
                 K.lambda_cap_clip_kernel,
-                dim=n_rows,
+                dim=3 * int(M_total),
                 inputs=[wp.float64(cap_internal)],
                 outputs=[lam_v],
                 device=device,
