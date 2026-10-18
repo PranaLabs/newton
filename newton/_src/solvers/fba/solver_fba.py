@@ -235,7 +235,6 @@ class SolverFBA(SolverBase):
         lam: float | None = None,
         friction: bool = True,
         mu_per_pair_override: np.ndarray | None = None,
-        nsn_iterations: int = 1,
         lambda_cap: float | None = None,
         use_isodof: bool = True,
         shape_angular_velocity: dict[int, float] | None = None,
@@ -267,7 +266,10 @@ class SolverFBA(SolverBase):
         """
         Args:
             model: The :class:`~newton.Model` containing cloth/tet attributes to integrate.
-            iterations: Number of PD local-global iterations per step.
+            iterations: Number of PD local-global iterations per step. Each
+                takes one semismooth Newton step of the contact and constraint
+                multipliers, warm-started from the previous iteration, as in
+                RealSim's local-global solver.
             pin_stiffness: Soft-pin stiffness [N/m].
             stretching_model: Stretching model — ``"arap"``, ``"corotational"``, or ``"neohookean"``.
             mu: First Lamé parameter [Pa] of the material; required for ``"corotational"``/``"neohookean"``,
@@ -277,16 +279,6 @@ class SolverFBA(SolverBase):
                 otherwise use Stage A unilateral NSN.
             mu_per_pair_override: Optional ``(num_pairs,)`` array of friction
                 coefficients overriding ``model.shape_material_mu`` lookups.
-            nsn_iterations: Number of FB-Newton linearization steps per
-                NSN call. Defaults to ``1``, matching RealSim's single
-                FB-Newton step per ``build`` -> ``solve`` ->
-                ``applyConstraintCorrection`` sequence in
-                ``NonSmoothNewton.cpp:102-171``. RealSim's scene.json
-                ``constraintsolver.iterations: 10`` is the **PCR Schur
-                LCP solver's** iterative-convergence cap, not a FB-Newton
-                outer loop count; see ``nsn_linear_iterations``. Values >1 add extra
-                FB-Newton linearizations beyond what RealSim does; useful
-                for stress-testing the FB residual but breaks 1:1 parity.
             lambda_cap: Optional per-step clamp on contact impulse magnitude in
                 **physical force units [N]**, matching RealSim's
                 ``constraintsolver.maxforce`` scene.json field. The internal
@@ -484,7 +476,6 @@ class SolverFBA(SolverBase):
         self._mu_per_pair_override = (
             np.asarray(mu_per_pair_override, dtype=np.float64) if mu_per_pair_override is not None else None
         )
-        self.nsn_iterations = int(nsn_iterations)
         self.nsn_linear_iterations = None if nsn_linear_iterations is None else int(nsn_linear_iterations)
         self.lambda_cap = lambda_cap
         self.use_isodof = bool(use_isodof)
@@ -1043,7 +1034,7 @@ class SolverFBA(SolverBase):
             None,
             None,
             None,
-            max_iters=self.nsn_iterations,
+            max_iters=1,
             dt=dt,
             W_device=self._rc_W_d,
             r_device=self._rc_r_d,
@@ -1735,7 +1726,7 @@ class SolverFBA(SolverBase):
                                 omega_out_d=self._nsn_omega_d,
                                 lam_apply_out_d=self._nsn_lam_apply_d,
                                 dt=dt,
-                                n_fb_iters=int(self.nsn_iterations),
+                                n_fb_iters=1,
                                 cap_internal=cap_internal,
                                 use_cap=bool(use_cap),
                                 row_particle_c_d=pc,
@@ -1766,7 +1757,7 @@ class SolverFBA(SolverBase):
                                     wp.float64(dt),
                                     wp.float64(cap_internal),
                                     wp.int32(use_cap),
-                                    wp.int32(int(self.nsn_iterations)),
+                                    wp.int32(1),
                                     wp.int32(3 * M),
                                 ],
                                 outputs=[
@@ -1793,7 +1784,7 @@ class SolverFBA(SolverBase):
                                     wp.float64(dt),
                                     wp.float64(cap_internal),
                                     wp.int32(use_cap),
-                                    wp.int32(int(self.nsn_iterations)),
+                                    wp.int32(1),
                                 ],
                                 outputs=[
                                     self._nsn_lam_d,
@@ -1808,7 +1799,7 @@ class SolverFBA(SolverBase):
                             None,
                             None,
                             None,
-                            max_iters=self.nsn_iterations,
+                            max_iters=1,
                             dt=dt,
                             W_device=ls.W_device_view(),
                             r_device=self._nsn_r_d,
@@ -1890,7 +1881,7 @@ class SolverFBA(SolverBase):
                         None,
                         None,
                         None,
-                        max_iters=self.nsn_iterations,
+                        max_iters=1,
                         dt=dt,
                         W_device=ls.W_device_view(),
                         r_device=self._nsn_r_d,
@@ -3587,7 +3578,7 @@ class SolverFBA(SolverBase):
             omega_out_d=self._pc_omega_d,
             lam_apply_out_d=self._pc_lam_apply_d,
             dt=dt,
-            n_fb_iters=self.nsn_iterations,
+            n_fb_iters=1,
             cap_internal=cap_internal,
             use_cap=use_cap,
             row_particle_c_d=self._pc_row_pc_d,
@@ -3967,7 +3958,7 @@ class SolverFBA(SolverBase):
                 provided.
             pene0: ``(M,)`` per-row anchor projection. May be ``None`` when
                 ``pene0_device`` is provided.
-            max_iters: FB-Newton iters; matches ``nsn_iterations``.
+            max_iters: FB-Newton steps; the solver takes one per local-global iteration.
             lam_init: Optional ``(M,)`` warm-start lambda (host).
             omega_init: Optional ``(M,)`` warm-start omega (host).
             dt: Timestep (s).

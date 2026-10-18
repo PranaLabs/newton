@@ -90,13 +90,8 @@ class Example:
         # the rigid-body integrator + PD-FBA pair.  We keep the VBD reference
         # 10 substeps so the robot's key-pose interpolation isn't aliased.
         self.sim_substeps = 10
-        # PD + NSN iterations.  Empirically, the cloth-on-table phase under
-        # the Franka gripper trajectory requires at least 8 PD sweeps and 3
-        # NSN-inner iterations to keep contact lambdas bounded; combined
-        # with the ``lambda_cap`` knob below, this lets the demo run the
-        # full 1200-frame trajectory without NaN.
+        # PD local-global iterations, each with one NSN step.
         self.pd_iterations = 8
-        self.nsn_iterations = 3
         self.fps = 60
         self.frame_dt = 1 / self.fps
         self.sim_dt = self.frame_dt / self.sim_substeps
@@ -265,7 +260,6 @@ class Example:
             self.cloth_solver = SolverFBA(
                 self.model,
                 iterations=self.pd_iterations,
-                nsn_iterations=self.nsn_iterations,
                 friction=True,
                 stretching_model="arap",
                 pin_stiffness=1.0e10,
@@ -332,11 +326,12 @@ class Example:
         return np.array(wp.transform_get_translation(tf)), rotation @ self.fingertip_axes, opening
 
     def grasp(self, state: State):
-        """Take the particles in the box between the pads, short of their contact thickness, grown by half of it."""
+        """Take the particles between the pads and those that touch them: the box of the pads, grown by the contact
+        thickness across them and by half of it all around."""
         origin, axes, opening = self.fingertip_frame(state)
         local = (state.particle_q.numpy() - origin) @ axes
         thickness = self.cloth_particle_radius
-        half = np.array([opening - thickness, PAD_HALF_WIDTH, PAD_HALF_LENGTH]) + 0.5 * thickness
+        half = np.array([opening, PAD_HALF_WIDTH + thickness, PAD_HALF_LENGTH]) + 0.5 * thickness
         inside = np.all(np.abs(local - [0.0, 0.0, PAD_CENTER]) <= half, axis=1)
         self.grasped = np.flatnonzero(inside).astype(np.int32)
         self.grasp_offsets = local[inside]

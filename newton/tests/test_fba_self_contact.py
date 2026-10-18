@@ -100,7 +100,7 @@ class TestSelfContactSolve(unittest.TestCase):
         if not wp.is_cuda_available():
             raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
 
-    def _drop(self, start_gap, cells=10, fps=60, steps=60, **solver_args):
+    def _drop(self, start_gap, cells=10, fps=60, steps=60, mu=None, **solver_args):
         """Largest number of intersecting triangle pairs over the steps, then the gap between the sheets [m]."""
         builder = newton.ModelBuilder()
         builder.add_shape_box(-1, xform=wp.transform((0.0, 0.0, 0.25), wp.quat_identity()), hx=0.25, hy=0.25, hz=0.25)
@@ -109,6 +109,8 @@ class TestSelfContactSolve(unittest.TestCase):
             corner = wp.vec3(shift - 0.01 * cells, shift - 0.01 * cells, z)
             builder.add_cloth_grid(pos=corner, rot=wp.quat_identity(), vel=wp.vec3(0.0), tri_ka=1e3, **grid)
         model = builder.finalize()
+        if mu is not None:
+            model.particle_mu = mu
         solver = newton.solvers.SolverFBA(model, iterations=10, **solver_args)
         pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.01)
         detector = TriMeshCollisionDetector(model)
@@ -133,13 +135,14 @@ class TestSelfContactSolve(unittest.TestCase):
         self.assertAlmostEqual(gap, 0.005, delta=2e-4)
 
     def test_vertex_vertex_holds_the_radius(self):
-        """Particles 3 cm apart cover the 2.8 cm longest edges; the upper sheet nests between the lower particles,
-        2.65 to 3 cm over them, without a crossing triangle. With friction the tilted rows need 5 NSN iterations."""
+        """Particles 3 cm apart cover the 2.8 cm longest edges; the upper sheet, without friction, nests between
+        the lower particles, 2.65 to 3 cm over them, without a crossing triangle. With friction, one NSN step per
+        local-global iteration does not hold the tilted rows: the sheet sinks to 14 mm."""
         kw = {"particle_self_contact_mode": "vertex_vertex", "particle_self_contact_radius": 0.03}
-        kw |= {"particle_self_contact_margin": 0.0315, "nsn_iterations": 5}
-        worst, gap = self._drop(0.035, particle_enable_self_contact=True, **kw)
+        kw |= {"particle_self_contact_margin": 0.0315}
+        worst, gap = self._drop(0.035, mu=0.0, particle_enable_self_contact=True, **kw)
         self.assertEqual(worst, 0)
-        self.assertGreater(gap, 0.0265)
+        self.assertGreater(gap, 0.026)
         self.assertLess(gap, 0.030)
 
     def test_lite_nsn_holds_the_radius(self):

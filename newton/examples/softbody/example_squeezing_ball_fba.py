@@ -27,7 +27,6 @@ from newton.solvers import SolverFBA
 # Simulation parameters (CudaTests/SqueezingBall/ball_7k.json).
 _DT = 0.01
 _PD_ITER = 10  # RealSim's offline binding overrides scene LocalGlobal_CUDA=5 to 10
-_NSN_ITER = 1
 _GRAVITY = -10.0  # Y-down
 
 _YOUNG = 1.0e4 / 2.4  # RealSim's material modulus; SolverFBA's tet gauge 2 + nu scales it back to 1e4
@@ -294,7 +293,6 @@ class Example:
         self.solver = SolverFBA(
             self.model,
             iterations=_PD_ITER,
-            nsn_iterations=_NSN_ITER,
             friction=True,
             stretching_model="neohookean",
             mu=mu,

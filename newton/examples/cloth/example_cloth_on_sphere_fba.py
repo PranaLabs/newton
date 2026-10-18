@@ -27,7 +27,6 @@ from newton.solvers import SolverFBA
 # ParallelEnvTest/scene.json + cloth0.json
 _DT = 0.01
 _PD_ITER = 5  # scene.json LocalGlobal = 5
-_NSN_ITER = 1  # FB-Newton outer count (RealSim runs 1 per step; locked)
 _GRAVITY = -10.0
 _OBJ_MASS = 1000.0
 
@@ -191,7 +190,6 @@ class Example:
         self.solver = SolverFBA(
             self.model,
             iterations=_PD_ITER,
-            nsn_iterations=_NSN_ITER,
             friction=True,
             stretching_model="arap",
             mu_per_pair_override=mu_override,

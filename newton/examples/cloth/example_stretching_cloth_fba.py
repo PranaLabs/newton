@@ -25,7 +25,6 @@ from newton.solvers import SolverFBA
 
 _DT = 0.01
 _PD_ITER = 10
-_NSN_ITER = 1
 _GRAVITY = -1.0  # Y-up, RealSim scene.json gravity=[0,-1,0]
 
 _YOUNG = 35483.87096774193  # RealSim's material modulus; SolverFBA's tri gauge scales it back to 1e5
@@ -145,7 +144,6 @@ class Example:
         self.solver = SolverFBA(
             self.model,
             iterations=_PD_ITER,
-            nsn_iterations=_NSN_ITER,
             friction=False,
             stretching_model="neohookean",
             nh_solver="lbfgs",
