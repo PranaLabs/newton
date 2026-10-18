@@ -104,6 +104,8 @@ class Example:
         # Body-cloth contact margin (cm).
         self.cloth_particle_radius = 0.8
         self.cloth_body_contact_margin = 0.8
+        # Distance the shirt keeps each particle from its nearest triangle (cm).
+        self.cloth_self_contact_radius = 0.8
 
         # Robot-side contact materials (cm scale, copied from VBD reference;
         # FBA doesn't actually consume ke/kd directly — it uses the rigid
@@ -279,13 +281,13 @@ class Example:
                 # 200 N in this cm-kg-s scene, bounds it. A particle resting on the
                 # table needs 0.14 N, a landing one 18 N.
                 lambda_cap=2.0e4,
-                # The shirt keeps each particle a contact thickness from its nearest triangle, but
+                # The shirt keeps each particle its self-contact radius from its nearest triangle, but
                 # not from triangles within one ring or within that distance at rest, so folds close
                 # only between parts that start apart.
                 particle_enable_self_contact=True,
-                particle_self_contact_radius=self.cloth_particle_radius,
+                particle_self_contact_radius=self.cloth_self_contact_radius,
                 particle_topological_contact_filter_threshold=1,
-                particle_rest_shape_contact_exclusion_radius=self.cloth_particle_radius,
+                particle_rest_shape_contact_exclusion_radius=self.cloth_self_contact_radius,
                 nsn_linear_iterations=20,
             )
 
@@ -336,34 +338,32 @@ class Example:
         return np.array(wp.transform_get_translation(tf)), rotation @ self.fingertip_axes, opening
 
     def grasp(self, state: State):
-        """Take the particles under the gap between the pads, up to three contact thicknesses below it, so both
-        layers of the shirt, with the points where they would enter it straight up, in the fingertip frame."""
-        origin, axes, opening = self.fingertip_frame(state)
+        """Take the particles under the gap that the pads close to, a contact thickness inside each, down to the
+        second layer of the shirt, with one rise straight up for all that brings the lowest into the gap, in the
+        fingertip frame. Held there, they keep their spacing and their contact thickness from the pads."""
+        origin, axes, _ = self.fingertip_frame(state)
         local = (state.particle_q.numpy() - origin) @ axes
         up = axes.T @ np.array([0.0, 0.0, 1.0])
-        half = np.array([opening, PAD_HALF_WIDTH, PAD_HALF_LENGTH])
+        # The fingers close to half openings of four times the key poses' clamp.
+        half = np.array([4.0 * self.clamp_close - self.cloth_particle_radius, PAD_HALF_WIDTH, PAD_HALF_LENGTH])
         # Where each particle's way up enters and leaves the box of the gap.
         with np.errstate(divide="ignore", invalid="ignore"):
             ends = ((np.array([0.0, 0.0, PAD_CENTER]) + np.stack([-half, half]))[:, None] - local) / up
         enter, leave = np.nanmax(ends.min(axis=0), axis=1), np.nanmin(ends.max(axis=0), axis=1)
-        inside = (enter <= leave) & (leave >= 0.0) & (enter <= 3.0 * self.cloth_particle_radius)
+        reach = 2.0 * self.cloth_particle_radius + self.cloth_self_contact_radius
+        under = np.flatnonzero((enter <= leave) & (leave >= 0.0) & (enter <= reach))
         # The solver holds up to 21 particles at points: keep the nearest to the gap.
-        self.grasped = np.flatnonzero(inside)[np.argsort(enter[inside])[:21]].astype(np.int32)
+        self.grasped = under[np.argsort(enter[under])[:21]].astype(np.int32)
         self.grasp_from = local[self.grasped]
-        rise = np.minimum(np.maximum(enter[self.grasped], 0.0) + 0.25, leave[self.grasped])
-        self.grasp_to = self.grasp_from + rise[:, None] * up
-        self.grasp_opening, self.grasp_time = opening, self.sim_time
+        rise = min(enter[self.grasped].max(initial=0.0) + 0.25, leave[self.grasped].min(initial=np.inf))
+        self.grasp_to = self.grasp_from + rise * up
+        self.grasp_time = self.sim_time
 
     def hold_grasp(self, state: State):
-        """Hold the taken particles at points of the fingertip frame that rise into the gap between the pads.
-
-        Along the closing axis the points close in with the pads, a contact thickness inside each.
-        """
-        origin, axes, opening = self.fingertip_frame(state)
+        """Hold the taken particles at points of the fingertip frame that rise into the gap between the pads."""
+        origin, axes, _ = self.fingertip_frame(state)
         rise = min((self.sim_time - self.grasp_time) / GRASP_RISE, 1.0)
-        local = self.grasp_from + rise * (self.grasp_to - self.grasp_from)
-        local[:, 0] *= 1.0 + rise * (max(opening - self.cloth_particle_radius, 0.0) / self.grasp_opening - 1.0)
-        targets = origin + local @ axes.T
+        targets = origin + (self.grasp_from + rise * (self.grasp_to - self.grasp_from)) @ axes.T
         n = len(self.grasped)
         self.cloth_solver.set_particle_constraints(
             np.repeat(self.grasped, 3)[:, None], np.ones((3 * n, 1)), targets.reshape(-1), np.tile(np.eye(3), (n, 1))
@@ -434,24 +434,26 @@ class Example:
         )
         builder.joint_q[:6] = [0.0, 0.0, 0.0, -1.59695, 0.0, 2.5307]
 
-        # Closed, the pads stay 1 cm apart from the middle, past the 0.8 cm contact thickness of the cloth
-        # they hold there.
-        clamp_close = self.clamp_close = 0.25
+        # Closed, the pads stay 1.4 cm apart from the middle, so the shirt held within 0.6 cm of it keeps its
+        # contact thickness from them.
+        clamp_close = self.clamp_close = 0.35
         clamp_open = self.clamp_open = 0.8
         # Fingertip frame axes in the end effector body frame, as columns.
         self.fingertip_axes = np.array([[1.0, -1.0, 0.0], [1.0, 1.0, 0.0], [0.0, 0.0, np.sqrt(2.0)]]) / np.sqrt(2.0)
 
+        # Over the 20 cm table top, with the pads' lowest edge 0.6 cm under the end effector in the grasp pose.
+        grasp_z = 20.0 + 2.0 * self.cloth_particle_radius + self.cloth_self_contact_radius + 0.1 + 0.6
         # The first fold of the SolverVBD reference: the later folds stack layers of the shirt, which needs
         # cloth self-contact.
         self.robot_key_poses = np.array(
             [
                 # descend
                 [4, 31.0, -60.0, 40.0, 0.8536, -0.3536, 0.3536, -0.1464, clamp_open],
-                # approach until the pads rest on the top-left corner, their lowest edge 22.5 cm over
-                # the 20 cm table top, past the contact thickness of the two layers of the shirt and of
-                # the pads; then grasp it
-                [4, 31.0, -60.0, 23.1, 0.8536, -0.3536, 0.3536, -0.1464, clamp_open],
-                [2, 31.0, -60.0, 23.1, 0.8536, -0.3536, 0.3536, -0.1464, clamp_close],
+                # approach until the pads rest on the top-left corner, their lowest edge 1 mm past the
+                # contact thickness of the second layer of the shirt, a self-contact radius over the
+                # first on the 20 cm table top; then grasp it
+                [4, 31.0, -60.0, grasp_z, 0.8536, -0.3536, 0.3536, -0.1464, clamp_open],
+                [2, 31.0, -60.0, grasp_z, 0.8536, -0.3536, 0.3536, -0.1464, clamp_close],
                 # lift
                 [2, 26.0, -60.0, 26.0, 0.8536, -0.3536, 0.3536, -0.1464, clamp_close],
                 [2, 12.0, -60.0, 31.0, 0.8536, -0.3536, 0.3536, -0.1464, clamp_close],
