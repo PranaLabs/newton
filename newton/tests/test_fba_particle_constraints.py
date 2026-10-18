@@ -127,9 +127,7 @@ class TestParticleConstraints(unittest.TestCase):
 
     def test_lite_rows_hold_a_particle_at_a_point(self):
         """Three rows of the lite NSN hold the middle particle of a cloth on the ground, first 2 mm into the
-        ground, then 5 cm over it while they drag it at 0.2 m/s. Their Delassus block dt^2 / m is within 2 % of
-        the particle's block of A^-1 here (1 kg particles, soft cloth), so they hold it to 0.1 mm, and its
-        contacts carry no force."""
+        ground, then 5 cm over it while they drag it at 0.2 m/s, and its contacts carry no force."""
         builder = newton.ModelBuilder()
         builder.add_ground_plane()
         grid = {"dim_x": 4, "dim_y": 4, "cell_x": 0.1, "cell_y": 0.1, "tri_ke": 1.0, "tri_ka": 1.0, "edge_ke": 0.01}
@@ -145,12 +143,36 @@ class TestParticleConstraints(unittest.TestCase):
             solver.step(s0, s1, None, contacts, 1.0 / 60.0)
             s0, s1 = s1, s0
             if k in (29, 59):
-                np.testing.assert_allclose(s0.particle_q.numpy()[12], target, atol=1e-4)
+                np.testing.assert_allclose(s0.particle_q.numpy()[12], target, atol=1e-6)
             if k == 29:
                 m = solver._contact_count
                 rows = np.flatnonzero(solver._linear_solver._row_particle_d.numpy()[: 3 * m] == 12)
                 self.assertEqual(len(rows), 3)
                 np.testing.assert_array_equal(solver._nsn_lam_apply_d.numpy()[rows], 0.0)
+
+    def test_lite_rows_hold_a_stiff_cloth_at_points(self):
+        """Rows of the lite NSN lift a 2 x 2 corner of a stiff cloth on the ground 5 cm in 1/3 s. The particles'
+        blocks of A^-1 are a few percent of dt^2 / m here, where the rows lagged by up to 17 mm with the
+        particles' contacts; they solve their own Delassus matrix and hold the corner on its targets."""
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        grid = {"dim_x": 4, "dim_y": 4, "cell_x": 0.1, "cell_y": 0.1, "tri_ke": 1e3, "tri_ka": 1e3, "edge_ke": 0.1}
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.2, -0.2, 0.0), rot=wp.quat_identity(), vel=wp.vec3(0.0), mass=0.01, **grid
+        )
+        model = builder.finalize()
+        solver = newton.solvers.SolverFBA(model, iterations=10, nsn_schur_mode="lite")
+        contacts, s0, s1 = model.contacts(), model.state(), model.state()
+        held = [0, 1, 5, 6]
+        x0 = model.particle_q.numpy()[held]
+        for k in range(20):
+            target = x0 + np.array([0.0, 0.0, 0.05 * (k + 1) / 20])
+            rows = np.repeat(held, 3)[:, None], np.ones((12, 1)), target.reshape(-1), np.tile(np.eye(3), (4, 1))
+            solver.set_particle_constraints(*rows)
+            model.collide(s0, contacts)
+            solver.step(s0, s1, None, contacts, 1.0 / 60.0)
+            s0, s1 = s1, s0
+            np.testing.assert_allclose(s0.particle_q.numpy()[held], target, atol=1e-6)
 
     def test_lite_rows_take_a_direction_and_one_particle(self):
         solver = newton.solvers.SolverFBA(self._model(), nsn_schur_mode="lite")

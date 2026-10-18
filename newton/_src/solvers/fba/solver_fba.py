@@ -8,6 +8,7 @@ import math
 import time
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
 
 import numpy as np
@@ -488,7 +489,7 @@ class SolverFBA(SolverBase):
         self._face_query, self._contact_extra = None, None
         self._constraint_rows = None  # set_particle_constraints: particles, coefficients, directions, targets
         self._constraint_lengths = False  # the rows hold |sum_k c_k x_k|, along its direction at each iteration
-        self._self_contact, self._lite_slot_rows = None, None
+        self._self_contact, self._lite_slot_rows, self._held_rows = None, None, None
         if particle_enable_self_contact:
             if not self.friction or not self.use_isodof or mu_per_pair_override is not None:
                 raise ValueError("self contact needs friction=True, use_isodof=True and no mu_per_pair_override")
@@ -1250,6 +1251,8 @@ class SolverFBA(SolverBase):
         self._dt_setup = dt
         # A changed → any cached W / A^{-1} J^T is stale.
         self._invalidate_schur_cache()
+        if self._held_rows is not None:
+            self._held_rows[1] = None
 
         device = self._device
         self._tri_indices_d = wp.array(
@@ -1793,6 +1796,16 @@ class SolverFBA(SolverBase):
                                 ],
                                 device=device,
                             )
+                        if self._held_rows is not None:
+                            # The contacts of particles held at points carry no force, so the rows that hold them
+                            # take their own step after the correction of the other rows.
+                            from .joints import scatter_values_kernel  # noqa: PLC0415
+
+                            h = self._held_row_factor(ls)
+                            outputs = [self._nsn_lam_apply_d[3 * M :]]
+                            wp.launch(
+                                scatter_values_kernel, h.rows.shape[0], [h.zeros, 0, h.rows], outputs, device=device
+                            )
                     else:
                         self._solve_nsn_coulomb_gpu(
                             None,
@@ -1823,6 +1836,8 @@ class SolverFBA(SolverBase):
                     # no-op Cholesky solve is small relative to the saved
                     # ``_nsn_lam_apply_d.numpy()`` round-trip.
                     ls.apply_lambda_correction_combined(self._nsn_lam_apply_d, self._rhs, self._x_cur)
+                    if use_lite_block_diag and self._held_rows is not None:
+                        self._step_held_rows(ls, M, dt)
                     if _perf_on:
                         wp.synchronize_device()
                         self._timing_nsn_inner_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_nsn_0))
@@ -2261,11 +2276,13 @@ class SolverFBA(SolverBase):
         fixed for the step drops it, and a body that chained rows compress beyond its buckling load then
         flutters. Unused slots have particle ``-1``; slot 0 must be used. ``None`` removes the rows.
 
-        The lite NSN solves each particle's rows on their own, so with ``nsn_schur_mode="lite"`` every
-        row needs a direction and one particle. Rows along three directions hold a particle at a point,
-        and its contacts then carry no force. Like the contacts, the rows see the particle's mass alone,
-        ``dt^2 / m`` in place of its block of ``A^-1``, and lag their targets by the share of the
-        stiffness in that block.
+        With ``nsn_schur_mode="lite"`` every row needs a direction and one particle. Three rows along
+        independent directions hold a particle at a point, and its contacts then carry no force. These rows
+        take their Newton step after the correction of the other rows, with the Cholesky factor of their own
+        Delassus matrix ``J A^-1 J^T`` as the joint rows of articulations do, and so reach their targets in every
+        iteration; at most 64 of them. Other rows are solved with the particle's contacts, which see its mass
+        alone, ``dt^2 / m`` in place of its block of ``A^-1``, and lag their targets by the share of the stiffness
+        in that block.
 
         Args:
             particles: Particle indices, shape ``(R, K)``.
@@ -2275,7 +2292,7 @@ class SolverFBA(SolverBase):
         """
         self._invalidate_schur_cache()
         if particles is None or len(particles) == 0:
-            self._constraint_rows = None
+            self._constraint_rows = self._held_rows = None
             return
         if not self.friction or (self.nsn_schur_mode == "full" and not self.use_isodof):
             raise ValueError("particle constraints need friction=True, and use_isodof=True in the full NSN")
@@ -2287,6 +2304,71 @@ class SolverFBA(SolverBase):
         arrays = [(particles, np.int32, wp.int32), (coefficients, np.float32, wp.float32)]
         arrays += [(directions, np.float32, wp.vec3), (targets, np.float64, wp.float64)]
         self._constraint_rows = [wp.array(np.asarray(a, dtype=n), dtype=t, device=self._device) for a, n, t in arrays]
+        if self.nsn_schur_mode == "lite":
+            self._hold_at_points(np.asarray(particles)[:, 0], np.asarray(coefficients)[:, 0], np.asarray(directions))
+
+    def _hold_at_points(self, p: np.ndarray, c: np.ndarray, d: np.ndarray) -> None:
+        """Keep the lite rows that hold particles at points, and their factor while they keep their particles,
+        coefficients and directions."""
+        held = [q for q in np.unique(p) if np.linalg.matrix_rank(d[p == q], tol=1e-3) >= 3]
+        rows = np.flatnonzero(np.isin(p, held)).astype(np.int32)
+        if np.bincount(p[rows]).max(initial=3) > 3:
+            raise ValueError("a particle held at a point takes three rows")
+        if len(rows) > 64:
+            raise NotImplementedError(f"SolverFBA's lite NSN holds at most 64 rows at points, got {len(rows)}")
+        key = (rows, p[rows], c[rows].astype(np.float64), d[rows].astype(np.float64))
+        if not len(rows):
+            self._held_rows = None
+        elif self._held_rows is None or not all(map(np.array_equal, key, self._held_rows[0])):
+            self._held_rows = [key, None]
+
+    def _held_row_factor(self, ls) -> SimpleNamespace:
+        """The rows that hold particles at points with the Cholesky factor ``L`` of their Delassus matrix
+        ``J A^-1 J^T``, padded with identity to ``tile`` rows, and the ``columns`` of ``A^-1`` at their particles.
+        ``A`` holds for the run, so these hold while the rows do."""
+        if self._held_rows[1] is None:
+            rows, p, c, d = self._held_rows[0]
+            unique, index = np.unique(p, return_inverse=True)
+            e = wp.zeros(ls.n, dtype=wp.float64, device=self._device)
+            columns = wp.empty((len(unique), ls.n), dtype=wp.float64, device=self._device)
+            for k, q in enumerate(unique):
+                e.zero_()
+                e[int(q) : int(q) + 1].fill_(1.0)
+                ls.solve_scalar(e, columns[k])
+            block = columns.numpy()[:, unique]
+            tile = max(8, 1 << int(np.ceil(np.log2(len(rows)))))
+            L = np.eye(tile)
+            L[: len(rows), : len(rows)] = np.linalg.cholesky(block[np.ix_(index, index)] * (d @ d.T) * np.outer(c, c))
+            device, f64 = self._device, wp.float64
+            self._held_rows[1] = SimpleNamespace(
+                tile=tile,
+                L=wp.array(L[None], dtype=f64, device=device),
+                rhs=wp.zeros((1, tile), dtype=f64, device=device),
+                x=wp.zeros((1, tile), dtype=f64, device=device),
+                zeros=wp.zeros(len(rows), dtype=f64, device=device),
+                rows=wp.array(rows, dtype=wp.int32, device=device),
+                column=wp.array(index, dtype=wp.int32, device=device),
+                coefficient=wp.array(c, dtype=f64, device=device),
+                direction=wp.array(d, dtype=wp.vec3d, device=device),
+                columns=columns,
+            )
+        return self._held_rows[1]
+
+    def _step_held_rows(self, ls, M: int, dt: float) -> None:
+        """Newton step of the rows that hold particles at points, at the positions the other rows corrected."""
+        from . import kernels as K  # noqa: PLC0415
+        from .joints import _tile_kernels, gather_values_kernel  # noqa: PLC0415
+
+        h, device, r = self._held_row_factor(ls), self._device, self._nsn_r_d
+        inputs = [*self._constraint_rows, self._x_cur, wp.int32(3 * M)]
+        n_b = self._constraint_rows[0].shape[0]
+        wp.launch(K.particle_constraint_residual_kernel, n_b, inputs, [r, self._nsn_pene0_d], device=device)
+        wp.launch(gather_values_kernel, h.rows.shape[0], [r[3 * M :], h.rows, 0], [h.rhs.flatten()], device=device)
+        wp.launch_tiled(_tile_kernels(h.tile)[1], dim=1, inputs=[h.L, h.rhs, h.x], block_dim=64, device=device)
+        outputs = [a[3 * M :] for a in (self._nsn_lam_d, self._nsn_omega_d, self._nsn_lam_apply_d)]
+        wp.launch(K.held_row_update_kernel, h.rows.shape[0], [h.rows, h.x, wp.float64(dt)], outputs, device=device)
+        inputs = [h.rows, h.column, h.coefficient, h.direction, h.columns, h.x]
+        wp.launch(K.held_row_correction_kernel, ls.n, inputs, [self._x_cur], device=device)
 
     def _slot_rows(self, M: int, ls, n_b: int) -> tuple:
         """Particles and coefficients of the rows of the ``M`` contacts and ``n_b`` bilateral rows in four slots,

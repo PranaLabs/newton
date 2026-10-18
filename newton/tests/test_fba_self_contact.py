@@ -161,8 +161,7 @@ class TestSelfContactSolve(unittest.TestCase):
     def test_lite_rows_hold_particles_among_self_contacts(self):
         """Rows lift a 2 x 2 corner of both 6-cell sheets 3 cm in 0.1 s, the upper corner held 2 mm over the
         lower one, inside the 5 mm contact radius. Contacts on held particles carry no force, so the conflict
-        does not throw the cloth, and the other contacts keep every triangle apart. The lite rows lag their
-        moving targets by the stiffness share, a few millimeters here."""
+        does not throw the cloth, and the other contacts keep every triangle apart."""
         builder = newton.ModelBuilder()
         builder.add_shape_box(-1, xform=wp.transform((0.0, 0.0, 0.25), wp.quat_identity()), hx=0.25, hy=0.25, hz=0.25)
         grid = {"dim_x": 6, "dim_y": 6, "cell_x": 0.02, "cell_y": 0.02, "mass": 0.004, "tri_ke": 1e3, "tri_ka": 1e3}
@@ -193,8 +192,8 @@ class TestSelfContactSolve(unittest.TestCase):
                 detector.refit(s0.particle_q)
                 detector.triangle_triangle_intersection_detection()
                 self.assertEqual(int(detector.triangle_intersecting_triangles_count.numpy().sum()), 0)
-        self.assertLess(float(np.abs(s0.particle_qd.numpy()).max()), 1.0)
-        np.testing.assert_allclose(s0.particle_q.numpy()[held], target, atol=5e-3)
+        self.assertLess(float(np.abs(s0.particle_qd.numpy()).max()), 0.01)
+        np.testing.assert_allclose(s0.particle_q.numpy()[held], target, atol=1e-6)
 
 
 if __name__ == "__main__":

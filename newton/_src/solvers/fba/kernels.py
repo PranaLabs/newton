@@ -3541,6 +3541,41 @@ def particle_constraint_residual_kernel(
 
 
 @wp.kernel
+def held_row_update_kernel(
+    rows: wp.array[wp.int32],
+    x: wp.array2d[wp.float64],  # (1, tile) Newton step of the rows, W^-1 r
+    dt: wp.float64,
+    lam: wp.array[wp.float64],  # out, bilateral rows
+    omega: wp.array[wp.float64],  # out, bilateral rows
+    lam_apply: wp.array[wp.float64],  # out, bilateral rows
+):
+    """Multipliers of the bilateral rows that hold particles at points, from their Newton step ``x``."""
+    k = wp.tid()
+    r = rows[k]
+    lam_apply[r] = x[0, k]
+    lam[r] = x[0, k] / (dt * dt)
+    omega[r] = wp.float64(1.0)
+
+
+@wp.kernel
+def held_row_correction_kernel(
+    rows: wp.array[wp.int32],
+    column: wp.array[wp.int32],  # column of A^-1 at the particle of each row
+    coefficient: wp.array[wp.float64],
+    direction: wp.array[wp.vec3d],
+    columns: wp.array2d[wp.float64],  # (U, N) columns of A^-1 at the held particles
+    x: wp.array2d[wp.float64],  # (1, tile) multipliers of the rows
+    q: wp.array[wp.vec3],  # inout
+):
+    """``q += A^-1 J^T x`` for the rows that hold particles at points, by the columns of ``A^-1``."""
+    i = wp.tid()
+    dq = wp.vec3d(0.0)
+    for k in range(rows.shape[0]):
+        dq += columns[column[k], i] * coefficient[k] * x[0, k] * direction[k]
+    q[i] = q[i] + wp.vec3(dq)
+
+
+@wp.kernel
 def particle_constraint_direction_kernel(
     particles: wp.array2d[wp.int32],  # (B, K), -1 when unused
     coefficients: wp.array2d[wp.float32],  # (B, K)
