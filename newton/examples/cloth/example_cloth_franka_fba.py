@@ -158,6 +158,9 @@ class Example:
         usd_stage = Usd.Stage.Open(newton.examples.get_asset("unisex_shirt.usd"))
         usd_prim = usd_stage.GetPrimAtPath("/root/shirt")
         shirt_mesh = newton.usd.get_mesh(usd_prim)
+        # Even out the asset's 0.6 to 2.8 cm edges to at most 1.48 cm at about its vertex count, so that the
+        # 0.8 cm vertex-face self contacts cover every crossing edge.
+        shirt_mesh = newton.utils.remesh_mesh(shirt_mesh, method="isotropic", edge_length=1.11)
         mesh_points = shirt_mesh.vertices
         mesh_indices = shirt_mesh.indices
         vertices = [wp.vec3(v) for v in mesh_points]
@@ -276,9 +279,14 @@ class Example:
                 # 200 N in this cm-kg-s scene, bounds it. A particle resting on the
                 # table needs 0.14 N, a landing one 18 N.
                 lambda_cap=2.0e4,
-                # Cloth self-contact is off: on the flattened shirt, the lite
-                # self-contact solve of thousands of two-way vertex-triangle pairs
-                # moves particles by up to 18 cm in one pass.
+                # The shirt keeps each particle a contact thickness from its nearest triangle, but
+                # not from triangles within one ring or within that distance at rest, so folds close
+                # only between parts that start apart.
+                particle_enable_self_contact=True,
+                particle_self_contact_radius=self.cloth_particle_radius,
+                particle_topological_contact_filter_threshold=1,
+                particle_rest_shape_contact_exclusion_radius=self.cloth_particle_radius,
+                nsn_linear_iterations=20,
             )
 
         self.viewer.set_model(self.model)
@@ -328,8 +336,8 @@ class Example:
         return np.array(wp.transform_get_translation(tf)), rotation @ self.fingertip_axes, opening
 
     def grasp(self, state: State):
-        """Take the particles under the gap between the pads, up to two contact thicknesses below it, with the
-        points where they would enter it straight up, in the fingertip frame."""
+        """Take the particles under the gap between the pads, up to three contact thicknesses below it, so both
+        layers of the shirt, with the points where they would enter it straight up, in the fingertip frame."""
         origin, axes, opening = self.fingertip_frame(state)
         local = (state.particle_q.numpy() - origin) @ axes
         up = axes.T @ np.array([0.0, 0.0, 1.0])
@@ -338,7 +346,7 @@ class Example:
         with np.errstate(divide="ignore", invalid="ignore"):
             ends = ((np.array([0.0, 0.0, PAD_CENTER]) + np.stack([-half, half]))[:, None] - local) / up
         enter, leave = np.nanmax(ends.min(axis=0), axis=1), np.nanmin(ends.max(axis=0), axis=1)
-        inside = (enter <= leave) & (leave >= 0.0) & (enter <= 2.0 * self.cloth_particle_radius)
+        inside = (enter <= leave) & (leave >= 0.0) & (enter <= 3.0 * self.cloth_particle_radius)
         # The solver holds up to 21 particles at points: keep the nearest to the gap.
         self.grasped = np.flatnonzero(inside)[np.argsort(enter[inside])[:21]].astype(np.int32)
         self.grasp_from = local[self.grasped]
@@ -439,10 +447,11 @@ class Example:
             [
                 # descend
                 [4, 31.0, -60.0, 40.0, 0.8536, -0.3536, 0.3536, -0.1464, clamp_open],
-                # approach until the pads rest on the top-left corner, their lowest edge 21.7 cm over
-                # the 20 cm table top, past twice the contact thickness; then grasp it
-                [4, 31.0, -60.0, 22.3, 0.8536, -0.3536, 0.3536, -0.1464, clamp_open],
-                [2, 31.0, -60.0, 22.3, 0.8536, -0.3536, 0.3536, -0.1464, clamp_close],
+                # approach until the pads rest on the top-left corner, their lowest edge 22.5 cm over
+                # the 20 cm table top, past the contact thickness of the two layers of the shirt and of
+                # the pads; then grasp it
+                [4, 31.0, -60.0, 23.1, 0.8536, -0.3536, 0.3536, -0.1464, clamp_open],
+                [2, 31.0, -60.0, 23.1, 0.8536, -0.3536, 0.3536, -0.1464, clamp_close],
                 # lift
                 [2, 26.0, -60.0, 26.0, 0.8536, -0.3536, 0.3536, -0.1464, clamp_close],
                 [2, 12.0, -60.0, 31.0, 0.8536, -0.3536, 0.3536, -0.1464, clamp_close],
