@@ -10,9 +10,10 @@
 # The contacts carry the 0.8 cm particle radius as a contact thickness, so
 # the shirt rests on the table like SolverVBD's. The hard contacts do not let
 # the closing fingertips sink into the shirt and pinch it, as SolverVBD's
-# penalty contacts do; instead, once the fingertips have closed, rows of the
-# solver hold the particles between them at points of the fingertip frame,
-# like a positional controller, until the fingertips open.
+# penalty contacts do, so the fingertips come down only until their pads rest
+# on the shirt. As they close, rows of the solver take the shirt under the gap
+# between the pads and lift it into the gap, like a positional controller,
+# until the fingertips open.
 #
 # Command: python -m newton.examples cloth_franka_fba
 #
@@ -31,13 +32,14 @@ import newton.utils
 from newton import Model, ModelBuilder, State, eval_fk
 from newton.solvers import SolverFBA, SolverFeatherstone
 
-# Fingertip pads of the Franka hand at scale 100 [cm], in the fingertip frame: each reaches
-# PAD_OVERLAP past the opening that its finger joint states, PAD_HALF_WIDTH to either side,
-# and PAD_HALF_LENGTH about PAD_CENTER along the axis out of the fingertips.
-PAD_OVERLAP = 0.11
-PAD_HALF_WIDTH = 0.76
-PAD_HALF_LENGTH = 0.92
-PAD_CENTER = -0.93
+# Fingertip pads of the Franka hand at scale 100 [cm], in the fingertip frame: the inner face of
+# each sits at the opening that its finger joint states, and the pads reach PAD_HALF_WIDTH to
+# either side and PAD_HALF_LENGTH about PAD_CENTER along the axis out of the fingertips.
+PAD_HALF_WIDTH = 0.875
+PAD_HALF_LENGTH = 0.925
+PAD_CENTER = -0.935
+# Time [s] over which the taken particles rise into the gap between the pads.
+GRASP_RISE = 0.5
 
 
 @wp.kernel
@@ -322,43 +324,51 @@ class Example:
         """
         tf = wp.transform(*state.body_q.numpy()[self.endeffector_id]) * self.endeffector_offset
         rotation = np.array(wp.quat_to_matrix(wp.transform_get_rotation(tf))).reshape(3, 3)
-        opening = float(state.joint_q.numpy()[-2:].mean()) - PAD_OVERLAP
+        opening = float(state.joint_q.numpy()[-2:].mean())
         return np.array(wp.transform_get_translation(tf)), rotation @ self.fingertip_axes, opening
 
     def grasp(self, state: State):
-        """Take the particles between the pads and those that touch them: the box of the pads, grown by the contact
-        thickness across them and by half of it all around."""
+        """Take the particles under the gap between the pads, up to two contact thicknesses below it, with the
+        points where they would enter it straight up, in the fingertip frame."""
         origin, axes, opening = self.fingertip_frame(state)
         local = (state.particle_q.numpy() - origin) @ axes
-        thickness = self.cloth_particle_radius
-        half = np.array([opening, PAD_HALF_WIDTH + thickness, PAD_HALF_LENGTH]) + 0.5 * thickness
-        inside = np.all(np.abs(local - [0.0, 0.0, PAD_CENTER]) <= half, axis=1)
-        self.grasped = np.flatnonzero(inside).astype(np.int32)
-        self.grasp_offsets = local[inside]
-        self.grasp_opening = opening
+        up = axes.T @ np.array([0.0, 0.0, 1.0])
+        half = np.array([opening, PAD_HALF_WIDTH, PAD_HALF_LENGTH])
+        # Where each particle's way up enters and leaves the box of the gap.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ends = ((np.array([0.0, 0.0, PAD_CENTER]) + np.stack([-half, half]))[:, None] - local) / up
+        enter, leave = np.nanmax(ends.min(axis=0), axis=1), np.nanmin(ends.max(axis=0), axis=1)
+        inside = (enter <= leave) & (leave >= 0.0) & (enter <= 2.0 * self.cloth_particle_radius)
+        # The solver holds up to 21 particles at points: keep the nearest to the gap.
+        self.grasped = np.flatnonzero(inside)[np.argsort(enter[inside])[:21]].astype(np.int32)
+        self.grasp_from = local[self.grasped]
+        rise = np.minimum(np.maximum(enter[self.grasped], 0.0) + 0.25, leave[self.grasped])
+        self.grasp_to = self.grasp_from + rise[:, None] * up
+        self.grasp_opening, self.grasp_time = opening, self.sim_time
 
     def hold_grasp(self, state: State):
-        """Hold the taken particles at their offsets in the fingertip frame.
+        """Hold the taken particles at points of the fingertip frame that rise into the gap between the pads.
 
-        Along the closing axis the offsets shrink with the room between the contact thicknesses of the pads.
+        Along the closing axis the points close in with the pads, a contact thickness inside each.
         """
         origin, axes, opening = self.fingertip_frame(state)
-        thickness = self.cloth_particle_radius
-        draw = min(max(opening - thickness, 0.0) / (self.grasp_opening - thickness), 1.0)
-        targets = origin + (self.grasp_offsets * [draw, 1.0, 1.0]) @ axes.T
+        rise = min((self.sim_time - self.grasp_time) / GRASP_RISE, 1.0)
+        local = self.grasp_from + rise * (self.grasp_to - self.grasp_from)
+        local[:, 0] *= 1.0 + rise * (max(opening - self.cloth_particle_radius, 0.0) / self.grasp_opening - 1.0)
+        targets = origin + local @ axes.T
         n = len(self.grasped)
         self.cloth_solver.set_particle_constraints(
             np.repeat(self.grasped, 3)[:, None], np.ones((3 * n, 1)), targets.reshape(-1), np.tile(np.eye(3), (n, 1))
         )
 
     def update_grasp(self):
-        """Take the particles once the fingertips have closed to within 2.5 mm, and let them go as they open."""
+        """Take the particles once the fingertips have closed to within 5 mm, and let them go as they open."""
         if self.target[-1] > 0.5 * (self.clamp_open + self.clamp_close):
             if len(self.grasped):
                 self.grasped = self.grasped[:0]
                 self.cloth_solver.set_particle_constraints(None, None, None)
             self.grasp_armed = True
-        elif self.grasp_armed and self.fingertip_frame(self.state_0)[2] < 4.0 * self.clamp_close - PAD_OVERLAP + 0.25:
+        elif self.grasp_armed and self.fingertip_frame(self.state_0)[2] < 4.0 * self.clamp_close + 0.5:
             self.grasp(self.state_0)
             self.grasp_armed = False
 
@@ -416,7 +426,7 @@ class Example:
         )
         builder.joint_q[:6] = [0.0, 0.0, 0.0, -1.59695, 0.0, 2.5307]
 
-        # Closed, the pads stay 0.89 cm apart from the middle, past the 0.8 cm contact thickness of the cloth
+        # Closed, the pads stay 1 cm apart from the middle, past the 0.8 cm contact thickness of the cloth
         # they hold there.
         clamp_close = self.clamp_close = 0.25
         clamp_open = self.clamp_open = 0.8
@@ -429,9 +439,10 @@ class Example:
             [
                 # descend
                 [4, 31.0, -60.0, 40.0, 0.8536, -0.3536, 0.3536, -0.1464, clamp_open],
-                # approach + grasp top-left corner
-                [2, 31.0, -60.0, 20.0, 0.8536, -0.3536, 0.3536, -0.1464, clamp_open],
-                [2, 31.0, -60.0, 20.0, 0.8536, -0.3536, 0.3536, -0.1464, clamp_close],
+                # approach until the pads rest on the top-left corner, their lowest edge 21.7 cm over
+                # the 20 cm table top, past twice the contact thickness; then grasp it
+                [4, 31.0, -60.0, 22.3, 0.8536, -0.3536, 0.3536, -0.1464, clamp_open],
+                [2, 31.0, -60.0, 22.3, 0.8536, -0.3536, 0.3536, -0.1464, clamp_close],
                 # lift
                 [2, 26.0, -60.0, 26.0, 0.8536, -0.3536, 0.3536, -0.1464, clamp_close],
                 [2, 12.0, -60.0, 31.0, 0.8536, -0.3536, 0.3536, -0.1464, clamp_close],
@@ -599,7 +610,7 @@ class Example:
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
-    # The key poses finish at 18 s.
-    parser.set_defaults(num_frames=1080)
+    # The key poses finish at 20 s.
+    parser.set_defaults(num_frames=1200)
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)
