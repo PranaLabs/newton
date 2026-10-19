@@ -50,7 +50,8 @@ def fb_unilateral_row(
     plam = precond * lam
     root = math.sqrt(pene * pene + plam * plam)
     if root < 1e-30:
-        return 0.0, precond / (dt * dt), pene0
+        # The residual vanishes at the origin, so the row takes no Newton step.
+        return 0.0, precond / (dt * dt), 0.0
     omega = 1.0 - pene / root
     compliance = (1.0 - plam / root) * (precond / (dt * dt))
     h = -(pene + plam - root) + omega * (penetration + pene0)

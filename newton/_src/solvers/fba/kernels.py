@@ -3628,13 +3628,14 @@ def fb_unilateral_row_wp(
     Returns:
         ``vec3d(omega, compliance, h)`` matching the CPU reference's tuple
         return semantics. The degenerate-root branch returns
-        ``(0, precond/dt², pene0)`` to suppress this row's contribution.
+        ``(0, precond/dt², 0)``: the residual vanishes there, so the row
+        takes no Newton step.
     """
     pene = penetration
     plam = precond * lam
     root = wp.sqrt(pene * pene + plam * plam)
     if root < wp.float64(1.0e-30):
-        return wp.vec3d(wp.float64(0.0), precond / (dt * dt), pene0)
+        return wp.vec3d(wp.float64(0.0), precond / (dt * dt), wp.float64(0.0))
     omega = wp.float64(1.0) - pene / root
     compliance = (wp.float64(1.0) - plam / root) * (precond / (dt * dt))
     h = -(pene + plam - root) + omega * (penetration + pene0)

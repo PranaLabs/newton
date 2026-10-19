@@ -129,6 +129,20 @@ class TestFbUnilateralRowWp(unittest.TestCase):
                 got = _run_unilateral_wp(pen, lam, precond, dt, pene0)
                 self._assert_close(got, expected)
 
+    def test_newton_rhs_ignores_the_anchor_offset(self):
+        # The row's Newton right-hand side h - omega * (penetration + pene0) is -phi, so moving the contact plane off
+        # the origin must not change it. A float32 residual can land exactly on the plane: the degenerate root.
+        cases = [(0.0, 0.0, 2.0, 0.01), (0.01, 0.5, 2.0, 0.01), (-0.002, 1.2, 1.5, 0.01), (0.05, 0.0, 1.0, 0.02)]
+        for pen, lam, precond, dt in cases:
+            phi = pen + precond * lam - np.hypot(pen, precond * lam)
+            for pene0 in (0.0, 3.0, -7.25):
+                for omega, _, h in (
+                    fb_unilateral_row(pen, lam, precond, dt, pene0),
+                    _run_unilateral_wp(pen, lam, precond, dt, pene0),
+                ):
+                    with self.subTest(pen=pen, lam=lam, pene0=pene0):
+                        self.assertAlmostEqual(h - omega * (pen + pene0), -phi, delta=1e-12)
+
 
 class TestFbFrictionalRowWp(unittest.TestCase):
     """Verify GPU ``fb_frictional_row_wp`` matches the CPU reference."""
