@@ -1925,6 +1925,16 @@ class FBALinearSolver:
                     -alpha[has_b, None] * d[has_b]
                 ).reshape(n_triplets_b, 1, 3)
 
+        rows_d = wp.array(rows, dtype=wp.int32, device=dev)
+        cols_d = wp.array(cols, dtype=wp.int32, device=dev)
+        vals_d = wp.array(vals, dtype=self._mat1x3_dtype, device=dev)
+        return self.build_schur_lite_triplets(total_rows, rows_d, cols_d, vals_d)
+
+    def build_schur_lite_triplets(
+        self, total_rows: int, rows_d: wp.array, cols_d: wp.array, vals_d: wp.array
+    ) -> wps.BsrMatrix:
+        """``W = H (dt^2 M^-1) H^T`` from the triplets of ``H``, rows of 1 x 3 blocks over the particles;
+        triplets with a negative column are skipped."""
         # Build H BSR fresh each call.  ``bsr_set_from_triplets`` writes into
         # the destination's ``offsets`` buffer at length ``rows_of_blocks+1``,
         # so reusing the same BsrMatrix with a different ``total_rows`` would
@@ -1932,16 +1942,11 @@ class FBALinearSolver:
         # given typical call frequency (per FB-Newton step).
         self._H_lite_uni_bsr = wps.bsr_zeros(
             rows_of_blocks=total_rows,
-            cols_of_blocks=n,
-            block_type=self._mat1x3_dtype,
-            device=dev,
+            cols_of_blocks=self.n,
+            block_type=vals_d.dtype,
+            device=self.device,
         )
-        rows_d = wp.array(rows, dtype=wp.int32, device=dev)
-        cols_d = wp.array(cols, dtype=wp.int32, device=dev)
-        vals_d = wp.array(vals, dtype=self._mat1x3_dtype, device=dev)
-        wps.bsr_set_from_triplets(
-            self._H_lite_uni_bsr, rows_d, cols_d, vals_d, prune_numerical_zeros=False
-        )
+        wps.bsr_set_from_triplets(self._H_lite_uni_bsr, rows_d, cols_d, vals_d, prune_numerical_zeros=False)
 
         HT = wps.bsr_transposed(self._H_lite_uni_bsr)
         Minv_HT = wps.bsr_mm(self._M_inv_dt2_bsr, HT)
@@ -1949,20 +1954,8 @@ class FBALinearSolver:
         self._W_lite_uni_total_rows = total_rows
         return self._W_lite_uni_bsr
 
-    def build_a_schur_lite_bsr(
-        self,
-        W_bsr: "wps.BsrMatrix",
-        omega_d: wp.array,         # (total_rows,) fp64
-        compliance_d: wp.array,    # (total_rows,) fp64
-    ) -> "wps.BsrMatrix":
-        """Construct ``A_schur = ωωᵀ ⊙ W + diag(c)`` in BSR (same sparsity as W).
-
-        ``warp.sparse`` collapses 1×1-block BSR storage to scalar fp64 values,
-        so ``W_bsr.values.dtype == wp.float64`` (not ``mat1x1``).  We allocate
-        the sibling A_schur matrix with the same convention.
-        """
-        from .kernels import build_a_schur_lite_bsr_kernel  # noqa: PLC0415
-
+    def reserve_a_schur_lite_bsr(self, W_bsr: wps.BsrMatrix) -> wps.BsrMatrix:
+        """Storage for ``A_schur`` with the sparsity of ``W_bsr``, which it shares; its values are not set."""
         nnz = int(W_bsr.nnz)
         n_rows = int(W_bsr.nrow)
 
@@ -1992,9 +1985,26 @@ class FBALinearSolver:
         self._A_schur_lite_bsr.offsets = W_bsr.offsets
         self._A_schur_lite_bsr.columns = W_bsr.columns
 
+        return self._A_schur_lite_bsr
+
+    def build_a_schur_lite_bsr(
+        self,
+        W_bsr: wps.BsrMatrix,
+        omega_d: wp.array,  # (total_rows,) fp64
+        compliance_d: wp.array,  # (total_rows,) fp64
+    ) -> wps.BsrMatrix:
+        """Construct ``A_schur = ωωᵀ ⊙ W + diag(c)`` in BSR (same sparsity as W).
+
+        ``warp.sparse`` collapses 1x1-block BSR storage to scalar fp64 values,
+        so ``W_bsr.values.dtype == wp.float64`` (not ``mat1x1``).  We allocate
+        the sibling A_schur matrix with the same convention.
+        """
+        from .kernels import build_a_schur_lite_bsr_kernel  # noqa: PLC0415
+
+        A = self.reserve_a_schur_lite_bsr(W_bsr)
         wp.launch(
             build_a_schur_lite_bsr_kernel,
-            dim=n_rows,
+            dim=int(W_bsr.nrow),
             inputs=[
                 W_bsr.offsets,
                 W_bsr.columns,
@@ -2002,10 +2012,10 @@ class FBALinearSolver:
                 omega_d,
                 compliance_d,
             ],
-            outputs=[self._A_schur_lite_bsr.values],
+            outputs=[A.values],
             device=self.device,
         )
-        return self._A_schur_lite_bsr
+        return A
 
     def build_schur_lite_dense(
         self,

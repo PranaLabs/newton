@@ -496,6 +496,8 @@ class SolverFBA(SolverBase):
         self._self_contact, self._lite_slot_rows, self._held_rows = None, None, None
         # Graph of the step's sparse lite NSN, False when its capture failed.
         self._lite_nsn_graph = None
+        # Particles that the lite rows hold at points, and a flag per particle on the device.
+        self._held_particles, self._held_particle_d = np.zeros(0, dtype=np.int32), None
         if particle_enable_self_contact:
             if not self.friction or not self.use_isodof or mu_per_pair_override is not None:
                 raise ValueError("self contact needs friction=True, use_isodof=True and no mu_per_pair_override")
@@ -1721,14 +1723,10 @@ class SolverFBA(SolverBase):
                         )
                         if self._lite_slot_rows is not None:
                             # Rows on several particles couple them: the sparse lite NSN.
-                            (pa, pb, pc, pd), (wa, wb, wc, wd), ones, W_bsr, held_d = self._lite_slot_rows
+                            W_bsr, held_d = self._lite_slot_rows
                             nsn = functools.partial(
                                 self._solve_nsn_coulomb_lite_bsr,
                                 M_total=M,
-                                row_particle_a_d=pa,
-                                row_particle_b_d=pb,
-                                row_dir_d=ls._row_dir_d,
-                                row_alpha_d=ones,
                                 contact_mu_d=self._contact_mu_d,
                                 r_d=self._nsn_r_d,
                                 pene0_d=self._nsn_pene0_d,
@@ -1741,12 +1739,6 @@ class SolverFBA(SolverBase):
                                 n_fb_iters=1,
                                 cap_internal=cap_internal,
                                 use_cap=bool(use_cap),
-                                row_particle_c_d=pc,
-                                row_particle_d_d=pd,
-                                row_wa_d=wa,
-                                row_wb_d=wb,
-                                row_wc_d=wc,
-                                row_wd_d=wd,
                                 W_bsr=W_bsr,
                                 n_bilateral=n_b,
                                 held_d=held_d,
@@ -2320,7 +2312,11 @@ class SolverFBA(SolverBase):
     def _hold_at_points(self, p: np.ndarray, c: np.ndarray, d: np.ndarray) -> None:
         """Keep the lite rows that hold particles at points, and their factor while they keep their particles,
         coefficients and directions."""
-        held = [q for q in np.unique(p) if np.linalg.matrix_rank(d[p == q], tol=1e-3) >= 3]
+        held = np.array([q for q in np.unique(p) if np.linalg.matrix_rank(d[p == q], tol=1e-3) >= 3], dtype=np.int32)
+        if self._held_particle_d is None or not np.array_equal(held, self._held_particles):
+            flags = np.zeros(self.model.particle_count, dtype=np.int32)
+            flags[held] = 1
+            self._held_particles, self._held_particle_d = held, wp.array(flags, device=self._device)
         rows = np.flatnonzero(np.isin(p, held)).astype(np.int32)
         if np.bincount(p[rows]).max(initial=3) > 3:
             raise ValueError("a particle held at a point takes three rows")
@@ -2381,34 +2377,27 @@ class SolverFBA(SolverBase):
         wp.launch(K.held_row_correction_kernel, ls.n, inputs, [self._x_cur], device=device)
 
     def _slot_rows(self, M: int, ls, n_b: int) -> tuple:
-        """Particles and coefficients of the rows of the ``M`` contacts and ``n_b`` bilateral rows in four slots,
-        unit row scales, their sparse lite Delassus matrix, which holds for the step, and the contacts on a
-        particle that the bilateral rows hold at a point, for the sparse lite NSN."""
-        extra_p, extra_a = (a.numpy()[:M] for a in self._contact_extra)
-        pad = ((0, 0), (0, 3 - extra_p.shape[1]))
-        contact_p = np.column_stack([self._contact_particle_h[:M], np.pad(extra_p, pad, constant_values=-1)])
-        p = contact_p.repeat(3, axis=0)
-        w = np.column_stack([self._contact_alpha_h[:M], np.pad(extra_a, pad)]).repeat(3, axis=0)
-        held_d = None
+        """The sparse lite Delassus matrix of the ``M`` contacts and ``n_b`` bilateral rows, which holds for the
+        step, and the contacts on a particle that the bilateral rows hold at a point, for the sparse lite NSN."""
+        from . import kernels as K  # noqa: PLC0415
+
+        n, device = 3 * M + n_b, self._device
+        if self._held_particle_d is None:
+            self._held_particle_d = wp.zeros(self.model.particle_count, dtype=wp.int32, device=device)
         if n_b:
-            b_p, b_dir, b_alpha = self._lite_constraint_rows()
-            p = np.vstack([p, np.column_stack([b_p, np.full((n_b, 3), -1)])]).astype(np.int32)
-            w = np.vstack([w, np.column_stack([b_alpha, np.zeros((n_b, 3))])]).astype(np.float32)
-            held = [q for q in np.unique(b_p) if np.linalg.matrix_rank(b_dir[b_p == q], tol=1e-3) >= 3]
-            held_contact = np.isin(contact_p, held).any(axis=1)
-            held_d = wp.array(held_contact.astype(np.int32), dtype=wp.int32, device=self._device)
-        particles = [wp.array(np.ascontiguousarray(p[:, k]), dtype=wp.int32, device=self._device) for k in range(4)]
-        weights = [wp.array(np.ascontiguousarray(w[:, k]), dtype=wp.float32, device=self._device) for k in range(4)]
-        ones = wp.array(np.ones(3 * M + n_b, dtype=np.float32), device=self._device)
-        slots = {f"row_particle_{c}_d": particles[i] for i, c in ((2, "c"), (3, "d"))}
-        slots |= {f"row_w{c}_d": weights[i] for i, c in enumerate("abcd")}
-        W = ls.build_schur_lite_unified(3 * M + n_b, particles[0], particles[1], ls._row_dir_d, ones, **slots)
-        if W is not None:
-            # The NSN's graph captures its buffers: they take their sizes for the step here.
-            n = 3 * M + n_b
-            self._ensure_lite_bsr_buffers(n)
-            ls.build_a_schur_lite_bsr(W, self._bsr_omega[:n], self._bsr_compliance[:n])
-        return particles, weights, ones, W, held_d
+            bilateral = self._constraint_rows[:2]
+        else:
+            bilateral = [wp.empty((0, 1), dtype=t, device=device) for t in (wp.int32, wp.float32)]
+        triplets = [wp.empty(4 * n, dtype=t, device=device) for t in (wp.int32, wp.int32, K._mat13d)]
+        held_d = wp.empty(M, dtype=wp.int32, device=device)
+        inputs = [self._contact_particle_d, self._contact_alpha_d, *self._contact_extra, *bilateral, ls._row_dir_d]
+        inputs += [self._held_particle_d, M]
+        wp.launch(K.lite_row_triplets_kernel, n, inputs, [*triplets, held_d], device=device)
+        W = ls.build_schur_lite_triplets(n, *triplets)
+        # The NSN's graph captures its buffers: they take their sizes for the step here.
+        self._ensure_lite_bsr_buffers(n)
+        ls.reserve_a_schur_lite_bsr(W)
+        return W, held_d if n_b else None
 
     def _lite_constraint_rows(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Particles, directions and coefficients of the bilateral rows, each on one particle."""
@@ -3729,10 +3718,6 @@ class SolverFBA(SolverBase):
         self,
         *,
         M_total: int,
-        row_particle_a_d: wp.array,
-        row_particle_b_d: wp.array,
-        row_dir_d: wp.array,
-        row_alpha_d: wp.array,
         contact_mu_d: wp.array,
         r_d: wp.array,
         pene0_d: wp.array,
@@ -3745,7 +3730,11 @@ class SolverFBA(SolverBase):
         n_fb_iters: int,
         cap_internal: float,
         use_cap: bool,
-        # ---- Optional 4-slot Jacobian (v-t / e-e) ----
+        # ---- Jacobian rows, to build W_bsr when it is not given; optional 4-slot Jacobian (v-t / e-e) ----
+        row_particle_a_d: wp.array | None = None,
+        row_particle_b_d: wp.array | None = None,
+        row_dir_d: wp.array | None = None,
+        row_alpha_d: wp.array | None = None,
         row_particle_c_d: wp.array | None = None,
         row_particle_d_d: wp.array | None = None,
         row_wa_d: wp.array | None = None,

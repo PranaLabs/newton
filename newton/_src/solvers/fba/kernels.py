@@ -4098,6 +4098,54 @@ def bilateral_law_kernel(
     h[i] = pene0[i]
 
 
+_mat13d = wp.types.matrix(shape=(1, 3), dtype=wp.float64)
+
+
+@wp.kernel
+def lite_row_triplets_kernel(
+    contact_particle: wp.array[wp.int32],  # (M,) first particle of each contact
+    contact_alpha: wp.array[wp.float32],  # (M,) its coefficient
+    extra_particle: wp.array2d[wp.int32],  # (M, E) further particles of each contact, -1 where unused
+    extra_alpha: wp.array2d[wp.float32],  # (M, E) their coefficients
+    row_particle: wp.array2d[wp.int32],  # (B, K) particle of each bilateral row in slot 0
+    row_coefficient: wp.array2d[wp.float32],  # (B, K) its coefficient
+    row_dir: wp.array[wp.vec3],  # (3 M + B,) direction of each row
+    held_particle: wp.array[wp.int32],  # (N,) 1 for particles that bilateral rows hold at a point
+    contacts: int,
+    # outputs
+    rows: wp.array[wp.int32],  # (4 (3 M + B),)
+    columns: wp.array[wp.int32],
+    values: wp.array[_mat13d],
+    held: wp.array[wp.int32],  # (M,) 1 when a particle of the contact is held at a point
+):
+    """The blocks ``c_k d`` of the lite Jacobian in four slots per row, the three rows of each contact and then
+    the bilateral rows, with a negative column where a slot has no particle or a zero coefficient."""
+    r = wp.tid()
+    d = row_dir[r]
+    on_held = wp.int32(0)
+    for k in range(4):
+        p = wp.int32(-1)
+        c = wp.float32(0.0)
+        if r < 3 * contacts:
+            if k == 0:
+                p = contact_particle[r // 3]
+                c = contact_alpha[r // 3]
+            elif k - 1 < extra_particle.shape[1]:
+                p = extra_particle[r // 3, k - 1]
+                c = extra_alpha[r // 3, k - 1]
+        elif k == 0:
+            p = row_particle[r - 3 * contacts, 0]
+            c = row_coefficient[r - 3 * contacts, 0]
+        rows[4 * r + k] = r
+        columns[4 * r + k] = wp.where(p >= 0 and c != wp.float32(0.0), p, -1)
+        values[4 * r + k] = wp.matrix_from_rows(wp.float64(c) * wp.vec3d(d))
+        if p >= 0:
+            if held_particle[p] != 0:
+                on_held = 1
+    if r < 3 * contacts and r % 3 == 0:
+        held[r // 3] = on_held
+
+
 @wp.kernel
 def held_contact_law_kernel(
     held: wp.array[wp.int32],  # (M,) 1 when a particle of the contact is held at a point
