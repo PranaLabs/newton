@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import functools
-import math
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Literal
@@ -15,81 +14,6 @@ import warp as wp
 from ...sim import BodyFlags, Contacts, Control, Model, ModelFlags, State
 from ..solver import SolverBase
 from .cable import Cable
-
-
-def fb_unilateral_row(
-    penetration: float,
-    lam: float,
-    precond: float,
-    dt: float,
-    pene0: float,
-) -> tuple[float, float, float]:
-    """Fischer-Burmeister evaluation for a unilateral (normal) contact row.
-
-    Port of RealSim ``NonSmoothNewton.cpp:332-341``. Returns
-    ``(omega, compliance, h)``.
-
-    Args:
-        penetration: ``J·q − pene0`` at current iterate (m).
-        lam: Current normal lambda (N).
-        precond: ``1 / W_ii`` (1/N).
-        dt: Timestep (s).
-        pene0: ``n·anchor`` (m).
-
-    Returns:
-        ``(omega, compliance, h)``:
-        - ``omega``: per-row weighting ``1 − pene/√(pene² + (precond·lam)²)``.
-          May exceed 1 in deep penetration (penetration < 0); intentional.
-        - ``compliance``: diagonal regularization for the Schur LHS.
-        - ``h``: row contribution to the Schur RHS,
-          ``−(pene + precond·lam − root) + omega · (penetration + pene0)``.
-    """
-    pene = penetration
-    plam = precond * lam
-    root = math.sqrt(pene * pene + plam * plam)
-    if root < 1e-30:
-        # The residual vanishes at the origin, so the row takes no Newton step.
-        return 0.0, precond / (dt * dt), 0.0
-    omega = 1.0 - pene / root
-    compliance = (1.0 - plam / root) * (precond / (dt * dt))
-    h = -(pene + plam - root) + omega * (penetration + pene0)
-    return omega, compliance, h
-
-
-def fb_frictional_row(
-    penetration: float,
-    lam_t: float,
-    lam_n: float,
-    mu: float,
-    precond: float,
-    dt: float,
-    pene0: float,
-) -> tuple[float, float, float]:
-    """Fischer-Burmeister evaluation for a frictional (tangent) contact row.
-
-    Port of RealSim ``NonSmoothNewton.cpp:343-378``. Returns
-    ``(omega, compliance, h)``.
-
-    Inactive contact (``lam_n ≤ 0``): ``omega = 0``, ``compliance = 1/dt``,
-    ``h = -dt · lam_t``.
-
-    Active contact (``lam_n > 0``): smooth complementarity between slip speed
-    ``|penetration|/dt`` and cone slack ``μ·lam_n − |lam_t|``. ``omega = 1``,
-    compliance varies between near-zero (stick) and ``~1/dt`` (slip).
-    """
-    if lam_n <= 0.0:
-        return 0.0, 1.0 / dt, -dt * lam_t
-
-    abspenevel = abs(penetration / dt)
-    tmp = precond * (mu * lam_n - abs(lam_t))
-    root = math.sqrt(abspenevel * abspenevel + tmp * tmp)
-    denom = abspenevel + mu * precond * lam_n - root
-    if abs(denom) < 1e-30:
-        compliance = 1.0 / dt
-    else:
-        compliance = ((root - tmp) / denom) * (precond / dt)
-    h = -(dt * dt) * compliance * lam_t + pene0
-    return 1.0, compliance, h
 
 
 def _host_mirror(name: str) -> property:
@@ -2847,7 +2771,7 @@ class SolverFBA(SolverBase):
         Sequence per FB-Newton iter (mirrors the CPU loop body 1:1):
 
             1. ``penetration = -r + dt²·W·(ω·λ)``
-            2. ``(ω, c, h) = fb_unilateral_row(...)`` per row
+            2. ``(ω, c, h) = fb_unilateral_row_wp(...)`` per row
             3. ``A_schur = ωωᵀ ⊙ W + diag(c)``
             4. ``rhs = (1/dt²)·(h - ω·J·x_corrected)``
             5. ``dλ = A_schur⁻¹·rhs`` via :class:`NSNPCRSolver`

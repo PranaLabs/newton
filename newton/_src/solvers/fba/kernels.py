@@ -3445,7 +3445,7 @@ def fb_unilateral_row_wp(
     """Fischer-Burmeister evaluation for a unilateral (normal) contact row.
 
     GPU port of RealSim ``NonSmoothNewton.cpp:332-341`` and the CPU
-    reference :func:`~newton._src.solvers.fba.solver_fba.fb_unilateral_row`.
+    reference ``fb_unilateral_row`` (``newton/tests/fba/_reference.py``).
     Returns a :class:`warp.vec3d` packing ``(omega, compliance, h)`` —
     Warp ``@wp.func`` cannot return Python tuples, so we use the fp64 vec3
     type for the three scalars.
@@ -3487,7 +3487,7 @@ def fb_frictional_row_wp(
     """Fischer-Burmeister evaluation for a frictional (tangent) contact row.
 
     GPU port of RealSim ``NonSmoothNewton.cpp:343-378`` and the CPU
-    reference :func:`~newton._src.solvers.fba.solver_fba.fb_frictional_row`.
+    reference ``fb_frictional_row`` (``newton/tests/fba/_reference.py``).
     Returns ``(omega, compliance, h)`` packed as :class:`warp.vec3d`.
 
     Inactive contact (``lam_n ≤ 0``): ``omega = 0``, ``compliance = 1/dt``,
