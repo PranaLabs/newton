@@ -17,7 +17,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.fba import kernels as K
-from newton._src.solvers.fba.solver_fba import fb_frictional_row, fb_unilateral_row
+from newton.tests.fba._reference import fb_frictional_row, fb_unilateral_row
 
 
 @wp.kernel

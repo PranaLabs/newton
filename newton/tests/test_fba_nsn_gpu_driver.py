@@ -29,7 +29,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.fba import SolverFBA
-from newton._src.solvers.fba.solver_fba import fb_frictional_row, fb_unilateral_row
+from newton.tests.fba._reference import fb_frictional_row, fb_unilateral_row
 
 
 def _make_unilateral_inputs(M: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
