@@ -108,7 +108,7 @@ class Example:
         self.lifted = 0.0
 
     def simulate(self):
-        # Ramp the cables like RealSim's cable controller and move the palm.
+        # Ramp the cables and move the palm.
         ratio, lift = schedule(self.sim_time)
         target = self.x0.copy()
         target[self.palm, 2] += lift

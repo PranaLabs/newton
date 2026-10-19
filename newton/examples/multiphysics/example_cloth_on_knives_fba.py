@@ -4,11 +4,11 @@
 ###########################################################################
 # Example Cloth on Knives FBA
 #
-# A 6 x 5.4 m cloth drops onto five blades with V notches, after RealSim's
-# cloth on knives scene. Each blade is a closed mesh that tapers from 20 mm
-# at its base to 1 mm at its tips, so particle contacts see both of its
-# sides. The cloth triangles are larger than the contact margin, and face
-# contacts keep the blade tips and edges out of them.
+# A 6 x 5.4 m cloth drops onto five blades with V notches. Each blade is a
+# closed mesh that tapers from 20 mm at its base to 1 mm at its tips, so
+# particle contacts see both of its sides. The cloth triangles are larger
+# than the contact margin, and face contacts keep the blade tips and edges
+# out of them.
 #
 # Command: uv run -m newton.examples cloth_on_knives_fba
 ###########################################################################
@@ -68,7 +68,7 @@ def knife_mesh(n=20):
 
 
 def cloth_mesh():
-    """RealSim's square_5101P: a 51 x 51 grid with a center particle per cell, four triangles per cell."""
+    """A 51 x 51 grid with a center particle per cell, four triangles per cell."""
     g = np.linspace(-1.0, 1.0, 51)
     c = 0.5 * (g[1:] + g[:-1])
     uv = np.vstack([np.stack(np.meshgrid(a, a, indexing="ij"), -1).reshape(-1, 2) for a in (g, c)])
@@ -92,7 +92,7 @@ class Example:
         builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.0))
         builder.add_shape_mesh(-1, mesh=knife_mesh(), cfg=newton.ModelBuilder.ShapeConfig(mu=0.3))
 
-        # RealSim's membrane, young 37500 and poisson 0.4; 1000 kg spread evenly over the particles.
+        # A membrane of Young's modulus 37500 Pa and Poisson ratio 0.4; 1000 kg spread evenly over the particles.
         young, poisson = 37500.0, 0.4
         mu = young / (2.0 * (1.0 + poisson))
         lam = young * poisson / ((1.0 + poisson) * (1.0 - 2.0 * poisson))

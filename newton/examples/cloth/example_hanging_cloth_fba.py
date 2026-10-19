@@ -6,7 +6,7 @@
 #
 # A 10225-particle Neo-Hookean cloth tilted 30 deg about X and pinned
 # along its top edge, draping under gravity (-10 m/s^2 along Y) with
-# isometric bending.  Mirrors RealSim Tests/ClothTest.
+# isometric bending.
 #
 # Command: uv run -m newton.examples hanging_cloth_fba
 ###########################################################################
@@ -22,21 +22,19 @@ import newton
 import newton.examples
 from newton.solvers import SolverFBA
 
-_DT = 0.05  # ClothTest/scene.json timestep
-_PD_ITER = 10  # scene.json LocalGlobal = 10
-_GRAVITY = -10.0  # scene.json gravity = [0, -10, 0]
+_DT = 0.05
+_PD_ITER = 10
+_GRAVITY = -10.0  # along -Y
 
 _YOUNG = 1.0e4
 _POISSON = 0.4
 _OBJ_MASS = 1000.0
-_BENDING = 1.0e-3  # softer than ClothTest's 0.1 — Newton's edge_ke uses a
-# different normalisation than RealSim's bending coefficient, so 0.1 here
-# is far too stiff and washes out the drape wrinkles.
+_BENDING = 1.0e-3  # bending modulus [N·m]; 0.1 would wash out the drape's wrinkles
 
-_ROT_X_DEG = 30.0  # object.json rotation=[30, 0, 0]
+_ROT_X_DEG = 30.0
 _TRANS = np.array([0.0, 0.0, 0.0])
 
-# Pin AABB in world coordinates (post-transformation), per object.json.
+# Pin AABB in world coordinates (post-transformation).
 _PIN_LO = (-1.1, 0.8, -1.1)
 _PIN_HI = (+1.1, 1.1, +1.1)
 

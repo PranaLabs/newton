@@ -6,8 +6,7 @@
 #
 # A 1013-particle TRI_ARAP cloth (Young=1e5, Poisson=0.4, isometric bending)
 # dropped onto a static sphere (radius 3, mu=0.3) under gravity -10 Y.
-# Mirrors RealSim CudaTests/ParallelEnvTest single-env geometry — this is
-# the Phase 1 fixture for SolverFBA multi-env / LiteNSN validation.
+# ``--schur-mode lite`` steps it with the lite NSN contact operator.
 #
 # Command: uv run -m newton.examples cloth_on_sphere_fba
 ###########################################################################
@@ -24,31 +23,28 @@ import newton
 import newton.examples
 from newton.solvers import SolverFBA
 
-# ParallelEnvTest/scene.json + cloth0.json
 _DT = 0.01
-_PD_ITER = 5  # scene.json LocalGlobal = 5
+_PD_ITER = 5
 _GRAVITY = -10.0
 _OBJ_MASS = 1000.0
 
 _YOUNG = 1.0e5
 _POISSON = 0.4
-_BENDING = 20.0  # scene.json bending=20; revisit if drape explodes (see plan §1.1)
+_BENDING = 20.0
 
 # Rx(90°) then scale 3.5 then trans (0, 3.5, 0).
 _ROT_X_DEG = 90.0
 _SCALE = 3.5
 _TRANS = np.array([0.0, 3.5, 0.0])
 
-# Static sphere collider (ParallelEnvTest/scene.json sphereCollisions[0]).
+# Static sphere collider.
 _SPHERE_RADIUS = 3.0
 _SPHERE_VISUAL_RADIUS = 2.90  # Slightly inside the collision surface so the
 # cloth visually rests on top of the rendered sphere instead of penetrating
-# into it (mirrors RealSim ParallelEnvTest's ``visualradius`` field, but
-# pulled in a touch further to absorb Newton's slightly thicker visual
-# rendering of the cloth triangles).
+# into it, with room for the rendered thickness of the cloth triangles.
 _SPHERE_CENTER = np.array([0.0, 0.0, 0.0])
 _FRICTION_MU = 0.3
-_PIN_STIFFNESS = 1.0e10  # carried forward from Demo 5 (no pins, only used by Stage B residual)
+_PIN_STIFFNESS = 1.0e10  # unused: the sheet has no pins
 
 # Visual checker for the cloth (planar UVs from rest pose, projected XZ).
 _CLOTH_COLOR = (0.78, 0.62, 0.32)  # warm tan
@@ -96,14 +92,10 @@ def _make_checker_texture(size: int = 64) -> np.ndarray:
 
 
 def build_cloth_on_sphere_builder() -> newton.ModelBuilder:
-    """Construct a single-env cloth-on-sphere ``ModelBuilder`` (not finalized).
-
-    Used both by the user-facing :class:`Example` and by the multi-env
-    benchmark harness (``scripts/fba_multienv_cloth_bench.py``).
-    """
+    """Construct a single-env cloth-on-sphere ``ModelBuilder`` (not finalized)."""
     verts_local, tris = _square_cloth(22)  # 1013 particles
 
-    # Rx(90°) then scale then translate (matches RealSim transformation block).
+    # Rx(90°) then scale then translate.
     verts_world = ((verts_local * _SCALE) @ _rot_x(_ROT_X_DEG).T + _TRANS).astype(np.float32)
 
     builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, _GRAVITY, 0.0))
@@ -137,8 +129,7 @@ def build_cloth_on_sphere_builder() -> newton.ModelBuilder:
     # sphere is what the viewer renders.  Without this split the cloth
     # particles visibly sink ~``_SPHERE_RADIUS - _SPHERE_VISUAL_RADIUS`` into
     # the rendered surface because contact is resolved at the *centre* of the
-    # cloth particle radius rather than at the surface mesh vertex.  RealSim's
-    # ``visualradius`` field uses the same trick.
+    # cloth particle radius rather than at the surface mesh vertex.
     xform_world = wp.transform(wp.vec3(*_SPHERE_CENTER.tolist()), wp.quat_identity())
 
     cfg_collision = builder.default_shape_cfg.copy()
@@ -180,7 +171,7 @@ class Example:
         builder = build_cloth_on_sphere_builder()
         self.model = builder.finalize()
 
-        # Uniform mass lumping (RealSim Mass.cpp:12-21 parity).
+        # Uniform mass lumping: every particle carries the same share of the total mass.
         uniform_mass = _OBJ_MASS / self.model.particle_count
         self.model.particle_mass.assign(np.full(self.model.particle_count, uniform_mass, dtype=np.float32))
         self.model.particle_inv_mass.assign(np.full(self.model.particle_count, 1.0 / uniform_mass, dtype=np.float32))

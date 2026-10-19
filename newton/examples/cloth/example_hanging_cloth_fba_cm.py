@@ -10,11 +10,6 @@
 # transforms as ``area → area · 10⁴`` and energy/work transforms identically,
 # so ``tri_ke`` itself is unchanged).
 #
-# Phase 0 of ``docs/superpowers/plans/2026-05-19-fba-franka-cloth.md``: the
-# Franka cloth demo runs in cm for VBD numerical stability, so before porting
-# the demo to SolverFBA we need a cm-scale FBA regression that matches the
-# m-scale baseline to 1 mm p95 (after undoing the 100x scale factor).
-#
 # Command: uv run -m newton.examples hanging_cloth_fba_cm
 ###########################################################################
 

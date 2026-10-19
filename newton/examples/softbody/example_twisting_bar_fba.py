@@ -6,7 +6,7 @@
 #
 # An 11340-particle Neo-Hookean tet cube (E=1e9, nu=0.45) twisted by two
 # ROLLING pin caps rotating about +/-Y at 10 deg/s, capped at +/-90 deg.
-# 810 frames at dt=0.01.  Mirrors RealSim CudaTests/TwistingBarNH.
+# 810 frames at dt=0.01.
 #
 # Command: uv run -m newton.examples twisting_bar_fba
 ###########################################################################
@@ -23,7 +23,7 @@ import newton.examples
 from newton.solvers import SolverFBA
 
 _DT = 0.01
-_PD_ITER = 10  # RealSim's offline binding overrides scene LocalGlobal_CUDA=5 to 10
+_PD_ITER = 10
 _GRAVITY = 0.0
 _TOTAL_MASS = 1000.0
 
@@ -126,7 +126,7 @@ class Example:
 
         self.model = builder.finalize()
 
-        # Uniform mass lumping per RealSim Mass.cpp:12-21.
+        # Uniform mass lumping: every particle carries the same share of the total mass.
         uniform_mass = _TOTAL_MASS / self.model.particle_count
         self.model.particle_mass.assign(np.full(self.model.particle_count, uniform_mass, dtype=np.float32))
         inv = np.full(self.model.particle_count, 1.0 / uniform_mass, dtype=np.float32)
@@ -169,7 +169,7 @@ class Example:
         self.viewer.set_camera(pos=wp.vec3(4.5, 1.5, 4.5), pitch=-13.3, yaw=-135.0)
 
     def step(self):
-        # Advance to "after frame f+1" (RealSim 1-indexed convention):
+        # Pose the pins for the end of this frame:
         # ROLLING pin angle = avel * (frame+1) * dt, clamped to MAX_ANGLE.
         f = self._frame + 1
         top_angle = min(_PIN_AVEL * f * self.frame_dt, _MAX_ANGLE)

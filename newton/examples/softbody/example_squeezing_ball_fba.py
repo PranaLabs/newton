@@ -7,7 +7,6 @@
 # A 7129-particle Neo-Hookean tet ball drops between two pairs of rolling
 # cylinders (mu=0.5, |omega|=3 rad/s) onto a static plane (mu=0.5).  The
 # rolling cylinders friction-drag the ball laterally as it passes through.
-# Mirrors the RealSim CudaTests/SqueezingBall reference scene.
 #
 # Command: uv run -m newton.examples squeezing_ball_fba
 ###########################################################################
@@ -24,12 +23,12 @@ import newton
 import newton.examples
 from newton.solvers import SolverFBA
 
-# Simulation parameters (CudaTests/SqueezingBall/ball_7k.json).
+# Simulation parameters.
 _DT = 0.01
-_PD_ITER = 5  # CudaTests/SqueezingBall/scene.json: integrator iterations
+_PD_ITER = 5
 _GRAVITY = -10.0  # Y-down
 
-_YOUNG = 1.0e4 / 2.4  # RealSim's material modulus; SolverFBA's tet gauge 2 + nu scales it back to 1e4
+_YOUNG = 1.0e4 / 2.4  # material modulus; SolverFBA's tet gauge 2 + nu scales it back to 1e4
 _POISSON = 0.4
 _OBJ_MASS = 1000.0
 
@@ -37,7 +36,7 @@ _BALL_SCALE = 3.0
 _BALL_TRANS = np.array([0.0, 2.6, 0.0])
 
 _CYL_RADIUS = 1.0
-_CYL_HALF_HEIGHT = 3.6  # 1.2x of the CudaTests reference 3.0
+_CYL_HALF_HEIGHT = 3.6
 # Multiplicative visual shrink applied only to the cylinder's render shape,
 # so the gray body sits slightly inside the stripe/marker grid (radius 1.0)
 # and the grid reads as ``on the surface''. Collision uses a separate full-size
@@ -209,7 +208,7 @@ class Example:
             k_lambda=lam,
             k_damp=0.0,
             add_surface_mesh_edges=False,
-            # Contacts start within the 5 cm margin, RealSim's collision alarm; SolverFBA's act at the surface.
+            # Contacts start within the 5 cm margin and act at the surface.
             particle_radius=0.0,
         )
 
@@ -276,7 +275,7 @@ class Example:
 
         self.model = builder.finalize()
 
-        # Uniform mass lumping (RealSim Mass.cpp:12-21 parity).
+        # Uniform mass lumping: every particle carries the same share of the total mass.
         uniform_mass = _OBJ_MASS / self.model.particle_count
         mass_arr = np.full(self.model.particle_count, uniform_mass, dtype=np.float32)
         inv_mass_arr = np.full(self.model.particle_count, 1.0 / uniform_mass, dtype=np.float32)

@@ -5,9 +5,9 @@
 # Example StretchingCloth FBA
 #
 # A 20201-particle Neo-Hookean cloth pulled along +/-x by two pin sets on
-# opposing edges, ~1 m total per side over 1200 steps at dt=0.01.  Mirrors
-# the RealSim CudaTests/StretchingCloth reference scene.  The cloth is
-# rendered with a tiled 2x2 checker texture so the stretching is visible.
+# opposing edges, ~1 m total per side over 1200 steps at dt=0.01.  The
+# cloth is rendered with a tiled 2x2 checker texture so the stretching is
+# visible.
 #
 # Command: uv run -m newton.examples stretching_cloth_fba
 ###########################################################################
@@ -25,9 +25,9 @@ from newton.solvers import SolverFBA
 
 _DT = 0.01
 _PD_ITER = 10
-_GRAVITY = -1.0  # Y-up, RealSim scene.json gravity=[0,-1,0]
+_GRAVITY = -1.0  # along -Y
 
-_YOUNG = 35483.87096774193  # RealSim's material modulus; SolverFBA's tri gauge scales it back to 1e5
+_YOUNG = 35483.87096774193  # material modulus; SolverFBA's tri gauge scales it back to 1e5
 _POISSON = 0.45
 _OBJ_MASS = 1000.0
 
