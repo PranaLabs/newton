@@ -11,6 +11,9 @@ import warp as wp
 from ...geometry.kernels import compute_tri_aabbs, triangle_closest_point
 from ...sim import Model
 
+# Threads that share the candidate triangles of one particle.
+_LANES = wp.constant(32)
+
 
 @wp.func
 def _in_ring(ring_offsets: wp.array[wp.int32], ring: wp.array[wp.int32], v: wp.int32, u: wp.int32) -> bool:
@@ -30,10 +33,36 @@ def _in_ring(ring_offsets: wp.array[wp.int32], ring: wp.array[wp.int32], v: wp.i
 
 
 @wp.kernel
+def triangle_candidates_kernel(
+    q: wp.array[wp.vec3],
+    bvh: wp.uint64,
+    margin: float,
+    candidates: wp.array2d[wp.int32],
+    candidate_count: wp.array[wp.int32],
+    count: wp.array[wp.int32],
+):
+    """The triangles whose bounds come within ``margin`` of each particle along every axis, in the order of the
+    query, as many as fit; ``count[1]`` takes the most of any particle. The search runs apart from the tests
+    of :func:`vertex_face_contacts_kernel`, whose registers would otherwise spill in its loop."""
+    v = wp.tid()
+    p = q[v]
+    query = wp.bvh_query_aabb(bvh, p - wp.vec3(margin), p + wp.vec3(margin))
+    t = wp.int32(0)
+    k = wp.int32(0)
+    while wp.bvh_query_next(query, t):
+        if k < candidates.shape[1]:
+            candidates[v, k] = t
+        k += 1
+    candidate_count[v] = k
+    wp.atomic_max(count, 1, k)
+
+
+@wp.kernel
 def vertex_face_contacts_kernel(
     q: wp.array[wp.vec3],
     tri_indices: wp.array2d[wp.int32],
-    bvh: wp.uint64,
+    candidates: wp.array2d[wp.int32],
+    candidate_count: wp.array[wp.int32],
     ring_offsets: wp.array[wp.int32],
     ring: wp.array[wp.int32],
     rest: wp.array[wp.vec3],
@@ -45,19 +74,24 @@ def vertex_face_contacts_kernel(
     normal: wp.array[wp.vec3],
 ):
     """The nearest triangle of each particle within ``margin``, outside its rings and ``rest_radius`` from it
-    at rest."""
-    v = wp.tid()
+    at rest, the first of equals among its candidates. The ``_LANES`` threads of a block take the candidates
+    of one particle in turn, and test the rings and rest distance of only those nearer than their nearest yet."""
+    v, lane = wp.tid()
     p = q[v]
-    query = wp.bvh_query_aabb(bvh, p - wp.vec3(margin), p + wp.vec3(margin))
-    t = wp.int32(0)
     best = margin
+    best_k = wp.int32(2147483647)
     best_t = wp.int32(-1)
     best_bary = wp.vec3(0.0)
     best_point = wp.vec3(0.0)
-    while wp.bvh_query_next(query, t):
+    for k in range(lane, wp.min(candidate_count[v], candidates.shape[1]), _LANES):
+        t = candidates[v, k]
         a = tri_indices[t, 0]
         b = tri_indices[t, 1]
         c = tri_indices[t, 2]
+        point, bary, _feature = triangle_closest_point(q[a], q[b], q[c], p)
+        d = wp.length(p - point)
+        if d >= best:
+            continue
         if (
             _in_ring(ring_offsets, ring, v, a)
             or _in_ring(ring_offsets, ring, v, b)
@@ -68,23 +102,23 @@ def vertex_face_contacts_kernel(
             rest_point, _rest_bary, _rest_feature = triangle_closest_point(rest[a], rest[b], rest[c], rest[v])
             if wp.length(rest[v] - rest_point) < rest_radius:
                 continue
-        point, bary, _feature = triangle_closest_point(q[a], q[b], q[c], p)
-        d = wp.length(p - point)
-        if d < best:
-            best = d
-            best_t = t
-            best_bary = bary
-            best_point = point
-    if best_t < 0 or best < 1.0e-6 * margin:
+        best = d
+        best_k = k
+        best_t = t
+        best_bary = bary
+        best_point = point
+    nearest = wp.tile_min(wp.tile(best))[0]
+    first = wp.tile_min(wp.tile(wp.where(best == nearest, best_k, wp.int32(2147483647))))[0]
+    if best_t < 0 or best_k != first or best < 1.0e-6 * margin:
         return
-    k = wp.atomic_add(count, 0, 1)
-    if k < particles.shape[0]:
-        particles[k, 0] = v
-        alpha[k, 0] = 1.0
+    slot = wp.atomic_add(count, 0, 1)
+    if slot < particles.shape[0]:
+        particles[slot, 0] = v
+        alpha[slot, 0] = 1.0
         for i in range(3):
-            particles[k, i + 1] = tri_indices[best_t, i]
-            alpha[k, i + 1] = -best_bary[i]
-        normal[k] = (p - best_point) / best
+            particles[slot, i + 1] = tri_indices[best_t, i]
+            alpha[slot, i + 1] = -best_bary[i]
+        normal[slot] = (p - best_point) / best
 
 
 @wp.kernel
@@ -175,9 +209,12 @@ class SelfContact:
             self.upper = wp.zeros(model.tri_count, dtype=wp.vec3, device=self.device)
             self._bounds(model.particle_q)
             self.bvh = wp.Bvh(self.lower, self.upper)
+            self.candidates = wp.empty((model.particle_count, 64), dtype=wp.int32, device=self.device)
+            self.candidate_count = wp.empty(model.particle_count, dtype=wp.int32, device=self.device)
         else:
             self.grid = wp.HashGrid(128, 128, 128, device=self.device)
-        self.count = wp.zeros(1, dtype=wp.int32, device=self.device)
+        # Contacts found, and the most candidate triangles of a particle.
+        self.count = wp.zeros(2, dtype=wp.int32, device=self.device)
         self._allocate(model.particle_count * (1 if mode == "vertex_face" else 8))
 
     def _bounds(self, q: wp.array) -> None:
@@ -195,19 +232,31 @@ class SelfContact:
         if self.mode == "vertex_face":
             self._bounds(q)
             self.bvh.refit()
-            kernel, scene = vertex_face_contacts_kernel, [self.tri_indices, self.bvh.id]
         else:
             self.grid.build(q, self.margin)
-            kernel, scene = vertex_vertex_contacts_kernel, [self.grid.id]
         while True:
             self.count.zero_()
             outputs = [self.count, self.particles, self.alpha, self.normal]
-            inputs = [q, *scene, self.ring_offsets, self.ring, self.rest, self.rest_radius, self.margin]
-            wp.launch(kernel, q.shape[0], inputs, outputs, device=self.device)
-            n = int(self.count.numpy()[0])
-            if n <= self.particles.shape[0]:
+            filters = [self.ring_offsets, self.ring, self.rest, self.rest_radius, self.margin]
+            if self.mode == "vertex_face":
+                found = [self.candidates, self.candidate_count]
+                inputs = [q, self.bvh.id, self.margin]
+                wp.launch(triangle_candidates_kernel, q.shape[0], inputs, [*found, self.count], device=self.device)
+                inputs = [q, self.tri_indices, *found, *filters]
+                kernel = vertex_face_contacts_kernel
+                wp.launch_tiled(
+                    kernel, dim=[q.shape[0]], inputs=inputs, outputs=outputs, block_dim=_LANES, device=self.device
+                )
+            else:
+                inputs = [q, self.grid.id, *filters]
+                wp.launch(vertex_vertex_contacts_kernel, q.shape[0], inputs, outputs, device=self.device)
+            n, most = (int(x) for x in self.count.numpy())
+            if self.mode == "vertex_face" and most > self.candidates.shape[1]:
+                self.candidates = wp.empty((q.shape[0], 2 * most), dtype=wp.int32, device=self.device)
+            elif n > self.particles.shape[0]:
+                self._allocate(2 * n)
+            else:
                 break
-            self._allocate(2 * n)
         particles, alpha, normal = self.particles.numpy()[:n], self.alpha.numpy()[:n], self.normal.numpy()[:n]
         order = np.lexsort((particles[:, 1], particles[:, 0]))
         return particles[order], alpha[order], normal[order]

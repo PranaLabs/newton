@@ -54,6 +54,18 @@ class TestSelfContactDetection(unittest.TestCase):
             np.testing.assert_allclose(point, nearest, atol=2e-4)
             np.testing.assert_allclose(normal[k], (q[v] - point) / np.linalg.norm(q[v] - point), atol=1e-5)
 
+    def test_vertex_face_grows_its_candidate_lists(self):
+        """Particles with more candidate triangles than their lists hold search again with longer lists and find
+        the same contacts."""
+        model = self._sheets()
+        contact = SelfContact(model, "vertex_face", 0.015)
+        expected = contact.detect(model.particle_q)
+        contact.candidates = wp.empty((model.particle_count, 1), dtype=wp.int32, device=model.device)
+        found = contact.detect(model.particle_q)
+        self.assertGreater(contact.candidates.shape[1], 1)
+        for got, want in zip(found, expected, strict=True):
+            np.testing.assert_array_equal(got, want)
+
     def test_vertex_vertex_pairs_once(self):
         """Every pair of particles within the margin is one contact; a sheet's own particles lie 2 cm apart, so
         all pairs join the two sheets."""
