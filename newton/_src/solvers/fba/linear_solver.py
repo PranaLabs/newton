@@ -6,8 +6,7 @@
 Setup phase (CPU):
     1. assemble scalar N*N PD Hessian ``A`` (caller-supplied).
     2. factor ``P A Pᵀ = L D Lᵀ`` with :func:`~.sparse_ldlt.factor_ldlt` (nested dissection, multifrontal).
-    3. compute ``S = L⁻¹`` keeping elimination-tree sparsity (ported from
-       RealSim ``LDLT_computeLowerInverse``, SparseLDLT.cpp:225-347).
+    3. compute ``S = L⁻¹`` keeping elimination-tree sparsity.
     4. upload to device as Warp BSR matrices.
 
 Runtime (GPU):
@@ -382,9 +381,8 @@ def _lower_inverse_column_kernel(
 ):
     """One thread per CSC column of S.
 
-    Computes column ``index`` of ``S = L^{-1}`` using the sparse-inverse
-    recurrence ported from RealSim ``LDLT_computeLowerInverse``
-    (SparseLDLT.cpp:225-347). The column-level data flow is:
+    Computes column ``index`` of ``S = L^{-1}`` with the sparse-inverse
+    recurrence of :func:`compute_lower_inverse`. The column-level data flow is:
 
       - The thread writes only to ``S_values[outerPtr[index] : outerPtr[index+1]]``.
       - Inside the column it reads ``S_values[i-1]`` (within the same slice)
@@ -468,7 +466,6 @@ def compute_lower_inverse(
 ):
     """Compute S = L⁻¹ as a sparse CSC matrix.
 
-    Ports RealSim ``LDLT_computeLowerInverse`` (SparseLDLT.cpp:225-347).
     Sparsity pattern of S is derived from L's elimination tree; this gives
     the exact sparse inverse (no thresholding, no fill-in).
 
@@ -1287,16 +1284,15 @@ class FBALinearSolver:
     ) -> np.ndarray | None:
         """Isodof-restricted Schur build.
 
-        Mirrors RealSim ``addHAinvHT_gpu`` (CUDASparseInverseSolver.cpp:215-339):
-        we collect the unique contacted DOFs ``isodofs``, compute the dense
+        Collects the unique contacted DOFs ``isodofs``, computes the dense
         ``k x k`` matrix ``Wi[a, b] = A^{-1}[isodofs[a], isodofs[b]]`` via a
         column-intersection kernel over the sparse-inverse factor ``S``, and
-        then assemble ``W[c', c]`` from per-contact ``(particle, dir, alpha)``
+        then assembles ``W[c', c]`` from per-contact ``(particle, dir, alpha)``
         triples and an ``isodof_rank`` lookup.
 
-        The legacy multi-RHS solve over ``A`` is skipped entirely — for sparse
-        meshes where ``k^2 * nnz_col(S) << M * nnz(S)``, this is the dominant
-        speedup ("Task P", ~RealSim parity).
+        This skips the solves with ``A`` for the ``M`` columns of ``Jᵀ``, which
+        dominate the cost on sparse meshes, where
+        ``k^2 * nnz_col(S) << M * nnz(S)``.
 
         ``Wi`` is computed via blocked dense ``X^T X`` GEMM (``wp.tile_matmul``):
         densify the selected columns of ``S`` into a padded ``(N_pad, k_pad)``
@@ -2151,17 +2147,15 @@ class FBALinearSolver:
     ) -> None:
         """Compute ``x_out = A⁻¹ · (rhs_inout + Jᵀ · lam)`` with in-place rhs update.
 
-        Implements RealSim's combined-form constraint correction from
-        ``NonSmoothNewton.cpp:151-167`` (``applyConstraintCorrection``):
+        Applies the constraint correction in combined form:
 
             b += dt² · Jᵀ · (ω · λ)
-            _systemlinearsolver->solve(x, b)
+            x = A⁻¹ · b
 
-        Used by :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA.step` to
-        replace the prior split-form ``x_cur += A⁻¹ · Jᵀ · lam_apply``. The
-        combined form is algebraically equivalent but bit-distinct under
-        float32 rounding, matching RealSim's single ``A⁻¹`` solve over the
-        already-incremented ``b`` vector.
+        :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA.step` uses it
+        instead of the split form ``x_cur += A⁻¹ · Jᵀ · lam_apply``, which is
+        algebraically equivalent but rounds differently in float32: the
+        combined form takes a single ``A⁻¹`` solve over the incremented ``b``.
 
         The implementation:
 
@@ -2237,7 +2231,7 @@ class FBALinearSolver:
         )
         self._gather_slot_terms()
 
-        # Step 2: rhs_inout += Jᵀ·lam  (RealSim's b += dt²·J·(ω·λ); the dt²·ω
+        # Step 2: rhs_inout += Jᵀ·lam, that is b += dt²·Jᵀ·(ω·λ): the dt²·ω
         # weighting is folded into ``lam`` by the caller, see
         # ``_solve_nsn_*`` which returns ``lam_apply = dt²·ω·λ``).
         wp.launch(

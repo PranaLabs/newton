@@ -4,8 +4,8 @@
 """Face contacts: the deepest point of a deformable triangle inside a rigid shape.
 
 Particle contacts test only vertices, so a box edge can pass through a triangle between them. The
-point minimizes the shape's signed distance over the triangle with the Frank-Wolfe iteration of
-RealSim's face query (``SDFCollisionDevice.cuh``), from the deepest vertex. Vertex optima are left to
+point minimizes the shape's signed distance over the triangle with a Frank-Wolfe iteration from the
+deepest vertex. Vertex optima are left to
 the particle contacts; unselected vertices keep exactly zero weight, which marks edge optima. A face
 contact appears as soon as the optimum leaves the vertices, where it coincides with that vertex's
 particle contact, so switching it on or off moves no constraint beyond the Frank-Wolfe accuracy.
@@ -219,8 +219,8 @@ def mesh_minima_kernel(
     normal: wp.array2d[wp.vec3],
 ):
     """The other local minima of each mesh contact's particle distance to the mesh, within the particle radius
-    plus the shape margin plus ``alarm``: projections into faces whose outer side the particle is on, as
-    RealSim's vertex-face contacts, and closest points on an edge that the triangle across it shares. A
+    plus the shape margin plus ``alarm``: projections into faces whose outer side the particle is on, and
+    closest points on an edge that the triangle across it shares. A
     contact's closest point holds its particle against one side of a concave corner; these hold it against the
     others. Minima at vertices are left out. ``neighbors[neighbor_start[s] + t]`` lists the triangles across
     the edges ``ab``, ``ac`` and ``bc`` of triangle ``t`` of shape ``s``. ``body_pos`` and ``normal`` are as in

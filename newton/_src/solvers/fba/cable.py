@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Cables through tetrahedral bodies, after RealSim's ``CableController`` and SOFA SoftRobots' cable constraint."""
+"""Cables through tetrahedral bodies, after the cable constraint of SOFA's SoftRobots plugin."""
 
 import numpy as np
 

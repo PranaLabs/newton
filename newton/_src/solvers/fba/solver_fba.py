@@ -66,9 +66,8 @@ class SolverFBA(SolverBase):
     Implements a Projective Dynamics (PD) local-global iteration for cloth
     with isotropic stretching (ARAP or corotational), isometric bending,
     and soft Pin constraints. The PD Hessian is prefactored once (nested dissection
-    ordering, multifrontal LDLᵀ); the sparse inverse `S = L⁻¹` is computed
-    exactly using the elimination tree (ported from RealSim
-    `LDLT_computeLowerInverse`) and uploaded to Warp BSR matrices. The
+    ordering, multifrontal LDLᵀ); the sparse inverse ``S = L⁻¹`` is computed
+    exactly on the elimination tree and uploaded to Warp BSR matrices. The
     runtime linear solve evaluates ``A⁻¹·b = Sᵀ · D⁻¹ · S · b`` via two
     GPU SpMVs per coordinate component, avoiding the inherently
     sequential GPU triangular solve.
@@ -93,7 +92,7 @@ class SolverFBA(SolverBase):
     tetrahedra, ``nu = lam / (2 * (lam + mu))``, and by
     ``c = (4 * mu + 3 * lam) / (2 * mu + lam)`` for triangles. SolverFBA
     scales ``mu``, ``lam`` and the stretching weights of these models by
-    ``c``, as RealSim does, which restores the modulus: at every strain for
+    ``c``, which restores the modulus: at every strain for
     corotational elasticity, at small strain for Neo-Hookean. The stretching
     weight of every element is ``2 * k_mu`` times its rest area or volume
     (``tri_ke`` is a triangle's ``k_mu``). ARAP is exact and unscaled.
@@ -114,17 +113,12 @@ class SolverFBA(SolverBase):
           operates in float64, but ``state_out.particle_q`` (vec3) is
           float32. This caps achievable position precision at ~1e-7 m.
 
-        - Stability tracks `dt^2 * tri_ke / mass` — the standard CFL-like
+        - Stability tracks ``dt^2 * tri_ke / mass``, the standard CFL-like
           factor for implicit elastic dynamics. Realistic cloth parameters
           (tri_ke ~ 1e4 for ~10 kPa Young's modulus) keep arbitrarily
           sized grids stable with 5-10 PD iterations. Pathologically
           soft inputs (tri_ke < 200 for the default test setup) drive
-          unphysical large oscillations that eventually overflow. The
-          implementation faithfully reproduces RealSim's PD formulas
-          (verified by hand against PDTriangleStretchingEnergy.cpp and
-          PDIsometricBendingEnergy.cpp); the previous "dim>=24 unstable"
-          claim was an artifact of using tri_ke=100 (~1000x softer than
-          real cloth) in the test scenarios.
+          unphysical large oscillations that eventually overflow.
 
     See also:
         :class:`~newton.solvers.SolverStyle3D` — Newton's other PD cloth
@@ -173,44 +167,36 @@ class SolverFBA(SolverBase):
             model: The :class:`~newton.Model` containing cloth/tet attributes to integrate.
             iterations: Number of PD local-global iterations per step. Each
                 takes one semismooth Newton step of the contact and constraint
-                multipliers, warm-started from the previous iteration, as in
-                RealSim's local-global solver.
+                multipliers, warm-started from the previous iteration.
             pin_stiffness: Soft-pin stiffness [N/m].
             stretching_model: Stretching model — ``"arap"``, ``"corotational"``, or ``"neohookean"``.
-            friction: If ``True`` (default) use Stage B Coulomb friction NSN solver;
-                otherwise use Stage A unilateral NSN.
+            friction: If ``True`` (default), contacts carry Coulomb friction;
+                otherwise they only push.
             mu_per_pair_override: Optional ``(num_pairs,)`` array of friction
                 coefficients overriding ``model.shape_material_mu`` lookups.
-            lambda_cap: Optional per-step clamp on contact impulse magnitude in
-                **physical force units [N]**, matching RealSim's
-                ``constraintsolver.maxforce`` scene.json field. The internal
-                Lagrange multiplier ``λ_FBA = λ_R/dt²`` is scaled, so the clamp
-                is internally divided by ``dt²`` at each NSN solve. ``None``
-                disables clamping.
-            use_isodof: If ``True`` (default, Task P), build the Schur
-                complement via the isodof-restricted path that computes only
-                the ``A^{-1}[i, j]`` entries for the unique contacted
-                particles, skipping the multi-RHS Cholesky solve over ``M``
-                columns of ``J^T``. Mirrors RealSim's
-                ``CUDASparseInverseSolver::addHAinvHT_gpu``. Set to ``False``
-                only for regression testing against the legacy path.
+            lambda_cap: Optional clamp on the magnitude of each contact
+                row's multiplier, in force units [N]. The multipliers are
+                forces divided by ``dt²``, so the clamp is divided by ``dt²``
+                at each NSN solve. ``None`` disables clamping.
+            use_isodof: If ``True`` (default), build the Schur complement
+                from the entries ``A⁻¹[i, j]`` of the contacted particles
+                alone, read from the sparse inverse, instead of solving with
+                ``A`` for the ``M`` columns of ``Jᵀ``. ``False`` takes those
+                solves, for regression tests.
             shape_angular_velocity: Optional ``{shape_index: ω_rad_s}`` mapping.
                 Each listed shape rotates about its local +Z axis (Newton's
                 cylinder primitive axis) at the given angular speed.  Surfaces
                 with nonzero ω contribute a tangential anchor velocity
                 ``v_anchor = -ω · cross(axis_world, world_anchor - shape_center)``
-                into the Stage B friction residual; the shape geometry itself
-                stays static.  Sign matches RealSim CudaTests'
-                ``cylindercollisions[i].rollingvel`` (tangent direction
-                ``cross(normal, axis)``).  Defaults to no kinematic motion.
+                into the residual of the friction rows; the shape geometry
+                itself stays static. A positive ``ω`` moves the surface along
+                ``cross(normal, axis)``. Defaults to no kinematic motion.
             nh_solver: Local-projection inner solver for the Neo-Hookean
-                stretching model.  ``"lbfgs"`` (default) uses an LBFGS+Armijo
-                cubic-backtracking line search ported from RealSim
-                ``mcl::optlib::LBFGS<double, 2/3>`` (M=8, c_1=1e-4, tol=1e-6,
-                max_iters=50; LBFGS.hpp:36-152, Backtracking.hpp:74-145,
-                HyperelasticProblemS.h:5-120). ``"newton5"`` keeps FBA's
-                legacy 5-iter fixed Newton (no line search, no convergence
-                check) for regression. Ignored unless
+                stretching model. ``"lbfgs"`` (default) runs L-BFGS with an
+                Armijo cubic backtracking line search (memory 8,
+                ``c_1 = 1e-4``, tolerance ``1e-6``, at most 50 iterations).
+                ``"newton5"`` takes five Newton steps without line search or
+                convergence check. Ignored unless
                 ``stretching_model="neohookean"``.
             nsn_schur_mode: Contact operator ``W`` of the NSN steps.
                 ``"full"`` (default) builds ``J A⁻¹ Jᵀ`` from the prefactored
@@ -247,8 +233,8 @@ class SolverFBA(SolverBase):
             face_contacts: If ``True``, a triangle next to a particle contact
                 also gets a contact at its deepest point inside the shape when
                 that point lies between its particles, so shape edges and
-                corners cannot pass through the triangle (RealSim's face
-                query). Needs ``friction=True``, ``nsn_schur_mode="full"``,
+                corners cannot pass through the triangle. Needs
+                ``friction=True``, ``nsn_schur_mode="full"``,
                 ``use_isodof=True`` and no ``mu_per_pair_override``. Mesh
                 and convex hull shapes must be closed. Warp's sign query
                 treats faces within 1e-3 of the mean edge length as equally
@@ -265,14 +251,13 @@ class SolverFBA(SolverBase):
                 sharp edge the gradient jumps between the two faces, so a
                 triangle point that sinks into the edge flips its normal and
                 pushes the cloth sideways; the rounding keeps the normal
-                continuous, as RealSim's smoothed SDF does.
+                continuous.
             nsn_linear_iterations: Iteration cap of the conjugate residual
-                solve in each NSN step, RealSim's
-                ``constraintsolver.iterations``. ``None`` solves to a relative
+                solve in each NSN step. ``None`` solves to a relative
                 residual of ``1e-10``. A capped step is inexact, and the next
                 LG iteration's NSN step continues from it.
             face_contact_margin: Distance [m] within which every triangle is
-                also tested for face contacts, RealSim's collision alarm.
+                also tested for face contacts.
                 ``None`` tests only the triangles next to particle contacts,
                 which misses a shape tip or edge poking into a triangle whose
                 particles all lie beyond the particle contact margin.
@@ -398,8 +383,7 @@ class SolverFBA(SolverBase):
         self._rigid_dt: float | None = None
         self._rigid_linear_solver = None
 
-        # Per-shape kinematic angular velocity (rad/s about local +Z).  RealSim
-        # parity for ``cylindercollisions.rollingvel``.
+        # Per-shape kinematic angular velocity (rad/s about local +Z).
         n_shapes = int(model.shape_count) if hasattr(model, "shape_count") and model.shape_count else 0
         self._shape_omega_h = np.zeros(max(n_shapes, 1), dtype=np.float64)
         if shape_angular_velocity is not None:
@@ -446,10 +430,9 @@ class SolverFBA(SolverBase):
         # we only need to track whether that buffer is fresh for the current step.
         self._cached_A_inv_Jt_valid: bool = False
 
-        # λ persistent across PD outer iters within a step. RealSim parity:
-        # cuda_lambda.setZero once per frame in prepare_gpu, then λ += dλ
-        # accumulates over PD outer iters. The host mirrors read the last
-        # step's values when first read, as their step left ``_persistent_rows``.
+        # λ persists across the PD outer iterations of a step: it starts at zero in every step, and λ += dλ
+        # accumulates over the iterations. The host mirrors read the last step's values when first read, as their
+        # step left ``_persistent_rows``.
         self._persistent_rows: int | None = None
         self._lam_unilateral_persistent: np.ndarray | None = None
         self._lam_coulomb_persistent: np.ndarray | None = None
@@ -1117,8 +1100,7 @@ class SolverFBA(SolverBase):
             # Rest curvature magnitude per edge: ``‖q·x‖`` of the hinge at its
             # rest angle ``model.edge_rest_angle``. The local projection pulls
             # ``q·x_cur`` back to this magnitude (not all the way to a flat
-            # configuration), like RealSim's
-            # ``PDIsometricBendingEnergy::computeRestBendingEnergy``. ``q·x``
+            # configuration). ``q·x``
             # vanishes on a flat hinge, and folding it by ``θ`` about the shared
             # edge moves the opposite vertex v3 by ``2 h3 sin(θ / 2)``, with h3
             # its distance from the edge.
@@ -1610,12 +1592,9 @@ class SolverFBA(SolverBase):
                     # Persist device-resident lam / omega for next PD iter.
                     wp.copy(self._lam_coulomb_persistent_d, self._nsn_lam_d, count=3 * M + n_b)
                     wp.copy(self._omega_coulomb_persistent_d, self._nsn_omega_d, count=3 * M + n_b)
-                    # RealSim in-iter combined-form correction (Task 1.3.g,
-                    # A-tier alignment): mirrors NonSmoothNewton.cpp:151-167's
-                    # ``applyConstraintCorrection``. The magnitude guard was
-                    # dropped along with the host download — the cost of a
-                    # no-op Cholesky solve is small relative to the saved
-                    # ``_nsn_lam_apply_d.numpy()`` round-trip.
+                    # Apply the contact forces in combined form, with one solve over the incremented right-hand
+                    # side. It runs even when the forces vanish: the solve costs less than reading them back to
+                    # check.
                     ls.apply_lambda_correction_combined(self._nsn_lam_apply_d, self._rhs, self._x_cur)
                     if use_lite_block_diag and self._held_rows is not None:
                         self._step_held_rows(ls, M, dt)
@@ -1679,8 +1658,7 @@ class SolverFBA(SolverBase):
                     )
                     wp.copy(self._lam_unilateral_persistent_d, self._nsn_lam_d, count=M)
                     wp.copy(self._omega_unilateral_persistent_d, self._nsn_omega_d, count=M)
-                    # RealSim in-iter combined-form correction (Task 1.3.g);
-                    # see Stage B comment above re: dropped magnitude guard.
+                    # Apply the contact forces in combined form, as the frictional branch above does.
                     ls.apply_lambda_correction_combined(self._nsn_lam_apply_d, self._rhs, self._x_cur)
             if rigid:
                 self._rigid_iteration(state_in, state_out, dt)
@@ -2157,10 +2135,8 @@ class SolverFBA(SolverBase):
         ``_omega_unilateral_persistent``, ``_omega_coulomb_persistent``)
         are intentionally left untouched here. Per-step entry in
         :meth:`step` reallocates them when the contact count ``M``
-        changes and otherwise zero-fills them in-place, matching
-        RealSim's ``cuda_lambda.setZero(_num_constraint)`` pattern in
-        ``CUDANonSmoothNewton::prepare_gpu`` — a per-step concern that
-        is decoupled from Schur factor invalidation.
+        changes and otherwise zero-fills them in place, a per-step concern
+        that is decoupled from Schur factor invalidation.
         """
         self._cached_W = None
         self._cached_A_inv_Jt_valid = False
@@ -2584,20 +2560,14 @@ class SolverFBA(SolverBase):
         return M, Ms
 
     # ------------------------------------------------------------------
-    # NSN inner-loop GPU drivers (Steps 6-10 of the NSN GPU port)
+    # NSN inner-loop GPU drivers
     # ------------------------------------------------------------------
     #
-    # The drivers below mirror ``solve_nsn_unilateral`` (``newton/tests/fba/_reference.py``) and
-    # ``solve_nsn_coulomb`` (``newton/tests/fba/_reference.py``) but execute the per-iteration sequence
-    # (residual → penetration → FB rows → Schur build → linear solve →
-    # lambda update → box clamp → cap clip) on the device. They are
-    # transitional: the host-side ``W`` / ``r`` / ``lam_init`` / ``omega_init``
-    # arguments are accepted for direct CPU-parity testing and to keep the
-    # ``step()`` plumbing decisions in Step 11. The new methods exit with
-    # host-side ``(lam, omega, lam_apply)`` for the same reason.
-    #
-    # See ``docs/superpowers/plans/2026-05-17-fba-nsn-gpu-port.md`` for the
-    # roll-out plan; RealSim reference is ``NonSmoothNewton.cpp:102-171``.
+    # The drivers below run the iterations of ``solve_nsn_unilateral`` and ``solve_nsn_coulomb``
+    # (``newton/tests/fba/_reference.py``) on the device: residual → penetration → FB rows → Schur build →
+    # linear solve → lambda update → box clamp → cap clip. They also accept host-side ``W`` / ``r`` /
+    # ``lam_init`` / ``omega_init`` arguments, with which the tests compare them to the host reference, and
+    # return host-side ``(lam, omega, lam_apply)`` unless told to skip the download.
 
     def _solve_nsn_coulomb_lite_bsr(
         self,
@@ -2947,10 +2917,6 @@ class SolverFBA(SolverBase):
                 and the caller is expected to consume them on device.
             m_rows: Override row count when ``r_device`` is supplied (needed
                 because device arrays carry capacity, not active size).
-
-        References:
-            RealSim ``NonSmoothNewton.cpp:102-171`` (Newton step assembly)
-            and ``:332-341`` (unilateral FB row).
         """
         from . import kernels as K  # noqa: PLC0415
 
@@ -3199,10 +3165,9 @@ class SolverFBA(SolverBase):
 
         Identical structure to :meth:`_solve_nsn_unilateral_gpu` with row
         count ``3M`` and the frictional FB block replacing the unilateral
-        per-row evaluation. After the Newton update, the per-contact
-        signed-cone tangent clamp from RealSim
-        ``NonSmoothNewton.cpp:395-403`` runs on device via
-        :func:`coulomb_box_clamp_kernel`.
+        per-row evaluation. After the Newton update,
+        :func:`coulomb_box_clamp_kernel` clamps the tangent multipliers of
+        each contact to ``±mu`` times its signed normal multiplier.
 
         Args:
             W: ``(3M, 3M)`` Schur complement (host fp64). May be ``None``
@@ -3242,16 +3207,11 @@ class SolverFBA(SolverBase):
                 rows, passed to :meth:`NSNPCRSolver.solve`.
             contact_regularization: Relative regularization ``gamma`` of the
                 ``3M`` contact rows of each Newton system,
-                ``A_cc += gamma diag(A_cc)`` (RealSim
-                ``applyContactRegularization``).
+                ``A_cc += gamma diag(A_cc)``.
 
         Returns:
             ``(lam, omega, lam_apply)`` host fp64 arrays of shape ``(3M,)``.
             All three are empty when ``skip_download=True``.
-
-        References:
-            RealSim ``NonSmoothNewton.cpp:102-171`` (Newton assembly),
-            ``:343-378`` (frictional FB row), ``:395-403`` (cone clamp).
         """
         from . import kernels as K  # noqa: PLC0415
 
