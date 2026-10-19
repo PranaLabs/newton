@@ -3567,7 +3567,7 @@ def build_a_schur_kernel(
 # ``docs/superpowers/plans/2026-05-17-fba-nsn-gpu-port.md``). Each kernel is
 # a direct port of a numpy expression in
 # ``solve_nsn_unilateral`` (``newton/tests/fba/_reference.py``)
-# / ``_solve_nsn_coulomb``; cross-reference RealSim
+# / ``solve_nsn_coulomb``; cross-reference RealSim
 # ``NonSmoothNewton.cpp:102-171`` for the full FB-Newton update sequence.
 # ---------------------------------------------------------------------------
 
@@ -3686,7 +3686,7 @@ def compute_precond_coulomb_kernel(
     ``dt·W_ii`` for tangent rows, with ``|W_ii|`` floor of ``1e-12``.
 
     GPU port of the per-contact loop in
-    :meth:`SolverFBA._solve_nsn_coulomb` (``w_n/w_t1/w_t2 =
+    ``solve_nsn_coulomb`` (``newton/tests/fba/_reference.py``) (``w_n/w_t1/w_t2 =
     max(|diag_W[3c..]|, 1e-12)``; ``precond[3c] = dt²·w_n``;
     ``precond[3c+1/2] = dt·w_t1/t2``).
 
@@ -3871,7 +3871,7 @@ def compute_frictional_fb_kernel(
 
     One thread per contact emits the unilateral normal row plus two
     frictional tangent rows, matching the CPU loop body in
-    :meth:`SolverFBA._solve_nsn_coulomb`. The tangent rows take the
+    ``solve_nsn_coulomb`` (``newton/tests/fba/_reference.py``). The tangent rows take the
     *current iterate* of ``lam_n`` as their companion normal lambda
     (RealSim ``NonSmoothNewton.cpp:343-378``); this is identical to the
     CPU reference which reads ``lam[idx_n]`` before computing the tangent
@@ -4838,7 +4838,7 @@ def coulomb_box_clamp_kernel(
     """Per-contact Coulomb signed-cone clamp on tangent lambdas.
 
     Mirrors RealSim ``NonSmoothNewton.cpp:395-403`` (friction branch) and
-    the CPU reference loop in :meth:`SolverFBA._solve_nsn_coulomb`. ``lam_n``
+    the CPU reference loop in ``solve_nsn_coulomb`` (``newton/tests/fba/_reference.py``). ``lam_n``
     is read **signed** (per RealSim — the ``if(_lambda[cid] < 0.0)`` line
     is explicitly commented out) so ``upper = mu·lam_n`` and
     ``lower = -mu·lam_n`` can swap when ``lam_n < 0``. The two ``if``

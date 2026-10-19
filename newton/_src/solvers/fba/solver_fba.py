@@ -2522,172 +2522,12 @@ class SolverFBA(SolverBase):
             self._contact_extra = extra
         return M, Ms
 
-    def _solve_nsn_coulomb(
-        self,
-        W: np.ndarray,
-        r: np.ndarray,
-        mu: np.ndarray,
-        pene0: np.ndarray,
-        max_iters: int = 1,
-        lam_init: np.ndarray | None = None,
-        omega_init: np.ndarray | None = None,
-        dt: float = 0.01,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Legacy CPU/numpy NSN driver for the frictional LCP (Stage B).
-
-        .. deprecated:: Step 13 (NSN GPU port)
-            No longer dispatched by :meth:`step`; the GPU driver
-            :meth:`_solve_nsn_coulomb_gpu` is unconditional.  Retained
-            only as a parity oracle for
-            ``newton.tests.test_fba_nsn_gpu_driver`` and
-            ``newton.tests.test_solver_fba``.  Do not call from new code.
-
-        RealSim NonSmoothNewton port for the frictional LCP.
-
-        Implements the dλ-Newton update from ``NonSmoothNewton.cpp:102-170``
-        + ``343-378``, with omega weighting and position-LCP coupling. λ
-        accumulates across ``max_iters`` iterations.
-
-        Args:
-            W: ``(3M, 3M)`` Schur complement.
-            r: ``(3M,)`` residual ``pene0 − α·J·x_unc``.
-            mu: ``(M,)`` per-contact friction coefficient.
-            pene0: ``(3M,)`` per-row anchor projection. Constant within step.
-            max_iters: NSN iterations (default 1).
-            lam_init: Optional warm-start ``(3M,)`` lambda.
-            omega_init: Optional warm-start ``(3M,)`` omega from previous call.
-            dt: Timestep (s).
-
-        Returns:
-            ``(lam, omega, lam_apply)``:
-              - ``lam`` (force units, ``(3M,)``): RealSim-style accumulated λ
-                with layout ``[λ_n_0, λ_t1_0, λ_t2_0, ...]``. Use as warm-start.
-              - ``omega``: per-row weighting from the last NSN iter.
-              - ``lam_apply`` = ``dt² · ω · lam``: pass into
-                :meth:`~newton._src.solvers.fba.linear_solver.FBALinearSolver.apply_lambda_correction_combined`.
-        """
-        M = len(mu)
-        if M == 0:
-            return (
-                np.zeros(0, dtype=np.float64),
-                np.zeros(0, dtype=np.float64),
-                np.zeros(0, dtype=np.float64),
-            )
-        size_total = 3 * M
-
-        if lam_init is not None and lam_init.shape == (size_total,):
-            lam = lam_init.astype(np.float64, copy=True)
-        else:
-            lam = np.zeros(size_total, dtype=np.float64)
-        if omega_init is not None and omega_init.shape == (size_total,):
-            omega = omega_init.astype(np.float64, copy=True)
-        else:
-            omega = np.zeros(size_total, dtype=np.float64)
-
-        diag_W = np.diag(W)
-        # RealSim convention: precond[3c]   = dt² · W_ii  (unilateral row)
-        #                     precond[3c+1] = dt   · W_ii  (tangent rows)
-        #                     precond[3c+2] = dt   · W_ii
-        precond = np.zeros(size_total, dtype=np.float64)
-        for c in range(M):
-            w_n = max(float(abs(diag_W[3 * c])), 1e-12)
-            w_t1 = max(float(abs(diag_W[3 * c + 1])), 1e-12)
-            w_t2 = max(float(abs(diag_W[3 * c + 2])), 1e-12)
-            precond[3 * c] = (dt * dt) * w_n
-            precond[3 * c + 1] = dt * w_t1
-            precond[3 * c + 2] = dt * w_t2
-
-        for _ in range(max_iters):
-            # penetration = -r + dt²·W·(ω·λ); on iter 0 with ω=0 this is -r.
-            penetration = -r + (dt * dt) * (W @ (omega * lam))
-
-            omega = np.zeros(size_total, dtype=np.float64)
-            compliance = np.zeros(size_total, dtype=np.float64)
-            h = np.zeros(size_total, dtype=np.float64)
-            for c in range(M):
-                idx_n = 3 * c
-                idx_t1 = 3 * c + 1
-                idx_t2 = 3 * c + 2
-                on, cn, hn = fb_unilateral_row(
-                    penetration=penetration[idx_n],
-                    lam=lam[idx_n],
-                    precond=precond[idx_n],
-                    dt=dt,
-                    pene0=pene0[idx_n],
-                )
-                ot1, ct1, ht1 = fb_frictional_row(
-                    penetration=penetration[idx_t1],
-                    lam_t=lam[idx_t1],
-                    lam_n=lam[idx_n],
-                    mu=mu[c],
-                    precond=precond[idx_t1],
-                    dt=dt,
-                    pene0=pene0[idx_t1],
-                )
-                ot2, ct2, ht2 = fb_frictional_row(
-                    penetration=penetration[idx_t2],
-                    lam_t=lam[idx_t2],
-                    lam_n=lam[idx_n],
-                    mu=mu[c],
-                    precond=precond[idx_t2],
-                    dt=dt,
-                    pene0=pene0[idx_t2],
-                )
-                omega[idx_n] = on
-                omega[idx_t1] = ot1
-                omega[idx_t2] = ot2
-                compliance[idx_n] = cn
-                compliance[idx_t1] = ct1
-                compliance[idx_t2] = ct2
-                h[idx_n] = hn
-                h[idx_t1] = ht1
-                h[idx_t2] = ht2
-
-            # Schur LHS.
-            A_schur = (omega[:, None] * omega[None, :]) * W + np.diag(compliance)
-            # J·x_corrected = J·x_unc + dt²·W·(ω·λ) = (pene0 − r) + dt²·W·(ω·λ).
-            J_x = (pene0 - r) + (dt * dt) * (W @ (omega * lam))
-            rhs = (1.0 / (dt * dt)) * (h - omega * J_x)
-
-            try:
-                dlam = np.linalg.solve(A_schur, rhs)
-            except np.linalg.LinAlgError:
-                break
-            lam = lam + dlam
-
-            # boundConstraintForces (NonSmoothNewton.cpp:395-403, friction
-            # branch): signed cone clamp. lam_n is NOT clamped to >= 0 inside
-            # the inner loop (the `if(_lambda[cid] < 0.0) = 0` line is
-            # explicitly commented out in RealSim). Tangent clamp is two
-            # independent if-statements applied in order; when lam_n < 0 this
-            # saturates lam_t to -mu*lam_n (positive) rather than producing a
-            # degenerate np.clip with low > high. Mirroring RealSim's exact
-            # mutation order:
-            for c in range(M):
-                lam_n_c = lam[3 * c]  # SIGNED, per RealSim
-                upper = mu[c] * lam_n_c
-                lower = -mu[c] * lam_n_c
-                if lam[3 * c + 1] > upper:
-                    lam[3 * c + 1] = upper
-                if lam[3 * c + 1] < lower:
-                    lam[3 * c + 1] = lower
-                if lam[3 * c + 2] > upper:
-                    lam[3 * c + 2] = upper
-                if lam[3 * c + 2] < lower:
-                    lam[3 * c + 2] = lower
-
-        if self.lambda_cap is not None:
-            cap_internal = self.lambda_cap / (dt * dt)
-            np.clip(lam, -cap_internal, cap_internal, out=lam)
-        lam_apply = (dt * dt) * omega * lam
-        return lam, omega, lam_apply
-
     # ------------------------------------------------------------------
     # NSN inner-loop GPU drivers (Steps 6-10 of the NSN GPU port)
     # ------------------------------------------------------------------
     #
     # The drivers below mirror ``solve_nsn_unilateral`` (``newton/tests/fba/_reference.py``) and
-    # :meth:`_solve_nsn_coulomb` but execute the per-iteration sequence
+    # ``solve_nsn_coulomb`` (``newton/tests/fba/_reference.py``) but execute the per-iteration sequence
     # (residual → penetration → FB rows → Schur build → linear solve →
     # lambda update → box clamp → cap clip) on the device. They are
     # transitional: the host-side ``W`` / ``r`` / ``lam_init`` / ``omega_init``
@@ -3295,7 +3135,7 @@ class SolverFBA(SolverBase):
         block_precond: Callable[[wp.array, wp.array], None] | None = None,
         contact_regularization: float = 0.0,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """GPU port of :meth:`_solve_nsn_coulomb` (Stage B NSN inner).
+        """GPU port of ``solve_nsn_coulomb`` (``newton/tests/fba/_reference.py``) (Stage B NSN inner).
 
         Identical structure to :meth:`_solve_nsn_unilateral_gpu` with row
         count ``3M`` and the frictional FB block replacing the unilateral
