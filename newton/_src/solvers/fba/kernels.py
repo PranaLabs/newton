@@ -4099,6 +4099,68 @@ def bilateral_law_kernel(
 
 
 @wp.kernel
+def soft_contact_keys_kernel(
+    particle: wp.array[wp.int32],
+    shape: wp.array[wp.int32],
+    shape_count: int,
+    # outputs
+    keys: wp.array[wp.int64],
+    values: wp.array[wp.int32],
+):
+    """Keys that sort the particle-shape contacts by particle and then shape, and their indices."""
+    i = wp.tid()
+    keys[i] = wp.int64(particle[i]) * wp.int64(shape_count) + wp.int64(shape[i])
+    values[i] = i
+
+
+@wp.kernel
+def assemble_contacts_kernel(
+    order: wp.array[wp.int32],  # indices of the particle-shape contacts in their sorted order
+    soft_particle: wp.array[wp.int32],
+    soft_shape: wp.array[wp.int32],
+    soft_body_pos: wp.array[wp.vec3],
+    soft_normal: wp.array[wp.vec3],
+    self_particles: wp.array2d[wp.int32],  # (S, 4) vertex-face self contacts: the particle, then the triangle
+    self_alpha: wp.array2d[wp.float32],  # (S, 4)
+    self_normal: wp.array[wp.vec3],  # (S,)
+    shape_contacts: int,
+    self_radius: float,
+    # outputs
+    particle: wp.array[wp.int32],
+    normal: wp.array[wp.vec3],
+    alpha: wp.array[wp.float32],
+    shape: wp.array[wp.int32],
+    body_pos: wp.array[wp.vec3],
+    extra_particle: wp.array2d[wp.int32],  # (M, 3)
+    extra_alpha: wp.array2d[wp.float32],  # (M, 3)
+):
+    """The particle-shape contacts in their sorted order and then the self contacts, anchored the self-contact
+    radius along their normals, with the further particles of each contact."""
+    c = wp.tid()
+    if c < shape_contacts:
+        i = order[c]
+        particle[c] = soft_particle[i]
+        normal[c] = soft_normal[i]
+        alpha[c] = 1.0
+        shape[c] = soft_shape[i]
+        body_pos[c] = soft_body_pos[i]
+        for k in range(3):
+            extra_particle[c, k] = -1
+            extra_alpha[c, k] = 0.0
+    else:
+        s = c - shape_contacts
+        n = self_normal[s]
+        particle[c] = self_particles[s, 0]
+        normal[c] = n
+        alpha[c] = self_alpha[s, 0]
+        shape[c] = -1
+        body_pos[c] = self_radius * n
+        for k in range(3):
+            extra_particle[c, k] = self_particles[s, k + 1]
+            extra_alpha[c, k] = self_alpha[s, k + 1]
+
+
+@wp.kernel
 def contact_mu_kernel(
     contact_shape: wp.array[wp.int32],  # (M,) shape of each contact, -1 for self contacts
     shape_material_mu: wp.array[wp.float32],

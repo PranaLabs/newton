@@ -1704,7 +1704,9 @@ class SolverFBA(SolverBase):
                                 self._contact_tangent2_d,
                                 bilateral=self._lite_constraint_rows() if n_b else None,
                                 **self._contact_extra_args(),
-                                host=(self._contact_particle_h, self._contact_alpha_h, *(self._contact_extra_h or ())),
+                                host=None
+                                if self._contact_particle_h is None
+                                else (self._contact_particle_h, self._contact_alpha_h, *(self._contact_extra_h or ())),
                             )
                             self._lite_slot_rows = None if self._contact_extra is None else self._slot_rows(M, ls, n_b)
                             self._lite_nsn_graph = None
@@ -2541,82 +2543,92 @@ class SolverFBA(SolverBase):
         # ``wp.atomic_add(soft_contact_count, 0, 1)`` so per-frame order
         # depends on GPU thread scheduling — downstream Gauss-Seidel and
         # atomic ``J^T λ`` accumulation are order-sensitive, hence we sort.
-        if contacts is None:
-            particle_h, shape_h = np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.int32)
-            body_pos_h, normal_h = np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
+        # The pipeline gives one contact per particle and shape, and a particle one vertex-face self contact at
+        # most: with these alone, the contacts are sorted and assembled on the device.
+        on_device = contacts is not None and self._face_query is None
+        if on_device and getattr(self._self_contact, "mode", None) == "vertex_face":
+            M, shape_contacts = self._assemble_contacts_on_device(contacts, state, M_raw)
+            particle_h = normal_h = alpha_h = shape_h = body_pos_h = extra = None
         else:
-            particle_h = contacts.soft_contact_particle.numpy()[:M_raw]
-            shape_h = contacts.soft_contact_shape.numpy()[:M_raw]
-            # soft_contact_body_pos convention (from create_soft_contacts kernel):
-            #   - body_index >= 0 (dynamic body): contact point in body-local frame.
-            #   - body_index  < 0 (static shape): contact point already in world frame
-            #     (because X_wb = identity so X_ws = X_bs, and body_pos = X_bs * x_local).
-            body_pos_h = contacts.soft_contact_body_pos.numpy()[:M_raw]
-            normal_h = contacts.soft_contact_normal.numpy()[:M_raw]  # world frame
+            if contacts is None:
+                particle_h, shape_h = np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.int32)
+                body_pos_h, normal_h = np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
+            else:
+                particle_h = contacts.soft_contact_particle.numpy()[:M_raw]
+                shape_h = contacts.soft_contact_shape.numpy()[:M_raw]
+                # soft_contact_body_pos convention (from create_soft_contacts kernel):
+                #   - body_index >= 0 (dynamic body): contact point in body-local frame.
+                #   - body_index  < 0 (static shape): contact point already in world frame
+                #     (because X_wb = identity so X_ws = X_bs, and body_pos = X_bs * x_local).
+                body_pos_h = contacts.soft_contact_body_pos.numpy()[:M_raw]
+                normal_h = contacts.soft_contact_normal.numpy()[:M_raw]  # world frame
 
-        # Filter out sentinel entries (particle == -1).
-        valid_mask = particle_h >= 0
-        particle_h = particle_h[valid_mask]
-        shape_h = shape_h[valid_mask]
-        body_pos_h = body_pos_h[valid_mask]
-        normal_h = normal_h[valid_mask]
-        M = int(particle_h.shape[0])
+            # Filter out sentinel entries (particle == -1).
+            valid_mask = particle_h >= 0
+            particle_h = particle_h[valid_mask]
+            shape_h = shape_h[valid_mask]
+            body_pos_h = body_pos_h[valid_mask]
+            normal_h = normal_h[valid_mask]
+            M = int(particle_h.shape[0])
 
-        if M == 0 and not other_contacts:
-            self._contact_count = 0
-            return
+            if M == 0 and not other_contacts:
+                self._contact_count = 0
+                return
 
-        # Deterministic contact ordering (host-side lexsort — see comment above).
-        sort_keys = (
-            normal_h[:, 2].astype(np.float64),
-            normal_h[:, 1].astype(np.float64),
-            normal_h[:, 0].astype(np.float64),
-            shape_h.astype(np.int64),
-            particle_h.astype(np.int64),
-        )
-        order = np.lexsort(sort_keys)
-        particle_h = particle_h[order]
-        shape_h = shape_h[order]
-        body_pos_h = body_pos_h[order]
-        normal_h = normal_h[order]
-
-        # Face contacts follow the particle contacts: slot 0 holds their first particle.
-        alpha_h, extra = np.ones(M, dtype=np.float32), None
-        if self._face_query is not None:
-            src = state if state is not None else self.model
-            found = self._face_query.query(
-                self.model,
-                src.particle_q,
-                src.body_q,
-                particle_h,
-                shape_h,
-                self.face_contact_edge_radius,
-                self.face_contact_margin,
+            # Deterministic contact ordering (host-side lexsort — see comment above).
+            sort_keys = (
+                normal_h[:, 2].astype(np.float64),
+                normal_h[:, 1].astype(np.float64),
+                normal_h[:, 0].astype(np.float64),
+                shape_h.astype(np.int64),
+                particle_h.astype(np.int64),
             )
-            if len(found[0]):
-                tri, bary = self._face_query.tri[found[0]], found[2]
-                particle_h, alpha_h = np.concatenate([particle_h, tri[:, 0]]), np.concatenate([alpha_h, bary[:, 0]])
-                shape_h, body_pos_h = np.concatenate([shape_h, found[1]]), np.concatenate([body_pos_h, found[3]])
-                normal_h = np.concatenate([normal_h, found[4]])
-                extra = [np.full((M, 2), -1, dtype=np.int32), np.zeros((M, 2), dtype=np.float32)]
-                extra = [np.concatenate([extra[0], tri[:, 1:]]), np.concatenate([extra[1], bary[:, 1:]])]
-                M = len(particle_h)
-        # Self contacts follow, with a static anchor at the contact radius along their normal: their rows hold
-        # n . sum_k alpha_k x_k >= radius and start without tangential offset.
-        shape_contacts = M
-        if self._self_contact is not None:
-            src = state if state is not None else self.model
-            sp, sa, sn = self._self_contact.detect(src.particle_q)
-            if len(sp):
-                particle_h, alpha_h = np.concatenate([particle_h, sp[:, 0]]), np.concatenate([alpha_h, sa[:, 0]])
-                shape_h, normal_h = np.concatenate([shape_h, np.full(len(sp), -1)]), np.concatenate([normal_h, sn])
-                body_pos_h = np.concatenate([body_pos_h, self.particle_self_contact_radius * sn])
-                if extra is None:
-                    extra = [np.full((M, 3), -1, dtype=np.int32), np.zeros((M, 3), dtype=np.float32)]
-                else:
-                    extra = [np.pad(extra[0], ((0, 0), (0, 1)), constant_values=-1), np.pad(extra[1], ((0, 0), (0, 1)))]
-                extra = [np.concatenate([extra[0], sp[:, 1:]]), np.concatenate([extra[1], sa[:, 1:]])]
-                M = len(particle_h)
+            order = np.lexsort(sort_keys)
+            particle_h = particle_h[order]
+            shape_h = shape_h[order]
+            body_pos_h = body_pos_h[order]
+            normal_h = normal_h[order]
+
+            # Face contacts follow the particle contacts: slot 0 holds their first particle.
+            alpha_h, extra = np.ones(M, dtype=np.float32), None
+            if self._face_query is not None:
+                src = state if state is not None else self.model
+                found = self._face_query.query(
+                    self.model,
+                    src.particle_q,
+                    src.body_q,
+                    particle_h,
+                    shape_h,
+                    self.face_contact_edge_radius,
+                    self.face_contact_margin,
+                )
+                if len(found[0]):
+                    tri, bary = self._face_query.tri[found[0]], found[2]
+                    particle_h, alpha_h = np.concatenate([particle_h, tri[:, 0]]), np.concatenate([alpha_h, bary[:, 0]])
+                    shape_h, body_pos_h = np.concatenate([shape_h, found[1]]), np.concatenate([body_pos_h, found[3]])
+                    normal_h = np.concatenate([normal_h, found[4]])
+                    extra = [np.full((M, 2), -1, dtype=np.int32), np.zeros((M, 2), dtype=np.float32)]
+                    extra = [np.concatenate([extra[0], tri[:, 1:]]), np.concatenate([extra[1], bary[:, 1:]])]
+                    M = len(particle_h)
+            # Self contacts follow, with a static anchor at the contact radius along their normal: their rows hold
+            # n . sum_k alpha_k x_k >= radius and start without tangential offset.
+            shape_contacts = M
+            if self._self_contact is not None:
+                src = state if state is not None else self.model
+                sp, sa, sn = self._self_contact.detect(src.particle_q)
+                if len(sp):
+                    particle_h, alpha_h = np.concatenate([particle_h, sp[:, 0]]), np.concatenate([alpha_h, sa[:, 0]])
+                    shape_h, normal_h = np.concatenate([shape_h, np.full(len(sp), -1)]), np.concatenate([normal_h, sn])
+                    body_pos_h = np.concatenate([body_pos_h, self.particle_self_contact_radius * sn])
+                    if extra is None:
+                        extra = [np.full((M, 3), -1, dtype=np.int32), np.zeros((M, 3), dtype=np.float32)]
+                    else:
+                        extra = [
+                            np.pad(extra[0], ((0, 0), (0, 1)), constant_values=-1),
+                            np.pad(extra[1], ((0, 0), (0, 1))),
+                        ]
+                    extra = [np.concatenate([extra[0], sp[:, 1:]]), np.concatenate([extra[1], sa[:, 1:]])]
+                    M = len(particle_h)
         if extra is not None:
             self._contact_extra = [wp.array(a, device=self._device) for a in extra]
             self._contact_extra_h = extra
@@ -2643,11 +2655,12 @@ class SolverFBA(SolverBase):
         device = self._device
 
         # Upload (sorted) compact contact arrays to device once.
-        self._contact_particle_d.assign(particle_h.astype(np.int32))
-        self._contact_normal_d.assign(normal_h.astype(np.float32))
-        self._contact_alpha_d.assign(alpha_h)
-        self._contact_shape_d.assign(shape_h.astype(np.int32))
-        self._contact_body_pos_d.assign(body_pos_h.astype(np.float32))
+        if particle_h is not None:
+            self._contact_particle_d.assign(particle_h.astype(np.int32))
+            self._contact_normal_d.assign(normal_h.astype(np.float32))
+            self._contact_alpha_d.assign(alpha_h)
+            self._contact_shape_d.assign(shape_h.astype(np.int32))
+            self._contact_body_pos_d.assign(body_pos_h.astype(np.float32))
 
         # Resolve model fields used by the GPU kernels.  When a field is
         # absent or empty we still pass a non-null dummy buffer through
@@ -2714,8 +2727,8 @@ class SolverFBA(SolverBase):
         # Host mirrors of the basic contact fields are still consumed by
         # the CPU residual (``_compute_contact_residual*``); a follow-on
         # step in the plan moves the residual to GPU and removes these.
-        self._contact_particle_h = particle_h.astype(np.int32)
-        self._contact_normal_h = normal_h.astype(np.float32)
+        self._contact_particle_h = None if particle_h is None else particle_h.astype(np.int32)
+        self._contact_normal_h = None if normal_h is None else normal_h.astype(np.float32)
         self._contact_alpha_h = alpha_h
         self._contact_count = M
 
@@ -2813,6 +2826,32 @@ class SolverFBA(SolverBase):
     # ------------------------------------------------------------------
     # Phase 4 Stage A — Schur-complement NSN helpers
     # ------------------------------------------------------------------
+
+    def _assemble_contacts_on_device(self, contacts: Contacts, state: State | None, M_raw: int) -> tuple[int, int]:
+        """Sort the particle-shape contacts by particle and shape and append the vertex-face self contacts in the
+        order of their particles, as the host sort orders them, on the device. Returns the number of contacts and
+        of particle-shape contacts."""
+        from .kernels import assemble_contacts_kernel, soft_contact_keys_kernel  # noqa: PLC0415
+
+        device, sc = self._device, self._self_contact
+        Ms = min(M_raw, contacts.soft_contact_particle.shape[0])
+        keys = wp.empty(2 * Ms, dtype=wp.int64, device=device)
+        order = wp.empty(2 * Ms, dtype=wp.int32, device=device)
+        inputs = [contacts.soft_contact_particle, contacts.soft_contact_shape, self.model.shape_count]
+        wp.launch(soft_contact_keys_kernel, Ms, inputs, [keys, order], device=device)
+        wp.utils.radix_sort_pairs(keys, order, Ms)
+        M = Ms + sc.find((state if state is not None else self.model).particle_q)
+        self._ensure_contact_buffers(M)
+        extra = [wp.empty((M, 3), dtype=t, device=device) for t in (wp.int32, wp.float32)]
+        inputs = [order, contacts.soft_contact_particle, contacts.soft_contact_shape, contacts.soft_contact_body_pos]
+        inputs += [contacts.soft_contact_normal, sc.found_particles, sc.found_alpha, sc.found_normal, Ms]
+        inputs += [self.particle_self_contact_radius]
+        outputs = [self._contact_particle_d, self._contact_normal_d, self._contact_alpha_d, self._contact_shape_d]
+        outputs += [self._contact_body_pos_d, *extra]
+        wp.launch(assemble_contacts_kernel, M, inputs, outputs, device=device)
+        if M > Ms:
+            self._contact_extra = extra
+        return M, Ms
 
     def _compute_contact_residual_friction(self, x_np: np.ndarray) -> np.ndarray:
         """Compute the 3M-vector residual ``r = [r_n, r_t1, r_t2]`` for each contact.
