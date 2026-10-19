@@ -149,7 +149,15 @@ class TestSelfContactSolve(unittest.TestCase):
         """Largest number of intersecting triangle pairs over the steps, then the gap between the sheets [m]."""
         builder = newton.ModelBuilder()
         builder.add_shape_box(-1, xform=wp.transform((0.0, 0.0, 0.25), wp.quat_identity()), hx=0.25, hy=0.25, hz=0.25)
-        grid = {"dim_x": cells, "dim_y": cells, "cell_x": 0.02, "cell_y": 0.02, "mass": 0.004, "tri_ke": 500.0}
+        grid = {
+            "dim_x": cells,
+            "dim_y": cells,
+            "cell_x": 0.02,
+            "cell_y": 0.02,
+            "mass": 0.004,
+            "tri_ke": 500.0,
+            "particle_radius": 0.0,
+        }
         for z, shift in ((0.5, 0.0), (0.5 + start_gap, 0.004)):
             corner = wp.vec3(shift - 0.01 * cells, shift - 0.01 * cells, z)
             builder.add_cloth_grid(pos=corner, rot=wp.quat_identity(), vel=wp.vec3(0.0), tri_ka=1e3, **grid)
@@ -157,7 +165,7 @@ class TestSelfContactSolve(unittest.TestCase):
         if mu is not None:
             model.particle_mu = mu
         solver = newton.solvers.SolverFBA(model, iterations=10, **solver_args)
-        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.01)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.11)
         detector = TriMeshCollisionDetector(model)
         contacts, s0, s1, worst = pipeline.contacts(), model.state(), model.state(), 0
         for _ in range(steps):
@@ -209,7 +217,16 @@ class TestSelfContactSolve(unittest.TestCase):
         does not throw the cloth, and the other contacts keep every triangle apart."""
         builder = newton.ModelBuilder()
         builder.add_shape_box(-1, xform=wp.transform((0.0, 0.0, 0.25), wp.quat_identity()), hx=0.25, hy=0.25, hz=0.25)
-        grid = {"dim_x": 6, "dim_y": 6, "cell_x": 0.02, "cell_y": 0.02, "mass": 0.004, "tri_ke": 500.0, "tri_ka": 1e3}
+        grid = {
+            "dim_x": 6,
+            "dim_y": 6,
+            "cell_x": 0.02,
+            "cell_y": 0.02,
+            "mass": 0.004,
+            "tri_ke": 500.0,
+            "tri_ka": 1e3,
+            "particle_radius": 0.0,
+        }
         for z, shift in ((0.5, 0.0), (0.505, 0.004)):
             corner = wp.vec3(shift - 0.06, shift - 0.06, z)
             builder.add_cloth_grid(pos=corner, rot=wp.quat_identity(), vel=wp.vec3(0.0), **grid)
@@ -218,7 +235,7 @@ class TestSelfContactSolve(unittest.TestCase):
         solver = newton.solvers.SolverFBA(
             model, iterations=10, nsn_schur_mode="lite", particle_enable_self_contact=True, **kw
         )
-        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.01)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.11)
         detector = TriMeshCollisionDetector(model)
         contacts, s0, s1 = pipeline.contacts(), model.state(), model.state()
         held = [0, 1, 7, 8, 49, 50, 56, 57]

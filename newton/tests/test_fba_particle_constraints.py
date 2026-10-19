@@ -34,7 +34,7 @@ class TestParticleConstraints(unittest.TestCase):
             tri_ke=500.0,
             tri_ka=1.0e3,
             edge_ke=0.1,
-            particle_radius=0.005,
+            particle_radius=0.0,
         )
         return builder.finalize()
 
@@ -42,7 +42,7 @@ class TestParticleConstraints(unittest.TestCase):
         solver = newton.solvers.SolverFBA(model, iterations=10)
         if rows is not None:
             solver.set_particle_constraints(*rows)
-        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.02)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.025)
         contacts, s0, s1 = pipeline.contacts(), model.state(), model.state()
         for _ in range(steps):
             pipeline.collide(s0, contacts)
@@ -74,7 +74,16 @@ class TestParticleConstraints(unittest.TestCase):
         builder.add_ground_plane()
         box = builder.add_body(xform=wp.transform((0.0, 0.0, 0.5), wp.quat_identity()))
         builder.add_shape_box(box, cfg=newton.ModelBuilder.ShapeConfig(density=100.0))
-        grid = {"dim_x": 4, "dim_y": 4, "cell_x": 0.1, "cell_y": 0.1, "tri_ke": 500.0, "tri_ka": 1.0e3, "edge_ke": 1.0}
+        grid = {
+            "dim_x": 4,
+            "dim_y": 4,
+            "cell_x": 0.1,
+            "cell_y": 0.1,
+            "tri_ke": 500.0,
+            "tri_ka": 1.0e3,
+            "edge_ke": 1.0,
+            "particle_radius": 0.0,
+        }
         builder.add_cloth_grid(
             pos=wp.vec3(-0.2, -0.2, 1.005), rot=wp.quat_identity(), vel=wp.vec3(0.0), mass=0.2, **grid
         )
@@ -82,7 +91,7 @@ class TestParticleConstraints(unittest.TestCase):
 
     def _run_on_box(self, model, solver, steps):
         """The state after ``steps`` steps of 5 ms and the particle velocities before the last one."""
-        pipeline = newton.CollisionPipeline(model)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.11)
         contacts, s0, s1 = pipeline.contacts(), model.state(), model.state()
         for _ in range(steps):
             pipeline.collide(s0, contacts)
@@ -131,11 +140,20 @@ class TestParticleConstraints(unittest.TestCase):
         ground, then 5 cm over it while they drag it at 0.2 m/s, and its contacts carry no force."""
         builder = newton.ModelBuilder()
         builder.add_ground_plane()
-        grid = {"dim_x": 4, "dim_y": 4, "cell_x": 0.1, "cell_y": 0.1, "tri_ke": 0.5, "tri_ka": 1.0, "edge_ke": 0.01}
+        grid = {
+            "dim_x": 4,
+            "dim_y": 4,
+            "cell_x": 0.1,
+            "cell_y": 0.1,
+            "tri_ke": 0.5,
+            "tri_ka": 1.0,
+            "edge_ke": 0.01,
+            "particle_radius": 0.0,
+        }
         builder.add_cloth_grid(pos=wp.vec3(-0.2, -0.2, 0.0), rot=wp.quat_identity(), vel=wp.vec3(0.0), mass=1.0, **grid)
         model = builder.finalize()
         solver = newton.solvers.SolverFBA(model, iterations=10, nsn_schur_mode="lite")
-        pipeline = newton.CollisionPipeline(model)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.11)
         contacts, s0, s1 = pipeline.contacts(), model.state(), model.state()
         x0 = model.particle_q.numpy()[12]
         for k in range(60):
@@ -158,13 +176,22 @@ class TestParticleConstraints(unittest.TestCase):
         particles' contacts; they solve their own Delassus matrix and hold the corner on its targets."""
         builder = newton.ModelBuilder()
         builder.add_ground_plane()
-        grid = {"dim_x": 4, "dim_y": 4, "cell_x": 0.1, "cell_y": 0.1, "tri_ke": 500.0, "tri_ka": 1e3, "edge_ke": 0.1}
+        grid = {
+            "dim_x": 4,
+            "dim_y": 4,
+            "cell_x": 0.1,
+            "cell_y": 0.1,
+            "tri_ke": 500.0,
+            "tri_ka": 1e3,
+            "edge_ke": 0.1,
+            "particle_radius": 0.0,
+        }
         builder.add_cloth_grid(
             pos=wp.vec3(-0.2, -0.2, 0.0), rot=wp.quat_identity(), vel=wp.vec3(0.0), mass=0.01, **grid
         )
         model = builder.finalize()
         solver = newton.solvers.SolverFBA(model, iterations=10, nsn_schur_mode="lite")
-        pipeline = newton.CollisionPipeline(model)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.11)
         contacts, s0, s1 = pipeline.contacts(), model.state(), model.state()
         held = [0, 1, 5, 6]
         x0 = model.particle_q.numpy()[held]

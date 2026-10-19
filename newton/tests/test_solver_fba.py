@@ -2723,6 +2723,7 @@ class TestPhase4StageAContact(unittest.TestCase):
             tri_kd=0.0,
             edge_ke=0.0,
             edge_kd=0.0,
+            particle_radius=0.0,
         )
         builder.particle_mass[1] = 0.0  # pin
         builder.particle_mass[2] = 0.0  # pin
@@ -2836,6 +2837,7 @@ class TestPhase4StageAContact(unittest.TestCase):
             edge_ke=1.0e-2,
             edge_kd=0.0,
             fix_left=False,
+            particle_radius=0.0,
         )
         # Pin one corner so the model is determinate.
         builder.particle_mass[0] = 0.0
@@ -3175,6 +3177,7 @@ class TestPhase4StageBFriction(unittest.TestCase):
             tri_kd=0.0,
             edge_ke=0.0,
             edge_kd=0.0,
+            particle_radius=0.0,
         )
         builder.particle_mass[1] = 0.0
         builder.particle_mass[2] = 0.0
@@ -3291,6 +3294,7 @@ class TestPhase4StageBFriction(unittest.TestCase):
             tri_kd=0.0,
             edge_ke=0.0,
             edge_kd=0.0,
+            particle_radius=0.0,
         )
         builder.particle_mass[1] = 0.0
         builder.particle_mass[2] = 0.0
@@ -3360,6 +3364,7 @@ class TestPhase4StageBFriction(unittest.TestCase):
                 tri_kd=0.0,
                 edge_ke=0.0,
                 edge_kd=0.0,
+                particle_radius=0.0,
             )
             builder.particle_mass[1] = 0.0
             builder.particle_mass[2] = 0.0
@@ -3452,10 +3457,11 @@ class TestPhase4StageBFriction(unittest.TestCase):
             tri_kd=0.0,
             edge_ke=5.0e-3,
             edge_kd=0.0,
+            particle_radius=0.0,
         )
         model = builder.finalize()
 
-        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.08)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.18)
         contacts = pipeline.contacts()
 
         particle_count = model.particle_count
@@ -3505,7 +3511,7 @@ class TestPhase4StageCShapePrimitives(unittest.TestCase):
 
     # ------------------------------------------------------------------ helpers
 
-    def _make_pipeline(self, model, soft_contact_gap=0.2):
+    def _make_pipeline(self, model, soft_contact_gap=0.3):
         """Create a CollisionPipeline with an explicit soft contact gap."""
         return newton.CollisionPipeline(model, soft_contact_gap=soft_contact_gap)
 
@@ -3541,6 +3547,7 @@ class TestPhase4StageCShapePrimitives(unittest.TestCase):
             tri_kd=0.0,
             edge_ke=0.0,
             edge_kd=0.0,
+            particle_radius=0.0,
         )
         builder.particle_mass[1] = 0.0
         builder.particle_mass[2] = 0.0
@@ -3599,6 +3606,7 @@ class TestPhase4StageCShapePrimitives(unittest.TestCase):
             tri_kd=0.0,
             edge_ke=0.0,
             edge_kd=0.0,
+            particle_radius=0.0,
         )
         builder.particle_mass[1] = 0.0
         builder.particle_mass[2] = 0.0
@@ -3659,10 +3667,11 @@ class TestPhase4StageCShapePrimitives(unittest.TestCase):
             edge_ke=1.0e-2,
             edge_kd=0.0,
             fix_top=True,
+            particle_radius=0.0,
         )
         model = builder.finalize()
 
-        pipeline = self._make_pipeline(model, soft_contact_gap=0.15)
+        pipeline = self._make_pipeline(model, soft_contact_gap=0.25)
         contacts = pipeline.contacts()
         solver = SolverFBA(model, iterations=10, friction=False)
         s_in, s_out = model.state(), model.state()
@@ -3718,10 +3727,11 @@ class TestPhase4StageCShapePrimitives(unittest.TestCase):
             k_mu=1.0e3,
             k_lambda=1.0e3,
             k_damp=0.0,
+            particle_radius=0.0,
         )
         model = builder.finalize()
 
-        pipeline = self._make_pipeline(model, soft_contact_gap=0.15)
+        pipeline = self._make_pipeline(model, soft_contact_gap=0.25)
         contacts = pipeline.contacts()
         solver = SolverFBA(model, iterations=10, friction=False)
         s_in, s_out = model.state(), model.state()
@@ -3780,10 +3790,11 @@ class TestPhase4StageCShapePrimitives(unittest.TestCase):
             edge_ke=1.0e-2,
             edge_kd=0.0,
             fix_top=True,
+            particle_radius=0.0,
         )
         model = builder.finalize()
 
-        pipeline = self._make_pipeline(model, soft_contact_gap=0.15)
+        pipeline = self._make_pipeline(model, soft_contact_gap=0.25)
         contacts = pipeline.contacts()
         solver = SolverFBA(model, iterations=10, friction=False)
         s_in, s_out = model.state(), model.state()
@@ -3855,6 +3866,7 @@ class TestPhase4StageCShapePrimitives(unittest.TestCase):
             tri_kd=0.0,
             edge_ke=0.0,
             edge_kd=0.0,
+            particle_radius=0.0,
         )
         builder.particle_mass[1] = 0.0
         builder.particle_mass[2] = 0.0
@@ -3863,7 +3875,7 @@ class TestPhase4StageCShapePrimitives(unittest.TestCase):
         # gravity while being pushed out of the sphere.
         model.gravity.assign(wp.zeros(1, dtype=wp.vec3))
 
-        pipeline = self._make_pipeline(model, soft_contact_gap=0.2)
+        pipeline = self._make_pipeline(model, soft_contact_gap=0.3)
         contacts = pipeline.contacts()
         solver = SolverFBA(model, iterations=15, friction=False)
         s_in, s_out = model.state(), model.state()
@@ -4126,6 +4138,7 @@ class SolverFBALambdaWarmStartTests(unittest.TestCase):
             tri_ke=5000.0,
             tri_ka=0.0,
             tri_kd=0.0,
+            particle_radius=0.0,
         )
         return builder.finalize()
 
@@ -4145,7 +4158,7 @@ class SolverFBALambdaWarmStartTests(unittest.TestCase):
         model = self._cloth_on_plane_model()
         solver = SolverFBA(model, friction=False)
         s_in, s_out = model.state(), model.state()
-        pipeline = CollisionPipeline(model, soft_contact_gap=0.05)
+        pipeline = CollisionPipeline(model, soft_contact_gap=0.15)
         contacts = pipeline.contacts()
 
         # The flat cloth falls 0.15 m and lands on the plane at step 11; step
@@ -4190,6 +4203,7 @@ class SolverFBAKinematicCylinderTests(unittest.TestCase):
             k_mu=5.0e3,
             k_lambda=5.0e3,
             k_damp=0.0,
+            particle_radius=0.0,
         )
         # Z-aligned cylinder primitive → rotate to +X via 90° about -Y.
         half = math.pi / 4.0
@@ -4203,7 +4217,7 @@ class SolverFBAKinematicCylinderTests(unittest.TestCase):
             half_height=2.0,
         )
         model = builder.finalize()
-        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.1)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.2)
         contacts = pipeline.contacts()
         return model, pipeline, contacts
 
@@ -4594,13 +4608,14 @@ class SolverFBAIsodofJtLambdaDeterminismTests(unittest.TestCase):
             tri_ke=5000.0,
             tri_ka=0.0,
             tri_kd=0.0,
+            particle_radius=0.0,
         )
         model = builder.finalize()
         if hasattr(model, "shape_material_mu") and model.shape_material_mu is not None:
             mu_arr = model.shape_material_mu.numpy()
             mu_arr[0] = 0.3
             model.shape_material_mu.assign(mu_arr.astype(np.float32))
-        pipeline = CollisionPipeline(model, soft_contact_gap=0.1)
+        pipeline = CollisionPipeline(model, soft_contact_gap=0.2)
         contacts = pipeline.contacts()
         solver = SolverFBA(
             model,

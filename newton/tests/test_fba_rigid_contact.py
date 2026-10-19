@@ -536,11 +536,13 @@ class TestSolverFBATwoWayContacts(unittest.TestCase):
         builder.add_shape_box(box, cfg=newton.ModelBuilder.ShapeConfig(density=box_density))
         grid = {"dim_x": 4, "dim_y": 4, "cell_x": 0.1, "cell_y": 0.1, "tri_ke": 500.0, "tri_ka": 1.0e3, "edge_ke": 1.0}
         pos, vel = wp.vec3(-0.2, -0.2, cloth_z), wp.vec3(0.0, 0.0, v_cloth)
-        builder.add_cloth_grid(pos=pos, rot=wp.quat_identity(), vel=vel, mass=particle_mass, **grid)
+        builder.add_cloth_grid(
+            pos=pos, rot=wp.quat_identity(), vel=vel, mass=particle_mass, particle_radius=0.0, **grid
+        )
         model = builder.finalize()
         solver = SolverFBA(model, iterations=10)
         s0, s1 = model.state(), model.state()
-        pipeline = newton.CollisionPipeline(model)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.11)
         contacts, momentum = pipeline.contacts(), []
         m_p, m_b = model.particle_mass.numpy(), model.body_mass.numpy()[0]
         for _ in range(steps):
