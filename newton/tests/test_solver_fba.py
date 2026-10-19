@@ -61,7 +61,7 @@ class TestBuildPDSystem(unittest.TestCase):
     def test_diagonal_includes_mass_over_dt_squared(self):
         model = self._build_two_triangle_cloth()
         dt = 1.0 / 60.0
-        A, _meta = build_pd_system(model, dt=dt, pin_stiffness=1e12)
+        A = build_pd_system(model, dt=dt, pin_stiffness=1e12)[0].toarray()
 
         self.assertEqual(A.shape, (model.particle_count, model.particle_count))
         # A is symmetric.
@@ -97,7 +97,7 @@ class TestBuildPDSystem(unittest.TestCase):
         builder.particle_mass[0] = 0.0
         model = builder.finalize(device="cpu")
 
-        A, _ = build_pd_system(model, dt=1.0 / 60.0, pin_stiffness=1e12)
+        A = build_pd_system(model, dt=1.0 / 60.0, pin_stiffness=1e12)[0].toarray()
         # Pin contributes pin_stiffness to A[0,0].
         self.assertGreaterEqual(A[0, 0], 1e12 - 1e-3)
 
@@ -2175,7 +2175,7 @@ class TestTetHessianAssembly(unittest.TestCase):
 
     def test_tet_hessian_symmetric(self):
         model = self._build_single_tet_model()
-        A, _meta = build_pd_system(model, dt=1.0 / 60.0, pin_stiffness=1e12)
+        A = build_pd_system(model, dt=1.0 / 60.0, pin_stiffness=1e12)[0].toarray()
         diff = A - A.T
         self.assertLess(np.abs(diff).max(), 1e-10, "tet Hessian is not symmetric")
 

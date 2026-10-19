@@ -36,8 +36,8 @@ class SolverFBA(SolverBase):
 
     Implements a Projective Dynamics (PD) local-global iteration for cloth
     with isotropic stretching (ARAP or corotational), isometric bending,
-    and soft Pin constraints. The PD Hessian is prefactored once via scipy
-    SuperLU (COLAMD ordering); the sparse inverse `S = L⁻¹` is computed
+    and soft Pin constraints. The PD Hessian is prefactored once (nested dissection
+    ordering, multifrontal LDLᵀ); the sparse inverse `S = L⁻¹` is computed
     exactly using the elimination tree (ported from RealSim
     `LDLT_computeLowerInverse`) and uploaded to Warp BSR matrices. The
     runtime linear solve evaluates ``A⁻¹·b = Sᵀ · D⁻¹ · S · b`` via two

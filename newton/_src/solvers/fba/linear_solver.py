@@ -17,14 +17,11 @@ Runtime (GPU):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 import warp as wp
 import warp.sparse as wps
-
-if TYPE_CHECKING:
-    import scipy.sparse as sp
 
 from ...sim import Model
 from .kernels import (
@@ -45,7 +42,7 @@ def build_pd_system(
     pin_stiffness: float,
     tri_weight_scale: float = 1.0,
     tet_weight_scale: float = 1.0,
-) -> tuple[sp.csr_matrix, dict[str, Any]]:
+) -> tuple[CsrMatrix, dict[str, Any]]:
     """Assemble the constant scalar PD Hessian ``A`` for cloth.
 
     Args:
@@ -73,8 +70,6 @@ def build_pd_system(
         - ``meta["pin_indices"]`` : ``np.ndarray[int32]`` (packed pinned indices)
         - ``meta["pin_weight"]`` : float
     """
-    import scipy.sparse as _sp
-
     N = model.particle_count
     mass = model.particle_mass.numpy().astype(np.float64)
     inv_mass = model.particle_inv_mass.numpy().astype(np.float64)
@@ -245,13 +240,7 @@ def build_pd_system(
         cols = np.zeros(0, dtype=np.int32)
         vals = np.zeros(0, dtype=np.float64)
 
-    A = _sp.csr_matrix(
-        (
-            vals,
-            (rows, cols),
-        ),
-        shape=(N, N),
-    )
+    A = CsrMatrix.from_triplets((N, N), rows, cols, vals)
 
     meta: dict[str, Any] = {
         "tri_indices": tri_indices,
@@ -273,7 +262,7 @@ def build_pd_system(
     return A, meta
 
 
-def build_rigid_system(model: Model, bodies: np.ndarray, dt: float) -> sp.csr_matrix:
+def build_rigid_system(model: Model, bodies: np.ndarray, dt: float) -> CsrMatrix:
     """Assemble the constant rigid-body block of the PD system matrix.
 
     Body ``bodies[k]`` owns DOFs ``6k .. 6k+5``: the translation ``chi`` and the
@@ -294,12 +283,10 @@ def build_rigid_system(model: Model, bodies: np.ndarray, dt: float) -> sp.csr_ma
         ValueError: If a body has non-positive mass or an inertia tensor that is
             not positive definite.
     """
-    import scipy.sparse as _sp
-
     bodies = np.asarray(bodies, dtype=np.int32)
     m = bodies.size
     if m == 0:
-        return _sp.csr_matrix((0, 0), dtype=np.float64)
+        return CsrMatrix.from_triplets((0, 0), [], [], [])
     mass = model.body_mass.numpy()[bodies].astype(np.float64)
     inertia = model.body_inertia.numpy()[bodies].astype(np.float64)
     bad = (mass <= 0.0) | (np.linalg.eigvalsh(inertia)[:, 0] <= 0.0)
@@ -310,25 +297,23 @@ def build_rigid_system(model: Model, bodies: np.ndarray, dt: float) -> sp.csr_ma
     blocks[:, :3, :3] = mass[:, None, None] * np.eye(3)
     blocks[:, 3:, 3:] = inertia
     blocks /= dt * dt
-    A = _sp.bsr_matrix((blocks, np.arange(m), np.arange(m + 1)), shape=(6 * m, 6 * m)).tocsr()
-    A.eliminate_zeros()
-    return A
+    body, row, col = np.nonzero(blocks)
+    return CsrMatrix.from_triplets((6 * m, 6 * m), 6 * body + row, 6 * body + col, blocks[body, row, col])
 
 
-def rigid_block_inverses(A_rigid: sp.spmatrix) -> np.ndarray:
+def rigid_block_inverses(A_rigid: CsrMatrix) -> np.ndarray:
     """Inverse of each 6x6 diagonal block of the rigid system matrix, shape [m, 6, 6].
 
     Raises:
         ValueError: If ``A_rigid`` is not block diagonal in 6x6 blocks.
     """
-    import scipy.sparse as _sp
-
-    m = A_rigid.shape[0] // 6
-    bsr = _sp.bsr_matrix(A_rigid, blocksize=(6, 6))
-    bsr.sort_indices()
-    if not (np.array_equal(bsr.indptr, np.arange(m + 1)) and np.array_equal(bsr.indices, np.arange(m))):
+    A_rigid = CsrMatrix.from_matrix(A_rigid)
+    rows, cols = A_rigid.row_of_entries(), A_rigid.indices
+    if np.any(rows // 6 != cols // 6):
         raise ValueError("The rigid system matrix must be block diagonal")
-    return np.linalg.inv(bsr.data)
+    blocks = np.zeros((A_rigid.shape[0] // 6, 6, 6))
+    blocks[rows // 6, rows % 6, cols % 6] = A_rigid.data
+    return np.linalg.inv(blocks)
 
 
 def _compute_rest_inv_from_positions(model: Model) -> np.ndarray:
@@ -611,7 +596,7 @@ def _compute_lower_inverse_column_warp(
     """Run :func:`_lower_inverse_column_kernel` on a Warp device.
 
     Lays out all inputs as Warp arrays, dispatches one thread per S column,
-    and returns ``S_values`` as a host NumPy array (consumed by SciPy CSC).
+    and returns ``S_values`` as a host NumPy array.
     """
     n = int(S_outerPtr.size - 1)
     S_nnz = int(S_outerPtr[n])
@@ -817,7 +802,7 @@ class FBALinearSolver:
         # Slots of contact rows on several particles: (particles, coefficients, CSR offsets, CSR entries).
         self._row_slots = None
 
-        # Build 1x1 BSR matrices from SciPy sparse factors.
+        # Build 1x1 BSR matrices from the sparse factors.
         self._S_bsr = _csc_to_bsr_1x1(factor.S, self.device)
         self._ST_bsr = _csc_to_bsr_1x1(factor.S, self.device, transpose=True)
         self._Dinv = wp.array(factor.Dinv.astype(np.float64), dtype=wp.float64, device=self.device)
