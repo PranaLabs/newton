@@ -1768,12 +1768,10 @@ def project_stretching_neohookean_tet_compute_kernel_lbfgs(
     :func:`project_stretching_neohookean_tet_compute_kernel`).
 
     Same scatter math as the Newton variant. The local sigma projection is the
-    RealSim-faithful LBFGS solver (:func:`project_neohookean_sigma3d_lbfgs`)
-    instead of FBA's 5-iter Newton. SVD, LBFGS, sigma projection and P
-    reconstruction all run in ``wp.float64`` -- mirroring RealSim's
-    ``signedEigenSVD`` (``SVD.cpp:7-29``) + ``mcl::optlib::LBFGS<double,3>``
-    contract. Final ``proj`` is demoted to fp32 only at the contributions
-    write boundary (``_rhs`` itself is fp32).
+    LBFGS solver (:func:`project_neohookean_sigma3d_lbfgs`) instead of the
+    5-iteration Newton solve. SVD, LBFGS, sigma projection and P
+    reconstruction all run in ``wp.float64``. Final ``proj`` is demoted to
+    fp32 only at the contributions write boundary (``_rhs`` itself is fp32).
     """
     t = wp.tid()
     mu, lam = lame[t][0], lame[t][1]
@@ -2021,20 +2019,8 @@ def project_corotational_sigma(sigma_sq: wp.vec2, mu: float, lam: float) -> wp.v
     linear system has the closed-form solution below.  Both singular
     values share the same energy-form term (symmetric trace), which is
     the standard corotational formulation in elasticity references
-    (Sifakis 2012, Bouaziz 2014, etc.).
-
-    Note - mismatch with RealSim reference:
-        RealSim's ``CorotProjectionProblem2D::energy_density`` evaluates
-        ``(x - I).trace()`` on an ``Eigen::Vector2d``; Eigen's ``trace()``
-        on a non-square matrix returns the sum over indices [0, min(rows,
-        cols)), i.e. ``x[0]`` only for a 2x1 vector - not ``x[0] + x[1]``
-        (verified empirically). RealSim therefore implements an
-        anisotropic energy that only penalises ``(sigma_0 - 1)`` in the
-        trace term. Newton's implementation here is the standard symmetric
-        formulation. Trajectory-level cross-check vs RealSim Corotational
-        is therefore expected to differ at the order of mm on stretched
-        cloth (see docs/superpowers/specs cross-check write-ups). ARAP
-        and Neo-Hookean cross-checks against RealSim agree to <10 microns.
+    (Sifakis 2012, Bouaziz 2014, etc.): the trace term sums both singular
+    values, ``tr(s-I) = (s_0-1) + (s_1-1)``.
 
     Args:
         sigma_sq: Squared singular values from ``wp.svd2(FtF)``.
@@ -2548,8 +2534,8 @@ def project_stretching_neohookean_compute_kernel_lbfgs(
     :func:`project_stretching_neohookean_compute_kernel`).
 
     Same scatter math as the Newton variant. The local sigma projection is the
-    RealSim-faithful LBFGS solver (:func:`project_neohookean_sigma2d_lbfgs`)
-    instead of FBA's 5-iter Newton. SVD inputs (singular values of F derived
+    LBFGS solver (:func:`project_neohookean_sigma2d_lbfgs`) instead of the
+    5-iteration Newton solve. SVD inputs (singular values of F derived
     from ``wp.svd2(F^T F)``) are cast fp32 -> fp64 before LBFGS; the projected
     sigma is cast back to fp32 for the P reconstruction and scatter.
     """
@@ -2646,12 +2632,11 @@ def project_bending_kernel(
 ):
     """Per-edge isometric bending scatter for PD cloth.
 
-    Matches RealSim ``PDIsometricBendingEnergy::localProjection``: for each
-    interior edge, the local step projects the current curvature vector
+    For each interior edge, the local step projects the current curvature vector
     ``q*x_cur`` onto a sphere of radius ``_norm[i] = ||q*x_rest||``, i.e. pulls
     the curvature *magnitude* back to its rest value while letting the
     direction follow ``x_cur``. This is correct on both flat and curved rest
-    cloth; the previous ``q*x_ref`` form only agreed on flat rest.
+    cloth.
 
     The local-projection target is ``ê * _norm[i]`` with
     ``ê = (q*x_cur) / ||q*x_cur||``. We scatter
@@ -2800,7 +2785,7 @@ def project_pin_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Phase 4 Stage A — contact Jacobian kernels
+# Contact Jacobian kernels
 # ---------------------------------------------------------------------------
 
 
@@ -2980,7 +2965,7 @@ def unpack_to_A_inv_Jt_3axis_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Task P — isodof-restricted Schur build primitives
+# Schur build primitives restricted to the contacted DOFs (isodofs)
 # ---------------------------------------------------------------------------
 
 
@@ -3054,10 +3039,8 @@ def compute_wi_kernel(
 
 
 # Tile sizes for the dense GEMM used by ``compute_wi_tiled_kernel``.
-# ``32 x 32 x 32`` with ``128`` threads per block was empirically fastest on
-# Demo 5 (k ~ 1200, N ~ 7000) on an RTX 5090 fp64 pipeline — see
-# ``scripts/profile_schur_w.py`` and the perf summary in
-# ``docs/superpowers/specs/2026-05-18-fba-realsim-perf-comparison.md``.
+# ``32 x 32 x 32`` with ``128`` threads per block was empirically fastest for
+# k ~ 1200 contacted DOFs among N ~ 7000 particles on an RTX 5090 in fp64.
 _WI_TILE_M = wp.constant(32)
 _WI_TILE_N = wp.constant(32)
 _WI_TILE_K = wp.constant(32)
@@ -3122,8 +3105,8 @@ def compute_wi_tiled_kernel(
     """Compute ``Wi = X^T · X`` via blocked dense GEMM where ``X = sqrt(D_inv) · S_iso``.
 
     Replaces the O(k² · nnz_col) two-pointer ``compute_wi_kernel`` with a dense
-    blocked matrix-matrix multiply.  For Demo 5 (k≈1200, N≈7000, mean S column
-    nnz ≈ 1700 — i.e. ``S`` columns are ~24% dense) the densified GEMM is
+    blocked matrix-matrix multiply. For k≈1200, N≈7000 and a mean S column
+    nnz ≈ 1700 (``S`` columns ~24% dense), the densified GEMM is
     >3x faster than the sparse intersection because the inner loop becomes a
     streamed tile-mma instead of a per-(a,b) gather over ~1700 indirected
     fp64 reads.
@@ -3262,8 +3245,8 @@ def gather_jt_lambda_kernel(
     :meth:`~newton._src.solvers.fba.linear_solver.FBALinearSolver.build_schur_complement`)
     and sums ``alpha[r] * lam[r] * dir[r]`` over them.
 
-    For Stage A (unilateral): one row per contact, ``total_rows == M``.
-    For Stage B (Coulomb): three rows per contact (n, t1, t2 — all sharing
+    Frictionless (unilateral) contacts: one row per contact, ``total_rows == M``.
+    Frictional (Coulomb) contacts: three rows per contact (n, t1, t2, all sharing
     the same particle), ``total_rows == 3*M``. Both cases use the same CSR
     layout because rows are indexed by their position in the per-row
     direction/alpha arrays.
@@ -3432,12 +3415,11 @@ def particle_constraint_direction_kernel(
 
 
 # ---------------------------------------------------------------------------
-# NSN inner LCP — Fischer-Burmeister rows + Schur build (Option C, fp64).
+# NSN inner LCP: Fischer-Burmeister rows and Schur build, in fp64.
 #
-# GPU port of RealSim's ``NonSmoothNewton::buildSchurFB`` per-row scalar
-# evaluators and the ``A_schur = ωωᵀ ⊙ W + diag(c)`` assembly. The inner
-# Schur solve runs in fp64 for parity with the CPU reference; see audit V
-# in ``docs/superpowers/plans/2026-05-17-fba-nsn-gpu-port.md``.
+# Per-row scalar evaluators of the Fischer-Burmeister functions and the
+# ``A_schur = ωωᵀ ⊙ W + diag(c)`` assembly. The inner Schur solve runs in
+# fp64, as the host reference in the tests does.
 # ---------------------------------------------------------------------------
 
 
@@ -3451,11 +3433,10 @@ def fb_unilateral_row_wp(
 ) -> wp.vec3d:
     """Fischer-Burmeister evaluation for a unilateral (normal) contact row.
 
-    GPU port of RealSim ``NonSmoothNewton.cpp:332-341`` and the CPU
-    reference ``fb_unilateral_row`` (``newton/tests/fba/_reference.py``).
-    Returns a :class:`warp.vec3d` packing ``(omega, compliance, h)`` —
-    Warp ``@wp.func`` cannot return Python tuples, so we use the fp64 vec3
-    type for the three scalars.
+    GPU version of the host reference ``fb_unilateral_row``
+    (``newton/tests/fba/_reference.py``). Returns a :class:`warp.vec3d`
+    packing ``(omega, compliance, h)``: Warp ``@wp.func`` cannot return Python
+    tuples, so the fp64 vec3 type carries the three scalars.
 
     Args:
         penetration: ``J·q - pene0`` at current iterate (m).
@@ -3493,8 +3474,8 @@ def fb_frictional_row_wp(
 ) -> wp.vec3d:
     """Fischer-Burmeister evaluation for a frictional (tangent) contact row.
 
-    GPU port of RealSim ``NonSmoothNewton.cpp:343-378`` and the CPU
-    reference ``fb_frictional_row`` (``newton/tests/fba/_reference.py``).
+    GPU version of the host reference ``fb_frictional_row``
+    (``newton/tests/fba/_reference.py``).
     Returns ``(omega, compliance, h)`` packed as :class:`warp.vec3d`.
 
     Inactive contact (``lam_n ≤ 0``): ``omega = 0``, ``compliance = 1/dt``,
@@ -3545,12 +3526,11 @@ def build_a_schur_kernel(
 ):
     """Assemble ``A_schur = ωωᵀ ⊙ W + diag(compliance)`` on GPU.
 
-    GPU port of the CPU expression in
-    ``solve_nsn_unilateral`` (``newton/tests/fba/_reference.py``)
-    (``A_schur = (omega[:, None] * omega[None, :]) * W + np.diag(compliance)``),
-    which mirrors RealSim ``NonSmoothNewton.cpp:332-341`` (unilateral) and
-    ``:343-378`` (frictional) row contributions assembled into the inner
-    Schur LHS.
+    GPU version of the host expression in
+    ``solve_nsn_unilateral`` (``newton/tests/fba/_reference.py``),
+    ``A_schur = (omega[:, None] * omega[None, :]) * W + np.diag(compliance)``,
+    which assembles the unilateral and frictional row contributions into the
+    inner Schur LHS.
 
     Launch with ``dim=(n_rows, n_rows)``.
 
@@ -3568,14 +3548,10 @@ def build_a_schur_kernel(
 
 
 # ---------------------------------------------------------------------------
-# NSN inner driver — residual, penetration, rhs, FB row launchers, box clamp.
+# NSN inner driver: residual, penetration, rhs, FB row launchers, box clamp.
 #
-# Steps 6-10 of the NSN GPU port (see
-# ``docs/superpowers/plans/2026-05-17-fba-nsn-gpu-port.md``). Each kernel is
-# a direct port of a numpy expression in
-# ``solve_nsn_unilateral`` (``newton/tests/fba/_reference.py``)
-# / ``solve_nsn_coulomb``; cross-reference RealSim
-# ``NonSmoothNewton.cpp:102-171`` for the full FB-Newton update sequence.
+# Each kernel computes a NumPy expression of ``solve_nsn_unilateral`` or
+# ``solve_nsn_coulomb`` (``newton/tests/fba/_reference.py``) on the device.
 # ---------------------------------------------------------------------------
 
 
@@ -3588,7 +3564,7 @@ def compute_contact_residual_unilateral_kernel(
     x: wp.array[wp.vec3],  # (N,) particle positions (float32)
     r: wp.array[wp.float64],  # (M,) output residual
 ):
-    """Stage A contact residual.
+    """Frictionless (unilateral) contact residual.
 
     Computes ``r[c] = offset[c] - alpha[c] * dot(normal[c], x[particle[c]])``
     one contact per thread. ``wp.dot`` on a ``vec3`` returns ``float32``; it is
@@ -3622,7 +3598,7 @@ def compute_contact_residual_coulomb_kernel(
     x: wp.array[wp.vec3],  # (N,) particle positions (float32)
     r: wp.array[wp.float64],  # (3M,) output residual
 ):
-    """Stage B contact residual.
+    """Frictional (Coulomb) contact residual.
 
     Emits ``r[3c+0/1/2] = offset_{n/t1/t2}[c] - alpha[c] * dot(axis, x[p[c]])``
     where ``axis`` is normal / t1 / t2 respectively. One contact per thread
@@ -3656,7 +3632,7 @@ def compute_precond_unilateral_kernel(
     dt: wp.float64,
     precond: wp.array[wp.float64],  # (M,) output
 ):
-    """Compute ``precond[i] = dt² · max(|W_ii|, 1e-12)`` (Stage A).
+    """Compute ``precond[i] = dt² · max(|W_ii|, 1e-12)`` (frictionless rows).
 
     GPU port of the CPU expression in
     ``solve_nsn_unilateral`` (``newton/tests/fba/_reference.py``):
@@ -3689,7 +3665,7 @@ def compute_precond_coulomb_kernel(
     dt: wp.float64,
     precond: wp.array[wp.float64],  # (3M,) output
 ):
-    """Compute Stage B preconditioner: ``dt²·W_ii`` for normal rows and
+    """Compute the frictional preconditioner: ``dt²·W_ii`` for normal rows and
     ``dt·W_ii`` for tangent rows, with ``|W_ii|`` floor of ``1e-12``.
 
     GPU port of the per-contact loop in
@@ -3748,7 +3724,7 @@ def compute_penetration_kernel(
         W: Schur complement, shape ``[n_rows, n_rows]``.
         omega: FB row weights, shape ``[n_rows]``.
         lam: Current lambda, shape ``[n_rows]``.
-        n_rows: Active row count (``M`` for Stage A, ``3M`` for Stage B).
+        n_rows: Active row count (``M`` frictionless, ``3M`` frictional).
         n_rows_pad: ``ceil(n_rows / TILE_K) * TILE_K`` — the K loop runs up
             to this so the partial last tile reduces through the same
             ``tile_sum`` path; bounds-checked ``tile_load`` zero-pads OOB.
@@ -3879,10 +3855,9 @@ def compute_frictional_fb_kernel(
     One thread per contact emits the unilateral normal row plus two
     frictional tangent rows, matching the CPU loop body in
     ``solve_nsn_coulomb`` (``newton/tests/fba/_reference.py``). The tangent rows take the
-    *current iterate* of ``lam_n`` as their companion normal lambda
-    (RealSim ``NonSmoothNewton.cpp:343-378``); this is identical to the
-    CPU reference which reads ``lam[idx_n]`` before computing the tangent
-    rows in the same iteration.
+    *current iterate* of ``lam_n`` as their companion normal lambda, as the
+    host reference does, which reads ``lam[idx_n]`` before computing the
+    tangent rows in the same iteration.
 
     Args:
         penetration: Per-row penetration, shape ``[3M]``.
@@ -4194,7 +4169,7 @@ def fb_newton_lite_coulomb_kernel(
     omega: wp.array[wp.float64],  # (3M,) inout — warm-started on entry, written on exit
     lam_apply: wp.array[wp.float64],  # (3M,) output: dt² · ω · λ_final
 ):
-    """Fused per-contact FB-Newton step for LiteNSN, Stage B (Coulomb).
+    """Fused per-contact FB-Newton step for LiteNSN with Coulomb friction.
 
     Under the lite approximation ``W = H · (dt²·M⁻¹) · Hᵀ``, contacts that touch
     distinct particles decouple completely.  For cloth-on-sphere (and all
@@ -4302,7 +4277,7 @@ def fb_newton_lite_coulomb_kernel(
         pen_t2 = -r_t2 + dt2 * Wol_t2
 
         # FB evaluation refreshes (ω, c, h) using the current λ.  The tangent
-        # rows read ``lam_n`` (companion normal) as RealSim does.
+        # rows read ``lam_n``, their companion normal multiplier.
         out_n = fb_unilateral_row_wp(pen_n, lam_n, precond_n, dt, p0_n)
         om_n = out_n[0]
         c_n = out_n[1]
@@ -4391,7 +4366,7 @@ def fb_newton_lite_coulomb_kernel(
     lam_apply[i_t2] = dt2 * om_t2 * lam_t2
 
 
-# ----- BSR + sparse-PCR helpers for LiteNSN with self-contact (Phase 3) -----
+# ----- BSR + sparse-PCR helpers for LiteNSN with self-contact -----
 
 # Module-level type alias for the 1x1 fp64 BSR block — warp can only resolve
 # matrix types when they're statically named at module scope.
@@ -4404,7 +4379,7 @@ def precond_from_bsr_diag_coulomb_kernel(
     dt: wp.float64,
     precond: wp.array[wp.float64],
 ):
-    """Compute Stage B precond (dt²·|W_ii| for normals, dt·|W_ii| for tangents)
+    """Compute the frictional precond (dt²·|W_ii| for normals, dt·|W_ii| for tangents)
     directly from a BSR diagonal.  Companion to the dense
     :func:`compute_precond_coulomb_kernel`.
 
@@ -4505,9 +4480,9 @@ def compute_omega_times_lam_kernel(
 
 
 # ===========================================================================
-# 4-slot (v-t/e-e) particle-contact kernels — Phase 1 + 2 of the v-t/e-e plan.
+# 4-slot (v-t/e-e) particle-contact kernels.
 #
-# LOCKED-B (uniform 4-slot row layout): all particle-contact rows carry
+# Uniform 4-slot row layout: all particle-contact rows carry
 # ``(pa, pb, pc, pd)`` int32 + ``(wa, wb, wc, wd)`` float32.  Sentinel
 # ``p* = -1`` (with matching ``w* = 0``) skips that slot in every consumer.
 #
@@ -4521,7 +4496,7 @@ def compute_omega_times_lam_kernel(
 # ===========================================================================
 
 
-# ----- Per-particle fused FB-Newton kernel for LiteNSN (Phase 1 of Franka plan) -----
+# ----- Per-particle fused FB-Newton kernel for LiteNSN -----
 #
 # Generalises ``fb_newton_lite_coulomb_kernel`` to handle ``k_p ∈ {1..4}``
 # contacts per particle.  Each thread processes one *unique-contacted* particle
@@ -4530,8 +4505,8 @@ def compute_omega_times_lam_kernel(
 # block-diagonal-by-particle — no BSR matrix, no SpGEMM.
 #
 # Particles with ``k_p > _MAX_KP_PER_PARTICLE`` are detected on the host side
-# and routed to the BSR + sparse-PCR path (the same one Phase 3 will use for
-# self-contact).  For the Franka cloth scene, the worst case is one cloth
+# and routed to the BSR + sparse-PCR path, which self-contact uses as well.
+# For the Franka cloth scene, the worst case is one cloth
 # vertex touching both finger pads + the table = 3, so k_max=4 leaves
 # headroom.  ``mat12`` is the largest type we materialise per thread.
 _MAX_KP_PER_PARTICLE = wp.constant(4)
@@ -4567,7 +4542,7 @@ def fb_newton_lite_coulomb_per_particle_kernel(
     omega: wp.array[wp.float64],  # (3M,) inout
     lam_apply: wp.array[wp.float64],  # (3M,) output
 ):
-    """Per-particle fused FB-Newton for LiteNSN, Stage B (Coulomb), k_p ∈ {1..4}.
+    """Per-particle fused FB-Newton for LiteNSN with Coulomb friction, k_p ∈ {1..4}.
 
     Each thread handles one unique-contacted particle ``p``.  Its ``k_p`` contact
     rows live consecutively in ``isodof_row_indices[start:end]``; each row carries
@@ -4836,18 +4811,16 @@ def coulomb_box_clamp_kernel(
     mu: wp.array[wp.float64],  # (M,)
     lam: wp.array[wp.float64],  # (3M,) inout
 ):
-    """Per-contact Coulomb signed-cone clamp on tangent lambdas.
+    """Per-contact Coulomb box clamp on tangent lambdas.
 
-    Mirrors RealSim ``NonSmoothNewton.cpp:395-403`` (friction branch) and
-    the CPU reference loop in ``solve_nsn_coulomb`` (``newton/tests/fba/_reference.py``). ``lam_n``
-    is read **signed** (per RealSim — the ``if(_lambda[cid] < 0.0)`` line
-    is explicitly commented out) so ``upper = mu·lam_n`` and
-    ``lower = -mu·lam_n`` can swap when ``lam_n < 0``. The two ``if``
-    statements per tangent must run in the exact CPU order (``> upper``
-    first, then ``< lower``) — when ``lam_n < 0`` the first clamp pulls
-    ``lam_t`` down to a negative ``upper``; the second then clamps it back
-    up to ``lower`` (positive), yielding RealSim's saturated behavior
-    rather than the degenerate ``np.clip(low > high)`` artifact.
+    As in the host loop of ``solve_nsn_coulomb`` (``newton/tests/fba/_reference.py``),
+    ``lam_n`` is read **signed**, so ``upper = mu·lam_n`` and
+    ``lower = -mu·lam_n`` swap when ``lam_n < 0``. The two ``if`` statements
+    per tangent must run in the host order (``> upper`` first, then
+    ``< lower``): when ``lam_n < 0`` the first clamp pulls ``lam_t`` down to a
+    negative ``upper``, and the second clamps it back up to ``lower``
+    (positive), a saturated value rather than the degenerate
+    ``np.clip(low > high)`` result.
 
     Args:
         mu: Per-contact friction coefficient (fp64), shape ``[M]``.
@@ -4900,9 +4873,9 @@ def compute_lam_apply_kernel(
     """Compute ``lam_apply = dt² · ω · lam`` (position-LCP correction units).
 
     See ``solve_nsn_unilateral`` (``newton/tests/fba/_reference.py``) docstring for the
-    derivation: RealSim's correction is ``Δq = dt² · A⁻¹ · Jᵀ · (ω · λ)``
-    whereas FBA's ``apply_lambda_correction_combined`` adds
-    ``A⁻¹·Jᵀ·λ_apply`` directly, so we pre-scale by ``dt²·ω`` here.
+    derivation: the correction is ``Δq = dt² · A⁻¹ · Jᵀ · (ω · λ)``, and
+    ``apply_lambda_correction_combined`` adds ``A⁻¹·Jᵀ·λ_apply`` directly, so
+    the multipliers are pre-scaled by ``dt²·ω`` here.
 
     Args:
         lam: Force-units lambda (fp64), shape ``[n_rows]``.
@@ -5005,14 +4978,11 @@ def cast_fp64_to_fp32_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Step 5.5 — _ingest_contacts per-contact bookkeeping ported to GPU.
+# Per-contact bookkeeping of ``SolverFBA._ingest_contacts`` on the device.
 #
-# CPU implementation pulled six per-contact buffers to host every step and
-# ran a Python ``for`` loop to evaluate the body transform, the normal
-# offset, and (Stage B) the tangent basis / kinematic anchor velocity.
-# These kernels move that loop on-device; only the lexsort (intentional S.1
-# for determinism) and the singleton ``soft_contact_count`` read still hit
-# the host. See ``SolverFBA._ingest_contacts``.
+# These kernels evaluate the body transform, the normal offset, and for
+# frictional contacts the tangent basis and kinematic anchor velocity of each
+# contact, after the contacts are sorted into a deterministic order.
 # ---------------------------------------------------------------------------
 
 
@@ -5256,9 +5226,8 @@ def compute_v_anchor_kernel(
     For non-spinning contacts ``v_anchor = 0``. For spinning cylinder
     shapes ``v_anchor = -omega · cross(axis_world, r_local)`` where
     ``r_local = world_anchor - shape_translation`` and ``axis_world`` is
-    the shape's local +Z direction in world frame. The leading minus
-    matches RealSim's sign convention; see comment in CPU reference
-    ``SolverFBA._ingest_contacts``.
+    the shape's local +Z direction in world frame. The leading minus makes
+    a positive ``omega`` move the anchor along ``cross(normal, axis_world)``.
 
     Args:
         is_spinning: Per-contact spinning-shape flag from
