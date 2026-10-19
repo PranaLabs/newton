@@ -394,9 +394,9 @@ class SolverFBA(SolverBase):
         # Task L: cache ``W`` and the device buffer of ``A⁻¹ · Jᵀ`` across
         # PD outer iterations within a single ``step()`` call.  Both depend
         # only on (J, A) which are constant within a step (J is set once
-        # by :meth:`update_contacts`, A is fixed unless dt or the model
+        # by :meth:`_ingest_contacts`, A is fixed unless dt or the model
         # changes).  The cache is invalidated whenever either input could
-        # change: by :meth:`update_contacts` (J change) and by
+        # change: by :meth:`_ingest_contacts` (J change) and by
         # :meth:`notify_model_changed` / :meth:`_setup_pd_system` (A change).
         # Sentinel: ``True`` once the device-resident ``W`` is up-to-date for
         # the current contact set, ``None`` otherwise.  The numpy result is
@@ -1216,7 +1216,7 @@ class SolverFBA(SolverBase):
 
         # Ingest contact data once per step (if provided).
         if contacts is not None or self._self_contact is not None:
-            self.update_contacts(contacts, state_in)
+            self._ingest_contacts(contacts, state_in)
         # Note: if contacts is None, self._contact_count retains its previous value (0 by default).
         # Call with contacts=None to keep existing behaviour; explicitly pass contacts to activate.
         # Reset contact count when contacts=None so the path stays disabled.
@@ -1227,7 +1227,7 @@ class SolverFBA(SolverBase):
         has_contacts = self._contact_count > 0
 
         # Apply kinematic anchor advancement: tangent_offset = base + dt · dot(t, v_anchor).
-        # update_contacts cached base offsets + v_anchor; the dt-dependent
+        # _ingest_contacts cached base offsets + v_anchor; the dt-dependent
         # shift is applied here on device (kernel) so the per-step
         # ``tangent1_d.numpy() / tangent2_d.numpy() / v_anchor_d.numpy()``
         # downloads no longer fire. When ω = 0 everywhere, v_anchor is
@@ -1243,7 +1243,7 @@ class SolverFBA(SolverBase):
                     self._contact_tangent1_d,
                     self._contact_tangent2_d,
                     self._contact_v_anchor_d,
-                    self._contact_tangent1_offset_d,  # base (set in update_contacts)
+                    self._contact_tangent1_offset_d,  # base (set in _ingest_contacts)
                     self._contact_tangent2_offset_d,  # base
                     wp.float64(dt),
                 ],
@@ -2063,7 +2063,7 @@ class SolverFBA(SolverBase):
         """Drop the per-step ``W`` / ``A⁻¹·Jᵀ`` cache.
 
         Called whenever either input (``J`` from
-        :meth:`update_contacts` or the Cholesky factor of ``A`` from
+        :meth:`_ingest_contacts` or the Cholesky factor of ``A`` from
         :meth:`_setup_pd_system` / :meth:`notify_model_changed`) might
         change so the next :meth:`step` rebuilds the Schur complement.
 
@@ -2099,9 +2099,9 @@ class SolverFBA(SolverBase):
         self._contact_tangent1_d = wp.empty(cap, dtype=wp.vec3, device=device)
         self._contact_tangent2_d = wp.empty(cap, dtype=wp.vec3, device=device)
         # Step 5.5: device-resident scratch buffers consumed by the
-        # ``update_contacts`` GPU kernels (world anchor, tangent offsets,
+        # ``_ingest_contacts`` GPU kernels (world anchor, tangent offsets,
         # spinning flag, v_anchor). Sized to ``cap`` once here so kernel
-        # launches in :meth:`update_contacts` never re-allocate.
+        # launches in :meth:`_ingest_contacts` never re-allocate.
         self._contact_shape_d = wp.empty(cap, dtype=wp.int32, device=device)
         self._contact_body_pos_d = wp.empty(cap, dtype=wp.vec3, device=device)
         self._contact_world_anchor_d = wp.empty(cap, dtype=wp.vec3, device=device)
@@ -2115,11 +2115,11 @@ class SolverFBA(SolverBase):
         self._contact_tangent1_offset_shifted_d = wp.empty(cap, dtype=wp.float64, device=device)
         self._contact_tangent2_offset_shifted_d = wp.empty(cap, dtype=wp.float64, device=device)
         # Per-contact friction mu, device-resident fp64. Populated in
-        # :meth:`update_contacts` to avoid the per-PD-iter host->device
+        # :meth:`_ingest_contacts` to avoid the per-PD-iter host->device
         # upload that previously fired from the Stage B NSN driver.
         self._contact_mu_d = wp.empty(cap, dtype=wp.float64, device=device)
 
-    def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
+    def _ingest_contacts(self, contacts: Contacts, state: State | None = None) -> None:
         """Ingest the active particle-vs-shape contact set for the next step.
 
         Reads the soft contact fields from ``contacts`` and builds device-side

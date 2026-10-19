@@ -3173,10 +3173,10 @@ class TestPhase4StageAContact(unittest.TestCase):
         contacts.soft_contact_shape.assign(np.array([sphere_shape, plane_shape, cylinder_shape], dtype=np.int32))
 
         solver = SolverFBA(model, iterations=1, friction=False)
-        solver.update_contacts(contacts)
+        solver._ingest_contacts(contacts)
 
         # Map our shape index back to the (post-sort) contact slot by reading
-        # the per-contact offsets off the device.  ``update_contacts``
+        # the per-contact offsets off the device.  ``_ingest_contacts``
         # lexsorts by ``(normal_z, normal_y, normal_x, shape, particle)``, so
         # with identical normals the sort is by shape index ascending.
         offsets = solver._contact_offset_d.numpy()[: solver._contact_count]
@@ -3545,7 +3545,7 @@ class TestPhase4StageCShapePrimitives(unittest.TestCase):
     """Phase 4 Stage C: verify the Schur-complement pipeline works for non-plane
     shape primitives (sphere, box) using Newton's real collision detection.
 
-    All tests drive the FULL pipeline:  collide -> update_contacts -> step.
+    All tests drive the FULL pipeline:  collide -> _ingest_contacts -> step.
     """
 
     @classmethod
@@ -3885,7 +3885,7 @@ class TestPhase4StageCShapePrimitives(unittest.TestCase):
         """
         builder = newton.ModelBuilder()
         # Sphere at (5, 0, 0) — non-origin position exercises the
-        # static-shape path in update_contacts that previously double-applied
+        # static-shape path in _ingest_contacts that previously double-applied
         # the shape_transform.
         builder.add_shape_sphere(
             body=-1,
@@ -4163,7 +4163,7 @@ class SolverFBALambdaWarmStartTests(unittest.TestCase):
     Verifies:
     1. λ is zero at step entry (per-frame setZero).
     2. After the first NSN call within a step, λ persistent is non-zero.
-    3. After update_contacts changes the set, λ persistent is reset.
+    3. After _ingest_contacts changes the set, λ persistent is reset.
     """
 
     def _cloth_on_plane_model(self):
@@ -4311,7 +4311,7 @@ class SolverFBAKinematicCylinderTests(unittest.TestCase):
             mu_per_pair_override=np.full(model.particle_count, 0.5),
             shape_angular_velocity={0: -3.0},
         )
-        # Drive one step on both so update_contacts ran on each.
+        # Drive one step on both so _ingest_contacts ran on each.
         s2 = model.state()
         solver_static.step(s_in, s_out, None, contacts, 1.0 / 60.0)
         solver_spin.step(s_in, s2, None, contacts, 1.0 / 60.0)

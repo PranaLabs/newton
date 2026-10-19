@@ -4,7 +4,7 @@
 """Tests for the GPU contact bookkeeping kernels (NSN GPU port Step 5.5).
 
 Covers the kernels that replaced the Python ``for`` loop in
-:meth:`~newton._src.solvers.fba.solver_fba.SolverFBA.update_contacts`:
+``SolverFBA._ingest_contacts``:
 
 * :func:`~newton._src.solvers.fba.kernels.compute_world_anchor_kernel`
 * :func:`~newton._src.solvers.fba.kernels.compute_normal_offset_kernel`
@@ -14,7 +14,7 @@ Covers the kernels that replaced the Python ``for`` loop in
 * :func:`~newton._src.solvers.fba.kernels.compute_v_anchor_kernel`
 
 Each kernel is exercised in isolation against a numpy reference; an
-integration test runs ``update_contacts`` end-to-end on a small cloth +
+integration test runs ``_ingest_contacts`` end-to-end on a small cloth +
 sphere model and confirms the device-side ``_contact_offset_d`` /
 ``_contact_tangent*_offset_d`` arrays match the reference computation
 that the CPU loop previously produced.
@@ -406,8 +406,8 @@ class TestComputeVAnchorKernel(unittest.TestCase):
         np.testing.assert_allclose(got, expected, atol=1e-6)
 
 
-class TestUpdateContactsIntegration(unittest.TestCase):
-    """End-to-end: ``update_contacts`` outputs match a numpy reference."""
+class TestIngestContactsIntegration(unittest.TestCase):
+    """End-to-end: ``_ingest_contacts`` outputs match a numpy reference."""
 
     @classmethod
     def setUpClass(cls):
@@ -443,7 +443,7 @@ class TestUpdateContactsIntegration(unittest.TestCase):
         )
         return builder.finalize()
 
-    def test_update_contacts_offsets_match_reference(self):
+    def test_ingest_contacts_offsets_match_reference(self):
         model = self._build_cloth_over_plane()
         solver = SolverFBA(
             model,
@@ -460,7 +460,7 @@ class TestUpdateContactsIntegration(unittest.TestCase):
         pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.5)
         contacts = pipeline.contacts()
         pipeline.collide(state, contacts)
-        solver.update_contacts(contacts, state)
+        solver._ingest_contacts(contacts, state)
 
         M = solver._contact_count
         self.assertGreater(M, 0, "expected at least one contact below the plane")
@@ -573,8 +573,8 @@ class TestComputeVAnchorFromBodyKernel(unittest.TestCase):
         np.testing.assert_allclose(v_anchor.numpy()[0], expected, atol=1e-5)
 
 
-class TestUpdateContactsMovingBody(unittest.TestCase):
-    """``update_contacts`` reads the body pose and velocity from ``state``."""
+class TestIngestContactsMovingBody(unittest.TestCase):
+    """``_ingest_contacts`` reads the body pose and velocity from ``state``."""
 
     @classmethod
     def setUpClass(cls):
@@ -622,7 +622,7 @@ class TestUpdateContactsMovingBody(unittest.TestCase):
         pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.5)
         contacts = pipeline.contacts()
         pipeline.collide(state, contacts)
-        solver.update_contacts(contacts, state)
+        solver._ingest_contacts(contacts, state)
 
         M = solver._contact_count
         self.assertGreater(M, 0, "expected contacts between the cloth and the moved sphere")

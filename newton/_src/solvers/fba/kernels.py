@@ -5030,14 +5030,14 @@ def cast_fp64_to_fp32_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Step 5.5 — update_contacts per-contact bookkeeping ported to GPU.
+# Step 5.5 — _ingest_contacts per-contact bookkeeping ported to GPU.
 #
 # CPU implementation pulled six per-contact buffers to host every step and
 # ran a Python ``for`` loop to evaluate the body transform, the normal
 # offset, and (Stage B) the tangent basis / kinematic anchor velocity.
 # These kernels move that loop on-device; only the lexsort (intentional S.1
 # for determinism) and the singleton ``soft_contact_count`` read still hit
-# the host. See :meth:`newton._src.solvers.fba.solver_fba.SolverFBA.update_contacts`.
+# the host. See ``SolverFBA._ingest_contacts``.
 # ---------------------------------------------------------------------------
 
 
@@ -5054,7 +5054,7 @@ def compute_world_anchor_kernel(
     """Promote per-contact ``body_pos`` to world frame.
 
     Matches the CPU reference in
-    :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA.update_contacts`:
+    ``SolverFBA._ingest_contacts``:
     if the contact's shape is attached to a dynamic body, transform
     ``body_pos`` through the body quaternion; otherwise pass through
     (static shapes already store world-frame anchors per the collision
@@ -5147,7 +5147,7 @@ def compute_tangent_basis_kernel(
     for the default case (pick a reference direction, cross with ``n``).
     When the contact's shape has nonzero ``shape_omega`` and a valid
     transform, switch to the cylinder-rolling-aligned basis used in
-    ``update_contacts``: ``t1 = normalize(cross(n, axis_world))``,
+    ``_ingest_contacts``: ``t1 = normalize(cross(n, axis_world))``,
     ``t2 = normalize(cross(n, t1))``. ``is_spinning_out[c]`` is set to ``1``
     only when the override succeeded - the v_anchor kernel uses that flag
     to decide whether to emit a kinematic anchor velocity.
@@ -5240,7 +5240,7 @@ def compute_v_anchor_kernel(
     ``r_local = world_anchor - shape_translation`` and ``axis_world`` is
     the shape's local +Z direction in world frame. The leading minus
     matches RealSim's sign convention; see comment in CPU reference
-    :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA.update_contacts`.
+    ``SolverFBA._ingest_contacts``.
 
     Args:
         is_spinning: Per-contact spinning-shape flag from
