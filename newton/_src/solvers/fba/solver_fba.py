@@ -681,6 +681,11 @@ class SolverFBA(SolverBase):
         self._k_tet_nh = _K.project_stretching_neohookean_tet_compute_kernel
         self._k_tet_nh_lbfgs = _K.project_stretching_neohookean_tet_compute_kernel_lbfgs
 
+    @property
+    def _contact_v_anchor_h(self) -> np.ndarray:
+        """Velocities of the contacts' anchors, read from the device, for tests and diagnostics."""
+        return self._contact_v_anchor_d.numpy()[: self._contact_count]
+
     def _read_persistent(self) -> None:
         """Read the persistent multipliers of the last step into their host mirrors, for tests and diagnostics."""
         M, self._persistent_rows = self._persistent_rows, None
@@ -2472,7 +2477,6 @@ class SolverFBA(SolverBase):
         # Stage B: tangent directions and per-contact friction mu.
         self._contact_tangent1_d = wp.empty(cap, dtype=wp.vec3, device=device)
         self._contact_tangent2_d = wp.empty(cap, dtype=wp.vec3, device=device)
-        self._contact_mu_h = np.zeros(cap, dtype=np.float64)  # host-side mu array
         # Step 5.5: device-resident scratch buffers consumed by the
         # ``update_contacts`` GPU kernels (world anchor, tangent offsets,
         # spinning flag, v_anchor). Sized to ``cap`` once here so kernel
@@ -2793,45 +2797,18 @@ class SolverFBA(SolverBase):
 
             # Host mirrors (transitional — Step 6 moves the friction
             # residual to GPU and we can drop most of these).
-            self._contact_tangent1_h = self._contact_tangent1_d.numpy()[:M].copy()
-            self._contact_tangent2_h = self._contact_tangent2_d.numpy()[:M].copy()
-            self._contact_v_anchor_h = self._contact_v_anchor_d.numpy()[:M].copy()
-            t1_offset_h = self._contact_tangent1_offset_d.numpy()[:M].copy()
-            t2_offset_h = self._contact_tangent2_offset_d.numpy()[:M].copy()
-            self._contact_tangent1_offset_h_base = t1_offset_h.copy()
-            self._contact_tangent2_offset_h_base = t2_offset_h.copy()
-            self._contact_tangent1_offset_h = t1_offset_h
-            self._contact_tangent2_offset_h = t2_offset_h
-
-            # Per-contact friction μ. RealSim uses the shape's material μ directly
-            # (no particle-side μ, no mixing) — see RealSim collision shape mu
-            # propagation. FBA previously did `sqrt(particle_mu * shape_mu)` (VBD-style
-            # mixing), which diverged from RealSim whenever a demo didn't override
-            # via mu_per_pair_override. Per Q-G2 user decision 2026-05-17, align to
-            # RealSim: shape μ directly. particle_mu kept as a fallback only when
-            # the shape has no material μ (purely a robustness path; no in-scope
-            # demo hits it).
             particle_mu = float(getattr(model, "particle_mu", 0.5))
-            mu_h = np.zeros(M, dtype=np.float64)
+            self._contact_mu_d.zero_()
             if self._mu_per_pair_override is not None:
-                for c in range(M):
-                    mu_h[c] = float(self._mu_per_pair_override[c])
+                self._contact_mu_d[:M].assign(self._mu_per_pair_override[:M])
             else:
-                shape_mat_mu = model.shape_material_mu.numpy() if hasattr(model, "shape_material_mu") else None
-                for c in range(M):
-                    s_idx = int(shape_h[c])
-                    if shape_mat_mu is not None and s_idx >= 0 and s_idx < len(shape_mat_mu):
-                        mu_h[c] = float(shape_mat_mu[s_idx])
-                    else:
-                        mu_h[c] = particle_mu
-            self._contact_mu_h = mu_h[:M]
-            # Push mu to the device-resident buffer once per contact-set
-            # update; the Stage B NSN inner driver reads from this fp64
-            # array directly, eliminating the per-PD-iter ``M*8`` byte
-            # host -> device upload.
-            mu_padded = np.zeros(self._contact_mu_d.size, dtype=np.float64)
-            mu_padded[:M] = self._contact_mu_h
-            self._contact_mu_d.assign(mu_padded)
+                from .kernels import contact_mu_kernel  # noqa: PLC0415
+
+                shape_mu = getattr(model, "shape_material_mu", None)
+                if shape_mu is None:
+                    shape_mu = wp.empty(0, dtype=wp.float32, device=device)
+                inputs = [self._contact_shape_d, shape_mu, wp.float64(particle_mu)]
+                wp.launch(contact_mu_kernel, M, inputs, [self._contact_mu_d], device=device)
 
     # ------------------------------------------------------------------
     # Phase 4 Stage A — Schur-complement NSN helpers
@@ -2865,17 +2842,19 @@ class SolverFBA(SolverBase):
         """
         M = self._contact_count
         offset = self._contact_offset_d.numpy()[:M]
+        t1s, t2s = self._contact_tangent1_d.numpy()[:M], self._contact_tangent2_d.numpy()[:M]
+        t1_offset, t2_offset = self._contact_tangent1_offset_d.numpy()[:M], self._contact_tangent2_offset_d.numpy()[:M]
         r = np.zeros(3 * M, dtype=np.float64)
         for c in range(M):
             ip = int(self._contact_particle_h[c])
             xp = x_np[ip].astype(np.float64)
             alpha = float(self._contact_alpha_h[c])
             n = self._contact_normal_h[c].astype(np.float64)
-            t1 = self._contact_tangent1_h[c].astype(np.float64)
-            t2 = self._contact_tangent2_h[c].astype(np.float64)
+            t1 = t1s[c].astype(np.float64)
+            t2 = t2s[c].astype(np.float64)
             r[3 * c + 0] = float(offset[c]) - alpha * float(np.dot(n, xp))
-            r[3 * c + 1] = float(self._contact_tangent1_offset_h[c]) - alpha * float(np.dot(t1, xp))
-            r[3 * c + 2] = float(self._contact_tangent2_offset_h[c]) - alpha * float(np.dot(t2, xp))
+            r[3 * c + 1] = float(t1_offset[c]) - alpha * float(np.dot(t1, xp))
+            r[3 * c + 2] = float(t2_offset[c]) - alpha * float(np.dot(t2, xp))
         return r
 
     def _compute_contact_residual(self, x_np: np.ndarray) -> np.ndarray:

@@ -4099,6 +4099,23 @@ def bilateral_law_kernel(
 
 
 @wp.kernel
+def contact_mu_kernel(
+    contact_shape: wp.array[wp.int32],  # (M,) shape of each contact, -1 for self contacts
+    shape_material_mu: wp.array[wp.float32],
+    particle_mu: wp.float64,
+    # output
+    mu: wp.array[wp.float64],
+):
+    """Friction coefficient of each contact: its shape's, or the particles' for contacts without a shape."""
+    c = wp.tid()
+    s = contact_shape[c]
+    if s >= 0 and s < shape_material_mu.shape[0]:
+        mu[c] = wp.float64(shape_material_mu[s])
+    else:
+        mu[c] = particle_mu
+
+
+@wp.kernel
 def lite_row_dirs_kernel(
     normal: wp.array[wp.vec3],  # (M,)
     tangent1: wp.array[wp.vec3],  # (M,), unused with one row per contact
