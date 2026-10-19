@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import functools
 import math
-import time
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Literal
@@ -260,7 +259,6 @@ class SolverFBA(SolverBase):
         use_isodof: bool = True,
         shape_angular_velocity: dict[int, float] | None = None,
         nh_solver: Literal["newton5", "lbfgs"] = "lbfgs",
-        enable_perf_timing: bool = False,
         nsn_schur_mode: Literal["full", "lite"] = "full",
         particle_contact_radius: float | None = None,
         particle_contact_margin: float = 0.04,
@@ -332,14 +330,6 @@ class SolverFBA(SolverBase):
                 legacy 5-iter fixed Newton (no line search, no convergence
                 check) for regression. Ignored unless
                 ``stretching_model="neohookean"``.
-            enable_perf_timing: If ``True``, instrument :meth:`step` with
-                per-PD-iter ``wp.synchronize_device()``-bracketed timers for
-                the local energy projection, Schur ``W`` build, linear solve,
-                and NSN inner phase. Each PD outer iter appends one entry to
-                the corresponding ``_timing_*_ms_per_iter`` list. Off by
-                default — synchronization adds ~50us overhead per call, so
-                this is opt-in for matched-granularity profiling against
-                RealSim's ``LocalGlobalSolver::printTimer`` output.
             particle_contact_ee: If ``True`` (default) and
                 ``particle_contact_mode='vt'``, run the edge-edge broadphase
                 + emit pass in addition to v-t.  Each detected pair emits a
@@ -640,17 +630,6 @@ class SolverFBA(SolverBase):
         self._particle_edge_element_d = None
         self._particle_edge_local_d = None
 
-        # Opt-in per-PD-iter perf instrumentation. Matches the granularity of
-        # RealSim's ``LocalGlobalSolver::printTimer`` (Schur, Local, Linear
-        # solve, NSN inner).  Each list grows by one entry per PD outer iter
-        # when :attr:`enable_perf_timing` is ``True``. Synchronization adds
-        # measurable overhead, so this is opt-in.
-        self.enable_perf_timing = bool(enable_perf_timing)
-        self._timing_local_ms_per_iter: list[float] = []
-        self._timing_schur_ms_per_iter: list[float] = []
-        self._timing_linear_solve_ms_per_iter: list[float] = []
-        self._timing_nsn_inner_ms_per_iter: list[float] = []
-
         # Perf #5: cache the local-phase kernel symbols on the solver so the
         # hot path avoids a per-step ``from .kernels import`` lookup.  The
         # kernels module never changes after solver construction.
@@ -684,53 +663,6 @@ class SolverFBA(SolverBase):
         elif hasattr(self, "_lam_unilateral_persistent_d"):
             self._lam_unilateral_persistent = self._lam_unilateral_persistent_d.numpy()[:M].astype(np.float64)
             self._omega_unilateral_persistent = self._omega_unilateral_persistent_d.numpy()[:M].astype(np.float64)
-
-    def reset_timing(self) -> None:
-        """Clear all per-PD-iter timing buffers.
-
-        Useful between warm-up steps and the measured window.
-        """
-        self._timing_local_ms_per_iter.clear()
-        self._timing_schur_ms_per_iter.clear()
-        self._timing_linear_solve_ms_per_iter.clear()
-        self._timing_nsn_inner_ms_per_iter.clear()
-
-    def get_timing_summary(self, last_n_steps: int | None = 50) -> dict:
-        """Return mean per-PD-iter timings over the last ``last_n_steps`` steps.
-
-        Args:
-            last_n_steps: Number of trailing PD outer iterations to include.
-                The buffer grows by :attr:`iterations` entries per ``step()``
-                call, so passing ``50`` means "last 50 steps" only if all
-                steps ran the same number of PD iters (default behaviour).
-                Pass ``None`` to average over the full history.
-
-        Returns:
-            Dict with keys ``local_ms``, ``linear_solve_ms``, ``schur_ms``,
-            ``nsn_inner_ms``, each a mean (``None`` if no samples were
-            recorded for that phase — e.g. ``schur_ms`` for contact-free
-            demos). Also includes ``n_samples`` (count of PD iters used).
-        """
-        if last_n_steps is None:
-            window = None
-        else:
-            window = int(last_n_steps) * int(self.iterations)
-
-        def _mean(buf: list[float]) -> float | None:
-            if not buf:
-                return None
-            slice_ = buf[-window:] if window is not None else buf
-            return sum(slice_) / len(slice_) if slice_ else None
-
-        return {
-            "local_ms": _mean(self._timing_local_ms_per_iter),
-            "linear_solve_ms": _mean(self._timing_linear_solve_ms_per_iter),
-            "schur_ms": _mean(self._timing_schur_ms_per_iter),
-            "nsn_inner_ms": _mean(self._timing_nsn_inner_ms_per_iter),
-            "n_samples": len(self._timing_local_ms_per_iter)
-            if window is None
-            else min(window, len(self._timing_local_ms_per_iter)),
-        }
 
     def _setup_rigid_system(self, dt: float) -> None:
         """Factor the rigid block for the dynamic bodies this solver integrates."""
@@ -1567,46 +1499,20 @@ class SolverFBA(SolverBase):
         wp.copy(self._x_cur, self._x_inertia)
 
         # 2) PD outer iterations.
-        _perf_on = self.enable_perf_timing
-
-        # Perf #5: capture the PD local-phase + linear-solve sequence into a
-        # CUDA graph once per step.  All energies/pins active here are fixed
-        # by ``_setup_pd_system`` and the buffer pointers (``_rhs``, ``_x_cur``,
-        # ``_tri_contrib_d``, ...) are stable, so a single
-        # ``wp.capture_launch`` per PD iter replaces ~25-30 individual
-        # ``wp.launch`` dispatches.  We avoid the graph when ``_perf_on``
-        # (needs per-iter ``wp.synchronize_device`` brackets).
-        _use_lg_graph = (not _perf_on) and wp.get_device(device).is_cuda
+        # Capture the PD local phase and linear solve into a CUDA graph once per step: all energies and pins
+        # are fixed by ``_setup_pd_system`` and the buffers are stable, so one ``wp.capture_launch`` per PD
+        # iteration replaces ~25-30 launches.
+        _use_lg_graph = wp.get_device(device).is_cuda
         _lg_graph = self._get_or_build_lg_iter_graph(dt) if _use_lg_graph else None
 
         for _k in range(self.iterations):
             # ---- Local phase (energy projection + RHS assembly) ----
             if _lg_graph is not None:
-                # Graph fast path replays both the local phase and the
-                # linear solve in a single ``cuGraphLaunch``.  All per-iter
-                # state is read from ``self._x_cur`` (the previous iter's
-                # result) and written through the same buffers.  Skipped
-                # when ``_perf_on`` (needs per-section syncs).
+                # The graph replays the local phase and the linear solve; per-iteration state lives in
+                # ``self._x_cur`` (the previous iteration's result) and the same buffers.
                 wp.capture_launch(_lg_graph)
             else:
-                if _perf_on:
-                    wp.synchronize_device()
-                    _t_local_0 = time.perf_counter()
-                # Separate the local projections from the linear solve so the
-                # ``_perf_on`` path can time each section independently.
-                self._run_pd_local_phase_eager(N, dt, include_linear_solve=False)
-
-                if _perf_on:
-                    wp.synchronize_device()
-                    self._timing_local_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_local_0))
-                    _t_lin_0 = time.perf_counter()
-
-                # Global linear solve: x_unc = A^-1 . rhs  (unconstrained).
-                self._linear_solver.solve(self._rhs, self._x_cur)
-
-                if _perf_on:
-                    wp.synchronize_device()
-                    self._timing_linear_solve_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_lin_0))
+                self._run_pd_local_phase_eager(N, dt)
 
             if (has_contacts or n_b) and not self._two_way:
                 # --- Schur-complement NSN contact correction ---
@@ -1620,9 +1526,6 @@ class SolverFBA(SolverBase):
                     # Task L: reuse cached W and ls._A_inv_Jt_d across PD outer
                     # iters — both depend only on (J, A), which are fixed
                     # within a step.
-                    if _perf_on:
-                        wp.synchronize_device()
-                        _t_schur_0 = time.perf_counter()
 
                     use_lite_block_diag = self.nsn_schur_mode == "lite"
                     from . import kernels as K_step  # noqa: PLC0415
@@ -1670,10 +1573,6 @@ class SolverFBA(SolverBase):
                             )
                         self._cached_W = True
                         self._cached_A_inv_Jt_valid = True
-                    if _perf_on:
-                        wp.synchronize_device()
-                        self._timing_schur_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_schur_0))
-                        _t_nsn_0 = time.perf_counter()
                     # Bottleneck #2 fix: residual + pene0 + warm-start all
                     # device-resident. The PD outer iter now does ZERO
                     # host<->device transfers around the NSN call.
@@ -1830,14 +1729,8 @@ class SolverFBA(SolverBase):
                     ls.apply_lambda_correction_combined(self._nsn_lam_apply_d, self._rhs, self._x_cur)
                     if use_lite_block_diag and self._held_rows is not None:
                         self._step_held_rows(ls, M, dt)
-                    if _perf_on:
-                        wp.synchronize_device()
-                        self._timing_nsn_inner_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_nsn_0))
                 else:
                     # Stage A: M Schur complement, unilateral (λ ≥ 0) only.
-                    if _perf_on:
-                        wp.synchronize_device()
-                        _t_schur_0 = time.perf_counter()
                     if self._cached_W is None or not self._cached_A_inv_Jt_valid:
                         # ``download=False``: see Stage B branch above — the
                         # GPU NSN driver reads ``W`` from device via
@@ -1860,10 +1753,6 @@ class SolverFBA(SolverBase):
                             )
                         self._cached_W = True
                         self._cached_A_inv_Jt_valid = True
-                    if _perf_on:
-                        wp.synchronize_device()
-                        self._timing_schur_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_schur_0))
-                        _t_nsn_0 = time.perf_counter()
                     # Bottleneck #2 fix: residual + pene0 + warm-start all
                     # device-resident.
                     self._ensure_nsn_inner_buffers(M)
@@ -1903,9 +1792,6 @@ class SolverFBA(SolverBase):
                     # RealSim in-iter combined-form correction (Task 1.3.g);
                     # see Stage B comment above re: dropped magnitude guard.
                     ls.apply_lambda_correction_combined(self._nsn_lam_apply_d, self._rhs, self._x_cur)
-                    if _perf_on:
-                        wp.synchronize_device()
-                        self._timing_nsn_inner_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_nsn_0))
             if rigid:
                 self._rigid_iteration(state_in, state_out, dt)
 
@@ -1938,7 +1824,7 @@ class SolverFBA(SolverBase):
         if has_contacts:
             self._persistent_rows = M
 
-    def _run_pd_local_phase_eager(self, N: int, dt: float, include_linear_solve: bool = True) -> None:
+    def _run_pd_local_phase_eager(self, N: int, dt: float) -> None:
         """Issue the PD local-phase launches on the active stream.
 
         Mirrors the body of one PD outer iter (RHS zero + inertia + pin +
@@ -1953,12 +1839,6 @@ class SolverFBA(SolverBase):
             N: Particle count (used for the per-particle kernel launch
                 dimensions).  Equal to ``model.particle_count``.
             dt: Timestep [s], passed into the inertia kernel.
-            include_linear_solve: When ``True`` (the default and the path
-                used inside ``wp.ScopedCapture``) the global linear solve
-                ``A^-1 . rhs`` is appended after the projections.  The
-                ``_perf_on`` path passes ``False`` so the caller can
-                bracket the local + linear sections separately for
-                per-section timing.
         """
         model = self.model
         device = self._device
@@ -2168,10 +2048,8 @@ class SolverFBA(SolverBase):
                     outputs=[self._rhs],
                     device=device,
                 )
-        if include_linear_solve:
-            # Global linear solve: x_unc = A^-1 . rhs (mirrors RealSim
-            # ``LocalGlobalSolver::globalSolve``).
-            self._linear_solver.solve(self._rhs, self._x_cur)
+        # Global linear solve: x_unc = A^-1 . rhs.
+        self._linear_solver.solve(self._rhs, self._x_cur)
 
     def _get_or_build_lg_iter_graph(self, dt: float) -> wp.Graph | None:
         """Look up (or capture lazily) the PD local-phase + linear-solve graph.
