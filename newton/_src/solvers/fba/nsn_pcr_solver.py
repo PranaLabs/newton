@@ -400,6 +400,8 @@ class NSNPCRSolver:
         self._h = wp.zeros(self.max_n, dtype=wp.float64, device=device)
         self._s = wp.zeros(self.max_n, dtype=wp.float64, device=device)
         self._precond = wp.zeros(self.max_n, dtype=wp.float64, device=device)
+        # Diagonal of the sparse matrix of :meth:`solve_sparse`.
+        self._diag = wp.zeros(self.max_n, dtype=wp.float64, device=device)
 
         # Device-resident scalars for ``rho``, ``rho_old``, ``den``, ``alpha``,
         # ``beta`` — keep the per-iter PCR coefficients on device so the inner
@@ -574,7 +576,7 @@ class NSNPCRSolver:
         W_bsr,
         b: wp.array[wp.float64],
         x_out: wp.array[wp.float64],
-    ) -> tuple[int, float]:
+    ) -> int:
         """LiteNSN sparse-Schur PCR: ``W_bsr @ x = b`` for a BSR ``W`` with
         ``1×1`` blocks.
 
@@ -583,6 +585,11 @@ class NSNPCRSolver:
         replaces the dense tiled matvec with :func:`warp.sparse.bsr_mv`.  This
         is the linear-solver entry point for ``SolverFBA(nsn_schur_mode="lite")``.
 
+        The residual is first checked after ``check_every`` iterations. When all
+        ``max_iter`` iterations fit before it, the tolerance cannot end the run
+        early, and they run without reading the device: a zero ``b`` then leaves
+        ``x = 0`` through the protected step.
+
         Args:
             W_bsr: ``BsrMatrix`` of block shape ``(1, 1)`` and scalar type
                 ``wp.float64`` (the LiteNSN Schur ``H · M⁻¹ · Hᵀ``).
@@ -590,7 +597,7 @@ class NSNPCRSolver:
             x_out: ``(n,)`` output, fp64.
 
         Returns:
-            ``(iterations_taken, final_rho)``.
+            The iterations taken.
 
         Raises:
             ValueError: when shapes are inconsistent.
@@ -603,26 +610,26 @@ class NSNPCRSolver:
         if n > self.max_n:
             raise ValueError(f"system size n={n} exceeds preallocated max_n={self.max_n}")
         if int(W_bsr.shape[0]) != n or int(W_bsr.shape[1]) != n:
-            raise ValueError(
-                f"W_bsr shape {tuple(W_bsr.shape)} incompatible with b shape ({n},)"
-            )
+            raise ValueError(f"W_bsr shape {tuple(W_bsr.shape)} incompatible with b shape ({n},)")
         if x_out.shape[0] != n:
             raise ValueError(f"x_out shape ({x_out.shape[0]},) incompatible with b shape ({n},)")
 
         device = self.device
         max_iter = min(self.max_iter, n)
+        unchecked = max_iter <= self.check_every
 
         # ----- x = 0 ----------------------------------------------------
         self._x.zero_()
 
         # ----- Early exit if b == 0 -------------------------------------
-        dot_b = float(wp.utils.array_inner(b, b, count=n))
-        if dot_b == 0.0:
-            wp.copy(x_out, self._x, count=n)
-            return (0, 0.0)
+        if not unchecked:
+            dot_b = float(wp.utils.array_inner(b, b, count=n))
+            if dot_b == 0.0:
+                wp.copy(x_out, self._x, count=n)
+                return 0
 
         # ----- Build Jacobi preconditioner from W's diagonal ------------
-        diag_blocks = wps.bsr_get_diag(W_bsr)  # array[mat1x1[float64]], length n
+        diag_blocks = wps.bsr_get_diag(W_bsr, out=self._diag)
         wp.launch(
             _precond_from_bsr_diag_kernel,
             dim=n,
@@ -641,6 +648,11 @@ class NSNPCRSolver:
         wps.bsr_mv(W_bsr, self._d[:n], self._q[:n])
         wp.utils.array_inner(self._s, self._q, out=self._rho_d, count=n)
         self._stopped_d.zero_()
+        if unchecked:
+            for _ in range(max_iter):
+                self._pcr_iter_eager(None, n, n, device, W_bsr=W_bsr, diag=diag_blocks)
+            wp.copy(x_out, self._x, count=n)
+            return max_iter
         tol_sq = self.tol * self.tol * dot_b
         r_norm_sq = dot_b
         # No CUDA-graph capture here: bsr_mv issues internal allocations on
@@ -656,9 +668,8 @@ class NSNPCRSolver:
             r_norm_sq = float(self._r_norm_d.numpy()[0])
             if self._stopped_d.numpy()[0] != 0.0:
                 break
-        rho = float(self._rho_d.numpy()[0])
         wp.copy(x_out, self._x, count=n)
-        return (nb_iter, rho)
+        return nb_iter
 
     # ------------------------------------------------------------------
     # Per-iter body + graph capture (Perf #5)
