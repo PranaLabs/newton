@@ -390,7 +390,7 @@ class SolverFBA(SolverBase):
             for s_idx, omega in shape_angular_velocity.items():
                 if 0 <= int(s_idx) < n_shapes:
                     self._shape_omega_h[int(s_idx)] = float(omega)
-        # Device mirror consumed by the Step 5.5 GPU contact kernels; the
+        # Device mirror consumed by the GPU contact kernels; the
         # host array stays the source of truth (small, rarely modified).
         self._shape_omega_d = wp.array(self._shape_omega_h, dtype=wp.float64, device=model.device)
 
@@ -409,10 +409,10 @@ class SolverFBA(SolverBase):
         self._x_cur = wp.empty(N, dtype=wp.vec3, device=device)
         self._rhs = wp.empty(N, dtype=wp.vec3, device=device)
 
-        # Phase 4 Stage A — contact state (0 = no contacts registered yet).
+        # Contact state (0 = no contacts registered yet).
         self._contact_count: int = 0
 
-        # Task L: cache ``W`` and the device buffer of ``A⁻¹ · Jᵀ`` across
+        # Cache ``W`` and the device buffer of ``A⁻¹ · Jᵀ`` across
         # PD outer iterations within a single ``step()`` call.  Both depend
         # only on (J, A) which are constant within a step (J is set once
         # by :meth:`_ingest_contacts`, A is fixed unless dt or the model
@@ -423,7 +423,7 @@ class SolverFBA(SolverBase):
         # the current contact set, ``None`` otherwise.  The numpy result is
         # no longer cached (the GPU NSN driver reads ``W`` from device via
         # :meth:`FBALinearSolver.W_device_view`); skipping the host pull is
-        # the largest single Schur-build optimization on Demo 5.
+        # the largest single Schur-build optimization on large contact sets.
         self._cached_W: bool | None = None
         # ``_A_inv_Jt_d`` itself lives on the :class:`FBALinearSolver` and
         # is reused by :meth:`~newton._src.solvers.fba.linear_solver.FBALinearSolver.apply_lambda_correction_combined`;
@@ -465,7 +465,7 @@ class SolverFBA(SolverBase):
         # PD isometric bending scatter; allocated in _setup_pd_system, reused per step.
         self._edge_contrib_d: wp.array | None = None
 
-        # Particle-centered CSR adjacency for deterministic PD reductions (Task P2-D-A).
+        # Particle-centered CSR adjacency for deterministic PD reductions.
         # Lets the PD scatter use (compute → gather) instead of atomic_add.
         self._particle_tet_offsets_d = None
         self._particle_tet_element_d = None
@@ -1139,7 +1139,7 @@ class SolverFBA(SolverBase):
                 device=device,
             )
 
-        # Particle-centered CSR adjacency for deterministic PD reductions (Task P2-D-A).
+        # Particle-centered CSR adjacency for deterministic PD reductions.
         # Lets the PD scatter use (compute → gather) instead of atomic_add.
         from .linear_solver import build_particle_element_csr  # noqa: PLC0415
 
@@ -1394,9 +1394,9 @@ class SolverFBA(SolverBase):
                     self._ensure_contact_buffers(1)
 
                 if self.friction and hasattr(self, "_contact_tangent1_d"):
-                    # Stage B: 3M Schur complement with Coulomb cone projection.
-                    # Task L: reuse cached W and ls._A_inv_Jt_d across PD outer
-                    # iters — both depend only on (J, A), which are fixed
+                    # Frictional contacts: 3M Schur complement with Coulomb cone
+                    # projection. Reuse cached W and ls._A_inv_Jt_d across PD
+                    # outer iters: both depend only on (J, A), which are fixed
                     # within a step.
 
                     use_lite_block_diag = self.nsn_schur_mode == "lite"
@@ -1411,8 +1411,9 @@ class SolverFBA(SolverBase):
                         # ``download=False``: the GPU NSN driver consumes ``W``
                         # via :meth:`FBALinearSolver.W_device_view`, so the
                         # device-to-host pull at the end of ``build_schur_complement``
-                        # is dead work — skipping it removes the dominant cost
-                        # on Demo 5 (Schur build was ~70% PCIe download time).
+                        # is dead work; skipping it removes the dominant cost on
+                        # large contact sets, where the download took ~70% of the
+                        # Schur build.
                         if use_lite_block_diag:
                             # LiteNSN block-diagonal-by-particle path: no dense
                             # W is materialized — the fused per-contact kernel
@@ -1445,9 +1446,9 @@ class SolverFBA(SolverBase):
                             )
                         self._cached_W = True
                         self._cached_A_inv_Jt_valid = True
-                    # Bottleneck #2 fix: residual + pene0 + warm-start all
-                    # device-resident. The PD outer iter now does ZERO
-                    # host<->device transfers around the NSN call.
+                    # Residual + pene0 + warm-start all device-resident: the PD
+                    # outer iter does no host<->device transfers around the NSN
+                    # call.
                     self._ensure_nsn_inner_buffers(3 * M + n_b, alloc_2d=not use_lite_block_diag)
 
                     self._launch_contact_residual(self._nsn_r_d)
@@ -1472,10 +1473,10 @@ class SolverFBA(SolverBase):
                         else:
                             cap_internal = 0.0
                             use_cap = 0
-                        # Dispatch: Phase 1 (Franka plan) per-particle kernel
-                        # whenever any particle has more than 3 contact rows
-                        # (i.e. >1 contact in Stage B, since each contact owns
-                        # 3 rows).  Otherwise stick with the per-contact
+                        # Dispatch: the per-particle kernel whenever any
+                        # particle has more than 3 contact rows (i.e. >1
+                        # frictional contact, since each contact owns 3 rows).
+                        # Otherwise stick with the per-contact
                         # kernel: it's the k_p==1 specialisation and avoids
                         # the per-particle kernel's 12x12 register footprint
                         # for what is the only common case in cloth-on-rigid.
@@ -1599,9 +1600,9 @@ class SolverFBA(SolverBase):
                     if use_lite_block_diag and self._held_rows is not None:
                         self._step_held_rows(ls, M, dt)
                 else:
-                    # Stage A: M Schur complement, unilateral (λ ≥ 0) only.
+                    # Frictionless contacts: M Schur complement, unilateral (λ ≥ 0) only.
                     if self._cached_W is None or not self._cached_A_inv_Jt_valid:
-                        # ``download=False``: see Stage B branch above — the
+                        # ``download=False``: see the frictional branch above; the
                         # GPU NSN driver reads ``W`` from device via
                         # :meth:`FBALinearSolver.W_device_view`.
                         if self.nsn_schur_mode == "lite":
@@ -1622,8 +1623,7 @@ class SolverFBA(SolverBase):
                             )
                         self._cached_W = True
                         self._cached_A_inv_Jt_valid = True
-                    # Bottleneck #2 fix: residual + pene0 + warm-start all
-                    # device-resident.
+                    # Residual + pene0 + warm-start all device-resident.
                     self._ensure_nsn_inner_buffers(M)
                     from . import kernels as K_step  # noqa: PLC0415
 
@@ -1640,7 +1640,7 @@ class SolverFBA(SolverBase):
                         outputs=[self._nsn_r_d],
                         device=device,
                     )
-                    # Stage A pene0 == contact_offset (no kinematic shift).
+                    # Frictionless pene0 == contact_offset (no kinematic shift).
                     # Reuse the device buffer directly.
                     self._solve_nsn_unilateral_gpu(
                         None,
@@ -2142,7 +2142,7 @@ class SolverFBA(SolverBase):
         self._cached_A_inv_Jt_valid = False
 
     # ------------------------------------------------------------------
-    # Phase 4 Stage A — contact state (allocated lazily on first call).
+    # Contact state (allocated lazily on first call).
     # ------------------------------------------------------------------
 
     def _ensure_contact_buffers(self, max_contacts: int) -> None:
@@ -2158,10 +2158,10 @@ class SolverFBA(SolverBase):
         self._contact_normal_d = wp.empty(cap, dtype=wp.vec3, device=device)
         self._contact_alpha_d = wp.empty(cap, dtype=wp.float32, device=device)
         self._contact_offset_d = wp.empty(cap, dtype=wp.float64, device=device)
-        # Stage B: tangent directions and per-contact friction mu.
+        # Friction: tangent directions and per-contact friction mu.
         self._contact_tangent1_d = wp.empty(cap, dtype=wp.vec3, device=device)
         self._contact_tangent2_d = wp.empty(cap, dtype=wp.vec3, device=device)
-        # Step 5.5: device-resident scratch buffers consumed by the
+        # Device-resident scratch buffers consumed by the
         # ``_ingest_contacts`` GPU kernels (world anchor, tangent offsets,
         # spinning flag, v_anchor). Sized to ``cap`` once here so kernel
         # launches in :meth:`_ingest_contacts` never re-allocate.
@@ -2173,13 +2173,13 @@ class SolverFBA(SolverBase):
         self._contact_tangent2_offset_d = wp.empty(cap, dtype=wp.float64, device=device)
         self._contact_v_anchor_d = wp.empty(cap, dtype=wp.vec3d, device=device)
         # Per-step kinematic-shifted tangent offsets (base + dt·t·v_anchor).
-        # Stage B residual + interleaved pene0 read these directly so the
-        # ``dt`` shift no longer round-trips through host arrays.
+        # The frictional residual and interleaved pene0 read these directly,
+        # so the ``dt`` shift does not round-trip through host arrays.
         self._contact_tangent1_offset_shifted_d = wp.empty(cap, dtype=wp.float64, device=device)
         self._contact_tangent2_offset_shifted_d = wp.empty(cap, dtype=wp.float64, device=device)
         # Per-contact friction mu, device-resident fp64. Populated in
-        # :meth:`_ingest_contacts` to avoid the per-PD-iter host->device
-        # upload that previously fired from the Stage B NSN driver.
+        # :meth:`_ingest_contacts`, which avoids a host->device upload in
+        # every PD iteration of the frictional NSN driver.
         self._contact_mu_d = wp.empty(cap, dtype=wp.float64, device=device)
 
     def _ingest_contacts(self, contacts: Contacts, state: State | None = None) -> None:
@@ -2189,7 +2189,7 @@ class SolverFBA(SolverBase):
         Jacobian arrays (particle index, normal, alpha, signed-distance offset)
         that the Schur-complement path inside :meth:`step` will consume.
 
-        For Stage A all contacts are particle-vs-static-shape so ``alpha = 1.0``.
+        Particle-vs-shape contacts have ``alpha = 1.0``.
         The signed-distance offset is ``dot(normal, world_anchor)`` where
         ``world_anchor`` is:
 
@@ -2219,8 +2219,8 @@ class SolverFBA(SolverBase):
             self._contact_count = 0
             return
 
-        # Pull contact data to host for the lexsort (intentional S.1
-        # for deterministic contact ordering; M is small so this is fast).
+        # Pull contact data to host for the lexsort, for a deterministic
+        # contact order (M is small so this is fast).
         # The collision pipeline writes contacts to slots assigned by
         # ``wp.atomic_add(soft_contact_count, 0, 1)`` so per-frame order
         # depends on GPU thread scheduling — downstream Gauss-Seidel and
@@ -2339,11 +2339,9 @@ class SolverFBA(SolverBase):
 
         self._ensure_contact_buffers(M)
 
-        # Step 5.5: per-contact bookkeeping (world_anchor, n·anchor offset,
-        # tangent basis, t·anchor tangent offsets, v_anchor for rolling
-        # cylinders) runs on GPU.  Only the lexsort above and the
-        # singleton ``soft_contact_count`` read still hit the host;
-        # everything else stays device-resident.
+        # Per-contact bookkeeping (world_anchor, n·anchor offset, tangent
+        # basis, t·anchor tangent offsets, v_anchor for rolling cylinders)
+        # runs on GPU.
         from .kernels import (  # noqa: PLC0415
             compute_normal_offset_kernel,
             compute_tangent_basis_kernel,
@@ -2436,7 +2434,7 @@ class SolverFBA(SolverBase):
         self._contact_alpha_h = alpha_h
         self._contact_count = M
 
-        # Stage B: tangent basis, tangent offsets, kinematic anchor velocity.
+        # Friction: tangent basis, tangent offsets, kinematic anchor velocity.
         if self.friction:
             wp.launch(
                 compute_tangent_basis_kernel,
@@ -2483,8 +2481,8 @@ class SolverFBA(SolverBase):
                 outputs=[self._contact_v_anchor_d],
                 device=device,
             )
-            # Phase 2 (Franka plan): when the contact's parent shape is attached
-            # to a moving rigid body, body-driven 6-DoF velocity supersedes the
+            # When the contact's parent shape is attached to a moving rigid
+            # body, body-driven 6-DoF velocity supersedes the
             # per-shape ``shape_angular_velocity``.  This kernel only writes
             # contacts whose ``shape_body[s] >= 0``; static-shape contacts keep
             # the value computed above by ``compute_v_anchor_kernel``.
@@ -2512,8 +2510,8 @@ class SolverFBA(SolverBase):
                     device=device,
                 )
 
-            # Host mirrors (transitional — Step 6 moves the friction
-            # residual to GPU and we can drop most of these).
+            # Per-contact friction coefficients, from the override or from
+            # the shape and particle materials.
             particle_mu = float(getattr(model, "particle_mu", 0.5))
             self._contact_mu_d.zero_()
             if self._mu_per_pair_override is not None:
@@ -2528,7 +2526,7 @@ class SolverFBA(SolverBase):
                 wp.launch(contact_mu_kernel, M, inputs, [self._contact_mu_d], device=device)
 
     # ------------------------------------------------------------------
-    # Phase 4 Stage A — Schur-complement NSN helpers
+    # Schur-complement NSN helpers
     # ------------------------------------------------------------------
 
     def _assemble_contacts_on_device(self, contacts: Contacts, state: State | None, M_raw: int) -> tuple[int, int]:
@@ -2607,9 +2605,7 @@ class SolverFBA(SolverBase):
         rows carry both ``row_particle_a`` and ``row_particle_b`` valid.
 
         This is the consumer of ``FBALinearSolver.build_schur_lite_unified``
-        and ``build_a_schur_lite_bsr``, and of ``NSNPCRSolver.solve_sparse``
-        — all three were implemented as part of the multi-env plan but only
-        now have a hot-path caller (Phase 3.3 of the Franka plan).
+        and ``build_a_schur_lite_bsr``, and of ``NSNPCRSolver.solve_sparse``.
         """
         import warp.sparse as wps  # noqa: PLC0415
 
@@ -2811,7 +2807,7 @@ class SolverFBA(SolverBase):
 
         Buffers grow with a 1.5x headroom factor so a slowly climbing contact
         count does not realloc the dense ``(cap, cap)`` matrices every frame.
-        Demo 5 contact counts can ramp by tens of contacts between frames; a
+        Contact counts can ramp by tens of contacts between frames; a
         per-frame realloc otherwise pegs the device allocator and stalls.
 
         Args:
@@ -2872,7 +2868,7 @@ class SolverFBA(SolverBase):
         skip_download: bool = False,
         m_rows: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """GPU port of ``solve_nsn_unilateral`` (``newton/tests/fba/_reference.py``) (Stage A NSN inner).
+        """GPU version of ``solve_nsn_unilateral`` (``newton/tests/fba/_reference.py``), the frictionless NSN inner.
 
         Sequence per FB-Newton iter (mirrors the CPU loop body 1:1):
 
@@ -2940,7 +2936,7 @@ class SolverFBA(SolverBase):
         self._ensure_pcr_solver(M)
 
         cap = self._nsn_inner_n
-        # Bottleneck #1 fix: when the caller supplies a device-resident W view
+        # When the caller supplies a device-resident W view
         # (the hot solver path), use it directly — the kernels read only the
         # ``[:M, :M]`` block and the FBALinearSolver._W_device_d buffer already
         # holds the freshly built ``J A^{-1} J^T``.  Otherwise fall back to the
@@ -2952,9 +2948,8 @@ class SolverFBA(SolverBase):
             W_pad[:M, :M] = W.astype(np.float64)
             self._nsn_W_d.assign(W_pad)
             W_d = self._nsn_W_d
-        # Residual / pene0: prefer device buffers when supplied — eliminates
-        # the per-PD-iter ``cap*8`` host upload that previously fired every
-        # outer iter (Demo 5: ~6000 transfers/run).
+        # Residual / pene0: prefer device buffers when supplied, which avoids
+        # a ``cap*8`` host upload in every PD outer iter.
         if r_device is not None and r_device.shape[0] >= M:
             r_d = r_device
         else:
@@ -3003,7 +2998,7 @@ class SolverFBA(SolverBase):
         n_rows_pad_w = wp.int32(((M + tile_k - 1) // tile_k) * tile_k)
         block_dim_nsn = int(K._NSN_MATVEC_BLOCK_DIM)
 
-        # Step 7-prep: precond = dt² · max(W_ii, 1e-12) (Stage A).
+        # precond = dt² · max(W_ii, 1e-12) (frictionless rows).
         wp.launch(
             K.compute_precond_unilateral_kernel,
             dim=M,
@@ -3013,7 +3008,7 @@ class SolverFBA(SolverBase):
         )
 
         for _ in range(int(max_iters)):
-            # Step 7: penetration = -r + dt²·W·(ω·λ).
+            # penetration = -r + dt²·W·(ω·λ).
             wp.launch_tiled(
                 K.compute_penetration_kernel,
                 dim=M,
@@ -3031,7 +3026,7 @@ class SolverFBA(SolverBase):
                 device=device,
             )
 
-            # Step 9 — FB rows (unilateral) overwrite omega/compliance/h.
+            # FB rows (unilateral) overwrite omega/compliance/h.
             wp.launch(
                 K.compute_unilateral_fb_kernel,
                 dim=M,
@@ -3064,7 +3059,7 @@ class SolverFBA(SolverBase):
                 device=device,
             )
 
-            # Step 8: rhs = (1/dt²) · (h - ω · J·x_corrected).
+            # rhs = (1/dt²) · (h - ω · J·x_corrected).
             wp.launch_tiled(
                 K.compute_nsn_rhs_kernel,
                 dim=M,
@@ -3161,7 +3156,7 @@ class SolverFBA(SolverBase):
         block_precond: Callable[[wp.array, wp.array], None] | None = None,
         contact_regularization: float = 0.0,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """GPU port of ``solve_nsn_coulomb`` (``newton/tests/fba/_reference.py``) (Stage B NSN inner).
+        """GPU version of ``solve_nsn_coulomb`` (``newton/tests/fba/_reference.py``), the frictional NSN inner.
 
         Identical structure to :meth:`_solve_nsn_unilateral_gpu` with row
         count ``3M`` and the frictional FB block replacing the unilateral
@@ -3236,7 +3231,7 @@ class SolverFBA(SolverBase):
         self._ensure_pcr_solver(n_rows)
         cap = self._nsn_inner_n
 
-        # Stage B mu is a separate per-contact (size-M) array.
+        # Friction mu is a separate per-contact (size-M) array.
         mu_cap = max(M, 16)
         mu_existing = getattr(self, "_nsn_mu_d", None)
         if mu_existing is None or mu_existing.size < mu_cap:
@@ -3249,9 +3244,8 @@ class SolverFBA(SolverBase):
             self._nsn_mu_d.assign(mu_h)
             mu_d = self._nsn_mu_d
 
-        # Bottleneck #1 fix: prefer the caller-supplied device W when given,
-        # eliminating the cap*cap fp64 upload that previously fired every
-        # PD outer iter.
+        # Prefer the caller-supplied device W when given, which avoids a
+        # cap*cap fp64 upload in every PD outer iter.
         if W_device is not None and W_device.shape[0] >= n_rows and W_device.shape[1] >= n_rows:
             W_d = W_device
         else:
@@ -3300,7 +3294,7 @@ class SolverFBA(SolverBase):
         n_rows_pad_w = wp.int32(((n_rows + tile_k - 1) // tile_k) * tile_k)
         block_dim_nsn = int(K._NSN_MATVEC_BLOCK_DIM)
 
-        # Stage B precond: dt²·W_ii for normal rows; dt·W_ii for tangents.
+        # Frictional precond: dt²·W_ii for normal rows; dt·W_ii for tangents.
         wp.launch(
             K.compute_precond_coulomb_kernel,
             dim=n_rows,

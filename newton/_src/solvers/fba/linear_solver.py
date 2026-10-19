@@ -680,7 +680,7 @@ def _compute_isometric_bending_q(edge_indices: np.ndarray, positions: np.ndarray
     (v0, v1) is the shared edge and (v2, v3) the opposite vertices of the two
     adjacent triangles, the per-edge bending Hessian contribution is
     ``(3 / (A0 + A1)) · q·qᵀ`` with q given by cotangents at all four
-    edge-endpoint angles. See PDIsometricBendingEnergy.cpp::init().
+    edge-endpoint angles.
 
     Implementation: fully vectorized over all edges with NumPy array math —
     no per-edge Python loop. Heron's formula and cotangent identities are
@@ -991,16 +991,16 @@ class FBALinearSolver:
     ) -> np.ndarray | None:
         """Build ``W = J · A⁻¹ · Jᵀ`` as a dense NumPy array (batched GPU implementation).
 
-        Stage A (``j_tangent1`` and ``j_tangent2`` are ``None``): emits an ``(M, M)``
+        Frictionless (``j_tangent1`` and ``j_tangent2`` are ``None``): emits an ``(M, M)``
         matrix with one row per contact (normal direction only).
 
-        Stage B (both tangent arrays provided): emits a ``(3M, 3M)`` matrix with
+        Frictional (both tangent arrays provided): emits a ``(3M, 3M)`` matrix with
         three rows per contact ordered ``[n_c, t1_c, t2_c]`` for c = 0..M-1.
         Off-diagonal coupling between contacts is fully included.
 
         Two implementations are supported:
 
-        - ``use_isodof=True`` (default, Task P): computes only the selected
+        - ``use_isodof=True`` (default): computes only the selected
             ``A^{-1}[i, j]`` entries for ``i, j`` in the unique-particle set of
             ``j_indices`` (the "isolated DOFs" / isodofs).  ``W`` is then assembled
             from ``Wi``, the per-particle direction, and the contact alpha entirely
@@ -1009,7 +1009,7 @@ class FBALinearSolver:
             need the lambda correction must use the isodof-aware
             :meth:`apply_lambda_correction_isodof` helper.
 
-        - ``use_isodof=False`` (regression / fallback): the previous Approach B
+        - ``use_isodof=False`` (regression / fallback): the
             multi-RHS solve. Computes ``A^{-1} J^T`` for all ``3 * M_rows`` columns
             and assembles ``W`` from those columns.  The ``_A_inv_Jt_d`` device
             buffer of shape ``(M_rows, N)`` is left populated and reused by
@@ -1021,7 +1021,7 @@ class FBALinearSolver:
             j_normals: World-frame contact normal per contact, shape ``[M]``, dtype vec3.
             j_alpha: Jacobian coefficient per contact, shape ``[M]``, dtype float32.
             j_tangent1: First tangent direction per contact, shape ``[M]``, dtype vec3.
-                When ``None``, Stage A behavior (M x M W).
+                When ``None``, frictionless behavior (M x M W).
             j_tangent2: Second tangent direction per contact, shape ``[M]``, dtype vec3.
                 Must be provided together with ``j_tangent1``.
             use_isodof: If ``True`` (default) use the isodof-restricted build
@@ -1031,7 +1031,7 @@ class FBALinearSolver:
                 array.  Set ``False`` from callers that consume ``W`` directly
                 on device via :meth:`W_device_view` — this skips a multi-MB
                 device-to-host copy that dominates the Schur build cost on
-                large contact sets (see Demo 5).  When ``False`` the method
+                large contact sets.  When ``False`` the method
                 returns ``None``; the device-side ``W`` remains accessible
                 through :meth:`W_device_view`.
             j_extra_indices: Optional further particles of each contact,
@@ -1046,8 +1046,8 @@ class FBALinearSolver:
             bilateral_dir: Direction of each bilateral row, shape ``[B]``, dtype vec3.
 
         Returns:
-            Dense float64 NumPy array of shape ``(M, M)`` (Stage A) or
-            ``(3M, 3M)`` (Stage B) when ``download=True``; otherwise ``None``.
+            Dense float64 NumPy array of shape ``(M, M)`` (frictionless) or
+            ``(3M, 3M)`` (frictional) when ``download=True``; otherwise ``None``.
         """
         from .kernels import (  # noqa: PLC0415
             compute_wi_tiled_kernel,
@@ -1065,8 +1065,8 @@ class FBALinearSolver:
         dev = self.device
 
         # --- Build unified per-row direction and particle arrays on device ---
-        # For Stage A: total_rows == M, each row uses normal direction.
-        # For Stage B: total_rows == 3M, rows interleaved [n_c, t1_c, t2_c].
+        # Frictionless: total_rows == M, each row uses normal direction.
+        # Frictional: total_rows == 3M, rows interleaved [n_c, t1_c, t2_c].
         # ``j_*`` arrays may be over-allocated (capacity > M); slice to active range.
         idx_np = j_indices.numpy()[:M]  # (M,) int32 — small, needed for row dir array
         n_np = j_normals.numpy()[:M]  # (M, 3) float32
@@ -1080,7 +1080,7 @@ class FBALinearSolver:
         row_dir = np.empty((total_rows, 3), dtype=np.float32)
         row_alpha = np.empty(total_rows, dtype=np.float32)
         if has_friction:
-            # Stage B: 3 rows per contact, interleaved (n, t1, t2).
+            # Frictional: 3 rows per contact, interleaved (n, t1, t2).
             row_particle[0::3] = idx_np
             row_particle[1::3] = idx_np
             row_particle[2::3] = idx_np
@@ -1129,7 +1129,7 @@ class FBALinearSolver:
         # --- Allocate/reuse W device buffer (used by both paths). ---
         # Grow with a 1.5x headroom factor so a slow contact-count climb does
         # not realloc every frame.  ``M`` can spike by 10s of contacts between
-        # frames in Demo 5 (squeezing), and a (cap, cap) dense float64 buffer
+        # frames in a squeezed soft body, and a (cap, cap) dense float64 buffer
         # is the dominant device alloc on the FBA hot path.
         if (
             not hasattr(self, "_W_device_d")
@@ -1156,7 +1156,7 @@ class FBALinearSolver:
         # Inverse mapping (particle → incident contact rows) for the
         # deterministic ``J^T·lambda`` gather in
         # :meth:`apply_lambda_correction_isodof`. Each contact row maps to
-        # exactly one particle (Stage A: 1 row/contact; Stage B: 3 rows/contact
+        # exactly one particle (frictionless: 1 row/contact; frictional: 3 rows/contact
         # all sharing one particle), so a stable-sort by particle yields a
         # CSR adjacency. Built once per contact-set update — host-side cost is
         # ``O(total_rows log total_rows)`` and ``total_rows`` is small (~1k).
@@ -1169,7 +1169,7 @@ class FBALinearSolver:
         self._isodof_row_indices_d = wp.array(order, dtype=wp.int32, device=dev)
 
         # =====================================================================
-        # Isodof-restricted path (Task P): build ``Wi`` of size (k, k) for the
+        # Isodof-restricted path: build ``Wi`` of size (k, k) for the
         # unique contacted particles, then assemble W via a 2D kernel reading
         # ``Wi[isodof_rank(p_cp), isodof_rank(p_c)]``. Skips the multi-RHS solve
         # entirely. ``_A_inv_Jt_d`` is intentionally NOT populated here — the
@@ -1297,16 +1297,16 @@ class FBALinearSolver:
         ``Wi`` is computed via blocked dense ``X^T X`` GEMM (``wp.tile_matmul``):
         densify the selected columns of ``S`` into a padded ``(N_pad, k_pad)``
         buffer with ``sqrt(D_inv)`` baked into the values, then run a tiled
-        SYRK-style matmul.  This replaces the prior two-pointer
-        ``compute_wi_kernel`` which was O(k² · nnz_col) and dominated the Schur
-        build on Demo 5 (Squeezing Ball) where ``nnz_col(S) ≈ 1700``.
+        SYRK-style matmul.  The two-pointer ``compute_wi_kernel`` is
+        O(k² · nnz_col) and dominated the Schur build of the squeezing ball
+        example, where ``nnz_col(S) ≈ 1700``.
         """
         N = self.n
         dev = self.device
 
         # --- Build isodofs (unique sorted particle indices) on host ---
-        # For Stage A: row_particle has one entry per contact.
-        # For Stage B: each contact contributes 3 identical particle entries
+        # Frictionless: row_particle has one entry per contact.
+        # Frictional: each contact contributes 3 identical particle entries
         # (n/t1/t2 share a particle), so dedup gives the same set.
         # M is small (~1000), so np.unique is cheap.
         isodofs_h = np.unique(row_particle.astype(np.int64)).astype(np.int32)
@@ -1444,7 +1444,7 @@ class FBALinearSolver:
         # Single host pull for the (total_rows x total_rows) W matrix.
         # Skipped when callers (e.g. the GPU NSN driver) consume ``W`` via
         # :meth:`W_device_view` — a multi-MB copy of a padded dense buffer
-        # otherwise dominates the Schur build on Demo 5.
+        # otherwise dominates the Schur build on large contact sets.
         if not download:
             return None
         W = self._W_device_d.numpy()[:total_rows, :total_rows].copy()
@@ -1622,7 +1622,7 @@ class FBALinearSolver:
         ``j_indices``, ``j_alpha`` and the further particles and coefficients,
         or ``None`` for them, so that they need not be read from the device.
 
-        Returns ``total_rows`` (``M`` for Stage A, ``3M`` for Stage B, plus the
+        Returns ``total_rows`` (``M`` frictionless, ``3M`` frictional, plus the
         bilateral rows).
         """
         has_friction = j_tangent1 is not None and j_tangent2 is not None
@@ -1676,7 +1676,7 @@ class FBALinearSolver:
         self._isodof_row_offsets_d = wp.array(offsets, dtype=wp.int32, device=dev)
         self._isodof_row_indices_d = wp.array(order, dtype=wp.int32, device=dev)
 
-        # Phase 1 (Franka plan): per-particle fused kernel launches one thread
+        # The per-particle fused kernel launches one thread
         # per *unique* contacted particle, not per all-particles.  Stash the
         # compact list of unique isodofs and the per-isodof contact count so
         # the kernel can index its rows directly.
@@ -1921,11 +1921,10 @@ class FBALinearSolver:
         explicitly zeroed; only entries sharing a particle take the lite
         approximation.
 
-        This is the integration point for ``SolverFBA(nsn_schur_mode="lite")``
-        single-env validation (Phase 2.4): the dense ``W_lite`` slots into the
-        existing dense-PCR NSN inner.  At larger N (Phase 3), the dense buffer
-        is the bottleneck — switch to the truly-sparse path through
-        :meth:`build_schur_lite_triplets` + ``solve_sparse`` instead.
+        The dense ``W_lite`` slots into the dense-PCR NSN inner solve of
+        ``SolverFBA(nsn_schur_mode="lite")``.  At larger N the dense buffer
+        dominates the cost; the sparse path through
+        :meth:`build_schur_lite_triplets` + ``solve_sparse`` avoids it.
 
         Side effects: populates ``_W_device_d[:total_rows, :total_rows]`` and
         ``_W_device_active_rows`` so subsequent :meth:`W_device_view` calls
@@ -2095,7 +2094,7 @@ class FBALinearSolver:
 
         Args:
             lam: Contact impulse vector, shape ``(total_rows,)``, float64.
-                ``total_rows == M`` for Stage A, ``3 * M`` for Stage B.
+                ``total_rows == M`` frictionless, ``3 * M`` frictional.
             out: Output correction, shape ``[N]``, vec3. Overwritten.
         """
         from .kernels import gather_jt_lambda_kernel  # noqa: PLC0415
@@ -2173,8 +2172,8 @@ class FBALinearSolver:
             lam: Contact impulse vector, shape ``(total_rows,)``. Accepts
                 either a host ``numpy`` array (legacy CPU path) or a
                 device-resident ``wp.array[wp.float64]`` produced by the
-                NSN inner driver. ``total_rows == M`` for Stage A,
-                ``3 * M`` for Stage B.
+                NSN inner driver. ``total_rows == M`` frictionless,
+                ``3 * M`` frictional.
             rhs_inout: Right-hand side vec3 array of length ``N`` —
                 MUTATED in place to ``rhs_inout + Jᵀ·lam``.
             x_out: Output position correction, shape ``[N]``, vec3.
