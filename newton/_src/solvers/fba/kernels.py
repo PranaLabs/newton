@@ -3539,7 +3539,7 @@ def build_a_schur_kernel(
     """Assemble ``A_schur = ωωᵀ ⊙ W + diag(compliance)`` on GPU.
 
     GPU port of the CPU expression in
-    :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA._solve_nsn_unilateral`
+    ``solve_nsn_unilateral`` (``newton/tests/fba/_reference.py``)
     (``A_schur = (omega[:, None] * omega[None, :]) * W + np.diag(compliance)``),
     which mirrors RealSim ``NonSmoothNewton.cpp:332-341`` (unilateral) and
     ``:343-378`` (frictional) row contributions assembled into the inner
@@ -3566,7 +3566,7 @@ def build_a_schur_kernel(
 # Steps 6-10 of the NSN GPU port (see
 # ``docs/superpowers/plans/2026-05-17-fba-nsn-gpu-port.md``). Each kernel is
 # a direct port of a numpy expression in
-# :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA._solve_nsn_unilateral`
+# ``solve_nsn_unilateral`` (``newton/tests/fba/_reference.py``)
 # / ``_solve_nsn_coulomb``; cross-reference RealSim
 # ``NonSmoothNewton.cpp:102-171`` for the full FB-Newton update sequence.
 # ---------------------------------------------------------------------------
@@ -3652,7 +3652,7 @@ def compute_precond_unilateral_kernel(
     """Compute ``precond[i] = dt² · max(|W_ii|, 1e-12)`` (Stage A).
 
     GPU port of the CPU expression in
-    :meth:`SolverFBA._solve_nsn_unilateral`:
+    ``solve_nsn_unilateral`` (``newton/tests/fba/_reference.py``):
     ``precond = (dt*dt) * np.where(|diag_W|>1e-12, max(diag_W, 1e-12), 1.0)``.
     Note the ``np.where`` falls through to ``1.0`` only when ``|diag_W| <=
     1e-12`` (degenerate row); otherwise we take ``max(diag_W, 1e-12)`` which
@@ -3836,7 +3836,7 @@ def compute_unilateral_fb_kernel(
     Per-row launcher that calls the existing ``@wp.func`` FB evaluator;
     one thread populates ``(omega[i], compliance[i], h[i])``. Matches the
     CPU per-row ``fb_unilateral_row(...)`` loop in
-    :meth:`SolverFBA._solve_nsn_unilateral`.
+    ``solve_nsn_unilateral`` (``newton/tests/fba/_reference.py``).
 
     Args:
         penetration: Per-row penetration ``J·q - pene0``, shape ``[M]``.
@@ -4898,7 +4898,7 @@ def compute_lam_apply_kernel(
 ):
     """Compute ``lam_apply = dt² · ω · lam`` (position-LCP correction units).
 
-    See :meth:`SolverFBA._solve_nsn_unilateral` docstring for the
+    See ``solve_nsn_unilateral`` (``newton/tests/fba/_reference.py``) docstring for the
     derivation: RealSim's correction is ``Δq = dt² · A⁻¹ · Jᵀ · (ω · λ)``
     whereas FBA's ``apply_lambda_correction_combined`` adds
     ``A⁻¹·Jᵀ·λ_apply`` directly, so we pre-scale by ``dt²·ω`` here.

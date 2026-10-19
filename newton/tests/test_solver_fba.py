@@ -3986,7 +3986,7 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
 class SolverFBAStageAStageBEquivalenceTests(unittest.TestCase):
     """Stage A (unilateral, M-row) ≡ Stage B (frictional, 3M-row) at μ=0.
 
-    Justifies keeping FBA's ``_solve_nsn_unilateral`` (which has no RealSim
+    Justifies keeping FBA's unilateral Stage A NSN (which has no RealSim
     equivalent — RealSim always uses the 3M frictional path) as a
     perf-valuable shortcut. The unit test below proves the two paths produce
     numerically identical ``λ_n`` and ``lam_apply_n`` when ``μ = 0`` so the
