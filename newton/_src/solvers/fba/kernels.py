@@ -8,30 +8,25 @@ import warp as wp
 # 3x2 matrix type (wp.mat32 is not available in Warp 1.14; use types.matrix).
 mat32 = wp.types.matrix(shape=(3, 2), dtype=wp.float32)
 
-# ---- LBFGS history types (M = 8 history slots, faithful to RealSim
-# LBFGS.hpp:36 default ``M = 8`` used by ``NHProjectionProblem2D`` /
-# ``NHProjectionProblem3D``). DIM = 2 (Tri) or 3 (Tet).
+# ---- LBFGS history types: M = 8 history slots for the Neo-Hookean singular
+# value problems, DIM = 2 (Tri) or 3 (Tet).
 _LBFGS_M = 8
 _lbfgs_mat_2xM = wp.types.matrix(shape=(2, _LBFGS_M), dtype=wp.float64)
 _lbfgs_mat_3xM = wp.types.matrix(shape=(3, _LBFGS_M), dtype=wp.float64)
 _lbfgs_vec_M = wp.types.vector(length=_LBFGS_M, dtype=wp.float64)
 
-# Locked LBFGS / line-search parameters. Faithful to RealSim defaults
-# (Minimizer.hpp:66-70, LBFGS.hpp:47, HyperelasticProblemS.h:11):
+# Fixed LBFGS / line-search parameters:
 #   max_iters = 50, ls_decrease (c_1) = 1e-4, tol = 1e-6, M = 8.
 _LBFGS_MAX_ITERS = wp.constant(50)
-_LBFGS_LS_MAX_ITERS = wp.constant(64)  # Cap RealSim's 100000 to a Warp-friendly bound.
+_LBFGS_LS_MAX_ITERS = wp.constant(64)  # Bound on the trial steps of one line search.
 _LBFGS_C1 = wp.constant(wp.float64(1.0e-4))
 _LBFGS_TOL = wp.constant(wp.float64(1.0e-6))
-# Sigma feasibility floor (RealSim PDNeohookeanTriangleEnergyParallel.h:68
-# / PDNeohookeanTetrahedronEnergyParallel.h:69 all-three-tiny clamp).
+# Sigma feasibility floor, also the value of the clamp applied when all
+# singular values are tiny.
 _NH_EPS = wp.constant(wp.float64(1.0e-6))
 # Huge-but-finite "infinity" returned by ``value()`` when sigma_i < 0 to
-# block the line search. Faithful to RealSim HyperelasticProblemS.h:39/97
-# which returns ``std::numeric_limits<float>::max() ~= 3.4e38`` rather than
-# a true +infinity. Using ``1e30`` (USER-CONFIRMED SUBSTITUTION per Q9): Warp
-# ``@wp.func`` cannot throw, and a finite ceiling avoids NaN propagation
-# on GPU floating-point ops.
+# block the line search. Warp ``@wp.func`` cannot throw, and a finite
+# ceiling avoids NaN propagation on GPU floating-point ops.
 _NH_VALUE_INF = wp.constant(wp.float64(1.0e30))
 
 
@@ -302,9 +297,8 @@ def project_arap_3x3_d(F: wp.mat33d) -> wp.mat33d:
     Lifts the SVD and reflection-handling rotation projection to ``wp.float64``
     so that ill-conditioned ``F`` (large condition number, e.g. a thin tip
     stretched far along one axis) does not lose accuracy through the fp32
-    SVD core. Mirrors RealSim's ``signedEigenSVD`` (``SVD.cpp:7-29``) which
-    runs an Eigen JacobiSVD in ``double``; the reflection branch here flips
-    column 2 of U to keep R a proper rotation.
+    SVD core. The reflection branch flips column 2 of U to keep R a proper
+    rotation.
     """
     U, _sigma, V = wp.svd3(F)
     detUV = wp.determinant(U) * wp.determinant(V)
@@ -374,10 +368,9 @@ def project_stretching_arap_tet_kernel(
     Dm_inv = tet_rest_inv[t]
     F = Ds * Dm_inv
 
-    # fp64 SVD-based rotation projection. RealSim's signedEigenSVD
-    # (SVD.cpp:7-29) runs Eigen JacobiSVD in double; we mirror that here to
-    # avoid fp32 SVD accuracy loss on ill-conditioned F (e.g. extreme tail
-    # stretching). proj is then demoted to fp32 for the rhs scatter.
+    # fp64 SVD-based rotation projection, to avoid fp32 SVD accuracy loss on
+    # ill-conditioned F (e.g. extreme tail stretching). proj is then demoted
+    # to fp32 for the rhs scatter.
     F_d = wp.mat33d(
         wp.float64(F[0, 0]),
         wp.float64(F[0, 1]),
@@ -404,7 +397,7 @@ def project_stretching_arap_tet_kernel(
     w_d = wp.float64(tet_weight[t])
     proj_d = w_d * (Dm_inv_d * wp.transpose(R_d))
 
-    # Scatter stencil (RealSim PDTetrahedronEnergy.cpp:191-194):
+    # Scatter stencil:
     #   rhs[t[0]] += -proj.row(0) - proj.row(1) - proj.row(2)
     #   rhs[t[1]] += proj.row(0)
     #   rhs[t[2]] += proj.row(1)
@@ -521,14 +514,9 @@ def project_corotational_sigma3d(sigma: wp.vec3, mu: float, lam: float) -> wp.ve
         sum_b = 6*mu + 9*lam + 2*mu*(s0[0]+s0[1]+s0[2])
         s_proj[i] = b_i/alpha - beta*sum_b / (alpha*(alpha + 3*beta))
 
-    Note: uses the standard symmetric trace formula (NOT mimicking RealSim's
-    Eigen .trace() bug on Vector2d which only reads index 0). The 2D cloth
-    Corot in this codebase uses the same standard formulation; this 3D tet
-    Corot is the natural 3D extension of the same energy.
-
-    See ``docs/superpowers/specs/2026-05-15-fba-corot-realsim-discrepancy.md``
-    for details on the RealSim Eigen .trace() discrepancy (applies to both 2D
-    cloth and 3D tet corotational).
+    Note: the trace term sums all three singular values,
+    ``tr(s-I) = (s_0-1) + (s_1-1) + (s_2-1)``. The 2D cloth Corot uses the
+    same standard formulation; this 3D tet Corot is its natural 3D extension.
 
     Args:
         sigma: Singular values from ``wp.svd3(F)``, shape (3,), in descending order.
@@ -640,9 +628,8 @@ def project_stretching_corotational_tet_kernel(
     Dm_inv = tet_rest_inv[t]
     F = Ds * Dm_inv
 
-    # fp64 SVD + sigma projection + P reconstruction. Mirrors RealSim
-    # signedEigenSVD (SVD.cpp:7-29) which runs Eigen JacobiSVD in double.
-    # Demoted to fp32 at the rhs scatter boundary only.
+    # fp64 SVD + sigma projection + P reconstruction, demoted to fp32 at the
+    # rhs scatter boundary only.
     F_d = wp.mat33d(
         wp.float64(F[0, 0]),
         wp.float64(F[0, 1]),
@@ -689,7 +676,7 @@ def project_stretching_corotational_tet_kernel(
     w_d = wp.float64(tet_weight[t])
     proj_d = w_d * (Dm_inv_d * wp.transpose(P_d))
 
-    # Scatter stencil (RealSim PDTetrahedronEnergy.cpp:191-194):
+    # Scatter stencil:
     #   rhs[t[0]] += -proj.row(0) - proj.row(1) - proj.row(2)
     #   rhs[t[1]] += proj.row(0)
     #   rhs[t[2]] += proj.row(1)
@@ -819,20 +806,17 @@ def project_stretching_corotational_tet_compute_kernel(
 
 
 # ---------------------------------------------------------------------------
-# RealSim-faithful LBFGS port for Tri/Tet Neo-Hookean local projection.
+# LBFGS for the Tri/Tet Neo-Hookean local projection.
 #
-# Mirrors RealSim's ``mcl::optlib::LBFGS<double, DIM>`` (M = 8, ``c_1 = 1e-4``,
-# tol = 1e-6, max_iters = 50, BacktrackingCubic line search) used at
-# ``PDNeohookeanTriangleEnergyParallel.h:74`` and
-# ``PDNeohookeanTetrahedronEnergyParallel.h:80``. The Tri (2D) and Tet (3D)
-# variants are kept separate (faithful to Q12) for clarity. All arithmetic
-# is in ``wp.float64`` (Q13). USER-CONFIRMED SUBSTITUTIONS (Q9):
+# L-BFGS (M = 8, ``c_1 = 1e-4``, tol = 1e-6, max_iters = 50) with a cubic
+# backtracking line search minimizes the Neo-Hookean energy of the singular
+# values plus the PD penalty. The Tri (2D) and Tet (3D) variants are kept
+# separate for clarity. All arithmetic is in ``wp.float64``. Warp functions
+# cannot throw, so:
 #   - ``nh_value_2d/3d`` returns ``1e30`` instead of ``+infinity`` for sigma_i < 0
-#     (Warp ``@wp.func`` cannot represent semantically clean +infinity without NaN
-#     risk; RealSim itself returns ``std::numeric_limits<float>::max()`` ~=
-#     3.4e38, not literal infinity).
+#     (a semantically clean +infinity risks NaN propagation);
 #   - ``nh_gradient_2d/3d`` clamps sigma_i >= 1e-6 internally instead of
-#     RealSim's ``std::runtime_error`` (Warp cannot throw).
+#     raising.
 # ---------------------------------------------------------------------------
 
 
@@ -846,9 +830,7 @@ def nh_value_2d(
 ) -> wp.float64:
     """Tri NH objective value Psi(sigma) + (k/2)||sigma-sigma_init||^2.
 
-    Mirrors ``NHProjectionProblem2D::value`` (HyperelasticProblemS.h:93-102)
-    and ``energy_density`` (HyperelasticProblemS.h:81-91). For sigma_i < 0 returns
-    a huge finite barrier ``1e30`` (substitution per Q9). For sigma_i >= 0 returns
+    For sigma_i < 0 returns the huge finite barrier ``1e30``. For sigma_i >= 0 returns
     ``(mu/2)(sigma_0^2 + sigma_1^2 - 2*log(J) - 3) + (lam/2)*log^2(J) + (k/2)||sigma-sigma_init||^2``
     with ``J = sigma_0*sigma_1``.
     """
@@ -878,12 +860,10 @@ def nh_gradient_2d(
 ) -> wp.vec2d:
     """Tri NH gradient grad Psi + k(sigma - sigma_init).
 
-    Mirrors ``NHProjectionProblem2D::gradient`` (HyperelasticProblemS.h:104-116).
     sigma_i is clamped to ``1e-6`` internally before computing ``log(J)`` and
-    ``1/sigma_i`` (Q9 substitution: RealSim throws ``runtime_error`` when J <= 0;
-    Warp cannot throw, and the LBFGS line search will reject any step where
-    ``value()`` returned the +infinity barrier so a gracefully-clamped gradient is
-    never actually consumed for an accepted step).
+    ``1/sigma_i``: Warp cannot throw, and the LBFGS line search rejects any step
+    where ``value()`` returned the +infinity barrier, so a clamped gradient is
+    never consumed for an accepted step.
     """
     s0 = wp.max(sigma[0], _NH_EPS)
     s1 = wp.max(sigma[1], _NH_EPS)
@@ -904,8 +884,8 @@ def nh_value_3d(
     lam: wp.float64,
     k: wp.float64,
 ) -> wp.float64:
-    """Tet NH objective value. Mirrors ``NHProjectionProblem3D::value``
-    (HyperelasticProblemS.h:35-44, energy at :23-33). sigma_i < 0 returns 1e30."""
+    """Tet NH objective value Psi(sigma) + (k/2)||sigma-sigma_init||^2, with
+    ``J = sigma_0*sigma_1*sigma_2``. sigma_i < 0 returns 1e30."""
     if sigma[0] < wp.float64(0.0) or sigma[1] < wp.float64(0.0) or sigma[2] < wp.float64(0.0):
         return _NH_VALUE_INF
     s0 = sigma[0]
@@ -931,8 +911,8 @@ def nh_gradient_3d(
     lam: wp.float64,
     k: wp.float64,
 ) -> wp.vec3d:
-    """Tet NH gradient. Mirrors ``NHProjectionProblem3D::gradient``
-    (HyperelasticProblemS.h:46-59). sigma_i clamped to 1e-6 inside (Q9)."""
+    """Tet NH gradient grad Psi + k(sigma - sigma_init). sigma_i is clamped to
+    1e-6 inside, as in :func:`nh_gradient_2d`."""
     s0 = wp.max(sigma[0], _NH_EPS)
     s1 = wp.max(sigma[1], _NH_EPS)
     s2 = wp.max(sigma[2], _NH_EPS)
@@ -956,7 +936,7 @@ def _cubic_step(
     fxp: wp.float64,
     alphap: wp.float64,
 ) -> wp.float64:
-    """Cubic-interpolation step length per Backtracking.hpp:129-143.
+    """Cubic-interpolation step length of the backtracking line search.
 
     Solves the 2x2 system for the cubic coefficients (r[0], r[1]) fitted to
     f(alpha), f'(alpha), f(alpha_p), f(alpha). Returns the larger root of the derived
@@ -982,7 +962,7 @@ def _cubic_step(
 
 @wp.func
 def _clamp_range(alpha: wp.float64, low: wp.float64, high: wp.float64) -> wp.float64:
-    """Backtracking.hpp:116-120 ``range`` clamp."""
+    """Clamp the trial step length to ``[low, high]``."""
     if alpha < low:
         return low
     if alpha > high:
@@ -1002,17 +982,15 @@ def _backtracking_cubic_2d(
     lam: wp.float64,
     k: wp.float64,
 ) -> wp.float64:
-    """BacktrackingCubic Armijo line search for Tri NH.
+    """Cubic backtracking Armijo line search for Tri NH.
 
-    Mirrors ``BacktrackingCubic::search`` (Backtracking.hpp:79-113). ``fx0``
-    and ``gtp = grad f(x)*p`` are passed in (already computed by the caller) --
-    RealSim recomputes them inside ``search`` but doing so wastes a gradient
-    eval per LBFGS iter (section 3.4 of the spec). Returns ``-1`` on failure (Armijo
-    not satisfied within the inner iteration cap).
+    ``fx0`` and ``gtp = grad f(x)*p`` are passed in, already computed by the
+    caller, which saves a gradient evaluation per LBFGS iteration. Returns
+    ``-1`` on failure (Armijo not satisfied within the inner iteration cap).
     """
     p_norm_sq = p[0] * p[0] + p[1] * p[1]
     if p_norm_sq <= wp.float64(0.0):
-        return _LBFGS_C1  # Matches Backtracking.hpp:43 (return decrease).
+        return _LBFGS_C1  # A zero direction returns the decrease factor.
 
     alpha = alpha0
     fxp = fx0
@@ -1026,7 +1004,7 @@ def _backtracking_cubic_2d(
             return alpha
 
         if _i == 0:
-            # First-failure: quadratic interpolation (Backtracking.hpp:99-100).
+            # First failure: quadratic interpolation.
             alpha_tmp = gtp / (wp.float64(2.0) * (fx0 + gtp - fxa))
         else:
             alpha_tmp = _cubic_step(fx0, gtp, fxa, alpha, fxp, alphap)
@@ -1050,7 +1028,7 @@ def _backtracking_cubic_3d(
     lam: wp.float64,
     k: wp.float64,
 ) -> wp.float64:
-    """Tet variant of the BacktrackingCubic Armijo line search."""
+    """Tet variant of the cubic backtracking Armijo line search."""
     p_norm_sq = p[0] * p[0] + p[1] * p[1] + p[2] * p[2]
     if p_norm_sq <= wp.float64(0.0):
         return _LBFGS_C1
@@ -1084,30 +1062,26 @@ def project_neohookean_sigma2d_lbfgs(
     mu: wp.float64,
     lam: wp.float64,
 ) -> wp.vec2d:
-    """Tri NH local projection via RealSim's LBFGS (M=8, BacktrackingCubic).
+    """Tri NH local projection by LBFGS (M=8) with a cubic backtracking line search.
 
-    Faithful port of ``mcl::optlib::LBFGS<double, 2>::minimize`` (LBFGS.hpp:52-151)
-    applied to ``NHProjectionProblem2D`` (HyperelasticProblemS.h:73-120) at
-    PDNeohookeanTriangleEnergyParallel.h:74. History is freshly zeroed per
-    call (LBFGS.hpp:53-67 -- stack-local), matching the per-element /
-    per-PD-outer-iter reset semantics. Convergence: ``||grad|| < 1e-6`` OR
-    ``||x_prev - x|| < 1e-6`` (HyperelasticProblemS.h:67-70). Returns ``sigma_init``
-    on line-search failure (RealSim's FAILURE escape).
+    Minimizes the Neo-Hookean energy of the singular values plus the PD penalty
+    ``(k/2)||sigma - sigma_init||^2``, ``k = 2 mu``. The history is stack-local
+    and starts empty in every call, so every element and PD outer iteration
+    starts afresh. Convergence: ``||grad|| < 1e-6`` OR ``||x_prev - x|| < 1e-6``.
+    Returns the current iterate on line-search failure.
     """
     k = wp.float64(2.0) * mu
 
-    # All-tiny clamp (PDNeohookeanTriangleEnergyParallel.h:68-72). Note the
-    # ``sigma_2 < 0`` flip in the Tet wrapper is *omitted* in the Tri wrapper
-    # because ``Eigen::JacobiSVD<Mat3x2>`` returns non-negative singular
-    # values natively. Our Tri caller uses ``wp.svd2(F^T F)`` which yields
-    # eigenvalues >= 0, then we take ``sqrt`` -- also non-negative.
+    # All-tiny clamp. The Tet wrapper's ``sigma_2 < 0`` flip is omitted here:
+    # the Tri caller uses ``wp.svd2(F^T F)``, which yields eigenvalues >= 0, and
+    # takes their ``sqrt``, also non-negative.
     s0 = sigma_init[0]
     s1 = sigma_init[1]
     if wp.abs(s0) < _NH_EPS and wp.abs(s1) < _NH_EPS:
         s0 = _NH_EPS
         s1 = _NH_EPS
     x = wp.vec2d(s0, s1)
-    x0 = x  # Quadratic-penalty anchor (RealSim's ``sigma0``, LBFGS.hpp:52 ``x0``).
+    x0 = x  # Quadratic-penalty anchor.
 
     # History storage: ``s`` and ``y`` columns hold history pairs (oldest in
     # col 0). ``alpha``/``rho`` are two-loop scratch. All zeroed.
@@ -1120,10 +1094,10 @@ def project_neohookean_sigma2d_lbfgs(
     gamma_k = wp.float64(1.0)
     alpha_init = wp.float64(1.0)
 
-    # ``history_count`` plays the role of ``min(M, k)`` in RealSim's loop. We
-    # use a budget counter and a fixed Python ``range`` (Warp can't
-    # mutate the loop var). Restart sets ``history_count = 0`` and decrements
-    # ``iters_remaining`` (LBFGS.hpp:105-106 ``max_iters -= k; k = 0``).
+    # ``history_count`` is ``min(M, k)`` for ``k`` iterations since the last
+    # restart. A budget counter and a fixed Python ``range`` bound the
+    # iterations across restarts (Warp can't mutate the loop var). A restart
+    # sets ``history_count = 0``; ``iters_remaining`` keeps counting down.
     history_count = int(0)
     iters_remaining = _LBFGS_MAX_ITERS
 
@@ -1135,9 +1109,9 @@ def project_neohookean_sigma2d_lbfgs(
         grad_old = grad
         q = grad
 
-        # L-BFGS first-loop recursion (LBFGS.hpp:86-92), newest -> oldest.
-        # Note: RealSim's iter = min(M, k) where ``k`` is the iteration index;
-        # since we evict on overflow, ``history_count`` is exactly that value.
+        # L-BFGS first-loop recursion, newest -> oldest, over the
+        # ``min(M, k)`` stored pairs: eviction on overflow keeps
+        # ``history_count`` at that value.
         iter_count = history_count
         if iter_count > _LBFGS_M:
             iter_count = _LBFGS_M
@@ -1156,7 +1130,7 @@ def project_neohookean_sigma2d_lbfgs(
         # Initial Hessian scaling H_0 = gamma_k * I (Nocedal-Wright "method 1").
         q = wp.vec2d(gamma_k * q[0], gamma_k * q[1])
 
-        # L-BFGS second-loop recursion (LBFGS.hpp:94-99), oldest -> newest.
+        # L-BFGS second-loop recursion, oldest -> newest.
         for i in range(_LBFGS_M):
             if i >= iter_count:
                 break
@@ -1165,7 +1139,7 @@ def project_neohookean_sigma2d_lbfgs(
             coeff = alpha_vec[i] - beta
             q = wp.vec2d(q[0] + coeff * s_hist[0, i], q[1] + coeff * s_hist[1, i])
 
-        # Non-descent restart (LBFGS.hpp:101-108).
+        # Non-descent restart.
         dir_dot = q[0] * grad[0] + q[1] * grad[1]
         restarted = False
         if dir_dot <= wp.float64(0.0):
@@ -1180,20 +1154,19 @@ def project_neohookean_sigma2d_lbfgs(
 
         # Line search on direction p = -q.
         p_search = wp.vec2d(-q[0], -q[1])
-        # fx0 = f(x); gtp = grad f(x)*p = -q*grad. RealSim recomputes the
-        # gradient inside ``BacktrackingCubic::search``; we pass it through.
+        # fx0 = f(x); gtp = grad f(x)*p = -q*grad, passed to the line search.
         fx0 = nh_value_2d(x, x0, mu, lam, k)
         gtp = grad[0] * p_search[0] + grad[1] * p_search[1]
         rate = _backtracking_cubic_2d(x, x0, p_search, fx0, gtp, alpha_init, mu, lam, k)
         if rate <= wp.float64(0.0):
-            # Linesearch failure -> RealSim returns FAILURE (LBFGS.hpp:113-114).
+            # Line-search failure: return the current iterate.
             return x
 
         x_last = x
         x = wp.vec2d(x[0] - rate * q[0], x[1] - rate * q[1])
         iters_remaining -= 1
 
-        # Convergence on grad (at x_old, pre-recompute -- faithful) OR step.
+        # Convergence on grad (at x_old, before it is recomputed) OR step.
         gn = wp.sqrt(grad[0] * grad[0] + grad[1] * grad[1])
         step = wp.vec2d(x_last[0] - x[0], x_last[1] - x[1])
         sn = wp.sqrt(step[0] * step[0] + step[1] * step[1])
@@ -1212,8 +1185,7 @@ def project_neohookean_sigma2d_lbfgs(
             y_hist[1, slot] = y_temp[1]
             history_count += 1
         else:
-            # Evict oldest, shift left, append newest at col M-1
-            # (LBFGS.hpp:131-134 non-circular buffer; semantically equivalent
+            # Evict oldest, shift left, append newest at col M-1 (equivalent
             # to a circular index with the same first/second-loop ordering).
             for j in range(_LBFGS_M - 1):
                 s_hist[0, j] = s_hist[0, j + 1]
@@ -1232,8 +1204,8 @@ def project_neohookean_sigma2d_lbfgs(
         gamma_k = sy / denom
 
         if restarted:
-            # On a restart the ``alpha_init`` was set to min(1, 1/||g||inf); the
-            # *next* iter resets to 1.0 per RealSim LBFGS.hpp:145.
+            # On a restart ``alpha_init`` was set to min(1, 1/||g||inf); the
+            # *next* iter resets it to 1.0.
             alpha_init = wp.float64(1.0)
         else:
             alpha_init = wp.float64(1.0)
@@ -1247,14 +1219,12 @@ def project_neohookean_sigma3d_lbfgs(
     mu: wp.float64,
     lam: wp.float64,
 ) -> wp.vec3d:
-    """Tet NH local projection via RealSim's LBFGS (M=8, BacktrackingCubic).
+    """Tet NH local projection by LBFGS (M=8) with a cubic backtracking line search.
 
-    Faithful port of ``mcl::optlib::LBFGS<double, 3>::minimize`` (LBFGS.hpp:52-151)
-    applied to ``NHProjectionProblem3D`` (HyperelasticProblemS.h:15-63) at
-    PDNeohookeanTetrahedronEnergyParallel.h:80. Pre-LBFGS sigma fix-up
-    mirrors PDNeohookeanTetrahedronEnergyParallel.h:69-78: all-three-tiny
-    clamp + sigma_2 sign flip. The sigma_2 flip is a no-op in practice because
-    ``wp.svd3`` returns non-negative singular values (Q10 -- surfaced).
+    As :func:`project_neohookean_sigma2d_lbfgs` with three singular values. The
+    sigma fix-up before the minimization clamps all-three-tiny singular values
+    and flips the sign of a negative sigma_2. The flip is a no-op in practice
+    because ``wp.svd3`` returns non-negative singular values.
     """
     k = wp.float64(2.0) * mu
 
@@ -1266,7 +1236,7 @@ def project_neohookean_sigma3d_lbfgs(
         s1 = _NH_EPS
         s2 = _NH_EPS
     if s2 < wp.float64(0.0):
-        s2 = -s2  # No-op for wp.svd3 outputs (>= 0), kept for parity.
+        s2 = -s2  # No-op for wp.svd3 outputs (>= 0), kept as a guard.
     x = wp.vec3d(s0, s1, s2)
     x0 = x
 
@@ -1468,8 +1438,8 @@ def project_neohookean_sigma3d(sigma: wp.vec3, mu: float, lam: float) -> wp.vec3
     E_NH(s) = (mu/2)*(I1 - 2*log(J) - 3) + (lam/2)*log(J)^2
     with I1 = s0^2 + s1^2 + s2^2, J = s0*s1*s2.
 
-    Matches RealSim NHProjectionProblem3D::energy_density (using log_I3 = 2*log(J),
-    so 0.125*lam*log_I3^2 = (lam/2)*log^2(J)). Sign verified against RealSim reference.
+    The code writes the energy with log_I3 = 2*log(J), so
+    0.125*lam*log_I3^2 = (lam/2)*log^2(J).
 
     Gradient:
         grad_i = mu*(s_i - 1/s_i) + lam*log(J)/s_i + k*(s_i - s0_i)
@@ -1611,8 +1581,8 @@ def project_stretching_neohookean_tet_kernel(
     Dm_inv = tet_rest_inv[t]
     F = Ds * Dm_inv
 
-    # fp64 SVD + 5-iter Newton + P reconstruction. Mirrors RealSim
-    # signedEigenSVD (SVD.cpp:7-29). Demoted to fp32 at the rhs scatter.
+    # fp64 SVD + 5-iter Newton + P reconstruction, demoted to fp32 at the rhs
+    # scatter.
     F_d = wp.mat33d(
         wp.float64(F[0, 0]),
         wp.float64(F[0, 1]),
