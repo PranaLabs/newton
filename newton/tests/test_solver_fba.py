@@ -4204,6 +4204,31 @@ class SolverFBALambdaWarmStartTests(unittest.TestCase):
         )
         return builder.finalize()
 
+    def test_step_carries_no_history(self) -> None:
+        """Step a state as a new solver steps it: the solver keeps no history for reset to discard.
+
+        The cloth rests on the plane after 14 steps; the contact multipliers and weights start at zero in every
+        step, in the full and the lite contact solve."""
+        from newton import CollisionPipeline  # noqa: PLC0415
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._cloth_on_plane_model()
+        pipeline = CollisionPipeline(model, soft_contact_gap=0.15)
+        contacts = pipeline.contacts()
+        for mode in ("full", "lite"):
+            solver, s0, s1 = SolverFBA(model, nsn_schur_mode=mode), model.state(), model.state()
+            for _ in range(14):
+                pipeline.collide(s0, contacts)
+                solver.step(s0, s1, None, contacts, 1.0 / 60.0)
+                s0, s1 = s1, s0
+            steps = []
+            for stepper in (solver, SolverFBA(model, nsn_schur_mode=mode)):
+                pipeline.collide(s0, contacts)
+                stepper.step(s0, s1, None, contacts, 1.0 / 60.0)
+                steps.append(s1.particle_q.numpy())
+            self.assertGreater(solver._contact_count, 0)
+            np.testing.assert_array_equal(steps[0], steps[1], err_msg=mode)
+
     def test_lam_persistent_initially_none(self) -> None:
         from newton.solvers import SolverFBA  # noqa: PLC0415
 

@@ -48,6 +48,11 @@ class SolverFBA(SolverBase):
         attributes may change without the normal deprecation period. It
         simulates models with one world.
 
+    A step depends only on its input state, contacts and control, and on the
+    pin targets and particle constraints last set: the contact multipliers
+    and weights start at zero in every step, so the solver keeps no history
+    for :meth:`reset` to discard.
+
     Implements a Projective Dynamics (PD) local-global iteration for cloth
     with isotropic stretching (ARAP or corotational), isometric bending,
     and soft Pin constraints. The PD Hessian is prefactored once (nested dissection
@@ -1260,10 +1265,7 @@ class SolverFBA(SolverBase):
                 device=self._device,
             )
 
-        # RealSim parity: λ = 0 once per step (per frame), then accumulates
-        # across the PD outer iters below. ω carries the previous step's
-        # weighting so iter-0 of the next call can compute penetration at the
-        # already-corrected position.
+        # λ and ω start at zero in every step, then carry across its PD outer iterations below.
         M = self._contact_count
         n_b = 0 if self._constraint_rows is None else self._constraint_rows[0].shape[0]
         if M > 0 or n_b:
