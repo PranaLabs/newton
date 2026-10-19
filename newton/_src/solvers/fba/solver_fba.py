@@ -494,6 +494,8 @@ class SolverFBA(SolverBase):
         self._constraint_rows = None  # set_particle_constraints: particles, coefficients, directions, targets
         self._constraint_lengths = False  # the rows hold |sum_k c_k x_k|, along its direction at each iteration
         self._self_contact, self._lite_slot_rows, self._held_rows = None, None, None
+        # Graph of the step's sparse lite NSN, False when its capture failed.
+        self._lite_nsn_graph = None
         if particle_enable_self_contact:
             if not self.friction or not self.use_isodof or mu_per_pair_override is not None:
                 raise ValueError("self contact needs friction=True, use_isodof=True and no mu_per_pair_override")
@@ -1664,6 +1666,7 @@ class SolverFBA(SolverBase):
                                 **self._contact_extra_args(),
                             )
                             self._lite_slot_rows = None if self._contact_extra is None else self._slot_rows(M, ls, n_b)
+                            self._lite_nsn_graph = None
                         else:
                             ls.build_schur_complement(
                                 M,
@@ -1719,7 +1722,8 @@ class SolverFBA(SolverBase):
                         if self._lite_slot_rows is not None:
                             # Rows on several particles couple them: the sparse lite NSN.
                             (pa, pb, pc, pd), (wa, wb, wc, wd), ones, W_bsr, held_d = self._lite_slot_rows
-                            self._solve_nsn_coulomb_lite_bsr(
+                            nsn = functools.partial(
+                                self._solve_nsn_coulomb_lite_bsr,
                                 M_total=M,
                                 row_particle_a_d=pa,
                                 row_particle_b_d=pb,
@@ -1747,6 +1751,7 @@ class SolverFBA(SolverBase):
                                 n_bilateral=n_b,
                                 held_d=held_d,
                             )
+                            self._launch_lite_nsn(nsn, _use_lg_graph)
                         elif use_per_particle:
                             wp.launch(
                                 K_step.fb_newton_lite_coulomb_per_particle_kernel,
@@ -2398,6 +2403,11 @@ class SolverFBA(SolverBase):
         slots = {f"row_particle_{c}_d": particles[i] for i, c in ((2, "c"), (3, "d"))}
         slots |= {f"row_w{c}_d": weights[i] for i, c in enumerate("abcd")}
         W = ls.build_schur_lite_unified(3 * M + n_b, particles[0], particles[1], ls._row_dir_d, ones, **slots)
+        if W is not None:
+            # The NSN's graph captures its buffers: they take their sizes for the step here.
+            n = 3 * M + n_b
+            self._ensure_lite_bsr_buffers(n)
+            ls.build_a_schur_lite_bsr(W, self._bsr_omega[:n], self._bsr_compliance[:n])
         return particles, weights, ones, W, held_d
 
     def _lite_constraint_rows(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -3788,42 +3798,7 @@ class SolverFBA(SolverBase):
             # Nothing to solve.
             return
 
-        # PCR solver capacity check.
-        self._ensure_pcr_solver(n_rows)
-
-        # ---- Per-row scratch (1D fp64, sized to upper bound once).
-        # Resizing mid-run risks use-after-free under in-flight kernels.
-        if not hasattr(self, "_bsr_omega_lam"):
-            cap = max(n_rows, 48)
-            # Honor an explicit upper bound from the self-contact path if set.
-            cap = max(cap, getattr(self, "_particle_contact_buf_cap", 0))
-            self._bsr_buf_cap = cap
-            self._bsr_omega_lam = wp.zeros(cap, dtype=wp.float64, device=device)
-            self._bsr_w_omega_lam = wp.zeros(cap, dtype=wp.float64, device=device)
-            self._bsr_penetration = wp.zeros(cap, dtype=wp.float64, device=device)
-            self._bsr_compliance = wp.zeros(cap, dtype=wp.float64, device=device)
-            self._bsr_h = wp.zeros(cap, dtype=wp.float64, device=device)
-            self._bsr_rhs = wp.zeros(cap, dtype=wp.float64, device=device)
-            self._bsr_dlam = wp.zeros(cap, dtype=wp.float64, device=device)
-            self._bsr_precond = wp.zeros(cap, dtype=wp.float64, device=device)
-            self._bsr_lam = wp.zeros(cap, dtype=wp.float64, device=device)
-            self._bsr_omega = wp.zeros(cap, dtype=wp.float64, device=device)
-        elif self._bsr_omega_lam.size < n_rows:
-            # Grow with 1.5x headroom to avoid frequent reallocation when the
-            # contact count ramps up gradually (e.g. v-t broadphase warming).
-            new_cap = max(int(n_rows * 1.5), int(self._bsr_omega_lam.size) * 2)
-            new_cap = max(new_cap, getattr(self, "_particle_contact_buf_cap", 0))
-            self._bsr_buf_cap = new_cap
-            self._bsr_omega_lam = wp.zeros(new_cap, dtype=wp.float64, device=device)
-            self._bsr_w_omega_lam = wp.zeros(new_cap, dtype=wp.float64, device=device)
-            self._bsr_penetration = wp.zeros(new_cap, dtype=wp.float64, device=device)
-            self._bsr_compliance = wp.zeros(new_cap, dtype=wp.float64, device=device)
-            self._bsr_h = wp.zeros(new_cap, dtype=wp.float64, device=device)
-            self._bsr_rhs = wp.zeros(new_cap, dtype=wp.float64, device=device)
-            self._bsr_dlam = wp.zeros(new_cap, dtype=wp.float64, device=device)
-            self._bsr_precond = wp.zeros(new_cap, dtype=wp.float64, device=device)
-            self._bsr_lam = wp.zeros(new_cap, dtype=wp.float64, device=device)
-            self._bsr_omega = wp.zeros(new_cap, dtype=wp.float64, device=device)
+        self._ensure_lite_bsr_buffers(n_rows)
 
         # Warm-start λ, ω from the persistent buffers.
         wp.copy(self._bsr_lam, lam_init_d, count=n_rows)
@@ -3844,7 +3819,7 @@ class SolverFBA(SolverBase):
         dlam_v = self._bsr_dlam[:n_rows]
 
         # Precond per row from W's diagonal.
-        W_diag = wps.bsr_get_diag(W_bsr)
+        W_diag = wps.bsr_get_diag(W_bsr, out=self._bsr_w_diag)
         wp.launch(
             K.precond_from_bsr_diag_coulomb_kernel,
             dim=n_rows,
@@ -3943,6 +3918,37 @@ class SolverFBA(SolverBase):
         )
         wp.copy(lam_out_d, self._bsr_lam, count=n_rows)
         wp.copy(omega_out_d, self._bsr_omega, count=n_rows)
+
+    def _ensure_lite_bsr_buffers(self, n_rows: int) -> None:
+        """Size the PCR solver and the per-row scratch of the sparse lite NSN for ``n_rows`` rows, with headroom.
+        Resizing mid-run risks use-after-free under in-flight kernels."""
+        self._ensure_pcr_solver(n_rows)
+        size = self._bsr_lam.size if hasattr(self, "_bsr_lam") else 0
+        if size >= n_rows:
+            return
+        # Grow with 1.5x headroom so a contact count that ramps up does not reallocate every step.
+        cap = max(n_rows, 48) if size == 0 else max(int(n_rows * 1.5), 2 * size)
+        cap = max(cap, self._particle_contact_buf_cap)
+        for name in "omega_lam w_omega_lam penetration compliance h rhs dlam precond lam omega w_diag".split():
+            setattr(self, f"_bsr_{name}", wp.zeros(cap, dtype=wp.float64, device=self._device))
+
+    def _launch_lite_nsn(self, nsn: Callable[[], None], use_graph: bool) -> None:
+        """Run ``nsn``, a step of the sparse lite NSN. Its matrices and buffers hold for the time step, so its
+        launches are captured in a graph at the first local-global iteration and replayed at all of them, when
+        its linear solve runs a fixed count of iterations without reading the device."""
+        pcr = self._pcr_solver
+        use_graph = use_graph and pcr.max_iter <= pcr.check_every
+        if use_graph and self._lite_nsn_graph is None:
+            try:
+                with wp.ScopedCapture(device=self._device) as capture:
+                    nsn()
+                self._lite_nsn_graph = capture.graph
+            except Exception:
+                self._lite_nsn_graph = False
+        if use_graph and self._lite_nsn_graph:
+            wp.capture_launch(self._lite_nsn_graph)
+        else:
+            nsn()
 
     def _ensure_pcr_solver(self, max_n: int) -> None:
         """Lazily create / resize the NSN-Schur PCR solver."""
