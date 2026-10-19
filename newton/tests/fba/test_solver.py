@@ -2220,6 +2220,44 @@ class TestDynamicPin(unittest.TestCase):
             s0, s1 = s1, s0
         np.testing.assert_allclose(s0.particle_q.numpy(), x0, atol=1.0e-6)
 
+    def test_inactive_particles_hold_their_state(self):
+        """Hold particles with mass but without the ACTIVE flag where the input state has them, as Newton's
+        integrators do; particles with zero mass keep following their pin targets (see test_pin_follows_target)."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0, 1.0, 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=5000.0,
+            edge_ke=0.1,
+        )
+        model = builder.finalize()
+        top = [20, 24]  # the corners of the top row
+        flags = model.particle_flags.numpy()
+        flags[top] &= ~int(newton.ParticleFlags.ACTIVE)
+        model.particle_flags.assign(flags)
+        solver = SolverFBA(model, iterations=5)
+        s0, s1 = model.state(), model.state()
+        x0 = s0.particle_q.numpy()
+        for step in range(30):
+            if step == 15:  # move a held corner by writing the state
+                q = s0.particle_q.numpy()
+                self.assertLess(q[12, 1], x0[12, 1] - 1.0e-4, "the cloth does not hang from its corners")
+                q[24, 2] += 0.1
+                s0.particle_q.assign(q)
+                moved = q[24].copy()
+            solver.step(s0, s1, None, None, 1.0 / 60.0)
+            s0, s1 = s1, s0
+        q = s0.particle_q.numpy()
+        np.testing.assert_array_equal(q[20], x0[20])
+        np.testing.assert_array_equal(q[24], moved)
+        np.testing.assert_array_equal(s0.particle_qd.numpy()[top], 0.0)
+
 
 class TestTetHessianAssembly(unittest.TestCase):
     """Verify tet Hessian block assembly in build_pd_system."""

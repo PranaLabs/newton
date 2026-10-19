@@ -11,6 +11,7 @@ from typing import Literal
 import numpy as np
 import warp as wp
 
+from ...geometry import ParticleFlags
 from ...sim import BodyFlags, Contacts, Control, Model, ModelFlags, State
 from ..solver import SolverBase
 from .cable import Cable
@@ -451,7 +452,7 @@ class SolverFBA(SolverBase):
         self._edge_quad_q_d = None
         self._edge_weight_d = None
         self._edge_norm_d = None
-        self._pin_indices_d = None
+        self._pin_indices_d = self._inactive_d = None
 
         # Tet device data (filled by _setup_pd_system).
         self._tet_indices_d = None
@@ -1046,14 +1047,19 @@ class SolverFBA(SolverBase):
         fs = factorize_and_sparse_inverse(A, self.model.particle_q.numpy())
         self._linear_solver = FBALinearSolver(fs, device=self._device)
         device = self._device
-        # Particles with zero inverse mass hold at their pin targets: a mass they keep must not pull them toward
-        # their inertial predictions.
-        mass = particle_masses(self.model)[0]
+        # Particles with zero inverse mass hold at their pin targets, so a mass they keep must not pull them toward
+        # their inertial predictions; inactive ones with mass hold where the input state has them, as Newton's
+        # integrators hold inactive particles.
+        mass, inv_mass = particle_masses(self.model)
         self._mass_d = wp.array(mass.astype(np.float32), dtype=wp.float32, device=device)
+        self._inv_mass_d = wp.array(inv_mass.astype(np.float32), dtype=wp.float32, device=device)
+        inactive = (self.model.particle_flags.numpy() & int(ParticleFlags.ACTIVE)) == 0
+        inactive = np.flatnonzero(inactive & (self.model.particle_inv_mass.numpy() > 0.0))
+        self._inactive_d = wp.array(inactive.astype(np.int32), dtype=wp.int32, device=device) if inactive.size else None
         # LiteNSN dense kernel + sparse BSR pipeline both consume the lite mass
         # matrix; build it once here so the per-step Schur dispatch is allocation-free.
         if self.nsn_schur_mode == "lite":
-            self._linear_solver.setup_lite_mass(self.model.particle_inv_mass, dt)
+            self._linear_solver.setup_lite_mass(self._inv_mass_d, dt)
         self._meta = meta
         self._dt_setup = dt
         # A changed → any cached W / A^{-1} J^T is stale.
@@ -1230,6 +1236,7 @@ class SolverFBA(SolverBase):
         """
         from .kernels import (  # noqa: PLC0415
             compute_inertial_kernel,
+            copy_particles_kernel,
             write_velocity_kernel,
         )
 
@@ -1344,6 +1351,10 @@ class SolverFBA(SolverBase):
         if rigid:
             self._begin_rigid_contacts(contacts)
 
+        if self._inactive_d is not None:
+            inputs = [self._inactive_d, state_in.particle_q]
+            wp.launch(copy_particles_kernel, self._inactive_d.shape[0], inputs, [self._x_ref], device=device)
+
         # 1) Compute inertial prediction x_inertia.
         wp.launch(
             compute_inertial_kernel,
@@ -1352,7 +1363,7 @@ class SolverFBA(SolverBase):
                 state_in.particle_q,
                 state_in.particle_qd,
                 state_in.particle_f,
-                model.particle_inv_mass,
+                self._inv_mass_d,
                 model.particle_world,
                 model.gravity,
                 dt,
@@ -1661,11 +1672,14 @@ class SolverFBA(SolverBase):
                 self._rigid_iteration(state_in, state_out, dt)
 
         # 3) Write velocity and update state_out.
+        if self._inactive_d is not None:
+            inputs = [self._inactive_d, state_in.particle_q]
+            wp.launch(copy_particles_kernel, self._inactive_d.shape[0], inputs, [self._x_cur], device=device)
         wp.copy(state_out.particle_q, self._x_cur)
         wp.launch(
             write_velocity_kernel,
             dim=N,
-            inputs=[state_in.particle_q, self._x_cur, model.particle_inv_mass, dt],
+            inputs=[state_in.particle_q, self._x_cur, self._inv_mass_d, dt],
             outputs=[state_out.particle_qd],
             device=device,
         )
@@ -1955,8 +1969,10 @@ class SolverFBA(SolverBase):
         """Update reference positions for pinned particles (dynamic pin).
 
         For pinned particles (``inv_mass == 0``), the soft Pin energy pulls them
-        toward ``target_positions[i]``.  For free particles the value is unused
-        but the array must cover all particles.
+        toward ``target_positions[i]``; they start at their model positions.
+        Inactive particles with mass hold where the input state has them
+        instead. For free particles the value is unused but the array must
+        cover all particles.
 
         Args:
             target_positions: Per-particle target positions [particle_count, 3].

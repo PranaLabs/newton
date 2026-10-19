@@ -182,6 +182,17 @@ def add_inertia_to_rhs_kernel(
 
 
 @wp.kernel
+def copy_particles_kernel(
+    particles: wp.array[wp.int32],
+    source: wp.array[wp.vec3],
+    target: wp.array[wp.vec3],
+):
+    """``target[p] = source[p]`` for each listed particle ``p``."""
+    p = particles[wp.tid()]
+    target[p] = source[p]
+
+
+@wp.kernel
 def write_velocity_kernel(
     x_prev: wp.array[wp.vec3],
     x_new: wp.array[wp.vec3],

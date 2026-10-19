@@ -23,6 +23,7 @@ import numpy as np
 import warp as wp
 import warp.sparse as wps
 
+from ...geometry import ParticleFlags
 from ...sim import Model
 from .kernels import (
     accumulate_schur_W_kernel,
@@ -37,11 +38,13 @@ from .sparse_ldlt import CscMatrix, CsrMatrix, factor_ldlt
 
 
 def particle_masses(model: Model) -> tuple[np.ndarray, np.ndarray]:
-    """Masses [kg] and inverse masses [1/kg] of the particles, with zero mass for the pinned ones, which have zero
-    inverse mass."""
+    """Masses [kg] and inverse masses [1/kg] of the particles, both zero for those the solver holds: the pinned
+    ones, which have zero inverse mass, and the inactive ones."""
     mass = model.particle_mass.numpy().astype(np.float64)
     inv_mass = model.particle_inv_mass.numpy().astype(np.float64)
-    mass[inv_mass == 0.0] = 0.0
+    held = (inv_mass == 0.0) | ((model.particle_flags.numpy() & int(ParticleFlags.ACTIVE)) == 0)
+    mass[held] = 0.0
+    inv_mass[held] = 0.0
     return mass, inv_mass
 
 
