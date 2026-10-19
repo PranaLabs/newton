@@ -3,83 +3,65 @@
 
 """Jacobi-preconditioned Conjugate Residual (PCR) solver for the NSN Schur LCP.
 
-This module ports RealSim's ``CUDADenseJacobiPCRSolver`` to Newton/Warp. The
-solver is used inside the Non-Smooth Newton (NSN) outer loop to solve the
-dense fp64 SPD reduced (Schur) system on every Newton step.
+The solver is used inside the Non-Smooth Newton (NSN) outer loop to solve the
+dense fp64 SPD reduced (Schur) system on every Newton step, and the sparse
+Schur system of the lite mode.
 
-References (RealSim ``realsim_py``):
-    * ``src/Scomponent/linearsolver/iterative/CUDADenseCRSolver.cpp``
-      ``solve_vec_gpu``: lines 121-238 — main PCR loop with cuBLAS calls.
-    * ``src/Scomponent/linearsolver/iterative/CUDADenseJacobiPCRSolver.cpp``
-      ``computePrecond_gpu`` / ``apply_precond_gpu``: lines 34-47 — Jacobi
-      (diagonal-inverse) preconditioner.
-    * ``include/Scomponent/linearsolver/iterative/CUDADenseJacobiPCRSolver.h``
-      lines 13-17 — default constructor ``maxIter=100, tol=1e-5``.
-
-Algorithm (matches RealSim ``CUDADenseCRSolver.cpp:121-238`` line-for-line):
+Algorithm: conjugate residuals on the symmetrically preconditioned system
+``P^1/2 A P^1/2``, with the Jacobi preconditioner ``P = diag(A)^-1``:
 
     Initial:
-        x_0  = 0                  (RealSim ``_x.setZero(n)`` line 136)
-        r    = b                  (RealSim line 142)
-        d    = P * r              (RealSim line 147, precond branch)
-        q    = A * d              (RealSim line 156)
-        h    = q                  (RealSim line 159)
-        rho  = <r, h>             (RealSim line 162)
-        tol2 = tol^2 * rho_init   (RealSim line 164)
+        x    = 0
+        r    = b
+        z    = P * r
+        p    = z
+        q    = A * p
+        rho  = <z, q>
 
-    While rho > tol2 and iter <= max_iter:
-        den  = <q, q>             (RealSim line 170)
-        alpha= rho / den          (RealSim line 173)
-        x   += alpha * d          (RealSim line 177)
-        r   -= alpha * q          (RealSim line 181)
-        s    = P * r              (RealSim line 186)
-        h    = A * s              (RealSim line 189)
+    While |r| > tol * |b| and iter < max_iter:
+        t     = P * q
+        den   = <q, t>
+        alpha = rho / den
+        x    += alpha * p
+        r    -= alpha * q
+        z    -= alpha * t
+        t     = A * z
         rho_old = rho
-        rho  = <r, h>             (RealSim line 193)
-        beta = rho / rho_old      (RealSim line 195)
-        d    = beta * d + s       (RealSim lines 198-201)
-        q    = beta * q + h       (RealSim lines 204-207)
+        rho   = <z, t>
+        beta  = rho / rho_old
+        p     = z + beta * p
+        q     = t + beta * q
 
-Notes on faithful port:
-    * Convergence test is on ``rho`` (preconditioned), not ``||r||`` — this is
-      RealSim's exact behaviour (line 166). ``rho`` is compared to
-      ``tol^2 * rho_init`` so ``tol`` effectively bounds the
-      preconditioned-residual *ratio* relative to the initial value.
-    * ``x_0 = 0`` always — the ``warmStart`` flag on the C++ constructor is
-      not honoured inside ``solve_vec_gpu`` (line 136). We replicate that.
-    * ``max_iter`` is capped at ``n`` to mirror RealSim line 126.
+Notes:
+    * ``x = 0`` always: a solve takes no warm start.
+    * ``max_iter`` is capped at ``n``.
+    * A direction ``p`` whose curvature ``pᵀ A p / pᵀ diag(A) p`` falls below
+      ``1 / max_inverse_gain`` would amplify the residual by more than
+      ``max_inverse_gain``. From such a near-null direction on, and from a
+      vanishing denominator on, ``alpha`` is zero and the iterate stays put.
 
-Perf optimization notes (Perf #3, 2026-05):
-    * Matvec is now a block-per-row tiled reduction (``_matvec_tiled_kernel``)
-      using ``wp.tile_load`` + ``wp.tile_sum``: ~4-5x faster than the prior
+Performance notes:
+    * Matvec is a block-per-row tiled reduction (``_matvec_tiled_kernel``)
+      using ``wp.tile_load`` + ``wp.tile_sum``: ~4-5x faster than a
       single-thread-per-row serial inner loop at n ~ 600..1500.
     * Dot products use ``wp.utils.array_inner`` (CUB-backed parallel reduction)
       instead of a single-thread accumulator: ~6x faster at n ~ 900.
-    * Per-iter host syncs are gone — convergence is checked once at the end
-      of the loop after a fixed iter count (still capped by ``rho > tol``).
-      Saves 5-10 syncs per PCR call.
-
-Perf optimization notes (Perf #5, 2026-05):
+    * The per-iteration scalars stay on the device: the host reads the
+      residual norm once per ``check_every`` iterations, which saves 5-10
+      syncs per PCR call.
     * The per-iter PCR body (matvec + dots + axpy + scale-add + precond)
-      issues ~10 kernel launches per iter; at Demo 5's typical 25 iters
-      per ``solve()`` call that's ~250 Python-side launch dispatches.
-      Each Warp ``wp.launch`` plus the CUDA driver call add ~3-6 us of
-      host overhead; CUDA graphs replay that batch with ~1 us per call.
-    * We capture **one** PCR iter (lines RealSim 170-207) into a
-      :class:`warp.Graph` per ``n`` shape and cache the graph keyed by
-      ``(n, A.ptr)``.  Subsequent solves at the same shape replay the
-      graph ``check_every`` times per convergence-block — a single
-      ``cuGraphLaunch`` per block on the device side.
-
-Perf optimization notes (Perf #6, 2026-05):
-    * The previous optional cuBLAS DGEMV path (Perf #4 via cupy) was
-      removed.  cuBLAS calls trip ``cudaErrorStreamCaptureImplicit``
-      during graph capture, so the two paths were mutually exclusive.
-      CUDA graph capture of the pure-Warp ``tile_matmul`` path wins by
-      a large margin (Demo 5 step_mean 43.4 ms with graphs vs ~99 ms
-      with cuBLAS+eager on RTX 5090 fp64), so the cuBLAS path is no
-      longer worth keeping.  Removing it drops the optional ``cupy``
-      dependency from the project.
+      issues ~10 kernel launches per iter; at a typical 25 iters per
+      ``solve()`` call that's ~250 Python-side launch dispatches. Each Warp
+      ``wp.launch`` plus the CUDA driver call add ~3-6 us of host overhead;
+      CUDA graphs replay that batch with ~1 us per call. :meth:`NSNPCRSolver.solve`
+      captures one PCR iter into a :class:`warp.Graph` per ``n`` shape and
+      caches it by the matrix's pointer and strides. Subsequent solves at the
+      same shape replay the graph ``check_every`` times per convergence block,
+      a single ``cuGraphLaunch`` per replay on the device side.
+    * The matvec stays in Warp: cuBLAS calls fail inside graph capture
+      (``cudaErrorStreamCaptureImplicit``), and the captured Warp path ran a
+      step in 43.4 ms against ~99 ms with cuBLAS run eagerly, on an RTX 5090
+      in fp64.
 """
 
 from __future__ import annotations
@@ -93,8 +75,7 @@ import warp as wp
 # ---------------------------------------------------------------------------
 # K-dim tile width: each block accumulates ``TILE_K`` columns per inner step
 # and uses ``wp.tile_sum`` to reduce them in shared memory.  ``128`` is the
-# sweet spot for n ~ 600..1500 on the NSN Schur sizes Demo 4/5 produce on an
-# RTX 5090 fp64 pipeline (sweep run on 2026-05-18 — see commit log).  Smaller
+# sweet spot for NSN Schur sizes n ~ 600..1500 on an RTX 5090 in fp64.  Smaller
 # tiles win at n > 1500 where occupancy beats per-block re-use; larger tiles
 # win at n < 400 where launch overhead dominates.
 _PCR_TILE_K = wp.constant(128)
@@ -111,16 +92,10 @@ def _compute_precond_kernel(
     A: wp.array2d[wp.float64],
     precond: wp.array[wp.float64],
 ):
-    """Compute the Jacobi (diagonal-inverse) preconditioner.
-
-    Faithful to RealSim ``CUDADenseJacobiPCRSolver.cpp:49-67`` and the GPU
-    variant ``cudaJacobiPrecondition`` invoked at line 37: ``precond[i] = 1/A[i,i]``.
+    """Compute the Jacobi (diagonal-inverse) preconditioner ``precond[i] = 1/A[i,i]``.
 
     A zero diagonal entry is converted to ``0.0`` (rather than ``inf``) so a
-    silently-degenerate row produces a zero update instead of NaNs. RealSim's
-    CPU fallback (line 56-60) also early-exits and disables the preconditioner
-    in that case; we surface the issue at the Python layer through
-    ``NSNPCRSolver.solve`` instead.
+    silently-degenerate row produces a zero update instead of NaNs.
     """
     i = wp.tid()
     d = A[i, i]
@@ -163,10 +138,10 @@ def _matvec_tiled_kernel(
 ):
     """Dense matvec ``out = A @ x`` with one CUDA block per output row.
 
-    Replaces the prior single-thread row-wise accumulator.  Each block sums
-    one row of ``A`` against ``x`` cooperatively: threads load a ``TILE_K``
-    strip via ``wp.tile_load`` (bounds-checked, so a partial last tile loads
-    zero-padded), element-wise multiply, then reduce with ``wp.tile_sum``.
+    Each block sums one row of ``A`` against ``x`` cooperatively: threads load a
+    ``TILE_K`` strip via ``wp.tile_load`` (bounds-checked, so a partial last
+    tile loads zero-padded), element-wise multiply, then reduce with
+    ``wp.tile_sum``.
 
     Launched via ``wp.launch_tiled`` with ``dim=n`` (one block per active
     row) and ``block_dim=_PCR_BLOCK_DIM``.
@@ -205,11 +180,7 @@ def _apply_precond_kernel(
     precond: wp.array[wp.float64],
     out: wp.array[wp.float64],
 ):
-    """Apply Jacobi preconditioner: ``out = P * r`` (elementwise).
-
-    RealSim ``CUDADenseJacobiPCRSolver.cpp:42-47`` calls the helper
-    ``cudaDiagMatrixVectorMultiplication``; this kernel is the direct equivalent.
-    """
+    """Apply Jacobi preconditioner: ``out = P * r`` (elementwise)."""
     i = wp.tid()
     out[i] = precond[i] * r[i]
 
@@ -227,9 +198,8 @@ def _axpy_arr_kernel(
 
     Used inside the per-iter PCR loop so ``alpha`` (computed from device-side
     dot products) does not need to round-trip through host memory.  ``sign``
-    folds in the ``+/-`` so we can reuse one kernel for both
-    ``x += alpha * d`` and ``r -= alpha * q``.  Mirrors RealSim's
-    ``cublasDaxpy`` updates (``CUDADenseCRSolver.cpp:177, 181``).
+    folds in the ``+/-`` so one kernel serves ``x += alpha * p``,
+    ``r -= alpha * q`` and ``z -= alpha * t``.
     """
     i = wp.tid()
     y[i] = y[i] + sign * a_arr[0] * x[i]
@@ -243,10 +213,9 @@ def _scal_add_arr_kernel(
 ):
     """Combined scale-and-add reading the coefficient from device memory.
 
-    ``y = a_arr[0] * y + x`` — mirrors RealSim's ``cublasDscal`` +
-    ``cublasDaxpy`` pair used to compute ``d = beta*d + s`` and ``q = beta*q + h``
-    (``CUDADenseCRSolver.cpp:198-207``).  Fused into one kernel to halve
-    launch overhead, and reads ``beta`` from device memory so the inner PCR
+    ``y = a_arr[0] * y + x``, which computes ``p = z + beta*p`` and
+    ``q = t + beta*q``. One kernel instead of a scale and an add halves the
+    launch overhead, and it reads ``beta`` from device memory so the inner PCR
     loop never blocks on a host transfer.
     """
     i = wp.tid()
@@ -261,11 +230,8 @@ def _div_scalar_kernel(
 ):
     """Device-side scalar divide ``out[0] = num[0] / den[0]``.
 
-    Used to compute PCR ``alpha = rho / den`` and ``beta = rho / rho_old`` on
-    device, avoiding the host round-trip that previously cost two syncs per
-    iter.  Guarded against ``den[0] == 0`` by emitting ``0.0`` (the caller's
-    convergence check sees ``rho``/``rho_old`` and breaks before re-using a
-    stale alpha).
+    Computes the PCR ``beta = rho / rho_old`` on the device, so the host never
+    reads it. A zero ``den[0]`` gives ``0.0``.
     """
     d = den[0]
     if d == wp.float64(0.0):
