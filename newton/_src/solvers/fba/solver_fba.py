@@ -2465,9 +2465,7 @@ class SolverFBA(SolverBase):
                 device=device,
             )
 
-        # Host mirrors of the basic contact fields are still consumed by
-        # the CPU residual (``_compute_contact_residual*``); a follow-on
-        # step in the plan moves the residual to GPU and removes these.
+        # Host mirrors of the basic contact fields, for the host paths that still read them.
         self._contact_particle_h = None if particle_h is None else particle_h.astype(np.int32)
         self._contact_normal_h = None if normal_h is None else normal_h.astype(np.float32)
         self._contact_alpha_h = alpha_h
@@ -2594,67 +2592,6 @@ class SolverFBA(SolverBase):
             self._contact_extra = extra
         return M, Ms
 
-    def _compute_contact_residual_friction(self, x_np: np.ndarray) -> np.ndarray:
-        """Compute the 3M-vector residual ``r = [r_n, r_t1, r_t2]`` for each contact.
-
-        For each contact c:
-
-        - ``r_n[c]  = offset_n[c]  - alpha[c] * dot(n[c],  x_np[p[c]])``
-        - ``r_t1[c] = offset_t1[c] - alpha[c] * dot(t1[c], x_np[p[c]])``
-        - ``r_t2[c] = offset_t2[c] - alpha[c] * dot(t2[c], x_np[p[c]])``
-
-        where ``offset_n = dot(n, world_anchor)`` and
-        ``offset_t1 = dot(t1, world_anchor)``,
-        ``offset_t2 = dot(t2, world_anchor)`` (set in :meth:`update_contacts`).
-
-        The tangent residuals measure displacement from the contact anchor
-        along each tangent direction, so they are zero when the particle
-        sits exactly at the anchor.  Using the global origin (offset = 0)
-        was incorrect and inflated residuals by ~10x for off-origin
-        contacts, driving unphysically large friction impulses.
-
-        Args:
-            x_np: Unconstrained solution, shape ``(N, 3)``, float32.
-
-        Returns:
-            Residual vector of shape ``(3M,)``, float64, ordered
-            ``[r_n_0, r_t1_0, r_t2_0, r_n_1, ...]``.
-        """
-        M = self._contact_count
-        offset = self._contact_offset_d.numpy()[:M]
-        t1s, t2s = self._contact_tangent1_d.numpy()[:M], self._contact_tangent2_d.numpy()[:M]
-        t1_offset, t2_offset = self._contact_tangent1_offset_d.numpy()[:M], self._contact_tangent2_offset_d.numpy()[:M]
-        r = np.zeros(3 * M, dtype=np.float64)
-        for c in range(M):
-            ip = int(self._contact_particle_h[c])
-            xp = x_np[ip].astype(np.float64)
-            alpha = float(self._contact_alpha_h[c])
-            n = self._contact_normal_h[c].astype(np.float64)
-            t1 = t1s[c].astype(np.float64)
-            t2 = t2s[c].astype(np.float64)
-            r[3 * c + 0] = float(offset[c]) - alpha * float(np.dot(n, xp))
-            r[3 * c + 1] = float(t1_offset[c]) - alpha * float(np.dot(t1, xp))
-            r[3 * c + 2] = float(t2_offset[c]) - alpha * float(np.dot(t2, xp))
-        return r
-
-    def _compute_contact_residual(self, x_np: np.ndarray) -> np.ndarray:
-        """Compute ``r[c] = alpha[c] * dot(n[c], x_np[p[c]]) - offset[c]``.
-
-        Args:
-            x_np: Current unconstrained solution, shape ``(N, 3)``, float32/64.
-
-        Returns:
-            Residual vector of shape ``(M,)``, float64.
-        """
-        M = self._contact_count
-        offset = self._contact_offset_d.numpy()[:M]
-        r = np.zeros(M, dtype=np.float64)
-        for c in range(M):
-            ip = int(self._contact_particle_h[c])
-            # r[c] = c_offset - J·x_unc  (positive when particle penetrates)
-            r[c] = offset[c] - float(self._contact_alpha_h[c]) * float(np.dot(self._contact_normal_h[c], x_np[ip]))
-        return r
-
     def _solve_nsn_unilateral(
         self,
         W: np.ndarray,
@@ -2779,8 +2716,7 @@ class SolverFBA(SolverBase):
 
         Args:
             W: ``(3M, 3M)`` Schur complement.
-            r: ``(3M,)`` residual ``pene0 − α·J·x_unc`` from
-                ``_compute_contact_residual_friction``.
+            r: ``(3M,)`` residual ``pene0 − α·J·x_unc``.
             mu: ``(M,)`` per-contact friction coefficient.
             pene0: ``(3M,)`` per-row anchor projection. Constant within step.
             max_iters: NSN iterations (default 1).

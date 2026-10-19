@@ -2827,67 +2827,6 @@ def build_contact_jacobian_vec3_kernel(
 
 
 @wp.kernel
-def build_contact_jacobian_dir_kernel(
-    particle_count: int,
-    contact_idx: int,
-    j_indices: wp.array[wp.int32],
-    j_alpha: wp.array[wp.float32],
-    direction: wp.vec3,
-    out: wp.array[wp.vec3],
-):
-    """Set out[j_indices[contact_idx]] = j_alpha[contact_idx] * direction.
-
-    General-direction variant of :func:`build_contact_jacobian_vec3_kernel`.
-    Used by Stage B friction to set tangent-direction Jacobian columns (t1, t2)
-    without storing them in a per-contact array.
-
-    Called with ``dim=1`` (single thread).  Caller must zero ``out`` before launch.
-
-    Args:
-        particle_count: Total particle count (bounds guard).
-        contact_idx: Contact row index (0-based).
-        j_indices: Particle index per contact, shape ``[M]``.
-        j_alpha: Jacobian coefficient per contact (1.0 for particle-shape), shape ``[M]``.
-        direction: The unit direction vector (normal, t1, or t2).
-        out: Output vec3 array of length ``particle_count``.
-    """
-    _tid = wp.tid()
-    idx = j_indices[contact_idx]
-    if idx >= 0 and idx < particle_count:
-        out[idx] = wp.float32(j_alpha[contact_idx]) * direction
-
-
-@wp.kernel
-def set_lambda_jacobian_vec3_kernel(
-    contact_idx: int,
-    j_indices: wp.array[wp.int32],
-    j_normals: wp.array[wp.vec3],
-    j_alpha: wp.array[wp.float32],
-    lam_c: float,
-    particle_count: int,
-    out: wp.array[wp.vec3],
-):
-    """Scatter ``lam_c * j_alpha[c] * j_normals[c]`` to ``out[j_indices[c]]``.
-
-    Called with ``dim=1``.  Caller must zero ``out`` before launch if
-    accumulation from previous contacts is not desired.
-
-    Args:
-        contact_idx: Contact row index ``c``.
-        j_indices: Particle index per contact row, shape ``[M]``.
-        j_normals: Contact normal per row, shape ``[M]``.
-        j_alpha: Coefficient per row (1.0 for particle-shape contacts).
-        lam_c: Scalar multiplier (lambda for contact ``c``).
-        particle_count: Guard for bounds checking.
-        out: Output vec3 array of length ``particle_count``.
-    """
-    _tid = wp.tid()
-    idx = j_indices[contact_idx]
-    if idx >= 0 and idx < particle_count:
-        out[idx] = lam_c * wp.float32(j_alpha[contact_idx]) * j_normals[contact_idx]
-
-
-@wp.kernel
 def accumulate_vec3_kernel(
     src: wp.array[wp.vec3],
     dst: wp.array[wp.vec3],
@@ -2996,64 +2935,6 @@ def scale_by_diag_multi_rhs_kernel(
     """
     rhs_idx, i = wp.tid()
     dst[rhs_idx, i] = diag[i] * src[rhs_idx, i]
-
-
-@wp.kernel
-def pack_jacobian_axis_kernel(
-    axis: int,
-    contact_particle: wp.array[wp.int32],
-    contact_dir: wp.array[wp.vec3],
-    contact_alpha: wp.array[wp.float32],
-    b_multi: wp.array2d[wp.float64],
-):
-    """Pack one axis of J^T into b_multi for multi-RHS solve.
-
-    For RHS row ``r`` (i.e. contact row ``r``):
-        b_multi[r, :] = 0.0 for all particles except particle[r],
-        b_multi[r, particle[r]] = alpha[r] * dir[r][axis].
-
-    Called with ``dim = total_rows``. Caller must zero ``b_multi`` before launch.
-
-    Args:
-        axis: Spatial axis to extract (0=x, 1=y, 2=z).
-        contact_particle: Particle index per row, shape ``[total_rows]``, int32.
-        contact_dir: Contact direction per row, shape ``[total_rows]``, vec3.
-        contact_alpha: Jacobian coefficient per row, shape ``[total_rows]``, float32.
-        b_multi: Output RHS buffer, shape ``(total_rows, N)`` float64.
-    """
-    r = wp.tid()
-    p = contact_particle[r]
-    d = contact_dir[r]
-    alpha = wp.float64(contact_alpha[r])
-    b_multi[r, p] = alpha * wp.float64(d[axis])
-
-
-@wp.kernel
-def unpack_to_A_inv_Jt_axis_kernel(
-    axis: int,
-    y_multi: wp.array2d[wp.float64],
-    A_inv_Jt: wp.array2d[wp.vec3],
-):
-    """Write one axis of y_multi back into A_inv_Jt.
-
-    A_inv_Jt[r, i][axis] = float32(y_multi[r, i]).
-
-    Called with ``dim = (total_rows, N)``.
-
-    Args:
-        axis: Spatial axis to write (0=x, 1=y, 2=z).
-        y_multi: Solved result, shape ``(total_rows, N)`` float64.
-        A_inv_Jt: Output buffer, shape ``(total_rows, N)`` vec3; only axis is written.
-    """
-    r, i = wp.tid()
-    v = A_inv_Jt[r, i]
-    if axis == 0:
-        v[0] = wp.float32(y_multi[r, i])
-    elif axis == 1:
-        v[1] = wp.float32(y_multi[r, i])
-    else:
-        v[2] = wp.float32(y_multi[r, i])
-    A_inv_Jt[r, i] = v
 
 
 @wp.kernel
@@ -3729,13 +3610,11 @@ def compute_contact_residual_unilateral_kernel(
     x: wp.array[wp.vec3],  # (N,) particle positions (float32)
     r: wp.array[wp.float64],  # (M,) output residual
 ):
-    """GPU port of :meth:`SolverFBA._compute_contact_residual` (Stage A).
+    """Stage A contact residual.
 
     Computes ``r[c] = offset[c] - alpha[c] * dot(normal[c], x[particle[c]])``
-    one contact per thread. Mirrors the CPU loop body exactly, including
-    the float32→float64 promotion on ``dot`` (Warp ``wp.dot`` on a ``vec3``
-    returns ``float32``; we widen to fp64 before the multiply to match the
-    CPU ``np.dot`` working in fp64 after the explicit cast).
+    one contact per thread. ``wp.dot`` on a ``vec3`` returns ``float32``; it is
+    widened to fp64 before the multiply.
 
     Args:
         contact_offset: ``n·anchor`` per contact (fp64), shape ``[M]``.
@@ -3765,12 +3644,12 @@ def compute_contact_residual_coulomb_kernel(
     x: wp.array[wp.vec3],  # (N,) particle positions (float32)
     r: wp.array[wp.float64],  # (3M,) output residual
 ):
-    """GPU port of :meth:`SolverFBA._compute_contact_residual_friction` (Stage B).
+    """Stage B contact residual.
 
     Emits ``r[3c+0/1/2] = offset_{n/t1/t2}[c] - alpha[c] * dot(axis, x[p[c]])``
     where ``axis`` is normal / t1 / t2 respectively. One contact per thread
     writes three consecutive rows in interleaved ``[r_n, r_t1, r_t2]``
-    layout, matching the CPU reference.
+    layout.
 
     Args:
         contact_offset_n: ``n·anchor`` (fp64), shape ``[M]``.
