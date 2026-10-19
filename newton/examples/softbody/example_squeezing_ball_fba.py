@@ -318,11 +318,9 @@ class Example:
         self.viewer.show_triangles = False
         self.viewer.set_model(self.model)
 
-        # Camera framed on the squeeze zone.  Cylinders sit at y in
-        # [-1, -3.5]; the ball drops from y≈2.6 through the gap into the
-        # plane at y=-10, so the centroid of activity is around y≈-3.
-        # The camera looks toward (0, -3, 0).
-        self.viewer.set_camera(pos=wp.vec3(13.0, 3.0, 13.0), pitch=-18.1, yaw=-135.0)
+        # The camera looks toward (0, -2.2, 0) from 24 m, so the whole drop fits a 16:9 view: the ball's top
+        # starts at y = 5.6 m and it comes to rest on the plane at y = -10 m.
+        self.viewer.set_camera(pos=wp.vec3(16.39, 4.01, 16.39), pitch=-15.0, yaw=-135.0)
 
         # Cache the initial shape_transform array as a NumPy buffer; per-step
         # rotation updates write into a copy of this and assign in bulk.
