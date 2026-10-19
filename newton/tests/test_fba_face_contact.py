@@ -8,7 +8,7 @@ import warp as wp
 
 import newton
 from newton._src.geometry.types import GeoType
-from newton._src.solvers.fba.face_contact import FaceContactQuery, face_contact_kernel
+from newton._src.solvers.fba.face_contact import FaceContactQuery, _mesh_neighbors, face_contact_kernel
 
 HALF = np.array([0.5, 0.5, 0.5])
 
@@ -36,6 +36,34 @@ def _pyramid_mesh():
     """A closed square pyramid 0.1 m tall with its tip at the origin."""
     verts = [[0.0, 0.0, 0.0], [-0.05, -0.05, -0.1], [0.05, -0.05, -0.1], [0.05, 0.05, -0.1], [-0.05, 0.05, -0.1]]
     return newton.Mesh(np.array(verts), np.ravel([(0, 1, 2), (0, 2, 3), (0, 3, 4), (0, 4, 1), (1, 3, 2), (1, 4, 3)]))
+
+
+def _notch_mesh(half_width, segments=1):
+    """A closed block 1 m wide and tall over ``|y| <= half_width`` with a 90 degree V notch from its top corners
+    down to ``(x, z) = (0, 0.5)``: the three triangles around the notch split into ``segments**2``, wound outward."""
+    bl, br, tr, notch, tl = np.array([(-0.5, 0.0), (0.5, 0.0), (0.5, 1.0), (0.0, 0.5), (-0.5, 1.0)])  # (x, z)
+    n, pts, tris = segments, [], []
+    for a, b, c in ((notch, bl, br), (notch, br, tr), (notch, tl, bl)):  # counterclockwise in (x, z)
+        index = {}
+        for i in range(n + 1):
+            for j in range(n + 1 - i):
+                index[i, j] = len(pts)
+                pts.append((i * b + j * c + (n - i - j) * a) / n)
+        for i in range(n):
+            for j in range(n - i):
+                tris.append((index[i, j], index[i + 1, j], index[i, j + 1]))
+                if i + j < n - 1:
+                    tris.append((index[i + 1, j], index[i + 1, j + 1], index[i, j + 1]))
+    pts, remap = np.unique(np.round(pts, 9), axis=0, return_inverse=True)
+    tris = remap.reshape(-1)[np.array(tris)]
+    # Counterclockwise in (x, z), so the -y cap's normals point along -y; its boundary edges run counterclockwise.
+    edges = np.concatenate((tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]))
+    _, inverse, counts = np.unique(np.sort(edges, axis=1), axis=0, return_inverse=True, return_counts=True)
+    a, b = edges[counts[inverse.reshape(-1)] == 1].T
+    v = len(pts)
+    verts = np.array([(x, y, z) for y in (-half_width, half_width) for x, z in pts])
+    sides = [np.stack([a, b + v, b], axis=1), np.stack([a, a + v, b + v], axis=1)]
+    return newton.Mesh(verts, np.vstack([tris, tris[:, ::-1] + v, *sides]).ravel())
 
 
 def _add_triangle_over_tip(builder, radius=0.002):
@@ -367,6 +395,24 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             newton.solvers.SolverFBA(builder.finalize(), friction=False, face_contacts=True)
+
+
+class TestMeshNeighbors(unittest.TestCase):
+    def test_closed_mesh(self):
+        """Across each edge of a triangle of a closed mesh lies a triangle with that edge, which lists it back."""
+        builder = newton.ModelBuilder()
+        builder.add_shape_sphere(-1, radius=0.1)
+        builder.add_shape_mesh(-1, mesh=_notch_mesh(0.005, 3))
+        model = builder.finalize(device="cpu")
+        start, table = (a.numpy() for a in _mesh_neighbors(model, model.device))
+        tri = np.asarray(model.shape_source[1].indices).reshape(-1, 3)
+        rows = table[start[1] : start[1] + len(tri)]
+        self.assertTrue((rows >= 0).all())
+        for t, row in enumerate(rows):
+            for (i, j), other in zip(((0, 1), (0, 2), (1, 2)), row, strict=True):
+                self.assertNotEqual(other, t)
+                self.assertTrue({tri[t, i], tri[t, j]} <= set(tri[other]))
+                self.assertIn(t, rows[other])
 
 
 if __name__ == "__main__":

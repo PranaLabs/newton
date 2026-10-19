@@ -185,6 +185,26 @@ def near_face_kernel(
         pair[wp.atomic_add(count, 0, 1)] = wp.int64(s) * wp.int64(tri_indices.shape[0]) + wp.int64(f)
 
 
+def _mesh_neighbors(model, device) -> tuple[wp.array, wp.array]:
+    """Per shape, the first row of its triangles in the neighbor table, and the table: for each triangle of each
+    mesh shape, the triangles across its edges ``ab``, ``ac`` and ``bc``, ``-1`` on a boundary."""
+    shape_type = model.shape_type.numpy()
+    start, tables, rows = np.zeros(max(len(shape_type), 1), dtype=np.int32), [np.zeros((0, 3), np.int32)], 0
+    for s in np.flatnonzero(shape_type == int(GeoType.MESH)):
+        tri = np.asarray(model.shape_source[s].indices, dtype=np.int64).reshape(-1, 3)
+        edges = np.sort(np.concatenate([tri[:, [0, 1]], tri[:, [0, 2]], tri[:, [1, 2]]]), axis=1)
+        owner, slot = np.tile(np.arange(len(tri)), 3), np.repeat(np.arange(3), len(tri))
+        order = np.lexsort((owner, edges[:, 1], edges[:, 0]))
+        pair = np.flatnonzero((edges[order][1:] == edges[order][:-1]).all(axis=1))
+        table = np.full((len(tri), 3), -1, dtype=np.int32)
+        a, b = order[pair], order[pair + 1]
+        table[owner[a], slot[a]], table[owner[b], slot[b]] = owner[b], owner[a]
+        start[s], rows = rows, rows + len(tri)
+        tables.append(table)
+    table = np.concatenate(tables) if rows else np.full((1, 3), -1, dtype=np.int32)
+    return wp.array(start, dtype=wp.int32, device=device), wp.array(table, dtype=wp.int32, device=device)
+
+
 class FaceContactQuery:
     """Face contacts of the triangles around a step's particle contacts.
 
