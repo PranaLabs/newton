@@ -843,9 +843,13 @@ class FBALinearSolver:
         # A⁻¹ b = P_r⁻¹ · Sᵀ · D⁻¹ · S · P_r · b: gather by invperm, two SpMVs
         # around the diagonal scale, then gather by perm.
         wp.launch(apply_permutation_scalar_kernel, dim=n, inputs=[b, self._invperm], outputs=[self._b_perm], device=dev)
-        wps.bsr_mv(self._S_bsr, self._b_perm, self._Sb)
+        # Row i of S lists the descendants of i in the elimination tree, so the rows near the root span the
+        # system and one thread per row serializes them; Warp picks tiles by the mean row length only, and
+        # uses them only on CUDA.
+        tile = 64 if dev.is_cuda else 0
+        wps.bsr_mv(self._S_bsr, self._b_perm, self._Sb, tile_size=tile)
         wp.launch(scale_by_diag_kernel, dim=n, inputs=[self._Sb, self._Dinv], outputs=[self._DSb], device=dev)
-        wps.bsr_mv(self._ST_bsr, self._DSb, self._SDSb)
+        wps.bsr_mv(self._ST_bsr, self._DSb, self._SDSb, tile_size=tile)
         wp.launch(apply_permutation_scalar_kernel, dim=n, inputs=[self._SDSb, self._perm], outputs=[x], device=dev)
 
     def _ensure_multi_rhs_buffers(self, R: int) -> None:
