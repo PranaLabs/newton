@@ -50,6 +50,12 @@ _PIN_HI = (+1.1 * _SCALE, 1.1 * _SCALE, +1.1 * _SCALE)
 _CLOTH_COLOR = (0.78, 0.32, 0.36)
 
 
+@wp.kernel
+def scale_positions(q: wp.array[wp.vec3], scale: float, out: wp.array[wp.vec3]):
+    i = wp.tid()
+    out[i] = q[i] * scale
+
+
 def _square_cloth(n: int) -> tuple[np.ndarray, np.ndarray]:
     """An ``n x n`` grid on ``[-1, 1]^2`` in the ``z = 0`` plane with a vertex at each cell center, four triangles per cell."""
     g = np.linspace(-1.0, 1.0, n + 1)
@@ -140,8 +146,10 @@ class Example:
 
         self.viewer.show_triangles = False
         self.viewer.set_model(self.model)
-        # The m-scale camera scaled to cm, looking toward (0, -40, 0).
-        self.viewer.set_camera(pos=wp.vec3(2.8 * _SCALE, 0.6 * _SCALE, 3.2 * _SCALE), pitch=-13.2, yaw=-131.2)
+        # The viewer draws the cloth in meters, with the camera of example_hanging_cloth_fba: its lighting
+        # does not scale with the scene, and leaves a 100 times larger cloth dark.
+        self._q_m = wp.empty_like(self.state_0.particle_q)
+        self.viewer.set_camera(pos=wp.vec3(2.8, 0.6, 3.2), pitch=-13.2, yaw=-131.2)
 
     def step(self):
         self.state_0.clear_forces()
@@ -150,11 +158,10 @@ class Example:
         self.sim_time += self.frame_dt
 
     def render(self):
+        wp.launch(scale_positions, self._q_m.shape[0], [self.state_0.particle_q, 1.0 / _SCALE], [self._q_m])
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
-        self.viewer.log_mesh(
-            "/cloth", self.state_0.particle_q, self._cloth_tri_indices, color=_CLOTH_COLOR, backface_culling=False
-        )
+        self.viewer.log_mesh("/cloth", self._q_m, self._cloth_tri_indices, color=_CLOTH_COLOR, backface_culling=False)
         self.viewer.end_frame()
 
     def test_post_step(self):
