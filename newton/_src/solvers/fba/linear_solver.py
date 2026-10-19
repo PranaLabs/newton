@@ -5,7 +5,7 @@
 
 Setup phase (CPU):
     1. assemble scalar N*N PD Hessian ``A`` (caller-supplied).
-    2. factor with ``scipy.sparse.linalg.splu`` (COLAMD ordering).
+    2. factor ``P A Pᵀ = L D Lᵀ`` with :func:`~.sparse_ldlt.factor_ldlt` (nested dissection, multifrontal).
     3. compute ``S = L⁻¹`` keeping elimination-tree sparsity (ported from
        RealSim ``LDLT_computeLowerInverse``, SparseLDLT.cpp:225-347).
     4. upload to device as Warp BSR matrices.
@@ -36,6 +36,7 @@ from .kernels import (
     lite_row_slots_kernel,
     scale_by_diag_kernel,
 )
+from .sparse_ldlt import CscMatrix, CsrMatrix, factor_ldlt
 
 
 def build_pd_system(
@@ -352,41 +353,6 @@ def _compute_rest_inv_from_positions(model: Model) -> np.ndarray:
     return out
 
 
-def _splu_extract_factors(
-    A,
-) -> tuple:
-    """Wrap scipy.sparse.linalg.splu and return (L_csc, U_csc, Dinv, perm_r, perm_c).
-
-    For SPD A, splu effectively produces LU = L · U with U = D · Lᵀ; we extract
-    the lower factor L (with unit diagonal), the diagonal D = diag(U), and the
-    permutation arrays. The factor satisfies P · A · Pᵀ = L · D · Lᵀ with
-    ``perm_r == perm_c``.
-
-    SPD matrices admit LDLᵀ without pivoting, so diagonal pivots are forced.
-    SuperLU's default partial pivoting picks an off-diagonal pivot whenever it
-    is larger than the diagonal (bending stencils, rigid inertia with products
-    of inertia), which breaks the symmetric ``A⁻¹ = Pᵀ Sᵀ D⁻¹ S P`` form.
-
-    Args:
-        A: Sparse SPD matrix (CSC or CSR).
-
-    Returns:
-        Tuple (L_csc, U_csc, Dinv, perm_r, perm_c).
-    """
-    import scipy.sparse.linalg as spla
-
-    lu = spla.splu(A.tocsc(), permc_spec="COLAMD", diag_pivot_thresh=0.0, options={"SymmetricMode": True})
-    L = lu.L.tocsc()  # lower-tri with unit diagonal
-    L.sort_indices()  # SuperLU may return unsorted column indices; sort for alignment
-    U = lu.U.tocsc()
-    Dinv = 1.0 / U.diagonal()
-    perm_r = lu.perm_r.astype(np.int32)
-    perm_c = lu.perm_c.astype(np.int32)
-    if not np.array_equal(perm_r, perm_c):
-        raise RuntimeError("Off-diagonal pivot in the PD system factorization; A must be symmetric positive definite.")
-    return L, U, Dinv, perm_r, perm_c
-
-
 def _elimination_tree(L) -> np.ndarray:
     """Build elimination tree parent[] from L's sparsity structure.
 
@@ -541,8 +507,6 @@ def compute_lower_inverse(
         10201  ~16 min (extrapolated) 1.0 s
         =====  =====================  =====================
     """
-    import scipy.sparse as _sp
-
     n = L.shape[0]
     if parent is None:
         parent = _elimination_tree(L)
@@ -579,7 +543,7 @@ def compute_lower_inverse(
 
     S_values = _compute_lower_inverse_column_warp(S_outerPtr, S_innerInd, perm, aL, wp_device)
 
-    return _sp.csc_matrix((S_values, S_innerInd, S_outerPtr), shape=(n, n))
+    return CscMatrix((n, n), S_outerPtr, S_innerInd, S_values)
 
 
 def _build_inverse_pattern(parent: np.ndarray, invperm: np.ndarray, n: int) -> tuple[np.ndarray, np.ndarray]:
@@ -789,43 +753,44 @@ def _compute_isometric_bending_q(edge_indices: np.ndarray, positions: np.ndarray
 class FactorizedSystem:
     """Output of factorize_and_sparse_inverse."""
 
-    S: sp.csc_matrix  # n x n, lower-tri inverse with elimination-tree sparsity
-    ST: sp.csc_matrix  # transpose, runtime-uploaded separately
+    S: CscMatrix  # n x n, lower-tri inverse with elimination-tree sparsity
     Dinv: np.ndarray  # length n
     perm_r: np.ndarray  # length n, int32
     invperm_r: np.ndarray  # length n, int32
 
 
-def factorize_and_sparse_inverse(A) -> FactorizedSystem:
-    """Run COLAMD ordering + LU factor + sparse inverse on an SPD matrix.
+def factorize_and_sparse_inverse(A, positions: np.ndarray | None = None) -> FactorizedSystem:
+    """Factor an SPD matrix as ``P A Pᵀ = L D Lᵀ`` and compute ``S = L⁻¹``.
 
     Args:
-        A: scalar N x N PD Hessian (csr or csc, will be converted internally).
+        A: Scalar N x N PD matrix: a :class:`~.sparse_ldlt.CsrMatrix`, a dense array, or a matrix with ``tocoo()``.
+        positions: Point of each unknown [m], shape ``[N, 3]``, for the nested dissection ordering; ``None``
+            factors densely in the given order.
 
     Returns:
         FactorizedSystem with all data needed to construct an FBALinearSolver.
     """
-    L, _U, Dinv, perm_r, _perm_c = _splu_extract_factors(A)
-    parent = _elimination_tree(L)
-    invperm_r = np.argsort(perm_r).astype(np.int32)
-    S = compute_lower_inverse(L, parent=parent)
-    ST = S.T.tocsc()
-    return FactorizedSystem(S=S, ST=ST, Dinv=Dinv, perm_r=perm_r, invperm_r=invperm_r)
+    order, L, d = factor_ldlt(CsrMatrix.from_matrix(A), positions)
+    S = compute_lower_inverse(L, parent=_elimination_tree(L))
+    perm_r = np.argsort(order).astype(np.int32)
+    return FactorizedSystem(S=S, Dinv=1.0 / d, perm_r=perm_r, invperm_r=order.astype(np.int32))
 
 
-def _csc_to_bsr_1x1(M, device):
-    """Build a Warp 1x1 BSR matrix (float64) from a SciPy CSC/CSR matrix.
+def _csc_to_bsr_1x1(M: CscMatrix, device, transpose: bool = False):
+    """Build a Warp 1x1 BSR matrix (float64) from a CSC matrix or its transpose.
 
     Args:
-        M: SciPy sparse matrix (any format, converted to CSR internally).
+        M: The matrix.
         device: Warp device to place the BSR matrix on.
+        transpose: Build ``Mᵀ`` instead of ``M``.
 
     Returns:
         A :class:`warp.sparse.BsrMatrix` with ``block_type=wp.float64``.
     """
-    M_csr = M.tocsr()
-    rows, cols = M_csr.nonzero()
-    vals = M_csr.data.astype(np.float64)
+    rows, cols = M.indices, np.repeat(np.arange(M.shape[1]), np.diff(M.indptr))
+    if transpose:
+        rows, cols = cols, rows
+    vals = M.data.astype(np.float64)
     rows_wp = wp.array(rows.astype(np.int32), dtype=wp.int32, device=device)
     cols_wp = wp.array(cols.astype(np.int32), dtype=wp.int32, device=device)
     vals_wp = wp.array(vals, dtype=wp.float64, device=device)
@@ -854,7 +819,7 @@ class FBALinearSolver:
 
         # Build 1x1 BSR matrices from SciPy sparse factors.
         self._S_bsr = _csc_to_bsr_1x1(factor.S, self.device)
-        self._ST_bsr = _csc_to_bsr_1x1(factor.ST, self.device)
+        self._ST_bsr = _csc_to_bsr_1x1(factor.S, self.device, transpose=True)
         self._Dinv = wp.array(factor.Dinv.astype(np.float64), dtype=wp.float64, device=self.device)
         self._perm = wp.array(factor.perm_r.astype(np.int32), dtype=wp.int32, device=self.device)
         self._invperm = wp.array(factor.invperm_r.astype(np.int32), dtype=wp.int32, device=self.device)

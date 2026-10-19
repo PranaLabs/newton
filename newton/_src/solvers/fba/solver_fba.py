@@ -489,7 +489,10 @@ class SolverFBA(SolverBase):
         if bodies.size == 0:
             return
         A = build_rigid_system(model, bodies, dt)
-        self._rigid_linear_solver = FBALinearSolver(factorize_and_sparse_inverse(A), device=self._device)
+        # The blocks do not couple: placing each body's DOFs at its slot along a line makes the dissection
+        # split between bodies with empty separators.
+        slots = np.stack([np.repeat(np.arange(bodies.size), 6), np.zeros(6 * bodies.size), np.zeros(6 * bodies.size)])
+        self._rigid_linear_solver = FBALinearSolver(factorize_and_sparse_inverse(A, slots.T), device=self._device)
         m = bodies.size
         device = self._device
         self._rigid_bodies_d = wp.array(bodies, dtype=wp.int32, device=device)
@@ -996,7 +999,7 @@ class SolverFBA(SolverBase):
             tri_weight_scale=self._tri_gauge,
             tet_weight_scale=self._tet_gauge,
         )
-        fs = factorize_and_sparse_inverse(A)
+        fs = factorize_and_sparse_inverse(A, self.model.particle_q.numpy())
         self._linear_solver = FBALinearSolver(fs, device=self._device)
         # LiteNSN dense kernel + sparse BSR pipeline both consume the lite mass
         # matrix; build it once here so the per-step Schur dispatch is allocation-free.

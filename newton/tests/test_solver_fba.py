@@ -185,36 +185,23 @@ class TestSparseInverse(unittest.TestCase):
     """T2: compute_lower_inverse matches dense np.linalg.inv on small SPD."""
 
     def test_random_spd_8x8(self):
-        import scipy.sparse as _sp
-
+        """``Sᵀ D⁻¹ S`` reproduces the permuted inverse of a tridiagonal SPD matrix."""
         from newton._src.solvers.fba.linear_solver import (  # noqa: PLC0415
             _elimination_tree,
-            _splu_extract_factors,
             compute_lower_inverse,
         )
+        from newton._src.solvers.fba.sparse_ldlt import CsrMatrix, factor_ldlt  # noqa: PLC0415
 
         rng = np.random.default_rng(0)
-        # Build a small SPD matrix via tridiagonal + jitter.
         n = 8
-        diag = rng.uniform(10.0, 20.0, n)
         off = rng.uniform(-1.0, 1.0, n - 1)
-        A = _sp.diags([off, diag, off], [-1, 0, 1], shape=(n, n), format="csc").astype(np.float64)
-
-        Ainv_dense = np.linalg.inv(A.toarray())
-
-        # splu decomposes P_r @ A @ P_c^T = L @ D @ L^T for SPD A.
-        # L is already in the permuted coordinate system, so compute S = L^{-1}
-        # directly (invperm=None means identity ordering for L's internal space).
-        L_csc, _U_csc, Dinv, perm_r, perm_c = _splu_extract_factors(A)
-        S = compute_lower_inverse(L_csc, parent=_elimination_tree(L_csc))
-
-        # Reconstruct A^{-1} = P_c^T @ S^T @ diag(Dinv) @ S @ P_r
-        # (from P_r A P_c^T = L D L^T => A^{-1} = P_c^T L^{-T} D^{-1} L^{-1} P_r)
-        S_arr = S.toarray()
-        P_r = np.eye(n)[perm_r]
-        P_c = np.eye(n)[perm_c]
-        Ainv_reconstructed = P_c.T @ S_arr.T @ np.diag(Dinv) @ S_arr @ P_r
-        self.assertLess(np.abs(Ainv_reconstructed - Ainv_dense).max(), 1e-12)
+        A = np.diag(rng.uniform(10.0, 20.0, n)) + np.diag(off, 1) + np.diag(off, -1)
+        # Points along a line make the nested dissection reorder the unknowns.
+        points = np.stack([np.arange(n), np.zeros(n), np.zeros(n)], axis=1).astype(np.float64)
+        order, L, d = factor_ldlt(CsrMatrix.from_matrix(A), points, leaf_size=2)
+        S = compute_lower_inverse(L, parent=_elimination_tree(L)).toarray()
+        Ainv = np.linalg.inv(A)[np.ix_(order, order)]
+        self.assertLess(np.abs(S.T @ np.diag(1.0 / d) @ S - Ainv).max(), 1e-12)
 
 
 class TestFBALinearSolver(unittest.TestCase):
@@ -3032,11 +3019,8 @@ class TestPhase4StageAContact(unittest.TestCase):
             factorize_and_sparse_inverse,
         )
 
-        # Build a sparse SPD matrix whose COLAMD ordering produces a
-        # non-trivial ``perm_r`` (``perm_r != invperm_r``). A purely random
-        # dense SPD often factors with the identity permutation under COLAMD,
-        # which masks any bug that swaps ``perm[isodofs]`` for
-        # ``invperm[isodofs]``.
+        # Build a sparse SPD matrix whose ordering produces a non-trivial ``perm_r`` (``perm_r != invperm_r``):
+        # the identity permutation would mask any bug that swaps ``perm[isodofs]`` for ``invperm[isodofs]``.
         rng = np.random.default_rng(11)
         N = 200
         M = 7
@@ -3056,10 +3040,10 @@ class TestPhase4StageAContact(unittest.TestCase):
             A_lil[0, j] = 0.5
             A_lil[j, 0] = 0.5
         A = A_lil.tocsc()
-        fs = factorize_and_sparse_inverse(A)
+        fs = factorize_and_sparse_inverse(A, rng.random((N, 3)))
         # Sanity: this is the regime where perm != invperm.
         assert not np.array_equal(fs.perm_r, fs.invperm_r), (
-            "Test setup invalid: COLAMD chose identity ordering; the isodof vs dense W test would be vacuous."
+            "Test setup invalid: identity ordering; the isodof vs dense W test would be vacuous."
         )
 
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
