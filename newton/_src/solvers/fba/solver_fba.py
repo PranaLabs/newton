@@ -260,15 +260,6 @@ class SolverFBA(SolverBase):
         shape_angular_velocity: dict[int, float] | None = None,
         nh_solver: Literal["newton5", "lbfgs"] = "lbfgs",
         nsn_schur_mode: Literal["full", "lite"] = "full",
-        particle_contact_radius: float | None = None,
-        particle_contact_margin: float = 0.04,
-        particle_contact_friction: float = 0.25,
-        particle_contact_topology_ring: int = 2,
-        particle_contact_rest_exclusion_radius: float = 0.1,
-        particle_contact_max_pairs: int | None = None,
-        particle_contact_mode: Literal["vv", "vt"] = "vt",
-        particle_contact_max_hits_per_vertex: int = 16,
-        particle_contact_ee: bool = True,
         integrate_with_external_rigid_solver: bool = False,
         contact_regularization: float = 1.0e-2,
         face_contacts: bool = False,
@@ -330,14 +321,6 @@ class SolverFBA(SolverBase):
                 legacy 5-iter fixed Newton (no line search, no convergence
                 check) for regression. Ignored unless
                 ``stretching_model="neohookean"``.
-            particle_contact_ee: If ``True`` (default) and
-                ``particle_contact_mode='vt'``, run the edge-edge broadphase
-                + emit pass in addition to v-t.  Each detected pair emits a
-                4-particle Jacobian row with weights ``(+(1-α), +α, -(1-β),
-                -β)`` on the two endpoint pairs.  Edges that are parallel to
-                within ``|cross|^2 < 1e-18`` are skipped (the v-t path catches
-                those contacts instead).  Set ``False`` to disable e-e and
-                fall back to v-t-only contact resolution.
             integrate_with_external_rigid_solver: If ``True``, rigid bodies are
                 integrated by another solver: ``state_in`` holds their previous
                 state, ``state_out`` their current one, and FBA leaves both
@@ -429,37 +412,6 @@ class SolverFBA(SolverBase):
             raise ValueError(f"nsn_schur_mode={nsn_schur_mode!r} not supported; choose 'full' or 'lite'")
         self.nsn_schur_mode = nsn_schur_mode
 
-        # Cloth self-contact (Phase 3 of the Franka plan).  Routed as a
-        # separate pass after the rigid NSN; uses the BSR + sparse-PCR
-        # pipeline regardless of nsn_schur_mode (self-contact rows have
-        # 2 nonzero blocks per H row, which the per-particle fused kernel
-        # cannot represent).
-        self.particle_contact_radius = float(particle_contact_radius) if particle_contact_radius is not None else None
-        self.particle_contact_margin = float(particle_contact_margin)
-        self.particle_contact_friction = float(particle_contact_friction)
-        self.particle_contact_topology_ring = int(particle_contact_topology_ring)
-        self.particle_contact_rest_exclusion_radius = float(particle_contact_rest_exclusion_radius)
-        self.particle_contact_max_pairs = particle_contact_max_pairs
-        if particle_contact_mode not in ("vv", "vt"):
-            raise ValueError(f"particle_contact_mode={particle_contact_mode!r} not supported; choose 'vv' or 'vt'")
-        self.particle_contact_mode = particle_contact_mode
-        self.particle_contact_max_hits_per_vertex = int(particle_contact_max_hits_per_vertex)
-        # Phase 3 (e-e): independent toggle gating the edge-edge broadphase +
-        # emit pass.  Only takes effect under ``particle_contact_mode='vt'``
-        # (which uses ``TriMeshCollisionDetector``).  Default True so the
-        # validated v-t/e-e path runs on existing call sites.
-        self.particle_contact_ee = bool(particle_contact_ee)
-        self._particle_broadphase = None  # lazily constructed in _apply_particle_contact_pass
-        self._particle_contact_detector = None  # TriMeshCollisionDetector (vt mode)
-        self._particle_contact_buf_cap = 0
-        self._pc_hit_offsets_d = None  # CSR per-vertex hit offsets, vt mode
-        self._pc_ee_hit_offsets_d = None  # CSR per-edge hit offsets, vt mode (Phase 3)
-        self._pc_contact_count_d = None  # atomic emitted-contact counter, vt mode
-        # Diagnostic counters, always present so callers can probe them
-        # unconditionally (Tier 3 acceptance reporting).
-        self._pc_last_vt_hits = 0
-        self._pc_last_ee_hits = 0
-        self._pc_last_n_contacts = 0
         if stretching_model in ("corotational", "neohookean"):
             if mu is None or lam is None:
                 raise ValueError(
@@ -1795,21 +1747,7 @@ class SolverFBA(SolverBase):
             if rigid:
                 self._rigid_iteration(state_in, state_out, dt)
 
-        # 3) Self-contact pass (Phase 3 of Franka plan) — only fires when
-        #    ``particle_contact_radius`` was set at construction.  Runs AFTER the
-        #    rigid NSN so the BSR pass sees a state already corrected for
-        #    rigid contacts.  Modifies ``self._x_cur`` in place; velocity
-        #    write below picks up the corrected positions.
-        if self.particle_contact_radius is not None:
-            # Wrap _x_cur in a state-like proxy for the existing pass API.
-            class _StateProxy:
-                pass
-
-            proxy = _StateProxy()
-            proxy.particle_q = self._x_cur
-            self._apply_particle_contact_pass(proxy, dt)
-
-        # 4) Write velocity and update state_out.
+        # 3) Write velocity and update state_out.
         wp.copy(state_out.particle_q, self._x_cur)
         wp.launch(
             write_velocity_kernel,
@@ -2990,26 +2928,6 @@ class SolverFBA(SolverBase):
     # See ``docs/superpowers/plans/2026-05-17-fba-nsn-gpu-port.md`` for the
     # roll-out plan; RealSim reference is ``NonSmoothNewton.cpp:102-171``.
 
-    def _apply_particle_contact_pass(self, state_inout, dt: float) -> int:
-        """Run one particle-contact NSN sweep on the current ``state_inout``.
-
-        Sequence:
-        1. Broadphase: enumerate particle-particle (v-v) or vertex-triangle
-           (v-t) contacts within the configured threshold.
-        2. Emit Stage B rows (normal + 2 tangents) per surviving contact in
-           the uniform 4-slot Jacobian layout.
-        3. Compute residual ``r`` for contact rows.
-        4. Call the BSR FB-Newton inner driver to solve for ``λ``.
-        5. Apply ``Δx = dt²·M⁻¹·Jᵀ·λ_apply`` to ``state_inout.particle_q``.
-
-        Returns the number of contact rows processed.
-        """
-        if self.particle_contact_radius is None:
-            return 0
-        if self.particle_contact_mode == "vt":
-            return self._apply_particle_contact_pass_vt(state_inout, dt)
-        return self._apply_particle_contact_pass_vv(state_inout, dt)
-
     def _ensure_particle_contact_buffers(self, cap: int) -> None:
         """Allocate 4-slot per-row arrays + work buffers up to ``cap`` rows.
 
@@ -3758,7 +3676,6 @@ class SolverFBA(SolverBase):
             return
         # Grow with 1.5x headroom so a contact count that ramps up does not reallocate every step.
         cap = max(n_rows, 48) if size == 0 else max(int(n_rows * 1.5), 2 * size)
-        cap = max(cap, self._particle_contact_buf_cap)
         for name in "omega_lam w_omega_lam penetration compliance h rhs dlam precond lam omega w_diag".split():
             setattr(self, f"_bsr_{name}", wp.zeros(cap, dtype=wp.float64, device=self._device))
 
