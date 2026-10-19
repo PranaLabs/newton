@@ -297,8 +297,6 @@ class Example:
             iterations=_PD_ITER,
             friction=True,
             stretching_model="neohookean",
-            mu=mu,
-            lam=lam,
             mu_per_pair_override=mu_override,
             shape_angular_velocity=shape_omega,
             lambda_cap=1.0e12,

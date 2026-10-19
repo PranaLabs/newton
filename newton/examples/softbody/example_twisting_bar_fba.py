@@ -139,8 +139,6 @@ class Example:
             iterations=_PD_ITER,
             pin_stiffness=1.0e12,
             stretching_model="neohookean",
-            mu=mu,
-            lam=lam,
         )
 
         self.state_0 = self.model.state()

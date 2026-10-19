@@ -101,8 +101,6 @@ class Example:
             self.model,
             iterations=10,
             stretching_model="neohookean",
-            mu=mu,
-            lam=lam,
             integrate_with_external_rigid_solver=True,
             soft_contact_thickness=THICKNESS,
         )

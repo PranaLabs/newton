@@ -123,7 +123,7 @@ class Example:
             indices=tris.reshape(-1).tolist(),
             density=density,
             tri_ke=mu,
-            tri_ka=0.0,
+            tri_ka=lam,
             tri_kd=0.0,
             edge_ke=0.0,
             edge_kd=0.0,
@@ -147,8 +147,6 @@ class Example:
             friction=False,
             stretching_model="neohookean",
             nh_solver="lbfgs",
-            mu=mu,
-            lam=lam,
             pin_stiffness=1.0e10,
         )
 

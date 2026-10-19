@@ -91,8 +91,6 @@ class Example:
             self.model,
             iterations=10,
             stretching_model="neohookean",
-            mu=mu,
-            lam=lam,
             face_contacts=True,
             soft_contact_thickness=CONTACT_THICKNESS,
             face_contact_margin=0.01,

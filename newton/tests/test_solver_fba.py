@@ -1485,7 +1485,7 @@ class TestFBARealSimAgreement(unittest.TestCase):
     DT = 0.01
     N_FRAMES = 50
     N_ITER = 5
-    # E=1e4, nu=0.4 → mu = E/(2*(1+nu)) = 1e4/2.8 ≈ 3571.43; tri_ke = 2*mu ≈ 7142.857
+    # E=1e4, nu=0.4 → mu = E/(2*(1+nu)) = 1e4/2.8 ≈ 3571.43 = tri_ke (k_mu)
     TRI_KE = 3571.4285
     EDGE_KE = 0.1
     PIN_STIFFNESS = 1e10  # RealSim init.h:1023
@@ -1712,8 +1712,8 @@ class TestCorotationalProjection(unittest.TestCase):
             cell_x=0.05,
             cell_y=0.05,
             mass=0.1,
-            tri_ke=3571.4285,  # μ≈3571
-            tri_ka=0.0,
+            tri_ke=3571.0,
+            tri_ka=4286.0,
             tri_kd=0.0,
             edge_ke=0.1,
             edge_kd=0.0,
@@ -1726,8 +1726,7 @@ class TestCorotationalProjection(unittest.TestCase):
         builder.particle_mass[top_right] = 0.0
         model = builder.finalize()
 
-        mu, lam = 3571.0, 4286.0
-        solver = SolverFBA(model, iterations=8, stretching_model="corotational", mu=mu, lam=lam)
+        solver = SolverFBA(model, iterations=8, stretching_model="corotational")
         s_in, s_out = model.state(), model.state()
         dt = 1.0 / 60.0
         for _ in range(50):
@@ -1737,8 +1736,8 @@ class TestCorotationalProjection(unittest.TestCase):
         q = s_in.particle_q.numpy()
         self.assertTrue(np.all(np.isfinite(q)), "non-finite values in corotational simulation")
 
-    def test_solver_init_requires_mu_lam_for_corot(self):
-        """SolverFBA with stretching_model='corotational' and no mu/lam raises ValueError."""
+    def test_solver_init_requires_lame_for_corot(self):
+        """SolverFBA with stretching_model='corotational' rejects triangles without a positive k_lambda."""
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
@@ -1761,13 +1760,27 @@ class TestCorotationalProjection(unittest.TestCase):
         model = builder.finalize()
 
         with self.assertRaises(ValueError):
-            SolverFBA(model, stretching_model="corotational")  # missing mu and lam
+            SolverFBA(model, stretching_model="corotational")  # k_lambda = tri_ka = 0
 
-        with self.assertRaises(ValueError):
-            SolverFBA(model, stretching_model="corotational", mu=1000.0)  # missing lam
+    def test_lame_parameters_come_from_each_element(self):
+        """Each triangle's projection takes its own k_mu and k_lambda, scaled by its own gauge."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
 
-        with self.assertRaises(ValueError):
-            SolverFBA(model, stretching_model="corotational", lam=1000.0)  # missing mu
+        builder = newton.ModelBuilder()
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            **{"dim_x": 2, "dim_y": 1, "cell_x": 0.1, "cell_y": 0.1, "mass": 0.01, "tri_ke": 1.0e3, "tri_ka": 2.0e3},
+        )
+        model = builder.finalize()
+        materials = model.tri_materials.numpy()
+        materials[1, :2] = (3.0e3, 5.0e2)
+        model.tri_materials.assign(materials)
+        lame = SolverFBA(model, stretching_model="corotational")._tri_lame_d.numpy()
+        mu, lam = materials[:, 0].astype(np.float64), materials[:, 1].astype(np.float64)
+        gauge = (4.0 * mu + 3.0 * lam) / (2.0 * mu + lam)
+        np.testing.assert_allclose(lame, np.stack([mu * gauge, lam * gauge], axis=1), rtol=1e-6)
 
 
 class TestNeoHookeanProjection(unittest.TestCase):
@@ -1877,8 +1890,8 @@ class TestNeoHookeanProjection(unittest.TestCase):
             cell_x=0.05,
             cell_y=0.05,
             mass=0.1,
-            tri_ke=3571.4285,  # mu=3571.43
-            tri_ka=0.0,
+            tri_ke=3571.4285714285716,
+            tri_ka=14285.71428571429,
             tri_kd=0.0,
             edge_ke=0.1,
             edge_kd=0.0,
@@ -1891,9 +1904,7 @@ class TestNeoHookeanProjection(unittest.TestCase):
         builder.particle_mass[top_right] = 0.0
         model = builder.finalize()
 
-        mu = 3571.4285714285716
-        lam = 14285.71428571429
-        solver = SolverFBA(model, iterations=5, stretching_model="neohookean", mu=mu, lam=lam)
+        solver = SolverFBA(model, iterations=5, stretching_model="neohookean")
         s_in, s_out = model.state(), model.state()
         dt = 0.01
         for _ in range(50):
@@ -1903,8 +1914,8 @@ class TestNeoHookeanProjection(unittest.TestCase):
         q = s_in.particle_q.numpy()
         self.assertTrue(np.all(np.isfinite(q)), "non-finite values in neohookean simulation")
 
-    def test_solver_init_requires_mu_lam_for_neohookean(self):
-        """SolverFBA with stretching_model='neohookean' and no mu/lam raises ValueError."""
+    def test_solver_init_requires_lame_for_neohookean(self):
+        """SolverFBA with stretching_model='neohookean' rejects triangles without a positive k_lambda."""
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
@@ -1927,13 +1938,7 @@ class TestNeoHookeanProjection(unittest.TestCase):
         model = builder.finalize()
 
         with self.assertRaises(ValueError):
-            SolverFBA(model, stretching_model="neohookean")  # missing mu and lam
-
-        with self.assertRaises(ValueError):
-            SolverFBA(model, stretching_model="neohookean", mu=1000.0)  # missing lam
-
-        with self.assertRaises(ValueError):
-            SolverFBA(model, stretching_model="neohookean", lam=1000.0)  # missing mu
+            SolverFBA(model, stretching_model="neohookean")  # k_lambda = tri_ka = 0
 
 
 class TestFBARealSimAgreementNH(unittest.TestCase):
@@ -2030,7 +2035,7 @@ class TestFBARealSimAgreementNH(unittest.TestCase):
             indices=indices,
             density=density,
             tri_ke=self.TRI_KE,
-            tri_ka=0.0,
+            tri_ka=self.LAM,
             tri_kd=0.0,
             edge_ke=self.EDGE_KE,
             edge_kd=0.0,
@@ -2064,8 +2069,6 @@ class TestFBARealSimAgreementNH(unittest.TestCase):
             iterations=self.N_ITER,
             pin_stiffness=self.PIN_STIFFNESS,
             stretching_model="neohookean",
-            mu=self.MU,
-            lam=self.LAM,
         )
 
         state_in = model.state()
@@ -2511,8 +2514,7 @@ class TestTetCorotational(unittest.TestCase):
         )
         model = builder.finalize()
 
-        mu, lam = 1.0e4, 1.0e4
-        solver = SolverFBA(model, iterations=10, stretching_model="corotational", mu=mu, lam=lam)
+        solver = SolverFBA(model, iterations=10, stretching_model="corotational")
         s_in, s_out = model.state(), model.state()
         dt = 1.0 / 60.0
         for _ in range(50):
@@ -2669,8 +2671,7 @@ class TestTetNeoHookean(unittest.TestCase):
         )
         model = builder.finalize()
 
-        mu, lam = 1.0e4, 1.0e4
-        solver = SolverFBA(model, iterations=10, stretching_model="neohookean", mu=mu, lam=lam)
+        solver = SolverFBA(model, iterations=10, stretching_model="neohookean")
         s_in, s_out = model.state(), model.state()
         dt = 1.0 / 60.0
         for _ in range(50):
@@ -4424,8 +4425,6 @@ class SolverFBATetCorotDeterminismTests(unittest.TestCase):
             iterations=1,
             friction=False,
             stretching_model="corotational",
-            mu=5.0e3,
-            lam=5.0e3,
         )
         s_in = model.state()
         s_out = model.state()
@@ -4470,8 +4469,6 @@ class SolverFBATetNHDeterminismTests(unittest.TestCase):
             iterations=1,
             friction=False,
             stretching_model="neohookean",
-            mu=5.0e3,
-            lam=5.0e3,
         )
         s_in = model.state()
         s_out = model.state()
@@ -4504,16 +4501,12 @@ class SolverFBATriDeterminismTests(unittest.TestCase):
             cell_x=0.1,
             cell_y=0.1,
             mass=0.05,
-            tri_ke=5000.0,
-            tri_ka=0.0,
+            tri_ke=5000.0 if stretching_model == "arap" else mu_val,
+            tri_ka=lam_val,
             tri_kd=0.0,
         )
         model = builder.finalize()
-        kwargs = {"iterations": 1, "friction": False, "stretching_model": stretching_model}
-        if stretching_model != "arap":
-            kwargs["mu"] = mu_val
-            kwargs["lam"] = lam_val
-        solver = SolverFBA(model, **kwargs)
+        solver = SolverFBA(model, iterations=1, friction=False, stretching_model=stretching_model)
         s_in = model.state()
         s_out = model.state()
         for _ in range(3):
@@ -5193,14 +5186,14 @@ class TestNeoHookeanLBFGS(unittest.TestCase):
             cell_y=0.1,
             mass=0.1,
             tri_ke=500.0,
-            tri_ka=0.0,
+            tri_ka=200.0,
             tri_kd=0.0,
             edge_ke=0.0,
             edge_kd=0.0,
             fix_left=False,
         )
         model = builder.finalize()
-        solver = SolverFBA(model, stretching_model="neohookean", mu=100.0, lam=200.0)
+        solver = SolverFBA(model, stretching_model="neohookean")
         self.assertEqual(solver.nh_solver, "lbfgs")
 
     def test_nh_solver_kwarg_rejects_unknown(self):
@@ -5218,7 +5211,7 @@ class TestNeoHookeanLBFGS(unittest.TestCase):
             cell_y=0.1,
             mass=0.1,
             tri_ke=500.0,
-            tri_ka=0.0,
+            tri_ka=200.0,
             tri_kd=0.0,
             edge_ke=0.0,
             edge_kd=0.0,
@@ -5226,7 +5219,7 @@ class TestNeoHookeanLBFGS(unittest.TestCase):
         )
         model = builder.finalize()
         with self.assertRaises(ValueError):
-            SolverFBA(model, stretching_model="neohookean", mu=100.0, lam=200.0, nh_solver="bogus")
+            SolverFBA(model, stretching_model="neohookean", nh_solver="bogus")
 
 
 class TestDroppedDualGauge(unittest.TestCase):
@@ -5264,6 +5257,7 @@ class TestDroppedDualGauge(unittest.TestCase):
                 cell_y=0.025,
                 mass=1.0e-4,
                 tri_ke=mu,
+                tri_ka=lam,
             )
             modulus, width = 4 * mu * (mu + lam) / (2 * mu + lam), 0.1
         model = builder.finalize()
@@ -5272,7 +5266,7 @@ class TestDroppedDualGauge(unittest.TestCase):
         mass = np.where(top, 0.0, np.where(bottom, 1.0 / bottom.sum(), model.particle_mass.numpy()))
         model.particle_mass.assign(mass)
         model.particle_inv_mass.assign(np.divide(1.0, mass, out=np.zeros_like(mass), where=mass > 0))
-        solver = SolverFBA(model, iterations=50, stretching_model=stretching_model, mu=mu, lam=lam)
+        solver = SolverFBA(model, iterations=50, stretching_model=stretching_model)
         s0, s1 = model.state(), model.state()
         for _ in range(30):  # implicit steps much longer than the 56 ms period settle the load
             solver.step(s0, s1, None, None, 0.1)

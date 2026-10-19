@@ -43,7 +43,7 @@ class TestCable(unittest.TestCase):
         model.particle_inv_mass.assign(np.divide(1.0, mass, out=np.zeros_like(mass), where=mass > 0))
         points = np.array([[s, 0.01, z] for s in np.linspace(0.005, 0.075, 8)])
         cable = SolverFBA.Cable(model, np.stack([points[:-1], points[1:]], axis=1))
-        return model, cable, SolverFBA(model, iterations=10, stretching_model="neohookean", mu=mu, lam=lam)
+        return model, cable, SolverFBA(model, iterations=10, stretching_model="neohookean")
 
     def _pull(self, ratio, steps=200):
         """Shorten the cable to ``ratio`` of its rest length over 1 s, as RealSim's cable controller ramps it."""

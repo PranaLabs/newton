@@ -40,8 +40,8 @@ def build_pd_system(
     model: Model,
     dt: float,
     pin_stiffness: float,
-    tri_weight_scale: float = 1.0,
-    tet_weight_scale: float = 1.0,
+    tri_weight_scale: float | np.ndarray = 1.0,
+    tet_weight_scale: float | np.ndarray = 1.0,
 ) -> tuple[CsrMatrix, dict[str, Any]]:
     """Assemble the constant scalar PD Hessian ``A`` for cloth.
 
@@ -51,8 +51,8 @@ def build_pd_system(
             ``particle_inv_mass == 0``.
         dt: Time step [s]. Enters as ``m_i / dt^2`` on the diagonal.
         pin_stiffness: PD soft-pin weight ``w_pin``. Larger means harder pin.
-        tri_weight_scale: Factor on every triangle's stretching weight.
-        tet_weight_scale: Factor on every tetrahedron's stretching weight.
+        tri_weight_scale: Factor on each triangle's stretching weight: a scalar or one per triangle.
+        tet_weight_scale: Factor on each tetrahedron's stretching weight: a scalar or one per tetrahedron.
 
     Returns:
         A tuple ``(A, meta)`` where ``A`` is an ``N x N`` symmetric PSD CSR

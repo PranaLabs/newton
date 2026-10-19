@@ -106,6 +106,7 @@ class Example:
             indices=tris.ravel().tolist(),
             density=1.0,
             tri_ke=mu,
+            tri_ka=lam,
             edge_ke=10.0,
             particle_radius=0.005,
         )
@@ -117,8 +118,6 @@ class Example:
             self.model,
             iterations=5,
             stretching_model="neohookean",
-            mu=mu,
-            lam=lam,
             face_contacts=True,
             soft_contact_thickness=CONTACT_THICKNESS,
             face_contact_margin=0.03,

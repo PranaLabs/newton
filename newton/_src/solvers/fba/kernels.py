@@ -719,6 +719,11 @@ def project_stretching_corotational_tet_compute_kernel(
     """
     t = wp.tid()
     mu, lam = lame[t][0], lame[t][1]
+    if tet_weight[t] == 0.0:
+        # No stiffness, such as a soft body's surface triangles: nothing to project.
+        for i in range(4):
+            contributions[t, i] = wp.vec3(0.0)
+        return
     i0 = tet_indices[4 * t + 0]
     i1 = tet_indices[4 * t + 1]
     i2 = tet_indices[4 * t + 2]
@@ -1680,6 +1685,11 @@ def project_stretching_neohookean_tet_compute_kernel(
     """
     t = wp.tid()
     mu, lam = lame[t][0], lame[t][1]
+    if tet_weight[t] == 0.0:
+        # No stiffness, such as a soft body's surface triangles: nothing to project.
+        for i in range(4):
+            contributions[t, i] = wp.vec3(0.0)
+        return
     i0 = tet_indices[4 * t + 0]
     i1 = tet_indices[4 * t + 1]
     i2 = tet_indices[4 * t + 2]
@@ -1786,6 +1796,11 @@ def project_stretching_neohookean_tet_compute_kernel_lbfgs(
     """
     t = wp.tid()
     mu, lam = lame[t][0], lame[t][1]
+    if tet_weight[t] == 0.0:
+        # No stiffness, such as a soft body's surface triangles: nothing to project.
+        for i in range(4):
+            contributions[t, i] = wp.vec3(0.0)
+        return
     i0 = tet_indices[4 * t + 0]
     i1 = tet_indices[4 * t + 1]
     i2 = tet_indices[4 * t + 2]
@@ -2198,6 +2213,11 @@ def project_stretching_corotational_compute_kernel(
     """
     t = wp.tid()
     mu, lam = lame[t][0], lame[t][1]
+    if tri_weight[t] == 0.0:
+        # No stiffness, such as a soft body's surface triangles: nothing to project.
+        for i in range(3):
+            contributions[t, i] = wp.vec3(0.0)
+        return
     i0 = tri_indices[3 * t + 0]
     i1 = tri_indices[3 * t + 1]
     i2 = tri_indices[3 * t + 2]
@@ -2458,6 +2478,11 @@ def project_stretching_neohookean_compute_kernel(
     """
     t = wp.tid()
     mu, lam = lame[t][0], lame[t][1]
+    if tri_weight[t] == 0.0:
+        # No stiffness, such as a soft body's surface triangles: nothing to project.
+        for i in range(3):
+            contributions[t, i] = wp.vec3(0.0)
+        return
     i0 = tri_indices[3 * t + 0]
     i1 = tri_indices[3 * t + 1]
     i2 = tri_indices[3 * t + 2]
@@ -2549,6 +2574,11 @@ def project_stretching_neohookean_compute_kernel_lbfgs(
     """
     t = wp.tid()
     mu, lam = lame[t][0], lame[t][1]
+    if tri_weight[t] == 0.0:
+        # No stiffness, such as a soft body's surface triangles: nothing to project.
+        for i in range(3):
+            contributions[t, i] = wp.vec3(0.0)
+        return
     i0 = tri_indices[3 * t + 0]
     i1 = tri_indices[3 * t + 1]
     i2 = tri_indices[3 * t + 2]

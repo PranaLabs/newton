@@ -16,6 +16,14 @@ from ..solver import SolverBase
 from .cable import Cable
 
 
+def _element_lame(materials: wp.array | None, count: int) -> tuple[np.ndarray, np.ndarray]:
+    """First and second Lamé parameters [Pa] of each element, from its material row."""
+    if count == 0:
+        return np.zeros(0), np.zeros(0)
+    rows = materials.numpy().astype(np.float64)
+    return rows[:, 0], rows[:, 1]
+
+
 def _host_mirror(name: str) -> property:
     """A host copy of a persistent multiplier buffer of :class:`SolverFBA`, read from the device when it is first
     read after a step."""
@@ -51,10 +59,10 @@ class SolverFBA(SolverBase):
       parameters needed; stiffness is fully encoded in ``tri_ke``.
     - ``"corotational"`` — Corotational linear elasticity: closed-form solve
       on singular values of F (2x2 for cloth, 3x3 Sherman-Morrison for tets).
-      Requires ``mu`` and ``lam`` (first and second Lame parameters [Pa]).
+      Takes each element's ``k_mu`` and ``k_lambda``, the first and second Lamé parameters [Pa].
     - ``"neohookean"`` — Neo-Hookean hyperelasticity: 5-iteration Newton solve
       on singular values of F (2x2 for cloth, 3x3 cofactor inverse for tets).
-      Requires ``mu`` and ``lam`` (first and second Lame parameters [Pa]).
+      Takes each element's ``k_mu`` and ``k_lambda``, the first and second Lamé parameters [Pa].
 
     Corotational and Neo-Hookean take the true Lamé parameters. Projective
     dynamics drops the dual variable of the local projection, so its fixed
@@ -105,8 +113,6 @@ class SolverFBA(SolverBase):
         iterations: int = 10,
         pin_stiffness: float = 1e12,
         stretching_model: Literal["arap", "corotational", "neohookean"] = "arap",
-        mu: float | None = None,
-        lam: float | None = None,
         friction: bool = True,
         mu_per_pair_override: np.ndarray | None = None,
         lambda_cap: float | None = None,
@@ -137,9 +143,6 @@ class SolverFBA(SolverBase):
                 RealSim's local-global solver.
             pin_stiffness: Soft-pin stiffness [N/m].
             stretching_model: Stretching model — ``"arap"``, ``"corotational"``, or ``"neohookean"``.
-            mu: First Lamé parameter [Pa] of the material; required for ``"corotational"``/``"neohookean"``,
-                which scale it by the gauge in the class notes.
-            lam: Second Lamé parameter [Pa] of the material; required for ``"corotational"``/``"neohookean"``.
             friction: If ``True`` (default) use Stage B Coulomb friction NSN solver;
                 otherwise use Stage A unilateral NSN.
             mu_per_pair_override: Optional ``(num_pairs,)`` array of friction
@@ -266,15 +269,6 @@ class SolverFBA(SolverBase):
             raise ValueError(f"nsn_schur_mode={nsn_schur_mode!r} not supported; choose 'full' or 'lite'")
         self.nsn_schur_mode = nsn_schur_mode
 
-        if stretching_model in ("corotational", "neohookean"):
-            if mu is None or lam is None:
-                raise ValueError(
-                    f"stretching_model={stretching_model!r} requires both mu and lam (first and second Lamé parameters)"
-                )
-            if mu <= 0:
-                raise ValueError("mu must be positive")
-            if lam <= 0:
-                raise ValueError("lam must be positive")
         if pin_stiffness <= 0:
             raise ValueError("pin_stiffness must be positive")
         if iterations < 1:
@@ -284,21 +278,22 @@ class SolverFBA(SolverBase):
         self.pin_stiffness = float(pin_stiffness)
         self.stretching_model = stretching_model
         self.nh_solver = nh_solver
-        self._mu = float(mu) if mu is not None else None
-        self._lam = float(lam) if lam is not None else None
-        # Dropped-dual gauge of the corotational and Neo-Hookean projections (see the class notes).
+        # Dropped-dual gauge of the corotational and Neo-Hookean projections (see the class notes), per element.
         self._tri_gauge = self._tet_gauge = 1.0
         if stretching_model in ("corotational", "neohookean"):
-            self._tri_gauge = (4.0 * self._mu + 3.0 * self._lam) / (2.0 * self._mu + self._lam)
-            self._tet_gauge = 2.0 + self._lam / (2.0 * (self._lam + self._mu))
-            self._tri_lame = (self._mu * self._tri_gauge, self._lam * self._tri_gauge)
-            self._tet_lame = (self._mu * self._tet_gauge, self._lam * self._tet_gauge)
-            self._tri_lame_d = wp.array(
-                np.tile(self._tri_lame, (model.tri_count, 1)), dtype=wp.vec2, device=model.device
-            )
-            self._tet_lame_d = wp.array(
-                np.tile(self._tet_lame, (model.tet_count, 1)), dtype=wp.vec2, device=model.device
-            )
+            tri_mu, tri_lam = _element_lame(model.tri_materials, model.tri_count)
+            tet_mu, tet_lam = _element_lame(model.tet_materials, model.tet_count)
+            # Elements with k_mu = 0, such as the surface triangles of a soft body, carry no stretching.
+            mu, lam = np.concatenate([tri_mu, tet_mu]), np.concatenate([tri_lam, tet_lam])
+            if (mu < 0).any() or (lam[mu > 0] <= 0).any():
+                raise ValueError(f"stretching_model={stretching_model!r} needs k_lambda > 0 wherever k_mu > 0")
+            with np.errstate(divide="ignore", invalid="ignore"):
+                self._tri_gauge = np.where(tri_mu > 0, (4.0 * tri_mu + 3.0 * tri_lam) / (2.0 * tri_mu + tri_lam), 1.0)
+                self._tet_gauge = np.where(tet_mu > 0, 2.0 + tet_lam / (2.0 * (tet_lam + tet_mu)), 1.0)
+            tri_lame = np.stack([tri_mu * self._tri_gauge, tri_lam * self._tri_gauge], axis=1)
+            tet_lame = np.stack([tet_mu * self._tet_gauge, tet_lam * self._tet_gauge], axis=1)
+            self._tri_lame_d = wp.array(tri_lame, dtype=wp.vec2, device=model.device)
+            self._tet_lame_d = wp.array(tet_lame, dtype=wp.vec2, device=model.device)
         self.friction = bool(friction)
         self._mu_per_pair_override = (
             np.asarray(mu_per_pair_override, dtype=np.float64) if mu_per_pair_override is not None else None
