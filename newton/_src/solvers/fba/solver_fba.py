@@ -214,7 +214,13 @@ class SolverFBA(SolverBase):
                 ``use_isodof=True`` and no ``mu_per_pair_override``. Mesh
                 and convex hull shapes must be closed. Warp's sign query
                 treats faces within 1e-3 of the mean edge length as equally
-                close, so parts thinner than that need a finer mesh.
+                close, so parts thinner than that need a finer mesh. A
+                particle contact on a mesh also gets a contact at each other
+                local minimum of the particle's distance to the mesh inside a
+                face or on an edge, within the particle radius plus the shape
+                margin plus ``face_contact_margin``: in a concave corner, such
+                as a V notch, the closest point alone holds the particle
+                against one side, and it slides through the other.
             face_contact_edge_radius: Radius [m] by which box and cylinder
                 edges are rounded in the signed distance the face contacts
                 minimize, at most half the shape's smallest extent. Inside a
@@ -313,7 +319,7 @@ class SolverFBA(SolverBase):
         self.face_contacts = bool(face_contacts)
         self.face_contact_edge_radius = float(face_contact_edge_radius)
         self.face_contact_margin = None if face_contact_margin is None else float(face_contact_margin)
-        self._face_query, self._contact_extra = None, None
+        self._face_query, self._contact_extra, self._mesh_shapes = None, None, False
         self._constraint_rows = None  # set_particle_constraints: particles, coefficients, directions, targets
         self._constraint_lengths = False  # the rows hold |sum_k c_k x_k|, along its direction at each iteration
         self._self_contact, self._lite_slot_rows, self._held_rows = None, None, None
@@ -341,9 +347,11 @@ class SolverFBA(SolverBase):
                     "and no mu_per_pair_override"
                 )
             if model.tri_count:
+                from ...geometry.types import GeoType  # noqa: PLC0415
                 from .face_contact import FaceContactQuery  # noqa: PLC0415
 
                 self._face_query = FaceContactQuery(model.tri_indices.numpy(), model.particle_count, model.device)
+                self._mesh_shapes = bool(model.shape_count) and bool((model.shape_type.numpy() == GeoType.MESH).any())
         self._rigid_dt: float | None = None
         self._rigid_linear_solver = None
 
@@ -2180,8 +2188,21 @@ class SolverFBA(SolverBase):
                 self._contact_count = 0
                 return
 
-            # Deterministic contact ordering (host-side lexsort — see comment above).
+            # A particle in a concave corner of a mesh touches every face of the corner, not only the closest.
+            if self._face_query is not None and self._mesh_shapes and M:
+                src = state if state is not None else self.model
+                alarm = 0.0 if self.face_contact_margin is None else self.face_contact_margin
+                more = self._face_query.mesh_minima(
+                    self.model, src.particle_q, src.body_q, particle_h, shape_h, body_pos_h, normal_h, alarm
+                )
+                contact = (particle_h, shape_h, body_pos_h, normal_h)
+                particle_h, shape_h, body_pos_h, normal_h = (np.concatenate(a) for a in zip(contact, more, strict=True))
+                M = int(particle_h.shape[0])
+
+            # Deterministic contact ordering (host-side lexsort — see comment above); the anchor orders the contacts
+            # of one particle and shape.
             sort_keys = (
+                *(body_pos_h[:, k].astype(np.float64) for k in (2, 1, 0)),
                 normal_h[:, 2].astype(np.float64),
                 normal_h[:, 1].astype(np.float64),
                 normal_h[:, 0].astype(np.float64),

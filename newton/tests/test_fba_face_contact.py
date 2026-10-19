@@ -477,6 +477,32 @@ class TestMeshContactMinima(unittest.TestCase):
         self.assertEqual(len(primary[0]), 1)
         self.assertEqual(len(minima[0]), 0)
 
+    def test_triangle_slides_into_the_notch(self):
+        """A frictionless triangle slides down the right face into the notch and stays a particle radius out of
+        both faces; held by its closest points alone, its particles slid through the left face."""
+        if not wp.is_cuda_available():
+            self.skipTest("The SolverFBA contact NSN needs CUDA")
+        builder = newton.ModelBuilder()
+        builder.add_shape_mesh(-1, mesh=_notch_mesh(0.2), cfg=newton.ModelBuilder.ShapeConfig(mu=0.0))
+        along = np.array([-1.0, 0.0, -1.0]) / np.sqrt(2.0)  # down the right face toward the notch
+        center = self.NOTCH - 0.3 * along + 0.006 * self.RIGHT
+        for offset in (0.02 * along, -0.01 * along + [0.0, 0.02, 0.0], -0.01 * along - [0.0, 0.02, 0.0]):
+            builder.add_particle(wp.vec3(*(center + offset)), wp.vec3(0.0), 0.01, radius=0.005)
+        builder.add_triangle(0, 1, 2, tri_ke=50.0)
+        model = builder.finalize()
+        solver = newton.solvers.SolverFBA(model, iterations=10, face_contacts=True, face_contact_margin=0.02)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.02)
+        contacts, s0, s1, lowest = pipeline.contacts(), model.state(), model.state(), np.inf
+        for _ in range(200):
+            pipeline.collide(s0, contacts)
+            solver.step(s0, s1, None, contacts, 0.005)
+            s0, s1 = s1, s0
+            gap = (s0.particle_q.numpy() - self.NOTCH) @ np.stack([self.LEFT, self.RIGHT], 1)
+            lowest = min(lowest, float(gap.min()) - 0.005)
+        self.assertGreater(lowest, -1.0e-3, f"a particle came {-lowest * 1e3:.1f} mm inside the contact surface")
+        x = s0.particle_q.numpy()
+        self.assertLess(np.abs(x[:, 0]).max(), 0.03, "the triangle did not settle in the notch")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
