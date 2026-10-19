@@ -13,12 +13,6 @@ compares against a numpy fp64 reference: the fp64 lift must agree with the
 reference within fp64 round-off (~1e-10 on the projected output) and must
 out-resolve the fp32-only baseline by 5+ orders of magnitude in projection
 accuracy on extreme stretches.
-
-Refs:
-  - RealSim ``signedEigenSVD`` (``SVD.cpp:7-29``) -- Eigen JacobiSVD<Mat3R>
-    + reflection sign correction, runs in double.
-  - Demo 4/5 Tier 2 drift root-cause spec:
-    ``docs/superpowers/specs/2026-05-18-demo4-5-tier2-rootcause.md``.
 """
 
 import unittest
@@ -326,7 +320,7 @@ class TestTetNeohookeanFp64(unittest.TestCase):
 
 
 class TestTetNeohookeanLbfgsFp64(unittest.TestCase):
-    """fp64 NH tet projection (LBFGS) -- the kernel actually used by Demo 4/5.
+    """fp64 NH tet projection with L-BFGS, the default ``nh_solver``.
 
     Confirms that the fp64 lift produces a finite, identity-respecting
     contribution and that for a moderately stretched F the LBFGS minimum

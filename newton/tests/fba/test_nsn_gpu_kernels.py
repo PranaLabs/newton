@@ -3,8 +3,7 @@
 
 """Tests for the GPU FB-row ``@wp.func`` ports and the Schur build kernel.
 
-Covers Step 2-4 of the NSN GPU port (see
-``docs/superpowers/plans/2026-05-17-fba-nsn-gpu-port.md``): verifies
+Verifies
 :func:`~newton._src.solvers.fba.kernels.fb_unilateral_row_wp`,
 :func:`~newton._src.solvers.fba.kernels.fb_frictional_row_wp` and
 :func:`~newton._src.solvers.fba.kernels.build_a_schur_kernel` against

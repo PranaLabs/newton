@@ -590,14 +590,13 @@ class TestBendingProjection(unittest.TestCase):
 
 
 class SolverFBABendingCurvedRestTests(unittest.TestCase):
-    """Regression (Task H'): bending local-step minimises curvature *magnitude*,
-    not direction, on curved rest cloth.
+    """Regression: the bending local step restores the curvature *magnitude*,
+    not its direction, on curved rest cloth.
 
-    The previous kernel scattered ``w · q · (q · x_ref)`` which is the gradient
+    An earlier kernel scattered ``w · q · (q · x_ref)`` which is the gradient
     of ``‖(q·x_cur) - (q·x_ref)‖²``. That penalises any deviation from the
     *rest curvature vector*, including curvature flips (e.g. cloth bent
-    against its rest direction). RealSim's
-    ``PDIsometricBendingEnergy::localProjection`` instead scatters
+    against its rest direction). The local projection instead scatters
     ``w · q · ê · ‖q·x_rest‖`` where ``ê = (q·x_cur) / ‖q·x_cur‖``: the
     direction follows ``x_cur`` and only the magnitude is restored.
 
@@ -1341,11 +1340,11 @@ class TestSolverFBAReconfigure(unittest.TestCase):
     def test_schur_invalidation_preserves_lambda_buffer_refs(self):
         """``_invalidate_schur_cache`` must not touch persistent λ/ω buffers.
 
-        Task 1.3.f: the persistent warm-start buffers
+        The persistent warm-start buffers
         (``_lam_unilateral_persistent``, ``_lam_coulomb_persistent``,
         ``_omega_unilateral_persistent``, ``_omega_coulomb_persistent``)
-        are reset/resized at step entry to match RealSim's per-step
-        ``cuda_lambda.setZero(_num_constraint)``. Schur factor
+        are reset/resized at step entry, so every step starts from zero
+        multipliers. Schur factor
         invalidation (driven by contact-set change or model notify) is
         a separate concern and must leave the warm-start buffers
         intact so the abstraction boundary stays clean.
@@ -2792,7 +2791,7 @@ class TestTetNeoHookean(unittest.TestCase):
 
 
 class TestPhase4StageAContact(unittest.TestCase):
-    """Phase 4 Stage A: unilateral plane contact via Schur complement.
+    """Unilateral (frictionless) plane contact via the Schur complement.
 
     Tests the hard-constraint contact path in SolverFBA — no friction,
     λ ≥ 0 only.  Each test constructs a :class:`~newton.Contacts` object
@@ -2847,8 +2846,8 @@ class TestPhase4StageAContact(unittest.TestCase):
             particle_indices: list[int] — particle index per contact.
             normals: list[tuple] — world-frame contact normal per contact.
             body_pos_world: list[tuple] — world anchor point per contact
-                (stored as-is in ``soft_contact_body_pos``; for Stage A tests
-                with static shapes this equals the world-frame anchor).
+                (stored as-is in ``soft_contact_body_pos``; for the frictionless
+                tests with static shapes this equals the world-frame anchor).
 
         Returns:
             :class:`~newton.Contacts` with ``soft_contact_count`` = ``count``.
@@ -3264,14 +3263,14 @@ class TestPhase4StageAContact(unittest.TestCase):
 
 
 class TestPhase4StageBFriction(unittest.TestCase):
-    """Phase 4 Stage B: Coulomb friction via NonSmooth Newton."""
+    """Coulomb friction via the semismooth Newton contact solve."""
 
     @classmethod
     def setUpClass(cls):
         wp.init()
 
     def test_friction_disabled_matches_stage_a(self):
-        """SolverFBA(friction=False) must produce bit-identical results to Stage A."""
+        """Step two ``friction=False`` solvers to bit-identical states, with the particle pushed out of the plane."""
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
         builder.add_cloth_mesh(
             pos=wp.vec3(0.0, 0.0, 0.0),
@@ -3578,8 +3577,8 @@ class TestPhase4StageBFriction(unittest.TestCase):
         contacts = pipeline.contacts()
 
         particle_count = model.particle_count
-        # mu_per_pair_override sized to particle_count — this is the Demo 3 pattern
-        # that previously triggered the bug.
+        # mu_per_pair_override sized to particle_count: that size previously
+        # triggered the bug.
         mu_override = np.full(particle_count, 0.4, dtype=np.float64)
         solver = SolverFBA(model, iterations=5, friction=True, mu_per_pair_override=mu_override)
 
@@ -3612,8 +3611,8 @@ class TestPhase4StageBFriction(unittest.TestCase):
 
 
 class TestPhase4StageCShapePrimitives(unittest.TestCase):
-    """Phase 4 Stage C: verify the Schur-complement pipeline works for non-plane
-    shape primitives (sphere, box) using Newton's real collision detection.
+    """Verify the Schur-complement pipeline works for non-plane shape
+    primitives (sphere, box) using Newton's real collision detection.
 
     All tests drive the FULL pipeline:  collide -> _ingest_contacts -> step.
     """
@@ -4066,9 +4065,9 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
     def test_lambda_cap_clamps_in_physical_force_units(self) -> None:
         """``lambda_cap`` is interpreted in physical force [N] units.
 
-        FBA's internal ``λ_FBA = λ_R/dt²``, so the clamp at the NSN clip
-        site must be ``self.lambda_cap / dt²`` (RealSim ``_maxforce``
-        semantics). Verifies both unilateral and Coulomb solvers.
+        The NSN multipliers are forces divided by ``dt²``, so the clamp at
+        the NSN clip site must be ``self.lambda_cap / dt²``. Verifies both
+        unilateral and Coulomb solvers.
         """
         model = self._tiny_cloth_model()
         lambda_cap = 1.0  # physical-force units [N]
@@ -4116,21 +4115,20 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
 
 
 class SolverFBAStageAStageBEquivalenceTests(unittest.TestCase):
-    """Stage A (unilateral, M-row) ≡ Stage B (frictional, 3M-row) at μ=0.
+    """The unilateral solve (``M`` rows) equals the frictional one (``3M`` rows) at μ=0.
 
-    Justifies keeping FBA's unilateral Stage A NSN (which has no RealSim
-    equivalent — RealSim always uses the 3M frictional path) as a
-    perf-valuable shortcut. The unit test below proves the two paths produce
-    numerically identical ``λ_n`` and ``lam_apply_n`` when ``μ = 0`` so the
-    short-circuit is a no-op in physical behavior.
+    The unilateral solve is a cheaper path for frictionless contact. The unit
+    test below shows that the two paths produce numerically identical ``λ_n``
+    and ``lam_apply_n`` when ``μ = 0``, so the shortcut does not change the
+    physical behavior.
 
-    Math: with ``μ = 0`` Stage B's frictional FB row collapses — at iter 0
+    Math: with ``μ = 0`` the frictional FB row collapses: at iter 0
     the inactive branch (``lam_n ≤ 0``) yields ``ω_t = 0, h_t = 0`` (since
     ``lam_t = 0``); at later iters the active branch with ``μ = 0`` and
     ``lam_t = 0`` yields ``ω_t = 1, h_t = 0, compliance_t = 1/dt``. When the
-    Stage B ``W`` is constructed block-diagonal (normal block = ``W_A``,
+    frictional ``W`` is constructed block-diagonal (normal block = ``W_A``,
     tangent blocks = identity, all cross-blocks zero), the resulting Schur
-    system decouples: the normal-normal sub-block matches Stage A's system
+    system decouples: the normal-normal sub-block matches the unilateral system
     exactly, and the tangent rows always solve to zero. Therefore ``λ_n``
     and ``ω_n·λ_n`` (the value applied as a correction) must agree to
     machine precision.
@@ -4160,7 +4158,7 @@ class SolverFBAStageAStageBEquivalenceTests(unittest.TestCase):
         pene0_a: np.ndarray,
         tangent_diag: float = 1.0,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Lift an M-row Stage A scenario to a 3M-row Stage B scenario.
+        """Lift an M-row unilateral scenario to a 3M-row frictional scenario.
 
         Normal-block ``W_b[3i, 3j] = W_a[i, j]``; tangent diagonals set to
         ``tangent_diag`` (any positive value works since tangent rows decouple
@@ -4292,10 +4290,10 @@ class TestContactForceObservable(unittest.TestCase):
 
 
 class SolverFBALambdaWarmStartTests(unittest.TestCase):
-    """λ warm-start across PD outer iters reproduces RealSim's per-frame reset.
+    """λ warm-starts across the PD outer iterations of a step and resets at every step.
 
     Verifies:
-    1. λ is zero at step entry (per-frame setZero).
+    1. λ is zero at step entry.
     2. After the first NSN call within a step, λ persistent is non-zero.
     3. After _ingest_contacts changes the set, λ persistent is reset.
     """
@@ -4382,7 +4380,7 @@ class SolverFBALambdaWarmStartTests(unittest.TestCase):
 
 
 class SolverFBAKinematicCylinderTests(unittest.TestCase):
-    """Per-shape angular velocity surfaces in Stage B tangent offsets."""
+    """Per-shape angular velocity surfaces in the tangent offsets of the friction rows."""
 
     def _ball_and_cylinder(self):
         """Tiny tet ball + 1 cylinder (axis +X world). Returns (model, pipeline, contacts)."""
@@ -4481,7 +4479,7 @@ class SolverFBAKinematicCylinderTests(unittest.TestCase):
         """For shapes with ω≠0, tangent basis is (cross(normal, axis), normalize(cross(normal, t1))).
 
         Verifies (i) v_anchor lies almost entirely along t1, (ii) projection onto
-        t2 ≈ 0 (the axial direction carries no anchor shift, matching RealSim).
+        t2 ≈ 0 (the axial direction carries no anchor shift).
         """
         model, pipeline, contacts = self._ball_and_cylinder()
         s_in = model.state()
@@ -4507,7 +4505,7 @@ class SolverFBAKinematicCylinderTests(unittest.TestCase):
         t2 = solver_spin._contact_tangent2_d.numpy()[:M].astype(np.float64)
         proj_t1 = np.einsum("ij,ij->i", t1, v)
         proj_t2 = np.einsum("ij,ij->i", t2, v)
-        # RealSim parity: v_anchor projection onto axial t2 must be ≈ 0.
+        # The v_anchor projection onto the axial t2 must be ≈ 0.
         # Allow small slack for numerical SVD / float32 round-trip on tangent arrays.
         self.assertLess(float(np.max(np.abs(proj_t2))), 1e-4)
         # And t1 must carry most of the v_anchor norm.
@@ -4754,7 +4752,7 @@ class SolverFBAIsodofJtLambdaDeterminismTests(unittest.TestCase):
     def _run_once(self) -> np.ndarray:
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
         builder.add_ground_plane()
-        # Cloth that develops Stage B friction contacts on the plane.
+        # Cloth that develops frictional contacts on the plane.
         builder.add_cloth_grid(
             pos=wp.vec3(-0.2, -0.2, 0.15),
             rot=wp.quat_identity(),
@@ -4862,15 +4860,15 @@ class FBNonsmoothFunctionTests(unittest.TestCase):
 
 
 class SolverFBAInIterReDeriveTests(unittest.TestCase):
-    """Task 1.3.g: in-iter ``b += dt²·J·(ω·λ)`` combined-form correction.
+    """In-iteration combined-form correction ``b += dt²·Jᵀ·(ω·λ)``.
 
-    Ports RealSim's ``NonSmoothNewton::applyConstraintCorrection`` flow
-    (``b += dt²·J·(ω·λ); _systemlinearsolver->solve(x, b)``) into FBA,
-    replacing the split-form ``x_cur += A⁻¹·Jᵀ·lam_apply``. The two are
-    algebraically equivalent by linearity of ``A⁻¹``; this test class
-    verifies both numerical equivalence and the warm-start preservation
-    that the combined-form bakes in through the next PD outer iter's
-    ``_rhs``.
+    The combined form increments the right-hand side and solves once,
+    ``b += dt²·Jᵀ·(ω·λ); x = A⁻¹·b``, in place of the split form
+    ``x_cur += A⁻¹·Jᵀ·lam_apply``. The two are algebraically equivalent by
+    linearity of ``A⁻¹``; this test class verifies their numerical
+    equivalence, the in-place update of the right-hand side, the pure solve
+    at ``lam = 0``, and that a solve keeps nothing from the previous one: the
+    warm start flows through the caller's persistent multipliers.
     """
 
     @classmethod
@@ -4973,14 +4971,7 @@ class SolverFBAInIterReDeriveTests(unittest.TestCase):
         )
 
     def test_combined_form_mutates_rhs_in_place(self):
-        """``rhs_inout`` is incremented by ``Jᵀ·lam`` (matches RealSim's
-        ``b += dt²·J·(ω·λ)`` in-place mutation).
-
-        This is the structural difference vs the split-form: in the
-        combined-form, the next PD outer iter's reuse of ``_rhs`` reflects
-        the prior iter's λ via the accumulated ``Jᵀ·λ`` term, which is
-        the warm-start mechanism RealSim relies on.
-        """
+        """Increment ``rhs_inout`` in place by ``Jᵀ·lam``, the ``b += dt²·Jᵀ·(ω·λ)`` of the combined form."""
         N = 16
         solver, _A_dense, particles, normals, alpha, _ = self._make_linear_solver(N=N)
         device = solver.device
@@ -5045,13 +5036,12 @@ class SolverFBAInIterReDeriveTests(unittest.TestCase):
         )
 
     def test_two_pd_outer_iters_preserve_warm_start_via_rhs(self):
-        """Simulate two PD outer iters; the second iter's ``Jᵀ·λ`` accumulates
-        on top of ``rhs`` exactly the way RealSim does ``b += dt²·J·(ω·λ)``.
+        """Simulate two PD outer iters, each with a fresh ``rhs``: the second solve is
+        ``A⁻¹·(rhs1 + Jᵀ·lam1)`` and keeps nothing from the first.
 
-        Verifies the warm-start preservation path: the combined-form uses
-        ``rhs`` mutation (rather than the deleted ``dt²·W·(ω·λ_init)``
-        term in NSN iter-0 penetration) to carry the prior iter's λ
-        forward into the next outer iter.
+        The solver rebuilds ``_rhs`` in every outer iteration, so the warm
+        start of λ flows through the caller's persistent multipliers, not
+        through buffers of the linear solver.
         """
         N = 16
         solver, A_dense, particles, normals, alpha, _ = self._make_linear_solver(N=N)
@@ -5103,7 +5093,7 @@ class SolverFBAInIterReDeriveTests(unittest.TestCase):
 
 
 class TestNeoHookeanLBFGS(unittest.TestCase):
-    """Unit tests for the RealSim-faithful LBFGS port (Tri/Tet NH local projection).
+    """Unit tests for the L-BFGS local projection of the Tri/Tet Neo-Hookean models.
 
     Validates :func:`project_neohookean_sigma2d_lbfgs` and
     :func:`project_neohookean_sigma3d_lbfgs` against ``scipy.optimize.minimize``

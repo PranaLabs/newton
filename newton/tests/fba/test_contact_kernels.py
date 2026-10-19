@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the GPU contact bookkeeping kernels (NSN GPU port Step 5.5).
+"""Tests for the GPU contact bookkeeping kernels.
 
 Covers the kernels that replaced the Python ``for`` loop in
 ``SolverFBA._ingest_contacts``:

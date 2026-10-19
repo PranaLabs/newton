@@ -46,7 +46,7 @@ class TestCable(unittest.TestCase):
         return model, cable, SolverFBA(model, iterations=10, stretching_model="neohookean")
 
     def _pull(self, ratio, steps=200):
-        """Shorten the cable to ``ratio`` of its rest length over 1 s, as RealSim's cable controller ramps it."""
+        """Shorten the cable linearly to ``ratio`` of its rest length over 1 s, then hold it."""
         model, cable, solver = self._finger()
         s0, s1 = model.state(), model.state()
         for step in range(steps):
