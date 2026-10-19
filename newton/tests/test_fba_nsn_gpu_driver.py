@@ -29,7 +29,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.fba import SolverFBA
-from newton.tests.fba._reference import fb_frictional_row, fb_unilateral_row, solve_nsn_unilateral
+from newton.tests.fba._reference import fb_frictional_row, fb_unilateral_row, solve_nsn_coulomb, solve_nsn_unilateral
 
 
 def _make_unilateral_inputs(M: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -231,7 +231,9 @@ class TestNSNCoulombGpuDriver(unittest.TestCase):
         W, r, pene0, mu = _make_coulomb_inputs(M=3, seed=11)
         dt = 0.01
 
-        lam_cpu, omega_cpu, lam_apply_cpu = solver._solve_nsn_coulomb(W, r, mu, pene0, max_iters=1, dt=dt)
+        lam_cpu, omega_cpu, lam_apply_cpu = solve_nsn_coulomb(
+            W, r, mu, pene0, max_iters=1, dt=dt, lambda_cap=solver.lambda_cap
+        )
         lam_gpu, omega_gpu, lam_apply_gpu = solver._solve_nsn_coulomb_gpu(W, r, mu, pene0, max_iters=1, dt=dt)
 
         # n=9 PCR cap → ~1e-6 relative; lambdas of magnitude ~few → atol 1e-4.
@@ -245,7 +247,9 @@ class TestNSNCoulombGpuDriver(unittest.TestCase):
         W, r, pene0, mu = _make_coulomb_inputs(M=20, seed=11)
         dt = 0.01
 
-        lam_cpu, omega_cpu, lam_apply_cpu = solver._solve_nsn_coulomb(W, r, mu, pene0, max_iters=1, dt=dt)
+        lam_cpu, omega_cpu, lam_apply_cpu = solve_nsn_coulomb(
+            W, r, mu, pene0, max_iters=1, dt=dt, lambda_cap=solver.lambda_cap
+        )
         lam_gpu, omega_gpu, lam_apply_gpu = solver._solve_nsn_coulomb_gpu(W, r, mu, pene0, max_iters=1, dt=dt)
 
         np.testing.assert_allclose(lam_gpu, lam_cpu, rtol=0, atol=1.0e-5)
