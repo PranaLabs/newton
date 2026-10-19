@@ -398,7 +398,8 @@ class FaceContactQuery:
 
     def mesh_minima(self, model, particle_q, body_q, particle, shape, body_pos, normal, alarm: float, slots: int = 3):
         """The other local minima of each particle contact's distance to a mesh, within the particle radius plus
-        the shape margin plus ``alarm`` [m], as ``(particle, shape, body_pos, normal)`` contact arrays.
+        the shape margin plus ``alarm`` [m], as ``(particle, shape, body_pos, normal, contact)`` arrays, where
+        ``contact`` indexes the particle contact each comes from.
 
         ``particle``, ``shape``, ``body_pos`` and ``normal`` list the particle contacts as ``Contacts`` holds
         them; each contact gets at most ``slots`` more, in the order of the contacts.
@@ -429,4 +430,5 @@ class FaceContactQuery:
             )
         hit = found.numpy()[:m].astype(bool)
         rows = np.nonzero(hit)[0]
-        return np.asarray(particle)[rows], np.asarray(shape)[rows], out[0].numpy()[:m][hit], out[1].numpy()[:m][hit]
+        minima = np.asarray(particle)[rows], np.asarray(shape)[rows], out[0].numpy()[:m][hit], out[1].numpy()[:m][hit]
+        return (*minima, rows)

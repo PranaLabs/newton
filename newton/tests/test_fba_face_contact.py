@@ -442,9 +442,10 @@ class TestMeshContactMinima(unittest.TestCase):
         """Above the notch and nearer its right face, the particle's closest point lies on that face alone; the
         other minimum adds the left face."""
         x = self.NOTCH + np.array([0.002, 0.0, 0.015])
-        primary, (particle, shape, body_pos, normal) = self._minima(x)
+        primary, (particle, shape, body_pos, normal, contact) = self._minima(x)
         np.testing.assert_allclose(primary[3], [self.RIGHT], atol=1e-5)
         np.testing.assert_array_equal(particle, [0])
+        np.testing.assert_array_equal(contact, [0])
         np.testing.assert_array_equal(shape, primary[1])
         np.testing.assert_allclose(normal, [self.LEFT], atol=1e-5)
         np.testing.assert_allclose(body_pos, [x - np.dot(x - self.NOTCH, self.LEFT) * self.LEFT], atol=1e-6)
@@ -453,7 +454,7 @@ class TestMeshContactMinima(unittest.TestCase):
         """On the ridge of a block 1 cm thick whose edges are split in 20, the minimum on the left face is found
         among the many triangles near the notch."""
         x = self.NOTCH + np.array([0.0015, 0.0034, 0.0179])
-        primary, (_, _, body_pos, normal) = self._minima(x, half_width=0.005, segments=20)
+        primary, (_, _, body_pos, normal, _) = self._minima(x, half_width=0.005, segments=20)
         np.testing.assert_allclose(primary[3], [self.RIGHT], atol=1e-5)
         np.testing.assert_allclose(normal, [self.LEFT], atol=1e-5)
         np.testing.assert_allclose(body_pos, [x - np.dot(x - self.NOTCH, self.LEFT) * self.LEFT], atol=1e-6)
@@ -502,6 +503,17 @@ class TestMeshContactMinima(unittest.TestCase):
         self.assertGreater(lowest, -1.0e-3, f"a particle came {-lowest * 1e3:.1f} mm inside the contact surface")
         x = s0.particle_q.numpy()
         self.assertLess(np.abs(x[:, 0]).max(), 0.03, "the triangle did not settle in the notch")
+        # Each row of the pipeline's particle contacts and of their other minima keeps its particle contact's index.
+        count = int(contacts.soft_contact_count.numpy()[0])
+        record = solver._contact_record_d.numpy()[: solver._contact_count]
+        rows = record >= 0
+        np.testing.assert_array_equal(np.unique(record[rows]), np.arange(count))
+        self.assertGreater(rows.sum(), count, "no particle has a second minimum in the notch")
+        pairs = np.stack([solver._contact_particle_d.numpy(), solver._contact_shape_d.numpy()])[
+            :, : solver._contact_count
+        ]
+        pipeline_pairs = np.stack([contacts.soft_contact_particle.numpy(), contacts.soft_contact_shape.numpy()])
+        np.testing.assert_array_equal(pairs[:, rows], pipeline_pairs[:, record[rows]])
 
 
 if __name__ == "__main__":

@@ -175,6 +175,14 @@ class TestSelfContactSolve(unittest.TestCase):
             detector.refit(s0.particle_q)
             detector.triangle_triangle_intersection_detection()
             worst = max(worst, int(detector.triangle_intersecting_triangles_count.numpy().sum()))
+        if solver._self_contact is not None:
+            # Each row of a particle-shape contact keeps its index in contacts; self contacts keep -1.
+            n, count = solver._contact_count, int(contacts.soft_contact_count.numpy()[0])
+            record, shape = solver._contact_record_d.numpy()[:n], solver._contact_shape_d.numpy()[:n]
+            np.testing.assert_array_equal(record < 0, shape < 0)
+            np.testing.assert_array_equal(np.sort(record[record >= 0]), np.arange(count))
+            particle = solver._contact_particle_d.numpy()[:n][record >= 0]
+            np.testing.assert_array_equal(particle, contacts.soft_contact_particle.numpy()[record[record >= 0]])
         z = s0.particle_q.numpy()[:, 2]
         return worst, z[model.particle_count // 2 :].mean() - z[: model.particle_count // 2].mean()
 

@@ -2100,6 +2100,8 @@ class SolverFBA(SolverBase):
         cap = max(max_contacts, 16)
         self._contact_buf_max = cap
         self._contact_particle_d = wp.empty(cap, dtype=wp.int32, device=device)
+        # The index in Contacts of the particle contact each row comes from, -1 for face and self contacts.
+        self._contact_record_d = wp.empty(cap, dtype=wp.int32, device=device)
         self._contact_normal_d = wp.empty(cap, dtype=wp.vec3, device=device)
         self._contact_alpha_d = wp.empty(cap, dtype=wp.float32, device=device)
         self._contact_offset_d = wp.empty(cap, dtype=wp.float64, device=device)
@@ -2175,7 +2177,7 @@ class SolverFBA(SolverBase):
         on_device = contacts is not None and self._face_query is None
         if on_device and getattr(self._self_contact, "mode", None) == "vertex_face":
             M, shape_contacts = self._assemble_contacts_on_device(contacts, state, M_raw)
-            particle_h = normal_h = alpha_h = shape_h = body_pos_h = extra = None
+            particle_h = normal_h = alpha_h = shape_h = body_pos_h = record_h = extra = None
         else:
             if contacts is None:
                 particle_h, shape_h = np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.int32)
@@ -2196,6 +2198,7 @@ class SolverFBA(SolverBase):
             shape_h = shape_h[valid_mask]
             body_pos_h = body_pos_h[valid_mask]
             normal_h = normal_h[valid_mask]
+            record_h = np.flatnonzero(valid_mask).astype(np.int32)
             M = int(particle_h.shape[0])
 
             if M == 0 and not other_contacts:
@@ -2209,8 +2212,10 @@ class SolverFBA(SolverBase):
                 more = self._face_query.mesh_minima(
                     self.model, src.particle_q, src.body_q, particle_h, shape_h, body_pos_h, normal_h, alarm
                 )
+                *more, parent = more
                 contact = (particle_h, shape_h, body_pos_h, normal_h)
                 particle_h, shape_h, body_pos_h, normal_h = (np.concatenate(a) for a in zip(contact, more, strict=True))
+                record_h = np.concatenate([record_h, record_h[parent]])
                 M = int(particle_h.shape[0])
 
             # Deterministic contact ordering (host-side lexsort — see comment above); the anchor orders the contacts
@@ -2228,6 +2233,7 @@ class SolverFBA(SolverBase):
             shape_h = shape_h[order]
             body_pos_h = body_pos_h[order]
             normal_h = normal_h[order]
+            record_h = record_h[order]
 
             # Face contacts follow the particle contacts: slot 0 holds their first particle.
             alpha_h, extra = np.ones(M, dtype=np.float32), None
@@ -2247,6 +2253,7 @@ class SolverFBA(SolverBase):
                     particle_h, alpha_h = np.concatenate([particle_h, tri[:, 0]]), np.concatenate([alpha_h, bary[:, 0]])
                     shape_h, body_pos_h = np.concatenate([shape_h, found[1]]), np.concatenate([body_pos_h, found[3]])
                     normal_h = np.concatenate([normal_h, found[4]])
+                    record_h = np.concatenate([record_h, np.full(len(found[0]), -1, dtype=np.int32)])
                     extra = [np.full((M, 2), -1, dtype=np.int32), np.zeros((M, 2), dtype=np.float32)]
                     extra = [np.concatenate([extra[0], tri[:, 1:]]), np.concatenate([extra[1], bary[:, 1:]])]
                     M = len(particle_h)
@@ -2260,6 +2267,7 @@ class SolverFBA(SolverBase):
                     particle_h, alpha_h = np.concatenate([particle_h, sp[:, 0]]), np.concatenate([alpha_h, sa[:, 0]])
                     shape_h, normal_h = np.concatenate([shape_h, np.full(len(sp), -1)]), np.concatenate([normal_h, sn])
                     body_pos_h = np.concatenate([body_pos_h, self.particle_self_contact_margin * sn])
+                    record_h = np.concatenate([record_h, np.full(len(sp), -1, dtype=np.int32)])
                     if extra is None:
                         extra = [np.full((M, 3), -1, dtype=np.int32), np.zeros((M, 3), dtype=np.float32)]
                     else:
@@ -2301,6 +2309,7 @@ class SolverFBA(SolverBase):
             self._contact_alpha_d.assign(alpha_h)
             self._contact_shape_d.assign(shape_h.astype(np.int32))
             self._contact_body_pos_d.assign(body_pos_h.astype(np.float32))
+            self._contact_record_d.assign(record_h)
 
         # Resolve model fields used by the GPU kernels.  When a field is
         # absent or empty we still pass a non-null dummy buffer through
@@ -2491,8 +2500,10 @@ class SolverFBA(SolverBase):
         outputs = [self._contact_particle_d, self._contact_normal_d, self._contact_alpha_d, self._contact_shape_d]
         outputs += [self._contact_body_pos_d, *extra]
         wp.launch(assemble_contacts_kernel, M, inputs, outputs, device=device)
+        wp.copy(self._contact_record_d, order, count=Ms)
         if M > Ms:
             self._contact_extra = extra
+            self._contact_record_d[Ms:M].fill_(-1)
         return M, Ms
 
     # ------------------------------------------------------------------
