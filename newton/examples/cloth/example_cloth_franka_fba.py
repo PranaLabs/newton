@@ -115,7 +115,7 @@ class Example:
 
         # Cloth elasticity (cm scale, mirrors VBD reference).  Tuned for
         # FBA's ARAP stretching + isometric bending below.
-        self.tri_ke = 1.0e4
+        self.tri_ke = 5000.0
         self.tri_ka = 1.0e4
         # ARAP stretching handles the elastic response; tri_kd here mirrors
         # the VBD reference's stretch-damping coefficient and gets surfaced

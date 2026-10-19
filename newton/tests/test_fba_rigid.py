@@ -265,7 +265,7 @@ class TestSolverFBARigidStep(unittest.TestCase):
                 ],
                 indices=[0, 1, 2, 1, 3, 2],
                 density=1.0,
-                tri_ke=1.0e2,
+                tri_ke=50.0,
                 tri_ka=0.0,
                 tri_kd=0.0,
                 edge_ke=1.0,

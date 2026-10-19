@@ -34,6 +34,7 @@ class TestSelfContactDetection(unittest.TestCase):
                 cell_x=0.02,
                 cell_y=0.02,
                 mass=0.01,
+                tri_ke=50.0,
             )
         return builder.finalize()
 
@@ -91,6 +92,7 @@ class TestSelfContactDetection(unittest.TestCase):
             cell_x=0.02,
             cell_y=0.02,
             mass=0.01,
+            tri_ke=50.0,
         )
         model = builder.finalize()
         tris = model.tri_indices.numpy()
@@ -117,6 +119,7 @@ class TestSelfContactDetection(unittest.TestCase):
             cell_x=0.02,
             cell_y=0.02,
             mass=0.01,
+            tri_ke=50.0,
         )
         model = builder.finalize()
         rest, tris = model.particle_q.numpy(), model.tri_indices.numpy()
@@ -146,7 +149,7 @@ class TestSelfContactSolve(unittest.TestCase):
         """Largest number of intersecting triangle pairs over the steps, then the gap between the sheets [m]."""
         builder = newton.ModelBuilder()
         builder.add_shape_box(-1, xform=wp.transform((0.0, 0.0, 0.25), wp.quat_identity()), hx=0.25, hy=0.25, hz=0.25)
-        grid = {"dim_x": cells, "dim_y": cells, "cell_x": 0.02, "cell_y": 0.02, "mass": 0.004, "tri_ke": 1e3}
+        grid = {"dim_x": cells, "dim_y": cells, "cell_x": 0.02, "cell_y": 0.02, "mass": 0.004, "tri_ke": 500.0}
         for z, shift in ((0.5, 0.0), (0.5 + start_gap, 0.004)):
             corner = wp.vec3(shift - 0.01 * cells, shift - 0.01 * cells, z)
             builder.add_cloth_grid(pos=corner, rot=wp.quat_identity(), vel=wp.vec3(0.0), tri_ka=1e3, **grid)
@@ -206,7 +209,7 @@ class TestSelfContactSolve(unittest.TestCase):
         does not throw the cloth, and the other contacts keep every triangle apart."""
         builder = newton.ModelBuilder()
         builder.add_shape_box(-1, xform=wp.transform((0.0, 0.0, 0.25), wp.quat_identity()), hx=0.25, hy=0.25, hz=0.25)
-        grid = {"dim_x": 6, "dim_y": 6, "cell_x": 0.02, "cell_y": 0.02, "mass": 0.004, "tri_ke": 1e3, "tri_ka": 1e3}
+        grid = {"dim_x": 6, "dim_y": 6, "cell_x": 0.02, "cell_y": 0.02, "mass": 0.004, "tri_ke": 500.0, "tri_ka": 1e3}
         for z, shift in ((0.5, 0.0), (0.505, 0.004)):
             corner = wp.vec3(shift - 0.06, shift - 0.06, z)
             builder.add_cloth_grid(pos=corner, rot=wp.quat_identity(), vel=wp.vec3(0.0), **grid)

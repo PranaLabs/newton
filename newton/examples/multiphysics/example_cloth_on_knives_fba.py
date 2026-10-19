@@ -105,7 +105,7 @@ class Example:
             vertices=[wp.vec3(*p) for p in pos],
             indices=tris.ravel().tolist(),
             density=1.0,
-            tri_ke=2.0 * mu,
+            tri_ke=mu,
             edge_ke=10.0,
             particle_radius=0.005,
         )

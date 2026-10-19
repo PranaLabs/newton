@@ -1891,7 +1891,7 @@ def project_stretching_arap_kernel(
         positions: Current particle positions [m], shape ``[particle_count]``.
         tri_indices: Flat triangle indices, shape ``[3 * tri_count]``.
         tri_rest_inv: Per-triangle 2x2 rest-pose inverse (``Dm_inv``).
-        tri_weight: Per-triangle stretching weight (`ke * area`).
+        tri_weight: Per-triangle stretching weight (``2 * k_mu * area``).
         rhs: Output RHS accumulator; receives atomic-add contributions.
     """
     t = wp.tid()
@@ -1965,7 +1965,7 @@ def project_stretching_arap_compute_kernel(
         positions: Current particle positions [m], shape ``[particle_count]``.
         tri_indices: Flat triangle indices, shape ``[3 * tri_count]``.
         tri_rest_inv: Per-triangle 2x2 rest-pose inverse (``Dm_inv``).
-        tri_weight: Per-triangle stretching weight (``ke * area``).
+        tri_weight: Per-triangle stretching weight (``2 * k_mu * area``).
         contributions: Output ``(tri_count, 3)`` per-local-vertex contribution.
     """
     t = wp.tid()
@@ -2086,7 +2086,7 @@ def project_stretching_corotational_kernel(
         positions: Current particle positions [m], shape ``[particle_count]``.
         tri_indices: Flat triangle indices, shape ``[3 * tri_count]``.
         tri_rest_inv: Per-triangle 2x2 rest-pose inverse (``Dm_inv``).
-        tri_weight: Per-triangle stretching weight (``ke * area``).
+        tri_weight: Per-triangle stretching weight (``2 * k_mu * area``).
         mu: First Lame parameter [Pa].
         lam: Second Lame parameter [Pa].
         rhs: Output RHS accumulator; receives atomic-add contributions.
@@ -2192,7 +2192,7 @@ def project_stretching_corotational_compute_kernel(
         positions: Current particle positions [m], shape ``[particle_count]``.
         tri_indices: Flat triangle indices, shape ``[3 * tri_count]``.
         tri_rest_inv: Per-triangle 2x2 rest-pose inverse (``Dm_inv``).
-        tri_weight: Per-triangle stretching weight (``ke * area``).
+        tri_weight: Per-triangle stretching weight (``2 * k_mu * area``).
         lame: First and second Lamé parameters of each element [Pa].
         contributions: Output ``(tri_count, 3)`` per-local-vertex contribution.
     """
@@ -2346,7 +2346,7 @@ def project_stretching_neohookean_kernel(
         positions: Current particle positions [m], shape ``[particle_count]``.
         tri_indices: Flat triangle indices, shape ``[3 * tri_count]``.
         tri_rest_inv: Per-triangle 2x2 rest-pose inverse (``Dm_inv``).
-        tri_weight: Per-triangle stretching weight (``ke * area``).
+        tri_weight: Per-triangle stretching weight (``2 * k_mu * area``).
         mu: First Lame parameter [Pa].
         lam: Second Lame parameter [Pa].
         rhs: Output RHS accumulator; receives atomic-add contributions.
@@ -2452,7 +2452,7 @@ def project_stretching_neohookean_compute_kernel(
         positions: Current particle positions [m], shape ``[particle_count]``.
         tri_indices: Flat triangle indices, shape ``[3 * tri_count]``.
         tri_rest_inv: Per-triangle 2x2 rest-pose inverse (``Dm_inv``).
-        tri_weight: Per-triangle stretching weight (``ke * area``).
+        tri_weight: Per-triangle stretching weight (``2 * k_mu * area``).
         lame: First and second Lamé parameters of each element [Pa].
         contributions: Output ``(tri_count, 3)`` per-local-vertex contribution.
     """

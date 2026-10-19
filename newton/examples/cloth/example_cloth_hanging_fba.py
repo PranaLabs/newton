@@ -43,7 +43,7 @@ class Example:
             cell_x=0.05,
             cell_y=0.05,
             mass=0.1,
-            tri_ke=1.0e4,
+            tri_ke=5000.0,
             tri_ka=0.0,
             tri_kd=0.0,
             edge_ke=1.0e-1,

@@ -122,7 +122,7 @@ class Example:
             vertices=[wp.vec3(*v.tolist()) for v in verts_world],
             indices=tris.reshape(-1).tolist(),
             density=density,
-            tri_ke=2.0 * mu,
+            tri_ke=mu,
             tri_ka=0.0,
             tri_kd=0.0,
             edge_ke=0.0,

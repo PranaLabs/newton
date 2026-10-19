@@ -62,7 +62,7 @@ def build_pd_system(
         - ``meta["tri_indices"]`` : ``np.ndarray[int32]`` shape (T, 3)
         - ``meta["tri_rest_inv"]`` : ``np.ndarray[float64]`` shape (T, 2, 2)
         - ``meta["tri_area"]`` : ``np.ndarray[float64]`` shape (T,)
-        - ``meta["tri_weight"]`` : ``np.ndarray[float64]`` shape (T,)  (= ke * area)
+        - ``meta["tri_weight"]`` : ``np.ndarray[float64]`` shape (T,)  (= 2 * k_mu * area)
         - ``meta["edge_indices"]`` : ``np.ndarray[int32]`` shape (E, 4)
         - ``meta["edge_quad_q"]`` : ``np.ndarray[float64]`` shape (E, 4)  (k-coefs)
         - ``meta["edge_quad_scale"]`` : ``np.ndarray[float64]`` shape (E,)  (3/(A0+A1))
@@ -115,10 +115,9 @@ def build_pd_system(
             tri_rest_inv = _compute_rest_inv_from_positions(model)
 
         tri_area = model.tri_areas.numpy().astype(np.float64)
-        # tri_materials column 0 is ke (area-weighted stretching stiffness).
+        # tri_materials column 0 is k_mu, the first Lamé parameter [Pa]: PD weight 2 * k_mu * area.
         tri_materials = model.tri_materials.numpy().astype(np.float64)
-        ke = tri_materials[:, 0]
-        tri_weight = ke * tri_area * tri_weight_scale
+        tri_weight = 2.0 * tri_materials[:, 0] * tri_area * tri_weight_scale
 
         # Vectorized 3x3 stencil scatter: G_t = ST @ Dm_inv_t, K_t = G_t @ G_t.T.
         # Then for each triangle we contribute w_t * K_t[a,b] to A[v_a, v_b]

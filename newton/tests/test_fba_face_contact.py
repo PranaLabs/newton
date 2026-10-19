@@ -42,7 +42,7 @@ def _add_triangle_over_tip(builder):
     """A triangle of circumradius 0.15 m centered 4 mm above the origin; its particles are 0.13 m from the pyramid."""
     for a in np.deg2rad([0.0, 120.0, 240.0]):
         builder.add_particle(wp.vec3(0.15 * np.cos(a), 0.15 * np.sin(a), 0.004), wp.vec3(0.0), 0.01, radius=0.002)
-    builder.add_triangle(0, 1, 2)
+    builder.add_triangle(0, 1, 2, tri_ke=50.0)
 
 
 def _draped_triangle(scale=0.15):
@@ -136,8 +136,8 @@ class TestFaceContactQuery(unittest.TestCase):
         tent = np.array([[-0.05, 0.0, 0.04], [0.0, -0.05, 0.01], [0.0, 0.05, 0.01], [0.05, 0.0, 0.04]])
         for p in np.concatenate([tent, tent[:3] * [1.0, 1.0, -1.0]]) + center:
             builder.add_particle(wp.vec3(*p), wp.vec3(0.0), 0.01)
-        builder.add_triangle(0, 1, 2)
-        builder.add_triangle(*((4, 5, 6) if mirrored else (3, 2, 1)))
+        builder.add_triangle(0, 1, 2, tri_ke=50.0)
+        builder.add_triangle(*((4, 5, 6) if mirrored else (3, 2, 1)), tri_ke=50.0)
         model = builder.finalize()
         query = FaceContactQuery(model.tri_indices.numpy(), model.particle_count, model.device)
         particles = np.array(contact_particles)
@@ -260,7 +260,7 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
             cell_x=0.05,
             cell_y=0.05,
             mass=0.002,
-            tri_ke=5.0e3,
+            tri_ke=2500.0,
             tri_ka=5.0e3,
             edge_ke=0.1,
         )
@@ -366,6 +366,7 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
             cell_x=0.1,
             cell_y=0.1,
             mass=0.01,
+            tri_ke=50.0,
         )
         with self.assertRaises(ValueError):
             newton.solvers.SolverFBA(builder.finalize(), friction=False, face_contacts=True)

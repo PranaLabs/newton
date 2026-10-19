@@ -65,9 +65,9 @@ class SolverFBA(SolverBase):
     ``c = (4 * mu + 3 * lam) / (2 * mu + lam)`` for triangles. SolverFBA
     scales ``mu``, ``lam`` and the stretching weights of these models by
     ``c``, as RealSim does, which restores the modulus: at every strain for
-    corotational elasticity, at small strain for Neo-Hookean. Set ``tri_ke``
-    to ``2 * mu`` for triangles and ``k_mu`` to ``mu`` for tetrahedra, the
-    weight the correction assumes. ARAP is exact and unscaled.
+    corotational elasticity, at small strain for Neo-Hookean. The stretching
+    weight of every element is ``2 * k_mu`` times its rest area or volume
+    (``tri_ke`` is a triangle's ``k_mu``). ARAP is exact and unscaled.
 
     Notes:
         - Float32 ``particle_q`` output: the interior linear solver

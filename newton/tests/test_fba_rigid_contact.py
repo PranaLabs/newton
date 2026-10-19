@@ -534,7 +534,7 @@ class TestSolverFBATwoWayContacts(unittest.TestCase):
             builder.add_ground_plane()
         box = builder.add_body(xform=wp.transform((0.0, 0.0, 0.5), wp.quat_identity()))
         builder.add_shape_box(box, cfg=newton.ModelBuilder.ShapeConfig(density=box_density))
-        grid = {"dim_x": 4, "dim_y": 4, "cell_x": 0.1, "cell_y": 0.1, "tri_ke": 1.0e3, "tri_ka": 1.0e3, "edge_ke": 1.0}
+        grid = {"dim_x": 4, "dim_y": 4, "cell_x": 0.1, "cell_y": 0.1, "tri_ke": 500.0, "tri_ka": 1.0e3, "edge_ke": 1.0}
         pos, vel = wp.vec3(-0.2, -0.2, cloth_z), wp.vec3(0.0, 0.0, v_cloth)
         builder.add_cloth_grid(pos=pos, rot=wp.quat_identity(), vel=vel, mass=particle_mass, **grid)
         model = builder.finalize()

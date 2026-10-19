@@ -65,7 +65,7 @@ class Example:
             -1, xform=wp.transform((0.0, -0.5, 0.1), wp.quat_identity()), hx=0.4, hy=0.4, hz=0.1, color=(0.5,) * 3
         )
         # A 1 kg/m^2 towel whose stretching, 50 N/m, and bending match the Franka shirt example's per unit mass.
-        towel = {"tri_ke": 50.0, "tri_ka": 50.0, "edge_ke": 7.5e-6, "particle_radius": THICKNESS}
+        towel = {"tri_ke": 25.0, "tri_ka": 50.0, "edge_ke": 7.5e-6, "particle_radius": THICKNESS}
         cells = round((FAR - NEAR) / CELL), round((CORNERS_Y[1] - CORNERS_Y[0]) / CELL)
         corner = wp.vec3(NEAR, CORNERS_Y[0], TABLE_TOP + THICKNESS)
         builder.add_cloth_grid(

@@ -69,7 +69,7 @@ class Example:
             cell_x=1.0 / 16.0,
             cell_y=1.0 / 16.0,
             mass=0.002,
-            tri_ke=5.0e3,
+            tri_ke=2500.0,
             tri_ka=5.0e3,
             edge_ke=0.1,
         )
