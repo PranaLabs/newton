@@ -56,7 +56,9 @@ class Example:
         self.hand = builder.body_count - 3
         self.fingers = [builder.body_count - 2, builder.body_count - 1]
         table = newton.ModelBuilder.ShapeConfig(mu=0.5)
-        builder.add_shape_box(-1, wp.transform((0.0, -0.5, 0.1), wp.quat_identity()), hx=0.4, hy=0.4, hz=0.1, cfg=table)
+        builder.add_shape_box(
+            -1, xform=wp.transform((0.0, -0.5, 0.1), wp.quat_identity()), hx=0.4, hy=0.4, hz=0.1, cfg=table
+        )
 
         # A 113 g foam ball: young 50 kPa, poisson 0.4.
         young, poisson = 5.0e4, 0.4
@@ -78,7 +80,6 @@ class Example:
         )
         builder.add_ground_plane()
         self.model = builder.finalize()
-        self.model.shape_contact_pair_count = 0
 
         # IK places the middle of the fingertip pads, 0.21 m along the last link, pointing down; the joint limits
         # keep the arm in range. The robot starts in the first key pose.
@@ -105,7 +106,7 @@ class Example:
             integrate_with_external_rigid_solver=True,
             soft_contact_thickness=THICKNESS,
         )
-        self.pipeline = newton.CollisionPipeline(self.model, soft_contact_margin=0.005)
+        self.pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=0.005)
         self.contacts = self.pipeline.contacts()
         self.gravity = self.model.gravity.numpy()
 

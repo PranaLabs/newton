@@ -109,7 +109,7 @@ class Example:
             total_vol += abs(np.dot(np.cross(v1 - v0, v2 - v0), v3 - v0)) / 6.0
         density = _TOTAL_MASS / max(total_vol, 1e-12)
 
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=_GRAVITY)
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, _GRAVITY, 0.0))
         builder.add_soft_mesh(
             pos=wp.vec3(0.0, 0.0, 0.0),
             rot=wp.quat_identity(),

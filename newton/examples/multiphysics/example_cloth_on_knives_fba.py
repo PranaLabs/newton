@@ -88,7 +88,7 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
 
-        builder = newton.ModelBuilder(gravity=-10.0)
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -10.0))
         builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.0))
         builder.add_shape_mesh(-1, mesh=knife_mesh(), cfg=newton.ModelBuilder.ShapeConfig(mu=0.3))
 
@@ -124,7 +124,7 @@ class Example:
             face_contact_margin=0.03,
             nsn_linear_iterations=10,
         )
-        self.pipeline = newton.CollisionPipeline(self.model, soft_contact_margin=0.03)
+        self.pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=0.03)
         self.contacts = self.pipeline.contacts()
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()

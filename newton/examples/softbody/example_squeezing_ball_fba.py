@@ -188,7 +188,7 @@ class Example:
         verts_local, tets = _ball_mesh()  # 6859 particles
         verts_world = verts_local * _BALL_SCALE + _BALL_TRANS
 
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=_GRAVITY)
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, _GRAVITY, 0.0))
 
         total_vol = 0.0
         for t in tets:
@@ -307,7 +307,7 @@ class Example:
             nsn_linear_iterations=10,
         )
 
-        self.pipeline = newton.CollisionPipeline(self.model, soft_contact_margin=0.05)
+        self.pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=0.05)
         self.contacts = self.pipeline.contacts()
 
         self.state_0 = self.model.state()

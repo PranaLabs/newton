@@ -92,7 +92,7 @@ def build_hanging_cloth_cm_builder() -> tuple[newton.ModelBuilder, np.ndarray]:
     # Scale m → cm: positions multiply by 100.
     verts_world = ((verts_local * _SCALE) @ _rot_x(_ROT_X_DEG).T + _TRANS).astype(np.float32)
 
-    builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=_GRAVITY)
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, _GRAVITY, 0.0))
 
     e1 = verts_world[tris[:, 1]] - verts_world[tris[:, 0]]
     e2 = verts_world[tris[:, 2]] - verts_world[tris[:, 0]]

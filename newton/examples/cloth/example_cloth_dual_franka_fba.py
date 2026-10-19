@@ -61,15 +61,26 @@ class Example:
             builder.joint_q[-9:] = [0.0, 0.0, 0.0, -1.59695, 0.0, 2.5307, 0.0, OPEN, OPEN]
             self.hands.append(builder.body_count - 3)
             self.fingers.append(builder.joint_coord_count - 2)
-        builder.add_shape_box(-1, wp.transform((0.0, -0.5, 0.1), wp.quat_identity()), 0.4, 0.4, 0.1, color=(0.5,) * 3)
+        builder.add_shape_box(
+            -1, xform=wp.transform((0.0, -0.5, 0.1), wp.quat_identity()), hx=0.4, hy=0.4, hz=0.1, color=(0.5,) * 3
+        )
         # A 1 kg/m^2 towel whose stretching, 50 N/m, and bending match the Franka shirt example's per unit mass.
         towel = {"tri_ke": 50.0, "tri_ka": 50.0, "edge_ke": 7.5e-6, "particle_radius": THICKNESS}
         cells = round((FAR - NEAR) / CELL), round((CORNERS_Y[1] - CORNERS_Y[0]) / CELL)
         corner = wp.vec3(NEAR, CORNERS_Y[0], TABLE_TOP + THICKNESS)
-        builder.add_cloth_grid(corner, wp.quat_identity(), wp.vec3(0.0), *cells, CELL, CELL, CELL * CELL, **towel)
+        builder.add_cloth_grid(
+            pos=corner,
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=cells[0],
+            dim_y=cells[1],
+            cell_x=CELL,
+            cell_y=CELL,
+            mass=CELL * CELL,
+            **towel,
+        )
         builder.add_ground_plane()
         self.model = builder.finalize()
-        self.model.shape_contact_pair_count = 0
 
         # IK places the middle of each hand's fingertip pads, pointing down; the arms start in the first key pose.
         self.ik_q = wp.array(self.model.joint_q, shape=(1, self.model.joint_coord_count))
@@ -100,7 +111,7 @@ class Example:
             particle_topological_contact_filter_threshold=1,
             particle_rest_shape_contact_exclusion_radius=SELF_RADIUS,
         )
-        self.pipeline = newton.CollisionPipeline(self.model, soft_contact_margin=THICKNESS)
+        self.pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=THICKNESS)
         self.contacts = self.pipeline.contacts()
         self.gravity = self.model.gravity.numpy()
         self.held = [None, None]  # per hand: pinched particles, their pad frame points before and after rising, time

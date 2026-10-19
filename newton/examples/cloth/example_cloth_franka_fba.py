@@ -133,7 +133,7 @@ class Example:
 
         self.viewer = viewer
 
-        self.scene = ModelBuilder(gravity=-981.0)
+        self.scene = ModelBuilder(gravity=(0.0, 0.0, -981.0))
 
         if self.add_robot:
             franka = ModelBuilder()
@@ -151,7 +151,7 @@ class Example:
         self.table_shape_idx = self.scene.shape_count
         self.scene.add_shape_box(
             -1,
-            wp.transform(self.table_pos_cm, wp.quat_identity()),
+            xform=wp.transform(self.table_pos_cm, wp.quat_identity()),
             hx=self.table_hx_cm,
             hy=self.table_hy_cm,
             hz=self.table_hz_cm,
@@ -247,7 +247,7 @@ class Example:
         # Contact pipeline shared with FBA — same custom margin as VBD.
         self.collision_pipeline = newton.CollisionPipeline(
             self.model,
-            soft_contact_margin=self.cloth_body_contact_margin,
+            soft_contact_gap=self.cloth_body_contact_margin,
         )
         self.contacts = self.collision_pipeline.contacts()
 
@@ -553,7 +553,6 @@ class Example:
                 particle_count = self.model.particle_count
                 self.model.particle_count = 0
                 self.model.gravity.assign(self.gravity_zero)
-                self.model.shape_contact_pair_count = 0
                 self.state_0.joint_qd.assign(self.target_joint_qd)
                 self.robot_solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
                 self.state_0.particle_f.zero_()

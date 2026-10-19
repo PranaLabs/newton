@@ -106,7 +106,7 @@ def build_cloth_on_sphere_builder() -> newton.ModelBuilder:
     # Rx(90°) then scale then translate (matches RealSim transformation block).
     verts_world = ((verts_local * _SCALE) @ _rot_x(_ROT_X_DEG).T + _TRANS).astype(np.float32)
 
-    builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=_GRAVITY)
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, _GRAVITY, 0.0))
 
     # Density bookkeeping — actual particle mass is uniform-lumped post-finalize.
     e1 = verts_world[tris[:, 1]] - verts_world[tris[:, 0]]
@@ -197,7 +197,7 @@ class Example:
             nsn_schur_mode=self.schur_mode,
         )
 
-        self.pipeline = newton.CollisionPipeline(self.model, soft_contact_margin=0.05)
+        self.pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=0.05)
         self.contacts = self.pipeline.contacts()
 
         self.state_0 = self.model.state()

@@ -57,10 +57,19 @@ class Example:
         for side in (-1.0, 1.0):
             inner = side * (BOX + GAP)
             builder.add_soft_grid(
-                wp.vec3(min(inner, inner + side * 4 * CELL), -2 * CELL, BOTTOM),
-                wp.quat_identity(),
-                wp.vec3(0.0),
-                *(4, 4, 20, CELL, CELL, CELL, 1100.0, mu, lam, 0.0),
+                pos=wp.vec3(min(inner, inner + side * 4 * CELL), -2 * CELL, BOTTOM),
+                rot=wp.quat_identity(),
+                vel=wp.vec3(0.0),
+                dim_x=4,
+                dim_y=4,
+                dim_z=20,
+                cell_x=CELL,
+                cell_y=CELL,
+                cell_z=CELL,
+                density=1100.0,
+                k_mu=mu,
+                k_lambda=lam,
+                k_damp=0.0,
                 particle_radius=0.002,
             )
         self.model = builder.finalize()
@@ -91,7 +100,7 @@ class Example:
             # 41 rad/s at the default 1e-2; damping them by 0.1 leaves 1.3 rad/s.
             contact_regularization=0.1,
         )
-        self.pipeline = newton.CollisionPipeline(self.model, soft_contact_margin=0.01)
+        self.pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=0.01)
         self.contacts = self.pipeline.contacts()
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
