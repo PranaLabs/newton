@@ -7,7 +7,6 @@ import functools
 import math
 import time
 from collections.abc import Callable
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
 
@@ -605,17 +604,6 @@ class SolverFBA(SolverBase):
         self._omega_unilateral_persistent: np.ndarray | None = None
         self._omega_coulomb_persistent: np.ndarray | None = None
 
-        # Optional single-frame diagnostic dump of per-PD-outer-iter intermediate
-        # variables, used for line-by-line parity with RealSim. Enabled via
-        # :meth:`configure_diagnostic_dump`. ``_step_count`` is incremented at the
-        # start of each :meth:`step` call; when it equals ``_diag_frame``, the
-        # solver records intermediate state and writes the buffers as ``.npz``
-        # to ``_diag_out_path`` at end of step.
-        self._diag_frame: int | None = None
-        self._diag_out_path: Path | None = None
-        self._diag_buffers: dict[str, np.ndarray] = {}
-        self._step_count: int = 0
-
         # Per-element device data (filled by _setup_pd_system).
         self._tri_indices_d = None
         self._tri_rest_inv_d = None
@@ -743,24 +731,6 @@ class SolverFBA(SolverBase):
             if window is None
             else min(window, len(self._timing_local_ms_per_iter)),
         }
-
-    def configure_diagnostic_dump(self, frame: int, out_path: str) -> None:
-        """Configure a single-frame diagnostic dump of PD intermediate state.
-
-        On the ``frame``-th call to :meth:`step` (1-indexed), the solver
-        captures per-PD-outer-iter intermediate variables (``x_pre``,
-        ``x_inertia``, ``rhs_k{k}``, ``x_post_solve_k{k}``) into an in-memory
-        buffer and writes them to ``out_path`` as a ``.npz`` archive once
-        the step completes. Used to compare against RealSim's binary dumps
-        for line-by-line parity verification.
-
-        Args:
-            frame: 1-indexed step number at which to capture the dump.
-            out_path: Destination ``.npz`` file path.
-        """
-        self._diag_frame = int(frame)
-        self._diag_out_path = Path(out_path)
-        self._diag_buffers = {}
 
     def _setup_rigid_system(self, dt: float) -> None:
         """Factor the rigid block for the dynamic bodies this solver integrates."""
@@ -1469,17 +1439,6 @@ class SolverFBA(SolverBase):
             write_velocity_kernel,
         )
 
-        # Diagnostic dump: increment step counter at the START so frame N
-        # corresponds to the N-th step() call (1-indexed). _diag_active becomes
-        # True only on the configured frame; if not configured, it is always
-        # False and all dump code below is a no-op.
-        self._step_count += 1
-        _diag_active = self._diag_frame is not None and self._step_count == self._diag_frame
-        if _diag_active:
-            self._diag_buffers = {
-                "x_pre": state_in.particle_q.numpy().astype(np.float64).copy(),
-            }
-
         self._two_way = False
         rigid = self.model.body_count > 0 and not self.integrate_with_external_rigid_solver
         rigid = rigid and self._begin_rigid_step(state_in, state_out, dt)
@@ -1607,9 +1566,6 @@ class SolverFBA(SolverBase):
         # Initialize current iterate x_cur = x_inertia (copy).
         wp.copy(self._x_cur, self._x_inertia)
 
-        if _diag_active:
-            self._diag_buffers["x_inertia"] = self._x_inertia.numpy().astype(np.float64).copy()
-
         # 2) PD outer iterations.
         _perf_on = self.enable_perf_timing
 
@@ -1618,11 +1574,9 @@ class SolverFBA(SolverBase):
         # by ``_setup_pd_system`` and the buffer pointers (``_rhs``, ``_x_cur``,
         # ``_tri_contrib_d``, ...) are stable, so a single
         # ``wp.capture_launch`` per PD iter replaces ~25-30 individual
-        # ``wp.launch`` dispatches.  We avoid the graph when ``_diag_active``
-        # (needs per-iter host downloads) or ``_perf_on`` (needs per-iter
-        # ``wp.synchronize_device`` brackets); both flags are stable for the
-        # duration of the call so the branch is cheap.
-        _use_lg_graph = (not _perf_on) and (not _diag_active) and wp.get_device(device).is_cuda
+        # ``wp.launch`` dispatches.  We avoid the graph when ``_perf_on``
+        # (needs per-iter ``wp.synchronize_device`` brackets).
+        _use_lg_graph = (not _perf_on) and wp.get_device(device).is_cuda
         _lg_graph = self._get_or_build_lg_iter_graph(dt) if _use_lg_graph else None
 
         for _k in range(self.iterations):
@@ -1632,8 +1586,7 @@ class SolverFBA(SolverBase):
                 # linear solve in a single ``cuGraphLaunch``.  All per-iter
                 # state is read from ``self._x_cur`` (the previous iter's
                 # result) and written through the same buffers.  Skipped
-                # when ``_perf_on`` (needs per-section syncs) or
-                # ``_diag_active`` (needs per-iter host downloads).
+                # when ``_perf_on`` (needs per-section syncs).
                 wp.capture_launch(_lg_graph)
             else:
                 if _perf_on:
@@ -1642,8 +1595,6 @@ class SolverFBA(SolverBase):
                 # Separate the local projections from the linear solve so the
                 # ``_perf_on`` path can time each section independently.
                 self._run_pd_local_phase_eager(N, dt, include_linear_solve=False)
-                if _diag_active:
-                    self._diag_buffers[f"rhs_k{_k}"] = self._rhs.numpy().astype(np.float64).copy()
 
                 if _perf_on:
                     wp.synchronize_device()
@@ -1656,9 +1607,6 @@ class SolverFBA(SolverBase):
                 if _perf_on:
                     wp.synchronize_device()
                     self._timing_linear_solve_ms_per_iter.append(1000.0 * (time.perf_counter() - _t_lin_0))
-
-            if _diag_active:
-                self._diag_buffers[f"x_post_solve_k{_k}"] = self._x_cur.numpy().astype(np.float64).copy()
 
             if (has_contacts or n_b) and not self._two_way:
                 # --- Schur-complement NSN contact correction ---
@@ -1989,28 +1937,6 @@ class SolverFBA(SolverBase):
         # for the device. When M==0 the host arrays were left at None / unchanged.
         if has_contacts:
             self._persistent_rows = M
-
-        # Diagnostic dump: flush captured buffers to .npz at end of step.
-        if _diag_active and self._diag_out_path is not None:
-            self._diag_out_path.parent.mkdir(parents=True, exist_ok=True)
-            meta = {
-                "N": int(N),
-                "PD_iter": int(self.iterations),
-                "frame": int(self._diag_frame),
-                "dt": float(dt),
-            }
-            np.savez(
-                str(self._diag_out_path),
-                _meta_N=np.int64(meta["N"]),
-                _meta_PD_iter=np.int64(meta["PD_iter"]),
-                _meta_frame=np.int64(meta["frame"]),
-                _meta_dt=np.float64(meta["dt"]),
-                **self._diag_buffers,
-            )
-            print(
-                f"[SolverFBA] wrote diagnostic dump for frame {self._diag_frame} "
-                f"to {self._diag_out_path} ({len(self._diag_buffers)} arrays)"
-            )
 
     def _run_pd_local_phase_eager(self, N: int, dt: float, include_linear_solve: bool = True) -> None:
         """Issue the PD local-phase launches on the active stream.
