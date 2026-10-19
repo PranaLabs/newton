@@ -26,7 +26,7 @@ from newton.solvers import SolverFBA
 
 # Simulation parameters (CudaTests/SqueezingBall/ball_7k.json).
 _DT = 0.01
-_PD_ITER = 10  # RealSim's offline binding overrides scene LocalGlobal_CUDA=5 to 10
+_PD_ITER = 5  # CudaTests/SqueezingBall/scene.json: integrator iterations
 _GRAVITY = -10.0  # Y-down
 
 _YOUNG = 1.0e4 / 2.4  # RealSim's material modulus; SolverFBA's tet gauge 2 + nu scales it back to 1e4
@@ -209,6 +209,8 @@ class Example:
             k_lambda=lam,
             k_damp=0.0,
             add_surface_mesh_edges=False,
+            # Contacts start within the 5 cm margin, RealSim's collision alarm; SolverFBA's act at the surface.
+            particle_radius=0.0,
         )
 
         # Each cylinder is two shapes:
@@ -301,6 +303,8 @@ class Example:
             shape_angular_velocity=shape_omega,
             lambda_cap=1.0e12,
             pin_stiffness=1.0e10,
+            # The scene's constraint_solver.linear_solver.max_iterations.
+            nsn_linear_iterations=10,
         )
 
         self.pipeline = newton.CollisionPipeline(self.model, soft_contact_margin=0.05)
