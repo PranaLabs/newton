@@ -212,6 +212,20 @@ class SolverFBA(SolverBase):
                 legacy 5-iter fixed Newton (no line search, no convergence
                 check) for regression. Ignored unless
                 ``stretching_model="neohookean"``.
+            nsn_schur_mode: Contact operator ``W`` of the NSN steps.
+                ``"full"`` (default) builds ``J A⁻¹ Jᵀ`` from the prefactored
+                system matrix ``A``. ``"lite"`` replaces ``A⁻¹`` by
+                ``dt² M⁻¹``, the inverse of the mass term ``M / dt²`` of ``A``:
+                the rows of different particles decouple, unless self contacts or
+                particle constraints couple them, and no ``W`` is built. Each
+                local-global iteration solves for the contact forces whose
+                motion, predicted through ``W``, closes the gaps of its
+                contact-free positions. The lite ``W`` overrates that motion
+                where the material spreads a force to the particle's
+                neighbors, so a pressed contact settles inside its shape, by
+                up to ``dt² F / m`` for a normal force ``F`` [N] on a particle
+                of mass ``m`` [kg], and more iterations do not reduce that.
+                Rigid contacts and face contacts need ``"full"``.
             integrate_with_external_rigid_solver: If ``True``, rigid bodies are
                 integrated by another solver: ``state_in`` holds their previous
                 state, ``state_out`` their current one, and FBA leaves both
