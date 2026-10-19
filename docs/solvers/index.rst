@@ -41,7 +41,7 @@ method details. For symptom-driven diagnosis and parameter tuning, start with
 Choosing a Solver
 -----------------
 
-MuJoCo, Kamino, and VBD currently have dedicated backend guides:
+MuJoCo, Kamino, VBD, and FBA currently have dedicated backend guides:
 
 - :doc:`MuJoCo <mujoco>` — generalized-coordinate rigid-body simulation and
   MuJoCo or MJCF workflows.
@@ -49,6 +49,9 @@ MuJoCo, Kamino, and VBD currently have dedicated backend guides:
   and hard frictional contacts; experimental.
 - :doc:`VBD <vbd>` — unified simulation of cloth, soft bodies, and rigid
   bodies in a single VBD-based solver; experimental.
+- :doc:`FBA <fba>`: projective dynamics for cloth and soft bodies with
+  non-penetrating frictional contact among them and rigid bodies;
+  experimental.
 
 The other solver backends are documented through their linked API references
 and the comparison tables below.
@@ -81,6 +84,14 @@ Supported Features
      - Cloth
      - Soft bodies
      - Differentiable
+   * - :class:`~newton.solvers.SolverFBA`
+     - Implicit
+     - ✅ maximal coordinates
+     - 🟨 :ref:`bilateral joints only <Joint feature support>`
+     - ✅
+     - ✅
+     - ✅
+     - ❌
    * - :class:`~newton.solvers.SolverFeatherstone`
      - Semi-implicit
      - ✅
@@ -169,6 +180,10 @@ Supported Features
 .. experimental::
     :class:`~newton.solvers.SolverVBD`'s public API and behavior may change without prior notice.
 
+.. experimental::
+    :class:`~newton.solvers.SolverFBA`'s public API and behavior may change without prior notice.
+    It simulates models with one world.
+
 .. _Contact material support:
 
 Contact Material Support
@@ -185,8 +200,10 @@ formulation.
   :class:`~newton.solvers.SolverSemiImplicit`,
   :class:`~newton.solvers.SolverXPBD`, :class:`~newton.solvers.SolverMuJoCo`,
   :class:`~newton.solvers.SolverVBD`, :class:`~newton.solvers.SolverKamino`,
-  :class:`~newton.solvers.SolverStyle3D`, and
-  :class:`~newton.solvers.SolverImplicitMPM`.
+  :class:`~newton.solvers.SolverStyle3D`,
+  :class:`~newton.solvers.SolverImplicitMPM`, and
+  :class:`~newton.solvers.SolverFBA` (the shape's ``mu`` for particle contacts,
+  the arithmetic mean of the two shapes for rigid contacts).
 - ``ke`` / ``kd``: :class:`~newton.solvers.SolverFeatherstone`,
   :class:`~newton.solvers.SolverSemiImplicit`,
   :class:`~newton.solvers.SolverMuJoCo`, and
@@ -223,6 +240,8 @@ The maximal-coordinate solvers (:class:`~newton.solvers.SolverSemiImplicit`,
 enforce joints as pairwise body constraints but do not use the articulation kinematic-tree structure.
 :class:`~newton.solvers.SolverVBD` supports a subset of joint types through maximal-coordinate
 constraints, with unified compliant ALM by default and a deprecated legacy AVBD path.
+:class:`~newton.solvers.SolverFBA` enforces joints as bilateral maximal-coordinate constraints, without limits or
+drives.
 :class:`~newton.solvers.SolverStyle3D` and :class:`~newton.solvers.SolverImplicitMPM` do not support joints.
 
 **Joint types**
@@ -240,7 +259,9 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
      - :class:`~newton.solvers.SolverMuJoCo`
      - :class:`~newton.solvers.SolverVBD`
      - :class:`~newton.solvers.SolverKamino`
+     - :class:`~newton.solvers.SolverFBA`
    * - PRISMATIC
+     - |yes|
      - |yes|
      - |yes|
      - |yes|
@@ -256,7 +277,9 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
      - |yes|
      - |yes|
      - |yes|
+     - |yes|
    * - BALL
+     - |yes|
      - |yes|
      - |yes|
      - |yes|
@@ -272,7 +295,9 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
      - |yes|
      - |yes|
      - |yes|
+     - |yes|
    * - FREE
+     - |yes|
      - |yes|
      - |yes|
      - |yes|
@@ -288,6 +313,7 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
      - |no|
      - |no|
      - |no|
+     - |no|
    * - D6
      - |yes|
      - |yes|
@@ -296,6 +322,7 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
      - |yes|
      - |yes|
      - |no|
+     - |yes|
    * - ROD
      - |no|
      - |no|
@@ -303,6 +330,7 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
      - |no|
      - |no|
      - |yes|
+     - |no|
      - |no|
 
 | :sup:`1` DISTANCE joints are treated as FREE (no distance constraint enforcement).
@@ -322,6 +350,7 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
      - :class:`~newton.solvers.SolverMuJoCo`
      - :class:`~newton.solvers.SolverVBD`
      - :class:`~newton.solvers.SolverKamino`
+     - :class:`~newton.solvers.SolverFBA`
    * - :attr:`~newton.Model.joint_enabled`
      - |no|
      - |no| :sup:`8`
@@ -330,6 +359,7 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
      - |no|
      - |yes|
      - |no|
+     - |yes|
    * - :attr:`~newton.Model.joint_armature`
      - |yes|
      - |yes|
@@ -338,6 +368,7 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
      - |yes|
      - |no|
      - |yes|
+     - |no|
    * - :attr:`~newton.Model.joint_friction`
      - |no|
      - |no|
@@ -346,6 +377,7 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
      - |yes|
      - |no|
      - |yes|
+     - |no|
    * - :attr:`~newton.Model.joint_limit_lower` / :attr:`~newton.Model.joint_limit_upper`
      - |yes|
      - |yes| :sup:`9`
@@ -354,6 +386,7 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
      - |yes|
      - |yes|
      - |yes|
+     - |no|
    * - :attr:`~newton.Model.joint_limit_ke` / :attr:`~newton.Model.joint_limit_kd`
      - |yes|
      - |no|
@@ -361,6 +394,7 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
      - |no|
      - |yes|
      - |yes| :sup:`7`
+     - |no|
      - |no|
    * - :attr:`~newton.Model.joint_effort_limit`
      - |no|
@@ -370,9 +404,11 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
      - |yes|
      - |no|
      - |yes|
+     - |no|
    * - :attr:`~newton.Model.joint_velocity_limit`
      - |no|
      - |yes| :sup:`11`
+     - |no|
      - |no|
      - |no|
      - |no|
@@ -396,6 +432,7 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
      - :class:`~newton.solvers.SolverMuJoCo`
      - :class:`~newton.solvers.SolverVBD`
      - :class:`~newton.solvers.SolverKamino`
+     - :class:`~newton.solvers.SolverFBA`
    * - :attr:`~newton.Model.joint_target_ke` / :attr:`~newton.Model.joint_target_kd`
      - |yes|
      - |yes|
@@ -404,6 +441,7 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
      - |yes|
      - |yes| :sup:`7`
      - |yes|
+     - |no|
    * - :attr:`~newton.Model.joint_target_mode`
      - |no|
      - |no|
@@ -412,6 +450,7 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
      - |yes|
      - |no|
      - |yes|
+     - |no|
    * - :attr:`~newton.Control.joint_f` (feedforward forces)
      - |yes|
      - |yes|
@@ -420,6 +459,7 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
      - |yes|
      - |yes|
      - |yes|
+     - |no|
 
 **Constraints**
 
@@ -436,12 +476,14 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
      - :class:`~newton.solvers.SolverMuJoCo`
      - :class:`~newton.solvers.SolverVBD`
      - :class:`~newton.solvers.SolverKamino`
+     - :class:`~newton.solvers.SolverFBA`
    * - Equality constraints (CONNECT, WELD, JOINT)
      - |no|
      - |no|
      - |no|
      - |no|
      - |yes|
+     - |no|
      - |no|
      - |no|
    * - Mimic joints
@@ -452,6 +494,7 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
      - |yes| :sup:`6`
      - |yes| :sup:`5`
      - |no|
+     - |no|
    * - Particle-body attachments
      - |no|
      - |no|
@@ -459,6 +502,7 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
      - |no|
      - |no|
      - |yes| :sup:`13`
+     - |no|
      - |no|
 
 | :sup:`3` Featherstone eliminates follower degrees of freedom from its reduced dynamics and transfers follower forces and inertia to the reference joint.
