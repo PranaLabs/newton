@@ -494,9 +494,10 @@ class TestMeshContactMinima(unittest.TestCase):
         solver = newton.solvers.SolverFBA(model, iterations=10, face_contacts=True, face_contact_margin=0.02)
         pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.02)
         contacts, s0, s1, lowest = pipeline.contacts(), model.state(), model.state(), np.inf
+        observables = solver.observables({solver.ObservableKind.CONTACT_F}, contacts=contacts)
         for _ in range(200):
             pipeline.collide(s0, contacts)
-            solver.step(s0, s1, None, contacts, 0.005)
+            solver.step(s0, s1, None, contacts, 0.005, observables=observables)
             s0, s1 = s1, s0
             gap = (s0.particle_q.numpy() - self.NOTCH) @ np.stack([self.LEFT, self.RIGHT], 1)
             lowest = min(lowest, float(gap.min()) - 0.005)
@@ -514,6 +515,12 @@ class TestMeshContactMinima(unittest.TestCase):
         ]
         pipeline_pairs = np.stack([contacts.soft_contact_particle.numpy(), contacts.soft_contact_shape.numpy()])
         np.testing.assert_array_equal(pairs[:, rows], pipeline_pairs[:, record[rows]])
+        # The forces on the block, the second faces' included, balance the last step's momentum change and weight.
+        soft = observables.contact_f.numpy()[contacts.rigid_contact_max :][:count]
+        mass = model.particle_mass.numpy()
+        change = mass @ (s0.particle_qd.numpy() - s1.particle_qd.numpy()) / 0.005
+        weight = float(mass.sum()) * 9.81
+        np.testing.assert_allclose(-soft[:, :3].sum(axis=0), change + np.array([0.0, 0.0, weight]), atol=1e-5 * weight)
 
 
 if __name__ == "__main__":

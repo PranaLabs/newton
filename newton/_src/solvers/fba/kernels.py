@@ -5100,6 +5100,49 @@ def compute_normal_offset_kernel(
 
 
 @wp.kernel
+def soft_contact_force_kernel(
+    record: wp.array[wp.int32],
+    count: int,
+    normal: wp.array[wp.vec3],
+    tangent1: wp.array[wp.vec3],
+    tangent2: wp.array[wp.vec3],
+    rows_per_contact: int,
+    lam_apply: wp.array[wp.float64],
+    anchor: wp.array[wp.vec3],
+    shape: wp.array[wp.int32],
+    shape_body: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    rigid_contact_max: int,
+    contact_f: wp.array[wp.spatial_vector],
+):
+    """Wrench on the shape's body of each particle contact ``record[c]`` of ``Contacts``, from the forces [N] the
+    step's last solve applied along the rows ``n, t1, t2`` (or ``n`` alone) of the contact: the force by the particle
+    and its torque about the body's center of mass, or the world origin for a static shape, in world frame. The rows
+    of a contact's other minima follow its row and add to it."""
+    c = wp.tid()
+    i = record[c]
+    if i < 0 or (c > 0 and record[c - 1] == i):
+        return
+    origin = wp.vec3(0.0)
+    if shape[c] >= 0 and shape_body[shape[c]] >= 0:
+        b = shape_body[shape[c]]
+        origin = wp.transform_point(body_q[b], body_com[b])
+    force = wp.vec3(0.0)
+    torque = wp.vec3(0.0)
+    k = c
+    while k < count and record[k] == i:
+        r = rows_per_contact * k
+        f = normal[k] * float(lam_apply[r])
+        if rows_per_contact == 3:
+            f = f + tangent1[k] * float(lam_apply[r + 1]) + tangent2[k] * float(lam_apply[r + 2])
+        force = force - f
+        torque = torque - wp.cross(anchor[k] - origin, f)
+        k += 1
+    contact_f[rigid_contact_max + i] = wp.spatial_vector(force, torque)
+
+
+@wp.kernel
 def add_contact_thickness_kernel(
     particle: wp.array[wp.int32],
     extra_particle: wp.array2d[wp.int32],

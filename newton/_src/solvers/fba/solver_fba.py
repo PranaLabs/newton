@@ -53,6 +53,15 @@ class SolverFBA(SolverBase):
     and weights start at zero in every step, so the solver keeps no history
     for :meth:`reset` to discard.
 
+    With :attr:`~newton.solvers.SolverBase.ObservableKind.CONTACT_F`
+    requested, a step writes row ``rigid_contact_max + i`` for each particle
+    contact ``i`` of its contacts: the force [N] on the shape's body by the
+    particle and its torque [N·m] about the body's center of mass, or about
+    the world origin for a static shape, in world frame, from the forces
+    the step's last solve applied. The other distance minima of a particle
+    on a mesh add to its contact's row. Face contacts, self contacts and
+    rigid contacts are not exported: their rows are zero.
+
     Implements a Projective Dynamics (PD) local-global iteration for cloth
     with isotropic stretching (ARAP or corotational), isometric bending,
     and soft Pin constraints. The PD Hessian is prefactored once (nested dissection
@@ -123,6 +132,8 @@ class SolverFBA(SolverBase):
 
     Cable = Cable
     """A cable through a tetrahedral body, driven through :meth:`set_particle_constraints`."""
+
+    SUPPORTED_OBSERVABLES = frozenset({SolverBase.ObservableKind.CONTACT_F})
 
     _lam_unilateral_persistent = _host_mirror("_lam_unilateral_persistent")
     _lam_coulomb_persistent = _host_mirror("_lam_coulomb_persistent")
@@ -1193,6 +1204,8 @@ class SolverFBA(SolverBase):
         control: Control | None,
         contacts: Contacts | None,
         dt: float,
+        *,
+        observables: SolverBase.Observables | None = None,
     ) -> None:
         """Advance deformables and rigid bodies by one implicit Euler step using PD.
 
@@ -1202,16 +1215,23 @@ class SolverFBA(SolverBase):
                 external forces [N] and torques [N·m].
             state_out: Output simulation state. Particle and body positions and
                 velocities are written; other fields are untouched.
-            control: Unused in MVP (cloth has no actuated joints).
-            contacts: Unused in MVP (contact-aware FBA is future work).
-            dt: Time step [s]. Triggers `_setup_pd_system` rebuild on first
-                step or when changed (PD Hessian depends on dt).
+            control: Unused: the solver has no actuators.
+            contacts: The step's contacts, detected on ``state_in``, or ``None``
+                to step without contacts.
+            dt: Time step [s]. The first step and a change of ``dt`` factor the
+                system again.
+            observables: Optional observables from :meth:`observables`; see the
+                class notes for :attr:`~newton.solvers.SolverBase.ObservableKind.CONTACT_F`.
         """
         from .kernels import (  # noqa: PLC0415
             compute_inertial_kernel,
             write_velocity_kernel,
         )
 
+        self.validate_observables(observables, contacts)
+        contact_f = None
+        if observables is not None and observables.is_requested(SolverBase.ObservableKind.CONTACT_F):
+            contact_f = observables.contact_f
         self._two_way = False
         rigid = self.model.body_count > 0 and not self.integrate_with_external_rigid_solver
         rigid = rigid and self._begin_rigid_step(state_in, state_out, dt)
@@ -1220,6 +1240,8 @@ class SolverFBA(SolverBase):
                 self._begin_rigid_contacts(contacts)
             for _ in range(self.iterations if rigid else 0):
                 self._rigid_iteration(state_in, state_out, dt)
+            if contact_f is not None:
+                contact_f.zero_()
             return
 
         if self._linear_solver is None or self._dt_setup is None or abs(self._dt_setup - dt) > 1e-12:
@@ -1643,6 +1665,9 @@ class SolverFBA(SolverBase):
             device=device,
         )
 
+        if contact_f is not None:
+            self._write_contact_forces(contact_f, contacts, state_in)
+
         # The host mirrors of the persistent buffers read them when first read, so the step ends without waiting
         # for the device. When M==0 the host arrays were left at None / unchanged.
         if has_contacts:
@@ -1903,6 +1928,23 @@ class SolverFBA(SolverBase):
             graph = None
         self._lg_graph_cache = (cache_key, graph)
         return graph
+
+    def _write_contact_forces(self, contact_f: wp.array, contacts: Contacts, state: State) -> None:
+        """Fill the rows of ``contact_f`` for the step's particle contacts and zero the others."""
+        from .kernels import soft_contact_force_kernel  # noqa: PLC0415
+
+        contact_f.zero_()
+        M, model, device = self._contact_count, self.model, self._device
+        if M == 0:
+            return
+        no_bodies = model.body_count == 0 or state.body_q is None
+        body_q = wp.empty(1, dtype=wp.transform, device=device) if no_bodies else state.body_q
+        body_com = wp.empty(1, dtype=wp.vec3, device=device) if no_bodies else model.body_com
+        inputs = [self._contact_record_d, M, self._contact_normal_d, self._contact_tangent1_d]
+        inputs += [self._contact_tangent2_d, 3 if self.friction else 1, self._nsn_lam_apply_d]
+        inputs += [self._contact_world_anchor_d, self._contact_shape_d, model.shape_body, body_q, body_com]
+        inputs += [contacts.rigid_contact_max]
+        wp.launch(soft_contact_force_kernel, M, inputs, [contact_f], device=device)
 
     def set_pin_targets(self, target_positions) -> None:
         """Update reference positions for pinned particles (dynamic pin).

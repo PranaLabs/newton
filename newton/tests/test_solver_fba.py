@@ -4176,6 +4176,51 @@ class SolverFBAStageAStageBEquivalenceTests(unittest.TestCase):
         self._assert_stage_a_equiv_stage_b(solver, W_a, r_a, pene0_a)
 
 
+class TestContactForceObservable(unittest.TestCase):
+    """CONTACT_F rows of a cloth resting on the ground."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not wp.is_cuda_available():
+            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
+
+    def test_resting_cloth_weighs_on_the_ground(self):
+        """Report the cloth's weight on the ground, with torques about the origin, in the full and the lite solve."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
+        builder.add_ground_plane()
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.2, -0.2, 0.01),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.05,
+            tri_ke=5000.0,
+            particle_radius=0.0,
+        )
+        model = builder.finalize()
+        weight = float(model.particle_mass.numpy().sum()) * 9.81
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.05)
+        contacts = pipeline.contacts()
+        for mode in ("full", "lite"):
+            solver, s0, s1 = SolverFBA(model, nsn_schur_mode=mode), model.state(), model.state()
+            observables = solver.observables({solver.ObservableKind.CONTACT_F}, contacts=contacts)
+            for _ in range(120):
+                pipeline.collide(s0, contacts)
+                solver.step(s0, s1, None, contacts, 1.0 / 60.0, observables=observables)
+                s0, s1 = s1, s0
+            count, rigid = int(contacts.soft_contact_count.numpy()[0]), contacts.rigid_contact_max
+            wrench = observables.contact_f.numpy()
+            soft = wrench[rigid : rigid + count]
+            # Friction holds the settling cloth with up to 2e-5 of its weight.
+            np.testing.assert_allclose(soft[:, :3].sum(axis=0), [0.0, 0.0, -weight], atol=2e-5 * weight, err_msg=mode)
+            anchor = contacts.soft_contact_body_pos.numpy()[:count]  # in world frame on the static ground
+            np.testing.assert_allclose(soft[:, 3:], np.cross(anchor, soft[:, :3]), atol=1e-6 * weight, err_msg=mode)
+            self.assertFalse(wrench[:rigid].any() or wrench[rigid + count :].any(), mode)
+
+
 class SolverFBALambdaWarmStartTests(unittest.TestCase):
     """λ warm-start across PD outer iters reproduces RealSim's per-frame reset.
 

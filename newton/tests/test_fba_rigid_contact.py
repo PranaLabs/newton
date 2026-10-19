@@ -526,7 +526,7 @@ class TestSolverFBATwoWayContacts(unittest.TestCase):
         if not wp.is_cuda_available():
             raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
 
-    def _run(self, gravity, cloth_z, v_cloth, box_density, particle_mass, steps, ground=False):
+    def _run(self, gravity, cloth_z, v_cloth, box_density, particle_mass, steps, ground=False, observe=False):
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, gravity))
@@ -544,31 +544,42 @@ class TestSolverFBATwoWayContacts(unittest.TestCase):
         s0, s1 = model.state(), model.state()
         pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.11)
         contacts, momentum = pipeline.contacts(), []
+        observables = solver.observables({solver.ObservableKind.CONTACT_F}, contacts=contacts) if observe else None
         m_p, m_b = model.particle_mass.numpy(), model.body_mass.numpy()[0]
         for _ in range(steps):
             pipeline.collide(s0, contacts)
-            solver.step(s0, s1, None, contacts, 0.005)
+            solver.step(s0, s1, None, contacts, 0.005, observables=observables)
             s0, s1 = s1, s0
             momentum.append(m_p @ s0.particle_qd.numpy() + m_b * s0.body_qd.numpy()[0, :3])
-        return solver, s0, np.array(momentum), m_p.sum(), m_b
+        return solver, s0, np.array(momentum), m_p.sum(), m_b, observables
 
     def test_collision_conserves_momentum(self):
         """Without gravity a 0.5 kg cloth hits a 1 kg box at 1 m/s and both move on at 1/3 m/s."""
-        solver, state, momentum, m_cloth, m_box = self._run(0.0, 1.05, -1.0, 1.0, 0.02, 60)
+        solver, state, momentum, m_cloth, m_box, _ = self._run(0.0, 1.05, -1.0, 1.0, 0.02, 60)
         self.assertTrue(solver._two_way)
         # Each step rounds the float32 particle positions, by up to m_cloth ulp(1) / dt of momentum.
         np.testing.assert_allclose(momentum[:20], np.tile([0.0, 0.0, -m_cloth], (20, 1)), atol=5e-5)
         self.assertAlmostEqual(state.body_qd.numpy()[0, 2], -m_cloth / (m_cloth + m_box), delta=1e-3)
 
     def test_box_carries_cloth_weight(self):
-        """A cloth resting on a box on the ground: the ground holds both weights."""
-        solver, state, _, m_cloth, m_box = self._run(-9.81, 1.005, 0.0, 100.0, 0.2, 200, ground=True)
+        """A cloth resting on a box on the ground: the ground holds both weights, and the CONTACT_F rows of the
+        cloth's contacts carry its weight to the box, with torques about the box's center of mass."""
+        solver, state, _, m_cloth, m_box, observables = self._run(-9.81, 1.005, 0.0, 100.0, 0.2, 200, True, True)
         m_s, m_r = solver._rc_counts
         rows = slice(3 * m_s, 3 * (m_s + m_r), 3)
         ground = solver._nsn_lam_apply_d.numpy()[rows].sum()
         self.assertAlmostEqual(ground / ((m_box + m_cloth) * 9.81), 1.0, delta=1e-4)
         np.testing.assert_allclose(state.body_q.numpy()[0], [0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 1.0], atol=1e-6)
         np.testing.assert_allclose(state.particle_q.numpy()[:, 2], 1.0, atol=1e-5)
+        contacts = observables.contacts
+        count, rigid = int(contacts.soft_contact_count.numpy()[0]), contacts.rigid_contact_max
+        wrench = observables.contact_f.numpy()
+        soft = wrench[rigid : rigid + count]
+        np.testing.assert_allclose(soft[:, :3].sum(axis=0), [0.0, 0.0, -m_cloth * 9.81], atol=1e-4 * m_cloth * 9.81)
+        # The box rests at (0, 0, 0.5) unrotated, the pose it was stepped from.
+        lever = contacts.soft_contact_body_pos.numpy()[:count] - solver.model.body_com.numpy()[0]
+        np.testing.assert_allclose(soft[:, 3:], np.cross(lever, soft[:, :3]), atol=1e-5)
+        self.assertFalse(wrench[:rigid].any(), "rigid contacts are not exported")
 
 
 if __name__ == "__main__":
