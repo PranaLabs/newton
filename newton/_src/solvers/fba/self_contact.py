@@ -72,9 +72,11 @@ def vertex_face_contacts_kernel(
     particles: wp.array2d[wp.int32],
     alpha: wp.array2d[wp.float32],
     normal: wp.array[wp.vec3],
+    found: wp.array[wp.int32],
 ):
     """The nearest triangle of each particle within ``margin``, outside its rings and ``rest_radius`` from it
-    at rest, the first of equals among its candidates. The ``_LANES`` threads of a block take the candidates
+    at rest, the first of equals among its candidates, in the particle's slot; ``found`` marks the particles
+    that have one. The ``_LANES`` threads of a block take the candidates
     of one particle in turn, and test the rings and rest distance of only those nearer than their nearest yet."""
     v, lane = wp.tid()
     p = q[v]
@@ -109,16 +111,41 @@ def vertex_face_contacts_kernel(
         best_point = point
     nearest = wp.tile_min(wp.tile(best))[0]
     first = wp.tile_min(wp.tile(wp.where(best == nearest, best_k, wp.int32(2147483647))))[0]
-    if best_t < 0 or best_k != first or best < 1.0e-6 * margin:
+    hit = first != wp.int32(2147483647) and nearest >= 1.0e-6 * margin
+    if lane == 0:
+        found[v] = wp.where(hit, 1, 0)
+    if not hit or best_k != first:
         return
-    slot = wp.atomic_add(count, 0, 1)
-    if slot < particles.shape[0]:
-        particles[slot, 0] = v
-        alpha[slot, 0] = 1.0
-        for i in range(3):
-            particles[slot, i + 1] = tri_indices[best_t, i]
-            alpha[slot, i + 1] = -best_bary[i]
-        normal[slot] = (p - best_point) / best
+    wp.atomic_add(count, 0, 1)
+    particles[v, 0] = v
+    alpha[v, 0] = 1.0
+    for i in range(3):
+        particles[v, i + 1] = tri_indices[best_t, i]
+        alpha[v, i + 1] = -best_bary[i]
+    normal[v] = (p - best_point) / best
+
+
+@wp.kernel
+def compact_contacts_kernel(
+    found: wp.array[wp.int32],
+    position: wp.array[wp.int32],  # exclusive scan of ``found``
+    particles: wp.array2d[wp.int32],
+    alpha: wp.array2d[wp.float32],
+    normal: wp.array[wp.vec3],
+    # outputs
+    out_particles: wp.array2d[wp.int32],
+    out_alpha: wp.array2d[wp.float32],
+    out_normal: wp.array[wp.vec3],
+):
+    """Gather the contacts in the slots of the particles that have one, in the order of the particles."""
+    v = wp.tid()
+    if found[v] == 0:
+        return
+    k = position[v]
+    for i in range(4):
+        out_particles[k, i] = particles[v, i]
+        out_alpha[k, i] = alpha[v, i]
+    out_normal[k] = normal[v]
 
 
 @wp.kernel
@@ -211,6 +238,12 @@ class SelfContact:
             self.bvh = wp.Bvh(self.lower, self.upper)
             self.candidates = wp.empty((model.particle_count, 64), dtype=wp.int32, device=self.device)
             self.candidate_count = wp.empty(model.particle_count, dtype=wp.int32, device=self.device)
+            # Particles with a contact, their places among the contacts, and the contacts in that order.
+            self.found = wp.empty(model.particle_count, dtype=wp.int32, device=self.device)
+            self.position = wp.empty(model.particle_count, dtype=wp.int32, device=self.device)
+            self.found_particles = wp.empty((model.particle_count, 4), dtype=wp.int32, device=self.device)
+            self.found_alpha = wp.empty((model.particle_count, 4), dtype=wp.float32, device=self.device)
+            self.found_normal = wp.empty(model.particle_count, dtype=wp.vec3, device=self.device)
         else:
             self.grid = wp.HashGrid(128, 128, 128, device=self.device)
         # Contacts found, and the most candidate triangles of a particle.
@@ -229,6 +262,16 @@ class SelfContact:
     def detect(self, q: wp.array) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Particles and coefficients, shape ``(C, 4)`` with particle ``-1`` in unused slots, and normals,
         shape ``(C, 3)``, of the contacts at ``q``, sorted by their particles."""
+        n = self.find(q)
+        if self.mode == "vertex_face":
+            return self.found_particles.numpy()[:n], self.found_alpha.numpy()[:n], self.found_normal.numpy()[:n]
+        particles, alpha, normal = self.particles.numpy()[:n], self.alpha.numpy()[:n], self.normal.numpy()[:n]
+        order = np.lexsort((particles[:, 1], particles[:, 0]))
+        return particles[order], alpha[order], normal[order]
+
+    def find(self, q: wp.array) -> int:
+        """Find the contacts at ``q`` and return their number. With ``mode="vertex_face"`` they stay on the
+        device in ``found_particles``, ``found_alpha`` and ``found_normal``, in the order of their particles."""
         if self.mode == "vertex_face":
             self._bounds(q)
             self.bvh.refit()
@@ -243,10 +286,14 @@ class SelfContact:
                 inputs = [q, self.bvh.id, self.margin]
                 wp.launch(triangle_candidates_kernel, q.shape[0], inputs, [*found, self.count], device=self.device)
                 inputs = [q, self.tri_indices, *found, *filters]
-                kernel = vertex_face_contacts_kernel
+                kernel, outputs = vertex_face_contacts_kernel, [*outputs, self.found]
                 wp.launch_tiled(
                     kernel, dim=[q.shape[0]], inputs=inputs, outputs=outputs, block_dim=_LANES, device=self.device
                 )
+                wp.utils.array_scan(self.found, self.position, inclusive=False)
+                inputs = [self.found, self.position, self.particles, self.alpha, self.normal]
+                outputs = [self.found_particles, self.found_alpha, self.found_normal]
+                wp.launch(compact_contacts_kernel, q.shape[0], inputs, outputs, device=self.device)
             else:
                 inputs = [q, self.grid.id, *filters]
                 wp.launch(vertex_vertex_contacts_kernel, q.shape[0], inputs, outputs, device=self.device)
@@ -256,7 +303,4 @@ class SelfContact:
             elif n > self.particles.shape[0]:
                 self._allocate(2 * n)
             else:
-                break
-        particles, alpha, normal = self.particles.numpy()[:n], self.alpha.numpy()[:n], self.normal.numpy()[:n]
-        order = np.lexsort((particles[:, 1], particles[:, 0]))
-        return particles[order], alpha[order], normal[order]
+                return n
