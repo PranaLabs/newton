@@ -15,6 +15,7 @@ from newton._src.solvers.fba.linear_solver import (
     build_rigid_system,
     factorize_and_sparse_inverse,
 )
+from newton.tests.fba._reference import solve_nsn_unilateral
 
 
 class TestSolverFBAImport(unittest.TestCase):
@@ -3952,7 +3953,7 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
         w_uni = np.eye(m_uni, dtype=np.float64)
         r_uni = np.full(m_uni, 100.0, dtype=np.float64)
         pene0_uni = np.zeros(m_uni, dtype=np.float64)
-        lam_uni, _, _ = solver._solve_nsn_unilateral(w_uni, r_uni, pene0_uni, max_iters=1, dt=dt)
+        lam_uni, _, _ = solve_nsn_unilateral(w_uni, r_uni, pene0_uni, max_iters=1, dt=dt, lambda_cap=solver.lambda_cap)
         self.assertTrue(
             np.all(np.abs(lam_uni) <= internal_cap + 1e-9),
             msg=f"unilateral lam exceeds internal cap: {lam_uni}",
@@ -4062,7 +4063,9 @@ class SolverFBAStageAStageBEquivalenceTests(unittest.TestCase):
     ) -> None:
         W_b, r_b, mu_b, pene0_b = self._build_stage_b_inputs(W_a, r_a, pene0_a)
 
-        lam_a, omega_a, lam_apply_a = solver._solve_nsn_unilateral(W_a, r_a, pene0_a, max_iters=max_iters, dt=dt)
+        lam_a, omega_a, lam_apply_a = solve_nsn_unilateral(
+            W_a, r_a, pene0_a, max_iters=max_iters, dt=dt, lambda_cap=solver.lambda_cap
+        )
         lam_b, omega_b, lam_apply_b = solver._solve_nsn_coulomb(W_b, r_b, mu_b, pene0_b, max_iters=max_iters, dt=dt)
 
         # Normal rows must agree to machine precision.

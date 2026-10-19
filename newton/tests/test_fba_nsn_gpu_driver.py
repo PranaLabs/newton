@@ -29,7 +29,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.fba import SolverFBA
-from newton.tests.fba._reference import fb_frictional_row, fb_unilateral_row
+from newton.tests.fba._reference import fb_frictional_row, fb_unilateral_row, solve_nsn_unilateral
 
 
 def _make_unilateral_inputs(M: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -101,7 +101,9 @@ class TestNSNUnilateralGpuDriver(unittest.TestCase):
         W, r, pene0 = _make_unilateral_inputs(M=1, seed=42)
         dt = 0.01
 
-        lam_cpu, omega_cpu, lam_apply_cpu = solver._solve_nsn_unilateral(W, r, pene0, max_iters=3, dt=dt)
+        lam_cpu, omega_cpu, lam_apply_cpu = solve_nsn_unilateral(
+            W, r, pene0, max_iters=3, dt=dt, lambda_cap=solver.lambda_cap
+        )
         lam_gpu, omega_gpu, lam_apply_gpu = solver._solve_nsn_unilateral_gpu(W, r, pene0, max_iters=3, dt=dt)
 
         # n=1: PCR converges in 1 iter so the GPU path matches CPU to fp64 noise.
@@ -120,7 +122,9 @@ class TestNSNUnilateralGpuDriver(unittest.TestCase):
         W, r, pene0 = _make_unilateral_inputs(M=50, seed=7)
         dt = 0.01
 
-        lam_cpu, omega_cpu, lam_apply_cpu = solver._solve_nsn_unilateral(W, r, pene0, max_iters=1, dt=dt)
+        lam_cpu, omega_cpu, lam_apply_cpu = solve_nsn_unilateral(
+            W, r, pene0, max_iters=1, dt=dt, lambda_cap=solver.lambda_cap
+        )
         lam_gpu, omega_gpu, lam_apply_gpu = solver._solve_nsn_unilateral_gpu(W, r, pene0, max_iters=1, dt=dt)
 
         # PCR relative accuracy ~1e-7 at n=50; absolute lambda magnitudes ~O(1),
@@ -141,14 +145,21 @@ class TestNSNUnilateralGpuDriver(unittest.TestCase):
         W, r, pene0 = _make_unilateral_inputs(M=1, seed=123)
         dt = 0.01
 
-        lam_cpu, omega_cpu, _ = solver._solve_nsn_unilateral(W, r, pene0, max_iters=1, dt=dt)
+        lam_cpu, omega_cpu, _ = solve_nsn_unilateral(W, r, pene0, max_iters=1, dt=dt, lambda_cap=solver.lambda_cap)
         lam_gpu, omega_gpu, _ = solver._solve_nsn_unilateral_gpu(W, r, pene0, max_iters=1, dt=dt)
         np.testing.assert_allclose(lam_gpu, lam_cpu, rtol=0, atol=1.0e-8)
         np.testing.assert_allclose(omega_gpu, omega_cpu, rtol=0, atol=1.0e-8)
 
         # Now warm-start the next call with the just-computed (lam, omega).
-        lam2_cpu, omega2_cpu, _ = solver._solve_nsn_unilateral(
-            W, r, pene0, max_iters=1, lam_init=lam_cpu, omega_init=omega_cpu, dt=dt
+        lam2_cpu, omega2_cpu, _ = solve_nsn_unilateral(
+            W,
+            r,
+            pene0,
+            max_iters=1,
+            lam_init=lam_cpu,
+            omega_init=omega_cpu,
+            dt=dt,
+            lambda_cap=solver.lambda_cap,
         )
         lam2_gpu, omega2_gpu, _ = solver._solve_nsn_unilateral_gpu(
             W, r, pene0, max_iters=1, lam_init=lam_gpu, omega_init=omega_gpu, dt=dt
@@ -176,7 +187,9 @@ class TestNSNUnilateralGpuDriver(unittest.TestCase):
         pene0 = rng.standard_normal(M) * 1.0e-3
         dt = 0.01
 
-        lam_cpu, omega_cpu, lam_apply_cpu = solver._solve_nsn_unilateral(W, r, pene0, max_iters=2, dt=dt)
+        lam_cpu, omega_cpu, lam_apply_cpu = solve_nsn_unilateral(
+            W, r, pene0, max_iters=2, dt=dt, lambda_cap=solver.lambda_cap
+        )
         lam_gpu, omega_gpu, lam_apply_gpu = solver._solve_nsn_unilateral_gpu(W, r, pene0, max_iters=2, dt=dt)
 
         cap_internal = lambda_cap / (dt * dt)

@@ -150,3 +150,93 @@ def fb_frictional_row(
         compliance = ((root - tmp) / denom) * (precond / dt)
     h = -(dt * dt) * compliance * lam_t + pene0
     return 1.0, compliance, h
+
+
+def solve_nsn_unilateral(
+    W: np.ndarray,
+    r: np.ndarray,
+    pene0: np.ndarray,
+    max_iters: int = 1,
+    lam_init: np.ndarray | None = None,
+    omega_init: np.ndarray | None = None,
+    dt: float = 0.01,
+    lambda_cap: float | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Host NSN driver for unilateral rows (Stage A), the reference of the GPU driver.
+
+    Returns ``(lam, omega, lam_apply)``:
+      - ``lam`` (force units, for warm-start): RealSim's accumulated λ.
+      - ``omega``: per-row weighting from the last NSN iter.
+      - ``lam_apply`` = ``dt² · ω · lam`` (position-LCP units): the value to
+        pass into :meth:`~newton._src.solvers.fba.linear_solver.FBALinearSolver.apply_lambda_correction_combined`
+        (which adds ``A⁻¹·Jᵀ·lam_apply`` to ``x_unc``).
+
+    The two scales differ because RealSim's correction is
+    ``Δq = dt² · A⁻¹ · Jᵀ · (ω · λ_force)``, whereas FBA's
+    ``apply_lambda_correction_combined`` adds ``A⁻¹·Jᵀ·λ`` directly. ``omega``
+    from the previous step is needed so that the next call can compute the
+    correct iter-0 ``penetration = -r + dt²·W·(ω·λ)`` accounting for the
+    previously-applied correction.
+    """
+    M = len(r)
+    if M == 0:
+        return (
+            np.zeros(0, dtype=np.float64),
+            np.zeros(0, dtype=np.float64),
+            np.zeros(0, dtype=np.float64),
+        )
+    if lam_init is not None and lam_init.shape == (M,):
+        lam = lam_init.astype(np.float64, copy=True)
+    else:
+        lam = np.zeros(M, dtype=np.float64)
+    if omega_init is not None and omega_init.shape == (M,):
+        omega = omega_init.astype(np.float64, copy=True)
+    else:
+        omega = np.zeros(M, dtype=np.float64)
+
+    diag_W = np.diag(W)
+    # RealSim convention: precond[i] = dt² · W_ii for unilateral rows.
+    precond = (dt * dt) * np.where(np.abs(diag_W) > 1e-12, np.maximum(diag_W, 1e-12), 1.0)
+
+    for _ in range(max_iters):
+        # penetration = -r + dt²·W·(ω·λ). With warm-start ω·λ this reflects
+        # the gap at the position currently corrected by the previous iter.
+        penetration = -r + (dt * dt) * (W @ (omega * lam))
+        omega = np.zeros(M, dtype=np.float64)
+        compliance = np.zeros(M, dtype=np.float64)
+        h = np.zeros(M, dtype=np.float64)
+        for c in range(M):
+            on, cn, hn = fb_unilateral_row(
+                penetration=penetration[c],
+                lam=lam[c],
+                precond=precond[c],
+                dt=dt,
+                pene0=pene0[c],
+            )
+            omega[c] = on
+            compliance[c] = cn
+            h[c] = hn
+
+        A_schur = (omega[:, None] * omega[None, :]) * W + np.diag(compliance)
+        # J·x_corrected = J·x_unc + dt²·W·(ω·λ) = (pene0 - r) + dt²·W·(ω·λ).
+        J_x = (pene0 - r) + (dt * dt) * (W @ (omega * lam))
+        rhs = (1.0 / (dt * dt)) * (h - omega * J_x)
+
+        try:
+            dlam = np.linalg.solve(A_schur, rhs)
+        except np.linalg.LinAlgError:
+            break
+        lam = lam + dlam
+        # No lam_n >= 0 clamp here. RealSim's boundConstraintForces
+        # (NonSmoothNewton.cpp:391-394, unilateral branch) explicitly
+        # comments out `if(_lambda[cid] < 0.0) _lambda[cid] = 0.0;` —
+        # FB-Newton allows transient negative lambda inside the inner
+        # solve and lets the FB residual converge. The previous
+        # np.maximum(lam, 0.0) clamp converted Stage A toward
+        # Signorini-PGS (see realsim-port-discipline P2-E v1 failure).
+
+    if lambda_cap is not None:
+        cap_internal = lambda_cap / (dt * dt)
+        np.clip(lam, -cap_internal, cap_internal, out=lam)
+    lam_apply = (dt * dt) * omega * lam
+    return lam, omega, lam_apply
