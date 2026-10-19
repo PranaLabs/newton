@@ -88,12 +88,12 @@ class Example:
         # Centimeter scale (matches the VBD reference).
         self.add_cloth = True
         self.add_robot = True
-        # FBA's PD outer loop is its own iteration scheme; sim_substeps drives
-        # the rigid-body integrator + PD-FBA pair.  We keep the VBD reference
-        # 10 substeps so the robot's key-pose interpolation isn't aliased.
-        self.sim_substeps = 10
+        # Three substeps of 1/180 s for the robot and the cloth. The lite NSN's contacts take a particle's
+        # mass alone for its response, which overstates it more the longer the step, so they close their
+        # violations over several iterations.
+        self.sim_substeps = 3
         # PD local-global iterations, each with one NSN step.
-        self.pd_iterations = 8
+        self.pd_iterations = 5
         self.fps = 60
         self.frame_dt = 1 / self.fps
         self.sim_dt = self.frame_dt / self.sim_substeps
@@ -104,8 +104,9 @@ class Example:
         # Body-cloth contact margin (cm).
         self.cloth_particle_radius = 0.8
         self.cloth_body_contact_margin = 0.8
-        # Distance the shirt keeps each particle from its nearest triangle (cm).
-        self.cloth_self_contact_radius = 0.8
+        # Distance the shirt keeps each particle from its nearest triangle (cm). At 0.8 cm the layers of the
+        # dropping shirt cross, 72 triangle pairs for good; 1.2 cm keeps them apart.
+        self.cloth_self_contact_radius = 1.2
 
         # Robot-side contact materials (cm scale, copied from VBD reference;
         # FBA doesn't actually consume ke/kd directly — it uses the rigid
@@ -279,7 +280,8 @@ class Example:
                 # Cloth squeezed between the closing rigid fingers or between them
                 # and the table has no solution; this force limit per contact row,
                 # 200 N in this cm-kg-s scene, bounds it. A particle resting on the
-                # table needs 0.14 N, a landing one 18 N.
+                # table needs 0.14 N, a landing one up to 50 N; two self contacts of
+                # the landing layers reach the limit for a step.
                 lambda_cap=2.0e4,
                 # The shirt keeps each particle its self-contact radius from its nearest triangle, but
                 # not from triangles within one ring or within that distance at rest, so folds close
@@ -288,7 +290,7 @@ class Example:
                 particle_self_contact_radius=self.cloth_self_contact_radius,
                 particle_topological_contact_filter_threshold=1,
                 particle_rest_shape_contact_exclusion_radius=self.cloth_self_contact_radius,
-                nsn_linear_iterations=20,
+                nsn_linear_iterations=10,
             )
 
         self.viewer.set_model(self.model)
