@@ -211,7 +211,8 @@ class Example:
 
     def test_final(self):
         # The caps turn by +/-theta at y = +/-2 m; along the bar the twist is linear, theta y / 2, as for a
-        # prismatic bar in Saint-Venant torsion: after 3 s, 7.22 deg at y = 0.47 m against 7.06 deg.
+        # prismatic bar in Saint-Venant torsion, but for the restrained end faces and, at large angles, the
+        # shortening bar: 1.3 % of theta off at 30 deg, 3 % at 81 deg, and 0.012 deg in the first frame.
         q, q0 = self.state_0.particle_q.numpy().astype(np.float64), self._verts_init
         assert np.all(np.isfinite(q)), "non-finite particle positions"
         theta = min(_PIN_AVEL * self._frame * self.frame_dt, _MAX_ANGLE)
@@ -219,12 +220,13 @@ class Example:
             ring = np.isclose(q0[:, 1], y) & (np.hypot(q0[:, 0], q0[:, 2]) > 0.5)
             turn = np.arctan2(q[ring, 0], q[ring, 2]) - np.arctan2(q0[ring, 0], q0[ring, 2])
             twist = np.angle(np.exp(1j * turn)).mean()
-            assert abs(twist - 0.5 * theta * y) < math.radians(1.0), (
+            assert abs(twist - 0.5 * theta * y) < 0.05 * theta + math.radians(0.05), (
                 f"twist {math.degrees(twist):.2f} deg at y = {y:.2f} m"
             )
 
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
+    parser.set_defaults(num_frames=810)
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

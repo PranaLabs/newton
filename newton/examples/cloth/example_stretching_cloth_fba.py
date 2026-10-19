@@ -211,19 +211,22 @@ class Example:
         assert speed < 5.0, f"particle speed {speed:.2f} m/s at t={self.sim_time:.2f} s"
 
     def test_final(self):
-        # Pulled 0.3 m per side in 3 s, the sheet spans 2.6 m, its middle narrows from 2 m to 1.83 m and it
-        # sags 6 cm under gravity 1 m/s^2.
+        # Pulled to a stretch s, the sheet narrows in its middle, but not below an incompressible strip in free
+        # uniaxial stretch, 2 / sqrt(s): 1.83 m against 1.75 m at s = 1.3, 1.51 m against 1.41 m at s = 2. Gravity
+        # 1 m/s^2 sags it by at most 14 cm, at 0.6 s, before the tension builds up.
         q, q0 = self.state_0.particle_q.numpy(), self.model.particle_q.numpy()
         assert np.all(np.isfinite(q)), "non-finite particle positions"
         pins = np.concatenate([self._pin0_idx, self._pin1_idx])
         assert np.abs(q[pins] - self._targets[pins]).max() < 1.0e-4, "pinned edges off their targets"
         middle = np.abs(q0[:, 0]) < 0.01
         width = q[middle, 2].max() - q[middle, 2].min()
-        assert 1.6 < width < 1.95, f"the middle of the sheet is {width:.3f} m wide"
+        stretch = 1.0 + self._pulled
+        assert 2.0 / math.sqrt(stretch) < width <= 2.0, f"the middle is {width:.3f} m wide at stretch {stretch:.2f}"
         assert q[:, 1].min() > -0.2, f"the sheet sags to y = {q[:, 1].min():.3f} m"
 
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
+    parser.set_defaults(num_frames=1200)
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)
