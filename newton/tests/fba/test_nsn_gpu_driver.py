@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the NSN inner-loop GPU drivers (Steps 6-10 of the NSN GPU port).
+"""Tests for the NSN inner-loop GPU drivers.
 
 Verifies that
 :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA._solve_nsn_unilateral_gpu`
@@ -14,9 +14,8 @@ Tolerance notes:
     :func:`numpy.linalg.solve` (LU factorisation, ~fp64 noise). The GPU
     driver uses :class:`NSNPCRSolver` (Jacobi-preconditioned Conjugate
     Residual), which is theoretically exact in ``n`` steps but capped at
-    ``min(max_iter, n)`` iterations -- see RealSim
-    ``CUDADenseCRSolver.cpp:126``. At small ``n`` (~10) this caps relative
-    accuracy at ~1e-4 (see ``test_fba_nsn_pcr.py::TestPCRReuse``). The
+    ``min(max_iter, n)`` iterations. At small ``n`` (~10) this caps relative
+    accuracy at ~1e-4 (see ``test_nsn_pcr.py::TestPCRReuse``). The
     parity tolerances below scale with ``n`` to reflect that.
 """
 
@@ -33,7 +32,7 @@ from newton.tests.fba._reference import fb_frictional_row, fb_unilateral_row, so
 
 
 def _make_unilateral_inputs(M: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build a well-conditioned SPD ``W`` plus ``(r, pene0)`` for Stage A.
+    """Build a well-conditioned SPD ``W`` plus ``(r, pene0)`` for a unilateral problem.
 
     Picks ``W = M_aux @ M_auxᵀ / M + I`` (matches the regime used by the
     NSN PCR tests) and standard-normal ``r`` / ``pene0`` scaled to typical
@@ -48,7 +47,7 @@ def _make_unilateral_inputs(M: int, seed: int) -> tuple[np.ndarray, np.ndarray, 
 
 
 def _make_coulomb_inputs(M: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Build a 3M-row Stage B test problem."""
+    """Build a 3M-row frictional (Coulomb) test problem."""
     rng = np.random.default_rng(seed)
     aux = rng.standard_normal((3 * M, 3 * M))
     W = (aux @ aux.T) / float(3 * M) + np.eye(3 * M)
@@ -87,7 +86,7 @@ def _build_minimal_solver(friction: bool, lambda_cap: float | None = None) -> So
 
 
 class TestNSNUnilateralGpuDriver(unittest.TestCase):
-    """Verify the Stage A GPU driver matches the CPU/numpy reference."""
+    """Verify the unilateral GPU driver matches the CPU/numpy reference."""
 
     @classmethod
     def setUpClass(cls):
@@ -214,7 +213,7 @@ class TestNSNUnilateralGpuDriver(unittest.TestCase):
 
 
 class TestNSNCoulombGpuDriver(unittest.TestCase):
-    """Verify the Stage B GPU driver matches the CPU/numpy reference."""
+    """Verify the Coulomb GPU driver matches the CPU/numpy reference."""
 
     @classmethod
     def setUpClass(cls):
@@ -307,7 +306,7 @@ class TestNSNCoulombGpuDriver(unittest.TestCase):
         np.testing.assert_allclose(lam_apply_gpu, dt * dt * omega_gpu * lam_gpu, rtol=1.0e-12)
 
     def test_gpu_path_coulomb_no_contacts(self):
-        """``M=0`` early-return for Stage B."""
+        """Return empty arrays from the Coulomb driver for ``M=0``."""
         solver = _build_minimal_solver(friction=True)
         W = np.zeros((0, 0), dtype=np.float64)
         r = np.zeros(0, dtype=np.float64)

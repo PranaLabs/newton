@@ -86,8 +86,7 @@ def fb_unilateral_row(
 ) -> tuple[float, float, float]:
     """Fischer-Burmeister evaluation for a unilateral (normal) contact row.
 
-    Port of RealSim ``NonSmoothNewton.cpp:332-341``. Returns
-    ``(omega, compliance, h)``.
+    Returns ``(omega, compliance, h)``.
 
     Args:
         penetration: ``J·q - pene0`` at current iterate (m).
@@ -127,8 +126,7 @@ def fb_frictional_row(
 ) -> tuple[float, float, float]:
     """Fischer-Burmeister evaluation for a frictional (tangent) contact row.
 
-    Port of RealSim ``NonSmoothNewton.cpp:343-378``. Returns
-    ``(omega, compliance, h)``.
+    Returns ``(omega, compliance, h)``.
 
     Inactive contact (``lam_n ≤ 0``): ``omega = 0``, ``compliance = 1/dt``,
     ``h = -dt · lam_t``.
@@ -162,17 +160,17 @@ def solve_nsn_unilateral(
     dt: float = 0.01,
     lambda_cap: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Host NSN driver for unilateral rows (Stage A), the reference of the GPU driver.
+    """Host NSN driver for unilateral (frictionless) rows, the reference of the GPU driver.
 
     Returns ``(lam, omega, lam_apply)``:
-      - ``lam`` (force units, for warm-start): RealSim's accumulated λ.
+      - ``lam`` (force units, for warm-start): the λ accumulated over the iterations.
       - ``omega``: per-row weighting from the last NSN iter.
       - ``lam_apply`` = ``dt² · ω · lam`` (position-LCP units): the value to
         pass into :meth:`~newton._src.solvers.fba.linear_solver.FBALinearSolver.apply_lambda_correction_combined`
         (which adds ``A⁻¹·Jᵀ·lam_apply`` to ``x_unc``).
 
-    The two scales differ because RealSim's correction is
-    ``Δq = dt² · A⁻¹ · Jᵀ · (ω · λ_force)``, whereas FBA's
+    The two scales differ because the correction is
+    ``Δq = dt² · A⁻¹ · Jᵀ · (ω · λ_force)``, whereas
     ``apply_lambda_correction_combined`` adds ``A⁻¹·Jᵀ·λ`` directly. ``omega``
     from the previous step is needed so that the next call can compute the
     correct iter-0 ``penetration = -r + dt²·W·(ω·λ)`` accounting for the
@@ -195,7 +193,7 @@ def solve_nsn_unilateral(
         omega = np.zeros(M, dtype=np.float64)
 
     diag_W = np.diag(W)
-    # RealSim convention: precond[i] = dt² · W_ii for unilateral rows.
+    # Preconditioner: precond[i] = dt² · W_ii for unilateral rows.
     precond = (dt * dt) * np.where(np.abs(diag_W) > 1e-12, np.maximum(diag_W, 1e-12), 1.0)
 
     for _ in range(max_iters):
@@ -227,13 +225,10 @@ def solve_nsn_unilateral(
         except np.linalg.LinAlgError:
             break
         lam = lam + dlam
-        # No lam_n >= 0 clamp here. RealSim's boundConstraintForces
-        # (NonSmoothNewton.cpp:391-394, unilateral branch) explicitly
-        # comments out `if(_lambda[cid] < 0.0) _lambda[cid] = 0.0;` —
-        # FB-Newton allows transient negative lambda inside the inner
-        # solve and lets the FB residual converge. The previous
-        # np.maximum(lam, 0.0) clamp converted Stage A toward
-        # Signorini-PGS (see realsim-port-discipline P2-E v1 failure).
+        # No lam_n >= 0 clamp here: FB-Newton allows a transiently negative
+        # lambda inside the inner solve and lets the FB residual converge. A
+        # np.maximum(lam, 0.0) clamp would turn the Newton iteration into a
+        # projected one.
 
     if lambda_cap is not None:
         cap_internal = lambda_cap / (dt * dt)
@@ -253,13 +248,12 @@ def solve_nsn_coulomb(
     dt: float = 0.01,
     lambda_cap: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Host NSN driver for frictional rows (Stage B), the reference of the GPU driver.
+    """Host NSN driver for frictional (Coulomb) rows, the reference of the GPU driver.
 
-    RealSim NonSmoothNewton port for the frictional LCP.
-
-    Implements the dλ-Newton update from ``NonSmoothNewton.cpp:102-170``
-    + ``343-378``, with omega weighting and position-LCP coupling. λ
-    accumulates across ``max_iters`` iterations.
+    Takes semismooth Newton steps ``dλ`` on the Fischer-Burmeister rows of
+    :func:`fb_unilateral_row` and :func:`fb_frictional_row`, with omega
+    weighting and position-LCP coupling. λ accumulates across ``max_iters``
+    iterations.
 
     Args:
         W: ``(3M, 3M)`` Schur complement.
@@ -273,8 +267,8 @@ def solve_nsn_coulomb(
 
     Returns:
         ``(lam, omega, lam_apply)``:
-          - ``lam`` (force units, ``(3M,)``): RealSim-style accumulated λ
-            with layout ``[λ_n_0, λ_t1_0, λ_t2_0, ...]``. Use as warm-start.
+          - ``lam`` (force units, ``(3M,)``): the λ accumulated over the
+            iterations, with layout ``[λ_n_0, λ_t1_0, λ_t2_0, ...]``. Use as warm-start.
           - ``omega``: per-row weighting from the last NSN iter.
           - ``lam_apply`` = ``dt² · ω · lam``: pass into
             :meth:`~newton._src.solvers.fba.linear_solver.FBALinearSolver.apply_lambda_correction_combined`.
@@ -298,9 +292,9 @@ def solve_nsn_coulomb(
         omega = np.zeros(size_total, dtype=np.float64)
 
     diag_W = np.diag(W)
-    # RealSim convention: precond[3c]   = dt² · W_ii  (unilateral row)
-    #                     precond[3c+1] = dt   · W_ii  (tangent rows)
-    #                     precond[3c+2] = dt   · W_ii
+    # Preconditioner: precond[3c]   = dt² · W_ii  (unilateral row)
+    #                 precond[3c+1] = dt   · W_ii  (tangent rows)
+    #                 precond[3c+2] = dt   · W_ii
     precond = np.zeros(size_total, dtype=np.float64)
     for c in range(M):
         w_n = max(float(abs(diag_W[3 * c])), 1e-12)
@@ -368,16 +362,13 @@ def solve_nsn_coulomb(
             break
         lam = lam + dlam
 
-        # boundConstraintForces (NonSmoothNewton.cpp:395-403, friction
-        # branch): signed cone clamp. lam_n is NOT clamped to >= 0 inside
-        # the inner loop (the `if(_lambda[cid] < 0.0) = 0` line is
-        # explicitly commented out in RealSim). Tangent clamp is two
-        # independent if-statements applied in order; when lam_n < 0 this
-        # saturates lam_t to -mu*lam_n (positive) rather than producing a
-        # degenerate np.clip with low > high. Mirroring RealSim's exact
-        # mutation order:
+        # Signed cone clamp: lam_n is NOT clamped to >= 0 inside the inner
+        # loop. The tangent clamp is two independent if-statements applied
+        # in order; when lam_n < 0 this saturates lam_t to -mu*lam_n
+        # (positive) rather than producing a degenerate np.clip with
+        # low > high. The GPU kernel applies them in the same order:
         for c in range(M):
-            lam_n_c = lam[3 * c]  # SIGNED, per RealSim
+            lam_n_c = lam[3 * c]  # signed
             upper = mu[c] * lam_n_c
             lower = -mu[c] * lam_n_c
             if lam[3 * c + 1] > upper:

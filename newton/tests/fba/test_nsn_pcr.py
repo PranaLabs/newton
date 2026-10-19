@@ -3,17 +3,15 @@
 
 """Tests for the NSN PCR (Jacobi-preconditioned Conjugate Residual) solver.
 
-Ported from RealSim ``CUDADenseJacobiPCRSolver`` (NSN inner Schur LCP solver).
-The reference algorithm lives in
-``newton/_src/solvers/fba/nsn_pcr_solver.py``; these tests validate it against
+The solver lives in ``newton/_src/solvers/fba/nsn_pcr_solver.py``; these
+tests validate it against
 ``numpy.linalg.solve`` on a battery of SPD matrices of increasing size.
 
 Test matrices are constructed as ``A = M Mᵀ / n + I`` which yields a
 well-conditioned diagonally-dominant SPD matrix. This is the regime in which
-RealSim's PCR (with Jacobi preconditioner, an *unsymmetric* application of
-preconditioning -- see RealSim ``CUDADenseCRSolver.cpp:166`` for the
-``rho > tol`` test) is well-defined and converges. NSN Schur LCP systems have
-the same structure (mass-derived diagonal-dominant).
+the Jacobi-preconditioned conjugate residual iteration is well-defined and
+converges. NSN Schur LCP systems have the same structure (mass-derived
+diagonal-dominant).
 """
 
 from __future__ import annotations
@@ -66,7 +64,7 @@ class _PCRTestCase(unittest.TestCase):
 
 
 class TestPCRBasic(_PCRTestCase):
-    """Identity / diagonal sanity checks (RealSim cuda_precond exactness)."""
+    """Identity and diagonal systems, which the Jacobi preconditioner solves exactly."""
 
     def test_solve_identity_system(self):
         n = 16
@@ -105,14 +103,14 @@ class TestPCRConvergence(_PCRTestCase):
         b_np = np.random.default_rng(2).standard_normal(n)
         x_ref = np.linalg.solve(A_np, b_np)
         x, iters, _ = self._solve(A_np, b_np, tol=1.0e-10, max_iter=200)
-        # RealSim caps iter count at ``min(max_iter, n)`` (CRSolver.cpp:126), so
+        # The solver caps its iteration count at ``min(max_iter, n)``, so
         # n=10 floors at 10 iters and roundoff floor is ~1e-5.
         self.assertLessEqual(iters, n)
         rel_err = np.linalg.norm(x - x_ref) / np.linalg.norm(x_ref)
         self.assertLess(rel_err, 1.0e-4)
 
     def test_solve_random_spd_large(self):
-        # Demo 5 Stage A size.
+        # The size of a frictionless contact solve with 300 contacts.
         n = 300
         A_np = _make_spd(n, seed=3)
         b_np = np.random.default_rng(4).standard_normal(n)
@@ -123,7 +121,7 @@ class TestPCRConvergence(_PCRTestCase):
         self.assertLess(rel_err, 1.0e-7)
 
     def test_solve_3M_size(self):
-        # Demo 5 Stage B size (3M-like dim).
+        # The size of a frictional contact solve with 300 contacts, three rows each.
         n = 900
         A_np = _make_spd(n, seed=5)
         b_np = np.random.default_rng(6).standard_normal(n)
@@ -140,9 +138,9 @@ class TestPCRDiagnostics(_PCRTestCase):
     def test_solve_monotone_residual_decrease(self):
         """Final ``||r||`` must be strictly smaller than ``||b||``.
 
-        RealSim PCR with diagonal-dominant SPD is not strictly monotone in
-        ``||r||`` (only the energy norm is monotone), but the *final* residual
-        must always be smaller than the initial one for a converged solve.
+        The preconditioned iteration need not decrease ``||r||`` at every
+        step, but the *final* residual must always be smaller than the initial
+        one for a converged solve.
         """
         n = 100
         A_np = _make_spd(n, seed=7)
@@ -166,7 +164,7 @@ class TestPCRDiagnostics(_PCRTestCase):
     def test_solve_zero_rhs_returns_zero(self):
         """``b = 0`` should short-circuit to ``x = 0`` in 0 iterations.
 
-        Mirrors RealSim ``CUDADenseCRSolver.cpp:138`` ``if(dot_b != 0.0)`` guard.
+        The solver checks ``dot(b, b) == 0`` before it iterates.
         """
         n = 50
         A_np = _make_spd(n, seed=11)
@@ -258,7 +256,7 @@ class TestPCRReuse(_PCRTestCase):
         max_n = 200
         solver = NSNPCRSolver(max_n=max_n, device=self.device, tol=1.0e-10, max_iter=500)
         # n=10 hits the n-cap and only converges to ~1e-5 relative;
-        # all other sizes reach 1e-7. See RealSim CRSolver.cpp:126.
+        # all other sizes reach 1e-7.
         rel_tol_by_size = {10: 1.0e-4, 50: 1.0e-7, 100: 1.0e-7, 200: 1.0e-7}
         for n in [10, 100, 200, 50]:
             A_np = _make_spd(n, seed=100 + n)
