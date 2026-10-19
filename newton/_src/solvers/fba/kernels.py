@@ -4116,6 +4116,62 @@ def contact_mu_kernel(
 
 
 @wp.kernel
+def lite_row_slots_kernel(
+    contact_particle: wp.array[wp.int32],  # (M,) first particle of each contact
+    contact_alpha: wp.array[wp.float32],  # (M,)
+    extra_particle: wp.array2d[wp.int32],  # (M, E) further particles of each contact, -1 where unused
+    extra_alpha: wp.array2d[wp.float32],  # (M, E)
+    bilateral_particle: wp.array[wp.int32],  # (B,) particle of each bilateral row
+    bilateral_alpha: wp.array[wp.float32],  # (B,)
+    rows_per_contact: int,
+    contact_rows: int,
+    # outputs
+    row_particle: wp.array[wp.int32],  # (R,)
+    row_alpha: wp.array[wp.float32],  # (R,)
+    slot_particle: wp.array2d[wp.int32],  # (R, E + 1)
+    slot_alpha: wp.array2d[wp.float32],  # (R, E + 1)
+    row_keys: wp.array[wp.int32],  # (2 R,) particle of each row, to sort
+    row_values: wp.array[wp.int32],  # (2 R,)
+    row_count: wp.array[wp.int32],  # (N,) rows of each particle, zeroed, incremented
+    slot_keys: wp.array[wp.int32],  # (2 R E,) particle of each further slot, row-major, or a past-the-end key
+    slot_values: wp.array[wp.int32],  # (2 R E,) row * (E + 1) + slot
+    slot_count: wp.array[wp.int32],  # (N,) further slots of each particle, zeroed, incremented
+):
+    """The particles and coefficients of the lite rows in slots, and the keys and counts of the CSRs from each
+    particle to its rows and to its further slots: contact rows first, then the bilateral rows."""
+    r = wp.tid()
+    c = r // rows_per_contact
+    p = wp.int32(-1)
+    a = wp.float32(0.0)
+    if r < contact_rows:
+        p = contact_particle[c]
+        a = contact_alpha[c]
+    else:
+        p = bilateral_particle[r - contact_rows]
+        a = bilateral_alpha[r - contact_rows]
+    row_particle[r] = p
+    row_alpha[r] = a
+    slot_particle[r, 0] = p
+    slot_alpha[r, 0] = a
+    row_keys[r] = p
+    row_values[r] = r
+    wp.atomic_add(row_count, p, 1)
+    width = extra_particle.shape[1]
+    for k in range(width):
+        q = wp.int32(-1)
+        b = wp.float32(0.0)
+        if r < contact_rows:
+            q = extra_particle[c, k]
+            b = extra_alpha[c, k]
+        slot_particle[r, k + 1] = q
+        slot_alpha[r, k + 1] = b
+        slot_keys[r * width + k] = wp.where(q >= 0, q, row_count.shape[0])
+        slot_values[r * width + k] = r * (width + 1) + k + 1
+        if q >= 0:
+            wp.atomic_add(slot_count, q, 1)
+
+
+@wp.kernel
 def lite_row_dirs_kernel(
     normal: wp.array[wp.vec3],  # (M,)
     tangent1: wp.array[wp.vec3],  # (M,), unused with one row per contact

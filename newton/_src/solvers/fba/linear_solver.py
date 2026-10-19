@@ -33,6 +33,7 @@ from .kernels import (
     extract_component_kernel,
     insert_component_kernel,
     lite_row_dirs_kernel,
+    lite_row_slots_kernel,
     scale_by_diag_kernel,
 )
 
@@ -1701,6 +1702,38 @@ class FBALinearSolver:
         )
         return np.concatenate([row_particle, extra_p[rows, slots]])
 
+    def _setup_lite_rows_on_device(self, M, rows_per_contact, directions, j_indices, j_alpha, extra, bilateral) -> int:
+        """:meth:`setup_lite_row_meta` on the device for rows on several particles, without the list of particles
+        that the rows touch, which only the per-particle lite kernel reads: the CSRs keep the order of a stable
+        sort of the rows, and of the further slots row by row."""
+        dev, n, width = self.device, self.n, extra[0].shape[1]
+        bilateral = bilateral or (np.zeros(0), np.zeros((0, 3)), np.zeros(0))
+        types = (wp.int32, wp.vec3, wp.float32)
+        b_p, b_d, b_a = (wp.array(np.asarray(a), dtype=t, device=dev) for a, t in zip(bilateral, types, strict=True))
+        contact_rows = M * rows_per_contact
+        R = contact_rows + b_p.shape[0]
+        self._row_dir_d = wp.empty(R, dtype=wp.vec3, device=dev)
+        inputs = [*directions, b_d, rows_per_contact, contact_rows]
+        wp.launch(lite_row_dirs_kernel, R, inputs, [self._row_dir_d], device=dev)
+        self._row_particle_d = wp.empty(R, dtype=wp.int32, device=dev)
+        self._row_alpha_d = wp.empty(R, dtype=wp.float32, device=dev)
+        slots = [wp.empty((R, width + 1), dtype=t, device=dev) for t in (wp.int32, wp.float32)]
+        row_kv = [wp.empty(2 * R, dtype=wp.int32, device=dev) for _ in range(2)]
+        slot_kv = [wp.empty(2 * R * width, dtype=wp.int32, device=dev) for _ in range(2)]
+        counts = [wp.zeros(n, dtype=wp.int32, device=dev) for _ in range(2)]
+        inputs = [j_indices, j_alpha, *extra, b_p, b_a, rows_per_contact, contact_rows]
+        outputs = [self._row_particle_d, self._row_alpha_d, *slots, *row_kv, counts[0], *slot_kv, counts[1]]
+        wp.launch(lite_row_slots_kernel, R, inputs, outputs, device=dev)
+        offsets = [wp.zeros(n + 1, dtype=wp.int32, device=dev) for _ in range(2)]
+        for kv, size, count, offset in zip((row_kv, slot_kv), (R, R * width), counts, offsets, strict=True):
+            wp.utils.radix_sort_pairs(*kv, size)
+            wp.utils.array_scan(count, offset[1:], inclusive=True)
+        self._row_slots = (*slots, offsets[1], slot_kv[1])
+        self._isodof_row_offsets_d, self._isodof_row_indices_d = offsets[0], row_kv[1]
+        self._isodof_unique_d, self._n_isodofs, self._isodof_max_k = None, 0, 0
+        self._row_total = R
+        return R
+
     def setup_lite_row_meta(
         self,
         num_contacts: int,
@@ -1742,6 +1775,10 @@ class FBALinearSolver:
         total_rows = M * rows_per_contact
         dev = self.device
         n = self.n
+        if j_extra_indices is not None:
+            normals = (j_normals, j_tangent1, j_tangent2) if has_friction else (j_normals, j_normals, j_normals)
+            extra = (j_extra_indices, j_extra_alpha)
+            return self._setup_lite_rows_on_device(M, rows_per_contact, normals, j_indices, j_alpha, extra, bilateral)
 
         if host is None:
             host = (j_indices.numpy(), j_alpha.numpy())
