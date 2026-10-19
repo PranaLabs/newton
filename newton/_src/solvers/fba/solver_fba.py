@@ -163,6 +163,21 @@ def _transform_point(pos: np.ndarray, quat: np.ndarray, p: np.ndarray) -> np.nda
     return np.array([rx + float(pos[0]), ry + float(pos[1]), rz + float(pos[2])], dtype=np.float64)
 
 
+def _host_mirror(name: str) -> property:
+    """A host copy of a persistent multiplier buffer of :class:`SolverFBA`, read from the device when it is first
+    read after a step."""
+
+    def get(solver):
+        if solver._persistent_rows is not None:
+            solver._read_persistent()
+        return solver.__dict__.get(name)
+
+    def put(solver, value):
+        solver.__dict__[name] = value
+
+    return property(get, put)
+
+
 class SolverFBA(SolverBase):
     """Fast But Accurate projective-dynamics cloth solver.
 
@@ -225,6 +240,11 @@ class SolverFBA(SolverBase):
 
     Cable = Cable
     """A cable through a tetrahedral body, driven through :meth:`set_particle_constraints`."""
+
+    _lam_unilateral_persistent = _host_mirror("_lam_unilateral_persistent")
+    _lam_coulomb_persistent = _host_mirror("_lam_coulomb_persistent")
+    _omega_unilateral_persistent = _host_mirror("_omega_unilateral_persistent")
+    _omega_coulomb_persistent = _host_mirror("_omega_coulomb_persistent")
 
     def __init__(
         self,
@@ -574,7 +594,9 @@ class SolverFBA(SolverBase):
 
         # λ persistent across PD outer iters within a step. RealSim parity:
         # cuda_lambda.setZero once per frame in prepare_gpu, then λ += dλ
-        # accumulates over PD outer iters.
+        # accumulates over PD outer iters. The host mirrors read the last
+        # step's values when first read, as their step left ``_persistent_rows``.
+        self._persistent_rows: int | None = None
         self._lam_unilateral_persistent: np.ndarray | None = None
         self._lam_coulomb_persistent: np.ndarray | None = None
         # ω persistent across PD outer iters: needed by NSN iter-0 to compute
@@ -658,6 +680,16 @@ class SolverFBA(SolverBase):
         self._k_tri_nh_lbfgs = _K.project_stretching_neohookean_compute_kernel_lbfgs
         self._k_tet_nh = _K.project_stretching_neohookean_tet_compute_kernel
         self._k_tet_nh_lbfgs = _K.project_stretching_neohookean_tet_compute_kernel_lbfgs
+
+    def _read_persistent(self) -> None:
+        """Read the persistent multipliers of the last step into their host mirrors, for tests and diagnostics."""
+        M, self._persistent_rows = self._persistent_rows, None
+        if self.friction and hasattr(self, "_lam_coulomb_persistent_d"):
+            self._lam_coulomb_persistent = self._lam_coulomb_persistent_d.numpy()[: 3 * M].astype(np.float64)
+            self._omega_coulomb_persistent = self._omega_coulomb_persistent_d.numpy()[: 3 * M].astype(np.float64)
+        elif hasattr(self, "_lam_unilateral_persistent_d"):
+            self._lam_unilateral_persistent = self._lam_unilateral_persistent_d.numpy()[:M].astype(np.float64)
+            self._omega_unilateral_persistent = self._omega_unilateral_persistent_d.numpy()[:M].astype(np.float64)
 
     def reset_timing(self) -> None:
         """Clear all per-PD-iter timing buffers.
@@ -1502,6 +1534,7 @@ class SolverFBA(SolverBase):
         M = self._contact_count
         n_b = 0 if self._constraint_rows is None else self._constraint_rows[0].shape[0]
         if M > 0 or n_b:
+            self._persistent_rows = None
             if self._lam_unilateral_persistent is None or self._lam_unilateral_persistent.shape != (M,):
                 self._lam_unilateral_persistent = np.zeros(M, dtype=np.float64)
             else:
@@ -1944,26 +1977,10 @@ class SolverFBA(SolverBase):
             device=device,
         )
 
-        # End-of-step refresh of host-mirror persistent buffers. Done once
-        # per step (not per PD outer iter) so tests / diagnostics that read
-        # ``solver._lam_*_persistent`` continue to see populated arrays
-        # while the hot path remains free of per-PD-iter device->host
-        # downloads. When M==0 the host arrays were left at None / unchanged.
+        # The host mirrors of the persistent buffers read them when first read, so the step ends without waiting
+        # for the device. When M==0 the host arrays were left at None / unchanged.
         if has_contacts:
-            if self.friction and hasattr(self, "_lam_coulomb_persistent_d"):
-                self._lam_coulomb_persistent = self._lam_coulomb_persistent_d.numpy()[: 3 * M].astype(
-                    np.float64, copy=True
-                )
-                self._omega_coulomb_persistent = self._omega_coulomb_persistent_d.numpy()[: 3 * M].astype(
-                    np.float64, copy=True
-                )
-            elif hasattr(self, "_lam_unilateral_persistent_d"):
-                self._lam_unilateral_persistent = self._lam_unilateral_persistent_d.numpy()[:M].astype(
-                    np.float64, copy=True
-                )
-                self._omega_unilateral_persistent = self._omega_unilateral_persistent_d.numpy()[:M].astype(
-                    np.float64, copy=True
-                )
+            self._persistent_rows = M
 
         # Diagnostic dump: flush captured buffers to .npz at end of step.
         if _diag_active and self._diag_out_path is not None:
