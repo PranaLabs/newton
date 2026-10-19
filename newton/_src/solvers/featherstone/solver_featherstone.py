@@ -5,8 +5,10 @@ import numpy as np
 import warp as wp
 
 from ...core.types import override
-from ...sim import BodyFlags, Contacts, Control, JointType, Model, State
-from ..flags import SolverNotifyFlags
+from ...sim import BodyFlags, Contacts, Control, JointType, Model, ModelFlags, State
+from ...sim.joint_mimic import eval_joint_mimic, has_supported_joint_mimics
+from ..coupled.interface import CouplingInterface
+from ..semi_implicit import kernels_contact, kernels_muscle, kernels_particle
 from ..semi_implicit.kernels_contact import (
     eval_body_contact,
     eval_particle_body_contact_forces,
@@ -22,12 +24,12 @@ from ..semi_implicit.kernels_particle import (
     eval_triangle_forces,
 )
 from ..solver import SolverBase
+from . import kernels
 from .kernels import (
     accumulate_free_distance_joint_f_to_body_force,
     compute_body_parent_f,
     compute_com_transforms,
     compute_spatial_inertia,
-    convert_body_force_com_to_origin,
     convert_free_distance_joint_f_public_to_internal,
     convert_free_distance_joint_qd_internal_to_public,
     convert_free_distance_joint_qd_public_to_internal,
@@ -45,14 +47,23 @@ from .kernels import (
     eval_rigid_jacobian,
     eval_rigid_mass,
     eval_rigid_tau,
+    expand_mimic_accelerations,
     integrate_generalized_joints,
     reconstruct_free_distance_joint_q_from_body_pose,
+    reduce_mimic_forces,
+    reduce_mimic_inertia,
     zero_kinematic_body_forces,
     zero_kinematic_joint_qdd,
 )
 
 
-class SolverFeatherstone(SolverBase):
+def _group_view(array: wp.array, start: int, shape: tuple[int, int, int]) -> wp.array:
+    """View a contiguous size group of a flat matrix array as a batched 3D array."""
+    start = int(start)
+    return array[start : start + int(np.prod(shape))].reshape(shape)
+
+
+class SolverFeatherstone(SolverBase, CouplingInterface):
     """A semi-implicit integrator using symplectic Euler that operates
     on reduced (also called generalized) coordinates to simulate articulated rigid body dynamics
     based on Featherstone's composite rigid body algorithm (CRBA).
@@ -83,21 +94,27 @@ class SolverFeatherstone(SolverBase):
 
     Joint limitations:
         - Supported joint types: PRISMATIC, REVOLUTE, BALL, FIXED, FREE, DISTANCE (treated as FREE), D6.
-          CABLE joints are not supported.
+          ROD joints are not supported.
         - :attr:`~newton.Model.joint_armature`, :attr:`~newton.Model.joint_limit_ke`/:attr:`~newton.Model.joint_limit_kd`,
           :attr:`~newton.Model.joint_target_ke`/:attr:`~newton.Model.joint_target_kd`, and :attr:`~newton.Control.joint_f`
           are supported.
+        - Position/velocity target tracking (:attr:`~newton.Control.joint_target_q`/
+          :attr:`~newton.Control.joint_target_qd`) is applied only to PRISMATIC, REVOLUTE,
+          and D6 joints. For BALL, FREE, and DISTANCE joints the target arrays are read
+          but no drive force is applied.
         - :attr:`~newton.Model.joint_friction`, :attr:`~newton.Model.joint_effort_limit`,
           :attr:`~newton.Model.joint_velocity_limit`, :attr:`~newton.Model.joint_enabled`,
           and :attr:`~newton.Model.joint_target_mode` are not supported.
-        - Equality and mimic constraints are not supported.
+        - Joint-owned mimic relationships are supported for PRISMATIC, REVOLUTE, and D6 joints.
+          Equality constraints and the deprecated sparse mimic constraints are not supported.
 
         See :ref:`Joint feature support` for the full comparison across solvers.
 
-    Extended state attributes:
-        :attr:`~newton.State.body_parent_f` is populated when requested via
-        :meth:`~newton.ModelBuilder.request_state_attributes`. The reported
-        wrench is the per-body net spatial force from the RNEA backward pass
+    Solver observables:
+        :attr:`~newton.solvers.SolverBase.Observables.body_parent_f` is populated when
+        :attr:`~newton.solvers.SolverBase.ObservableKind.BODY_PARENT_F` is requested
+        from :meth:`~newton.solvers.SolverBase.observables`. The reported wrench is
+        the per-body net spatial force from the RNEA backward pass
         translated to the body's COM (linear ``[N]`` first, torque ``[N·m]``
         in world frame at the COM), matching the wrench-transmitted-through-
         the-inbound-joint convention used by :class:`~newton.solvers.SolverMuJoCo`'s
@@ -111,6 +128,10 @@ class SolverFeatherstone(SolverBase):
         contacts vs. gravity in equilibrium, or the gyroscopic
         ``v x* (I*v)`` term during tumbling) rather than a true joint
         reaction. Treat it as a diagnostic in that case.
+
+    Mimic reduction requires every mimic follower and reference to belong to
+    the same assigned articulation. Models with standalone or mixed-membership
+    mimic pairs may be used with maximal-coordinate solvers instead.
 
     Example
     -------
@@ -126,14 +147,18 @@ class SolverFeatherstone(SolverBase):
 
     """
 
+    SUPPORTED_OBSERVABLES = frozenset({SolverBase.ObservableKind.BODY_PARENT_F})
+
     def __init__(
         self,
         model: Model,
+        *,
         angular_damping: float = 0.05,
         update_mass_matrix_interval: int = 1,
         friction_smoothing: float = 1.0,
         use_tile_gemm: bool = False,
         fuse_cholesky: bool = True,
+        deterministic: wp.DeterministicMode | None = None,
     ):
         """
         Args:
@@ -141,10 +166,61 @@ class SolverFeatherstone(SolverBase):
             angular_damping: Angular damping factor. Defaults to 0.05.
             update_mass_matrix_interval: How often to update the mass matrix (every n-th time the :meth:`step` function gets called). Defaults to 1.
             friction_smoothing: The delta value for the Huber norm (see :func:`warp.norm_huber() <warp._src.lang.norm_huber>`) used for the friction velocity normalization. Defaults to 1.0.
-            use_tile_gemm: Whether to use operators from Warp's Tile API to solve for joint accelerations. Defaults to False.
+            use_tile_gemm: Whether to use operators from Warp's Tile API to solve for joint accelerations. A kernel is compiled per distinct articulation size. Defaults to False.
             fuse_cholesky: Whether to fuse the Cholesky decomposition into the inertia matrix evaluation kernel when using the Tile API. Only used if `use_tile_gemm` is true. Defaults to True.
+            deterministic: Opt-in determinism for this solver's atomic-emitting
+                kernel modules. Pass a :class:`warp.DeterministicMode`, or
+                ``None`` (default) to inherit the current
+                ``wp.config.deterministic`` mode.
+
+        Raises:
+            ValueError: If ``model`` contains a :attr:`~newton.JointType.ROD`
+                joint, or active mimic reduction contains a pair outside the
+                same assigned articulation.
         """
+        if model._has_rod_joints and JointType.ROD in model.joint_type.numpy():  # pyright: ignore[reportPrivateUsage]
+            raise ValueError("SolverFeatherstone does not support JointType.ROD joints.")
+
         super().__init__(model)
+        self._has_joint_mimics = has_supported_joint_mimics(model, "SolverFeatherstone")
+        if self._has_joint_mimics:
+            mimic_joints = model.joint_mimic_joint.numpy()
+            articulations = model.joint_articulation.numpy()
+            followers = np.flatnonzero(mimic_joints >= 0)
+            references = mimic_joints[followers]
+            invalid = np.flatnonzero(
+                (articulations[followers] < 0) | (articulations[followers] != articulations[references])
+            )
+            if len(invalid) > 0:
+                idx = int(invalid[0])
+                follower = int(followers[idx])
+                reference = int(references[idx])
+                raise ValueError(
+                    "SolverFeatherstone requires mimic joints to belong to the same articulation. "
+                    f"Follower joint {follower} belongs to articulation {articulations[follower]}; "
+                    f"reference joint {reference} belongs to articulation {articulations[reference]}."
+                )
+        effective_deterministic = deterministic if deterministic is not None else wp.config.deterministic
+        if model.joint_count > 0:
+            self._set_module_options(
+                {
+                    "deterministic": effective_deterministic,
+                    "deterministic_max_records": 0,
+                },
+                module=kernels,
+            )
+
+        borrowed_modules = []
+        has_shape_contacts = getattr(model, "shape_count", 0) > 0 and (model.body_count > 0 or model.particle_count > 0)
+        if has_shape_contacts:
+            borrowed_modules.append(kernels_contact)
+        if getattr(model, "muscle_count", 0) > 0:
+            borrowed_modules.append(kernels_muscle)
+        if model.particle_count > 0:
+            borrowed_modules.append(kernels_particle)
+        borrowed_options = {"deterministic": effective_deterministic, "deterministic_max_records": 0}
+        for module in borrowed_modules:
+            self._set_module_options(borrowed_options, module=module)
 
         self.angular_damping = angular_damping
         self.update_mass_matrix_interval = update_mass_matrix_interval
@@ -160,20 +236,12 @@ class SolverFeatherstone(SolverBase):
         self._compute_articulation_indices(model)
         self._allocate_model_aux_vars(model)
 
-        if self.use_tile_gemm:
-            # create a custom kernel to evaluate the system matrix for this type
-            if self.fuse_cholesky:
-                self.eval_inertia_matrix_cholesky_kernel = create_inertia_matrix_cholesky_kernel(
-                    int(self.joint_count), int(self.dof_count)
-                )
+        if self.use_tile_gemm and model.joint_count:
+            if self.fuse_cholesky and not self._has_joint_mimics:
+                create_kernel = create_inertia_matrix_cholesky_kernel
             else:
-                self.eval_inertia_matrix_kernel = create_inertia_matrix_kernel(
-                    int(self.joint_count), int(self.dof_count)
-                )
-
-            # ensure matrix is reloaded since otherwise an unload can happen during graph capture
-            # todo: should not be necessary?
-            wp.load_module(device=wp.get_device())
+                create_kernel = create_inertia_matrix_kernel
+            self._tile_kernels_by_size = {size: create_kernel(*size) for size in self._group_to_art}
 
     def _update_kinematic_state(self):
         """Recompute cached solver flags and effective joint armature."""
@@ -185,12 +253,21 @@ class SolverFeatherstone(SolverBase):
         self.descendant_free_distance_refresh_joint_starts = None
         self.joint_armature_effective = model.joint_armature
 
+        body_flags = None
+        kinematic_mask = None
+        if model.body_count:
+            body_flags = model.body_flags.numpy()
+            kinematic_mask = (body_flags & int(BodyFlags.KINEMATIC)) != 0
+
         if model.joint_count:
             joint_type = model.joint_type.numpy()
             joint_parent = model.joint_parent.numpy()
+            joint_child = model.joint_child.numpy()
             descendant_free_distance_mask = (
                 (joint_type == int(JointType.FREE)) | (joint_type == int(JointType.DISTANCE))
             ) & (joint_parent >= 0)
+            if kinematic_mask is not None:
+                descendant_free_distance_mask &= ~kinematic_mask[joint_child]
             if np.any(descendant_free_distance_mask):
                 joint_indices = np.flatnonzero(descendant_free_distance_mask)
                 self.descendant_free_distance_joint_indices = wp.array(
@@ -199,11 +276,12 @@ class SolverFeatherstone(SolverBase):
                     device=model.device,
                 )
                 articulation_start = model.articulation_start.numpy()
+                articulation_end = model.articulation_end.numpy()
                 articulation_indices = []
                 refresh_joint_starts = []
                 for articulation in range(model.articulation_count):
                     joint_start = articulation_start[articulation]
-                    joint_end = articulation_start[articulation + 1]
+                    joint_end = articulation_end[articulation]
                     descendant_joint_offsets = np.flatnonzero(descendant_free_distance_mask[joint_start:joint_end])
                     if descendant_joint_offsets.size == 0:
                         continue
@@ -222,11 +300,8 @@ class SolverFeatherstone(SolverBase):
                     )
 
         if model.body_count:
-            body_flags = model.body_flags.numpy()
-            kinematic_mask = (body_flags & int(BodyFlags.KINEMATIC)) != 0
             self.has_kinematic_bodies = bool(np.any(kinematic_mask))
             if model.joint_count and self.has_kinematic_bodies:
-                joint_child = model.joint_child.numpy()
                 joint_qd_start = model.joint_qd_start.numpy()
                 joint_armature = model.joint_armature.numpy().copy()
                 for joint_idx in range(model.joint_count):
@@ -240,80 +315,57 @@ class SolverFeatherstone(SolverBase):
                     self.joint_armature_effective = wp.array(joint_armature, dtype=float, device=model.device)
 
     @override
-    def notify_model_changed(self, flags: int) -> None:
-        if flags & (SolverNotifyFlags.BODY_PROPERTIES | SolverNotifyFlags.JOINT_DOF_PROPERTIES):
+    def notify_model_changed(self, flags: ModelFlags | int) -> None:
+        self._apply_module_options()
+        if flags & (
+            ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_DOF_INERTIAL_PROPERTIES
+        ):
             self._update_kinematic_state()
             self._mass_matrix_dirty = True
 
     def _compute_articulation_indices(self, model):
         # calculate total size and offsets of Jacobian and mass matrices for entire system
         if model.joint_count:
-            self.J_size = 0
-            self.M_size = 0
-            self.H_size = 0
-
-            articulation_J_start = []
-            articulation_M_start = []
-            articulation_H_start = []
-
-            articulation_M_rows = []
-            articulation_H_rows = []
-            articulation_J_rows = []
-            articulation_J_cols = []
-
-            articulation_dof_start = []
-            articulation_coord_start = []
-
-            articulation_start = model.articulation_start.numpy()
+            articulation_start = model.articulation_start.numpy()[: model.articulation_count]
+            articulation_end = model.articulation_end.numpy()
             joint_q_start = model.joint_q_start.numpy()
             joint_qd_start = model.joint_qd_start.numpy()
 
-            for i in range(model.articulation_count):
-                first_joint = articulation_start[i]
-                last_joint = articulation_start[i + 1]
+            joint_count = (articulation_end - articulation_start).astype(np.int64)
+            dof_start = joint_qd_start[articulation_start]
+            dof_count = joint_qd_start[articulation_end] - dof_start
 
-                first_coord = joint_q_start[first_joint]
+            # Store equally sized articulations contiguously so the tile kernels can view each size group as a
+            # batched 3D array.
+            order = np.lexsort((dof_count, joint_count))
 
-                first_dof = joint_qd_start[first_joint]
-                last_dof = joint_qd_start[last_joint]
-
-                joint_count = last_joint - first_joint
-                dof_count = last_dof - first_dof
-
-                articulation_J_start.append(self.J_size)
-                articulation_M_start.append(self.M_size)
-                articulation_H_start.append(self.H_size)
-                articulation_dof_start.append(first_dof)
-                articulation_coord_start.append(first_coord)
-
-                # bit of data duplication here, but will leave it as such for clarity
-                articulation_M_rows.append(joint_count * 6)
-                articulation_H_rows.append(dof_count)
-                articulation_J_rows.append(joint_count * 6)
-                articulation_J_cols.append(dof_count)
-
-                if self.use_tile_gemm:
-                    # store the joint and dof count assuming all
-                    # articulations have the same structure
-                    self.joint_count = joint_count
-                    self.dof_count = dof_count
-
-                self.J_size += 6 * joint_count * dof_count
-                self.M_size += 6 * joint_count * 6 * joint_count
-                self.H_size += dof_count * dof_count
+            def offsets(sizes):
+                start = np.empty_like(sizes)
+                start[order] = np.cumsum(sizes[order]) - sizes[order]
+                return wp.array(start, dtype=wp.int32, device=model.device), int(sizes.sum())
 
             # matrix offsets for batched gemm
-            self.articulation_J_start = wp.array(articulation_J_start, dtype=wp.int32, device=model.device)
-            self.articulation_M_start = wp.array(articulation_M_start, dtype=wp.int32, device=model.device)
-            self.articulation_H_start = wp.array(articulation_H_start, dtype=wp.int32, device=model.device)
+            self.articulation_J_start, self.J_size = offsets(6 * joint_count * dof_count)
+            self.articulation_M_start, self.M_size = offsets(36 * joint_count * joint_count)
+            self.articulation_H_start, self.H_size = offsets(dof_count * dof_count)
 
-            self.articulation_M_rows = wp.array(articulation_M_rows, dtype=wp.int32, device=model.device)
-            self.articulation_H_rows = wp.array(articulation_H_rows, dtype=wp.int32, device=model.device)
-            self.articulation_J_rows = wp.array(articulation_J_rows, dtype=wp.int32, device=model.device)
-            self.articulation_J_cols = wp.array(articulation_J_cols, dtype=wp.int32, device=model.device)
+            group_to_art = {}
+            for art in order:
+                if dof_count[art] > 0:
+                    group_to_art.setdefault((int(joint_count[art]), int(dof_count[art])), []).append(art)
+            self._group_to_art = {
+                size: wp.array(arts, dtype=wp.int32, device=model.device) for size, arts in group_to_art.items()
+            }
 
-            self.articulation_dof_start = wp.array(articulation_dof_start, dtype=wp.int32, device=model.device)
-            self.articulation_coord_start = wp.array(articulation_coord_start, dtype=wp.int32, device=model.device)
+            self.articulation_M_rows = wp.array(6 * joint_count, dtype=wp.int32, device=model.device)
+            self.articulation_H_rows = wp.array(dof_count, dtype=wp.int32, device=model.device)
+            self.articulation_J_rows = wp.array(6 * joint_count, dtype=wp.int32, device=model.device)
+            self.articulation_J_cols = wp.array(dof_count, dtype=wp.int32, device=model.device)
+
+            self.articulation_dof_start = wp.array(dof_start, dtype=wp.int32, device=model.device)
+            self.articulation_coord_start = wp.array(
+                joint_q_start[articulation_start], dtype=wp.int32, device=model.device
+            )
 
     def _allocate_model_aux_vars(self, model):
         # allocate mass, Jacobian matrices, and other auxiliary variables pertaining to the model
@@ -326,6 +378,25 @@ class SolverFeatherstone(SolverBase):
 
             # zero since only upper triangle is set which can trigger NaN detection
             self.L = wp.zeros_like(self.H)
+            if self._has_joint_mimics:
+                self.H_mimic = wp.zeros_like(self.H)
+                self.joint_armature_zero = wp.zeros_like(model.joint_armature)
+            else:
+                self.H_mimic = None
+                self.joint_armature_zero = None
+
+            if self.use_tile_gemm:
+                J_start = self.articulation_J_start.numpy()
+                M_start = self.articulation_M_start.numpy()
+                H_start = self.articulation_H_start.numpy()
+                self._J_by_size, self._M_by_size, self._H_by_size, self._L_by_size = {}, {}, {}, {}
+                for size, arts in self._group_to_art.items():
+                    joint_count, dof_count = size
+                    first, n = int(arts.numpy()[0]), arts.shape[0]
+                    self._J_by_size[size] = _group_view(self.J, J_start[first], (n, 6 * joint_count, dof_count))
+                    self._M_by_size[size] = _group_view(self.M, M_start[first], (n, 6 * joint_count, 6 * joint_count))
+                    self._H_by_size[size] = _group_view(self.H, H_start[first], (n, dof_count, dof_count))
+                    self._L_by_size[size] = _group_view(self.L, H_start[first], (n, dof_count, dof_count))
 
         if model.body_count:
             self.body_I_m = wp.empty(
@@ -353,16 +424,25 @@ class SolverFeatherstone(SolverBase):
         # allocate auxiliary variables that vary with state
         if model.body_count:
             # joints
+            # Generalized joint accelerations solved from H * qdd = tau.
             target.joint_qdd = wp.zeros_like(model.joint_qd, requires_grad=requires_grad)
+            # Net generalized joint forces after targets, limits, controls, and the RNEA pass.
             target.joint_tau = wp.empty_like(model.joint_qd, requires_grad=requires_grad)
+            target.joint_tau_mimic = (
+                wp.zeros_like(model.joint_qd, requires_grad=requires_grad) if self._has_joint_mimics else None
+            )
             if requires_grad:
                 # used in the custom grad implementation of eval_dense_solve_batched
                 target.joint_solve_tmp = wp.zeros_like(model.joint_qd, requires_grad=True)
             else:
                 target.joint_solve_tmp = None
+            # Public FREE/DISTANCE qd converted to Featherstone's internal anchor-velocity basis.
             target.joint_qd_internal_in = wp.empty_like(model.joint_qd, requires_grad=requires_grad)
+            # Internal joint velocity result before converting FREE/DISTANCE qd back to public COM velocity.
             target.joint_qd_internal_out = wp.empty_like(model.joint_qd, requires_grad=requires_grad)
+            # Public joint_f with FREE/DISTANCE wrenches removed; those are routed through body_f_ext.
             target.joint_f_internal = wp.empty_like(model.joint_qd, requires_grad=requires_grad)
+            # Joint motion subspace columns expressed in the internal Featherstone solve frame.
             target.joint_S_s = wp.empty(
                 (model.joint_dof_count,),
                 dtype=wp.spatial_vector,
@@ -371,23 +451,38 @@ class SolverFeatherstone(SolverBase):
             )
 
             # derived rigid body data (maximal coordinates)
-            target.body_q_prev = wp.empty_like(model.body_q, requires_grad=requires_grad)
+            # Previous public body poses used when step-in-place refreshes descendant FREE/DISTANCE joints.
+            target._featherstone_body_q_prev = wp.empty_like(model.body_q, requires_grad=requires_grad)
+            # FK body twists in the public COM/world-coordinate convention.
+            target.body_qd_fk = wp.empty_like(model.body_qd, requires_grad=requires_grad)
+            # Body COM poses in world coordinates for frame shifts back to public wrenches.
             target.body_q_com = wp.empty_like(model.body_q, requires_grad=requires_grad)
+            # Per-body origin of the internal solve frame; floating roots use root COM to avoid large moment arms.
+            target.body_solve_origin = wp.zeros(
+                (model.body_count,), dtype=wp.vec3, device=model.device, requires_grad=requires_grad
+            )
+            # Body spatial inertia expressed about body_solve_origin with world-aligned axes.
             target.body_I_s = wp.empty(
                 (model.body_count,), dtype=wp.spatial_matrix, device=model.device, requires_grad=requires_grad
             )
+            # Body spatial velocity expressed in the internal solve frame.
             target.body_v_s = wp.empty(
                 (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
             )
+            # Body spatial acceleration/bias recurrence value expressed in the internal solve frame.
             target.body_a_s = wp.empty(
                 (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
             )
+            # Per-body inertial bias minus gravity wrench in the internal solve frame.
             target.body_f_s = wp.zeros(
                 (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
             )
-            target.body_f_ext = wp.zeros(
+            # External/contact body-force buffer. Before eval_rigid_tau it stores public
+            # COM/world wrenches; eval_rigid_tau shifts articulated entries to the solve frame.
+            target.body_f_ext = wp.empty(
                 (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
             )
+            # Accumulated descendant-subtree wrenches during the RNEA backward pass.
             target.body_ft_s = wp.zeros(
                 (model.body_count,), dtype=wp.spatial_vector, device=model.device, requires_grad=requires_grad
             )
@@ -402,7 +497,11 @@ class SolverFeatherstone(SolverBase):
         control: Control,
         contacts: Contacts,
         dt: float,
+        *,
+        observables: SolverBase.Observables | None = None,
     ) -> None:
+        self._apply_module_options()
+        self.validate_observables(observables)
         requires_grad = state_in.requires_grad
         step_in_place = state_in is state_out
 
@@ -413,6 +512,13 @@ class SolverFeatherstone(SolverBase):
             state_aug = self
 
         model = self.model
+        body_parent_f = (
+            observables.body_parent_f
+            if observables is not None and observables.is_requested(SolverBase.ObservableKind.BODY_PARENT_F)
+            else None
+        )
+        if body_parent_f is None:
+            body_parent_f = state_out.body_parent_f
         descendant_body_q_prev = state_in.body_q
 
         if not getattr(state_aug, "_featherstone_augmented", False):
@@ -422,6 +528,20 @@ class SolverFeatherstone(SolverBase):
 
         with wp.ScopedTimer("simulate", False):
             if model.joint_count:
+                if self._has_joint_mimics:
+                    wp.launch(
+                        kernel=eval_joint_mimic,
+                        dim=model.joint_count,
+                        inputs=[
+                            model.joint_mimic_joint,
+                            model.joint_mimic_coeffs,
+                            model.joint_q_start,
+                            model.joint_qd_start,
+                        ],
+                        outputs=[state_in.joint_q, state_in.joint_qd],
+                        device=model.device,
+                    )
+
                 # Keep articulated body poses current before any body/world-frame
                 # force accumulation. Generalized-coordinate callers should not
                 # need an explicit pre-step eval_fk() for FREE/DISTANCE wrenches.
@@ -430,6 +550,7 @@ class SolverFeatherstone(SolverBase):
                     dim=model.articulation_count,
                     inputs=[
                         model.articulation_start,
+                        model.articulation_end,
                         model.joint_type,
                         model.joint_parent,
                         model.joint_child,
@@ -446,8 +567,8 @@ class SolverFeatherstone(SolverBase):
                     device=model.device,
                 )
                 if step_in_place and self.descendant_free_distance_joint_indices is not None:
-                    wp.copy(state_aug.body_q_prev, state_in.body_q)
-                    descendant_body_q_prev = state_aug.body_q_prev
+                    wp.copy(state_aug._featherstone_body_q_prev, state_in.body_q)
+                    descendant_body_q_prev = state_aug._featherstone_body_q_prev
 
             particle_f = None
             body_f = None
@@ -458,13 +579,6 @@ class SolverFeatherstone(SolverBase):
             if state_in.body_count:
                 body_f = state_aug.body_f_ext
                 wp.copy(body_f, state_in.body_f)
-                wp.launch(
-                    convert_body_force_com_to_origin,
-                    dim=model.body_count,
-                    inputs=[state_in.body_q, self.body_X_com],
-                    outputs=[body_f],
-                    device=model.device,
-                )
                 if model.joint_count:
                     wp.launch(
                         accumulate_free_distance_joint_f_to_body_force,
@@ -473,8 +587,6 @@ class SolverFeatherstone(SolverBase):
                             model.joint_type,
                             model.joint_child,
                             model.joint_qd_start,
-                            state_in.body_q,
-                            self.body_X_com,
                             control.joint_f,
                         ],
                         outputs=[body_f],
@@ -496,8 +608,10 @@ class SolverFeatherstone(SolverBase):
             # particle-particle interactions
             eval_particle_contact_forces(model, state_in, particle_f)
 
-            # particle shape contact
-            eval_particle_body_contact_forces(model, state_in, contacts, particle_f, body_f, body_f_in_world_frame=True)
+            # particle shape contact for non-articulated models; articulated models run this after ID
+            # so contacts see the freshly reconstructed public COM twist.
+            if not model.joint_count:
+                eval_particle_body_contact_forces(model, state_in, contacts, particle_f, body_f)
 
             # muscles
             if False:
@@ -539,18 +653,23 @@ class SolverFeatherstone(SolverBase):
                 # print("body_X_sc:")
                 # print(state_in.body_q.numpy())
 
-                # evaluate joint inertias, motion vectors, and forces
+                # Evaluate solve-frame Featherstone scratch data. Only internal spatial quantities
+                # use ``body_solve_origin``; public state twists and wrenches keep their COM/world contract.
                 state_aug.body_f_s.zero_()
 
                 wp.launch(
                     eval_rigid_id,
                     dim=model.articulation_count,
                     inputs=[
+                        None,  # articulation_mask: solver runs on all articulations
                         model.articulation_start,
+                        model.articulation_end,
                         model.joint_type,
                         model.joint_parent,
                         model.joint_child,
+                        model.joint_q_start,
                         model.joint_qd_start,
+                        state_in.joint_q,
                         state_aug.joint_qd_internal_in,
                         model.joint_axis,
                         model.joint_dof_dim,
@@ -562,7 +681,9 @@ class SolverFeatherstone(SolverBase):
                         model.gravity,
                     ],
                     outputs=[
+                        state_aug.body_qd_fk,
                         state_aug.joint_S_s,
+                        state_aug.body_solve_origin,
                         state_aug.body_I_s,
                         state_aug.body_v_s,
                         state_aug.body_f_s,
@@ -571,13 +692,23 @@ class SolverFeatherstone(SolverBase):
                     device=model.device,
                 )
 
+                eval_particle_body_contact_forces(
+                    model,
+                    state_in,
+                    contacts,
+                    particle_f,
+                    body_f,
+                    body_q=state_in.body_q,
+                    body_qd=state_aug.body_qd_fk,
+                )
+
                 if contacts is not None and contacts.rigid_contact_max:
                     wp.launch(
                         kernel=eval_body_contact,
                         dim=contacts.rigid_contact_max,
                         inputs=[
                             state_in.body_q,
-                            state_aug.body_v_s,
+                            state_aug.body_qd_fk,
                             model.body_com,
                             model.shape_material_ke,
                             model.shape_material_kd,
@@ -588,6 +719,7 @@ class SolverFeatherstone(SolverBase):
                             contacts.rigid_contact_count,
                             contacts.rigid_contact_point0,
                             contacts.rigid_contact_point1,
+                            contacts.rigid_contact_surface_velocity,
                             contacts.rigid_contact_normal,
                             contacts.rigid_contact_shape0,
                             contacts.rigid_contact_shape1,
@@ -596,7 +728,7 @@ class SolverFeatherstone(SolverBase):
                             contacts.rigid_contact_stiffness,
                             contacts.rigid_contact_damping,
                             contacts.rigid_contact_friction,
-                            True,
+                            False,
                             self.friction_smoothing,
                         ],
                         outputs=[body_f],
@@ -617,8 +749,8 @@ class SolverFeatherstone(SolverBase):
                 # bodies that are not the child of any joint (or models
                 # without articulations) report a deterministic zero rather
                 # than stale buffer contents.
-                if state_out.body_parent_f is not None:
-                    state_out.body_parent_f.zero_()
+                if body_parent_f is not None:
+                    body_parent_f.zero_()
 
                 if model.articulation_count:
                     # evaluate joint torques
@@ -627,15 +759,18 @@ class SolverFeatherstone(SolverBase):
                         eval_rigid_tau,
                         dim=model.articulation_count,
                         inputs=[
+                            None,  # articulation_mask: solver runs on all articulations
                             model.articulation_start,
+                            model.articulation_end,
                             model.joint_type,
                             model.joint_parent,
                             model.joint_child,
                             model.joint_q_start,
                             model.joint_qd_start,
+                            model.joint_target_q_start,
                             model.joint_dof_dim,
-                            control.joint_target_pos,
-                            control.joint_target_vel,
+                            control.joint_target_q,
+                            control.joint_target_qd,
                             state_in.joint_q,
                             state_aug.joint_qd_internal_in,
                             state_aug.joint_f_internal,
@@ -645,7 +780,10 @@ class SolverFeatherstone(SolverBase):
                             model.joint_limit_upper,
                             model.joint_limit_ke,
                             model.joint_limit_kd,
+                            model.joint_damping,
                             state_aug.joint_S_s,
+                            state_aug.body_q_com,
+                            state_aug.body_solve_origin,
                             state_aug.body_f_s,
                             body_f,
                         ],
@@ -656,24 +794,23 @@ class SolverFeatherstone(SolverBase):
                         device=model.device,
                     )
 
-                    # Optionally populate ``state_out.body_parent_f`` (incoming
+                    # Optionally populate ``body_parent_f`` (incoming
                     # joint wrench per body in world frame at COM) from the
-                    # RNEA backward-pass spatial forces. Only runs when the
-                    # extended state attribute has been requested.
-                    if state_out.body_parent_f is not None:
+                    # RNEA backward-pass spatial forces.
+                    if body_parent_f is not None:
                         wp.launch(
                             compute_body_parent_f,
                             dim=model.body_count,
                             inputs=[
                                 state_aug.body_q_com,
+                                state_aug.body_solve_origin,
                                 state_aug.body_f_s,
                                 state_aug.body_ft_s,
                                 body_f,
                             ],
-                            outputs=[state_out.body_parent_f],
+                            outputs=[body_parent_f],
                             device=model.device,
                         )
-
                     # print("joint_tau:")
                     # print(state_aug.joint_tau.numpy())
                     # print("body_q:")
@@ -688,6 +825,7 @@ class SolverFeatherstone(SolverBase):
                             dim=model.articulation_count,
                             inputs=[
                                 model.articulation_start,
+                                model.articulation_end,
                                 self.articulation_J_start,
                                 model.joint_ancestor,
                                 model.joint_qd_start,
@@ -703,6 +841,7 @@ class SolverFeatherstone(SolverBase):
                             dim=model.articulation_count,
                             inputs=[
                                 model.articulation_start,
+                                model.articulation_end,
                                 self.articulation_M_start,
                                 state_aug.body_I_s,
                             ],
@@ -711,60 +850,31 @@ class SolverFeatherstone(SolverBase):
                         )
 
                         if self.use_tile_gemm:
-                            # reshape arrays
-                            M_tiled = self.M.reshape((-1, 6 * self.joint_count, 6 * self.joint_count))
-                            J_tiled = self.J.reshape((-1, 6 * self.joint_count, self.dof_count))
-                            R_tiled = self.joint_armature_effective.reshape((-1, self.dof_count))
-                            H_tiled = self.H.reshape((-1, self.dof_count, self.dof_count))
-                            L_tiled = self.L.reshape((-1, self.dof_count, self.dof_count))
-                            assert H_tiled.shape == (model.articulation_count, 18, 18)
-                            assert L_tiled.shape == (model.articulation_count, 18, 18)
-                            assert R_tiled.shape == (model.articulation_count, 18)
-
-                            if self.fuse_cholesky:
-                                wp.launch_tiled(
-                                    self.eval_inertia_matrix_cholesky_kernel,
-                                    dim=model.articulation_count,
-                                    inputs=[J_tiled, M_tiled, R_tiled],
-                                    outputs=[H_tiled, L_tiled],
-                                    device=model.device,
-                                    block_dim=64,
-                                )
-
-                            else:
-                                wp.launch_tiled(
-                                    self.eval_inertia_matrix_kernel,
-                                    dim=model.articulation_count,
-                                    inputs=[J_tiled, M_tiled],
-                                    outputs=[H_tiled],
-                                    device=model.device,
-                                    block_dim=256,
-                                )
-
-                                wp.launch(
-                                    eval_dense_cholesky_batched,
-                                    dim=model.articulation_count,
-                                    inputs=[
-                                        self.articulation_H_start,
-                                        self.articulation_H_rows,
-                                        self.articulation_dof_start,
-                                        self.H,
-                                        self.joint_armature_effective,
-                                    ],
-                                    outputs=[self.L],
-                                    device=model.device,
-                                )
-
-                            # import numpy as np
-                            # J = J_tiled.numpy()
-                            # M = M_tiled.numpy()
-                            # R = R_tiled.numpy()
-                            # for i in range(model.articulation_count):
-                            #     r = R[i,:,0]
-                            #     H = J[i].T @ M[i] @ J[i]
-                            #     L = np.linalg.cholesky(H + np.diag(r))
-                            #     np.testing.assert_allclose(H, H_tiled.numpy()[i], rtol=1e-2, atol=1e-2)
-                            #     np.testing.assert_allclose(L, L_tiled.numpy()[i], rtol=1e-1, atol=1e-1)
+                            for size, kernel in self._tile_kernels_by_size.items():
+                                if self.fuse_cholesky and not self._has_joint_mimics:
+                                    wp.launch_tiled(
+                                        kernel,
+                                        dim=self._group_to_art[size].shape[0],
+                                        inputs=[
+                                            self._J_by_size[size],
+                                            self._M_by_size[size],
+                                            self._group_to_art[size],
+                                            self.articulation_dof_start,
+                                            self.joint_armature_effective,
+                                        ],
+                                        outputs=[self._H_by_size[size], self._L_by_size[size]],
+                                        device=model.device,
+                                        block_dim=64,
+                                    )
+                                else:
+                                    wp.launch_tiled(
+                                        kernel,
+                                        dim=self._group_to_art[size].shape[0],
+                                        inputs=[self._J_by_size[size], self._M_by_size[size]],
+                                        outputs=[self._H_by_size[size]],
+                                        device=model.device,
+                                        block_dim=256,
+                                    )
 
                         else:
                             # form P = M*J
@@ -810,6 +920,32 @@ class SolverFeatherstone(SolverBase):
                                 device=model.device,
                             )
 
+                        if not (self.use_tile_gemm and self.fuse_cholesky and not self._has_joint_mimics):
+                            solve_H = self.H
+                            solve_armature = self.joint_armature_effective
+                            if self._has_joint_mimics:
+                                self.H_mimic.zero_()
+                                wp.launch(
+                                    reduce_mimic_inertia,
+                                    dim=model.articulation_count,
+                                    inputs=[
+                                        model.articulation_start,
+                                        model.articulation_end,
+                                        self.articulation_H_start,
+                                        self.articulation_H_rows,
+                                        self.articulation_dof_start,
+                                        model.joint_qd_start,
+                                        model.joint_mimic_joint,
+                                        model.joint_mimic_coeffs,
+                                        self.joint_armature_effective,
+                                        self.H,
+                                    ],
+                                    outputs=[self.H_mimic],
+                                    device=model.device,
+                                )
+                                solve_H = self.H_mimic
+                                solve_armature = self.joint_armature_zero
+
                             # compute decomposition
                             wp.launch(
                                 eval_dense_cholesky_batched,
@@ -818,8 +954,8 @@ class SolverFeatherstone(SolverBase):
                                     self.articulation_H_start,
                                     self.articulation_H_rows,
                                     self.articulation_dof_start,
-                                    self.H,
-                                    self.joint_armature_effective,
+                                    solve_H,
+                                    solve_armature,
                                 ],
                                 outputs=[self.L],
                                 device=model.device,
@@ -837,6 +973,27 @@ class SolverFeatherstone(SolverBase):
 
                     # solve for qdd
                     state_aug.joint_qdd.zero_()
+                    solve_H = self.H
+                    solve_tau = state_aug.joint_tau
+                    if self._has_joint_mimics:
+                        solve_H = self.H_mimic
+                        state_aug.joint_tau_mimic.zero_()
+                        wp.launch(
+                            reduce_mimic_forces,
+                            dim=model.articulation_count,
+                            inputs=[
+                                model.articulation_start,
+                                model.articulation_end,
+                                model.joint_qd_start,
+                                model.joint_mimic_joint,
+                                model.joint_mimic_coeffs,
+                                state_aug.joint_tau,
+                            ],
+                            outputs=[state_aug.joint_tau_mimic],
+                            device=model.device,
+                        )
+                        solve_tau = state_aug.joint_tau_mimic
+
                     wp.launch(
                         eval_dense_solve_batched,
                         dim=model.articulation_count,
@@ -844,9 +1001,9 @@ class SolverFeatherstone(SolverBase):
                             self.articulation_H_start,
                             self.articulation_H_rows,
                             self.articulation_dof_start,
-                            self.H,
+                            solve_H,
                             self.L,
-                            state_aug.joint_tau,
+                            solve_tau,
                         ],
                         outputs=[
                             state_aug.joint_qdd,
@@ -863,9 +1020,29 @@ class SolverFeatherstone(SolverBase):
                             outputs=[state_aug.joint_qdd],
                             device=model.device,
                         )
+
+                    if self._has_joint_mimics:
+                        wp.launch(
+                            expand_mimic_accelerations,
+                            dim=model.joint_count,
+                            inputs=[
+                                model.joint_qd_start,
+                                model.joint_mimic_joint,
+                                model.joint_mimic_coeffs,
+                            ],
+                            outputs=[state_aug.joint_qdd],
+                            device=model.device,
+                        )
                     # print("joint_qdd:")
                     # print(state_aug.joint_qdd.numpy())
                     # print("\n\n")
+
+            if (
+                body_parent_f is not None
+                and state_out.body_parent_f is not None
+                and state_out.body_parent_f.ptr != body_parent_f.ptr
+            ):
+                state_out.body_parent_f.assign(body_parent_f)
 
             # -------------------------------------
             # integrate bodies
@@ -903,6 +1080,20 @@ class SolverFeatherstone(SolverBase):
                             model.joint_qd_start,
                             state_in.joint_q,
                             state_aug.joint_qd_internal_in,
+                        ],
+                        outputs=[state_out.joint_q, state_aug.joint_qd_internal_out],
+                        device=model.device,
+                    )
+
+                if self._has_joint_mimics:
+                    wp.launch(
+                        kernel=eval_joint_mimic,
+                        dim=model.joint_count,
+                        inputs=[
+                            model.joint_mimic_joint,
+                            model.joint_mimic_coeffs,
+                            model.joint_q_start,
+                            model.joint_qd_start,
                         ],
                         outputs=[state_out.joint_q, state_aug.joint_qd_internal_out],
                         device=model.device,

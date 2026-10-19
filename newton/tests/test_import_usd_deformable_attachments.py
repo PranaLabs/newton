@@ -1,0 +1,1340 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for USD deformable attachments and element collision filters on cable bodies."""
+
+import math
+import unittest
+
+import numpy as np
+import warp as wp
+
+import newton
+from newton.tests._usd_deformable_test_utils import (
+    _add_cable_curve,
+    _add_cloth_mesh,
+    _add_element_collision_filter,
+    _add_physics_attachment,
+    _author_cable_rest_shape,
+    _author_deformable_element_array,
+    _bind_deformable_material,
+    _deformable_stage,
+    group_range,
+)
+from newton.tests.unittest_utils import USD_AVAILABLE
+
+
+@unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+class TestUSDDeformableAttachments(unittest.TestCase):
+    """Proposal PhysicsAttachment + element-collision-filter import onto cable bodies."""
+
+    def test_result_maps_stay_valid_after_collapse(self):
+        """With collapse_fixed_joints=True, the returned cable and attachment indices
+        are remapped to valid, correctly-labelled entries (the documented contract),
+        and joint_indices in the attachment attrs match the attachment map."""
+        from pxr import UsdGeom, UsdPhysics
+
+        stage = _deformable_stage()
+        # A rigid fixed pair collapses, shifting every body/joint index after it.
+        for name in ("A", "B"):
+            UsdPhysics.RigidBodyAPI.Apply(UsdGeom.Xform.Define(stage, f"/World/{name}").GetPrim())
+        fixed = UsdPhysics.FixedJoint.Define(stage, "/World/Fix")
+        fixed.CreateBody0Rel().SetTargets(["/World/A"])
+        fixed.CreateBody1Rel().SetTargets(["/World/B"])
+        pts = [(0.0, 0.0, 1.0), (0.1, 0.0, 1.0), (0.2, 0.0, 1.0), (0.3, 0.0, 1.0)]
+        _add_cable_curve(stage, "/World/Cable", pts)
+        _add_physics_attachment(
+            stage,
+            "/World/Anchor",
+            src0="/World/Cable",
+            type0="point",
+            indices0=[0],
+            coords1=[(0.0, 0.0, 1.0)],
+        )
+
+        builder = newton.ModelBuilder()
+        result = builder.add_usd(stage, collapse_fixed_joints=True, return_deformable_results=True)
+
+        bodies, joints = result["path_cable_map"]["/World/Cable"]
+        self.assertTrue(all("/World/Cable" in builder.body_label[b] for b in bodies))
+        self.assertTrue(all("/World/Cable" in builder.joint_label[j] for j in joints))
+        anchor_joints = result["path_attachment_map"]["/World/Anchor"]
+        self.assertEqual(len(anchor_joints), 1)
+        self.assertTrue(all(0 <= j < builder.joint_count for j in anchor_joints))
+        self.assertEqual(result["path_attachment_attrs"]["/World/Anchor"]["joint_indices"], list(anchor_joints))
+        builder.finalize()
+
+    def test_element_filter_disabled_and_unsupported_sources_skip(self):
+        """filterEnabled=false skips the filter; a cloth element source warns and skips."""
+        with self.subTest(case="disabled"):
+
+            def build(enabled):
+                stage = _deformable_stage()
+                pts = [(0.0, 0.0, 1.0), (0.1, 0.0, 1.0), (0.2, 0.0, 1.0)]
+                _add_cable_curve(stage, "/World/CableA", pts)
+                _add_cable_curve(stage, "/World/CableB", [(0.0, 0.1, 1.0), (0.1, 0.1, 1.0), (0.2, 0.1, 1.0)])
+                if enabled is not None:
+                    _add_element_collision_filter(
+                        stage, "/World/Filter", src0="/World/CableA", src1="/World/CableB", enabled=enabled
+                    )
+                builder = newton.ModelBuilder()
+                builder.add_usd(stage)
+                return len(builder.shape_collision_filter_pairs)
+
+            baseline = build(None)  # add_rod's own adjacent-segment filters
+            self.assertGreater(build(True), baseline)
+            self.assertEqual(build(False), baseline)
+
+        with self.subTest(case="cloth_source"):
+            stage = _deformable_stage()
+            _add_cloth_mesh(stage, "/World/Cloth")
+            _add_cable_curve(stage, "/World/Cable", [(0.0, 0.0, 1.0), (0.1, 0.0, 1.0), (0.2, 0.0, 1.0)])
+            _add_element_collision_filter(stage, "/World/Filter", src0="/World/Cloth", src1="/World/Cable")
+            builder = newton.ModelBuilder()
+            with self.assertWarnsRegex(UserWarning, "/World/Filter"):
+                builder.add_usd(stage)
+
+    def test_invalid_attachment_stiffness_is_preserved_not_hardened(self):
+        """Only +inf selects the hard path (the proposal's attachment sentinel with
+        range [0, inf]): NaN, -inf, and negative stiffness or damping warn and are
+        preserved as metadata instead of silently becoming hard joints."""
+        for label, kwargs in (
+            ("nan_stiffness", {"stiffness": float("nan")}),
+            ("neg_inf_stiffness", {"stiffness": float("-inf")}),
+            ("negative_stiffness", {"stiffness": -5.0}),
+            ("negative_damping", {"damping": -1.0}),
+        ):
+            with self.subTest(kind=label):
+                stage = _deformable_stage()
+                pts = [(0.0, 0.0, 1.0), (0.1, 0.0, 1.0), (0.2, 0.0, 1.0)]
+                _add_cable_curve(stage, "/World/Cable", pts)
+                _add_physics_attachment(
+                    stage,
+                    "/World/Att",
+                    src0="/World/Cable",
+                    type0="point",
+                    indices0=[0],
+                    coords1=[(0.0, 0.0, 1.0)],
+                    **kwargs,
+                )
+                builder = newton.ModelBuilder()
+                with self.assertWarnsRegex(UserWarning, "invalid PhysicsAttachment"):
+                    result = builder.add_usd(stage, return_deformable_results=True)
+                self.assertNotIn("/World/Att", result["path_attachment_map"])
+                self.assertIn("unsupported_reason", result["path_attachment_attrs"]["/World/Att"])
+                builder.finalize()
+
+    def test_malformed_attachment_gains_are_preserved_not_hardened(self):
+        """Preserve malformed attachment gains as unsupported instead of raising or hardening."""
+        from pxr import Sdf
+
+        for name in ("stiffness", "damping"):
+            for enabled in (True, False):
+                with self.subTest(attribute=name, enabled=enabled):
+                    stage = _deformable_stage()
+                    pts = [(0.0, 0.0, 1.0), (0.1, 0.0, 1.0), (0.2, 0.0, 1.0)]
+                    _add_cable_curve(stage, "/World/Cable", pts)
+                    attachment = _add_physics_attachment(
+                        stage,
+                        "/World/Att",
+                        src0="/World/Cable",
+                        type0="point",
+                        indices0=[0],
+                        coords1=[(0.0, 0.0, 1.0)],
+                        enabled=enabled,
+                    )
+                    attachment.CreateAttribute(f"physics:{name}", Sdf.ValueTypeNames.Token).Set("bad")
+
+                    builder = newton.ModelBuilder()
+                    with self.assertWarnsRegex(UserWarning, rf"/World/Att.*physics:{name}.*numeric scalar"):
+                        result = builder.add_usd(stage, return_deformable_results=True)
+
+                    self.assertNotIn("/World/Att", result["path_attachment_map"])
+                    attrs = result["path_attachment_attrs"]["/World/Att"]
+                    self.assertEqual(attrs[name], "bad")
+                    self.assertIn("unsupported_reason", attrs)
+                    builder.finalize()
+
+    def test_compliant_attachment_is_preserved_not_hardened(self):
+        """A finite-stiffness (compliant) attachment is preserved as metadata instead of
+        being silently lowered into a hard joint: authored physics is not changed, the
+        attrs keep the authored stiffness/damping, and no joint is created."""
+        stage = _deformable_stage()
+        pts = [(0.0, 0.0, 1.0), (0.1, 0.0, 1.0), (0.2, 0.0, 1.0), (0.3, 0.0, 1.0)]
+        _add_cable_curve(stage, "/World/Cable", pts)
+        _add_physics_attachment(
+            stage,
+            "/World/SoftAnchor",
+            src0="/World/Cable",
+            type0="point",
+            indices0=[0],
+            coords1=[(0.0, 0.0, 1.0)],
+            stiffness=500.0,
+            damping=2.0,
+        )
+
+        builder = newton.ModelBuilder()
+        with self.assertWarnsRegex(UserWarning, "stiffness"):
+            result = builder.add_usd(stage, return_deformable_results=True)
+
+        # Only the cable's free root and rod joints exist; the compliant attachment created none.
+        j0, j1 = group_range(builder, "cable", "/World/Cable", "joint")
+        self.assertEqual((j0, j1), (0, builder.joint_count))
+        self.assertEqual(result["path_cable_map"]["/World/Cable"][1], [1, 2])
+        self.assertNotIn("/World/SoftAnchor", result["path_attachment_map"])
+        attrs = result["path_attachment_attrs"]["/World/SoftAnchor"]
+        self.assertEqual(attrs["stiffness"], 500.0)
+        self.assertEqual(attrs["damping"], 2.0)
+        self.assertIn("unsupported_reason", attrs)
+        builder.finalize()
+
+    def test_damped_hard_attachment_imports_joint(self):
+        """A +inf-stiffness attachment with nonzero damping is hard per the proposal
+        (damping only applies when the constraint is not hard) and imports as a ball
+        joint instead of being preserved as unsupported metadata."""
+        stage = _deformable_stage()
+        pts = [(0.0, 0.0, 1.0), (0.1, 0.0, 1.0), (0.2, 0.0, 1.0), (0.3, 0.0, 1.0)]
+        _add_cable_curve(stage, "/World/Cable", pts)
+        _add_physics_attachment(
+            stage,
+            "/World/HardDamped",
+            src0="/World/Cable",
+            type0="point",
+            indices0=[0],
+            coords1=[(0.0, 0.0, 1.0)],
+            stiffness=math.inf,
+            damping=5.0,
+        )
+
+        builder = newton.ModelBuilder()
+        result = builder.add_usd(stage, return_deformable_results=True)
+
+        joints = result["path_attachment_map"]["/World/HardDamped"]
+        self.assertEqual(len(joints), 1)
+        self.assertEqual(builder.joint_type[joints[0]], newton.JointType.BALL)
+        self.assertNotIn("unsupported_reason", result["path_attachment_attrs"]["/World/HardDamped"])
+        builder.finalize()
+
+    def test_physics_attachment_segment_to_world_imports_ball_joint(self):
+        """A segment-to-world PhysicsAttachment imports as a world ball joint whose anchor
+        rides the import ``xform`` along with the cable geometry.
+
+        Without transforming the world ``coords1``, the cable bodies move under ``xform`` but
+        the world ball-joint anchor stays in original USD coordinates, pulling the cable off.
+        The asymmetric u = 0.25 also pins the proposal's segment-coordinate convention:
+        p = u*x0 + (1-u)*x1, so u weights the segment START vertex (u = 1 selects the start,
+        u = 0 the end), and with the start at body-local -L/2 the site sits at (0.5-u)*L.
+        """
+        stage = _deformable_stage()
+        pts = [(0.0, 0.0, 1.0), (0.1, 0.0, 1.0), (0.2, 0.0, 1.0), (0.3, 0.0, 1.0)]
+        _add_cable_curve(stage, "/World/Cable", pts)
+        # Segment 1 runs x0 = (0.1, 0, 1) -> x1 = (0.2, 0, 1), L = 0.1.
+        # u = 0.25 -> p = 0.25*x0 + 0.75*x1 = (0.175, 0, 1), authored as the world target too.
+        _add_physics_attachment(
+            stage,
+            "/World/AttachMid",
+            src0="/World/Cable",
+            type0="segment",
+            indices0=[1],
+            coords0=[(0.25, 0.0, 0.0)],
+            coords1=[(0.175, 0.0, 1.0)],
+        )
+
+        builder = newton.ModelBuilder()
+        result = builder.add_usd(
+            stage, xform=wp.transform(wp.vec3(10.0, 0.0, 0.0), wp.quat_identity()), return_deformable_results=True
+        )
+
+        b0, _ = group_range(builder, "cable", "/World/Cable", "body")
+        joints = result["path_attachment_map"]["/World/AttachMid"]
+        self.assertEqual(len(joints), 1)
+        j = joints[0]
+        self.assertEqual(builder.joint_type[j], newton.JointType.BALL)
+        self.assertEqual(builder.joint_parent[j], -1)
+        self.assertEqual(builder.joint_child[j], b0 + 1)
+        # The cable body and its world anchor both translate by xform's +10 in x.
+        np.testing.assert_allclose(np.array(builder.body_q[b0 + 1].p)[0], 10.15, atol=1e-5)
+        np.testing.assert_allclose(np.array(builder.joint_X_p[j].p), [10.175, 0.0, 1.0], atol=1e-5)
+        # Child-local anchor: z = (0.5 - u) * L = 0.025, invariant under xform.
+        np.testing.assert_allclose(np.array(builder.joint_X_c[j].p), [0.0, 0.0, 0.025], atol=1e-6)
+        # Both joint frames name the same world point (a flipped u sign puts the child
+        # anchor at world x = 10.125 and this fails).
+        child_anchor_world = wp.transform_point(builder.body_q[builder.joint_child[j]], builder.joint_X_c[j].p)
+        np.testing.assert_allclose(np.array(child_anchor_world), np.array(builder.joint_X_p[j].p), atol=1e-5)
+
+    def test_physics_attachment_interior_point_imports_single_joint(self):
+        """A point attachment site is a single point-point constraint per the proposal, so
+        an interior cable point (which borders two segment bodies) creates exactly one ball
+        joint, anchored to one flanking body at the shared vertex, not one joint per
+        incident segment."""
+        from pxr import UsdGeom, UsdPhysics
+
+        stage = _deformable_stage()
+        rigid = UsdGeom.Xform.Define(stage, "/World/Rigid")
+        UsdPhysics.RigidBodyAPI.Apply(rigid.GetPrim())
+        pts = [(0.0, 0.0, 1.0), (0.1, 0.0, 1.0), (0.2, 0.0, 1.0), (0.3, 0.0, 1.0)]
+        _add_cable_curve(stage, "/World/Cable", pts)
+        _add_physics_attachment(
+            stage,
+            "/World/AttachPoint",
+            src0="/World/Cable",
+            src1="/World/Rigid",
+            type0="point",
+            indices0=[1],
+            coords1=[(0.1, 0.0, 1.0)],
+        )
+
+        builder = newton.ModelBuilder()
+        result = builder.add_usd(stage, return_deformable_results=True)
+
+        rigid_body = result["path_body_map"]["/World/Rigid"]
+        b0, b1 = group_range(builder, "cable", "/World/Cable", "body")
+        joints = result["path_attachment_map"]["/World/AttachPoint"]
+        self.assertEqual(len(joints), 1)
+        j = joints[0]
+        # An independent attachment added after cable construction is outside its range.
+        self.assertEqual(group_range(builder, "cable", "/World/Cable", "joint"), (0, 3))
+        self.assertEqual(j, 3)
+        self.assertEqual(builder.joint_type[j], newton.JointType.BALL)
+        self.assertEqual(builder.joint_parent[j], rigid_body)
+        self.assertIn(builder.joint_child[j], range(b0, b1))
+        # Both frames name the authored vertex: the parent anchor directly, and the child
+        # anchor through its body transform (so the single joint pins the shared point).
+        np.testing.assert_allclose(np.array(builder.joint_X_p[j].p), [0.1, 0.0, 1.0], atol=1e-6)
+        child_anchor_world = wp.transform_point(builder.body_q[builder.joint_child[j]], builder.joint_X_c[j].p)
+        np.testing.assert_allclose(np.array(child_anchor_world), [0.1, 0.0, 1.0], atol=1e-6)
+
+    def test_physics_attachment_to_kinematic_body_finalizes(self):
+        """A cable and its jointless kinematic anchor share an articulation."""
+        from pxr import UsdGeom, UsdPhysics
+
+        stage = _deformable_stage()
+        # The collider gives the anchor positive mass, so rigid import creates its base joint.
+        anchor = UsdGeom.Cube.Define(stage, "/World/Anchor")
+        anchor.CreateSizeAttr(0.1)
+        rigid_api = UsdPhysics.RigidBodyAPI.Apply(anchor.GetPrim())
+        rigid_api.CreateKinematicEnabledAttr(True)
+        UsdPhysics.CollisionAPI.Apply(anchor.GetPrim())
+        pts = [(0.0, 0.0, 1.0), (0.1, 0.0, 1.0), (0.2, 0.0, 1.0), (0.3, 0.0, 1.0)]
+        _add_cable_curve(stage, "/World/Cable", pts)
+        _add_physics_attachment(
+            stage,
+            "/World/AttachKinematic",
+            src0="/World/Cable",
+            src1="/World/Anchor",
+            type0="point",
+            indices0=[0],
+            coords1=[(0.0, 0.0, 1.0)],
+        )
+
+        builder = newton.ModelBuilder()
+        result = builder.add_usd(stage, return_deformable_results=True)
+        self.assertEqual(builder.articulation_label, ["/World/Anchor"])
+        self.assertIn("/World/AttachKinematic", result["path_attachment_map"])
+
+        model = builder.finalize()
+        self.assertGreater(model.body_count, 0)
+
+    def test_strained_cable_attachments_use_rest_endpoints(self):
+        """Keep initial anchors when rest points are absent; let FK close stretched root attachments."""
+        from pxr import UsdGeom, UsdPhysics
+
+        for endpoint, expected_body in ((0, 0), (2, 1)):
+            for rooted, use_rest in ((False, False), (False, True), (True, False), (True, True)):
+                with self.subTest(endpoint=endpoint, rooted=rooted, use_rest=use_rest):
+                    stage = _deformable_stage()
+                    plug = UsdGeom.Cube.Define(stage, "/World/Plug")
+                    plug.CreateSizeAttr(0.1)
+                    UsdPhysics.RigidBodyAPI.Apply(plug.GetPrim())
+                    UsdPhysics.CollisionAPI.Apply(plug.GetPrim())
+                    points = [(0, 0, 0), (0, 0, 0.4), (0, 0, 0.8)]
+                    curves = _add_cable_curve(stage, "/World/Cable", points)
+                    if use_rest:
+                        _author_cable_rest_shape(curves, points=[(0, 0, 0), (0, 0, 0.1), (0, 0, 0.3)])
+                    half_lengths = [0.05, 0.1] if use_rest else [0.2, 0.2]
+                    expected_z = -half_lengths[0] if endpoint == 0 else half_lengths[1]
+                    _add_physics_attachment(
+                        stage,
+                        "/World/Endpoint",
+                        src0="/World/Cable",
+                        src1="/World/Plug",
+                        type0="point",
+                        indices0=[endpoint],
+                        coords1=[points[endpoint]],
+                    )
+                    if not rooted:
+                        # A second attachment keeps the endpoint in the separate attachment pass.
+                        _add_physics_attachment(
+                            stage,
+                            "/World/Segment",
+                            src0="/World/Cable",
+                            type0="segment",
+                            indices0=[1],
+                            coords0=[(0.25, 0.02, 0.03)],
+                            coords1=[(0, 0, 0.7)],
+                        )
+                    builder = newton.ModelBuilder()
+                    result = builder.add_usd(stage, return_deformable_results=True)
+                    bodies = result["path_cable_map"]["/World/Cable"][0]
+                    np.testing.assert_allclose(
+                        np.asarray(builder.body_q)[bodies, :3], [(0, 0, 0.2), (0, 0, 0.6)], atol=1e-6
+                    )
+                    joint = result["path_attachment_map"]["/World/Endpoint"][0]
+                    self.assertEqual(builder.joint_parent[joint], result["path_body_map"]["/World/Plug"])
+                    self.assertEqual(builder.joint_child[joint], bodies[expected_body])
+                    np.testing.assert_allclose(builder.joint_X_c[joint][:3], [0, 0, expected_z], atol=1e-6)
+                    self.assertEqual(builder.joint_articulation[joint] >= 0, rooted)
+                    anchor = wp.transform_point(builder.body_q[bodies[expected_body]], wp.vec3(0, 0, expected_z))
+                    expected_anchor = (0.15 if endpoint == 0 else 0.7) if use_rest else points[endpoint][2]
+                    self.assertAlmostEqual(float(anchor[2]), expected_anchor, places=6)
+                    if not rooted:
+                        segment_joint = result["path_attachment_map"]["/World/Segment"][0]
+                        np.testing.assert_allclose(
+                            builder.joint_X_c[segment_joint][:3], [-0.03, 0.02, 0.5 * half_lengths[1]], atol=1e-6
+                        )
+                    model = builder.finalize(device="cpu")
+                    state = model.state()
+                    np.testing.assert_allclose(state.body_q.numpy()[bodies], np.asarray(builder.body_q)[bodies])
+                    newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+                    expected_positions = np.array([[0, 0, 0.2], [0, 0, 0.6]])
+                    if rooted and use_rest:
+                        expected_positions[:, 2] += -0.15 if endpoint == 0 else 0.1
+                    np.testing.assert_allclose(state.body_q.numpy()[bodies, :3], expected_positions, atol=1e-6)
+
+    def test_physics_attachment_joins_plug_and_cable_articulation_for_vbd(self):
+        """Import a physically attached plug and cable as one articulation."""
+        from pxr import UsdGeom, UsdPhysics
+
+        stage = _deformable_stage()
+        plug = UsdGeom.Cube.Define(stage, "/World/Plug")
+        plug.CreateSizeAttr(0.1)
+        UsdPhysics.RigidBodyAPI.Apply(plug.GetPrim())
+        UsdPhysics.CollisionAPI.Apply(plug.GetPrim())
+
+        points = [(0.0, 0.0, 1.0), (0.1, 0.0, 1.0), (0.2, 0.0, 1.0), (0.3, 0.0, 1.0)]
+        _add_cable_curve(stage, "/World/Cable", points)
+        _add_physics_attachment(
+            stage,
+            "/World/PlugAttachment",
+            src0="/World/Cable",
+            src1="/World/Plug",
+            type0="point",
+            indices0=[0],
+            coords1=[(0.0, 0.0, 1.0)],
+        )
+
+        builder = newton.ModelBuilder()
+        result = builder.add_usd(stage, return_deformable_results=True)
+
+        plug_body = result["path_body_map"]["/World/Plug"]
+        plug_joints = [joint for joint, child in enumerate(builder.joint_child) if child == plug_body]
+        cable_joints = result["path_cable_map"]["/World/Cable"][1]
+        attachment_joints = result["path_attachment_map"]["/World/PlugAttachment"]
+        articulation_ids = {
+            builder.joint_articulation[joint] for joint in (*plug_joints, *cable_joints, *attachment_joints)
+        }
+
+        self.assertEqual(len(plug_joints), 1)
+        self.assertEqual(len(attachment_joints), 1)
+        self.assertEqual(len(articulation_ids), 1)
+        self.assertNotIn(-1, articulation_ids)
+        self.assertEqual(builder.articulation_count, 1)
+        root_joints = [
+            joint
+            for joint, articulation in enumerate(builder.joint_articulation)
+            if articulation in articulation_ids and builder.joint_parent[joint] == -1
+        ]
+        self.assertEqual(root_joints, plug_joints)
+        self.assertEqual(builder.joint_type[root_joints[0]], newton.JointType.FREE)
+        self.assertTrue(builder.validate_joint_ordering())
+
+        builder.color()
+        model = builder.finalize()
+        state = model.state()
+        initial_body_q = state.body_q.numpy().copy()
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        np.testing.assert_allclose(state.body_q.numpy(), initial_body_q, atol=1.0e-6)
+        newton.solvers.SolverVBD(model, iterations=1, rigid_compliant_alm=True)
+
+    def test_physics_attachment_joins_earlier_articulation_from_last_endpoint(self):
+        """Join a cable's last endpoint to a rigid articulation imported before unrelated bodies."""
+        from pxr import UsdGeom, UsdPhysics
+
+        stage = _deformable_stage()
+        for name in ("Plug", "Support", "Table"):
+            rigid = UsdGeom.Cube.Define(stage, f"/World/{name}")
+            rigid.CreateSizeAttr(0.1)
+            UsdPhysics.RigidBodyAPI.Apply(rigid.GetPrim())
+            UsdPhysics.CollisionAPI.Apply(rigid.GetPrim())
+
+        points = [(0.01 * index, 0.0, 1.0) for index in range(33)]
+        _add_cable_curve(stage, "/World/Cable", points)
+        _add_physics_attachment(
+            stage,
+            "/World/PlugAttachment",
+            src0="/World/Cable",
+            src1="/World/Plug",
+            type0="point",
+            indices0=[len(points) - 1],
+            coords1=[points[-1]],
+        )
+
+        builder = newton.ModelBuilder()
+        result = builder.add_usd(stage, return_deformable_results=True, enable_self_collisions=False)
+
+        plug_body = result["path_body_map"]["/World/Plug"]
+        support_body = result["path_body_map"]["/World/Support"]
+        table_body = result["path_body_map"]["/World/Table"]
+        plug_root_joint = next(joint for joint, child in enumerate(builder.joint_child) if child == plug_body)
+        plug_articulation = builder._find_articulation_for_body(plug_body)
+        cable_bodies, cable_joints = result["path_cable_map"]["/World/Cable"]
+        attachment_joint = result["path_attachment_map"]["/World/PlugAttachment"][0]
+
+        self.assertIsNotNone(plug_articulation)
+        support_articulation = builder._find_articulation_for_body(support_body)
+        table_articulation = builder._find_articulation_for_body(table_body)
+        self.assertIsNotNone(support_articulation)
+        self.assertIsNotNone(table_articulation)
+        self.assertNotEqual(support_articulation, plug_articulation)
+        self.assertNotEqual(table_articulation, plug_articulation)
+        self.assertEqual(builder.joint_articulation[attachment_joint], plug_articulation)
+        self.assertTrue(all(builder.joint_articulation[joint] == plug_articulation for joint in cable_joints))
+        self.assertEqual(builder.joint_child[attachment_joint], cable_bodies[-1])
+        self.assertEqual(
+            [builder.joint_parent[joint] for joint in cable_joints],
+            list(reversed(cable_bodies[1:])),
+        )
+        self.assertEqual(
+            [builder.joint_child[joint] for joint in cable_joints],
+            list(reversed(cable_bodies[:-1])),
+        )
+        cable_shapes = [builder.body_shapes[body][0] for body in cable_bodies]
+        plug_shape = builder.body_shapes[plug_body][0]
+        filtered_pairs = {tuple(sorted(pair)) for pair in builder.shape_collision_filter_pairs}
+        self.assertIn(tuple(sorted((plug_shape, cable_shapes[0]))), filtered_pairs)
+        self.assertIn(tuple(sorted((cable_shapes[0], cable_shapes[-1]))), filtered_pairs)
+
+        first_cable_joint = cable_joints[0]
+        parent_anchor_q = wp.mul(
+            wp.transform_get_rotation(builder.body_q[builder.joint_parent[first_cable_joint]]),
+            wp.transform_get_rotation(builder.joint_X_p[first_cable_joint]),
+        )
+        child_anchor_q = wp.mul(
+            wp.transform_get_rotation(builder.body_q[builder.joint_child[first_cable_joint]]),
+            wp.transform_get_rotation(builder.joint_X_c[first_cable_joint]),
+        )
+        np.testing.assert_allclose(
+            wp.quat_rotate(parent_anchor_q, wp.vec3(0.0, 0.0, 1.0)), [-1.0, 0.0, 0.0], atol=1.0e-6
+        )
+        np.testing.assert_allclose(
+            wp.quat_rotate(child_anchor_q, wp.vec3(0.0, 0.0, 1.0)), [-1.0, 0.0, 0.0], atol=1.0e-6
+        )
+        self.assertLess(plug_root_joint, attachment_joint)
+        self.assertLess(attachment_joint, cable_joints[0])
+        self.assertTrue(builder.validate_joint_ordering())
+
+        builder.color()
+        model = builder.finalize()
+        newton.solvers.SolverVBD(model, iterations=1, rigid_compliant_alm=True)
+
+    def test_physics_attachments_join_multiple_rigid_articulations(self):
+        """Join each cable to its own rigid articulation."""
+        from pxr import Gf, UsdGeom, UsdPhysics
+
+        stage = _deformable_stage()
+        cable_points = [(0.0, 0.0, 1.0), (0.1, 0.0, 1.0), (0.2, 0.0, 1.0), (0.3, 0.0, 1.0)]
+        for index in range(2):
+            plug_path = f"/World/Plug{index}"
+            cable_path = f"/World/Cable{index}"
+            attachment_path = f"/World/Attachment{index}"
+
+            plug = UsdGeom.Cube.Define(stage, plug_path)
+            plug.CreateSizeAttr(0.1)
+            UsdGeom.Xformable(plug).AddTranslateOp().Set(Gf.Vec3d(0.0, float(index), 0.0))
+            UsdPhysics.RigidBodyAPI.Apply(plug.GetPrim())
+            UsdPhysics.CollisionAPI.Apply(plug.GetPrim())
+            _add_cable_curve(stage, cable_path, [(x, y + index, z) for x, y, z in cable_points])
+            _add_physics_attachment(
+                stage,
+                attachment_path,
+                src0=cable_path,
+                src1=plug_path,
+                type0="point",
+                indices0=[len(cable_points) - 1],
+                coords1=[cable_points[-1]],
+            )
+
+        builder = newton.ModelBuilder()
+        result = builder.add_usd(stage, return_deformable_results=True)
+
+        self.assertEqual(builder.articulation_count, 2)
+        for index in range(2):
+            plug_body = result["path_body_map"][f"/World/Plug{index}"]
+            cable_joints = result["path_cable_map"][f"/World/Cable{index}"][1]
+            attachment_joint = result["path_attachment_map"][f"/World/Attachment{index}"][0]
+            articulation = builder._find_articulation_for_body(plug_body)
+            self.assertIsNotNone(articulation)
+            self.assertEqual(builder.joint_articulation[attachment_joint], articulation)
+            self.assertTrue(all(builder.joint_articulation[joint] == articulation for joint in cable_joints))
+
+        self.assertTrue(builder.validate_joint_ordering())
+        builder.finalize()
+
+    def test_physics_attachment_with_unrelated_welded_cable_graph(self):
+        """Keep a rigid cable attachment valid when other cables form a welded graph."""
+        from pxr import UsdGeom, UsdPhysics
+
+        stage = _deformable_stage()
+        plug = UsdGeom.Cube.Define(stage, "/World/Plug")
+        plug.CreateSizeAttr(0.1)
+        UsdPhysics.RigidBodyAPI.Apply(plug.GetPrim())
+        UsdPhysics.CollisionAPI.Apply(plug.GetPrim())
+
+        attached_points = [(0.0, 0.0, 1.0), (0.1, 0.0, 1.0), (0.2, 0.0, 1.0), (0.3, 0.0, 1.0)]
+        _add_cable_curve(stage, "/World/AttachedCable", attached_points)
+        _add_physics_attachment(
+            stage,
+            "/World/PlugAttachment",
+            src0="/World/AttachedCable",
+            src1="/World/Plug",
+            type0="point",
+            indices0=[len(attached_points) - 1],
+            coords1=[attached_points[-1]],
+        )
+
+        _add_cable_curve(stage, "/World/WeldedA", [(0.0, 2.0, 1.0), (0.1, 2.0, 1.0), (0.2, 2.0, 1.0)])
+        _add_cable_curve(stage, "/World/WeldedB", [(0.2, 2.0, 1.0), (0.3, 2.0, 1.0), (0.4, 2.0, 1.0)])
+        _add_physics_attachment(
+            stage,
+            "/World/WeldedJunction",
+            src0="/World/WeldedA",
+            src1="/World/WeldedB",
+            type0="point",
+            type1="point",
+            indices0=[2],
+            indices1=[0],
+        )
+
+        builder = newton.ModelBuilder()
+        result = builder.add_usd(stage, return_deformable_results=True)
+
+        plug_body = result["path_body_map"]["/World/Plug"]
+        plug_articulation = builder._find_articulation_for_body(plug_body)
+        attached_joints = result["path_cable_map"]["/World/AttachedCable"][1]
+        attachment_joint = result["path_attachment_map"]["/World/PlugAttachment"][0]
+        self.assertIsNotNone(plug_articulation)
+        self.assertEqual(builder.articulation_count, 2)
+        self.assertNotIn("/World/WeldedJunction", result["path_attachment_map"])
+        self.assertEqual(
+            result["path_cable_attrs"]["/World/WeldedA"]["graph_component"],
+            result["path_cable_attrs"]["/World/WeldedB"]["graph_component"],
+        )
+        self.assertEqual(builder.joint_articulation[attachment_joint], plug_articulation)
+        self.assertTrue(all(builder.joint_articulation[joint] == plug_articulation for joint in attached_joints))
+        self.assertTrue(builder.validate_joint_ordering())
+        builder.finalize()
+
+    def test_physics_attachment_joins_robot_articulation_for_vbd(self):
+        """Import a cable attached to a floating- or fixed-base robot articulation."""
+        from pxr import Gf, UsdGeom, UsdPhysics
+
+        for fixed_base in (False, True):
+            with self.subTest(fixed_base=fixed_base):
+                stage = _deformable_stage()
+                robot = UsdGeom.Xform.Define(stage, "/World/Robot")
+                UsdPhysics.ArticulationRootAPI.Apply(robot.GetPrim())
+
+                base = UsdGeom.Cube.Define(stage, "/World/Robot/Base")
+                base.CreateSizeAttr(0.2)
+                UsdGeom.Xformable(base).AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 1.0))
+                UsdPhysics.RigidBodyAPI.Apply(base.GetPrim())
+                UsdPhysics.CollisionAPI.Apply(base.GetPrim())
+
+                wrist = UsdGeom.Cube.Define(stage, "/World/Robot/Wrist")
+                wrist.CreateSizeAttr(0.2)
+                UsdGeom.Xformable(wrist).AddTranslateOp().Set(Gf.Vec3d(0.2, 0.0, 1.0))
+                UsdPhysics.RigidBodyAPI.Apply(wrist.GetPrim())
+                UsdPhysics.CollisionAPI.Apply(wrist.GetPrim())
+
+                shoulder = UsdPhysics.RevoluteJoint.Define(stage, "/World/Robot/Shoulder")
+                shoulder.CreateBody0Rel().SetTargets([base.GetPath()])
+                shoulder.CreateBody1Rel().SetTargets([wrist.GetPath()])
+                shoulder.CreateLocalPos0Attr().Set(Gf.Vec3f(0.1, 0.0, 0.0))
+                shoulder.CreateLocalPos1Attr().Set(Gf.Vec3f(-0.1, 0.0, 0.0))
+                shoulder.CreateAxisAttr().Set(UsdGeom.Tokens.z)
+
+                if fixed_base:
+                    root_joint = UsdPhysics.FixedJoint.Define(stage, "/World/Robot/RootJoint")
+                    root_joint.CreateBody1Rel().SetTargets([base.GetPath()])
+                    root_joint.CreateLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, 1.0))
+
+                unrelated = UsdGeom.Cube.Define(stage, "/World/Unrelated")
+                unrelated.CreateSizeAttr(0.1)
+                UsdPhysics.RigidBodyAPI.Apply(unrelated.GetPrim())
+                UsdPhysics.CollisionAPI.Apply(unrelated.GetPrim())
+
+                cable_points = [(0.3, 0.0, 1.0), (0.4, 0.0, 1.0), (0.5, 0.0, 1.0), (0.6, 0.0, 1.0)]
+                _add_cable_curve(stage, "/World/Cable", cable_points)
+                _add_physics_attachment(
+                    stage,
+                    "/World/Robot/CableAttachment",
+                    src0="/World/Cable",
+                    src1="/World/Robot/Wrist",
+                    type0="point",
+                    indices0=[len(cable_points) - 1],
+                    coords1=[(0.1, 0.0, 0.0)],
+                )
+
+                builder = newton.ModelBuilder()
+                result = builder.add_usd(stage, return_deformable_results=True)
+
+                base_body = result["path_body_map"]["/World/Robot/Base"]
+                wrist_body = result["path_body_map"]["/World/Robot/Wrist"]
+                unrelated_body = result["path_body_map"]["/World/Unrelated"]
+                base_joints = [joint for joint, child in enumerate(builder.joint_child) if child == base_body]
+                shoulder_joint = result["path_joint_map"]["/World/Robot/Shoulder"]
+                cable_bodies, cable_joints = result["path_cable_map"]["/World/Cable"]
+                attachment_joint = result["path_attachment_map"]["/World/Robot/CableAttachment"][0]
+                articulation = builder._find_articulation_for_body(wrist_body)
+
+                self.assertEqual(len(base_joints), 1)
+                self.assertEqual(
+                    builder.joint_type[base_joints[0]],
+                    newton.JointType.FIXED if fixed_base else newton.JointType.FREE,
+                )
+                self.assertEqual(builder.joint_parent[attachment_joint], wrist_body)
+                self.assertEqual(builder.joint_child[attachment_joint], cable_bodies[-1])
+                self.assertIsNotNone(articulation)
+                self.assertNotEqual(builder._find_articulation_for_body(unrelated_body), articulation)
+                self.assertTrue(
+                    all(
+                        builder.joint_articulation[joint] == articulation
+                        for joint in (base_joints[0], shoulder_joint, attachment_joint, *cable_joints)
+                    )
+                )
+                self.assertLess(base_joints[0], shoulder_joint)
+                self.assertLess(shoulder_joint, attachment_joint)
+                self.assertLess(attachment_joint, cable_joints[0])
+                self.assertEqual(builder.articulation_count, 2)
+                self.assertTrue(builder.validate_joint_ordering())
+
+                builder.color()
+                model = builder.finalize()
+                newton.solvers.SolverVBD(model, iterations=1, rigid_compliant_alm=True)
+
+    def test_physics_attachment_follows_excluded_articulation_joint(self):
+        """Keep an excluded loop joint outside an articulation extended by a cable."""
+        from pxr import Gf, Sdf, UsdGeom, UsdPhysics
+
+        stage = _deformable_stage()
+        robot = UsdGeom.Xform.Define(stage, "/World/Robot")
+        UsdPhysics.ArticulationRootAPI.Apply(robot.GetPrim())
+
+        bodies = []
+        for index, name in enumerate(("Base", "Middle", "Plug")):
+            body = UsdGeom.Cube.Define(stage, f"/World/Robot/{name}")
+            body.CreateSizeAttr(0.1)
+            UsdGeom.Xformable(body).AddTranslateOp().Set(Gf.Vec3d(0.1 * index, 0.0, 1.0))
+            UsdPhysics.RigidBodyAPI.Apply(body.GetPrim())
+            UsdPhysics.CollisionAPI.Apply(body.GetPrim())
+            bodies.append(body)
+
+        for index in range(2):
+            joint = UsdPhysics.RevoluteJoint.Define(stage, f"/World/Robot/Joint{index}")
+            joint.CreateBody0Rel().SetTargets([bodies[index].GetPath()])
+            joint.CreateBody1Rel().SetTargets([bodies[index + 1].GetPath()])
+
+        loop = UsdPhysics.FixedJoint.Define(stage, "/World/Robot/Loop")
+        loop.CreateBody0Rel().SetTargets([bodies[0].GetPath()])
+        loop.CreateBody1Rel().SetTargets([bodies[-1].GetPath()])
+        loop.GetPrim().CreateAttribute("physics:excludeFromArticulation", Sdf.ValueTypeNames.Bool).Set(True)
+
+        other = UsdGeom.Cube.Define(stage, "/World/OtherBody")
+        other.CreateSizeAttr(0.1)
+        UsdPhysics.RigidBodyAPI.Apply(other.GetPrim())
+        UsdPhysics.CollisionAPI.Apply(other.GetPrim())
+
+        cable_points = [(0.2 + 0.1 * index, 0.0, 1.0) for index in range(4)]
+        _add_cable_curve(stage, "/World/Cable", cable_points)
+        _add_physics_attachment(
+            stage,
+            "/World/Robot/CableAttachment",
+            src0="/World/Cable",
+            src1="/World/Robot/Plug",
+            type0="point",
+            indices0=[0],
+        )
+
+        for parented in (False, True):
+            with self.subTest(parented=parented):
+                builder = newton.ModelBuilder()
+                parent = -1
+                if parented:
+                    parent = builder.add_link(label="Parent")
+                    builder.add_shape_box(parent, hx=0.1, hy=0.1, hz=0.1)
+                    builder.add_articulation([builder.add_joint_free(child=parent)])
+                result = builder.add_usd(stage, parent_body=parent, return_deformable_results=True)
+
+                plug = result["path_body_map"]["/World/Robot/Plug"]
+                articulation = builder._find_articulation_for_body(plug)
+                attachment = result["path_attachment_map"]["/World/Robot/CableAttachment"][0]
+                cable_joints = result["path_cable_map"]["/World/Cable"][1]
+                loop_joint = result["path_joint_map"]["/World/Robot/Loop"]
+                self.assertIsNotNone(articulation)
+                self.assertEqual(builder.joint_articulation[loop_joint], -1)
+                self.assertTrue(
+                    all(builder.joint_articulation[joint] == articulation for joint in (attachment, *cable_joints))
+                )
+                self.assertGreater(loop_joint, cable_joints[-1])
+                if parented:
+                    other_body = result["path_body_map"]["/World/OtherBody"]
+                    self.assertEqual(builder._find_articulation_for_body(other_body), articulation)
+                    self.assertEqual(builder.articulation_count, 1)
+                    self.assertGreaterEqual(loop_joint, builder.articulation_end[articulation])
+                self.assertTrue(builder.validate_joint_ordering())
+                builder.finalize()
+
+    def test_rigid_attachment_imports_before_world_rooted_cable(self):
+        """Emit rigid-target cable joints before a world-rooted cable starts another articulation."""
+        from pxr import UsdGeom, UsdPhysics
+
+        stage = _deformable_stage()
+        plug = UsdGeom.Cube.Define(stage, "/World/Plug")
+        plug.CreateSizeAttr(0.1)
+        UsdPhysics.RigidBodyAPI.Apply(plug.GetPrim())
+        UsdPhysics.CollisionAPI.Apply(plug.GetPrim())
+        UsdGeom.Xform.Define(stage, "/World/WorldAnchor")
+
+        points = [(0.1 * index, 0.0, 1.0) for index in range(4)]
+        _add_cable_curve(stage, "/World/AWorldCable", points)
+        _add_physics_attachment(
+            stage,
+            "/World/AWorldAttachment",
+            src0="/World/AWorldCable",
+            src1="/World/WorldAnchor",
+            type0="point",
+            indices0=[0],
+            coords1=[points[0]],
+        )
+        _add_cable_curve(stage, "/World/ZPlugCable", points)
+        _add_physics_attachment(
+            stage,
+            "/World/ZPlugAttachment",
+            src0="/World/ZPlugCable",
+            src1="/World/Plug",
+            type0="point",
+            indices0=[0],
+            coords1=[points[0]],
+        )
+
+        builder = newton.ModelBuilder()
+        result = builder.add_usd(stage, return_deformable_results=True)
+
+        plug_body = result["path_body_map"]["/World/Plug"]
+        plug_articulation = builder._find_articulation_for_body(plug_body)
+        attachment = result["path_attachment_map"]["/World/ZPlugAttachment"][0]
+        self.assertIsNotNone(plug_articulation)
+        self.assertEqual(builder.joint_articulation[attachment], plug_articulation)
+        self.assertTrue(builder.validate_joint_ordering())
+        builder.finalize()
+
+    def test_physics_attachment_with_omitted_target_roots_cable_at_world(self):
+        """Treat an omitted xform target as the world when choosing the cable root."""
+        stage = _deformable_stage()
+        points = [(0.1 * index, 0.0, 1.0) for index in range(4)]
+        _add_cable_curve(stage, "/World/Cable", points)
+        _add_physics_attachment(
+            stage,
+            "/World/Attachment",
+            src0="/World/Cable",
+            type0="point",
+            indices0=[0],
+            coords1=[points[0]],
+        )
+
+        builder = newton.ModelBuilder()
+        result = builder.add_usd(stage, return_deformable_results=True)
+
+        cable_bodies, _ = result["path_cable_map"]["/World/Cable"]
+        attachment = result["path_attachment_map"]["/World/Attachment"][0]
+        articulation = builder._find_articulation_for_body(cable_bodies[0])
+        self.assertIsNotNone(articulation)
+        self.assertEqual(builder.joint_articulation[attachment], articulation)
+        self.assertEqual(builder.joint_parent[attachment], -1)
+        self.assertEqual(builder.joint_type[attachment], newton.JointType.BALL)
+        self.assertEqual(builder.articulation_count, 1)
+        builder.finalize()
+
+    def test_disabled_attachment_does_not_prevent_endpoint_root(self):
+        """Ignore a disabled attachment when deciding whether an endpoint can root the cable."""
+        from pxr import Gf, UsdGeom, UsdPhysics
+
+        for rigid_target in (False, True):
+            with self.subTest(rigid_target=rigid_target):
+                stage = _deformable_stage()
+                target_path = "/World/Anchor"
+                if rigid_target:
+                    target = UsdGeom.Cube.Define(stage, target_path)
+                    target.CreateSizeAttr(0.1)
+                    UsdGeom.Xformable(target).AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 1.0))
+                    UsdPhysics.RigidBodyAPI.Apply(target.GetPrim())
+                    UsdPhysics.CollisionAPI.Apply(target.GetPrim())
+                    target_point = (0.0, 0.0, 0.0)
+                else:
+                    UsdGeom.Xform.Define(stage, target_path)
+                    target_point = (0.0, 0.0, 1.0)
+
+                points = [(0.1 * index, 0.0, 1.0) for index in range(4)]
+                _add_cable_curve(stage, "/World/Cable", points)
+                _add_physics_attachment(
+                    stage,
+                    "/World/RootAttachment",
+                    src0="/World/Cable",
+                    src1=target_path,
+                    type0="point",
+                    indices0=[0],
+                    coords1=[target_point],
+                )
+                _add_physics_attachment(
+                    stage,
+                    "/World/DisabledAttachment",
+                    src0="/World/Cable",
+                    src1=target_path,
+                    type0="point",
+                    indices0=[len(points) - 1],
+                    enabled=False,
+                )
+
+                builder = newton.ModelBuilder()
+                result = builder.add_usd(stage, return_deformable_results=True)
+
+                cable_bodies, _ = result["path_cable_map"]["/World/Cable"]
+                articulation = builder._find_articulation_for_body(cable_bodies[0])
+                root_joint = result["path_attachment_map"]["/World/RootAttachment"][0]
+                self.assertIsNotNone(articulation)
+                self.assertEqual(builder.joint_articulation[root_joint], articulation)
+                self.assertNotIn("/World/DisabledAttachment", result["path_attachment_map"])
+                builder.finalize()
+
+    def test_ignored_attachment_does_not_change_cable_articulation(self):
+        """Exclude ignored attachments from both cable root selection and joint creation."""
+        from pxr import UsdGeom, UsdPhysics
+
+        for keep_attachment in (False, True):
+            for explicit_articulation in (False, True):
+                with self.subTest(keep_attachment=keep_attachment, explicit_articulation=explicit_articulation):
+                    stage = _deformable_stage()
+                    for name in ("Plug", "Unrelated"):
+                        body = UsdGeom.Cube.Define(stage, f"/World/{name}")
+                        body.CreateSizeAttr(0.1)
+                        UsdPhysics.RigidBodyAPI.Apply(body.GetPrim())
+                        UsdPhysics.CollisionAPI.Apply(body.GetPrim())
+                        if explicit_articulation:
+                            UsdPhysics.ArticulationRootAPI.Apply(body.GetPrim())
+
+                    points = [(0.1 * index, 0.0, 0.0) for index in range(4)]
+                    _add_cable_curve(stage, "/World/Cable", points)
+                    _add_physics_attachment(
+                        stage,
+                        "/World/IgnoredAttachment",
+                        src0="/World/Cable",
+                        src1="/World/Plug",
+                        type0="point",
+                        indices0=[len(points) - 1],
+                        coords1=[points[-1]],
+                    )
+                    if keep_attachment:
+                        _add_physics_attachment(
+                            stage,
+                            "/World/RootAttachment",
+                            src0="/World/Cable",
+                            src1="/World/Plug",
+                            type0="point",
+                            indices0=[0],
+                        )
+
+                    builder = newton.ModelBuilder()
+                    result = builder.add_usd(
+                        stage, ignore_paths=["/World/IgnoredAttachment"], return_deformable_results=True
+                    )
+
+                    self.assertNotIn("/World/IgnoredAttachment", result["path_attachment_map"])
+                    self.assertNotIn("/World/IgnoredAttachment", result["path_attachment_attrs"])
+                    bodies, _ = result["path_cable_map"]["/World/Cable"]
+                    cable_articulation = builder._find_articulation_for_body(bodies[0])
+                    plug = result["path_body_map"]["/World/Plug"]
+                    plug_articulation = builder._find_articulation_for_body(plug)
+                    self.assertIsNotNone(cable_articulation)
+                    self.assertIsNotNone(plug_articulation)
+                    if keep_attachment:
+                        self.assertEqual(cable_articulation, plug_articulation)
+                        root = result["path_attachment_map"]["/World/RootAttachment"][0]
+                        self.assertEqual(builder.joint_articulation[root], cable_articulation)
+                    else:
+                        self.assertNotEqual(cable_articulation, plug_articulation)
+                        root = builder.articulation_start[cable_articulation]
+                        self.assertEqual(builder.joint_type[root], newton.JointType.FREE)
+                    self.assertTrue(builder.validate_joint_ordering())
+                    builder.finalize()
+
+    def test_tapered_cable_material_follows_physical_joint_when_root_reverses(self):
+        """Assign tapered-cable bend gains by shared point for either endpoint root."""
+
+        def import_bend_gains(root_point):
+            from pxr import UsdGeom
+
+            stage = _deformable_stage()
+            UsdGeom.Xform.Define(stage, "/World/WorldAnchor")
+            points = [(float(index), 0.0, 1.0) for index in range(4)]
+            cable = _add_cable_curve(stage, "/World/Cable", points, thickness=None)
+            _bind_deformable_material(stage, cable.GetPrim(), "/World/Material", youngsModulus=1.0e6)
+            _author_deformable_element_array(cable.GetPrim(), "thicknesses", [0.02, 0.04, 0.08, 0.16], "point")
+            _add_physics_attachment(
+                stage,
+                "/World/Attachment",
+                src0="/World/Cable",
+                src1="/World/WorldAnchor",
+                type0="point",
+                indices0=[root_point],
+                coords1=[points[root_point]],
+            )
+
+            builder = newton.ModelBuilder()
+            result = builder.add_usd(stage, return_deformable_results=True)
+            bodies, joints = result["path_cable_map"]["/World/Cable"]
+            segment_by_body = {body: index for index, body in enumerate(bodies)}
+            gains = {}
+            for joint in joints:
+                parent_segment = segment_by_body[builder.joint_parent[joint]]
+                child_segment = segment_by_body[builder.joint_child[joint]]
+                shared_point = max(parent_segment, child_segment)
+                gains[shared_point] = builder.joint_target_ke[builder.joint_qd_start[joint] + 2]
+            return gains
+
+        first_endpoint_gains = import_bend_gains(0)
+        last_endpoint_gains = import_bend_gains(3)
+        self.assertEqual(first_endpoint_gains.keys(), last_endpoint_gains.keys())
+        for point in first_endpoint_gains:
+            self.assertAlmostEqual(first_endpoint_gains[point], last_endpoint_gains[point], places=6)
+
+    def test_empty_import_does_not_change_existing_articulation_collisions(self):
+        """Limit USD self-collision filtering to articulations touched by the import."""
+        builder = newton.ModelBuilder()
+        body0 = builder.add_link(label="Existing0")
+        body1 = builder.add_link(xform=wp.transform((1.0, 0.0, 0.0), wp.quat_identity()), label="Existing1")
+        builder.add_shape_box(body0, hx=0.1, hy=0.1, hz=0.1)
+        builder.add_shape_box(body1, hx=0.1, hy=0.1, hz=0.1)
+        root = builder.add_joint_free(child=body0)
+        child = builder.add_joint_fixed(parent=body0, child=body1, collision_filter_parent=False)
+        builder.add_articulation([root, child])
+
+        self.assertEqual(len(builder.shape_collision_filter_pairs), 0)
+        builder.add_usd(_deformable_stage(), enable_self_collisions=False)
+        self.assertEqual(len(builder.shape_collision_filter_pairs), 0)
+
+    def test_parented_usd_articulation_uses_its_self_collision_policy(self):
+        """Apply an imported articulation's collision policy when it extends a parent articulation."""
+        from pxr import Gf, Sdf, UsdGeom, UsdPhysics
+
+        builder = newton.ModelBuilder()
+        parent = builder.add_link(label="Parent")
+        builder.add_shape_box(parent, hx=0.1, hy=0.1, hz=0.1)
+        parent_root = builder.add_joint_free(child=parent)
+        builder.add_articulation([parent_root])
+
+        stage = _deformable_stage()
+        robot = UsdGeom.Xform.Define(stage, "/World/Robot")
+        UsdPhysics.ArticulationRootAPI.Apply(robot.GetPrim())
+        robot.GetPrim().CreateAttribute("newton:selfCollisionEnabled", Sdf.ValueTypeNames.Bool).Set(False)
+
+        bodies = []
+        for index in range(2):
+            body = UsdGeom.Cube.Define(stage, f"/World/Robot/Body{index}")
+            body.CreateSizeAttr(0.1)
+            UsdGeom.Xformable(body).AddTranslateOp().Set(Gf.Vec3d(float(index), 0.0, 0.0))
+            UsdPhysics.RigidBodyAPI.Apply(body.GetPrim())
+            UsdPhysics.CollisionAPI.Apply(body.GetPrim())
+            bodies.append(body)
+
+        joint = UsdPhysics.RevoluteJoint.Define(stage, "/World/Robot/Joint")
+        joint.CreateBody0Rel().SetTargets([bodies[0].GetPath()])
+        joint.CreateBody1Rel().SetTargets([bodies[1].GetPath()])
+        joint.CreateCollisionEnabledAttr().Set(True)
+
+        result = builder.add_usd(stage, parent_body=parent, floating=False)
+
+        shape_pair = tuple(
+            sorted(
+                (
+                    result["path_shape_map"]["/World/Robot/Body0"],
+                    result["path_shape_map"]["/World/Robot/Body1"],
+                )
+            )
+        )
+        self.assertIn(shape_pair, builder.shape_collision_filter_pairs)
+        self.assertEqual(builder.articulation_count, 1)
+        builder.finalize()
+
+    def test_free_cable_articulation_has_free_root_joint(self):
+        """A free cable has one free root joint to the world."""
+        stage = _deformable_stage()
+        points = [(0.0, 0.0, 1.0), (0.1, 0.0, 1.0), (0.2, 0.0, 1.0), (0.3, 0.0, 1.0)]
+        _add_cable_curve(stage, "/World/Cable", points)
+
+        builder = newton.ModelBuilder()
+        result = builder.add_usd(stage, return_deformable_results=True)
+
+        cable_bodies, cable_joints = result["path_cable_map"]["/World/Cable"]
+        articulation = builder._find_articulation_for_body(cable_bodies[0])
+        self.assertIsNotNone(articulation)
+        root_joints = [
+            joint
+            for joint, joint_articulation in enumerate(builder.joint_articulation)
+            if joint_articulation == articulation and builder.joint_parent[joint] == -1
+        ]
+        self.assertEqual(len(root_joints), 1)
+        self.assertEqual(builder.joint_type[root_joints[0]], newton.JointType.FREE)
+        self.assertEqual(builder.joint_child[root_joints[0]], cable_bodies[0])
+        self.assertTrue(all(builder.joint_articulation[joint] == articulation for joint in cable_joints))
+
+        builder.color()
+        model = builder.finalize()
+        newton.solvers.SolverVBD(model, iterations=1, rigid_compliant_alm=True)
+
+    def test_physics_attachment_disabled_or_unsupported_is_recorded_not_imported(self):
+        """Disabled and cloth/volume-source attachments create no joints; both preserve their
+        authored attrs (enabled flag / unsupported_reason), and unsupported sources warn."""
+        stage = _deformable_stage()
+        pts = [(0.0, 0.0, 1.0), (0.1, 0.0, 1.0), (0.2, 0.0, 1.0), (0.3, 0.0, 1.0)]
+        _add_cable_curve(stage, "/World/Cable", pts)
+        _add_cloth_mesh(stage, "/World/Cloth")
+        # attachmentEnabled=false on a supported cable-segment source.
+        _add_physics_attachment(
+            stage,
+            "/World/AttachDisabled",
+            src0="/World/Cable",
+            type0="segment",
+            indices0=[0],
+            coords0=[(0.5, 0.0, 0.0)],
+            coords1=[(0.05, 0.0, 1.0)],
+            enabled=False,
+        )
+        # Cloth/volume sources are surfaced but not lowered to fake constraints.
+        _add_physics_attachment(
+            stage,
+            "/World/AttachCloth",
+            src0="/World/Cloth",
+            type0="point",
+            indices0=[0],
+            coords1=[(0.0, 0.0, 1.0)],
+        )
+
+        builder = newton.ModelBuilder()
+        with self.assertWarnsRegex(UserWarning, "cloth/volume"):
+            result = builder.add_usd(stage, return_deformable_results=True)
+
+        # Neither policy case lowers to a joint.
+        self.assertNotIn("/World/AttachDisabled", result["path_attachment_map"])
+        self.assertNotIn("/World/AttachCloth", result["path_attachment_map"])
+        self.assertEqual(len(result["path_attachment_map"]), 0)
+        self.assertFalse(result["path_attachment_attrs"]["/World/AttachDisabled"]["enabled"])
+        attrs = result["path_attachment_attrs"]["/World/AttachCloth"]
+        self.assertEqual(attrs["src0"], "/World/Cloth")
+        self.assertIn("unsupported_reason", attrs)
+
+    def _two_cable_filter_stage(self, **filter_kwargs):
+        """Two 3-segment cables plus a PhysicsElementCollisionFilter; returns (builder, result, pairs)."""
+        stage = _deformable_stage()
+        a = [(0.0, 0.0, 1.0), (0.1, 0.0, 1.0), (0.2, 0.0, 1.0), (0.3, 0.0, 1.0)]  # 3 segments
+        b = [(0.0, 1.0, 1.0), (0.1, 1.0, 1.0), (0.2, 1.0, 1.0), (0.3, 1.0, 1.0)]  # 3 segments
+        _add_cable_curve(stage, "/World/CableA", a)
+        _add_cable_curve(stage, "/World/CableB", b)
+        _add_element_collision_filter(
+            stage, "/World/Filter", src0="/World/CableA", src1="/World/CableB", **filter_kwargs
+        )
+
+        builder = newton.ModelBuilder()
+        result = builder.add_usd(stage, return_deformable_results=True)
+        pairs = {tuple(sorted(p)) for p in builder.shape_collision_filter_pairs}
+        return builder, result, pairs
+
+    @staticmethod
+    def _cable_seg_shapes(builder, path):
+        b0, b1 = group_range(builder, "cable", path, "body")
+        return [builder.body_shapes[b][0] for b in range(b0, b1)]
+
+    def test_element_collision_filter_paired_groups(self):
+        """groupElemCounts pair indices element-wise: only the paired (i, j) elements filter,
+        not the full Cartesian product of the two index arrays."""
+        # counts [1, 1] / [1, 1] pairs (A0 with B2) and (A1 with B0) only.
+        builder, _result, pairs = self._two_cable_filter_stage(
+            indices0=[0, 1], counts0=[1, 1], indices1=[2, 0], counts1=[1, 1]
+        )
+        a = self._cable_seg_shapes(builder, "/World/CableA")
+        b = self._cable_seg_shapes(builder, "/World/CableB")
+        self.assertIn(tuple(sorted((a[0], b[2]))), pairs)
+        self.assertIn(tuple(sorted((a[1], b[0]))), pairs)
+        # The cross-product pairs that a non-paired reading would add must be absent.
+        self.assertNotIn(tuple(sorted((a[0], b[0]))), pairs, "cross-product pair must not be filtered")
+        self.assertNotIn(tuple(sorted((a[1], b[2]))), pairs, "cross-product pair must not be filtered")
+
+    def test_element_collision_filter_all_elements_group_broadcasts(self):
+        """An all-elements src0 group — an explicit groupElemCount of 0 or an absent counts
+        array (one implicit group) — is paired against every listed src1 group."""
+        cases = {
+            # src0 group is count-0 (all of CableA) paired with CableB segments {0, 1}.
+            "zero count": {"indices0": [], "counts0": [0], "indices1": [0, 1], "counts1": [2]},
+            # src0 has no counts -> one implicit all-elements group broadcast against two
+            # single-element src1 groups.
+            "empty counts": {"indices0": [], "indices1": [0, 1], "counts1": [1, 1]},
+        }
+        for name, kwargs in cases.items():
+            with self.subTest(name):
+                builder, _result, pairs = self._two_cable_filter_stage(**kwargs)
+                a = self._cable_seg_shapes(builder, "/World/CableA")
+                b = self._cable_seg_shapes(builder, "/World/CableB")
+                for sa in a:  # all of CableA filtered against B0 and B1
+                    self.assertIn(tuple(sorted((sa, b[0]))), pairs)
+                    self.assertIn(tuple(sorted((sa, b[1]))), pairs)
+                    self.assertNotIn(tuple(sorted((sa, b[2]))), pairs, "B segment 2 was not in any group")
+
+    def test_element_collision_filter_explicit_singleton_does_not_broadcast(self):
+        """An explicit single group (counts=[n]) must pair one-to-one, not broadcast: against
+        two groups on the other side it is a group-count mismatch that warns and skips. Only
+        the empty-counts form (no groupElemCounts authored) pairs against all groups."""
+        with self.assertWarnsRegex(UserWarning, "pair one-to-one"):
+            builder, _result, pairs = self._two_cable_filter_stage(
+                indices0=[0], counts0=[1], indices1=[0, 1], counts1=[1, 1]
+            )
+        a = self._cable_seg_shapes(builder, "/World/CableA")
+        b = self._cable_seg_shapes(builder, "/World/CableB")
+        cross = {tuple(sorted((sa, sb))) for sa in a for sb in b}
+        self.assertTrue(cross.isdisjoint(pairs), "an explicit singleton group must not broadcast")
+
+    def test_element_collision_filter_empty_counts_select_all_and_broadcast(self):
+        """Empty groupElemCounts means ALL elements of that source, paired against every group
+        of the other side (the proposal defines group boundaries only through the counts
+        array, so stray indices without counts define no subset and are ignored with a
+        warning)."""
+        with self.subTest(case="stray_indices_ignored"):
+            with self.assertWarnsRegex(UserWarning, "indices are ignored"):
+                builder, _result, pairs = self._two_cable_filter_stage(indices0=[1], indices1=[0, 2], counts1=[1, 1])
+            a = self._cable_seg_shapes(builder, "/World/CableA")
+            b = self._cable_seg_shapes(builder, "/World/CableB")
+            for sa in a:  # ALL of CableA, including segments not in the stray indices
+                self.assertIn(tuple(sorted((sa, b[0]))), pairs)
+                self.assertIn(tuple(sorted((sa, b[2]))), pairs)
+                self.assertNotIn(tuple(sorted((sa, b[1]))), pairs, "B segment 1 was not in any group")
+
+        with self.subTest(case="both_sides_empty"):
+            builder, _result, pairs = self._two_cable_filter_stage()
+            a = self._cable_seg_shapes(builder, "/World/CableA")
+            b = self._cable_seg_shapes(builder, "/World/CableB")
+            for sa in a:  # all elements vs all elements
+                for sb in b:
+                    self.assertIn(tuple(sorted((sa, sb))), pairs)
+
+    def test_element_collision_filter_deduplicates_pairs(self):
+        """Overlapping groups and a self-filter's mirrored (sa, sb)/(sb, sa) orderings repeat
+        the same shape combination; the filter adds each normalized pair once. The pair uses
+        non-adjacent segments because add_rod files its own adjacent-segment filters."""
+        stage = _deformable_stage()
+        pts = [(0.0, 0.0, 1.0), (0.1, 0.0, 1.0), (0.2, 0.0, 1.0), (0.3, 0.0, 1.0)]
+        _add_cable_curve(stage, "/World/CableA", pts)
+        # Three group pairings that all normalize to (A0, A2): forward, mirrored, repeated.
+        _add_element_collision_filter(
+            stage,
+            "/World/Filter",
+            src0="/World/CableA",
+            src1="/World/CableA",
+            indices0=[0, 2, 0],
+            counts0=[1, 1, 1],
+            indices1=[2, 0, 2],
+            counts1=[1, 1, 1],
+        )
+
+        builder = newton.ModelBuilder()
+        builder.add_usd(stage)
+
+        a = self._cable_seg_shapes(builder, "/World/CableA")
+        raw = [tuple(sorted(p)) for p in builder.shape_collision_filter_pairs]
+        self.assertEqual(raw.count(tuple(sorted((a[0], a[2])))), 1, "pair must be stored exactly once")
+
+    def test_element_collision_filter_malformed_counts_warns_and_skips(self):
+        """groupElemCounts whose sum exceeds the index array warns and applies no filter pairs."""
+        with self.assertWarnsRegex(UserWarning, "sum exceeds"):
+            builder, _result, pairs = self._two_cable_filter_stage(indices0=[0], counts0=[2], indices1=[0], counts1=[1])
+        # No cross-source pair is added (intra-cable adjacency filters from add_rod still exist).
+        a = self._cable_seg_shapes(builder, "/World/CableA")
+        b = self._cable_seg_shapes(builder, "/World/CableB")
+        cross = {tuple(sorted((sa, sb))) for sa in a for sb in b}
+        self.assertTrue(cross.isdisjoint(pairs), "a malformed counts array must add no cross-source filter pairs")
+
+    def test_element_collision_filter_resolves_collider_sources(self):
+        """The rigid-side filter source resolves to its shape whether the collider sits on the
+        rigid body prim itself, on a child geom under a rigid Xform, or on a bodyless static
+        prim; only the listed cable segments are filtered, unlisted segments stay collidable."""
+        from pxr import UsdGeom, UsdPhysics
+
+        stage = _deformable_stage()
+        # Collider on the rigid body prim itself.
+        box = UsdGeom.Cube.Define(stage, "/World/Box")
+        box.CreateSizeAttr(0.1)
+        UsdPhysics.RigidBodyAPI.Apply(box.GetPrim()).CreateKinematicEnabledAttr(True)
+        UsdPhysics.CollisionAPI.Apply(box.GetPrim())
+        # Rigid body Xform with the collider on a *child* geom (not the body prim itself).
+        rigid = UsdGeom.Xform.Define(stage, "/World/Rigid")
+        UsdPhysics.RigidBodyAPI.Apply(rigid.GetPrim()).CreateKinematicEnabledAttr(True)
+        collider = UsdGeom.Cube.Define(stage, "/World/Rigid/Collider")
+        collider.CreateSizeAttr(0.1)
+        UsdPhysics.CollisionAPI.Apply(collider.GetPrim())
+        # Static collider: CollisionAPI but no RigidBodyAPI, so it has no body in path_body_map.
+        ground = UsdGeom.Cube.Define(stage, "/World/Ground")
+        ground.CreateSizeAttr(0.1)
+        UsdPhysics.CollisionAPI.Apply(ground.GetPrim())
+
+        pts = [(0.0, 0.0, 1.0), (0.1, 0.0, 1.0), (0.2, 0.0, 1.0), (0.3, 0.0, 1.0)]  # 3 segments
+        _add_cable_curve(stage, "/World/Cable", pts)
+        # Filter the cable's first two segments (0, 1) against all of the box (explicit counts
+        # select the subset; empty indices1 with no counts = all elements of the box).
+        _add_element_collision_filter(
+            stage, "/World/FilterBox", src0="/World/Cable", src1="/World/Box", indices0=[0, 1], counts0=[2], indices1=[]
+        )
+        _add_element_collision_filter(
+            stage,
+            "/World/FilterChild",
+            src0="/World/Cable",
+            src1="/World/Rigid/Collider",
+            indices0=[0],
+            counts0=[1],
+            indices1=[],
+        )
+        _add_element_collision_filter(
+            stage,
+            "/World/FilterGround",
+            src0="/World/Cable",
+            src1="/World/Ground",
+            indices0=[0],
+            counts0=[1],
+            indices1=[],
+        )
+
+        builder = newton.ModelBuilder()
+        result = builder.add_usd(stage, return_deformable_results=True)
+        seg_shapes = self._cable_seg_shapes(builder, "/World/Cable")
+        pairs = {tuple(sorted(p)) for p in builder.shape_collision_filter_pairs}
+
+        box_shape = builder.body_shapes[result["path_body_map"]["/World/Box"]][0]
+        self.assertIn(tuple(sorted((seg_shapes[0], box_shape))), pairs)
+        self.assertIn(tuple(sorted((seg_shapes[1], box_shape))), pairs)
+        self.assertNotIn(tuple(sorted((seg_shapes[2], box_shape))), pairs, "segment 2 was not listed")
+
+        collider_shape = result["path_shape_map"]["/World/Rigid/Collider"]
+        self.assertIn(tuple(sorted((seg_shapes[0], collider_shape))), pairs)
+
+        ground_shape = result["path_shape_map"]["/World/Ground"]
+        self.assertIn(tuple(sorted((seg_shapes[0], ground_shape))), pairs)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

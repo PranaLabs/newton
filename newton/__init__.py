@@ -30,6 +30,7 @@ from ._src.geometry import (
     ParticleFlags,
     ShapeFlags,
     TetMesh,
+    intersect_ray,
 )
 
 __all__ += [
@@ -41,6 +42,7 @@ __all__ += [
     "ParticleFlags",
     "ShapeFlags",
     "TetMesh",
+    "intersect_ray",
 ]
 
 # ==================================================================================
@@ -49,44 +51,79 @@ __all__ += [
 from ._src.sim import (  # noqa: E402
     BodyFlags,
     CollisionPipeline,
+    CollisionSubstepScheduler,
     Contacts,
     Control,
-    EqType,
     JointTargetMode,
     JointType,
     Model,
     ModelBuilder,
+    ModelFlags,
+    Rod,
     State,
+    StateFlags,
+    TendonGuide,
+    TendonGuideFlags,
+    TendonGuideType,
     eval_fk,
     eval_ik,
+    eval_inverse_dynamics_force,
+    eval_inverse_dynamics_passive,
     eval_jacobian,
     eval_mass_matrix,
+    eval_mimic,
+    eval_rigid_contact_kinematics,
 )
 
 __all__ += [
     "BodyFlags",
     "CollisionPipeline",
+    "CollisionSubstepScheduler",
     "Contacts",
     "Control",
-    "EqType",
     "JointTargetMode",
     "JointType",
     "Model",
     "ModelBuilder",
+    "ModelFlags",
+    "Rod",
     "State",
+    "StateFlags",
+    "TendonGuide",
+    "TendonGuideFlags",
+    "TendonGuideType",
     "eval_fk",
     "eval_ik",
+    "eval_inverse_dynamics_force",
+    "eval_inverse_dynamics_passive",
     "eval_jacobian",
     "eval_mass_matrix",
+    "eval_mimic",
+    "eval_rigid_contact_kinematics",
 ]
 
 # ==================================================================================
 # submodule APIs
 # ==================================================================================
-from . import actuators, geometry, ik, math, selection, sensors, solvers, usd, utils, viewer  # noqa: E402
+from . import (  # noqa: E402
+    actuators,
+    controllers,
+    exceptions,
+    geometry,
+    ik,
+    math,
+    selection,
+    sensors,
+    solvers,
+    usd,
+    utils,
+    viewer,
+)
 
 __all__ += [
     "actuators",
+    "controllers",
+    "exceptions",
     "geometry",
     "ik",
     "math",
@@ -97,3 +134,8 @@ __all__ += [
     "utils",
     "viewer",
 ]
+
+from ._src.diagnostics import install_console_fallback as _install_console_fallback  # noqa: E402
+
+_install_console_fallback()
+del _install_console_fallback

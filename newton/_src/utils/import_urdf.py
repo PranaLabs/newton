@@ -7,30 +7,68 @@ import os
 import tempfile
 import warnings
 import xml.etree.ElementTree as ET
+from pathlib import Path, PurePath
 from typing import Literal
 from urllib.parse import unquote, urlsplit
+from urllib.request import url2pathname
 
 import numpy as np
 import warp as wp
 
 from ..core import Axis, AxisType, quat_between_axes
+from ..core._warnings import _external_warning_stacklevel
 from ..core.types import Transform
-from ..geometry import Mesh
+from ..exceptions import NewtonDeprecationWarning, NewtonWarning
+from ..geometry import Mesh, ShapeFlags
 from ..sim import ModelBuilder
 from ..sim.enums import JointTargetMode
 from ..sim.model import Model
-from .import_utils import parse_custom_attributes, sanitize_xml_content, should_show_collider
+from .import_utils import (
+    clamp_imported_opacity,
+    collapse_massless_fixed_root_joints,
+    parse_custom_attributes,
+    sanitize_xml_content,
+    should_show_collider,
+)
 from .mesh import load_meshes_from_file
 from .texture import load_texture
 from .topology import topological_sort
 
 AttributeFrequency = Model.AttributeFrequency
 
+
 # Optional dependency for robust URI resolution
 try:
     from resolve_robotics_uri_py import resolve_robotics_uri
 except ImportError:
     resolve_robotics_uri = None
+
+
+def _resolve_urdf_uri(uri: str, package_dirs: list[str]) -> str:
+    local_path = None
+    if uri.lower().startswith("file:"):
+        parsed = urlsplit(uri)
+        # The resolver ignores authorities, so reject remote hosts and network shares first.
+        if (
+            parsed.netloc.lower() not in ("", "localhost")
+            or not parsed.path.startswith("/")
+            or unquote(parsed.path).replace("\\", "/").startswith("//")
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(f'Invalid local file URI: "{uri}"')
+        local_path = url2pathname(parsed.path)
+        if not PurePath(local_path).is_absolute():
+            raise ValueError(f'Invalid local file URI "{uri}"; expected an absolute filesystem path.')
+        uri = "file:" + uri[5:]
+    if resolve_robotics_uri is None:
+        raise ImportError(
+            f'Cannot resolve URI "{uri}" without resolve-robotics-uri-py. '
+            "Install it with: pip install 'newton[importers]'"
+        )
+    resolved = resolve_robotics_uri(uri, package_dirs=package_dirs)
+    # Preserve symlinks so relative assets use the same directory as a plain file path.
+    return local_path if local_path is not None else os.fspath(resolved)
 
 
 def _download_file(dst, url: str) -> None:
@@ -71,16 +109,23 @@ def parse_urdf(
     joint_ordering: Literal["bfs", "dfs"] | None = "dfs",
     bodies_follow_joint_ordering: bool = True,
     collapse_fixed_joints: bool = False,
+    collapse_massless_fixed_root: bool = False,
     mesh_maxhullvert: int | None = None,
     force_position_velocity_actuation: bool = False,
     override_root_xform: bool = False,
+    joint_damping_mode: Literal["passive", "drive"] | None = None,
+    package_dirs: list[str] | None = None,
 ):
     """
     Parses a URDF file and adds the bodies and joints to the given ModelBuilder.
 
     Args:
-        builder (ModelBuilder): The :class:`ModelBuilder` to add the bodies and joints to.
-        source: The filename of the URDF file to parse, or the URDF XML string content.
+        builder: The :class:`ModelBuilder` to add the bodies and joints to.
+        source: URDF filename, local ``file:`` URI, ``package://`` or ``model://`` URI, or XML content.
+        package_dirs: Extra package roots for source and asset URIs; for ``package://robot/...``,
+            supply the directory containing ``robot``. Requires ``newton[importers]``.
+            Roots supplement environment paths without guaranteed precedence or restricting access.
+            Plain relative paths use the URDF directory; file URIs require an absolute local path.
         xform: The transform to apply to the root body. If None, the transform is set to identity.
         override_root_xform: If ``True``, the articulation root's world-space
             transform is replaced by ``xform`` instead of being composed with it,
@@ -165,6 +210,7 @@ def parse_urdf(
         joint_ordering: The ordering of the joints in the simulation. Can be either "bfs" or "dfs" for breadth-first or depth-first search, or ``None`` to keep joints in the order in which they appear in the URDF. Default is "dfs".
         bodies_follow_joint_ordering: If True, the bodies are added to the builder in the same order as the joints (parent then child body). Otherwise, bodies are added in the order they appear in the URDF. Default is True.
         collapse_fixed_joints: If True, fixed joints are removed and the respective bodies are merged.
+        collapse_massless_fixed_root: If True, collapse only the massless fixed-joint chain below an imported free root body. Ignored when ``collapse_fixed_joints`` is True.
         mesh_maxhullvert: Maximum vertices for convex hull approximation of meshes.
         force_position_velocity_actuation: If True and both position (stiffness) and velocity
             (damping) gains are non-zero, joints use :attr:`~newton.JointTargetMode.POSITION_VELOCITY` actuation mode.
@@ -172,7 +218,24 @@ def parse_urdf(
             :attr:`~newton.JointTargetMode.POSITION` if stiffness > 0, :attr:`~newton.JointTargetMode.VELOCITY` if only
             damping > 0, :attr:`~newton.JointTargetMode.EFFORT` if a drive is present but both gains are zero
             (direct torque control), or :attr:`~newton.JointTargetMode.NONE` if no drive/actuation is applied.
+        joint_damping_mode: How to interpret URDF ``<dynamics damping>``.
+            ``"passive"`` imports it into ``joint_damping`` and keeps drive
+            damping at ``default_joint_cfg.target_kd``. ``"drive"`` imports it
+            into ``joint_target_kd``; absent values use ``default_joint_cfg.target_kd``.
+            In drive mode, passive damping uses ``default_joint_cfg.damping``
+            for revolute, prismatic, and planar joints.
+            XPBD/VBD do not consume passive joint damping.
+
+            .. deprecated:: 1.7
+                The implicit None default retains the drive mapping and warns
+                when the URDF authors damping. The default will become
+                ``"passive"`` in Newton 1.8. Pass either mode explicitly to
+                silence the warning; both explicit modes remain supported.
     """
+    if joint_damping_mode not in (None, "passive", "drive"):
+        raise ValueError("joint_damping_mode must be 'passive', 'drive', or None")
+    use_drive_damping = joint_damping_mode != "passive"
+
     # Early validation of base joint parameters
     builder._validate_base_joint_params(floating, base_joint, parent_body)
 
@@ -189,23 +252,14 @@ def parse_urdf(
         xform = wp.transform(*xform) * axis_xform
 
     source = os.fspath(source) if hasattr(source, "__fspath__") else source
+    package_dirs = [os.fspath(path) for path in package_dirs] if package_dirs is not None else []
+    if package_dirs and resolve_robotics_uri is None:
+        raise ImportError(
+            "package_dirs requires resolve-robotics-uri-py. Install it with: pip install 'newton[importers]'"
+        )
 
-    if source.startswith(("package://", "model://")):
-        if resolve_robotics_uri is not None:
-            try:
-                source = resolve_robotics_uri(source)
-            except FileNotFoundError:
-                raise FileNotFoundError(
-                    f'Could not resolve URDF source URI "{source}". '
-                    f"Check that the package is installed and that relevant environment variables "
-                    f"(ROS_PACKAGE_PATH, AMENT_PREFIX_PATH, GZ_SIM_RESOURCE_PATH, etc.) are set correctly. "
-                    f"See https://github.com/ami-iit/resolve-robotics-uri-py for details."
-                ) from None
-        else:
-            raise ImportError(
-                f'Cannot resolve URDF source URI "{source}" without resolve-robotics-uri-py. '
-                f"Install it with: pip install resolve-robotics-uri-py"
-            )
+    if source.startswith(("package://", "model://")) or source.lower().startswith("file:"):
+        source = _resolve_urdf_uri(source, package_dirs)
 
     if os.path.isfile(source):
         file = ET.parse(source)
@@ -214,11 +268,23 @@ def parse_urdf(
         xml_content = sanitize_xml_content(source)
         urdf_root = ET.fromstring(xml_content)
 
+    if joint_damping_mode is None and urdf_root.find("joint/dynamics[@damping]") is not None:
+        warnings.warn(
+            "The default joint_damping_mode currently maps URDF damping to drive damping. "
+            "The default will switch to 'passive' in Newton 1.8. "
+            "Pass joint_damping_mode='drive' to retain the current mapping or "
+            "joint_damping_mode='passive' to use passive damping explicitly.",
+            NewtonDeprecationWarning,
+            stacklevel=_external_warning_stacklevel(),
+        )
+
     # load joint defaults
     default_joint_limit_lower = builder.default_joint_cfg.limit_lower
     default_joint_limit_upper = builder.default_joint_cfg.limit_upper
     default_joint_limit_effort = builder.default_joint_cfg.effort_limit
-    default_joint_damping = builder.default_joint_cfg.target_kd
+    default_joint_target_kd = builder.default_joint_cfg.target_kd
+    default_joint_damping = builder.default_joint_cfg.damping
+    urdf_default_damping = default_joint_target_kd if use_drive_damping else default_joint_damping
     default_joint_friction = builder.default_joint_cfg.friction
 
     # load shape defaults
@@ -239,33 +305,36 @@ def parse_urdf(
             return None, None
 
         file_tmp = None
-        if filename.startswith(("package://", "model://")):
-            if resolve_robotics_uri is not None:
+        if filename.startswith(("package://", "model://")) or filename.lower().startswith("file:"):
+            if resolve_robotics_uri is not None or filename.lower().startswith("file:"):
                 try:
-                    if filename.startswith("package://"):
-                        fn = filename.replace("package://", "")
+                    asset_package_dirs = list(package_dirs)
+                    if filename.startswith("package://") and os.path.isfile(source):
                         parent_urdf_folder = os.path.abspath(
                             os.path.join(os.path.abspath(source), os.pardir, os.pardir, os.pardir)
                         )
-                        package_dirs = [parent_urdf_folder]
-                    else:
-                        package_dirs = []
-                    filename = resolve_robotics_uri(filename, package_dirs=package_dirs)
+                        asset_package_dirs.append(parent_urdf_folder)
+                    filename = _resolve_urdf_uri(filename, asset_package_dirs)
+                except ImportError as exc:
+                    warnings.warn(str(exc), NewtonWarning, stacklevel=2)
+                    return None, None
                 except FileNotFoundError:
                     warnings.warn(
-                        f'Warning: could not resolve URI "{filename}". '
+                        f'Could not resolve URI "{filename}". '
                         f"Check that the package is installed and that relevant environment variables "
                         f"(ROS_PACKAGE_PATH, AMENT_PREFIX_PATH, GZ_SIM_RESOURCE_PATH, etc.) are set correctly. "
                         f"See https://github.com/ami-iit/resolve-robotics-uri-py for details.",
+                        NewtonWarning,
                         stacklevel=2,
                     )
                     return None, None
             else:
                 if not os.path.isfile(source):
                     warnings.warn(
-                        f'Warning: cannot resolve URI "{filename}" when URDF is loaded from XML string. '
+                        f'Cannot resolve URI "{filename}" when URDF is loaded from XML string. '
                         f"Load URDF from a file path, or install resolve-robotics-uri-py: "
                         f"pip install resolve-robotics-uri-py",
+                        NewtonWarning,
                         stacklevel=2,
                     )
                     return None, None
@@ -273,20 +342,28 @@ def parse_urdf(
                     fn = filename.replace("package://", "")
                     package_name = fn.split("/")[0]
                     urdf_folder = os.path.dirname(source)
-                    if package_name in urdf_folder:
-                        filename = os.path.join(urdf_folder[: urdf_folder.rindex(package_name)], fn)
+                    package_root = None
+                    urdf_parts = Path(os.path.abspath(urdf_folder)).parts
+                    for index in range(len(urdf_parts) - 1, -1, -1):
+                        if urdf_parts[index] == package_name:
+                            package_root = Path(*urdf_parts[:index])
+                            break
+                    if package_root is not None:
+                        filename = os.path.join(os.fspath(package_root), fn)
                     else:
                         warnings.warn(
-                            f'Warning: could not resolve package "{package_name}" in URI "{filename}". '
+                            f'Could not resolve package "{package_name}" in URI "{filename}". '
                             f"For robust URI resolution, install resolve-robotics-uri-py: "
                             f"pip install resolve-robotics-uri-py",
+                            NewtonWarning,
                             stacklevel=2,
                         )
                         return None, None
                 else:
                     warnings.warn(
-                        f'Warning: cannot resolve model:// URI "{filename}" without resolve-robotics-uri-py. '
+                        f'Cannot resolve model:// URI "{filename}" without resolve-robotics-uri-py. '
                         f"Install it with: pip install resolve-robotics-uri-py",
+                        NewtonWarning,
                         stacklevel=2,
                     )
                     return None, None
@@ -297,24 +374,26 @@ def parse_urdf(
             if not os.path.isabs(filename):
                 if not os.path.isfile(source):
                     warnings.warn(
-                        f'Warning: cannot resolve relative URI "{filename}" when URDF is loaded from XML string. '
+                        f'Cannot resolve relative URI "{filename}" when URDF is loaded from XML string. '
                         f"Load URDF from a file path.",
+                        NewtonWarning,
                         stacklevel=2,
                     )
                     return None, None
                 filename = os.path.join(os.path.dirname(source), filename)
 
         if not os.path.exists(filename):
-            warnings.warn(f"Warning: asset file {filename} does not exist", stacklevel=2)
+            warnings.warn(f"Asset file {filename} does not exist", NewtonWarning, stacklevel=2)
             return None, None
 
         return filename, file_tmp
 
     def _parse_material_properties(material_element):
         if material_element is None:
-            return None, None
+            return None, None, None
 
         color = None
+        opacity = None
         texture = None
 
         color_el = material_element.find("color")
@@ -324,6 +403,8 @@ def parse_urdf(
                 values = np.fromstring(rgba, sep=" ", dtype=np.float32)
                 if len(values) >= 3:
                     color = (float(values[0]), float(values[1]), float(values[2]))
+                if len(values) >= 4:
+                    opacity = clamp_imported_opacity(values[3], "URDF material rgba")
 
         texture_el = material_element.find("texture")
         if texture_el is not None:
@@ -342,36 +423,47 @@ def parse_urdf(
                     if tmpfile is not None:
                         os.remove(tmpfile.name)
 
-        return color, texture
+        return color, opacity, texture
 
-    materials: dict[str, dict[str, np.ndarray | None]] = {}
+    materials: dict[str, dict[str, object | None]] = {}
     for material in urdf_root.findall("material"):
         mat_name = material.get("name")
         if not mat_name:
             continue
-        color, texture = _parse_material_properties(material)
+        color, opacity, texture = _parse_material_properties(material)
         materials[mat_name] = {
             "color": color,
+            "opacity": opacity,
             "texture": texture,
         }
 
     def resolve_material(material_element):
         if material_element is None:
-            return {"color": None, "texture": None}
+            return {"color": None, "opacity": None, "texture": None}
         mat_name = material_element.get("name")
-        color, texture = _parse_material_properties(material_element)
+
+        # Fast path: pure name reference to an already-parsed material. URDFs
+        # typically define materials once at the top level and then reference
+        # them by name on individual geoms (`<material name="foo"/>` with no
+        # children). Skip the XML re-parse in that common case.
+        if mat_name and mat_name in materials and len(material_element) == 0:
+            return dict(materials[mat_name])
+
+        color, opacity, texture = _parse_material_properties(material_element)
 
         if mat_name and mat_name in materials:
             resolved = dict(materials[mat_name])
         else:
-            resolved = {"color": None, "texture": None}
+            resolved = {"color": None, "opacity": None, "texture": None}
 
         if color is not None:
             resolved["color"] = color
+        if opacity is not None:
+            resolved["opacity"] = opacity
         if texture is not None:
             resolved["texture"] = texture
 
-        if mat_name and mat_name not in materials and any(value is not None for value in (color, texture)):
+        if mat_name and mat_name not in materials and any(value is not None for value in (color, opacity, texture)):
             materials[mat_name] = dict(resolved)
 
         return resolved
@@ -424,9 +516,14 @@ def parse_urdf(
             if incoming_xform is not None:
                 tf = incoming_xform * tf
 
-            material_info = {"color": None, "texture": None}
+            material_info = resolve_material(geom_group.find("material"))
             if just_visual:
-                material_info = resolve_material(geom_group.find("material"))
+                if material_info["opacity"] is not None:
+                    shape_kwargs["opacity"] = material_info["opacity"]
+                else:
+                    shape_kwargs.pop("opacity", None)
+            else:
+                shape_kwargs.pop("opacity", None)
 
             for box in geo.findall("box"):
                 size = box.get("size") or "1 1 1"
@@ -436,6 +533,7 @@ def parse_urdf(
                     hx=size[0] * 0.5 * scale,
                     hy=size[1] * 0.5 * scale,
                     hz=size[2] * 0.5 * scale,
+                    color=material_info["color"],
                     **shape_kwargs,
                 )
                 shapes.append(s)
@@ -444,6 +542,7 @@ def parse_urdf(
                 s = builder.add_shape_sphere(
                     xform=tf,
                     radius=float(sphere.get("radius") or "1") * scale,
+                    color=material_info["color"],
                     **shape_kwargs,
                 )
                 shapes.append(s)
@@ -455,6 +554,7 @@ def parse_urdf(
                     xform=xform,
                     radius=float(cylinder.get("radius") or "1") * scale,
                     half_height=float(cylinder.get("length") or "1") * 0.5 * scale,
+                    color=material_info["color"],
                     **shape_kwargs,
                 )
                 shapes.append(s)
@@ -466,6 +566,7 @@ def parse_urdf(
                     xform=xform,
                     radius=float(capsule.get("radius") or "1") * scale,
                     half_height=float(capsule.get("height") or "1") * 0.5 * scale,
+                    color=material_info["color"],
                     **shape_kwargs,
                 )
                 shapes.append(s)
@@ -490,7 +591,8 @@ def parse_urdf(
                 for m_mesh in m_meshes:
                     if m_mesh.texture is not None and m_mesh.uvs is None:
                         warnings.warn(
-                            f"Warning: mesh {resolved} has a texture but no UVs; texture will be ignored.",
+                            f"Mesh {resolved} has a texture but no UVs; texture will be ignored.",
+                            NewtonWarning,
                             stacklevel=2,
                         )
                         m_mesh.texture = None
@@ -532,7 +634,7 @@ def parse_urdf(
             "child": child,
             "type": joint.get("type"),
             "origin": parse_transform(joint),
-            "damping": default_joint_damping,
+            "damping": urdf_default_damping,
             "friction": default_joint_friction,
             "axis": wp.vec3(1.0, 0.0, 0.0),
             "limit_lower": default_joint_limit_lower,
@@ -546,13 +648,15 @@ def parse_urdf(
             joint_data["axis"] = wp.vec3(float(ax[0]), float(ax[1]), float(ax[2]))
         el_dynamics = joint.find("dynamics")
         if el_dynamics is not None:
-            joint_data["damping"] = float(el_dynamics.get("damping", default_joint_damping))
+            joint_data["damping"] = float(el_dynamics.get("damping", urdf_default_damping))
             joint_data["friction"] = float(el_dynamics.get("friction", default_joint_friction))
         el_limit = joint.find("limit")
         if el_limit is not None:
             joint_data["limit_lower"] = float(el_limit.get("lower", default_joint_limit_lower))
             joint_data["limit_upper"] = float(el_limit.get("upper", default_joint_limit_upper))
             joint_data["limit_effort"] = float(el_limit.get("effort", default_joint_limit_effort))
+            if (velocity := el_limit.get("velocity")) is not None:
+                joint_data["limit_velocity"] = float(velocity)
         el_mimic = joint.find("mimic")
         if el_mimic is not None:
             joint_data["mimic_joint"] = el_mimic.get("joint")
@@ -603,8 +707,8 @@ def parse_urdf(
 
     # maps from link name -> link index
     link_index: dict[str, int] = {}
-    visual_shapes: list[int] = []
     start_shape_count = len(builder.shape_type)
+    model_has_visual_shapes = any(len(urdf_link.findall("visual")) > 0 for urdf_link in urdf_links)
 
     for urdf_link in urdf_links:
         name = urdf_link.get("name")
@@ -624,12 +728,11 @@ def parse_urdf(
         if parse_visuals_as_colliders:
             colliders = visuals
         else:
-            s = parse_shapes(link, visuals, density=0.0, just_visual=True, visible=not hide_visuals)
-            visual_shapes.extend(s)
+            parse_shapes(link, visuals, density=0.0, just_visual=True, visible=not hide_visuals)
 
         show_colliders = should_show_collider(
             force_show_colliders,
-            has_visual_shapes=len(visuals) > 0,
+            model_has_visual_shapes=model_has_visual_shapes,
             parse_visuals_as_colliders=parse_visuals_as_colliders,
         )
 
@@ -744,7 +847,10 @@ def parse_urdf(
         lower = joint.get("limit_lower", None)
         upper = joint.get("limit_upper", None)
         effort_limit = joint.get("limit_effort", None)
+        velocity_limit = joint.get("limit_velocity")
         joint_damping = joint["damping"]
+        joint_target_kd = joint_damping if use_drive_damping else default_joint_target_kd
+        joint_passive_damping = default_joint_damping if use_drive_damping else joint_damping
         joint_friction = joint["friction"]
 
         parent_xform = joint["origin"]
@@ -767,23 +873,27 @@ def parse_urdf(
         if joint["type"] == "revolute" or joint["type"] == "continuous":
             created_joint_idx = builder.add_joint_revolute(
                 axis=joint["axis"],
-                target_kd=joint_damping,
+                target_kd=joint_target_kd,
+                damping=joint_passive_damping,
                 friction=joint_friction,
                 actuator_mode=actuator_mode,
                 limit_lower=lower,
                 limit_upper=upper,
                 effort_limit=effort_limit,
+                velocity_limit=velocity_limit,
                 **joint_params,
             )
         elif joint["type"] == "prismatic":
             created_joint_idx = builder.add_joint_prismatic(
                 axis=joint["axis"],
-                target_kd=joint_damping,
+                target_kd=joint_target_kd,
+                damping=joint_passive_damping,
                 friction=joint_friction,
                 actuator_mode=actuator_mode,
                 limit_lower=lower * scale,
                 limit_upper=upper * scale,
                 effort_limit=effort_limit,
+                velocity_limit=velocity_limit * scale if velocity_limit is not None else None,
                 **joint_params,
             )
         elif joint["type"] == "fixed":
@@ -807,18 +917,20 @@ def parse_urdf(
             created_joint_idx = builder.add_joint_d6(
                 linear_axes=[
                     ModelBuilder.JointDofConfig(
-                        u,
+                        axis=u,
                         limit_lower=lower * scale,
                         limit_upper=upper * scale,
-                        target_kd=joint_damping,
+                        target_kd=joint_target_kd,
+                        damping=joint_passive_damping,
                         friction=joint_friction,
                         actuator_mode=actuator_mode,
                     ),
                     ModelBuilder.JointDofConfig(
-                        v,
+                        axis=v,
                         limit_lower=lower * scale,
                         limit_upper=upper * scale,
-                        target_kd=joint_damping,
+                        target_kd=joint_target_kd,
+                        damping=joint_passive_damping,
                         friction=joint_friction,
                         actuator_mode=actuator_mode,
                     ),
@@ -831,33 +943,51 @@ def parse_urdf(
         joint_indices.append(created_joint_idx)
         joint_name_to_idx[joint["name"]] = created_joint_idx
 
-    # Create mimic constraints
+    # Flatten imported chains because joint-owned mimic metadata requires an independent reference.
+    joints_by_name = {joint["name"]: joint for joint in sorted_joints}
     for joint in sorted_joints:
         if "mimic_joint" in joint:
             mimic_target_name = joint["mimic_joint"]
-            if mimic_target_name not in joint_name_to_idx:
-                warnings.warn(
-                    f"Mimic joint '{joint['name']}' references unknown joint '{mimic_target_name}', skipping mimic constraint",
-                    stacklevel=2,
-                )
-                continue
-
             follower_idx = joint_name_to_idx.get(joint["name"])
-            leader_idx = joint_name_to_idx.get(mimic_target_name)
-
             if follower_idx is None:
                 warnings.warn(
                     f"Mimic joint '{joint['name']}' was not created, skipping mimic constraint",
+                    NewtonWarning,
                     stacklevel=2,
                 )
                 continue
 
-            builder.add_constraint_mimic(
-                joint0=follower_idx,
-                joint1=leader_idx,
-                coef0=joint.get("mimic_coef0", 0.0),
-                coef1=joint.get("mimic_coef1", 1.0),
-                label=make_label(f"mimic_{joint['name']}"),
+            offset = joint.get("mimic_coef0", 0.0)
+            multiplier = joint.get("mimic_coef1", 1.0)
+            visited = [joint["name"]]
+            while mimic_target_name in joint_name_to_idx:
+                if mimic_target_name in visited:
+                    cycle = " -> ".join([*visited, mimic_target_name])
+                    raise ValueError(f"Cyclic URDF mimic joints: {cycle}")
+                visited.append(mimic_target_name)
+                target = joints_by_name[mimic_target_name]
+                if "mimic_joint" not in target:
+                    break
+                offset += multiplier * target.get("mimic_coef0", 0.0)
+                multiplier *= target.get("mimic_coef1", 1.0)
+                mimic_target_name = target["mimic_joint"]
+            else:
+                warnings.warn(
+                    f"Mimic joint '{joint['name']}' references unknown joint '{mimic_target_name}', skipping mimic constraint",
+                    NewtonWarning,
+                    stacklevel=2,
+                )
+                continue
+
+            # The composed relation uses URDF units. Convert it to the imported joint coordinates.
+            follower_scale = scale if joint["type"] == "prismatic" else 1.0
+            reference_scale = scale if joints_by_name[mimic_target_name]["type"] == "prismatic" else 1.0
+            if reference_scale == 0.0:
+                raise ValueError("URDF scale must be nonzero for a prismatic mimic reference.")
+            builder.set_joint_mimic(
+                joint=follower_idx,
+                reference_joint=joint_name_to_idx[mimic_target_name],
+                coeffs=(offset * follower_scale, multiplier * follower_scale / reference_scale),
             )
 
     # Create articulation from all collected joints
@@ -871,14 +1001,16 @@ def parse_urdf(
         custom_attributes=articulation_custom_attrs,
     )
 
-    for i in range(start_shape_count, end_shape_count):
-        for j in visual_shapes:
-            builder.add_shape_collision_filter_pair(i, j)
-
     if not enable_self_collisions:
-        for i in range(start_shape_count, end_shape_count):
-            for j in range(i + 1, end_shape_count):
+        # The broad phase only ever tests colliding shapes, so visual-only shapes need no filter pairs.
+        colliding_shapes = [
+            i for i in range(start_shape_count, end_shape_count) if builder.shape_flags[i] & ShapeFlags.COLLIDE_SHAPES
+        ]
+        for a, i in enumerate(colliding_shapes):
+            for j in colliding_shapes[a + 1 :]:
                 builder.add_shape_collision_filter_pair(i, j)
 
     if collapse_fixed_joints:
         builder.collapse_fixed_joints()
+    elif collapse_massless_fixed_root:
+        collapse_massless_fixed_root_joints(builder, joint_indices)

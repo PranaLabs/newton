@@ -15,7 +15,7 @@ class TestControlForce(unittest.TestCase):
 
 
 def _build_rotated_parent_descendant_free_model(device, child_com=None):
-    builder = newton.ModelBuilder(gravity=0.0, up_axis=newton.Axis.Y)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0), up_axis=newton.Axis.Y)
     if child_com is None:
         child_com = wp.vec3()
 
@@ -47,7 +47,7 @@ def _rotate_into_parent_frame(q_parent_xyzw: np.ndarray, v_world: np.ndarray) ->
 
 
 def test_floating_body(test: TestControlForce, device, solver_fn, test_angular=True):
-    builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=0.0)
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, 0.0, 0.0))
 
     # easy case: identity transform, zero center of mass
     b = builder.add_body()
@@ -79,17 +79,18 @@ def test_floating_body(test: TestControlForce, device, solver_fn, test_angular=T
     body_qd = state_0.body_qd.numpy()[0]
     test.assertGreater(body_qd[test_index], 0.04)
     test.assertLess(body_qd[test_index], 0.4)
+    zero_tol = 2e-6
     for i in range(6):
         if i == test_index:
             continue
-        test.assertAlmostEqual(body_qd[i], 0.0, delta=1e-6)
+        test.assertAlmostEqual(body_qd[i], 0.0, delta=zero_tol)
     # TODO test joint_qd for MJC, Featherstone solvers
 
 
 def test_3d_articulation(test: TestControlForce, device, solver_fn):
     # test mechanism with 3 orthogonally aligned prismatic joints
     # which allows to test all 3 dimensions of the control force independently
-    builder = newton.ModelBuilder(gravity=0.0)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     builder.default_shape_cfg.density = 100.0
 
     b = builder.add_link()
@@ -146,7 +147,7 @@ def test_child_xform_moment_arm(test: TestControlForce, device, solver_fn):
     the joint anchor and the body COM.
     """
     offset_y = 2.0
-    builder = newton.ModelBuilder(gravity=0.0)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     builder.default_shape_cfg.density = 100.0
 
     b = builder.add_link()
@@ -195,6 +196,70 @@ def test_child_xform_moment_arm(test: TestControlForce, device, solver_fn):
     # cross((0, offset_y, 0), (F, 0, 0)) = (0, 0, -F*offset_y)
     # So we expect negative angular velocity around Z
     test.assertLess(body_qd[5], -0.001, "Expected angular velocity around Z due to child_xform offset")
+
+
+# Non-XYZ axis orders, as in the nv_humanoid.xml hips, and two-axis poses beyond a quarter turn of the second axis.
+D6_ANGULAR_POSES = (
+    ((newton.Axis.X, newton.Axis.Z, newton.Axis.Y), (0.5, -0.4, 0.7)),
+    ((newton.Axis.X, newton.Axis.Z), (0.5, 2.0)),
+    ((newton.Axis.X, newton.Axis.Z), (0.5, -2.0)),
+)
+
+
+def _build_d6_angular(device, axes, joint_q, **dof_kwargs):
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    body = builder.add_link(mass=1.0, inertia=wp.mat33(np.diag([0.1, 0.2, 0.15])))
+    j = builder.add_joint_d6(
+        -1,
+        body,
+        angular_axes=[newton.ModelBuilder.JointDofConfig(axis=axis, armature=0.0, **dof_kwargs) for axis in axes],
+    )
+    builder.add_articulation([j])
+    builder.color()
+    model = builder.finalize(device=device)
+    state = model.state()
+    state.joint_q.assign(np.array(joint_q, dtype=np.float32))
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    return model, state
+
+
+def _step_d6_angular(model, solver, state, control):
+    state_1 = model.state()
+    for _ in range(10):
+        state.clear_forces()
+        solver.step(state, state_1, control, None, 1.0e-3)
+        state, state_1 = state_1, state
+    newton.eval_ik(model, state, state.joint_q, state.joint_qd)
+    return state
+
+
+def test_d6_angular_target_is_equilibrium(test: TestControlForce, device, solver_fn):
+    """A body posed by eval_fk at its multi-angular D6 drive targets must stay at rest."""
+    for axes, joint_q in D6_ANGULAR_POSES:
+        with test.subTest(joint_q=joint_q):
+            model, state = _build_d6_angular(device, axes, joint_q, target_ke=1000.0, target_kd=10.0)
+            control = model.control()
+            control.joint_target_q.assign(np.array(joint_q, dtype=np.float32))
+            state = _step_d6_angular(model, solver_fn(model), state, control)
+            np.testing.assert_allclose(state.joint_q.numpy(), joint_q, atol=1.0e-4)
+
+
+def test_d6_angular_joint_f_matches_featherstone(test: TestControlForce, device, solver_fn):
+    """joint_f on one multi-angular D6 coordinate must produce the generalized-coordinate response."""
+    cases = (
+        (*D6_ANGULAR_POSES[0], (0.0, 0.0, 1.0)),
+        # the two joint axes stay independent where a three-axis chain would be in gimbal lock
+        ((newton.Axis.X, newton.Axis.Y), (0.0, 0.5 * np.pi), (1.0, 0.0)),
+    )
+    for axes, joint_q, joint_f in cases:
+        with test.subTest(axis_count=len(axes)):
+            joint_qd = []
+            for make_solver in (solvers["featherstone"], solver_fn):
+                model, state = _build_d6_angular(device, axes, joint_q)
+                control = model.control()
+                control.joint_f.assign(np.array(joint_f, dtype=np.float32))
+                joint_qd.append(_step_d6_angular(model, make_solver(model), state, control).joint_qd.numpy())
+            np.testing.assert_allclose(joint_qd[1], joint_qd[0], atol=2.0e-3)
 
 
 def test_featherstone_free_descendant_joint_f_world_wrench_preserves_public_frames(test: TestControlForce, device):
@@ -263,7 +328,7 @@ def test_featherstone_free_descendant_joint_f_world_torque_preserves_public_fram
 
 def test_featherstone_free_descendant_joint_f_does_not_require_prefk(test: TestControlForce, device):
     """The descendant FREE world-wrench path should not require a caller-side pre-step eval_fk()."""
-    builder = newton.ModelBuilder(gravity=0.0, up_axis=newton.Axis.Y)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0), up_axis=newton.Axis.Y)
 
     base = builder.add_link(is_kinematic=True, mass=1.0)
     child = builder.add_link(mass=1.0)
@@ -313,14 +378,11 @@ def test_featherstone_free_descendant_joint_f_does_not_require_prefk(test: TestC
 devices = get_test_devices()
 solvers = {
     "featherstone": lambda model: newton.solvers.SolverFeatherstone(model, angular_damping=0.0),
-    "mujoco_cpu": lambda model: newton.solvers.SolverMuJoCo(
-        model, use_mujoco_cpu=True, update_data_interval=0, disable_contacts=True
-    ),
-    "mujoco_warp": lambda model: newton.solvers.SolverMuJoCo(
-        model, use_mujoco_cpu=False, update_data_interval=0, disable_contacts=True
-    ),
+    "mujoco_cpu": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=True, disable_contacts=True),
+    "mujoco_warp": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=False, disable_contacts=True),
     "xpbd": lambda model: newton.solvers.SolverXPBD(model, angular_damping=0.0),
     "semi_implicit": lambda model: newton.solvers.SolverSemiImplicit(model, angular_damping=0.0),
+    "kamino": newton.solvers.SolverKamino,
 }
 for device in devices:
     for solver_name, solver_fn in solvers.items():
@@ -342,6 +404,25 @@ for device in devices:
             devices=[device],
             solver_fn=solver_fn,
         )
+
+    for solver_name, solver_fn in {**solvers, "vbd": newton.solvers.SolverVBD}.items():
+        if device.is_cuda and solver_name == "mujoco_cpu":
+            continue
+        add_function_test(
+            TestControlForce,
+            f"test_d6_angular_target_is_equilibrium_{solver_name}",
+            test_d6_angular_target_is_equilibrium,
+            devices=[device],
+            solver_fn=solver_fn,
+        )
+        if solver_name != "featherstone":
+            add_function_test(
+                TestControlForce,
+                f"test_d6_angular_joint_f_matches_featherstone_{solver_name}",
+                test_d6_angular_joint_f_matches_featherstone,
+                devices=[device],
+                solver_fn=solver_fn,
+            )
 
 # Only test solvers that use apply_joint_forces with child transform
 child_xform_solvers = {

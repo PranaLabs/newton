@@ -11,6 +11,7 @@ types from :mod:`newton.usd`.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import IntEnum
@@ -22,6 +23,8 @@ if TYPE_CHECKING:
     from pxr import Usd
 
     from ..sim.builder import ModelBuilder
+
+logger = logging.getLogger(__name__)
 
 
 class PrimType(IntEnum):
@@ -75,6 +78,12 @@ class SchemaResolver:
     # extra_attr_namespaces is a list of additional USD attribute namespaces in which the schema attributes may be authored.
     extra_attr_namespaces: ClassVar[list[str]] = []
 
+    # deformable_attr_namespaces lists vendor namespaces that carry the deformable
+    # material/geometry attributes (parsed as a fallback to the canonical physics:
+    # schema). Kept separate from extra_attr_namespaces so generic rigid-body
+    # namespaces are never read as deformable attributes.
+    deformable_attr_namespaces: ClassVar[list[str]] = []
+
     def __init__(self) -> None:
         # Precompute the full set of USD attribute names referenced by this resolver's mapping.
         names: set[str] = set()
@@ -92,7 +101,7 @@ class SchemaResolver:
                     names.update(spec.attribute_names)
                 else:
                     names.add(spec.name)
-        self._solver_attributes: list[str] = list(names)
+        self._solver_attributes = frozenset(names)
 
     def get_value(self, prim: Usd.Prim, prim_type: PrimType, key: str) -> Any | None:
         """Get an authored value for a resolver key.
@@ -129,22 +138,21 @@ class SchemaResolver:
         if prim is None:
             return {}
 
-        # Collect attributes by known prefixes
-        # USD expects namespace tokens without ':' (e.g., 'newton', 'mjc', 'physxArticulation')
-        main_prefix = self.name
-        all_prefixes = [main_prefix]
-        if self.extra_attr_namespaces:
-            all_prefixes.extend(self.extra_attr_namespaces)
-        prefixed_attrs: dict[str, Any] = _collect_attrs_by_namespace(prim, all_prefixes)
-
-        # Collect explicit attribute names defined in the resolver mapping (precomputed)
-        prim_solver_attrs = _collect_attrs_by_name(prim, self._solver_attributes) if self._solver_attributes else {}
-
-        # Merge and return (explicit names take precedence)
-        merged: dict[str, Any] = {}
-        merged.update(prefixed_attrs)
-        merged.update(prim_solver_attrs)
-        return merged
+        # Prims author only a small subset of the attributes supported by a resolver.
+        # Traverse that subset once instead of querying every possible schema name.
+        prefixes = tuple(
+            ns + ":" if ns and not ns.endswith(":") else ns for ns in (self.name, *self.extra_attr_namespaces)
+        )
+        out: dict[str, Any] = {}
+        for attr in prim.GetAuthoredAttributes():
+            name = attr.GetName()
+            in_namespace = name.startswith(prefixes)
+            if (in_namespace or name in self._solver_attributes) and attr.HasAuthoredValue():
+                value = attr.Get()
+                # Namespaced time-sampled attributes retain their missing default value.
+                if value is not None or in_namespace:
+                    out[name] = value
+        return out
 
     def validate_custom_attributes(self, builder: ModelBuilder) -> None:
         """
@@ -161,26 +169,6 @@ class SchemaResolver:
 
 # Backward-compatible alias; prefer SchemaResolver.SchemaAttribute.
 SchemaAttribute = SchemaResolver.SchemaAttribute
-
-
-def _collect_attrs_by_name(prim: Usd.Prim, names: Sequence[str]) -> dict[str, Any]:
-    """Collect attributes authored on the prim that have direct mappings in the resolver mapping"""
-    out: dict[str, Any] = {}
-    for n in names:
-        v = usd.get_attribute(prim, n)
-        if v is not None:
-            out[n] = v
-    return out
-
-
-def _collect_attrs_by_namespace(prim: Usd.Prim, namespaces: Sequence[str]) -> dict[str, Any]:
-    """Collect authored attributes using USD namespace queries."""
-    out: dict[str, Any] = {}
-    if prim is None:
-        return out
-    for ns in namespaces:
-        out.update(usd.get_attributes_in_namespace(prim, ns))
-    return out
 
 
 class SchemaResolverManager:
@@ -231,17 +219,24 @@ class SchemaResolverManager:
         Returns:
             Resolved value according to the precedence above.
         """
+        value, _ = self.get_value_with_resolver(prim, prim_type, key, default, verbose)
+        return value
+
+    def get_value_with_resolver(
+        self, prim: Usd.Prim, prim_type: PrimType, key: str, default: Any = None, verbose: bool = False
+    ) -> tuple[Any, SchemaResolver | None]:
+        """Resolve a value and return the resolver that supplied an authored value."""
         # 1) Authored value by schema priority
         for r in self.resolvers:
             val = r.get_value(prim, prim_type, key)
             if val is None:
                 continue
             self._collect_on_first_use(r, prim)
-            return val
+            return val, r
 
         # 2) Caller-provided default, if any
         if default is not None:
-            return default
+            return default, None
 
         # 3) Resolver mapping defaults in priority order
         for resolver in self.resolvers:
@@ -250,7 +245,7 @@ class SchemaResolverManager:
                 d = getattr(spec, "default", None)
                 if d is not None:
                     transformer = getattr(spec, "usd_value_transformer", None)
-                    return transformer(d) if transformer is not None else d
+                    return (transformer(d) if transformer is not None else d), None
 
         # Nothing found
         try:
@@ -258,12 +253,40 @@ class SchemaResolverManager:
         except (AttributeError, RuntimeError):
             prim_path = "<invalid>"
         if verbose:
-            error_message = (
-                f"Error: Cannot resolve value for '{prim_type.name.lower()}:{key}' on prim '{prim_path}'; "
-                + "no authored value, no explicit default, and no solver mapping default."
+            logger.info(
+                "Cannot resolve value for '%s:%s' on prim '%s'; "
+                "no authored value, no explicit default, and no solver mapping default.",
+                prim_type.name.lower(),
+                key,
+                prim_path,
             )
-            print(error_message)
-        return None
+        return None, None
+
+    def deformable_compat_namespaces(self) -> list[str]:
+        """Deformable vendor attribute namespaces declared by the active resolvers.
+
+        Returns the union of every resolver's ``deformable_attr_namespaces``, in
+        resolver priority order. Used to accept deformable material/geometry
+        attributes authored under vendor namespaces (e.g. ``omniphysics:``,
+        ``physxDeformableBody:``) as a fallback to the canonical ``physics:``
+        schema. This is deliberately separate from the generic
+        ``extra_attr_namespaces`` so unrelated namespaces (``physxScene``,
+        ``drive``, ``state``, ...) are never read as deformable schema attributes.
+        Empty by default, so a default import reads only the canonical schema.
+        """
+        seen: set[str] = set()
+        namespaces: list[str] = []
+        for r in self.resolvers:
+            for ns in r.deformable_attr_namespaces:
+                if ns not in seen:
+                    seen.add(ns)
+                    namespaces.append(ns)
+        return namespaces
+
+    def read_deformable_attr(self, prim: Usd.Prim, name: str) -> Any:
+        """Read a deformable physics attribute: canonical ``physics:`` first, then the
+        resolver-declared vendor namespaces. The first authored value, or ``None``."""
+        return usd._read_physics_attr(prim, name, self.deformable_compat_namespaces())
 
     def collect_prim_attrs(self, prim: Usd.Prim) -> None:
         """

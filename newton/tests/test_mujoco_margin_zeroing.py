@@ -9,20 +9,24 @@ and keep ``mjw_model.geom_margin`` zero when MuJoCo handles collisions.
 """
 
 import unittest
+import warnings
 
 import numpy as np
 
 import newton
-from newton.solvers import SolverMuJoCo, SolverNotifyFlags
+from newton import ModelFlags
+from newton.solvers import SolverMuJoCo
 
 
 class TestMuJoCoMarginZeroing(unittest.TestCase):
     """Verify SolverMuJoCo margin handling for NATIVECCD compatibility."""
 
     @staticmethod
-    def _build_model_with_margin(margin: float = 1e-5) -> newton.Model:
+    def _build_model_with_margin(margin: float = 1e-5, *, nativeccd: bool = True) -> newton.Model:
         """Build a minimal model with two boxes that have non-zero margin."""
         builder = newton.ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
+        builder.custom_attributes["mujoco:flag_nativeccd"].values[0] = nativeccd
         builder.add_shape_box(
             body=-1,
             hx=1.0,
@@ -40,41 +44,23 @@ class TestMuJoCoMarginZeroing(unittest.TestCase):
         )
         return builder.finalize()
 
-    def test_mj_model_geom_margin_zero(self):
-        """The compiled MjModel must have zero geom_margin (zeroed in MjSpec before compilation)."""
-        model = self._build_model_with_margin(margin=1e-5)
-        with self.assertWarnsRegex(UserWarning, r"zeroed for NATIVECCD/MULTICCD"):
-            solver = SolverMuJoCo(model, use_mujoco_contacts=True)
-        np.testing.assert_array_equal(
-            solver.mj_model.geom_margin,
-            np.zeros_like(solver.mj_model.geom_margin),
-            err_msg="MjModel geom_margin should be zero in the spec",
-        )
-
-    def test_geom_margin_zero_with_mujoco_contacts(self):
-        """When MuJoCo handles collisions, mjw_model.geom_margin must stay zero."""
-        model = self._build_model_with_margin(margin=1e-5)
-        with self.assertWarnsRegex(UserWarning, r"zeroed for NATIVECCD/MULTICCD"):
-            solver = SolverMuJoCo(model, use_mujoco_contacts=True)
-        geom_margin = solver.mjw_model.geom_margin.numpy()
-        np.testing.assert_array_equal(
-            geom_margin,
-            np.zeros_like(geom_margin),
-            err_msg="geom_margin should be zero when use_mujoco_contacts=True",
-        )
-
-    def test_geom_margin_stays_zero_after_notify(self):
-        """Margins must stay zero after notify_model_changed with MuJoCo contacts."""
-        model = self._build_model_with_margin(margin=1e-5)
-        with self.assertWarnsRegex(UserWarning, r"zeroed for NATIVECCD/MULTICCD"):
-            solver = SolverMuJoCo(model, use_mujoco_contacts=True)
-        solver.notify_model_changed(SolverNotifyFlags.SHAPE_PROPERTIES)
-        geom_margin = solver.mjw_model.geom_margin.numpy()
-        np.testing.assert_array_equal(
-            geom_margin,
-            np.zeros_like(geom_margin),
-            err_msg="geom_margin should remain zero after notify_model_changed",
-        )
+    def test_geom_margin_zeroed_throughout_lifecycle(self):
+        """Preserve margins unless enabled NATIVECCD or MULTICCD requires zeroing."""
+        for nativeccd, multiccd in ((True, False), (False, False), (False, True)):
+            with self.subTest(nativeccd=nativeccd, multiccd=multiccd):
+                model = self._build_model_with_margin(margin=0.01, nativeccd=nativeccd)
+                expected_margin = 0.0 if nativeccd or multiccd else 0.01
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    solver = SolverMuJoCo(model, enable_multiccd=multiccd)
+                self.assertEqual(
+                    any("zeroed for NATIVECCD/MULTICCD" in str(w.message) for w in caught),
+                    expected_margin == 0.0,
+                )
+                np.testing.assert_allclose(solver.mj_model.geom_margin, expected_margin)
+                np.testing.assert_allclose(solver.mjw_model.geom_margin.numpy(), expected_margin)
+                solver.notify_model_changed(ModelFlags.SHAPE_PROPERTIES)
+                np.testing.assert_allclose(solver.mjw_model.geom_margin.numpy(), expected_margin)
 
 
 if __name__ == "__main__":

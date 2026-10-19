@@ -24,6 +24,18 @@ import warp as wp
 import newton
 import newton.examples
 
+CARD_COLOR_PALETTE = (
+    (68 / 255, 119 / 255, 170 / 255),
+    (102 / 255, 204 / 255, 238 / 255),
+    (34 / 255, 136 / 255, 51 / 255),
+    (204 / 255, 187 / 255, 68 / 255),
+    (238 / 255, 102 / 255, 119 / 255),
+    (170 / 255, 51 / 255, 119 / 255),
+    (238 / 255, 153 / 255, 51 / 255),
+    (0 / 255, 153 / 255, 136 / 255),
+)
+"""Paul Tol bright palette, matching the ModelBuilder shape palette."""
+
 
 class Example:
     def __init__(self, viewer, args):
@@ -61,7 +73,7 @@ class Example:
         self.random_offset_xy = 0.005  # m (0.5 cm) - random XY offset
 
         # Build the model (using meters)
-        builder = newton.ModelBuilder(gravity=-9.8)  # m/s²
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.8))  # m/s²
 
         # Add a static cube for cards to stack on
         body_cube = builder.add_body(
@@ -74,7 +86,7 @@ class Example:
         cube_cfg = newton.ModelBuilder.ShapeConfig()
         cube_cfg.density = 0.0  # Static body (infinite mass)
         cube_cfg.ke = 5.0e6  # Contact stiffness
-        cube_cfg.kd = 1.0e-4  # Contact damping
+        cube_cfg.kd = 1.0e4  # Contact damping
         cube_cfg.mu = 0.1  # Friction
         builder.add_shape_box(
             body_cube,
@@ -103,7 +115,7 @@ class Example:
         sphere_cfg = newton.ModelBuilder.ShapeConfig()
         sphere_cfg.density = 0.0  # Kinematic body (not affected by gravity)
         sphere_cfg.ke = 1.0e5  # Contact stiffness
-        sphere_cfg.kd = 1.0e-4  # Contact damping
+        sphere_cfg.kd = 1.0e1  # Contact damping
         sphere_cfg.mu = 0.3  # Friction
         builder.add_shape_sphere(body_sphere, radius=self.sphere_radius, cfg=sphere_cfg)
 
@@ -125,9 +137,9 @@ class Example:
         # edge_ke: bending stiffness (key for card rigidity)
         tri_ke = 1.0e4  # High stretch stiffness
         tri_ka = 1.0e4  # High shear stiffness
-        tri_kd = 1.0e-4  # Small damping
+        tri_kd = 1.0e0  # Stretch/shear damping
         edge_ke = 1.0e2  # High bending stiffness for rigid cards
-        edge_kd = 1.0e-2  # Bending damping
+        edge_kd = 1.0e0  # Bending damping
 
         # Particle radius for collision (in meters)
         particle_radius = 0.003  # m (0.15 cm)
@@ -168,12 +180,13 @@ class Example:
                 edge_ke=edge_ke,
                 edge_kd=edge_kd,
                 particle_radius=particle_radius,
+                color=CARD_COLOR_PALETTE[i % len(CARD_COLOR_PALETTE)],
             )
 
         # Add ground plane
         ground_cfg = newton.ModelBuilder.ShapeConfig()
         ground_cfg.ke = 1.0e5  # Contact stiffness
-        ground_cfg.kd = 1.0e-4  # Contact damping
+        ground_cfg.kd = 1.0e2  # Contact damping
         ground_cfg.mu = 0.3  #
         builder.add_ground_plane(cfg=ground_cfg)
 
@@ -185,7 +198,7 @@ class Example:
 
         # Contact parameters for card-card and card-ground interactions
         self.model.soft_contact_ke = 1.0e5  # Contact stiffness
-        self.model.soft_contact_kd = 1.0e-4  # Contact damping
+        self.model.soft_contact_kd = 1.0e2  # Contact damping
         self.model.soft_contact_mu = 0.3  # Friction coefficient
 
         # Create VBD solver with self-contact enabled
@@ -193,10 +206,11 @@ class Example:
             model=self.model,
             iterations=self.iterations,
             particle_enable_self_contact=True,
-            particle_self_contact_radius=0.001,  # m (0.1 cm)
-            particle_self_contact_margin=0.0015,  # m (0.15 cm)
+            particle_self_contact_margin=0.001,  # m (0.1 cm)
+            particle_self_contact_gap=0.0005,  # m (0.05 cm)
             particle_topological_contact_filter_threshold=2,
             particle_rest_shape_contact_exclusion_radius=0.0,  # m (0.5 cm)
+            rigid_body_particle_contact_buffer_size=1024,
         )
 
         # Create states
@@ -211,7 +225,7 @@ class Example:
         self.collision_pipeline = newton.CollisionPipeline(
             self.model,
             broad_phase="nxn",
-            soft_contact_margin=0.005,  # m (0.5 cm)
+            soft_contact_gap=0.005,  # m (0.5 cm)
         )
         self.contacts = self.collision_pipeline.contacts()
 
@@ -223,7 +237,7 @@ class Example:
             pitch=-15.0,
             yaw=140.0,
         )
-        if hasattr(self.viewer, "camera") and hasattr(self.viewer.camera, "fov"):
+        if hasattr(self.viewer, "camera"):
             self.viewer.camera.fov = 70.0
 
         self.capture()

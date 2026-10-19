@@ -138,6 +138,7 @@ class Example:
         self.sim_time = 0.0
 
         self.viewer = viewer
+        self.viewer.picking_enabled = False
         self.viewer.show_particles = True
 
         # ------------------------------------------------------------------
@@ -147,6 +148,7 @@ class Example:
         builder.add_urdf(
             newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
             floating=False,
+            joint_damping_mode="passive",
         )
         builder.add_ground_plane()
 
@@ -166,7 +168,7 @@ class Example:
             pitch=0.0,
             yaw=90.0,
         )
-        if hasattr(self.viewer, "camera") and hasattr(self.viewer.camera, "fov"):
+        if hasattr(self.viewer, "camera"):
             self.viewer.camera.fov = 90.0
 
         self.state = self.model.state()
@@ -260,10 +262,9 @@ class Example:
     # ----------------------------------------------------------------------
     def capture(self):
         self.graph = None
-        if wp.get_device().is_cuda:
-            with wp.ScopedCapture() as cap:
-                self.simulate()
-            self.graph = cap.graph
+        with wp.ScopedCapture() as cap:
+            self.simulate()
+        self.graph = cap.graph
 
     def simulate(self):
         self.ik_solver.reset()

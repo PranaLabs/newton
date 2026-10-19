@@ -196,6 +196,7 @@ class Example:
         self.verbose = args.verbose
 
         self.viewer = viewer
+        self.viewer.picking_enabled = False
 
         self.cube_count = 3
         self.cube_size = 0.05
@@ -238,13 +239,14 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.joint_target_shape = self.control.joint_target_pos.reshape((self.world_count, -1)).shape
-        wp.copy(self.control.joint_target_pos[:9], self.model.joint_q[:9])
+        self.joint_target_shape = self.control.joint_target_q.reshape((self.world_count, -1)).shape
+        wp.copy(self.control.joint_target_q, self.model.joint_q)
 
         # Evaluate forward kinematics for collision detection
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
 
-        self.contacts = self.model.contacts()
+        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.contacts = self.collision_pipeline.contacts()
 
         # Setup ik and tasks
         self.state = self.model.state()
@@ -256,7 +258,6 @@ class Example:
             self.viewer = newton.viewer.ViewerNull()
 
         self.viewer.set_model(self.model)
-        self.viewer.picking_enabled = False  # Disable interactive GUI picking for this example
 
         if hasattr(self.viewer, "renderer"):
             self.viewer.set_world_offsets(wp.vec3(1.5, 1.5, 0.0))
@@ -271,26 +272,24 @@ class Example:
 
     def capture_sim(self):
         self.graph = None
-        if wp.get_device().is_cuda:
-            with wp.ScopedCapture() as capture:
-                self.simulate()
-            self.graph = capture.graph
+        with wp.ScopedCapture() as capture:
+            self.simulate()
+        self.graph = capture.graph
 
     def capture_ik(self):
         self.graph_ik = None
 
-        if wp.get_device().is_cuda:
-            with wp.ScopedCapture() as capture:
-                self.ik_solver.step(self.joint_q_ik, self.joint_q_ik, iterations=self.ik_iters)
-            self.graph_ik = capture.graph
+        with wp.ScopedCapture() as capture:
+            self.ik_solver.step(self.joint_q_ik, self.joint_q_ik, iterations=self.ik_iters)
+        self.graph_ik = capture.graph
 
     def simulate(self):
         if not self.collide_substeps:
-            self.model.collide(self.state_0, self.contacts)
+            self.collision_pipeline.collide(self.state_0, self.contacts)
 
         for _ in range(self.sim_substeps):
             if self.collide_substeps:
-                self.model.collide(self.state_0, self.contacts)
+                self.collision_pipeline.collide(self.state_0, self.contacts)
 
             self.state_0.clear_forces()
 
@@ -339,6 +338,7 @@ class Example:
             floating=False,
             enable_self_collisions=False,
             parse_visuals_as_colliders=False,
+            joint_damping_mode="passive",
         )
 
         builder.joint_q[:9] = [
@@ -353,7 +353,7 @@ class Example:
             0.05,
         ]
 
-        builder.joint_target_pos[:9] = [
+        builder.joint_target_q[:9] = [
             -3.6802115e-03,
             2.3901723e-02,
             3.6804110e-03,
@@ -648,9 +648,9 @@ class Example:
             self.ik_solver.step(self.joint_q_ik, self.joint_q_ik, iterations=self.ik_iters)
 
         # Set the joint target positions
-        joint_target_pos_view = self.control.joint_target_pos.reshape((self.world_count, -1))
-        wp.copy(dest=joint_target_pos_view[:, :7], src=self.joint_q_ik[:, :7])
-        wp.copy(dest=joint_target_pos_view[:, 7:9], src=self.gripper_target_interpolated[:, :2])
+        joint_target_q_view = self.control.joint_target_q.reshape((self.world_count, -1))
+        wp.copy(dest=joint_target_q_view[:, :7], src=self.joint_q_ik[:, :7])
+        wp.copy(dest=joint_target_q_view[:, 7:9], src=self.gripper_target_interpolated[:, :2])
 
         wp.launch(
             advance_task_kernel,

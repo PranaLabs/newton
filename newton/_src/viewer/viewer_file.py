@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections.abc import Iterable, Mapping
+from collections.abc import Set as AbstractSet
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 
@@ -16,6 +18,7 @@ from warp._src import types as warp_types
 from ..core.types import override
 from ..geometry import Mesh
 from ..sim import Model, State
+from ..sim.shape_contact_pairs import _ShapeContactPairs
 from .viewer import ViewerBase
 
 # Optional CBOR2 support
@@ -25,6 +28,8 @@ try:
     HAS_CBOR2 = True
 except ImportError:
     HAS_CBOR2 = False
+
+logger = logging.getLogger(__name__)
 
 
 T = TypeVar("T")
@@ -235,7 +240,7 @@ def _get_serialization_format(file_path: str) -> str:
         return "json"
     elif ext == ".bin":
         if not HAS_CBOR2:
-            raise ImportError("cbor2 library is required for .bin files. Install with: pip install 'cbor2>=5.7.0,<6'")
+            raise ImportError("cbor2 library is required for .bin files. Install with: pip install 'cbor2>=5.7.0'")
         return "cbor2"
     else:
         raise ValueError(f"Unsupported file extension '{ext}'. Supported extensions: .json, .bin")
@@ -245,6 +250,10 @@ def _ptr_key_from_numpy(arr: np.ndarray) -> int:
     # Use the underlying buffer address as a stable key within a process
     # for non-aliased arrays. For views, this still points to the base buffer;
     # since user guarantees no aliasing across arrays, we can use the data address.
+    # Empty arrays share a null data buffer, so distinct empties would otherwise
+    # collide on the same key; fall back to object identity for them.
+    if arr.size == 0:
+        return id(arr)
     return int(arr.__array_interface__["data"][0])
 
 
@@ -265,12 +274,8 @@ def _warp_key(x) -> int:
     return _WARP_TAG + base
 
 
-def _mesh_key_from_vertices(vertices: np.ndarray, fallback_obj=None) -> int:
-    try:
-        base = _ptr_key_from_numpy(vertices)
-    except Exception:
-        base = int(id(fallback_obj)) if fallback_obj is not None else int(id(vertices))
-    return _MESH_TAG + base
+def _mesh_key_from_object(mesh: Mesh) -> int:
+    return _MESH_TAG + int(id(mesh))
 
 
 def serialize_ndarray(arr: np.ndarray, format_type: str = "json", cache: ArrayCache | None = None) -> dict:
@@ -341,12 +346,14 @@ def serialize_ndarray(arr: np.ndarray, format_type: str = "json", cache: ArrayCa
         raise ValueError(f"Unsupported format_type: {format_type}")
 
 
-def deserialize_ndarray(data: dict, format_type: str = "json", cache: ArrayCache | None = None) -> np.ndarray:
+def deserialize_ndarray(
+    data: Mapping[str, Any], format_type: str = "json", cache: ArrayCache | None = None
+) -> np.ndarray:
     """
-    Deserialize a dictionary representation back to a numpy ndarray.
+    Deserialize a mapping representation back to a numpy ndarray.
 
     Args:
-        data: Dictionary containing the serialized array data.
+        data: Mapping-like decoded serialized array data.
         format_type: The serialization format ('json' or 'cbor2').
 
     Returns:
@@ -451,8 +458,9 @@ def serialize(obj, callback, _visited=None, _path="", format_type="json", cache:
 
         # Iterables (like list, tuple, set)
         if isinstance(obj, Iterable) and not isinstance(obj, str | bytes | bytearray):
+            type_name = "set" if isinstance(obj, AbstractSet) else type(obj).__name__
             return {
-                "__type__": type(obj).__name__,
+                "__type__": type_name,
                 "items": [
                     serialize(
                         item, callback, _visited, f"{_path}[{i}]" if _path else f"[{i}]", format_type, cache=cache
@@ -463,6 +471,14 @@ def serialize(obj, callback, _visited=None, _path="", format_type="json", cache:
 
         # Custom object — serialize attributes
         if hasattr(obj, "__dict__"):
+            attributes = vars(obj)
+            if isinstance(obj, Model):
+                attributes = dict(attributes)
+                attributes["shape_contact_pairs"] = attributes.pop("_shape_contact_pairs", None)
+                pair_count = attributes.pop("_shape_contact_pair_count", None)
+                if pair_count is not None:
+                    attributes["shape_contact_pair_count"] = pair_count
+                attributes.pop("_shape_contact_pair_counts", None)
             return {
                 "__type__": obj.__class__.__name__,
                 "__module__": obj.__class__.__module__,
@@ -470,7 +486,7 @@ def serialize(obj, callback, _visited=None, _path="", format_type="json", cache:
                     attr: serialize(
                         value, callback, _visited, f"{_path}.{attr}" if _path else attr, format_type, cache=cache
                     )
-                    for attr, value in vars(obj).items()
+                    for attr, value in attributes.items()
                 },
             }
 
@@ -528,8 +544,25 @@ def _serialize_warp_dtype(dtype) -> dict:
     return result
 
 
+_MODEL_BVH_RECORDING_DEFAULTS = {
+    "bvh_shapes": None,
+    "bvh_shapes_group_roots": None,
+    "bvh_shape_enabled": None,
+    "bvh_shape_count_enabled": 0,
+    "bvh_shape_bounds": None,
+    "bvh_shape_world_transforms": None,
+    "bvh_particles": None,
+    "bvh_particles_group_roots": None,
+}
+
+
 def pointer_as_key(obj, format_type: str = "json", cache: ArrayCache | None = None):
     def callback(x, path):
+        if path.startswith("model."):
+            model_attr = path.removeprefix("model.").partition(".")[0]
+            if model_attr in _MODEL_BVH_RECORDING_DEFAULTS:
+                return _MODEL_BVH_RECORDING_DEFAULTS[model_attr]
+
         if isinstance(x, wp.array):
             # Skip arrays with struct dtypes - they can't be serialized
             if _is_struct_dtype(x.dtype):
@@ -565,6 +598,9 @@ def pointer_as_key(obj, format_type: str = "json", cache: ArrayCache | None = No
         if isinstance(x, wp.HashGrid):
             return {"__type__": "warp.HashGrid", "data": None}
 
+        if isinstance(x, wp.Bvh):
+            return {"__type__": "warp.Bvh", "data": None}
+
         if isinstance(x, wp.Mesh):
             return {"__type__": "warp.Mesh", "data": None}
 
@@ -576,12 +612,14 @@ def pointer_as_key(obj, format_type: str = "json", cache: ArrayCache | None = No
                 "is_solid": x.is_solid,
                 "has_inertia": x.has_inertia,
                 "maxhullvert": x.maxhullvert,
+                "color": x.color,
+                "opacity": x.opacity,
                 "mass": x.mass,
                 "com": [float(x.com[0]), float(x.com[1]), float(x.com[2])],
                 "inertia": serialize_ndarray(np.array(x.inertia), format_type, cache),
             }
             if cache is not None:
-                mesh_key = _mesh_key_from_vertices(x.vertices, fallback_obj=x)
+                mesh_key = _mesh_key_from_object(x)
                 idx = cache.try_register_pointer_and_value(mesh_key, x)
                 if idx > 0:
                     return {"__type__": "newton.geometry.Mesh_ref", "cache_index": int(idx)}
@@ -600,91 +638,130 @@ def pointer_as_key(obj, format_type: str = "json", cache: ArrayCache | None = No
     return serialize(obj, callback, format_type=format_type, cache=cache)
 
 
-def transfer_to_model(source_dict, target_obj, post_load_init_callback=None, _path=""):
+_MISSING = object()
+
+
+def transfer_to_model(source_dict: Mapping[str, Any], target_obj, post_load_init_callback=None, _path=""):
     """
-    Recursively transfer values from source_dict to target_obj, respecting the tree structure.
-    Only transfers values where both source and target have matching attributes.
+    Recursively transfer values from ``source_dict`` into ``target_obj``.
+
+    The walk is source-driven: each non-private key in ``source_dict`` is matched against
+    the corresponding slot on ``target_obj``. Source keys not declared on ``target_obj``
+    are dropped, with one exception — ``Model.AttributeNamespace`` targets hold arbitrary
+    user-defined keys, so a namespace target accepts every source key. When the source
+    carries a ``Model.AttributeNamespace`` (reconstructed by :func:`deserialize`) that the
+    target lacks, it is installed wholesale so namespaces like ``model.mujoco`` roundtrip.
 
     Args:
-        source_dict: Dictionary containing the values to transfer (from deserialization).
+        source_dict: Mapping-like decoded values to transfer from deserialization.
         target_obj: Target object to receive the values.
-        post_load_init_callback: Optional function taking (target_obj, path) called after all children are processed.
+        post_load_init_callback: Optional function taking (target_obj, path) called after
+            all children are processed.
         _path: Internal parameter tracking the current path.
     """
     if not hasattr(target_obj, "__dict__"):
         return
-
-    # Handle case where source_dict is not a dict (primitive value)
-    if not isinstance(source_dict, dict):
+    if not isinstance(source_dict, Mapping):
         return
 
-    # Iterate through all attributes of the target object
-    for attr_name in dir(target_obj):
-        # Skip private/magic methods and properties
+    target_is_namespace = isinstance(target_obj, Model.AttributeNamespace)
+    target_is_model = isinstance(target_obj, Model)
+
+    for attr_name, source_value in source_dict.items():
+        if target_is_model and attr_name in {
+            "_shape_collision_filter_pairs",
+            "shape_collision_filter_pairs",
+        }:
+            target_obj._set_shape_collision_filter_pairs(source_value)  # pyright: ignore[reportPrivateUsage]
+            continue
+
+        if target_is_model and attr_name in {
+            "shape_contact_pairs",
+            "_shape_contact_pairs",
+            "shape_contact_pair_count",
+            "_shape_contact_pair_count",
+        }:
+            continue
+
         if attr_name.startswith("_"):
             continue
 
-        # Skip if attribute doesn't exist in target or is not settable
-        try:
-            target_value = getattr(target_obj, attr_name)
-        except (AttributeError, TypeError, RuntimeError):
-            # Skip attributes that can't be accessed (including CUDA stream on CPU devices)
-            continue
+        target_value = getattr(target_obj, attr_name, _MISSING)
 
-        # Skip methods and non-data attributes
-        if callable(target_value):
-            continue
-
-        # Check if source_dict has this attribute (optimization: single dict lookup)
-        source_value = source_dict.get(attr_name, _MISSING := object())
-        if source_value is _MISSING:
-            continue
-
-        # Handle different types of values
-        if hasattr(target_value, "__dict__") and isinstance(source_value, dict):
-            # Recursively transfer for custom objects
-            # Build path only when needed (optimization: lazy string formatting)
-            current_path = f"{_path}.{attr_name}" if _path else attr_name
-            transfer_to_model(source_value, target_value, post_load_init_callback, current_path)
-        elif isinstance(source_value, list | tuple) and hasattr(target_value, "__len__"):
-            # Handle sequences - try to transfer if lengths match or target is empty
-            try:
-                # Optimization: cache len() call to avoid redundant computation
-                target_len = len(target_value)
-                if target_len == 0 or target_len == len(source_value):
-                    # For now, just assign the value directly
-                    # In a more sophisticated implementation, you might want to handle
-                    # element-wise transfer for lists of objects
-                    setattr(target_obj, attr_name, source_value)
-            except (TypeError, AttributeError):
-                # If we can't handle the sequence, try direct assignment
+        # Source carries a reconstructed AttributeNamespace (e.g. ``model.mujoco``).
+        # Install it on the target only when the slot is empty; if the target already has
+        # a namespace there, merge attrs into it; otherwise skip rather than overwrite a
+        # non-namespace target.
+        if isinstance(source_value, Model.AttributeNamespace):
+            if target_value is _MISSING:
                 try:
                     setattr(target_obj, attr_name, source_value)
                 except (AttributeError, TypeError):
-                    # Skip if we can't set the attribute
                     pass
-        else:
-            # Direct assignment for primitive types and other values
-            try:
-                setattr(target_obj, attr_name, source_value)
-            except (AttributeError, TypeError):
-                # Skip if we can't set the attribute (e.g., read-only property)
-                pass
+            elif isinstance(target_value, Model.AttributeNamespace):
+                for ns_attr, ns_value in vars(source_value).items():
+                    if ns_attr.startswith("_"):
+                        continue
+                    setattr(target_value, ns_attr, ns_value)
+            continue
 
-    # Call post_load_init_callback after all children have been processed
+        # Recurse into sub-objects (custom objects with a __dict__) when source is a dict.
+        if isinstance(source_value, Mapping) and target_value is not _MISSING and hasattr(target_value, "__dict__"):
+            current_path = f"{_path}.{attr_name}" if _path else attr_name
+            transfer_to_model(source_value, target_value, post_load_init_callback, current_path)
+            continue
+
+        # Drop source keys not declared on the target. AttributeNamespace targets hold
+        # arbitrary user-defined keys by design, so they bypass this guard.
+        if target_value is _MISSING and not target_is_namespace:
+            continue
+
+        # Length-match guard for Python sequences: refuse to overwrite a populated target
+        # list/array with a mismatched-length source list.
+        if isinstance(source_value, list | tuple) and target_value is not _MISSING and hasattr(target_value, "__len__"):
+            try:
+                target_len = len(target_value)
+            except TypeError:
+                target_len = None
+            if target_len is not None and target_len != 0 and target_len != len(source_value):
+                continue
+
+        try:
+            setattr(target_obj, attr_name, source_value)
+        except (AttributeError, TypeError):
+            pass
+
+    if target_is_model:
+        # Restore pair storage and topology; the count is derived from their contents.
+        pairs = source_dict.get("shape_contact_pairs", source_dict.get("_shape_contact_pairs", _MISSING))
+        if pairs is not _MISSING:
+            target_obj.shape_contact_pairs = pairs
+        data = source_dict.get("_shape_contact_pair_data")
+        if isinstance(data, Mapping):
+            target_obj._shape_contact_pair_data = _ShapeContactPairs(  # pyright: ignore[reportPrivateUsage]
+                data["shape_body"],
+                data["shape_world"],
+                data["shape_group"],
+                data["shape_flags"],
+                data["filter_pairs"],
+                data["world_count"],
+            )
+            target_obj._shape_contact_pair_count = int(target_obj._shape_contact_pair_data.counts.sum())  # pyright: ignore[reportPrivateUsage]
+
     if post_load_init_callback is not None:
         post_load_init_callback(target_obj, _path)
 
 
 def deserialize(data, callback, _path="", format_type="json", cache: ArrayCache | None = None):
     """
-    Recursively deserialize a dict back into objects, handling primitives,
+    Recursively deserialize mapping-like data back into objects, handling primitives,
     containers, and custom class instances. Calls callback(obj, path) for every object
     and replaces obj with the callback's return value before continuing.
 
     Args:
         data: The serialized data to deserialize.
-        callback: A function taking two arguments (the data dict and current path) and returning the (possibly transformed) object.
+        callback: A function taking two arguments (the decoded data and current path) and returning the
+            (possibly transformed) object.
         _path: Internal parameter tracking the current path/member name.
         format_type: The serialization format ('json' or 'cbor2').
     """
@@ -693,8 +770,8 @@ def deserialize(data, callback, _path="", format_type="json", cache: ArrayCache 
     if result is not data:
         return result
 
-    # If not a dict with __type__, return as-is
-    if not isinstance(data, dict) or "__type__" not in data:
+    # If not mapping-like with __type__, return as-is
+    if not isinstance(data, Mapping) or "__type__" not in data:
         return data
 
     type_name = data["__type__"]
@@ -707,10 +784,22 @@ def deserialize(data, callback, _path="", format_type="json", cache: ArrayCache 
     if type_name.startswith("numpy."):
         if type_name == "numpy.ndarray":
             return deserialize_ndarray(data, format_type, cache)
-        else:
-            # NumPy scalar types
-            numpy_type = getattr(np, type_name.split(".")[-1])
-            return numpy_type(data["value"])
+
+        scalar_name = type_name.removeprefix("numpy.")
+        numpy_type = getattr(np, scalar_name, None)
+        try:
+            is_number_type = (
+                isinstance(numpy_type, type)
+                and issubclass(numpy_type, np.number)
+                and np.dtype(numpy_type).type is numpy_type
+                and numpy_type.__name__ == scalar_name
+            )
+        except TypeError:
+            is_number_type = False
+        if not is_number_type:
+            raise ValueError(f"Unsupported NumPy scalar type: {type_name}")
+        assert isinstance(numpy_type, type)
+        return numpy_type(data["value"])
 
     # Mappings (like dict)
     if type_name == "dict":
@@ -734,15 +823,47 @@ def deserialize(data, callback, _path="", format_type="json", cache: ArrayCache 
 
     # Custom objects
     if "attributes" in data:
-        # For now, return a simple dict representation
-        # In a full implementation, you might want to reconstruct the actual class
+        if type_name == "AttributeSpec" and data.get("__module__") == Model.AttributeSpec.__module__:
+            attributes = {
+                attr: deserialize(value, callback, f"{_path}.{attr}" if _path else attr, format_type, cache)
+                for attr, value in data["attributes"].items()
+            }
+            for attr in ("frequency", "references"):
+                if isinstance(attributes.get(attr), int):
+                    attributes[attr] = Model.AttributeFrequency(attributes[attr])
+            if isinstance(attributes.get("assignment"), int):
+                attributes["assignment"] = Model.AttributeAssignment(attributes["assignment"])
+            return Model.AttributeSpec(**attributes)
+
+        # Reconstruct AttributeNamespace as a real instance so downstream consumers
+        # (notably ``transfer_to_model``) can identify it without resorting to a
+        # heuristic on serialized field names.
+        if type_name == "AttributeNamespace":
+            attrs_data = data["attributes"]
+            name_data = attrs_data.get("_name")
+            ns_name = (
+                deserialize(name_data, callback, f"{_path}._name" if _path else "_name", format_type, cache)
+                if name_data is not None
+                else ""
+            )
+            ns = Model.AttributeNamespace(ns_name)
+            for attr, value in attrs_data.items():
+                if attr == "_name":
+                    continue
+                setattr(
+                    ns,
+                    attr,
+                    deserialize(value, callback, f"{_path}.{attr}" if _path else attr, format_type, cache),
+                )
+            return ns
+        # Fallback: return a flat dict of decoded attributes for other custom classes.
         return {
             attr: deserialize(value, callback, f"{_path}.{attr}" if _path else attr, format_type, cache)
             for attr, value in data["attributes"].items()
         }
 
     # Unknown type - return the data as-is
-    return data["value"] if isinstance(data, dict) and "value" in data else data
+    return data["value"] if isinstance(data, Mapping) and "value" in data else data
 
 
 def extract_type_path(class_str: str) -> str:
@@ -806,7 +927,11 @@ _NUMPY_TO_WARP_SCALAR = {
 }
 
 
-def _resolve_warp_dtype(dtype_str: str, serialized_data: dict | None = None, np_arr: np.ndarray | None = None):
+def _resolve_warp_dtype(
+    dtype_str: str,
+    serialized_data: Mapping[str, Any] | None = None,
+    np_arr: np.ndarray | None = None,
+):
     """
     Resolve a dtype string to a warp dtype, with backwards compatibility.
 
@@ -815,7 +940,7 @@ def _resolve_warp_dtype(dtype_str: str, serialized_data: dict | None = None, np_
 
     Args:
         dtype_str: The dtype name extracted from serialized data.
-        serialized_data: Optional dict containing dtype metadata (__scalar_type__, __type_length__, __type_shape__).
+        serialized_data: Optional mapping containing dtype metadata (__scalar_type__, __type_length__, __type_shape__).
         np_arr: Optional numpy array to infer shape for generic types (fallback for old recordings).
 
     Returns:
@@ -866,11 +991,11 @@ def _resolve_warp_dtype(dtype_str: str, serialized_data: dict | None = None, np_
         suffix = _NUMPY_DTYPE_TO_SUFFIX.get(np_arr.dtype.type, "f")
         inferred = f"vec{vec_len}{suffix}"
         if hasattr(wp, inferred):
-            print(f"[Recorder] Info: Inferred dtype '{inferred}' from data shape for generic 'vec_t'")
+            logger.info("[Recorder] Inferred dtype '%s' from data shape for generic 'vec_t'", inferred)
             return getattr(wp, inferred)
         # For non-standard vector lengths (e.g., vec5), create dynamically
         scalar_type = _NUMPY_TO_WARP_SCALAR.get(np_arr.dtype.type, wp.float32)
-        print(f"[Recorder] Info: Creating dynamic vector type vec{vec_len} with {scalar_type.__name__}")
+        logger.info("[Recorder] Creating dynamic vector type vec%s with %s", vec_len, scalar_type.__name__)
         return wp.types.vector(vec_len, scalar_type)
 
     if dtype_str == "mat_t" and np_arr is not None and np_arr.ndim >= 2:
@@ -879,11 +1004,11 @@ def _resolve_warp_dtype(dtype_str: str, serialized_data: dict | None = None, np_
         suffix = _NUMPY_DTYPE_TO_SUFFIX.get(np_arr.dtype.type, "f")
         inferred = f"mat{rows}{cols}{suffix}"
         if hasattr(wp, inferred):
-            print(f"[Recorder] Info: Inferred dtype '{inferred}' from data shape for generic 'mat_t'")
+            logger.info("[Recorder] Inferred dtype '%s' from data shape for generic 'mat_t'", inferred)
             return getattr(wp, inferred)
         # For non-standard matrix shapes, create dynamically
         scalar_type = _NUMPY_TO_WARP_SCALAR.get(np_arr.dtype.type, wp.float32)
-        print(f"[Recorder] Info: Creating dynamic matrix type mat{rows}x{cols} with {scalar_type.__name__}")
+        logger.info("[Recorder] Creating dynamic matrix type mat%sx%s with %s", rows, cols, scalar_type.__name__)
         return wp.types.matrix((rows, cols), scalar_type)
 
     # If dtype ends with 'f' or 'd', try without suffix (e.g., vec3f -> vec3)
@@ -896,12 +1021,12 @@ def _resolve_warp_dtype(dtype_str: str, serialized_data: dict | None = None, np_
 
 
 # returns a model and a state history
-def depointer_as_key(data: dict, format_type: str = "json", cache: ArrayCache | None = None):
+def depointer_as_key(data: Mapping[str, Any], format_type: str = "json", cache: ArrayCache | None = None):
     """
     Deserialize Newton simulation data using callback approach.
 
     Args:
-        data: The serialized data containing model and states.
+        data: Mapping-like serialized data containing model and states.
         format_type: The serialization format ('json' or 'cbor2').
 
     Returns:
@@ -910,7 +1035,7 @@ def depointer_as_key(data: dict, format_type: str = "json", cache: ArrayCache | 
 
     def callback(x, path):
         # Optimization: extract type once to avoid repeated isinstance and dict lookups
-        x_type = x.get("__type__") if isinstance(x, dict) else None
+        x_type = x.get("__type__") if isinstance(x, Mapping) else None
 
         if x_type == "warp.array_ref":
             if cache is None:
@@ -935,11 +1060,14 @@ def depointer_as_key(data: dict, format_type: str = "json", cache: ArrayCache | 
                     cache.try_register_pointer_and_value_and_index(key, result, int(cache_index))
                 return result
             except Exception as e:
-                print(f"[Recorder] Warning: Failed to deserialize warp.array at '{path}': {e}")
+                logger.warning("[Recorder] Failed to deserialize warp.array at '%s': %s", path, e)
                 return None
 
         elif x_type == "warp.HashGrid":
             # Return None or create empty HashGrid as appropriate
+            return None
+
+        elif x_type == "warp.Bvh":
             return None
 
         elif x_type == "warp.Mesh":
@@ -967,6 +1095,8 @@ def depointer_as_key(data: dict, format_type: str = "json", cache: ArrayCache | 
                     compute_inertia=False,
                     is_solid=mesh_data["is_solid"],
                     maxhullvert=mesh_data["maxhullvert"],
+                    color=mesh_data.get("color"),
+                    opacity=mesh_data.get("opacity"),
                 )
 
                 # Restore the saved inertia properties
@@ -981,11 +1111,11 @@ def depointer_as_key(data: dict, format_type: str = "json", cache: ArrayCache | 
                 # Optimization: single dict lookup
                 cache_index = x.get("cache_index")
                 if cache is not None and cache_index is not None:
-                    mesh_key = _mesh_key_from_vertices(vertices, fallback_obj=mesh)
+                    mesh_key = _mesh_key_from_object(mesh)
                     cache.try_register_pointer_and_value_and_index(mesh_key, mesh, int(cache_index))
                 return mesh
             except Exception as e:
-                print(f"[Recorder] Warning: Failed to deserialize Mesh at '{path}': {e}")
+                logger.warning("[Recorder] Failed to deserialize Mesh at '%s': %s", path, e)
                 return None
 
         elif x_type == "callable":
@@ -997,7 +1127,7 @@ def depointer_as_key(data: dict, format_type: str = "json", cache: ArrayCache | 
     result = deserialize(data, callback, format_type=format_type, cache=cache)
 
     def _resolve_cache_refs(obj):
-        if isinstance(obj, dict):
+        if isinstance(obj, Mapping):
             # Optimization: single dict lookup instead of checking membership then accessing
             cache_ref = obj.get("__cache_ref__")
             if cache_ref is not None:
@@ -1066,16 +1196,16 @@ class ViewerFile(ViewerBase):
 
         self._frame_count = 0
         self._model_recorded = False
+        self._running = True
 
     @override
-    def set_model(self, model: Model | None, max_worlds: int | None = None):
+    def set_model(self, model: Model | None):
         """Override set_model to record the model when it is set.
 
         Args:
             model: Model to bind to this viewer.
-            max_worlds: Optional cap on rendered worlds.
         """
-        super().set_model(model, max_worlds=max_worlds)
+        super().set_model(model)
 
         if model is not None and not self._model_recorded:
             self.record_model(model)
@@ -1098,13 +1228,22 @@ class ViewerFile(ViewerBase):
         if self.auto_save and self._frame_count % self.save_interval == 0:
             self._save_recording()
 
+    @override
+    def is_running(self) -> bool:
+        """Report whether the file viewer should continue recording.
+
+        Returns:
+            bool: False after :meth:`close` has been called.
+        """
+        return self._running
+
     def save_recording(self, file_path: str | None = None, verbose: bool = False):
         """Save the recorded data to file.
 
         Args:
             file_path: Optional override for the output path. If omitted, uses
                 the ``output_path`` from construction.
-            verbose: If True, print status output on success/failure.
+            verbose: If True, log status output on success/failure.
         """
         effective_path = file_path if file_path is not None else str(self.output_path)
         self._save_recording(effective_path, verbose=verbose)
@@ -1115,10 +1254,10 @@ class ViewerFile(ViewerBase):
             effective_path = file_path if file_path is not None else str(self.output_path)
             self._save_to_file(effective_path)
             if verbose:
-                print(f"Recording saved to {effective_path} ({self._frame_count} frames)")
+                logger.info("Recording saved to %s (%s frames)", effective_path, self._frame_count)
         except Exception as e:
             if verbose:
-                print(f"Error saving recording: {e}")
+                logger.error("Failed to save recording: %s", e)
 
     def record(self, state: State):
         """Record a snapshot of the provided simulation state.
@@ -1140,7 +1279,7 @@ class ViewerFile(ViewerBase):
             frame_id: Frame index to load from history.
         """
         if not (0 <= frame_id < len(self.history)):
-            print(f"Warning: frame_id {frame_id} is out of bounds. Playback skipped.")
+            logger.warning("frame_id %s is out of bounds. Playback skipped.", frame_id)
             return
 
         state_data = self.history[frame_id]
@@ -1163,7 +1302,7 @@ class ViewerFile(ViewerBase):
             model: Destination model object to populate.
         """
         if not self.deserialized_model:
-            print("Warning: No model data to playback.")
+            logger.warning("No model data to playback.")
             return
 
         def post_load_init_callback(target_obj, path):
@@ -1245,6 +1384,8 @@ class ViewerFile(ViewerBase):
         color: tuple[float, float, float] | None = None,
         roughness: float | None = None,
         metallic: float | None = None,
+        dynamic: bool = False,
+        opacity: float | None = None,
     ):
         """File viewer does not render meshes.
 
@@ -1263,6 +1404,8 @@ class ViewerFile(ViewerBase):
                 smooth, ``1`` is fully rough.
             metallic: Metallicity in ``[0, 1]``. ``0`` is dielectric, ``1``
                 is metal.
+            dynamic: Whether mesh topology may change between frames.
+            opacity: Optional display opacity in [0, 1].
         """
         pass
 
@@ -1276,6 +1419,7 @@ class ViewerFile(ViewerBase):
         colors: wp.array[wp.vec3] | None,
         materials: wp.array[wp.vec4] | None,
         hidden: bool = False,
+        opacities: wp.array[wp.float32] | None = None,
     ):
         """File viewer does not render instances.
 
@@ -1287,6 +1431,7 @@ class ViewerFile(ViewerBase):
             colors: Optional per-instance colors.
             materials: Optional per-instance material parameters.
             hidden: Whether the instance batch is hidden.
+            opacities: Optional per-instance opacity values.
         """
         pass
 
@@ -1373,7 +1518,8 @@ class ViewerFile(ViewerBase):
         """Save final recording and cleanup."""
         if self._frame_count > 0:
             self._save_recording()
-        print(f"ViewerFile closed. Total frames recorded: {self._frame_count}")
+        self._running = False
+        logger.info("ViewerFile closed. Total frames recorded: %s", self._frame_count)
 
     def load_recording(self, file_path: str | None = None, verbose: bool = False):
         """Load a previously recorded file for playback.
@@ -1384,13 +1530,13 @@ class ViewerFile(ViewerBase):
         Args:
             file_path: Optional override for the file path. If omitted, uses
                 the ``output_path`` from construction.
-            verbose: If True, print status output after loading.
+            verbose: If True, log status output after loading.
         """
         effective_path = file_path if file_path is not None else str(self.output_path)
         self._load_from_file(effective_path)
         self._frame_count = len(self.history)
         if verbose:
-            print(f"Loaded recording with {self._frame_count} frames from {effective_path}")
+            logger.info("Loaded recording with %s frames from %s", self._frame_count, effective_path)
 
     def get_frame_count(self) -> int:
         """Return the number of frames in the loaded or recorded session.

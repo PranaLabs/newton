@@ -12,6 +12,7 @@ from .builder import PDMatrixBuilder
 from .collision import Collision
 from .kernels import (
     accumulate_dragging_pd_diag_kernel,
+    deactivate_zero_mass_particles_kernel,
     eval_bend_kernel,
     eval_drag_force_kernel,
     eval_stretch_kernel,
@@ -102,6 +103,7 @@ class SolverStyle3D(SolverBase):
     def __init__(
         self,
         model: Model,
+        *,
         iterations: int = 10,
         linear_iterations: int = 10,
         drag_spring_stiff: float = 1e2,
@@ -123,6 +125,16 @@ class SolverStyle3D(SolverBase):
                 "Call SolverStyle3D.register_custom_attributes() before building the model."
             )
         self.style3d = model.style3d
+        # Keep solver-specific activity constraints out of the shared model.
+        self._particle_flags = wp.clone(model.particle_flags)
+        if model.particle_count > 0:
+            wp.launch(
+                deactivate_zero_mass_particles_kernel,
+                dim=model.particle_count,
+                inputs=[model.particle_mass],
+                outputs=[self._particle_flags],
+                device=self.device,
+            )
         self.collision: Collision | None = Collision(model)  # set None to disable
         self.linear_iterations = linear_iterations
         self.nonlinear_iterations = iterations
@@ -152,7 +164,16 @@ class SolverStyle3D(SolverBase):
         self.drag_bary_coord = wp.zeros(1, dtype=wp.vec3, device=self.device)
 
     @override
-    def step(self, state_in: State, state_out: State, control: Control, contacts: Contacts, dt: float) -> None:
+    def step(
+        self,
+        state_in: State,
+        state_out: State,
+        control: Control,
+        contacts: Contacts,
+        dt: float,
+        *,
+        observables: SolverBase.Observables | None = None,
+    ) -> None:
         """Advance the Style3D solver by one time step.
 
         The solver performs non-linear projective dynamics iterations with
@@ -166,7 +187,22 @@ class SolverStyle3D(SolverBase):
             control: :class:`newton.Control` input (currently unused).
             contacts: :class:`newton.Contacts` used for collision response.
             dt: Time step in seconds.
+            observables: Optional solver observable arrays allocated by :meth:`observables`.
+                This solver declares no supported observables, so only an empty
+                container is accepted.
         """
+        self.validate_observables(observables, contacts)
+        # Model masses and flags may change between solver steps.
+        wp.copy(self._particle_flags, self.model.particle_flags)
+        if self.model.particle_count > 0:
+            wp.launch(
+                deactivate_zero_mass_particles_kernel,
+                dim=self.model.particle_count,
+                inputs=[self.model.particle_mass],
+                outputs=[self._particle_flags],
+                device=self.device,
+            )
+
         if self.collision is not None:
             self.collision.frame_begin(state_in.particle_q, state_in.particle_qd, dt)
 
@@ -183,7 +219,7 @@ class SolverStyle3D(SolverBase):
                 self.x_prev,
                 self.pd_diags,
                 self.model.particle_mass,
-                self.model.particle_flags,
+                self._particle_flags,
             ],
             outputs=[
                 self.x_inertia,
@@ -202,7 +238,7 @@ class SolverStyle3D(SolverBase):
                     self.drag_index,
                     self.drag_bary_coord,
                     self.model.tri_indices,
-                    self.model.particle_flags,
+                    self._particle_flags,
                 ],
                 outputs=[self.static_A_diags],
                 device=self.device,
@@ -283,7 +319,7 @@ class SolverStyle3D(SolverBase):
                     inputs=[
                         self.static_A_diags,
                         self.collision.contact_hessian_diagonal(),
-                        self.model.particle_flags,
+                        self._particle_flags,
                     ],
                     outputs=[self.inv_A_diags],
                     device=self.device,

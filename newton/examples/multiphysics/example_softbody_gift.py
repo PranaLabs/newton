@@ -79,23 +79,30 @@ def cloth_loop_around_box(
     )
 
 
+# 2x2x1 grid of unit cubes, each split into 5 tets. Adjacent cubes use
+# mirrored decompositions (checkerboard) so shared-face diagonals match
+# and the surface mesh stays manifold.
 PYRAMID_TET_INDICES = np.array(
     [
+        # cube (0,0,0): variant A
         [0, 1, 3, 9],
         [1, 4, 3, 13],
         [1, 3, 9, 13],
         [3, 9, 13, 12],
         [1, 9, 10, 13],
-        [1, 2, 4, 10],
-        [2, 5, 4, 14],
-        [2, 4, 10, 14],
-        [4, 10, 14, 13],
-        [2, 10, 11, 14],
-        [3, 4, 6, 12],
-        [4, 7, 6, 16],
-        [4, 6, 12, 16],
-        [6, 12, 16, 15],
-        [4, 12, 13, 16],
+        # cube (1,0,0): variant B
+        [1, 11, 5, 13],
+        [2, 5, 1, 11],
+        [4, 1, 5, 13],
+        [10, 11, 1, 13],
+        [14, 5, 11, 13],
+        # cube (0,1,0): variant B
+        [3, 13, 7, 15],
+        [4, 7, 3, 13],
+        [6, 3, 7, 15],
+        [12, 13, 3, 15],
+        [16, 7, 13, 15],
+        # cube (1,1,0): variant A
         [4, 5, 7, 13],
         [5, 8, 7, 17],
         [5, 7, 13, 17],
@@ -164,7 +171,7 @@ class Example:
                 density=100,
                 k_mu=1.0e5,
                 k_lambda=1.0e5,
-                k_damp=1e-5,
+                k_damp=1e0,
             )
 
         # Add first cloth strap
@@ -178,9 +185,9 @@ class Example:
             density=0.02,
             tri_ke=1e5,
             tri_ka=1e5,
-            tri_kd=1e-5,
+            tri_kd=1e0,
             edge_ke=0.01,
-            edge_kd=1e-2,
+            edge_kd=1e-4,
         )
 
         # Add second cloth strap (rotated 90 degrees)
@@ -194,9 +201,9 @@ class Example:
             density=0.02,
             tri_ke=1e5,
             tri_ka=1e5,
-            tri_kd=1e-5,
+            tri_kd=1e0,
             edge_ke=0.01,
-            edge_kd=1e-2,
+            edge_kd=1e-4,
         )
 
         # Color the mesh for VBD solver
@@ -206,15 +213,15 @@ class Example:
 
         # Contact parameters
         self.model.soft_contact_ke = 5.0e4
-        self.model.soft_contact_kd = 1e-5
+        self.model.soft_contact_kd = 5.0e-1
         self.model.soft_contact_mu = 1.0
 
         self.solver = newton.solvers.SolverVBD(
             model=self.model,
             iterations=self.iterations,
             particle_enable_self_contact=True,
-            particle_self_contact_radius=0.04,
-            particle_self_contact_margin=0.06,
+            particle_self_contact_margin=0.04,
+            particle_self_contact_gap=0.02,
             particle_topological_contact_filter_threshold=1,
             particle_enable_tile_solve=False,
         )
@@ -223,7 +230,8 @@ class Example:
         self.state_1 = self.model.state()
         self.control = self.model.control()
 
-        self.contacts = self.model.contacts()
+        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.contacts = self.collision_pipeline.contacts()
 
         self.viewer.set_model(self.model)
 
@@ -235,12 +243,9 @@ class Example:
         self.capture()
 
     def capture(self):
-        if wp.get_device().is_cuda:
-            with wp.ScopedCapture() as capture:
-                self.simulate()
-            self.graph = capture.graph
-        else:
-            self.graph = None
+        with wp.ScopedCapture() as capture:
+            self.simulate()
+        self.graph = capture.graph
 
     def simulate(self):
         for _ in range(self.sim_substeps):
@@ -249,7 +254,7 @@ class Example:
             # apply forces to the model
             self.viewer.apply_forces(self.state_0)
 
-            self.model.collide(self.state_0, self.contacts)
+            self.collision_pipeline.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
 
             # swap states

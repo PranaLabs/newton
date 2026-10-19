@@ -15,9 +15,23 @@ ci:
 # See https://pre-commit.com for more information
 # See https://pre-commit.com/hooks.html for more hooks
 repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      - id: check-case-conflict
+      - id: check-illegal-windows-names
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: check-toml
+      - id: check-yaml
+      - id: debug-statements
+      - id: detect-private-key
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
-    rev: v0.15.9
+    rev: v0.16.10
     hooks:
       # Run the linter.
       - id: ruff
@@ -26,12 +40,12 @@ repos:
       - id: ruff-format
   - repo: https://github.com/astral-sh/uv-pre-commit
     # uv version.
-    rev: 0.11.4
+    rev: 0.12.23
     hooks:
       # Update the uv lockfile
       - id: uv-lock
   - repo: https://github.com/crate-ci/typos
-    rev: v1.45.0
+    rev: v1.51.1
     hooks:
       - id: typos
         args: []
@@ -44,3 +58,10 @@ repos:
         language: python
         types: [python]
         exclude: ^(scripts/check_warp_array_syntax\.py)
+      - id: no-patch-dict-sys-modules
+        name: use patch_sys_module instead of patch.dict(sys.modules)
+        # patch.dict also drops modules first imported inside it (e.g. Warp internals).
+        language: pygrep
+        entry: patch\.dict\s*\((?:\s*|[^()]*\bin_dict\s*=\s*)["']?sys\.modules\b
+        args: [--multiline]
+        files: ^newton/tests/.*\.py$

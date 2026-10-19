@@ -3,18 +3,29 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import warp as wp
+
+from ..utils.deprecation import RemovedAttribute
+
+if TYPE_CHECKING:
+    from .model import Model
 
 
 class Control:
     """Time-varying control data for a :class:`Model`.
 
-    Time-varying control data includes joint torques, control inputs, muscle activations,
-    and activation forces for triangle and tetrahedral elements.
+    Carries joint torques, control inputs, muscle activations, and tri/tet
+    activation forces. Create via :func:`newton.Model.control()`.
 
-    The exact attributes depend on the contents of the model. Control objects
-    should generally be created using the :func:`newton.Model.control()` function.
+    Position and velocity targets live on :attr:`joint_target_q` and
+    :attr:`joint_target_qd`, matching the coordinate layout of
+    :attr:`State.joint_q` and DOF layout of :attr:`State.joint_qd`, respectively.
     """
+
+    joint_target_pos = RemovedAttribute("joint_target_q", removed_in="1.5")
+    joint_target_vel = RemovedAttribute("joint_target_qd", removed_in="1.5")
 
     def __init__(self):
         self.joint_f: wp.array | None = None
@@ -22,18 +33,23 @@ class Control:
         Array of generalized joint forces [N or N·m, depending on joint type] with shape ``(joint_dof_count,)``
         and type ``float``.
 
-        The degrees of freedom for FREE and DISTANCE joints are included in this array and have the same
+        The degrees of freedom for FREE, DISTANCE, and ROD joints are included in this array and have the same
         convention as the :attr:`newton.State.body_f` array where the 6D wrench is defined as
         ``(f_x, f_y, f_z, t_x, t_y, t_z)``, where ``f_x``, ``f_y``, and ``f_z`` are the components
         of the force vector (linear) [N] and ``t_x``, ``t_y``, and ``t_z`` are the
-        components of the torque vector (angular) [N·m]. For FREE and DISTANCE joints, the wrench is applied in world
+        components of the torque vector (angular) [N·m]. For FREE, DISTANCE, and ROD joints, the wrench is applied in world
         frame with the child body's center of mass (COM) as reference point.
         """
-        self.joint_target_pos: wp.array | None = None
-        """Per-DOF position targets [m or rad, depending on joint type], shape ``(joint_dof_count,)``, type ``float`` (optional)."""
+        self.joint_target_q: wp.array | None = None
+        """Joint position targets [m or rad, with unit quaternions for rotations
+        of ball and free joints], shape ``(joint_coord_count,)``.
+        Matches :attr:`State.joint_q`; index via :attr:`Model.joint_target_q_start`.
+        """
 
-        self.joint_target_vel: wp.array | None = None
-        """Per-DOF velocity targets [m/s or rad/s, depending on joint type], shape ``(joint_dof_count,)``, type ``float`` (optional)."""
+        self.joint_target_qd: wp.array | None = None
+        """Joint velocity targets [m/s or rad/s], shape ``(joint_dof_count,)``.
+        Matches :attr:`~newton.State.joint_qd`.
+        """
 
         self.joint_act: wp.array | None = None
         """Per-DOF feedforward actuation input, shape ``(joint_dof_count,)``, type ``float`` (optional).
@@ -56,8 +72,19 @@ class Control:
             Support for muscle dynamics is not yet implemented.
         """
 
-    def clear(self) -> None:
-        """Reset the control inputs to zero."""
+    def clear(self, model: Model | None = None) -> None:
+        """Reset all control inputs to zero.
+
+        ``joint_target_q`` is special: zeroing it corrupts
+        FREE/BALL/DISTANCE quaternion slots (``(0,0,0,0)`` is not a valid
+        rotation). Pass ``model`` to restore it from ``model.joint_target_q``
+        instead. Without ``model`` it falls back to the legacy zero-fill.
+
+        Args:
+            model: Optional source :class:`Model` whose ``joint_target_q``
+                seeds this Control. Required for models with FREE/BALL/DISTANCE
+                joints.
+        """
 
         if self.joint_f is not None:
             self.joint_f.zero_()
@@ -67,10 +94,13 @@ class Control:
             self.tet_activations.zero_()
         if self.muscle_activations is not None:
             self.muscle_activations.zero_()
-        if self.joint_target_pos is not None:
-            self.joint_target_pos.zero_()
-        if self.joint_target_vel is not None:
-            self.joint_target_vel.zero_()
+        if self.joint_target_q is not None:
+            if model is not None and model.joint_target_q is not None:
+                wp.copy(self.joint_target_q, model.joint_target_q)
+            else:
+                self.joint_target_q.zero_()
+        if self.joint_target_qd is not None:
+            self.joint_target_qd.zero_()
         if self.joint_act is not None:
             self.joint_act.zero_()
         self._clear_namespaced_arrays()
