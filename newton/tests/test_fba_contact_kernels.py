@@ -28,7 +28,6 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.geometry.types import GeoType
 from newton._src.solvers.fba import SolverFBA
 from newton._src.solvers.fba import kernels as K
 from newton.tests.fba._reference import compute_tangent_basis, quat_rotate_z_axis, transform_point

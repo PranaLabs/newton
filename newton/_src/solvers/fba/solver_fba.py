@@ -197,11 +197,11 @@ class SolverFBA(SolverBase):
                 Each listed shape rotates about its local +Z axis (Newton's
                 cylinder primitive axis) at the given angular speed.  Surfaces
                 with nonzero ω contribute a tangential anchor velocity
-                ``v_anchor = −ω · axis_world × (world_anchor − shape_center)``
+                ``v_anchor = -ω · cross(axis_world, world_anchor - shape_center)``
                 into the Stage B friction residual; the shape geometry itself
                 stays static.  Sign matches RealSim CudaTests'
                 ``cylindercollisions[i].rollingvel`` (tangent direction
-                ``normal × axis``).  Defaults to no kinematic motion.
+                ``cross(normal, axis)``).  Defaults to no kinematic motion.
             nh_solver: Local-projection inner solver for the Neo-Hookean
                 stretching model.  ``"lbfgs"`` (default) uses an LBFGS+Armijo
                 cubic-backtracking line search ported from RealSim
@@ -1404,7 +1404,7 @@ class SolverFBA(SolverBase):
                         if use_lite_block_diag:
                             # LiteNSN block-diagonal-by-particle path: no dense
                             # W is materialized — the fused per-contact kernel
-                            # below builds each ``3×3`` local W on-the-fly.
+                            # below builds each ``3x3`` local W on-the-fly.
                             # Only the row-metadata CSR is needed so the
                             # ``apply_lambda_correction_combined`` gather can run.
                             ls.setup_lite_row_meta(
@@ -1465,7 +1465,7 @@ class SolverFBA(SolverBase):
                         # (i.e. >1 contact in Stage B, since each contact owns
                         # 3 rows).  Otherwise stick with the per-contact
                         # kernel: it's the k_p==1 specialisation and avoids
-                        # the per-particle kernel's 12×12 register footprint
+                        # the per-particle kernel's 12x12 register footprint
                         # for what is the only common case in cloth-on-rigid.
                         use_per_particle = n_b or (
                             getattr(ls, "_isodof_max_k", 1) > 3 and getattr(ls, "_isodof_unique_d", None) is not None
@@ -2613,7 +2613,6 @@ class SolverFBA(SolverBase):
         n_rows = 3 * int(M_total) + int(n_bilateral)
         device = self._device
         dt_w = wp.float64(dt)
-        dt2 = float(dt) * float(dt)
 
         ls = self._linear_solver
 

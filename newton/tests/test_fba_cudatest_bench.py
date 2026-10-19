@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import unittest
 
+import numpy as np
+
 from scripts.fba_cudatest_bench.perf import stats_from_times_ms
+from scripts.fba_cudatest_bench.pin import select_in_aabb
 
 
 class PerfStatsTests(unittest.TestCase):
@@ -22,10 +25,6 @@ class PerfStatsTests(unittest.TestCase):
 
 class PinSelectorTests(unittest.TestCase):
     def test_aabb_selects_inside_only(self) -> None:
-        import numpy as np
-
-        from scripts.fba_cudatest_bench.pin import select_in_aabb
-
         verts = np.array(
             [
                 [0.0, 0.0, 0.0],

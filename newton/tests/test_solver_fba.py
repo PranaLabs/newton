@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import math
 import unittest
 from pathlib import Path
 
@@ -8,14 +9,21 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton import CollisionPipeline
 from newton._src.solvers.fba import SolverFBA
 from newton._src.solvers.fba.linear_solver import (
     FBALinearSolver,
+    build_particle_element_csr,
     build_pd_system,
     build_rigid_system,
     factorize_and_sparse_inverse,
 )
-from newton.tests.fba._reference import solve_nsn_coulomb, solve_nsn_unilateral
+from newton.tests.fba._reference import (
+    fb_frictional_row,
+    fb_unilateral_row,
+    solve_nsn_coulomb,
+    solve_nsn_unilateral,
+)
 
 
 class TestSolverFBAImport(unittest.TestCase):
@@ -4316,10 +4324,6 @@ class SolverFBAKinematicCylinderTests(unittest.TestCase):
 
     def _ball_and_cylinder(self):
         """Tiny tet ball + 1 cylinder (axis +X world). Returns (model, pipeline, contacts)."""
-        import math
-
-        import newton
-
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, -10.0, 0.0))
         builder.add_soft_grid(
             pos=wp.vec3(0.0, 0.5, 0.0),
@@ -4354,15 +4358,11 @@ class SolverFBAKinematicCylinderTests(unittest.TestCase):
         return model, pipeline, contacts
 
     def test_default_no_kinematic_motion(self) -> None:
-        from newton.solvers import SolverFBA
-
         model, _, _ = self._ball_and_cylinder()
         solver = SolverFBA(model, friction=True)
         self.assertTrue(np.all(solver._shape_omega_h == 0.0))
 
     def test_kinematic_motion_stored_per_shape(self) -> None:
-        from newton.solvers import SolverFBA
-
         model, _, _ = self._ball_and_cylinder()
         solver = SolverFBA(
             model,
@@ -4373,8 +4373,6 @@ class SolverFBAKinematicCylinderTests(unittest.TestCase):
 
     def test_kinematic_anchor_velocity_shifts_offsets(self) -> None:
         """ω ≠ 0 produces nonzero v_anchor; ω = 0 leaves it zero."""
-        from newton.solvers import SolverFBA
-
         model, pipeline, contacts = self._ball_and_cylinder()
         s_in = model.state()
         s_out = model.state()
@@ -4418,13 +4416,11 @@ class SolverFBAKinematicCylinderTests(unittest.TestCase):
         )
 
     def test_cylinder_aligned_basis_for_spinning_shape(self) -> None:
-        """For shapes with ω≠0, tangent basis is (normal × axis, normalize(normal × t1)).
+        """For shapes with ω≠0, tangent basis is (cross(normal, axis), normalize(cross(normal, t1))).
 
         Verifies (i) v_anchor lies almost entirely along t1, (ii) projection onto
         t2 ≈ 0 (the axial direction carries no anchor shift, matching RealSim).
         """
-        from newton.solvers import SolverFBA
-
         model, pipeline, contacts = self._ball_and_cylinder()
         s_in = model.state()
         s_out = model.state()
@@ -4465,10 +4461,6 @@ class ParticleElementCsrTests(unittest.TestCase):
     """Adjacency CSR builder produces correct (offsets, element_idx, local_vertex_idx)."""
 
     def test_basic_tet_adjacency(self) -> None:
-        import numpy as np
-
-        from newton._src.solvers.fba.linear_solver import build_particle_element_csr
-
         # 2 tets sharing vertices 1, 2, 3.
         tets = np.array([[0, 1, 2, 3], [1, 2, 3, 4]], dtype=np.int32)
         offsets, elem_idx, local_v = build_particle_element_csr(tets, n_particles=5, n_verts_per_element=4)
@@ -4476,26 +4468,18 @@ class ParticleElementCsrTests(unittest.TestCase):
         self.assertEqual(offsets.tolist(), [0, 1, 3, 5, 7, 8])
         # Vertex 1's entries: (tet=0, local=1) and (tet=1, local=0).
         v1_slice = slice(offsets[1], offsets[2])
-        elem_v1 = sorted(zip(elem_idx[v1_slice].tolist(), local_v[v1_slice].tolist()))
+        elem_v1 = sorted(zip(elem_idx[v1_slice].tolist(), local_v[v1_slice].tolist(), strict=True))
         self.assertEqual(elem_v1, [(0, 1), (1, 0)])
 
     def test_tri_adjacency(self) -> None:
-        import numpy as np
-
-        from newton._src.solvers.fba.linear_solver import build_particle_element_csr
-
         tris = np.array([[0, 1, 2], [1, 2, 3]], dtype=np.int32)
         offsets, elem_idx, local_v = build_particle_element_csr(tris, n_particles=4, n_verts_per_element=3)
         self.assertEqual(offsets.tolist(), [0, 1, 3, 5, 6])
         v1_slice = slice(offsets[1], offsets[2])
-        elem_v1 = sorted(zip(elem_idx[v1_slice].tolist(), local_v[v1_slice].tolist()))
+        elem_v1 = sorted(zip(elem_idx[v1_slice].tolist(), local_v[v1_slice].tolist(), strict=True))
         self.assertEqual(elem_v1, [(0, 1), (1, 0)])
 
     def test_empty_adjacency(self) -> None:
-        import numpy as np
-
-        from newton._src.solvers.fba.linear_solver import build_particle_element_csr
-
         empty = np.zeros((0, 4), dtype=np.int32)
         offsets, elem_idx, local_v = build_particle_element_csr(empty, n_particles=3, n_verts_per_element=4)
         self.assertEqual(offsets.tolist(), [0, 0, 0, 0])
@@ -4507,9 +4491,6 @@ class SolverFBATetArapDeterminismTests(unittest.TestCase):
     """Refactored tet ARAP scatter is bit-deterministic across reruns."""
 
     def _run_once(self) -> np.ndarray:
-        import newton
-        from newton.solvers import SolverFBA
-
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, -10.0, 0.0))
         builder.add_soft_grid(
             pos=wp.vec3(0.0, 1.0, 0.0),
@@ -4546,9 +4527,6 @@ class SolverFBATetCorotDeterminismTests(unittest.TestCase):
     """Refactored tet Corot scatter is bit-deterministic across reruns."""
 
     def _run_once(self) -> np.ndarray:
-        import newton
-        from newton.solvers import SolverFBA
-
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, -10.0, 0.0))
         builder.add_soft_grid(
             pos=wp.vec3(0.0, 1.0, 0.0),
@@ -4590,9 +4568,6 @@ class SolverFBATetNHDeterminismTests(unittest.TestCase):
     """Refactored tet NH scatter is bit-deterministic across reruns."""
 
     def _run_once(self) -> np.ndarray:
-        import newton
-        from newton.solvers import SolverFBA
-
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, -10.0, 0.0))
         builder.add_soft_grid(
             pos=wp.vec3(0.0, 1.0, 0.0),
@@ -4634,9 +4609,6 @@ class SolverFBATriDeterminismTests(unittest.TestCase):
     """Refactored tri stretching scatters are bit-deterministic across reruns."""
 
     def _run_once(self, stretching_model: str, mu_val: float = 0.0, lam_val: float = 0.0) -> np.ndarray:
-        import newton
-        from newton.solvers import SolverFBA
-
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
         builder.add_cloth_grid(
             pos=wp.vec3(-0.2, -0.2, 0.5),
@@ -4681,9 +4653,6 @@ class SolverFBABendingDeterminismTests(unittest.TestCase):
     """Refactored bending scatter is bit-deterministic across reruns."""
 
     def _run_once(self) -> np.ndarray:
-        import newton
-        from newton.solvers import SolverFBA
-
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
         # Cloth with bending edges enabled.
         builder.add_cloth_grid(
@@ -4721,10 +4690,6 @@ class SolverFBAIsodofJtLambdaDeterminismTests(unittest.TestCase):
     """Refactored isodof J^T·lambda scatter is bit-deterministic across reruns."""
 
     def _run_once(self) -> np.ndarray:
-        import newton
-        from newton import CollisionPipeline
-        from newton.solvers import SolverFBA
-
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
         builder.add_ground_plane()
         # Cloth that develops Stage B friction contacts on the plane.
@@ -4773,8 +4738,6 @@ class FBNonsmoothFunctionTests(unittest.TestCase):
     """FB unilateral and frictional row helpers — return (omega, compliance, h)."""
 
     def test_unilateral_signature(self) -> None:
-        from newton.tests.fba._reference import fb_unilateral_row
-
         omega, compliance, h = fb_unilateral_row(penetration=0.0, lam=0.0, precond=1.0, dt=0.01, pene0=0.0)
         self.assertTrue(np.isfinite(omega))
         self.assertTrue(np.isfinite(compliance))
@@ -4782,24 +4745,18 @@ class FBNonsmoothFunctionTests(unittest.TestCase):
 
     def test_unilateral_open(self) -> None:
         """Open contact (penetration > 0) with lam = 0 → omega = 0."""
-        from newton.tests.fba._reference import fb_unilateral_row
-
         omega, _, _ = fb_unilateral_row(penetration=0.1, lam=0.0, precond=1.0, dt=0.01, pene0=0.0)
         # ω = 1 - pene/root = 1 - 0.1/0.1 = 0.
         self.assertAlmostEqual(omega, 0.0, places=5)
 
     def test_unilateral_penetration(self) -> None:
         """Penetrating contact (penetration < 0) → omega > 1."""
-        from newton.tests.fba._reference import fb_unilateral_row
-
         omega, _, _ = fb_unilateral_row(penetration=-0.1, lam=0.0, precond=1.0, dt=0.01, pene0=0.0)
         # ω = 1 - (-0.1)/0.1 = 2.
         self.assertAlmostEqual(omega, 2.0, places=3)
 
     def test_frictional_inactive(self) -> None:
         """λ_n ≤ 0 → omega = 0, compliance = 1/dt, h = -dt·λ_t."""
-        from newton.tests.fba._reference import fb_frictional_row
-
         omega, compliance, h = fb_frictional_row(
             penetration=0.05,
             lam_t=10.0,
@@ -4815,8 +4772,6 @@ class FBNonsmoothFunctionTests(unittest.TestCase):
 
     def test_frictional_active_stick(self) -> None:
         """Active contact + cone slack > 0 → omega = 1, compliance small."""
-        from newton.tests.fba._reference import fb_frictional_row
-
         omega, compliance, _ = fb_frictional_row(
             penetration=1e-6,
             lam_t=10.0,
@@ -4831,8 +4786,6 @@ class FBNonsmoothFunctionTests(unittest.TestCase):
 
     def test_frictional_active_slip(self) -> None:
         """Active contact + on cone → omega = 1, compliance large."""
-        from newton.tests.fba._reference import fb_frictional_row
-
         omega, compliance, _ = fb_frictional_row(
             penetration=0.1,
             lam_t=50.0,

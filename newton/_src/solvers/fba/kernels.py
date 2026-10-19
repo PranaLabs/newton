@@ -4219,14 +4219,14 @@ def fb_newton_lite_coulomb_kernel(
     distinct particles decouple completely.  For cloth-on-sphere (and all
     cloth-on-rigid scenes where each cloth particle touches at most one rigid
     obstacle), every particle is touched by exactly one contact, so the
-    ``3M × 3M`` Schur system block-diagonalises into ``M`` independent ``3×3``
+    ``3M x 3M`` Schur system block-diagonalises into ``M`` independent ``3x3``
     blocks.  Each thread of this kernel processes one contact end-to-end:
 
-    1. Build the local ``3×3`` ``W`` block from ``α``, ``dir``, and ``dt² · inv_m``.
+    1. Build the local ``3x3`` ``W`` block from ``alpha``, ``dir``, and ``dt² · inv_m``.
     2. Compute the local penetration ``-r + dt² · W · (ω·λ)``.
     3. Evaluate the FB rows (normal + 2 tangents) to refresh ``(ω, c, h)``.
     4. Build ``A_schur = ωωᵀ ⊙ W + diag(c)`` and ``rhs = (1/dt²)·(h - ω · J_x)``.
-    5. Invert the ``3×3`` ``A_schur`` and apply ``dλ``.
+    5. Invert the ``3x3`` ``A_schur`` and apply ``dλ``.
     6. Coulomb clamp + optional symmetric ``lambda_cap``.
     7. Write ``lam_apply = dt² · ω · λ`` for the host-side correction step.
 
@@ -4268,7 +4268,7 @@ def fb_newton_lite_coulomb_kernel(
     t2_d = contact_tangent2[c]
 
     # Local W_3x3 = α² · dot(dir_a, dir_b) · dt² · inv_m.
-    # ``α`` is the same for all three rows of a contact (set by the host build).
+    # ``alpha`` is the same for all three rows of a contact (set by the host build).
     a_n = wp.float64(contact_alpha[c])
     coef = a_n * a_n * dt2 * inv_m
     W_nn = coef * wp.float64(wp.dot(n_d, n_d))
@@ -4309,7 +4309,7 @@ def fb_newton_lite_coulomb_kernel(
     mu_c = contact_mu[c]
 
     for _it in range(n_fb_iters):
-        # penetration = -r + dt² · W · (ω · λ).  Pure 3×3 matvec.
+        # penetration = -r + dt² · W · (ω · λ).  Pure 3x3 matvec.
         ol_n = om_n * lam_n
         ol_t1 = om_t1 * lam_t1
         ol_t2 = om_t2 * lam_t2
@@ -4353,7 +4353,7 @@ def fb_newton_lite_coulomb_kernel(
         rhs_t1 = inv_dt2 * (h_t1 - om_t1 * Jx_t1)
         rhs_t2 = inv_dt2 * (h_t2 - om_t2 * Jx_t2)
 
-        # 3×3 symmetric solve via cofactor expansion (no Cholesky needed at
+        # 3x3 symmetric solve via cofactor expansion (no Cholesky needed at
         # this size; the matrix is SPD by construction modulo the ωωᵀ Hadamard
         # which preserves SPD when c > 0 and W is SPD).
         # Determinant of A (symmetric).
@@ -4366,7 +4366,7 @@ def fb_newton_lite_coulomb_kernel(
             continue
 
         inv_det = wp.float64(1.0) / det
-        # Inverse of symmetric 3×3 via cofactor matrix.
+        # Inverse of symmetric 3x3 via cofactor matrix.
         i00 = (A11 * A22 - A12 * A12) * inv_det
         i01 = -(A01 * A22 - A02 * A12) * inv_det
         i02 = (A01 * A12 - A02 * A11) * inv_det
@@ -4412,7 +4412,7 @@ def fb_newton_lite_coulomb_kernel(
 
 # ----- BSR + sparse-PCR helpers for LiteNSN with self-contact (Phase 3) -----
 
-# Module-level type alias for the 1×1 fp64 BSR block — warp can only resolve
+# Module-level type alias for the 1x1 fp64 BSR block — warp can only resolve
 # matrix types when they're statically named at module scope.
 _BSR_BLOCK_1X1_F64 = wp.types.matrix((1, 1), wp.float64)
 
@@ -4427,7 +4427,7 @@ def precond_from_bsr_diag_coulomb_kernel(
     directly from a BSR diagonal.  Companion to the dense
     :func:`compute_precond_coulomb_kernel`.
 
-    ``warp.sparse.bsr_mm`` collapses a (1×1) block_type product into a
+    ``warp.sparse.bsr_mm`` collapses a (1x1) block_type product into a
     scalar fp64 BsrMatrix, so ``bsr_get_diag`` returns an
     ``array[wp.float64]`` rather than ``array[mat1x1]``.
     """
@@ -4463,13 +4463,13 @@ def compute_penetration_sparse_kernel(
 def build_a_schur_lite_bsr_kernel(
     w_offsets: wp.array[wp.int32],
     w_columns: wp.array[wp.int32],
-    w_values: wp.array[wp.float64],  # collapsed scalar values for 1×1 BSR
+    w_values: wp.array[wp.float64],  # collapsed scalar values for 1x1 BSR
     omega: wp.array[wp.float64],
     compliance: wp.array[wp.float64],
     a_values: wp.array[wp.float64],  # output, same shape as w_values
 ):
     """Build A_schur = ωωᵀ ⊙ W + diag(c) in BSR with W's sparsity (scalar
-    values since ``warp.sparse`` collapses 1×1 block BSR to scalar storage).
+    values since ``warp.sparse`` collapses 1x1 block BSR to scalar storage).
     """
     i = wp.tid()
     start = w_offsets[i]
@@ -4544,7 +4544,7 @@ def compute_omega_times_lam_kernel(
 #
 # Generalises ``fb_newton_lite_coulomb_kernel`` to handle ``k_p ∈ {1..4}``
 # contacts per particle.  Each thread processes one *unique-contacted* particle
-# end-to-end; the local 3·k_p × 3·k_p Schur block is constructed in registers
+# end-to-end; the local 3·k_p x 3·k_p Schur block is constructed in registers
 # (fp64 ``mat12``) and solved via in-place Cholesky.  Sparsity stays
 # block-diagonal-by-particle — no BSR matrix, no SpGEMM.
 #
@@ -4595,7 +4595,7 @@ def fb_newton_lite_coulomb_per_particle_kernel(
     block-diagonal-by-particle, so this thread is fully independent.
 
     Local state lives in registers / L1 (warp ``mat12``).  Cholesky on a
-    ``3·k_p × 3·k_p`` PSD matrix runs in-place over the same buffer.
+    ``3·k_p x 3·k_p`` PSD matrix runs in-place over the same buffer.
 
     Rows from ``n_contact_rows`` on are bilateral rows on one particle each, with
     the identity law of :func:`bilateral_law_kernel`. A particle whose bilateral
@@ -4618,14 +4618,8 @@ def fb_newton_lite_coulomb_per_particle_kernel(
             lam_apply[ra] = dt2 * omega[ra] * lam[ra]
         return
 
-    # Load up to 12 row indices and their per-row data into local arrays.
-    row_idx = _VEC12_F64(wp.float64(0.0))  # store as float for warp matrix-compat indexing
-    # Actually we want int row indices — use 12 separate locals (warp doesn't
-    # have small int vectors).  Materialise as a stack of fixed-size scalars.
-    # We can fall back to loading from the CSR each time we need the row index.
-
-    # Build local W (3k×3k) directly from (alpha, dir) triples.
-    # W[a, b] = α_a · α_b · dot(dir_a, dir_b) · dt² · inv_m
+    # Build local W (3kx3k) directly from (alpha, dir) triples.
+    # W[a, b] = alpha_a · alpha_b · dot(dir_a, dir_b) · dt² · inv_m
     W = _MAT12_F64(wp.float64(0.0))
     for ai in range(k_total):
         ra = isodof_row_indices[row_start + ai]

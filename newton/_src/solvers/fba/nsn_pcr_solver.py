@@ -140,7 +140,7 @@ def _precond_from_bsr_diag_kernel(
 ):
     """Build ``precond[i] = 1/diag[i]`` for the LiteNSN sparse Schur.
 
-    ``warp.sparse`` collapses 1×1-block BSR storage to scalar fp64 values
+    ``warp.sparse`` collapses 1x1-block BSR storage to scalar fp64 values
     automatically (verified empirically on Warp 1.14), so
     :func:`warp.sparse.bsr_get_diag` returns an ``array[wp.float64]``
     rather than ``array[mat1x1]``.  The zero-guard mirrors the dense
@@ -578,7 +578,7 @@ class NSNPCRSolver:
         x_out: wp.array[wp.float64],
     ) -> int:
         """LiteNSN sparse-Schur PCR: ``W_bsr @ x = b`` for a BSR ``W`` with
-        ``1×1`` blocks.
+        ``1x1`` blocks.
 
         Matches :meth:`solve` numerically — same termination criterion, same
         Jacobi preconditioner, same ``check_every`` host-sync cadence — but

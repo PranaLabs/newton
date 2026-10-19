@@ -1479,7 +1479,7 @@ class FBALinearSolver:
         """Cache the LiteNSN mass matrix ``M_inv_dt2 = diag(dt² · inv_mass) ⊗ I₃``.
 
         Builds (or rebuilds, when dt or pinned-particle layout changes) a
-        block-diagonal BSR matrix with ``3×3`` blocks ``dt² · inv_mass[p] · I₃``
+        block-diagonal BSR matrix with ``3x3`` blocks ``dt² · inv_mass[p] · I₃``
         per particle ``p``.  Pinned particles (``inv_mass == 0``) contribute a
         zero block, so contacts that target pinned vertices automatically
         produce a zero entry in ``W_lite`` — consistent with the full-NSN path,
@@ -1497,11 +1497,11 @@ class FBALinearSolver:
         dev = self.device
 
         # Block dtype for both M_inv and (later) H, M_inv·Hᵀ. Each block is a
-        # 3×3 dense matrix in row-major fp64.
+        # 3x3 dense matrix in row-major fp64.
         if not hasattr(self, "_mat3x3_dtype"):
             self._mat3x3_dtype = wp.types.matrix((3, 3), wp.float64)
 
-        # Build host-side per-block values: 3×3 identity scaled by dt²·inv_mass.
+        # Build host-side per-block values: 3x3 identity scaled by dt²·inv_mass.
         inv_mass_h = inv_mass_d.numpy().astype(np.float64)
         dt2 = float(dt) * float(dt)
         blocks = np.zeros((n, 3, 3), dtype=np.float64)
@@ -1686,10 +1686,10 @@ class FBALinearSolver:
     def build_schur_lite_unified(
         self,
         total_rows: int,
-        row_particle_a_d: wp.array,    # (total_rows,) int32
-        row_particle_b_d: wp.array,    # (total_rows,) int32 — -1 sentinel for 1-particle rows
-        row_dir_d: wp.array,           # (total_rows,) vec3 (fp32)
-        row_alpha_d: wp.array,         # (total_rows,) float32
+        row_particle_a_d: wp.array,  # (total_rows,) int32
+        row_particle_b_d: wp.array,  # (total_rows,) int32 — -1 sentinel for 1-particle rows
+        row_dir_d: wp.array,  # (total_rows,) vec3 (fp32)
+        row_alpha_d: wp.array,  # (total_rows,) float32
         # ---- Optional 4-slot extension (v-t / e-e contact rows). ----
         # When supplied, the Jacobian per row is built from up to 4 particle
         # slots with explicit per-slot weights.  When None, falls back to the
@@ -1703,31 +1703,28 @@ class FBALinearSolver:
         row_wb_d: wp.array | None = None,
         row_wc_d: wp.array | None = None,
         row_wd_d: wp.array | None = None,
-    ) -> "wps.BsrMatrix":
+    ) -> wps.BsrMatrix:
         """Build the LiteNSN sparse Schur for rows that touch **1, 2, or 4 particles**.
 
         Each row contributes its Jacobian entries to ``H``:
 
         Legacy (2-slot) path:
-        - 1 nonzero block at column ``particle_a`` with value ``+α·dir``
+        - 1 nonzero block at column ``particle_a`` with value ``+alpha·dir``
         - if ``particle_b ≥ 0``: an extra nonzero block at ``particle_b`` with
-          value ``-α·dir``.
+          value ``-alpha·dir``.
 
         4-slot path (when ``row_wa_d`` etc. are provided):
         - Up to 4 nonzero blocks per row, one per slot ``k ∈ {a, b, c, d}`` with
-          ``p_k >= 0``, value ``+w_k · α · dir``.
+          ``p_k >= 0``, value ``+w_k · alpha · dir``.
 
         Then ``W = H · (dt²·M⁻¹) · Hᵀ`` produces a (total_rows, total_rows)
         BSR matrix whose sparsity is the contact-graph adjacency.
         """
         if not hasattr(self, "_M_inv_dt2_bsr") or self._M_inv_dt2_bsr is None:
-            raise RuntimeError(
-                "build_schur_lite_unified requires setup_lite_mass first."
-            )
+            raise RuntimeError("build_schur_lite_unified requires setup_lite_mass first.")
         if total_rows == 0:
             return None
         dev = self.device
-        n = self.n
 
         if not hasattr(self, "_mat1x3_dtype"):
             self._mat1x3_dtype = wp.types.matrix((1, 3), wp.float64)
@@ -1777,9 +1774,7 @@ class FBALinearSolver:
                 idx = np.where(mask)[0]
                 triplet_rows.append(row_ids[idx])
                 triplet_cols.append(ps[idx])
-                triplet_vals.append(
-                    (ws[idx, None] * alpha[idx, None] * d[idx]).reshape(-1, 1, 3)
-                )
+                triplet_vals.append((ws[idx, None] * alpha[idx, None] * d[idx]).reshape(-1, 1, 3))
             if not triplet_rows:
                 return None
             rows = np.concatenate(triplet_rows).astype(np.int32)
@@ -1799,19 +1794,17 @@ class FBALinearSolver:
             cols = np.empty(n_triplets, dtype=np.int32)
             vals = np.empty((n_triplets, 1, 3), dtype=np.float64)
 
-            # First block of triplets: +α·dir at particle_a for every row.
+            # First block of triplets: +alpha·dir at particle_a for every row.
             rows[:total_rows] = np.arange(total_rows, dtype=np.int32)
             cols[:total_rows] = pa
             vals[:total_rows] = (alpha[:, None] * d).reshape(total_rows, 1, 3)
 
-            # Second block: -α·dir at particle_b only where particle_b ≥ 0.
+            # Second block: -alpha·dir at particle_b only where particle_b ≥ 0.
             if n_triplets_b > 0:
                 self_rows = np.where(has_b)[0].astype(np.int32)
                 rows[total_rows:] = self_rows
                 cols[total_rows:] = pb[has_b]
-                vals[total_rows:] = (
-                    -alpha[has_b, None] * d[has_b]
-                ).reshape(n_triplets_b, 1, 3)
+                vals[total_rows:] = (-alpha[has_b, None] * d[has_b]).reshape(n_triplets_b, 1, 3)
 
         rows_d = wp.array(rows, dtype=wp.int32, device=dev)
         cols_d = wp.array(cols, dtype=wp.int32, device=dev)
@@ -1962,11 +1955,14 @@ class FBALinearSolver:
         if has_friction:
             t1_np = j_tangent1.numpy()[:M]
             t2_np = j_tangent2.numpy()[:M]
-            row_particle[0::3] = idx_np; row_particle[1::3] = idx_np; row_particle[2::3] = idx_np
-            row_dir[0::3] = n_np; row_dir[1::3] = t1_np; row_dir[2::3] = t2_np
-            row_alpha[0::3] = a_np; row_alpha[1::3] = a_np; row_alpha[2::3] = a_np
+            for k, direction in enumerate((n_np, t1_np, t2_np)):
+                row_particle[k::3] = idx_np
+                row_dir[k::3] = direction
+                row_alpha[k::3] = a_np
         else:
-            row_particle[:] = idx_np; row_dir[:] = n_np; row_alpha[:] = a_np
+            row_particle[:] = idx_np
+            row_dir[:] = n_np
+            row_alpha[:] = a_np
 
         row_particle_d = wp.array(row_particle, dtype=wp.int32, device=dev)
         row_dir_d = wp.array(row_dir, dtype=wp.vec3, device=dev)
