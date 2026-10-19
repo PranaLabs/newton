@@ -76,7 +76,7 @@ def vertex_face_contacts_kernel(
 ):
     """The nearest triangle of each particle within ``query_radius``, outside its rings and ``rest_radius`` from it
     at rest, the first of equals among its candidates, in the particle's slot; ``found`` marks the particles
-    that have one. The ``_LANES`` threads of a block take the candidates
+    that have one. The threads of a block, ``_LANES`` on CUDA and one on the CPU, take the candidates
     of one particle in turn, and test the rings and rest distance of only those nearer than their nearest yet."""
     v, lane = wp.tid()
     p = q[v]
@@ -85,7 +85,7 @@ def vertex_face_contacts_kernel(
     best_t = wp.int32(-1)
     best_bary = wp.vec3(0.0)
     best_point = wp.vec3(0.0)
-    for k in range(lane, wp.min(candidate_count[v], candidates.shape[1]), _LANES):
+    for k in range(lane, wp.min(candidate_count[v], candidates.shape[1]), wp.block_dim()):
         t = candidates[v, k]
         a = tri_indices[t, 0]
         b = tri_indices[t, 1]

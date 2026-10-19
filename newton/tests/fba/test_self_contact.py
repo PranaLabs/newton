@@ -22,7 +22,7 @@ def _closest_on_triangle(p, a, b, c):
 class TestSelfContactDetection(unittest.TestCase):
     """Two sheets of 2 cm cells, the second 1 cm over the first and shifted 3 mm along x and y."""
 
-    def _sheets(self):
+    def _sheets(self, device=None):
         builder = newton.ModelBuilder()
         for z, shift in ((0.0, 0.0), (0.01, 0.003)):
             builder.add_cloth_grid(
@@ -36,24 +36,25 @@ class TestSelfContactDetection(unittest.TestCase):
                 mass=0.01,
                 tri_ke=50.0,
             )
-        return builder.finalize()
+        return builder.finalize(device=device)
 
     def test_vertex_face_takes_the_nearest_triangle(self):
-        """Each particle has one contact, with its nearest triangle of the other sheet, along the direction from
-        the closest point to the particle."""
-        model = self._sheets()
-        q, tris = model.particle_q.numpy(), model.tri_indices.numpy()
-        particles, alpha, normal = SelfContact(model, "vertex_face", 0.015).detect(model.particle_q)
-        np.testing.assert_array_equal(particles[:, 0], np.arange(model.particle_count))
-        half = model.particle_count // 2
-        for k in range(0, len(particles), 17):
-            v = particles[k, 0]
-            other = tris[(tris >= half).all(axis=1) if v < half else (tris < half).all(axis=1)]
-            closest = [_closest_on_triangle(q[v], *q[t]) for t in other]
-            nearest = closest[np.argmin([np.linalg.norm(q[v] - c) for c in closest])]
-            point = -(alpha[k, 1:] @ q[particles[k, 1:]])
-            np.testing.assert_allclose(point, nearest, atol=2e-4)
-            np.testing.assert_allclose(normal[k], (q[v] - point) / np.linalg.norm(q[v] - point), atol=1e-5)
+        """Find for each particle one contact, with its nearest triangle of the other sheet, along the direction
+        from the closest point to the particle, on the CPU, where a block has one thread, as on CUDA."""
+        for device in ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else []):
+            model = self._sheets(device)
+            q, tris = model.particle_q.numpy(), model.tri_indices.numpy()
+            particles, alpha, normal = SelfContact(model, "vertex_face", 0.015).detect(model.particle_q)
+            np.testing.assert_array_equal(particles[:, 0], np.arange(model.particle_count), err_msg=device)
+            half = model.particle_count // 2
+            for k in range(0, len(particles), 17):
+                v = particles[k, 0]
+                other = tris[(tris >= half).all(axis=1) if v < half else (tris < half).all(axis=1)]
+                closest = [_closest_on_triangle(q[v], *q[t]) for t in other]
+                nearest = closest[np.argmin([np.linalg.norm(q[v] - c) for c in closest])]
+                point = -(alpha[k, 1:] @ q[particles[k, 1:]])
+                np.testing.assert_allclose(point, nearest, atol=2e-4, err_msg=device)
+                np.testing.assert_allclose(normal[k], (q[v] - point) / np.linalg.norm(q[v] - point), atol=1e-5)
 
     def test_vertex_face_grows_its_candidate_lists(self):
         """Particles with more candidate triangles than their lists hold search again with longer lists and find
