@@ -206,14 +206,14 @@ def solve_nsn_unilateral(
         compliance = np.zeros(M, dtype=np.float64)
         h = np.zeros(M, dtype=np.float64)
         for c in range(M):
-            on, cn, hn = fb_unilateral_row(
+            om_n, cn, hn = fb_unilateral_row(
                 penetration=penetration[c],
                 lam=lam[c],
                 precond=precond[c],
                 dt=dt,
                 pene0=pene0[c],
             )
-            omega[c] = on
+            omega[c] = om_n
             compliance[c] = cn
             h[c] = hn
 
@@ -321,14 +321,14 @@ def solve_nsn_coulomb(
             idx_n = 3 * c
             idx_t1 = 3 * c + 1
             idx_t2 = 3 * c + 2
-            on, cn, hn = fb_unilateral_row(
+            om_n, cn, hn = fb_unilateral_row(
                 penetration=penetration[idx_n],
                 lam=lam[idx_n],
                 precond=precond[idx_n],
                 dt=dt,
                 pene0=pene0[idx_n],
             )
-            ot1, ct1, ht1 = fb_frictional_row(
+            om_t1, ct1, ht1 = fb_frictional_row(
                 penetration=penetration[idx_t1],
                 lam_t=lam[idx_t1],
                 lam_n=lam[idx_n],
@@ -337,7 +337,7 @@ def solve_nsn_coulomb(
                 dt=dt,
                 pene0=pene0[idx_t1],
             )
-            ot2, ct2, ht2 = fb_frictional_row(
+            om_t2, ct2, ht2 = fb_frictional_row(
                 penetration=penetration[idx_t2],
                 lam_t=lam[idx_t2],
                 lam_n=lam[idx_n],
@@ -346,9 +346,9 @@ def solve_nsn_coulomb(
                 dt=dt,
                 pene0=pene0[idx_t2],
             )
-            omega[idx_n] = on
-            omega[idx_t1] = ot1
-            omega[idx_t2] = ot2
+            omega[idx_n] = om_n
+            omega[idx_t1] = om_t1
+            omega[idx_t2] = om_t2
             compliance[idx_n] = cn
             compliance[idx_t1] = ct1
             compliance[idx_t2] = ct2
