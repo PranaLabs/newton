@@ -51,6 +51,7 @@ class Example:
             floating=False,
             enable_self_collisions=False,
             collapse_fixed_joints=True,
+            joint_damping_mode="passive",
         )
         builder.joint_q[:] = [0.0, 0.0, 0.0, -1.59695, 0.0, 2.5307, 0.0, OPEN, OPEN]
         self.hand = builder.body_count - 3

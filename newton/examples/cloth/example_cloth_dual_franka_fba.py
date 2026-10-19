@@ -55,7 +55,12 @@ class Example:
         builder.default_shape_cfg.mu = 1.0
         urdf = str(newton.utils.download_asset("franka_emika_panda") / "urdf" / "fr3_franka_hand.urdf")
         self.hands, self.fingers = [], []
-        options = {"floating": False, "enable_self_collisions": False, "collapse_fixed_joints": True}
+        options = {
+            "floating": False,
+            "enable_self_collisions": False,
+            "collapse_fixed_joints": True,
+            "joint_damping_mode": "passive",
+        }
         for y in CORNERS_Y:
             builder.add_urdf(urdf, xform=wp.transform((-0.55, y, 0.0), wp.quat_identity()), **options)
             builder.joint_q[-9:] = [0.0, 0.0, 0.0, -1.59695, 0.0, 2.5307, 0.0, OPEN, OPEN]
