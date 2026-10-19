@@ -294,38 +294,33 @@ def _copy_scalar_kernel(
 class NSNPCRSolver:
     """Jacobi-preconditioned Conjugate Residual solver for SPD systems.
 
-    :meth:`solve` runs RealSim's symmetrically preconditioned recurrence
-    (``IterativePCR.h``): conjugate residuals on ``P^1/2 A P^1/2`` with the
-    step denominator ``(A p)ᵀ P (A p)``, which stays a Krylov method when the
-    diagonal of ``A`` spans decades. Like RealSim's protected Krylov core it
-    refuses near-null directions, so a singular ``A`` with an inconsistent
-    right-hand side returns a bounded least-squares iterate.
-    :meth:`solve_sparse` keeps the original ``CUDADenseCRSolver.cpp`` port.
-    Used as the inner linear solver for the NSN Schur LCP system.
+    :meth:`solve` runs conjugate residuals on the symmetrically preconditioned
+    ``P^1/2 A P^1/2``, with the step denominator ``(A p)ᵀ P (A p)``, which stays
+    a Krylov method when the diagonal of ``A`` spans decades. It refuses
+    near-null directions, so a singular ``A`` with an inconsistent right-hand
+    side returns a bounded least-squares iterate. :meth:`solve_sparse` runs the
+    same iteration on a sparse matrix. Used as the inner linear solver for the
+    NSN Schur LCP system.
 
-    The solver is *stateless* between ``solve`` calls (the C++ class is too —
-    ``solve_vec_gpu`` always re-initializes ``x = 0``). Device buffers are
-    pre-allocated for ``max_n`` so repeated calls at smaller sizes do not
-    allocate.
+    The solver is *stateless* between ``solve`` calls: every call starts from
+    ``x = 0``. Device buffers are pre-allocated for ``max_n`` so repeated calls
+    at smaller sizes do not allocate.
 
     Args:
         max_n: Maximum system dimension the solver will handle. Internal
             buffers are sized to this.
         device: Warp device for buffer allocation (typically ``"cuda:0"``).
-        tol: Relative tolerance; :meth:`solve` stops once
-            ``|b - A x| < tol |b|`` and :meth:`solve_sparse` once the
-            preconditioned residual ``rho < tol^2 * rho_init``. RealSim
-            default is ``1e-5`` (``CUDADenseJacobiPCRSolver.h:13``).
-        max_iter: Outer-loop cap. Effective limit is ``min(max_iter, n)``
-            per RealSim ``CUDADenseCRSolver.cpp:126``.
+        tol: Relative tolerance: :meth:`solve` and :meth:`solve_sparse` stop
+            once ``|b - A x| < tol |b|``.
+        max_iter: Outer-loop cap. Effective limit is ``min(max_iter, n)``.
         check_every: Convergence-check batching factor.  PCR runs this many
             iters fully asynchronously on the device before pulling ``rho``
             to host to test for convergence.  The default ``25`` matches the
-            empirical iter count of the NSN Schur LCP on Demo 4/5 — a single
-            sync per ``solve()`` call covers the typical run.
+            typical iteration count of the NSN Schur LCP, so a single sync per
+            ``solve()`` call covers the typical run.
         max_inverse_gain: Largest amplification a step of :meth:`solve` may
             carry; directions with chart curvature below its inverse are
-            refused. RealSim's protected Krylov default is ``1e6``.
+            refused.
     """
 
     def __init__(
@@ -344,21 +339,21 @@ class NSNPCRSolver:
         self.device = device
         self.tol = float(tol)
         self.max_iter = int(max_iter)
-        # Bottleneck #2 fix: rather than syncing ``rho`` every iter (which
-        # forces a CPU stall after every PCR step), only test convergence
-        # every ``check_every`` iters.  Iterations between checks run fully
-        # asynchronously on the device.  Worst-case we overshoot the tol by
-        # ``check_every - 1`` iters; PCR's residual decay is monotone for SPD
-        # systems so this never compromises correctness.  RealSim itself
-        # syncs every iter via ``cublasDdot``; for the NSN inner this is the
-        # dominant per-step overhead at large n.  Default raised from 5 to
-        # 25 (Perf #3) — the NSN inner converges in ≤25 iters in practice so
-        # this is effectively one host sync per PCR call.
+        # Rather than syncing every iter (which forces a CPU stall after
+        # every PCR step), only test convergence every ``check_every`` iters.
+        # Iterations between checks run fully asynchronously on the device.
+        # Worst-case we overshoot the tol by ``check_every - 1`` iters; PCR's
+        # residual decay is monotone for SPD systems so this never
+        # compromises correctness.  A sync per iter would dominate the NSN
+        # inner solve's overhead at large n; the NSN inner converges in ≤25
+        # iters in practice, so the default 25 is effectively one host sync
+        # per PCR call.
         self.check_every = max(1, int(check_every))
         self._eta = wp.float64(1.0 / max_inverse_gain)
 
-        # Pre-allocate fp64 device buffers. Names mirror RealSim ``cuda_*``
-        # buffers in ``CUDADenseCRSolver.h:44-48`` for ease of cross-reference.
+        # Pre-allocate fp64 device buffers: ``_d`` holds the direction p,
+        # ``_q`` A p, ``_s`` the preconditioned residual z and ``_h`` the
+        # scratch t.
         self._x = wp.zeros(self.max_n, dtype=wp.float64, device=device)
         self._r = wp.zeros(self.max_n, dtype=wp.float64, device=device)
         self._d = wp.zeros(self.max_n, dtype=wp.float64, device=device)
@@ -385,7 +380,7 @@ class NSNPCRSolver:
         self._stopped_d = wp.zeros(1, dtype=wp.float64, device=device)
         self._r_norm_d = wp.zeros(1, dtype=wp.float64, device=device)
 
-        # Perf #5: cache one ``wp.Graph`` per active ``n`` shape so repeated
+        # Cache one ``wp.Graph`` per active ``n`` shape so repeated
         # solves at the same shape replay a pre-recorded CUDA graph for the
         # inner PCR iter, eliminating per-launch Python+driver overhead.
         # Capture is attempted lazily on first solve at each shape; if it
@@ -415,16 +410,14 @@ class NSNPCRSolver:
                 the solution on return.
             block_precond: Optional ``f(v, out)`` that overwrites rows of the
                 Jacobi product ``out = P v`` with an exact block solve, such
-                as the joint rows' Cholesky factor (RealSim's bilateral block
-                preconditioner). It runs eagerly, without the CUDA graph.
+                as the joint rows' Cholesky factor, a block preconditioner of
+                the bilateral rows. It runs eagerly, without the CUDA graph.
 
         Returns:
             A ``(iterations_taken, final_rho)`` tuple where ``iterations_taken``
-            counts the number of inner PCR iterations executed (matches
-            RealSim's ``_nb_iter`` accounting at ``CUDADenseCRSolver.cpp:127``,
-            ``234``) and ``final_rho`` is the last value of the preconditioned
-            residual scalar ``rho = <r, h>`` (>= 0 since ``h`` mixes with ``r``
-            through the SPD preconditioner).
+            counts the number of inner PCR iterations executed and
+            ``final_rho`` is the last value of the preconditioned residual
+            scalar ``rho = <z, A z>`` with ``z = P r`` (>= 0 for an SPD ``A``).
 
         Raises:
             ValueError: if ``A``/``b``/``x_out`` shapes are inconsistent or
@@ -441,18 +434,16 @@ class NSNPCRSolver:
             raise ValueError(f"x_out shape ({x_out.shape[0]},) incompatible with b shape ({n},)")
 
         device = self.device
-        max_iter = min(self.max_iter, n)  # RealSim CUDADenseCRSolver.cpp:126
+        max_iter = min(self.max_iter, n)
         tile_k = int(_PCR_TILE_K)
         n_pad = ((n + tile_k - 1) // tile_k) * tile_k
 
         # ----- Initialize x = 0 -----------------------------------------
-        # RealSim ``_x.setZero(n)`` (line 136). We zero only the active slice.
         self._x.zero_()
 
         # ----- Early exit if b == 0 -------------------------------------
-        # RealSim guards with ``if(dot_b != 0.0)`` (line 138). With b == 0,
-        # x = 0 is the exact solution.  ``array_inner`` is a CUB-style
-        # parallel reduction — far cheaper than the prior single-thread
+        # With b == 0, x = 0 is the exact solution.  ``array_inner`` is a
+        # CUB-style parallel reduction, far cheaper than a single-thread
         # accumulator at the typical n ~ 600..1500 sizes.
         dot_b = float(wp.utils.array_inner(b, b, count=n))
         if dot_b == 0.0:
@@ -468,7 +459,7 @@ class NSNPCRSolver:
             device=device,
         )
 
-        # ----- Symmetric PCR start (RealSim IterativePCR.h) -------------
+        # ----- Symmetric PCR start ---------------------------------------
         # Buffers: ``_s`` holds z = P r, ``_d`` the direction p = z, ``_q``
         # holds A p, and ``_h`` the scratch t (P q, then A z).
         wp.copy(self._r, b, count=n)
@@ -500,12 +491,11 @@ class NSNPCRSolver:
         # Iterations past convergence or past a refused direction leave the
         # iterate unchanged (see :func:`_protected_alpha_kernel`).
         #
-        # Perf #5: wrap one full PCR iter into a :class:`warp.Graph` and
-        # replay it ``check_every`` times per block.  Replays issue a single
+        # Wrap one full PCR iter into a :class:`warp.Graph` and replay it
+        # ``check_every`` times per block.  Replays issue a single
         # ``cuGraphLaunch`` on the device side instead of ~10 individual
         # ``wp.launch`` dispatches, so the Python+driver per-launch overhead
-        # drops from ~30-50 us/iter to ~2 us/iter at the n ~ 600..1500 sizes
-        # Demo 5 hits.
+        # drops from ~30-50 us/iter to ~2 us/iter at n ~ 600..1500.
         graph = None if block_precond is not None else self._get_or_build_pcr_iter_graph(A, n, n_pad, device)
 
         nb_iter = 0
@@ -638,7 +628,7 @@ class NSNPCRSolver:
         return nb_iter
 
     # ------------------------------------------------------------------
-    # Per-iter body + graph capture (Perf #5)
+    # Per-iter body + graph capture
     # ------------------------------------------------------------------
 
     def _pcr_iter_eager(
@@ -652,8 +642,8 @@ class NSNPCRSolver:
     ) -> None:
         """Issue one symmetric PCR iteration of :meth:`solve` on the active stream.
 
-        Mirrors RealSim ``IterativePCR.h``. All launches are stream-ordered
-        and safe to call inside a CUDA graph capture. With ``W_bsr`` and its
+        All launches are stream-ordered and safe to call inside a CUDA graph
+        capture. With ``W_bsr`` and its
         ``diag``, the iteration of :meth:`solve_sparse` multiplies by the
         sparse matrix instead of ``A``.
         """
