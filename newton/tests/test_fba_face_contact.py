@@ -415,5 +415,68 @@ class TestMeshNeighbors(unittest.TestCase):
                 self.assertIn(t, rows[other])
 
 
+class TestMeshContactMinima(unittest.TestCase):
+    """Particle contacts of radius 5 mm on a block with a 90 degree V notch whose bottom runs along y."""
+
+    NOTCH = np.array([0.0, 0.0, 0.5])
+    RIGHT = np.array([-1.0, 0.0, 1.0]) / np.sqrt(2.0)  # outward normal of the face from the notch up to x = 0.5
+    LEFT = np.array([1.0, 0.0, 1.0]) / np.sqrt(2.0)
+
+    def _minima(self, x, half_width=0.2, segments=1):
+        """The pipeline's contacts of a particle at ``x`` and the other minima of its distance to the block."""
+        builder = newton.ModelBuilder()
+        builder.add_shape_mesh(-1, mesh=_notch_mesh(half_width, segments))
+        builder.add_particle(wp.vec3(*x), wp.vec3(0.0), 0.01, radius=0.005)
+        model = builder.finalize()
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.02)
+        contacts = pipeline.contacts()
+        pipeline.collide(model.state(), contacts)
+        m = int(contacts.soft_contact_count.numpy()[0])
+        fields = (contacts.soft_contact_particle, contacts.soft_contact_shape)
+        fields += (contacts.soft_contact_body_pos, contacts.soft_contact_normal)
+        primary = [a.numpy()[:m] for a in fields]
+        query = FaceContactQuery(np.zeros((0, 3), dtype=np.int32), model.particle_count, model.device)
+        return primary, query.mesh_minima(model, model.particle_q, None, *primary, alarm=0.02)
+
+    def test_notch_holds_against_both_faces(self):
+        """Above the notch and nearer its right face, the particle's closest point lies on that face alone; the
+        other minimum adds the left face."""
+        x = self.NOTCH + np.array([0.002, 0.0, 0.015])
+        primary, (particle, shape, body_pos, normal) = self._minima(x)
+        np.testing.assert_allclose(primary[3], [self.RIGHT], atol=1e-5)
+        np.testing.assert_array_equal(particle, [0])
+        np.testing.assert_array_equal(shape, primary[1])
+        np.testing.assert_allclose(normal, [self.LEFT], atol=1e-5)
+        np.testing.assert_allclose(body_pos, [x - np.dot(x - self.NOTCH, self.LEFT) * self.LEFT], atol=1e-6)
+
+    def test_notch_of_a_thin_finely_split_block(self):
+        """On the ridge of a block 1 cm thick whose edges are split in 20, the minimum on the left face is found
+        among the many triangles near the notch."""
+        x = self.NOTCH + np.array([0.0015, 0.0034, 0.0179])
+        primary, (_, _, body_pos, normal) = self._minima(x, half_width=0.005, segments=20)
+        np.testing.assert_allclose(primary[3], [self.RIGHT], atol=1e-5)
+        np.testing.assert_allclose(normal, [self.LEFT], atol=1e-5)
+        np.testing.assert_allclose(body_pos, [x - np.dot(x - self.NOTCH, self.LEFT) * self.LEFT], atol=1e-6)
+
+    def test_flat_face_has_one_minimum(self):
+        """Under the bottom face, 4 mm beside the diagonal between its two triangles, the other triangle's closest
+        point on the diagonal lies within reach, but the triangle through it comes closer."""
+        primary, minima = self._minima([0.0, 0.004, -0.01])
+        self.assertEqual(len(primary[0]), 1)
+        self.assertEqual(len(minima[0]), 0)
+
+    def test_far_side_of_a_thin_block(self):
+        """Beside a block 1 cm thick, its far side lies within reach but faces away from the particle."""
+        primary, minima = self._minima([0.1, 0.015, 0.25], half_width=0.005)
+        self.assertEqual(len(primary[0]), 1)
+        self.assertEqual(len(minima[0]), 0)
+
+    def test_particle_inside(self):
+        """A particle inside the block keeps its one contact, which pushes it out through the nearest face."""
+        primary, minima = self._minima([0.0, 0.001, 0.45], half_width=0.005)
+        self.assertEqual(len(primary[0]), 1)
+        self.assertEqual(len(minima[0]), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
