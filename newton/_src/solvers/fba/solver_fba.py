@@ -293,6 +293,12 @@ class SolverFBA(SolverBase):
             self._tet_gauge = 2.0 + self._lam / (2.0 * (self._lam + self._mu))
             self._tri_lame = (self._mu * self._tri_gauge, self._lam * self._tri_gauge)
             self._tet_lame = (self._mu * self._tet_gauge, self._lam * self._tet_gauge)
+            self._tri_lame_d = wp.array(
+                np.tile(self._tri_lame, (model.tri_count, 1)), dtype=wp.vec2, device=model.device
+            )
+            self._tet_lame_d = wp.array(
+                np.tile(self._tet_lame, (model.tet_count, 1)), dtype=wp.vec2, device=model.device
+            )
         self.friction = bool(friction)
         self._mu_per_pair_override = (
             np.asarray(mu_per_pair_override, dtype=np.float64) if mu_per_pair_override is not None else None
@@ -1692,7 +1698,7 @@ class SolverFBA(SolverBase):
                         self._tri_indices_d,
                         self._tri_rest_inv_d,
                         self._tri_weight_d,
-                        *self._tri_lame,
+                        self._tri_lame_d,
                     ],
                     outputs=[self._tri_contrib_d],
                     device=device,
@@ -1719,7 +1725,7 @@ class SolverFBA(SolverBase):
                         self._tri_indices_d,
                         self._tri_rest_inv_d,
                         self._tri_weight_d,
-                        *self._tri_lame,
+                        self._tri_lame_d,
                     ],
                     outputs=[self._tri_contrib_d],
                     device=device,
@@ -1799,7 +1805,7 @@ class SolverFBA(SolverBase):
                         self._tet_indices_d,
                         self._tet_rest_inv_d,
                         self._tet_weight_d,
-                        *self._tet_lame,
+                        self._tet_lame_d,
                     ],
                     outputs=[self._tet_contrib_d],
                     device=device,
@@ -1826,7 +1832,7 @@ class SolverFBA(SolverBase):
                         self._tet_indices_d,
                         self._tet_rest_inv_d,
                         self._tet_weight_d,
-                        *self._tet_lame,
+                        self._tet_lame_d,
                     ],
                     outputs=[self._tet_contrib_d],
                     device=device,

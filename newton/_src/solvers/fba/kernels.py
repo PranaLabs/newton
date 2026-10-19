@@ -698,8 +698,7 @@ def project_stretching_corotational_tet_compute_kernel(
     tet_indices: wp.array[wp.int32],  # flat shape (4*T,)
     tet_rest_inv: wp.array[wp.mat33],
     tet_weight: wp.array[wp.float32],
-    mu: float,
-    lam: float,
+    lame: wp.array[wp.vec2],
     # output (per-tet, per-local-vertex contributions)
     contributions: wp.array2d[wp.vec3],  # (T, 4)
 ):
@@ -715,11 +714,11 @@ def project_stretching_corotational_tet_compute_kernel(
         tet_indices: Flat tet indices, shape ``[4 * tet_count]``.
         tet_rest_inv: Per-tet 3x3 rest-pose inverse (Dm_inv), shape ``[tet_count]``.
         tet_weight: Per-tet weight (2*mu * volume), shape ``[tet_count]``.
-        mu: First Lamé parameter [Pa].
-        lam: Second Lamé parameter [Pa].
+        lame: First and second Lamé parameters of each element [Pa].
         contributions: Output ``(tet_count, 4)`` per-local-vertex contribution.
     """
     t = wp.tid()
+    mu, lam = lame[t][0], lame[t][1]
     i0 = tet_indices[4 * t + 0]
     i1 = tet_indices[4 * t + 1]
     i2 = tet_indices[4 * t + 2]
@@ -1660,8 +1659,7 @@ def project_stretching_neohookean_tet_compute_kernel(
     tet_indices: wp.array[wp.int32],  # flat shape (4*T,)
     tet_rest_inv: wp.array[wp.mat33],
     tet_weight: wp.array[wp.float32],
-    mu: float,
-    lam: float,
+    lame: wp.array[wp.vec2],
     # output (per-tet, per-local-vertex contributions)
     contributions: wp.array2d[wp.vec3],  # (T, 4)
 ):
@@ -1677,11 +1675,11 @@ def project_stretching_neohookean_tet_compute_kernel(
         tet_indices: Flat tet indices, shape ``[4 * tet_count]``.
         tet_rest_inv: Per-tet 3x3 rest-pose inverse (Dm_inv), shape ``[tet_count]``.
         tet_weight: Per-tet weight (2*mu * volume), shape ``[tet_count]``.
-        mu: First Lamé parameter [Pa].
-        lam: Second Lamé parameter [Pa].
+        lame: First and second Lamé parameters of each element [Pa].
         contributions: Output ``(tet_count, 4)`` per-local-vertex contribution.
     """
     t = wp.tid()
+    mu, lam = lame[t][0], lame[t][1]
     i0 = tet_indices[4 * t + 0]
     i1 = tet_indices[4 * t + 1]
     i2 = tet_indices[4 * t + 2]
@@ -1771,8 +1769,7 @@ def project_stretching_neohookean_tet_compute_kernel_lbfgs(
     tet_indices: wp.array[wp.int32],  # flat shape (4*T,)
     tet_rest_inv: wp.array[wp.mat33],
     tet_weight: wp.array[wp.float32],
-    mu: float,
-    lam: float,
+    lame: wp.array[wp.vec2],
     # output (per-tet, per-local-vertex contributions)
     contributions: wp.array2d[wp.vec3],  # (T, 4)
 ):
@@ -1788,6 +1785,7 @@ def project_stretching_neohookean_tet_compute_kernel_lbfgs(
     write boundary (``_rhs`` itself is fp32).
     """
     t = wp.tid()
+    mu, lam = lame[t][0], lame[t][1]
     i0 = tet_indices[4 * t + 0]
     i1 = tet_indices[4 * t + 1]
     i2 = tet_indices[4 * t + 2]
@@ -2179,8 +2177,7 @@ def project_stretching_corotational_compute_kernel(
     tri_indices: wp.array[wp.int32],  # flat shape (3*T,)
     tri_rest_inv: wp.array[wp.mat22],
     tri_weight: wp.array[wp.float32],
-    mu: float,
-    lam: float,
+    lame: wp.array[wp.vec2],
     # output (per-tri, per-local-vertex contributions)
     contributions: wp.array2d[wp.vec3],  # (T, 3)
 ):
@@ -2196,11 +2193,11 @@ def project_stretching_corotational_compute_kernel(
         tri_indices: Flat triangle indices, shape ``[3 * tri_count]``.
         tri_rest_inv: Per-triangle 2x2 rest-pose inverse (``Dm_inv``).
         tri_weight: Per-triangle stretching weight (``ke * area``).
-        mu: First Lame parameter [Pa].
-        lam: Second Lame parameter [Pa].
+        lame: First and second Lamé parameters of each element [Pa].
         contributions: Output ``(tri_count, 3)`` per-local-vertex contribution.
     """
     t = wp.tid()
+    mu, lam = lame[t][0], lame[t][1]
     i0 = tri_indices[3 * t + 0]
     i1 = tri_indices[3 * t + 1]
     i2 = tri_indices[3 * t + 2]
@@ -2440,8 +2437,7 @@ def project_stretching_neohookean_compute_kernel(
     tri_indices: wp.array[wp.int32],  # flat shape (3*T,)
     tri_rest_inv: wp.array[wp.mat22],
     tri_weight: wp.array[wp.float32],
-    mu: float,
-    lam: float,
+    lame: wp.array[wp.vec2],
     # output (per-tri, per-local-vertex contributions)
     contributions: wp.array2d[wp.vec3],  # (T, 3)
 ):
@@ -2457,11 +2453,11 @@ def project_stretching_neohookean_compute_kernel(
         tri_indices: Flat triangle indices, shape ``[3 * tri_count]``.
         tri_rest_inv: Per-triangle 2x2 rest-pose inverse (``Dm_inv``).
         tri_weight: Per-triangle stretching weight (``ke * area``).
-        mu: First Lame parameter [Pa].
-        lam: Second Lame parameter [Pa].
+        lame: First and second Lamé parameters of each element [Pa].
         contributions: Output ``(tri_count, 3)`` per-local-vertex contribution.
     """
     t = wp.tid()
+    mu, lam = lame[t][0], lame[t][1]
     i0 = tri_indices[3 * t + 0]
     i1 = tri_indices[3 * t + 1]
     i2 = tri_indices[3 * t + 2]
@@ -2538,8 +2534,7 @@ def project_stretching_neohookean_compute_kernel_lbfgs(
     tri_indices: wp.array[wp.int32],  # flat shape (3*T,)
     tri_rest_inv: wp.array[wp.mat22],
     tri_weight: wp.array[wp.float32],
-    mu: float,
-    lam: float,
+    lame: wp.array[wp.vec2],
     # output (per-tri, per-local-vertex contributions)
     contributions: wp.array2d[wp.vec3],  # (T, 3)
 ):
@@ -2553,6 +2548,7 @@ def project_stretching_neohookean_compute_kernel_lbfgs(
     sigma is cast back to fp32 for the P reconstruction and scatter.
     """
     t = wp.tid()
+    mu, lam = lame[t][0], lame[t][1]
     i0 = tri_indices[3 * t + 0]
     i1 = tri_indices[3 * t + 1]
     i2 = tri_indices[3 * t + 2]

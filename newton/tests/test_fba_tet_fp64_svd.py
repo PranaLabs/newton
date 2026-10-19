@@ -109,7 +109,7 @@ def _launch_compute(kernel, positions, Dm_inv, weight, mu=None, lam=None):
         wp.launch(
             kernel,
             dim=1,
-            inputs=[pos, tet_idx, rest_inv, w, float(mu), float(lam)],
+            inputs=[pos, tet_idx, rest_inv, w, wp.array([[mu, lam]], dtype=wp.vec2)],
             outputs=[contrib],
         )
     return contrib.numpy()  # shape (1, 4, 3)
