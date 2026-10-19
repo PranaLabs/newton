@@ -3049,34 +3049,6 @@ class SolverFBA(SolverBase):
         detector.vertex_colliding_triangles_count.zero_()
         detector.vertex_triangle_collision_detection(float(threshold))
 
-        # ---- Optional e-e broadphase (Phase 3). ----
-        # The detector's ``min_query_radius`` + ``min_distance_filtering_ref_pos``
-        # implements rest-pose distance exclusion (same idea as v-v's
-        # rest_exclusion_radius): a pair whose REST-pose edge-edge distance
-        # is below ``min_query_radius`` is skipped.  Without this, a flat
-        # cloth at rest produces O(E²) "neighbours" that are merely co-planar
-        # in space — none of those are physical contacts, but their inclusion
-        # generates a singular Jacobian.  v-t doesn't suffer this because
-        # a vertex doesn't normally lie close to a non-adjacent triangle
-        # at rest.
-        ee_enabled = bool(self.particle_contact_ee) and (
-            self.model.edge_indices is not None and int(self.model.edge_count) > 0
-        )
-        if ee_enabled:
-            detector.edge_colliding_edges_count.zero_()
-            # Use the same threshold as the broadphase query for rest-pose
-            # filtering: any edge pair whose REST distance is also below
-            # ``threshold`` is a co-planar topology artifact (same cloth, far
-            # in mesh-graph distance but close in 3-space at rest), not a
-            # real contact.  Excluding them keeps the contact set sparse and
-            # eliminates singular Jacobians on flat cloth.  The same trick
-            # is implicit in v-v's ``rest_exclusion_radius`` mechanism.
-            detector.edge_edge_collision_detection(
-                float(threshold),
-                min_query_radius=float(threshold),
-                min_distance_filtering_ref_pos=self._x_ref,
-            )
-
         # ---- Build per-vertex clamped-hit-count + prefix sum on host. ----
         # Small particle count + Python overhead is acceptable for single-env.
         from . import kernels as K  # noqa: PLC0415
@@ -3103,44 +3075,17 @@ class SolverFBA(SolverBase):
         np.cumsum(clamped_np, out=offsets_np[1:])
         n_vt_hits = int(offsets_np[-1])
 
-        # ---- Per-edge clamped-hit-count + prefix sum. ----
-        n_edges = int(self.model.edge_count) if ee_enabled else 0
-        n_ee_hits = 0
-        ee_offsets_np = None
-        if ee_enabled and n_edges > 0:
-            ee_clamped = wp.empty(n_edges, dtype=wp.int32, device=device)
-            wp.launch(
-                K.ee_count_hits_kernel,
-                dim=n_edges,
-                inputs=[
-                    wp.int32(n_edges),
-                    detector.edge_colliding_edges_count,
-                    detector.edge_colliding_edges_buffer_sizes,
-                ],
-                outputs=[ee_clamped],
-                device=device,
-            )
-            ee_clamped_np = ee_clamped.numpy()
-            # Re-use ``particle_contact_max_hits_per_vertex`` as the per-edge cap
-            # (the detector itself already pre-allocs at this size; this is
-            # belt-and-suspenders).
-            np.minimum(ee_clamped_np, per_v_cap, out=ee_clamped_np)
-            ee_offsets_np = np.zeros(n_edges + 1, dtype=np.int32)
-            np.cumsum(ee_clamped_np, out=ee_offsets_np[1:])
-            n_ee_hits = int(ee_offsets_np[-1])
-
         # Diagnostic counters: always populated even when no contacts fire
         # so downstream introspection (Tier 3 acceptance reporting) can read
         # them unconditionally.
         self._pc_last_vt_hits = n_vt_hits
-        self._pc_last_ee_hits = n_ee_hits
-        if n_vt_hits == 0 and n_ee_hits == 0:
+        if n_vt_hits == 0:
             return 0
 
         # ---- Allocate buffers. ----
         # Each hit emits 1 contact = 3 rows. Bound capacity at 3 * total_hits +
         # a small safety margin.
-        total_hits = n_vt_hits + n_ee_hits
+        total_hits = n_vt_hits
         cap = max(48, 3 * (total_hits + 64))
         self._ensure_particle_contact_buffers(cap)
 
@@ -3149,12 +3094,6 @@ class SolverFBA(SolverBase):
             self._pc_hit_offsets_d = wp.empty(n_particles + 1, dtype=wp.int32, device=device)
         if n_vt_hits > 0:
             self._pc_hit_offsets_d.assign(offsets_np)
-
-        # Per-edge job-offsets array (e-e).
-        if n_ee_hits > 0:
-            if self._pc_ee_hit_offsets_d is None or int(self._pc_ee_hit_offsets_d.size) < n_edges + 1:
-                self._pc_ee_hit_offsets_d = wp.empty(n_edges + 1, dtype=wp.int32, device=device)
-            self._pc_ee_hit_offsets_d.assign(ee_offsets_np)
 
         if self._pc_contact_count_d is None:
             self._pc_contact_count_d = wp.zeros(1, dtype=wp.int32, device=device)
@@ -3200,45 +3139,6 @@ class SolverFBA(SolverBase):
                 device=device,
             )
 
-        # ---- Emit e-e rows (cid range [vt_contacts, vt+ee_contacts)). ----
-        # The atomic counter is shared, so e-e rows continue where v-t left off.
-        if n_ee_hits > 0:
-            wp.launch(
-                K.emit_ee_rows_kernel,
-                dim=n_ee_hits,
-                inputs=[
-                    wp.int32(n_ee_hits),
-                    self._pc_ee_hit_offsets_d,
-                    wp.int32(n_edges),
-                    detector.edge_colliding_edges,
-                    detector.edge_colliding_edges_offsets,
-                    self.model.edge_indices,
-                    state_inout.particle_q,
-                    wp.float32(threshold),
-                    wp.float64(gap_threshold),
-                    wp.float32(1.0e-9),  # parallel_eps (LOCKED)
-                    self._pc_contact_count_d,
-                    wp.int32(max_contacts),
-                    wp.int32(0),
-                ],
-                outputs=[
-                    self._pc_row_pa_d,
-                    self._pc_row_pb_d,
-                    self._pc_row_pc_d,
-                    self._pc_row_pd_d,
-                    self._pc_row_wa_d,
-                    self._pc_row_wb_d,
-                    self._pc_row_wc_d,
-                    self._pc_row_wd_d,
-                    self._pc_row_dir_d,
-                    self._pc_row_alpha_d,
-                    self._pc_row_offset_d,
-                    self._pc_contact_mu_d,
-                    wp.float64(self.particle_contact_friction),
-                ],
-                device=device,
-            )
-
         n_contacts = int(self._pc_contact_count_d.numpy()[0])
         if n_contacts > max_contacts:
             n_contacts = max_contacts
@@ -3248,7 +3148,6 @@ class SolverFBA(SolverBase):
         # (which is ``n_contacts``).  Some hits may be dropped inside the
         # emit kernel by the post-broadphase distance / parallel-eps check.
         self._pc_last_vt_hits = n_vt_hits
-        self._pc_last_ee_hits = n_ee_hits
         self._pc_last_n_contacts = int(n_contacts)
         if n_contacts == 0:
             return 0
