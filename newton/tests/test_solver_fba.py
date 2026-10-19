@@ -180,6 +180,45 @@ class TestBendingQMatchesReference(unittest.TestCase):
             f"scale mismatch: got {meta['edge_quad_scale'][0]}, expected {scale_ref}",
         )
 
+    def test_bending_matches_style3d(self):
+        """FBA's bending matrix is SolverStyle3D's: each interior edge adds ``edge_ke * 3 / (A0 + A1) * w w^T``
+        with the cotangent weights ``w`` that Style3D stores for the edge."""
+        builder = newton.ModelBuilder()
+        newton.solvers.SolverStyle3D.register_custom_attributes(builder)
+        # Cells of 10 x 20 cm: legs and diagonals of three lengths, and areas at which Style3D's 1e-8
+        # regularization of areas and cotangents stays below 1e-6.
+        newton.solvers.style3d.add_cloth_grid(
+            builder,
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=5,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.2,
+            mass=0.01,
+        )
+        model = builder.finalize(device="cpu")
+        n = model.particle_count
+        bending = model.edge_bending_properties.numpy().copy()  # a CPU array's numpy() is a view
+        self.assertGreater(bending[:, 0].min(), 0.0)
+
+        # Style3D's Hessian (style3d/builder.py add_bend_constraints); it skips boundary edges.
+        edges = model.edge_indices.numpy()
+        area, cot = model.style3d.edge_rest_area.numpy(), model.style3d.edge_bending_cot.numpy()
+        w = np.stack([-cot[:, 0] - cot[:, 2], -cot[:, 1] - cot[:, 3], cot[:, 2] + cot[:, 3], cot[:, 0] + cot[:, 1]], 1)
+        expected = np.zeros((n, n))
+        for e in np.flatnonzero((edges[:, 0] >= 0) & (edges[:, 1] >= 0)):
+            expected[np.ix_(edges[e], edges[e])] += bending[e, 0] * 3.0 / area[e] * np.outer(w[e], w[e])
+
+        # FBA's bending part: its PD matrix with the model's edge_ke minus the one without bending.
+        with_bending = build_pd_system(model, dt=1.0, pin_stiffness=0.0)[0].toarray()
+        model.edge_bending_properties.assign(bending * np.array([0.0, 1.0], dtype=np.float32))
+        without_bending = build_pd_system(model, dt=1.0, pin_stiffness=0.0)[0].toarray()
+        np.testing.assert_allclose(
+            with_bending - without_bending, expected, rtol=0.0, atol=1e-5 * np.abs(expected).max()
+        )
+
 
 class TestSparseInverse(unittest.TestCase):
     """T2: compute_lower_inverse matches dense np.linalg.inv on small SPD."""

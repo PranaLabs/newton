@@ -77,6 +77,17 @@ class SolverFBA(SolverBase):
     weight of every element is ``2 * k_mu`` times its rest area or volume
     (``tri_ke`` is a triangle's ``k_mu``). ARAP is exact and unscaled.
 
+    Bending follows :class:`~newton.solvers.SolverStyle3D`: each interior edge
+    adds the isometric bending energy of Bergou et al. (2006),
+    ``1/2 * edge_ke * 3 / (A0 + A1) * |sum_k q_k x_k|^2``, with the cotangent
+    weights ``q`` of the edge's two triangles and their rest areas ``A0`` and
+    ``A1``; ``edge_rest_angle`` sets its rest curvature. ``edge_ke`` is thus a
+    bending modulus [N·m], and the bending energy of a given shape converges
+    as the mesh is refined. :class:`~newton.solvers.SolverVBD` scales
+    ``edge_ke`` by the edge length instead, ``1/2 * edge_ke * |e| * theta^2``
+    for a dihedral angle ``theta``: at small angles the same ``edge_ke``
+    bends an FBA cloth ``3 * |e| / (A0 + A1)`` times as stiffly.
+
     Notes:
         - Float32 ``particle_q`` output: the interior linear solver
           operates in float64, but ``state_out.particle_q`` (vec3) is
