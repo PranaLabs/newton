@@ -120,3 +120,91 @@ def nested_dissection(matrix: CsrMatrix, positions: np.ndarray, leaf_size: int =
 
     dissect(np.arange(matrix.shape[0]), 0)
     return np.concatenate(order).astype(np.int64), nodes
+
+
+@dataclass
+class CscMatrix:
+    """A compressed sparse column matrix of NumPy arrays, with sorted row indices in each column."""
+
+    shape: tuple[int, int]
+    indptr: np.ndarray
+    indices: np.ndarray
+    data: np.ndarray
+
+    def toarray(self) -> np.ndarray:
+        """The matrix as a dense array."""
+        dense = np.zeros(self.shape)
+        np.add.at(dense, (self.indices, np.repeat(np.arange(self.shape[1]), np.diff(self.indptr))), self.data)
+        return dense
+
+
+def factor_ldlt(
+    matrix: CsrMatrix, positions: np.ndarray | None = None, leaf_size: int = 64
+) -> tuple[np.ndarray, CscMatrix, np.ndarray]:
+    """Factor a symmetric positive definite matrix as ``matrix[order][:, order] = L · diag(d) · Lᵀ``.
+
+    With ``positions`` the unknowns are ordered by :func:`nested_dissection` and every dissection node is
+    eliminated as one dense front (a multifrontal factorization); without them the matrix is factored densely in
+    its own order.
+
+    Args:
+        matrix: Symmetric positive definite matrix.
+        positions: Point of each unknown [m], shape ``[n, 3]``, or ``None``.
+        leaf_size: Largest dissection block that is not split further.
+
+    Returns:
+        ``(order, L, d)``: the elimination order, the unit lower triangular factor without exact zeros, and the
+        pivots.
+
+    Raises:
+        numpy.linalg.LinAlgError: If the matrix is not positive definite.
+    """
+    n = matrix.shape[0]
+    if positions is None:
+        order, nodes = np.arange(n), [(0, n, [])]
+    else:
+        order, nodes = nested_dissection(matrix, positions, leaf_size)
+    position = np.empty(n, dtype=np.int64)
+    position[order] = np.arange(n)
+    # The permuted matrix by columns; it is symmetric, so its rows serve as columns.
+    rows, cols = position[matrix.row_of_entries()], position[matrix.indices]
+    by_column = np.lexsort((rows, cols))
+    rows, cols, values = rows[by_column], cols[by_column], matrix.data[by_column]
+    column_start = np.searchsorted(cols, np.arange(n + 1))
+
+    # Each node's front holds its own unknowns and the later ones they couple to, directly or through children.
+    update = []
+    for first, end, children in nodes:
+        coupled = [rows[column_start[first] : column_start[end]], *(update[c] for c in children)]
+        later = np.unique(np.concatenate(coupled))
+        update.append(later[later >= end])
+
+    local = np.full(n, -1, dtype=np.int64)
+    pending, columns, d = {}, [None] * n, np.empty(n)
+    for k, (first, end, children) in enumerate(nodes):
+        front = np.concatenate([np.arange(first, end), update[k]])
+        local[front] = np.arange(front.size)
+        F = np.zeros((front.size, front.size))
+        s, e = column_start[first], column_start[end]
+        own = rows[s:e] >= first
+        F[local[rows[s:e][own]], local[cols[s:e][own]]] = values[s:e][own]
+        for child in children:
+            slots = local[update[child]]
+            F[np.ix_(slots, slots)] += pending.pop(child)
+        m = end - first
+        L11 = np.linalg.cholesky(F[:m, :m])
+        L21 = np.linalg.solve(L11, F[m:, :m].T).T
+        pending[k] = F[m:, m:] - L21 @ L21.T
+        pivots = np.diag(L11)
+        d[first:end] = pivots * pivots
+        factor = np.vstack([L11, L21]) / pivots
+        for j in range(m):
+            columns[first + j] = (front[j:], factor[j:, j])
+        local[front] = -1
+
+    indices = np.concatenate([c[0] for c in columns]) if n else np.zeros(0, dtype=np.int64)
+    data = np.concatenate([c[1] for c in columns]) if n else np.zeros(0)
+    owner = np.repeat(np.arange(n), [c[0].size for c in columns])
+    keep = data != 0.0
+    indptr = np.searchsorted(owner[keep], np.arange(n + 1))
+    return order, CscMatrix((n, n), indptr, indices[keep].astype(np.int32), data[keep]), d

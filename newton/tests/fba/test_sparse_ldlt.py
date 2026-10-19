@@ -7,7 +7,7 @@ import unittest
 
 import numpy as np
 
-from newton._src.solvers.fba.sparse_ldlt import CsrMatrix, nested_dissection
+from newton._src.solvers.fba.sparse_ldlt import CsrMatrix, factor_ldlt, nested_dissection
 
 
 def grid_system(nx: int, ny: int, nz: int) -> tuple[CsrMatrix, np.ndarray]:
@@ -66,6 +66,46 @@ class TestNestedDissection(unittest.TestCase):
         for i, j in zip(matrix.row_of_entries(), matrix.indices, strict=True):
             a, b = node_of[i], node_of[j]
             self.assertTrue(a in ancestors(b) or b in ancestors(a), (i, j))
+
+
+class TestFactorLdlt(unittest.TestCase):
+    def assert_factors(self, matrix, positions):
+        order, L, d = factor_ldlt(matrix, positions, leaf_size=16)
+        dense = matrix.toarray()[np.ix_(order, order)]
+        Ld = L.toarray()
+        np.testing.assert_allclose(np.diag(Ld), 1.0)
+        np.testing.assert_allclose(np.triu(Ld, 1), 0.0)
+        self.assertLess(np.abs(Ld * d @ Ld.T - dense).max(), 1e-12 * np.abs(dense).max())
+
+    def test_mesh_systems(self):
+        """Dissected sheet and block grids factor to round-off."""
+        for shape in ((30, 30, 1), (10, 10, 10)):
+            with self.subTest(shape=shape):
+                self.assert_factors(*grid_system(*shape))
+
+    def test_disconnected_meshes(self):
+        """Two separate grids, whose dissection has an empty separator, factor to round-off."""
+        a, pa = grid_system(8, 8, 2)
+        b, pb = grid_system(6, 6, 3)
+        n = a.shape[0] + b.shape[0]
+        rows = np.concatenate([a.row_of_entries(), b.row_of_entries() + a.shape[0]])
+        cols = np.concatenate([a.indices, b.indices + a.shape[0]])
+        both = CsrMatrix.from_triplets((n, n), rows, cols, np.concatenate([a.data, b.data]))
+        self.assert_factors(both, np.concatenate([pa, pb + 100.0]))
+
+    def test_dense_without_positions(self):
+        """Without points the factorization is dense, in the matrix's own order."""
+        rng = np.random.default_rng(5)
+        root = rng.standard_normal((40, 40))
+        matrix = CsrMatrix.from_matrix(root @ root.T + 40.0 * np.eye(40))
+        order, _, _ = factor_ldlt(matrix)
+        np.testing.assert_array_equal(order, np.arange(40))
+        self.assert_factors(matrix, None)
+
+    def test_rejects_indefinite(self):
+        """A matrix with a negative eigenvalue is not factored."""
+        with self.assertRaises(np.linalg.LinAlgError):
+            factor_ldlt(CsrMatrix.from_matrix(np.diag([1.0, -1.0, 2.0])))
 
 
 if __name__ == "__main__":
