@@ -128,8 +128,8 @@ class SolverFBA(SolverBase):
         face_contact_margin: float | None = None,
         particle_enable_self_contact: bool = False,
         particle_self_contact_mode: Literal["vertex_face", "vertex_vertex"] = "vertex_face",
-        particle_self_contact_radius: float = 2.0e-3,
-        particle_self_contact_margin: float | None = None,
+        particle_self_contact_margin: float = 2.0e-3,
+        particle_self_contact_gap: float | None = None,
         particle_topological_contact_filter_threshold: int = 2,
         particle_rest_shape_contact_exclusion_radius: float = 0.0,
     ) -> None:
@@ -227,16 +227,18 @@ class SolverFBA(SolverBase):
                 ``friction=True``, ``use_isodof=True`` and no
                 ``mu_per_pair_override``; friction takes ``model.particle_mu``.
             particle_self_contact_mode: ``"vertex_face"`` keeps each particle
-                ``particle_self_contact_radius`` from its nearest triangle, which
-                covers crossing edges only when the radius reaches half of the
-                longest edge. ``"vertex_vertex"`` keeps particles that radius
+                ``particle_self_contact_margin`` from its nearest triangle, which
+                covers crossing edges only when the margin reaches half of the
+                longest edge. ``"vertex_vertex"`` keeps particles that margin
                 apart, which covers the surface when it reaches the longest edge
                 (twice the largest circumradius of acute triangles), and leaves
                 a bumpy contact surface.
-            particle_self_contact_radius: Contact distance [m].
-            particle_self_contact_margin: Detection distance [m], at least the
-                radius, twice it by default; it bounds the relative motion per
-                step that cannot pass a contact.
+            particle_self_contact_margin: Self-contact distance [m]: the
+                distance at which a particle and a triangle or particle stop.
+            particle_self_contact_gap: Additional detection distance [m]: self
+                contacts are found within the margin plus the gap, which bounds
+                the relative motion per step that cannot pass a contact.
+                ``None`` takes the margin.
             particle_topological_contact_filter_threshold: Mesh edges within
                 which particles do not collide with each other or with
                 triangles that have such a particle.
@@ -311,16 +313,16 @@ class SolverFBA(SolverBase):
         if particle_enable_self_contact:
             if not self.friction or not self.use_isodof or mu_per_pair_override is not None:
                 raise ValueError("self contact needs friction=True, use_isodof=True and no mu_per_pair_override")
-            margin = particle_self_contact_margin
-            margin = 2.0 * particle_self_contact_radius if margin is None else margin
-            if margin < particle_self_contact_radius:
-                raise ValueError("particle_self_contact_margin is smaller than particle_self_contact_radius")
+            gap = particle_self_contact_margin if particle_self_contact_gap is None else particle_self_contact_gap
+            if gap < 0.0:
+                raise ValueError(f"particle_self_contact_gap must be >= 0, got {gap}")
             from .self_contact import SelfContact  # noqa: PLC0415
 
-            self.particle_self_contact_radius = float(particle_self_contact_radius)
+            self.particle_self_contact_margin = float(particle_self_contact_margin)
+            query_radius = particle_self_contact_margin + gap
             filter_rings = particle_topological_contact_filter_threshold
             rest_radius = particle_rest_shape_contact_exclusion_radius
-            self._self_contact = SelfContact(model, particle_self_contact_mode, margin, filter_rings, rest_radius)
+            self._self_contact = SelfContact(model, particle_self_contact_mode, query_radius, filter_rings, rest_radius)
         if self.face_contacts:
             if not self.friction or nsn_schur_mode != "full" or not self.use_isodof or mu_per_pair_override is not None:
                 raise ValueError(
@@ -2202,8 +2204,8 @@ class SolverFBA(SolverBase):
                     extra = [np.full((M, 2), -1, dtype=np.int32), np.zeros((M, 2), dtype=np.float32)]
                     extra = [np.concatenate([extra[0], tri[:, 1:]]), np.concatenate([extra[1], bary[:, 1:]])]
                     M = len(particle_h)
-            # Self contacts follow, with a static anchor at the contact radius along their normal: their rows hold
-            # n . sum_k alpha_k x_k >= radius and start without tangential offset.
+            # Self contacts follow, with a static anchor at the contact margin along their normal: their rows hold
+            # n . sum_k alpha_k x_k >= margin and start without tangential offset.
             shape_contacts = M
             if self._self_contact is not None:
                 src = state if state is not None else self.model
@@ -2211,7 +2213,7 @@ class SolverFBA(SolverBase):
                 if len(sp):
                     particle_h, alpha_h = np.concatenate([particle_h, sp[:, 0]]), np.concatenate([alpha_h, sa[:, 0]])
                     shape_h, normal_h = np.concatenate([shape_h, np.full(len(sp), -1)]), np.concatenate([normal_h, sn])
-                    body_pos_h = np.concatenate([body_pos_h, self.particle_self_contact_radius * sn])
+                    body_pos_h = np.concatenate([body_pos_h, self.particle_self_contact_margin * sn])
                     if extra is None:
                         extra = [np.full((M, 3), -1, dtype=np.int32), np.zeros((M, 3), dtype=np.float32)]
                     else:
@@ -2439,7 +2441,7 @@ class SolverFBA(SolverBase):
         extra = [wp.empty((M, 3), dtype=t, device=device) for t in (wp.int32, wp.float32)]
         inputs = [order, contacts.soft_contact_particle, contacts.soft_contact_shape, contacts.soft_contact_body_pos]
         inputs += [contacts.soft_contact_normal, sc.found_particles, sc.found_alpha, sc.found_normal, Ms]
-        inputs += [self.particle_self_contact_radius]
+        inputs += [self.particle_self_contact_margin]
         outputs = [self._contact_particle_d, self._contact_normal_d, self._contact_alpha_d, self._contact_shape_d]
         outputs += [self._contact_body_pos_d, *extra]
         wp.launch(assemble_contacts_kernel, M, inputs, outputs, device=device)

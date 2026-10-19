@@ -24,7 +24,7 @@ from newton.solvers import SolverFBA, SolverFeatherstone
 TABLE_TOP, CELL = 0.2, 0.01  # table top and towel grid spacing [m]
 NEAR, FAR = -0.2, 0.16  # towel edges along x [m]; the fold line lies midway
 CORNERS_Y = (-0.75, -0.25)  # the towel's side edges, in line with the arms' bases [m]
-THICKNESS, SELF_RADIUS = 0.004, 0.01  # the towel's contact thickness and the distance its folded layers keep [m]
+THICKNESS, SELF_MARGIN = 0.004, 0.01  # the towel's contact thickness and the distance its folded layers keep [m]
 OPEN, CLOSED = 0.04, 0.012  # finger joint positions [m]: the pads stand twice that apart
 # From the last link to the middle of the fingertip pads, and their half width and half length [m]; their axes in
 # the last link's frame, as columns: closing, spanning the pads and out of the fingertips.
@@ -40,7 +40,7 @@ GRASP_RISE, INTO_GAP = 0.5, -0.002
 _ARC, _MID, _R = np.radians([45.0, 90.0, 135.0, 180.0]), 0.5 * (FAR + NEAR), 0.5 * (FAR - NEAR) - INSET
 KEY_T = [0.0, 1.5, 2.5, 3.0, 3.6, 4.2, 4.8, 5.4, 6.0, 7.0]
 KEY_X = [_MID + _R] * 3 + [*(_MID + _R * np.cos(_ARC)), *[_MID - _R] * 3]
-KEY_Z = [GRASP + 0.1, GRASP, GRASP, *(GRASP + _R * np.sin(_ARC[:3])), *[GRASP + SELF_RADIUS + 0.005] * 3, GRASP + 0.1]
+KEY_Z = [GRASP + 0.1, GRASP, GRASP, *(GRASP + _R * np.sin(_ARC[:3])), *[GRASP + SELF_MARGIN + 0.005] * 3, GRASP + 0.1]
 KEY_Q = [OPEN, OPEN, *[CLOSED] * 6, OPEN, OPEN]
 
 
@@ -106,9 +106,9 @@ class Example:
             # Bounds a contact row at 1 N, five times what a landing particle needs.
             lambda_cap=1.0,
             particle_enable_self_contact=True,
-            particle_self_contact_radius=SELF_RADIUS,
+            particle_self_contact_margin=SELF_MARGIN,
             particle_topological_contact_filter_threshold=1,
-            particle_rest_shape_contact_exclusion_radius=SELF_RADIUS,
+            particle_rest_shape_contact_exclusion_radius=SELF_MARGIN,
         )
         self.pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=THICKNESS)
         self.contacts = self.pipeline.contacts()
@@ -206,10 +206,10 @@ class Example:
         # curl and the edge that swings past, it keeps at least half the self-contact radius from it.
         x0, x = self.model.particle_q.numpy(), self.state_0.particle_q.numpy()
         far = x[x0[:, 0] > _MID]
-        assert (far[:, 0] < _MID + SELF_RADIUS).all(), "part of the towel's far half is not folded over"
-        over = far[(far[:, 0] > NEAR + CELL) & (far[:, 0] < _MID - 2.0 * SELF_RADIUS)]
+        assert (far[:, 0] < _MID + SELF_MARGIN).all(), "part of the towel's far half is not folded over"
+        over = far[(far[:, 0] > NEAR + CELL) & (far[:, 0] < _MID - 2.0 * SELF_MARGIN)]
         low = over[:, 2].min() - (TABLE_TOP + THICKNESS)
-        assert low > 0.5 * SELF_RADIUS, f"the folded layer comes {low * 1e3:.1f} mm close to the one below"
+        assert low > 0.5 * SELF_MARGIN, f"the folded layer comes {low * 1e3:.1f} mm close to the one below"
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)

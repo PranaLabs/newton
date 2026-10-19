@@ -107,7 +107,7 @@ class Example:
         self.cloth_body_contact_margin = 0.8
         # Distance the shirt keeps each particle from its nearest triangle (cm). At 0.8 cm the layers of the
         # dropping shirt cross, 72 triangle pairs for good; 1.2 cm keeps them apart.
-        self.cloth_self_contact_radius = 1.2
+        self.cloth_self_contact_margin = 1.2
 
         # Robot-side contact materials (cm scale, copied from VBD reference;
         # FBA doesn't actually consume ke/kd directly — it uses the rigid
@@ -281,13 +281,13 @@ class Example:
                 # table needs 0.14 N, a landing one up to 50 N; two self contacts of
                 # the landing layers reach the limit for a step.
                 lambda_cap=2.0e4,
-                # The shirt keeps each particle its self-contact radius from its nearest triangle, but
+                # The shirt keeps each particle its self-contact margin from its nearest triangle, but
                 # not from triangles within one ring or within that distance at rest, so folds close
                 # only between parts that start apart.
                 particle_enable_self_contact=True,
-                particle_self_contact_radius=self.cloth_self_contact_radius,
+                particle_self_contact_margin=self.cloth_self_contact_margin,
                 particle_topological_contact_filter_threshold=1,
-                particle_rest_shape_contact_exclusion_radius=self.cloth_self_contact_radius,
+                particle_rest_shape_contact_exclusion_radius=self.cloth_self_contact_margin,
                 nsn_linear_iterations=10,
             )
 
@@ -350,7 +350,7 @@ class Example:
         with np.errstate(divide="ignore", invalid="ignore"):
             ends = ((np.array([0.0, 0.0, PAD_CENTER]) + np.stack([-half, half]))[:, None] - local) / up
         enter, leave = np.nanmax(ends.min(axis=0), axis=1), np.nanmin(ends.max(axis=0), axis=1)
-        reach = 2.0 * self.cloth_particle_radius + self.cloth_self_contact_radius
+        reach = 2.0 * self.cloth_particle_radius + self.cloth_self_contact_margin
         under = np.flatnonzero((enter <= leave) & (leave >= 0.0) & (enter <= reach))
         # The solver holds up to 21 particles at points: keep the nearest to the gap.
         self.grasped = under[np.argsort(enter[under])[:21]].astype(np.int32)
@@ -442,7 +442,7 @@ class Example:
         self.fingertip_axes = np.array([[1.0, -1.0, 0.0], [1.0, 1.0, 0.0], [0.0, 0.0, np.sqrt(2.0)]]) / np.sqrt(2.0)
 
         # Over the 20 cm table top, with the pads' lowest edge 0.6 cm under the end effector in the grasp pose.
-        grasp_z = 20.0 + 2.0 * self.cloth_particle_radius + self.cloth_self_contact_radius + 0.1 + 0.6
+        grasp_z = 20.0 + 2.0 * self.cloth_particle_radius + self.cloth_self_contact_margin + 0.1 + 0.6
         # The first fold of the SolverVBD reference: the later folds stack layers of the shirt, which needs
         # cloth self-contact.
         self.robot_key_poses = np.array(

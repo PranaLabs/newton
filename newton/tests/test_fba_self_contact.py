@@ -178,32 +178,33 @@ class TestSelfContactSolve(unittest.TestCase):
         z = s0.particle_q.numpy()[:, 2]
         return worst, z[model.particle_count // 2 :].mean() - z[: model.particle_count // 2].mean()
 
-    def test_vertex_face_holds_the_radius(self):
+    def test_vertex_face_holds_the_margin(self):
         """The upper sheet comes to rest 5 mm over the lower one without a single crossing triangle; without self
-        contact it falls into it. The 2.5 cm margin exceeds the 1.25 cm the sheet falls in its last step."""
+        contact it falls into it. Contacts are found within 2.5 cm, the 5 mm margin plus the 2 cm gap, more than the
+        1.25 cm the sheet falls in its last step."""
         self.assertGreater(self._drop(0.03)[0], 100)
-        kw = {"particle_self_contact_radius": 0.005, "particle_self_contact_margin": 0.025}
+        kw = {"particle_self_contact_margin": 0.005, "particle_self_contact_gap": 0.02}
         worst, gap = self._drop(0.03, particle_enable_self_contact=True, **kw)
         self.assertEqual(worst, 0)
         self.assertAlmostEqual(gap, 0.005, delta=2e-4)
 
-    def test_vertex_vertex_holds_the_radius(self):
+    def test_vertex_vertex_holds_the_margin(self):
         """Particles 3 cm apart cover the 2.8 cm longest edges; the upper sheet, without friction, nests between
         the lower particles, 2.65 to 3 cm over them, without a crossing triangle. With friction, one NSN step per
         local-global iteration does not hold the tilted rows: the sheet sinks to 14 mm."""
-        kw = {"particle_self_contact_mode": "vertex_vertex", "particle_self_contact_radius": 0.03}
-        kw |= {"particle_self_contact_margin": 0.0315}
+        kw = {"particle_self_contact_mode": "vertex_vertex", "particle_self_contact_margin": 0.03}
+        kw |= {"particle_self_contact_gap": 0.0015}
         worst, gap = self._drop(0.035, mu=0.0, particle_enable_self_contact=True, **kw)
         self.assertEqual(worst, 0)
         self.assertGreater(gap, 0.026)
         self.assertLess(gap, 0.030)
 
-    def test_lite_nsn_holds_the_radius(self):
-        """In the lite NSN, rows on several particles join a sparse solve, and both modes hold their radius as in
+    def test_lite_nsn_holds_the_margin(self):
+        """In the lite NSN, rows on several particles join a sparse solve, and both modes hold their margin as in
         the full NSN, at steps of 1/600 s where the lite Delassus approximation holds for this cloth."""
-        vertex_face = {"particle_self_contact_radius": 0.005, "particle_self_contact_margin": 0.01}
-        vertex_vertex = {"particle_self_contact_mode": "vertex_vertex", "particle_self_contact_radius": 0.03}
-        vertex_vertex["particle_self_contact_margin"] = 0.0315
+        vertex_face = {"particle_self_contact_margin": 0.005, "particle_self_contact_gap": 0.005}
+        vertex_vertex = {"particle_self_contact_mode": "vertex_vertex", "particle_self_contact_margin": 0.03}
+        vertex_vertex["particle_self_contact_gap"] = 0.0015
         for kw, start, low, high in ((vertex_face, 0.015, 0.0049, 0.0051), (vertex_vertex, 0.035, 0.0265, 0.030)):
             lite = {"particle_enable_self_contact": True, "nsn_schur_mode": "lite"}
             worst, gap = self._drop(start, cells=6, fps=600, steps=80, **kw, **lite)
@@ -231,7 +232,7 @@ class TestSelfContactSolve(unittest.TestCase):
             corner = wp.vec3(shift - 0.06, shift - 0.06, z)
             builder.add_cloth_grid(pos=corner, rot=wp.quat_identity(), vel=wp.vec3(0.0), **grid)
         model = builder.finalize()
-        kw = {"particle_self_contact_radius": 0.005, "particle_self_contact_margin": 0.01}
+        kw = {"particle_self_contact_margin": 0.005, "particle_self_contact_gap": 0.005}
         solver = newton.solvers.SolverFBA(
             model, iterations=10, nsn_schur_mode="lite", particle_enable_self_contact=True, **kw
         )
