@@ -104,6 +104,11 @@ class Example:
         self.contacts = self.pipeline.contacts()
         self.gravity = self.model.gravity.numpy()
         self.held = [None, None]  # per hand: pinched particles, their pad frame points before and after rising, time
+        # The fingers' collision boxes: body, transform in it and half extents.
+        m, bodies = self.model, [h + k for h in self.hands for k in (1, 2)]
+        boxes = np.isin(m.shape_body.numpy(), bodies) & (m.shape_type.numpy() == newton.GeoType.BOX)
+        shapes = zip(*(a.numpy()[boxes] for a in (m.shape_body, m.shape_transform, m.shape_scale)), strict=True)
+        self.finger_boxes = [(body, wp.transform(*X), half) for body, X, half in shapes]
 
         self.viewer.set_model(self.model)
         self.viewer.set_camera(pos=wp.vec3(1.25, -0.5, 0.95), pitch=-25.0, yaw=180.0)
@@ -169,6 +174,22 @@ class Example:
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
             self.sim_time += self.sim_dt
+
+    def test_post_step(self):
+        x, body_q = self.state_0.particle_q.numpy(), self.state_0.body_q.numpy()
+        speed = np.abs(self.state_0.particle_qd.numpy()).max()
+        assert speed < 2.0, f"particle speed {speed:.2f} m/s at t={self.sim_time:.2f} s"
+        free = np.ones(len(x), dtype=bool)
+        for hand, held in enumerate(self.held):
+            if held is not None:
+                free[held[0]] = False
+                origin, axes = self.pad_frame(self.state_0, hand)
+                off = np.abs(x[held[0]] - origin - held[2] @ axes.T).max()
+                assert self.sim_time - held[3] < GRASP_RISE or off < 1.0e-3, f"a pinched particle is {off:.4f} m off"
+        for body, X_bs, half in self.finger_boxes:
+            X = wp.transform(*body_q[body]) * X_bs
+            inside = np.abs((x[free] - X.p) @ np.array(wp.quat_to_matrix(X.q)).reshape(3, 3)) - half
+            assert inside.max(axis=1).min() > 0.0, f"a towel particle is inside a finger at t={self.sim_time:.2f} s"
 
     def test_final(self):
         # The far half lies folded over the near half: where it covers the flat near half, away from the fold's
