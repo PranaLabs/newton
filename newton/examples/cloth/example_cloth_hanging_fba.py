@@ -63,6 +63,8 @@ class Example:
         self.state_1 = self.model.state()
 
         self.viewer.set_model(self.model)
+        # Toward the middle of the sheet, which hangs in the x-y plane.
+        self.viewer.set_camera(pos=wp.vec3(2.0, 3.0, 3.0), pitch=-7.1, yaw=-111.8)
 
     def step(self):
         self.state_0.clear_forces()

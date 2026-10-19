@@ -53,6 +53,8 @@ class Example:
         self.state_1 = self.model.state()
 
         self.viewer.set_model(self.model)
+        # From the side, where the free face is seen sagging in the x-z plane.
+        self.viewer.set_camera(pos=wp.vec3(0.25, -0.4, 0.1), pitch=-5.4, yaw=91.8)
 
     def step(self):
         self.state_0.clear_forces()
