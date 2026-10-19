@@ -45,7 +45,8 @@ class SolverFBA(SolverBase):
     .. experimental::
 
         :class:`SolverFBA`, its constructor options and its solver-specific
-        attributes may change without the normal deprecation period.
+        attributes may change without the normal deprecation period. It
+        simulates models with one world.
 
     Implements a Projective Dynamics (PD) local-global iteration for cloth
     with isotropic stretching (ARAP or corotational), isometric bending,
@@ -271,6 +272,11 @@ class SolverFBA(SolverBase):
                 between parts that start apart.
         """
         super().__init__(model)
+        if model.world_count > 1:
+            raise ValueError(
+                f"SolverFBA simulates one world, but the model has {model.world_count}: its contact solve and "
+                "self contacts span all particles of the model"
+            )
 
         # ---- Validate ----
         if model.particle_count == 0 and model.body_count == 0:

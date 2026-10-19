@@ -3964,6 +3964,25 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
         )
         return builder.finalize()
 
+    def test_several_worlds_are_refused(self) -> None:
+        """Refuse a model with two worlds, whose contact solve and self contacts would couple them."""
+        cloth = newton.ModelBuilder()
+        cloth.add_cloth_grid(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=2,
+            dim_y=2,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.1,
+            tri_ke=50.0,
+        )
+        builder = newton.ModelBuilder()
+        builder.replicate(cloth, 2)
+        with self.assertRaisesRegex(ValueError, "one world"):
+            SolverFBA(builder.finalize())
+
     def test_lambda_cap_default_is_none(self) -> None:
         model = self._tiny_cloth_model()
         solver = SolverFBA(model)
