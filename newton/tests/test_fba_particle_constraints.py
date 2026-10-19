@@ -41,7 +41,7 @@ class TestParticleConstraints(unittest.TestCase):
     def _run(self, model, rows=None, steps=60):
         solver = newton.solvers.SolverFBA(model, iterations=10)
         if rows is not None:
-            solver.set_particle_constraints(*rows)
+            solver.set_particle_constraints(*rows[:3], directions=rows[3] if len(rows) > 3 else None)
         pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.025)
         contacts, s0, s1 = pipeline.contacts(), model.state(), model.state()
         for _ in range(steps):
@@ -158,7 +158,7 @@ class TestParticleConstraints(unittest.TestCase):
         x0 = model.particle_q.numpy()[12]
         for k in range(60):
             target = x0 + ([0.0, 0.0, -0.002] if k < 30 else [0.2 * (k - 29) / 60.0, 0.0, 0.05])
-            solver.set_particle_constraints([[12]] * 3, [[1.0]] * 3, target, np.eye(3))
+            solver.set_particle_constraints([[12]] * 3, [[1.0]] * 3, target, directions=np.eye(3))
             pipeline.collide(s0, contacts)
             solver.step(s0, s1, None, contacts, 1.0 / 60.0)
             s0, s1 = s1, s0
@@ -198,7 +198,7 @@ class TestParticleConstraints(unittest.TestCase):
         for k in range(20):
             target = x0 + np.array([0.0, 0.0, 0.05 * (k + 1) / 20])
             rows = np.repeat(held, 3)[:, None], np.ones((12, 1)), target.reshape(-1), np.tile(np.eye(3), (4, 1))
-            solver.set_particle_constraints(*rows)
+            solver.set_particle_constraints(*rows[:3], directions=rows[3] if len(rows) > 3 else None)
             pipeline.collide(s0, contacts)
             solver.step(s0, s1, None, contacts, 1.0 / 60.0)
             s0, s1 = s1, s0
@@ -209,7 +209,7 @@ class TestParticleConstraints(unittest.TestCase):
         with self.assertRaises(ValueError):
             solver.set_particle_constraints([[0]], [[1.0]], [1.0])
         with self.assertRaises(ValueError):
-            solver.set_particle_constraints([[0, 1]], [[1.0, -1.0]], [0.0], [[0.0, 0.0, 1.0]])
+            solver.set_particle_constraints([[0, 1]], [[1.0, -1.0]], [0.0], directions=[[0.0, 0.0, 1.0]])
 
 
 if __name__ == "__main__":

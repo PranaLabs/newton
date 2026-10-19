@@ -366,7 +366,10 @@ class Example:
         targets = origin + (self.grasp_from + rise * (self.grasp_to - self.grasp_from)) @ axes.T
         n = len(self.grasped)
         self.cloth_solver.set_particle_constraints(
-            np.repeat(self.grasped, 3)[:, None], np.ones((3 * n, 1)), targets.reshape(-1), np.tile(np.eye(3), (n, 1))
+            np.repeat(self.grasped, 3)[:, None],
+            np.ones((3 * n, 1)),
+            targets.reshape(-1),
+            directions=np.tile(np.eye(3), (n, 1)),
         )
 
     def update_grasp(self):

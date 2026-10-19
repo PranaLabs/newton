@@ -22,7 +22,7 @@ class Cable:
         min_ratio: Shortest length as a fraction of the rest length.
     """
 
-    def __init__(self, model, points, min_ratio: float = 0.85):
+    def __init__(self, model, points, *, min_ratio: float = 0.85):
         points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
         if len(points) == 0 or len(points) % 2:
             raise ValueError("a cable needs pairs of points")

@@ -246,7 +246,7 @@ class TestSelfContactSolve(unittest.TestCase):
             target = base + np.array([0.0, 0.0, 0.03 * min(1.0, (k + 1) / 60.0)])
             directions = np.tile(np.eye(3), (8, 1))
             solver.set_particle_constraints(
-                np.repeat(held, 3)[:, None], np.ones((24, 1)), target.reshape(-1), directions
+                np.repeat(held, 3)[:, None], np.ones((24, 1)), target.reshape(-1), directions=directions
             )
             pipeline.collide(s0, contacts)
             solver.step(s0, s1, None, contacts, 1.0 / 600.0)

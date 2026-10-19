@@ -163,7 +163,9 @@ class Example:
             return
         p, x = (np.concatenate(a) for a in zip(*rows, strict=True))
         eye = np.tile(np.eye(3), (len(p), 1))
-        self.solver.set_particle_constraints(np.repeat(p, 3)[:, None], np.ones((3 * len(p), 1)), x.reshape(-1), eye)
+        self.solver.set_particle_constraints(
+            np.repeat(p, 3)[:, None], np.ones((3 * len(p), 1)), x.reshape(-1), directions=eye
+        )
 
     def step(self):
         target = self.key_pose(self.sim_time + self.frame_dt)

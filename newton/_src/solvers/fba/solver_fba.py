@@ -42,6 +42,11 @@ def _host_mirror(name: str) -> property:
 class SolverFBA(SolverBase):
     """Fast But Accurate projective-dynamics cloth solver.
 
+    .. experimental::
+
+        :class:`SolverFBA`, its constructor options and its solver-specific
+        attributes may change without the normal deprecation period.
+
     Implements a Projective Dynamics (PD) local-global iteration for cloth
     with isotropic stretching (ARAP or corotational), isometric bending,
     and soft Pin constraints. The PD Hessian is prefactored once (nested dissection
@@ -121,6 +126,7 @@ class SolverFBA(SolverBase):
     def __init__(
         self,
         model: Model,
+        *,
         iterations: int = 10,
         pin_stiffness: float = 1e12,
         stretching_model: Literal["arap", "corotational", "neohookean"] = "arap",
@@ -1907,7 +1913,7 @@ class SolverFBA(SolverBase):
         else:
             self._x_ref.assign(np.asarray(target_positions, dtype=np.float32))
 
-    def set_particle_constraints(self, particles, coefficients, targets, directions=None) -> None:
+    def set_particle_constraints(self, particles, coefficients, targets, *, directions=None) -> None:
         """Hold lengths or linear combinations of particle positions in the following steps.
 
         Row ``r`` combines ``v_r = sum_k coefficients[r, k] * x[particles[r, k]]``. Without ``directions``
