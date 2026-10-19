@@ -2196,6 +2196,30 @@ class TestDynamicPin(unittest.TestCase):
             f"Pin should follow target; final={final}, target={target}",
         )
 
+    def test_pinned_particles_with_mass_hold_their_targets(self):
+        """Hold particles with zero inverse mass at their pin targets when they keep a mass."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0, 1.0, 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=1,
+            dim_y=1,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=1.0,
+            tri_ke=5000.0,
+        )
+        model = builder.finalize()
+        model.particle_inv_mass.zero_()  # every particle pinned, with its mass kept
+        solver = SolverFBA(model, iterations=5, pin_stiffness=1.0e6)
+        s0, s1 = model.state(), model.state()
+        x0 = s0.particle_q.numpy()
+        for _ in range(10):
+            solver.step(s0, s1, None, None, 1.0 / 60.0)
+            s0, s1 = s1, s0
+        np.testing.assert_allclose(s0.particle_q.numpy(), x0, atol=1.0e-6)
+
 
 class TestTetHessianAssembly(unittest.TestCase):
     """Verify tet Hessian block assembly in build_pd_system."""

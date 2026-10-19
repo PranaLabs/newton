@@ -36,6 +36,15 @@ from .kernels import (
 from .sparse_ldlt import CscMatrix, CsrMatrix, factor_ldlt
 
 
+def particle_masses(model: Model) -> tuple[np.ndarray, np.ndarray]:
+    """Masses [kg] and inverse masses [1/kg] of the particles, with zero mass for the pinned ones, which have zero
+    inverse mass."""
+    mass = model.particle_mass.numpy().astype(np.float64)
+    inv_mass = model.particle_inv_mass.numpy().astype(np.float64)
+    mass[inv_mass == 0.0] = 0.0
+    return mass, inv_mass
+
+
 def build_pd_system(
     model: Model,
     dt: float,
@@ -71,8 +80,7 @@ def build_pd_system(
         - ``meta["pin_weight"]`` : float
     """
     N = model.particle_count
-    mass = model.particle_mass.numpy().astype(np.float64)
-    inv_mass = model.particle_inv_mass.numpy().astype(np.float64)
+    mass, inv_mass = particle_masses(model)
 
     # COO triplet buffers — collected as a list of (rows, cols, vals) NumPy
     # arrays produced by each contribution (mass, pins, tris, bending), then

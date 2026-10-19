@@ -1033,6 +1033,7 @@ class SolverFBA(SolverBase):
             FBALinearSolver,
             build_pd_system,
             factorize_and_sparse_inverse,
+            particle_masses,
         )
 
         A, meta = build_pd_system(
@@ -1044,6 +1045,11 @@ class SolverFBA(SolverBase):
         )
         fs = factorize_and_sparse_inverse(A, self.model.particle_q.numpy())
         self._linear_solver = FBALinearSolver(fs, device=self._device)
+        device = self._device
+        # Particles with zero inverse mass hold at their pin targets: a mass they keep must not pull them toward
+        # their inertial predictions.
+        mass = particle_masses(self.model)[0]
+        self._mass_d = wp.array(mass.astype(np.float32), dtype=wp.float32, device=device)
         # LiteNSN dense kernel + sparse BSR pipeline both consume the lite mass
         # matrix; build it once here so the per-step Schur dispatch is allocation-free.
         if self.nsn_schur_mode == "lite":
@@ -1055,7 +1061,6 @@ class SolverFBA(SolverBase):
         if self._held_rows is not None:
             self._held_rows[1] = None
 
-        device = self._device
         self._tri_indices_d = wp.array(
             meta["tri_indices"].flatten().astype(np.int32),
             dtype=wp.int32,
@@ -1697,7 +1702,7 @@ class SolverFBA(SolverBase):
         wp.launch(
             self._k_add_inertia,
             dim=N,
-            inputs=[self._x_inertia, model.particle_mass, dt],
+            inputs=[self._x_inertia, self._mass_d, dt],
             outputs=[self._rhs],
             device=device,
         )
