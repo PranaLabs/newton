@@ -2798,13 +2798,6 @@ def project_pin_kernel(
 
 
 @wp.kernel
-def zero_scalar_kernel(arr: wp.array[wp.float64]):
-    """arr[i] = 0.0 — zeroes a float64 scalar array."""
-    tid = wp.tid()
-    arr[tid] = wp.float64(0.0)
-
-
-@wp.kernel
 def build_contact_jacobian_vec3_kernel(
     particle_count: int,
     contact_idx: int,
@@ -2930,17 +2923,6 @@ def accumulate_schur_W_kernel(
     alpha = contact_alpha[c_prime]
     n = contact_dir[c_prime]
     W[c_prime, c] = wp.float64(alpha) * wp.float64(wp.dot(n, y_at_p))
-
-
-@wp.kernel
-def subtract_vec3_kernel(
-    a: wp.array[wp.vec3],
-    b: wp.array[wp.vec3],
-    out: wp.array[wp.vec3],
-):
-    """out[i] = a[i] - b[i]."""
-    tid = wp.tid()
-    out[tid] = a[tid] - b[tid]
 
 
 # ---------------------------------------------------------------------------
@@ -4663,166 +4645,6 @@ def compute_omega_times_lam_kernel(
     """Elementwise ``out[i] = omega[i] · lam[i]`` so we can feed ``bsr_mv``."""
     i = wp.tid()
     out[i] = omega[i] * lam[i]
-
-
-@wp.kernel
-def compute_particle_contact_residual_kernel(
-    # Per-row inputs:
-    row_particle_a: wp.array[wp.int32],  # (3M_self,)
-    row_particle_b: wp.array[wp.int32],  # (3M_self,) all valid (≥0)
-    row_dir: wp.array[wp.vec3],  # (3M_self,)
-    row_alpha: wp.array[wp.float32],  # (3M_self,)
-    row_offset: wp.array[wp.float64],  # (3M_self,) = pene0[i]; gap threshold for n rows, 0 for tangents
-    x: wp.array[wp.vec3],  # (N,) particle positions
-    # Output:
-    r: wp.array[wp.float64],  # (3M_self,)
-):
-    """Residual for self-contact rows: ``r[i] = offset[i] - α[i] · dot(dir[i], x[a] - x[b])``.
-
-    Same FB convention as :func:`compute_contact_residual_coulomb_kernel`:
-    positive r means "penetrating" (gap_threshold > current_signed_separation),
-    so the FB unilateral function drives ``λ > 0`` to push the pair apart.
-    """
-    i = wp.tid()
-    ia = row_particle_a[i]
-    ib = row_particle_b[i]
-    alpha = wp.float64(row_alpha[i])
-    diff = x[ia] - x[ib]
-    r[i] = row_offset[i] - alpha * wp.float64(wp.dot(row_dir[i], diff))
-
-
-@wp.kernel
-def scatter_jt_lambda_two_particle_kernel(
-    n_rows: wp.int32,
-    row_particle_a: wp.array[wp.int32],
-    row_particle_b: wp.array[wp.int32],
-    row_dir: wp.array[wp.vec3],
-    row_alpha: wp.array[wp.float32],
-    lam: wp.array[wp.float32],
-    out: wp.array[wp.vec3],  # atomic-add target, length N
-):
-    """Per-row atomic scatter of ``Jᵀ·λ`` for 2-particle rows.
-
-    For each row r:
-        out[particle_a] += +α[r] · λ[r] · dir[r]
-        out[particle_b] += -α[r] · λ[r] · dir[r]   (only if particle_b ≥ 0)
-
-    Atomic adds make this non-deterministic across runs, but for the small
-    n_self contributions this is much simpler than building a per-step CSR.
-    Caller is responsible for zeroing ``out`` (or seeding it with the rigid
-    contribution) before launch.
-    """
-    i = wp.tid()
-    if i >= n_rows:
-        return
-    pa = row_particle_a[i]
-    contrib = row_alpha[i] * lam[i] * row_dir[i]
-    wp.atomic_add(out, pa, contrib)
-    pb = row_particle_b[i]
-    if pb >= wp.int32(0):
-        wp.atomic_add(out, pb, -contrib)
-
-
-@wp.kernel
-def gather_jt_lambda_two_particle_kernel(
-    # Per-particle CSR: row_offsets[p+1] - row_offsets[p] = number of
-    # signed entries for particle p.
-    row_offsets: wp.array[wp.int32],  # (N+1,)
-    row_indices: wp.array[wp.int32],  # (E,) — row idx
-    row_signs: wp.array[wp.float32],  # (E,) — +1.0 or -1.0
-    # Per-row direction and alpha (length = total self-contact rows).
-    row_dir: wp.array[wp.vec3],
-    row_alpha: wp.array[wp.float32],
-    lam: wp.array[wp.float32],
-    out: wp.array[wp.vec3],
-):
-    """Particle-centred ``Jᵀ·λ`` gather over rows that touch 2 particles.
-
-    For each particle ``p``, sums ``sign · α[r] · λ[r] · dir[r]`` over the
-    rows in its CSR slot.  ``sign`` is ``+1`` for rows where ``p ==
-    row_particle_a[r]`` and ``-1`` for rows where ``p == row_particle_b[r]``,
-    mirroring the ``∂/∂q`` of a relative-position constraint.
-
-    Writes (NOT accumulates) into ``out`` — caller zeroes ``out`` only on
-    particles that have entries.  Particles with empty rows leave ``out[p]``
-    unchanged from its prior value (so this kernel can be composed with the
-    rigid-side gather without zeroing rigid-only particles).
-    """
-    p = wp.tid()
-    start = row_offsets[p]
-    end = row_offsets[p + 1]
-    if start == end:
-        return
-    acc = wp.vec3(0.0, 0.0, 0.0)
-    for k in range(start, end):
-        ri = row_indices[k]
-        s = row_signs[k]
-        acc = acc + s * row_alpha[ri] * lam[ri] * row_dir[ri]
-    out[p] = out[p] + acc
-
-
-@wp.kernel
-def emit_particle_contact_rows_kernel(
-    n_pairs: wp.int32,
-    pair_a: wp.array[wp.int32],  # (n_pairs,)
-    pair_b: wp.array[wp.int32],  # (n_pairs,)
-    pair_normal: wp.array[wp.vec3],  # (n_pairs,) unit from b → a
-    gap_threshold: wp.float64,  # 2 · particle_radius
-    row_offset_base: wp.int32,  # where in the output arrays self rows start
-    row_particle_a: wp.array[wp.int32],
-    row_particle_b: wp.array[wp.int32],
-    row_dir: wp.array[wp.vec3],
-    row_alpha: wp.array[wp.float32],
-    row_offset: wp.array[wp.float64],
-    contact_mu: wp.array[wp.float64],  # (M_total,) per-contact μ — slot pair_to_contact_idx + p
-):
-    """Convert one broadphase pair into a Stage B contact (3 rows).
-
-    Tangent basis: build a stable orthonormal frame from the normal.  Pick
-    the world axis least aligned with ``n`` and Gram-Schmidt — avoids the
-    degeneracy of crossing ``n`` with itself when ``n`` happens to align
-    with a coordinate axis.
-
-    Friction μ is written by the host (single ``mu_d.fill_(self_friction_mu)``
-    call) — keeping it out of the kernel lets the caller pre-compose μ
-    arrays without re-launching this emit.
-    """
-    p = wp.tid()
-    if p >= n_pairs:
-        return
-    a = pair_a[p]
-    b = pair_b[p]
-    n = pair_normal[p]
-
-    ax = wp.float32(wp.abs(n[0]))
-    ay = wp.float32(wp.abs(n[1]))
-    az = wp.float32(wp.abs(n[2]))
-    if ax <= ay and ax <= az:
-        ref = wp.vec3(1.0, 0.0, 0.0)
-    elif ay <= az:
-        ref = wp.vec3(0.0, 1.0, 0.0)
-    else:
-        ref = wp.vec3(0.0, 0.0, 1.0)
-    t1 = wp.cross(n, ref)
-    t1 = t1 / wp.max(wp.length(t1), wp.float32(1.0e-9))
-    t2 = wp.cross(n, t1)
-
-    base = row_offset_base + 3 * p
-    row_particle_a[base + 0] = a
-    row_particle_b[base + 0] = b
-    row_dir[base + 0] = n
-    row_alpha[base + 0] = wp.float32(1.0)
-    row_offset[base + 0] = gap_threshold
-    row_particle_a[base + 1] = a
-    row_particle_b[base + 1] = b
-    row_dir[base + 1] = t1
-    row_alpha[base + 1] = wp.float32(1.0)
-    row_offset[base + 1] = wp.float64(0.0)
-    row_particle_a[base + 2] = a
-    row_particle_b[base + 2] = b
-    row_dir[base + 2] = t2
-    row_alpha[base + 2] = wp.float32(1.0)
-    row_offset[base + 2] = wp.float64(0.0)
 
 
 # ===========================================================================
