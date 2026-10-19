@@ -5100,13 +5100,33 @@ def compute_normal_offset_kernel(
 
 
 @wp.kernel
-def add_offset_kernel(
-    delta: wp.float64,
+def add_contact_thickness_kernel(
+    particle: wp.array[wp.int32],
+    extra_particle: wp.array2d[wp.int32],
+    extra_alpha: wp.array2d[wp.float32],
+    has_extra: int,
+    shape: wp.array[wp.int32],
+    particle_radius: wp.array[wp.float32],
+    shape_margin: wp.array[wp.float32],
     offset: wp.array[wp.float64],  # (M,) inout
 ):
-    """``offset[c] += delta``: the contact stops ``delta`` outside the shape surface."""
+    """Move each shape contact's plane out by the particle radius plus the shape margin.
+
+    A face contact interpolates the radii of its particles at its barycentric weights, as the first particle's
+    radius plus the weighted differences of the others, so that equal radii stay exact. A contact without a shape
+    (``shape < 0``) has no margin.
+    """
     c = wp.tid()
-    offset[c] = offset[c] + delta
+    radius0 = particle_radius[particle[c]]
+    radius = radius0
+    if has_extra:
+        for k in range(extra_particle.shape[1]):
+            p = extra_particle[c, k]
+            if p >= 0:
+                radius += extra_alpha[c, k] * (particle_radius[p] - radius0)
+    if shape[c] >= 0:
+        radius += shape_margin[shape[c]]
+    offset[c] = offset[c] + wp.float64(radius)
 
 
 @wp.kernel

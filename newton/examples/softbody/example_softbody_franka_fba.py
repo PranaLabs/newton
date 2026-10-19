@@ -102,7 +102,6 @@ class Example:
             iterations=10,
             stretching_model="neohookean",
             integrate_with_external_rigid_solver=True,
-            soft_contact_thickness=THICKNESS,
         )
         self.pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=0.005)
         self.contacts = self.pipeline.contacts()

@@ -72,14 +72,13 @@ class Example:
             tri_ke=2500.0,
             tri_ka=5.0e3,
             edge_ke=0.1,
+            particle_radius=3.0e-3,  # the cloth's contact thickness
         )
 
         self.model = builder.finalize()
         # Five LG iterations and at most ten conjugate residual iterations per contact solve.
-        self.solver = SolverFBA(
-            self.model, iterations=5, face_contacts=True, soft_contact_thickness=3.0e-3, nsn_linear_iterations=10
-        )
-        self.pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=0.05)
+        self.solver = SolverFBA(self.model, iterations=5, face_contacts=True, nsn_linear_iterations=10)
+        self.pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=0.147)
         self.contacts = self.pipeline.contacts()
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()

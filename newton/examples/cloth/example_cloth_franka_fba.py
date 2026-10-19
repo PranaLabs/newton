@@ -101,7 +101,8 @@ class Example:
 
         self.viz_scale = 0.01  # cm → m for the viewer
 
-        # Body-cloth contact margin (cm).
+        # Body-cloth contact (cm): shape contacts stop the particle radius out, so the shirt rests 0.8 cm over the
+        # table as with SolverVBD, and are detected up to the margin farther out.
         self.cloth_particle_radius = 0.8
         self.cloth_body_contact_margin = 0.8
         # Distance the shirt keeps each particle from its nearest triangle (cm). At 0.8 cm the layers of the
@@ -274,9 +275,6 @@ class Example:
                 nsn_schur_mode="lite",
                 # The robot is stepped by Featherstone before the cloth.
                 integrate_with_external_rigid_solver=True,
-                # The cloth particles' radius, as SolverVBD's contacts use it: the
-                # shirt rests 0.8 cm over the table.
-                soft_contact_thickness=self.cloth_particle_radius,
                 # Cloth squeezed between the closing rigid fingers or between them
                 # and the table has no solution; this force limit per contact row,
                 # 200 N in this cm-kg-s scene, bounds it. A particle resting on the

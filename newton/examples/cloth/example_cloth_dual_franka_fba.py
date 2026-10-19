@@ -103,7 +103,6 @@ class Example:
             nsn_schur_mode="lite",
             nsn_linear_iterations=10,
             integrate_with_external_rigid_solver=True,
-            soft_contact_thickness=THICKNESS,
             # Bounds a contact row at 1 N, five times what a landing particle needs.
             lambda_cap=1.0,
             particle_enable_self_contact=True,

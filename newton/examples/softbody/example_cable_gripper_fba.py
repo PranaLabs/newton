@@ -92,7 +92,6 @@ class Example:
             iterations=10,
             stretching_model="neohookean",
             face_contacts=True,
-            soft_contact_thickness=CONTACT_THICKNESS,
             face_contact_margin=0.01,
             # The box squeezed on the ground closes contact loops whose Newton steps rock the light box by
             # 41 rad/s at the default 1e-2; damping them by 0.1 leaves 1.3 rad/s.

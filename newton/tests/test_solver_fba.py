@@ -3078,8 +3078,8 @@ class TestPhase4StageAContact(unittest.TestCase):
     def test_contact_offset_per_shape_type(self):
         """Sphere, plane and cylinder contacts all take the plane through their anchor, ``n·anchor``.
 
-        The anchor is the closest shape point, so every contact stops on the
-        shape surface; ``soft_contact_thickness`` moves them all outward alike.
+        The anchor is the closest shape point; every contact then stops the
+        particle radius plus its shape's margin outside the shape surface.
         """
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
         # One free particle (needed so the solver has at least one DOF).
@@ -3100,13 +3100,16 @@ class TestPhase4StageAContact(unittest.TestCase):
             tri_kd=0.0,
             edge_ke=0.0,
             edge_kd=0.0,
+            particle_radius=0.01,
         )
         builder.particle_mass[1] = 0.0
         builder.particle_mass[2] = 0.0
         # Three static shapes covering the three relevant geometry types.
-        sphere_shape = builder.add_shape_sphere(body=-1, radius=0.5)
-        plane_shape = builder.add_shape_plane()
-        cylinder_shape = builder.add_shape_cylinder(body=-1, radius=0.3, half_height=0.4)
+        margin = {"sphere": 0.002, "plane": 0.0, "cylinder": 0.005}
+        cfg = {name: newton.ModelBuilder.ShapeConfig(margin=m) for name, m in margin.items()}
+        sphere_shape = builder.add_shape_sphere(body=-1, radius=0.5, cfg=cfg["sphere"])
+        plane_shape = builder.add_shape_plane(cfg=cfg["plane"])
+        cylinder_shape = builder.add_shape_cylinder(body=-1, radius=0.3, half_height=0.4, cfg=cfg["cylinder"])
         model = builder.finalize()
         device = model.device
 
@@ -3146,8 +3149,9 @@ class TestPhase4StageAContact(unittest.TestCase):
 
         # ``soft_contact_body_pos`` is stored float32: the dot product round-trips with ~1e-7 precision.
         base = float(np.dot(np.asarray(normal, dtype=np.float64), np.asarray(anchor, dtype=np.float64)))
-        for shape in (sphere_shape, plane_shape, cylinder_shape):
-            self.assertAlmostEqual(float(offsets[slot_of[shape]]), base, delta=1e-6)
+        shapes = {"sphere": sphere_shape, "plane": plane_shape, "cylinder": cylinder_shape}
+        for name, shape in shapes.items():
+            self.assertAlmostEqual(float(offsets[slot_of[shape]]), base + 0.01 + margin[name], delta=1e-6)
 
 
 class TestPhase4StageBFriction(unittest.TestCase):

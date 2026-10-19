@@ -8,6 +8,7 @@ Covers the kernels that replaced the Python ``for`` loop in
 
 * :func:`~newton._src.solvers.fba.kernels.compute_world_anchor_kernel`
 * :func:`~newton._src.solvers.fba.kernels.compute_normal_offset_kernel`
+* :func:`~newton._src.solvers.fba.kernels.add_contact_thickness_kernel`
 * :func:`~newton._src.solvers.fba.kernels.compute_tangent_basis_kernel`
 * :func:`~newton._src.solvers.fba.kernels.compute_tangent_offsets_kernel`
 * :func:`~newton._src.solvers.fba.kernels.compute_v_anchor_kernel`
@@ -132,6 +133,38 @@ class TestComputeNormalOffsetKernel(unittest.TestCase):
             K.compute_normal_offset_kernel, dim=4, inputs=[normals, wp.array(anchors, dtype=wp.vec3)], outputs=[offset]
         )
         np.testing.assert_allclose(offset.numpy(), [0.5, 2.0, 1.5, 0.25], atol=1e-7)
+
+
+class TestAddContactThicknessKernel(unittest.TestCase):
+    """Shape contacts stop the particle radius plus the shape margin outside the shape."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_radius_and_margin(self):
+        # A contact of particle 1 on shape 0, a face contact of triangle (0, 1, 2) at weights (0.5, 0.25, 0.25) on
+        # shape 0, and a contact of particle 2 without a shape.
+        radius = wp.array([0.001, 0.002, 0.004], dtype=wp.float32)
+        margin = wp.array([0.0005], dtype=wp.float32)
+        particle = wp.array([1, 0, 2], dtype=wp.int32)
+        extra_particle = wp.array(np.array([[-1, -1], [1, 2], [-1, -1]]), dtype=wp.int32)
+        extra_alpha = wp.array(np.array([[0.0, 0.0], [0.25, 0.25], [0.0, 0.0]]), dtype=wp.float32)
+        shape = wp.array([0, 0, -1], dtype=wp.int32)
+        offset = wp.array([1.0, 2.0, 3.0], dtype=wp.float64)
+        inputs = [particle, extra_particle, extra_alpha, 1, shape, radius, margin]
+        wp.launch(K.add_contact_thickness_kernel, dim=3, inputs=inputs, outputs=[offset])
+        np.testing.assert_allclose(offset.numpy(), [1.0025, 2.0025, 3.004], rtol=0.0, atol=1e-9)
+
+    def test_equal_radii_stay_exact(self):
+        # Equal radii give exactly that radius, whatever the weights.
+        radius = wp.array(np.full(3, 0.01), dtype=wp.float32)
+        extra_alpha = wp.array(np.array([[0.3, 0.3]]), dtype=wp.float32)
+        offset = wp.zeros(1, dtype=wp.float64)
+        inputs = [wp.array([0], dtype=wp.int32), wp.array(np.array([[1, 2]]), dtype=wp.int32), extra_alpha, 1]
+        inputs += [wp.array([0], dtype=wp.int32), radius, wp.zeros(1, dtype=wp.float32)]
+        wp.launch(K.add_contact_thickness_kernel, dim=1, inputs=inputs, outputs=[offset])
+        self.assertEqual(offset.numpy()[0], float(np.float32(0.01)))
 
 
 class TestComputeTangentBasisKernel(unittest.TestCase):
@@ -461,12 +494,14 @@ class TestUpdateContactsIntegration(unittest.TestCase):
         normal_sorted = normal[order].astype(np.float64)
         bpos_sorted = bpos[order].astype(np.float64)
         shape_sorted = shape[order].astype(np.int64)
+        particle_sorted = particle[order]
 
         # The plane is static so world_anchor = body_pos.
         np.testing.assert_allclose(world_anchor_d.astype(np.float64), bpos_sorted, atol=1e-5)
 
-        # offset_ref = dot(n, anchor).
+        # The contacts stop the particle radius plus the shape margin outside the plane: n·anchor + radius + margin.
         offset_ref = np.einsum("ij,ij->i", normal_sorted, bpos_sorted)
+        offset_ref += model.particle_radius.numpy()[particle_sorted] + model.shape_margin.numpy()[shape_sorted]
         np.testing.assert_allclose(offset_d, offset_ref, atol=1e-6)
         # Normals must round-trip through device storage with full fidelity.
         np.testing.assert_allclose(normal_d.astype(np.float64), normal_sorted, atol=1e-6)

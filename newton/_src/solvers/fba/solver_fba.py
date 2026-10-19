@@ -124,7 +124,6 @@ class SolverFBA(SolverBase):
         contact_regularization: float = 1.0e-2,
         face_contacts: bool = False,
         face_contact_edge_radius: float = 3.0e-3,
-        soft_contact_thickness: float = 0.0,
         nsn_linear_iterations: int | None = None,
         face_contact_margin: float | None = None,
         particle_enable_self_contact: bool = False,
@@ -212,11 +211,6 @@ class SolverFBA(SolverBase):
                 triangle point that sinks into the edge flips its normal and
                 pushes the cloth sideways; the rounding keeps the normal
                 continuous, as RealSim's smoothed SDF does.
-            soft_contact_thickness: Distance [m] outside a shape surface at
-                which particle and face contacts stop, the thickness of the
-                deformable surface. It shifts their constraint planes along
-                the contact normal and leaves rigid contacts and friction
-                unchanged; with ``0`` the points stop on the surface.
             nsn_linear_iterations: Iteration cap of the conjugate residual
                 solve in each NSN step, RealSim's
                 ``constraintsolver.iterations``. ``None`` solves to a relative
@@ -306,7 +300,6 @@ class SolverFBA(SolverBase):
         self.face_contacts = bool(face_contacts)
         self.face_contact_edge_radius = float(face_contact_edge_radius)
         self.face_contact_margin = None if face_contact_margin is None else float(face_contact_margin)
-        self.soft_contact_thickness = float(soft_contact_thickness)
         self._face_query, self._contact_extra = None, None
         self._constraint_rows = None  # set_particle_constraints: particles, coefficients, directions, targets
         self._constraint_lengths = False  # the rows hold |sum_k c_k x_k|, along its direction at each iteration
@@ -2312,16 +2305,20 @@ class SolverFBA(SolverBase):
             outputs=[self._contact_offset_d],
             device=device,
         )
-        if self.soft_contact_thickness != 0.0:
-            from .kernels import add_offset_kernel  # noqa: PLC0415
+        # Particle and face contacts stop the particle radius plus the shape margin outside the shape surface, as
+        # Newton's contact margins place them.
+        if shape_contacts:
+            from .kernels import add_contact_thickness_kernel  # noqa: PLC0415
 
-            wp.launch(
-                add_offset_kernel,
-                dim=shape_contacts,
-                inputs=[wp.float64(self.soft_contact_thickness)],
-                outputs=[self._contact_offset_d],
-                device=device,
-            )
+            extra = self._contact_extra
+            if extra is None:
+                extra = [
+                    wp.empty((1, 1), dtype=wp.int32, device=device),
+                    wp.empty((1, 1), dtype=wp.float32, device=device),
+                ]
+            inputs = [self._contact_particle_d, *extra, int(self._contact_extra is not None)]
+            inputs += [self._contact_shape_d, model.particle_radius, model.shape_margin]
+            wp.launch(add_contact_thickness_kernel, shape_contacts, inputs, [self._contact_offset_d], device=device)
 
         # Host mirrors of the basic contact fields, for the host paths that still read them.
         self._contact_particle_h = None if particle_h is None else particle_h.astype(np.int32)

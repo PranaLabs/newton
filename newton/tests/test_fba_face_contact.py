@@ -38,10 +38,10 @@ def _pyramid_mesh():
     return newton.Mesh(np.array(verts), np.ravel([(0, 1, 2), (0, 2, 3), (0, 3, 4), (0, 4, 1), (1, 3, 2), (1, 4, 3)]))
 
 
-def _add_triangle_over_tip(builder):
+def _add_triangle_over_tip(builder, radius=0.002):
     """A triangle of circumradius 0.15 m centered 4 mm above the origin; its particles are 0.13 m from the pyramid."""
     for a in np.deg2rad([0.0, 120.0, 240.0]):
-        builder.add_particle(wp.vec3(0.15 * np.cos(a), 0.15 * np.sin(a), 0.004), wp.vec3(0.0), 0.01, radius=0.002)
+        builder.add_particle(wp.vec3(0.15 * np.cos(a), 0.15 * np.sin(a), 0.004), wp.vec3(0.0), 0.01, radius=radius)
     builder.add_triangle(0, 1, 2, tri_ke=50.0)
 
 
@@ -263,12 +263,11 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
             tri_ke=2500.0,
             tri_ka=5.0e3,
             edge_ke=0.1,
+            particle_radius=thickness,
         )
         model = builder.finalize()
-        solver = newton.solvers.SolverFBA(
-            model, iterations=10, face_contacts=face_contacts, soft_contact_thickness=thickness
-        )
-        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.05)
+        solver = newton.solvers.SolverFBA(model, iterations=10, face_contacts=face_contacts)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.15 - thickness)
         contacts, s0, s1, speed = pipeline.contacts(), model.state(), model.state(), 0.0
         for _ in range(steps):
             pipeline.collide(s0, contacts)
@@ -325,12 +324,10 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
         for margin in (None, 0.01):
             builder = newton.ModelBuilder()
             builder.add_shape_mesh(-1, mesh=_pyramid_mesh(), cfg=newton.ModelBuilder.ShapeConfig(mu=0.6))
-            _add_triangle_over_tip(builder)
+            _add_triangle_over_tip(builder, radius=3e-3)
             model = builder.finalize()
-            solver = newton.solvers.SolverFBA(
-                model, iterations=10, face_contacts=True, soft_contact_thickness=3e-3, face_contact_margin=margin
-            )
-            pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.01)
+            solver = newton.solvers.SolverFBA(model, iterations=10, face_contacts=True, face_contact_margin=margin)
+            pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.009)
             contacts, s0, s1 = pipeline.contacts(), model.state(), model.state()
             for _ in range(30):
                 pipeline.collide(s0, contacts)

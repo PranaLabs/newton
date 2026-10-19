@@ -129,6 +129,7 @@ def build_cloth_on_sphere_builder() -> newton.ModelBuilder:
         tri_kd=0.0,
         edge_ke=_BENDING,
         edge_kd=0.0,
+        particle_radius=0.0,
     )
 
     # Split collision + visual: the collision sphere drives the physics at
@@ -197,7 +198,7 @@ class Example:
             nsn_schur_mode=self.schur_mode,
         )
 
-        self.pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=0.05)
+        self.pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=0.15)
         self.contacts = self.pipeline.contacts()
 
         self.state_0 = self.model.state()

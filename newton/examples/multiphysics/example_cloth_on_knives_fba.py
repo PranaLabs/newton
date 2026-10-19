@@ -108,7 +108,7 @@ class Example:
             tri_ke=mu,
             tri_ka=lam,
             edge_ke=10.0,
-            particle_radius=0.005,
+            particle_radius=CONTACT_THICKNESS,
         )
         self.model = builder.finalize()
         self.model.particle_mass.fill_(1000.0 / self.model.particle_count)
@@ -119,11 +119,10 @@ class Example:
             iterations=5,
             stretching_model="neohookean",
             face_contacts=True,
-            soft_contact_thickness=CONTACT_THICKNESS,
             face_contact_margin=0.03,
             nsn_linear_iterations=10,
         )
-        self.pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=0.03)
+        self.pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=0.025)
         self.contacts = self.pipeline.contacts()
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
