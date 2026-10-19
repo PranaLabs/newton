@@ -30,11 +30,7 @@ import newton
 from newton._src.geometry.types import GeoType
 from newton._src.solvers.fba import SolverFBA
 from newton._src.solvers.fba import kernels as K
-from newton._src.solvers.fba.solver_fba import (
-    _quat_rotate_z_axis,
-    _transform_point,
-    compute_tangent_basis,
-)
+from newton.tests.fba._reference import compute_tangent_basis, quat_rotate_z_axis, transform_point
 
 
 def _make_transform(pos: tuple[float, float, float], quat: tuple[float, float, float, float]):
@@ -82,7 +78,7 @@ class TestComputeWorldAnchorKernel(unittest.TestCase):
 
     def test_world_anchor_dynamic_body(self):
         # Dynamic body with non-trivial translation + rotation. world_anchor
-        # should equal _transform_point(body_q, body_pos).
+        # should equal transform_point(body_q, body_pos).
         # Rotation: 90° about world Y (qx, qy, qz, qw) = (0, sin45, 0, cos45)
         s2 = float(np.sqrt(2.0) / 2.0)
         pos = np.array([1.0, 2.0, 3.0], dtype=np.float64)
@@ -114,7 +110,7 @@ class TestComputeWorldAnchorKernel(unittest.TestCase):
         )
         got = world_anchor.numpy()
         expected = np.stack(
-            [_transform_point(pos, quat, bpos_np[i].astype(np.float64)) for i in range(M)],
+            [transform_point(pos, quat, bpos_np[i].astype(np.float64)) for i in range(M)],
             axis=0,
         )
         np.testing.assert_allclose(got, expected.astype(np.float32), atol=1e-5)
@@ -277,7 +273,7 @@ class TestComputeTangentBasisKernel(unittest.TestCase):
 
         # Reference: axis_world = q * (0,0,1) = (0,1,0).
         # t1 = normalize(cross((0,0,1), (0,1,0))) = normalize((-1,0,0)) = (-1,0,0)
-        axis_world = _quat_rotate_z_axis(np.array(shape_quat, dtype=np.float64))
+        axis_world = quat_rotate_z_axis(np.array(shape_quat, dtype=np.float64))
         n = np.array([0.0, 0.0, 1.0], dtype=np.float64)
         t1_ref = np.cross(n, axis_world)
         t1_ref /= np.linalg.norm(t1_ref)
@@ -369,7 +365,7 @@ class TestComputeVAnchorKernel(unittest.TestCase):
             outputs=[v_anchor],
         )
 
-        axis_world = _quat_rotate_z_axis(np.array(shape_quat, dtype=np.float64))
+        axis_world = quat_rotate_z_axis(np.array(shape_quat, dtype=np.float64))
         r_local = np.array([0.0, 0.0, 1.0], dtype=np.float64)
         cross_ar = np.cross(axis_world, r_local)
         expected = -omega * cross_ar

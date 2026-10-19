@@ -3231,7 +3231,7 @@ class TestPhase4StageBFriction(unittest.TestCase):
             FBALinearSolver,
             factorize_and_sparse_inverse,
         )
-        from newton._src.solvers.fba.solver_fba import compute_tangent_basis  # noqa: PLC0415
+        from newton.tests.fba._reference import compute_tangent_basis  # noqa: PLC0415
 
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
         rng = np.random.default_rng(42)

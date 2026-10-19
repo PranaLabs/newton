@@ -1,0 +1,75 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+"""Host reference implementations that the SolverFBA tests compare the solver against."""
+
+import numpy as np
+
+
+def compute_tangent_basis(n: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Compute two orthonormal tangent vectors ``(t1, t2)`` from a unit normal.
+
+    Pick a reference direction (world X, or world Y if the normal is nearly X),
+    cross the normal with it to get t1, then the normal with t1 to get t2.
+
+    Args:
+        n: Unit normal vector, shape ``(3,)``.
+
+    Returns:
+        Tuple ``(t1, t2)`` each of shape ``(3,)``, float64 unit vectors
+        orthogonal to ``n`` and to each other.
+    """
+    n = np.asarray(n, dtype=np.float64)
+    if abs(n[0]) > 0.9:
+        ref = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    else:
+        ref = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    t1 = np.cross(n, ref)
+    t1 /= np.linalg.norm(t1) + 1e-30
+    t2 = np.cross(n, t1)
+    t2 /= np.linalg.norm(t2) + 1e-30
+    return t1, t2
+
+
+def quat_rotate_z_axis(q: np.ndarray) -> np.ndarray:
+    """Apply quaternion ``q = (qx, qy, qz, qw)`` to the local +Z unit vector.
+
+    Returns the world-frame direction of a shape's local +Z, used as the spin
+    axis for Newton's cylinder primitive (which extends along local +Z).
+    """
+    qx, qy, qz, qw = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    return np.array(
+        [
+            2.0 * (qx * qz + qw * qy),
+            2.0 * (qy * qz - qw * qx),
+            1.0 - 2.0 * (qx * qx + qy * qy),
+        ],
+        dtype=np.float64,
+    )
+
+
+def transform_point(pos: np.ndarray, quat: np.ndarray, p: np.ndarray) -> np.ndarray:
+    """Apply a rigid transform ``T = (pos, quat)`` to point ``p``.
+
+    Warp stores transforms as ``[px, py, pz, qx, qy, qz, qw]``.
+
+    Args:
+        pos: Translation [m], shape ``(3,)``.
+        quat: Quaternion ``[qx, qy, qz, qw]``.
+        p: Point to transform, shape ``(3,)``.
+
+    Returns:
+        Transformed point, shape ``(3,)``.
+    """
+    qx, qy, qz, qw = float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])
+    px, py, pz = float(p[0]), float(p[1]), float(p[2])
+    # Rotate p by quaternion then add translation.
+    # Formula: q * p * q_conj where q = (qx, qy, qz, qw).
+    # Using Rodrigues formula: v' = v + 2*qw*(q_vec x v) + 2*(q_vec x (q_vec x v))
+    tx = 2.0 * (qy * pz - qz * py)
+    ty = 2.0 * (qz * px - qx * pz)
+    tz = 2.0 * (qx * py - qy * px)
+    rx = px + qw * tx + (qy * tz - qz * ty)
+    ry = py + qw * ty + (qz * tx - qx * tz)
+    rz = pz + qw * tz + (qx * ty - qy * tx)
+    return np.array([rx + float(pos[0]), ry + float(pos[1]), rz + float(pos[2])], dtype=np.float64)
