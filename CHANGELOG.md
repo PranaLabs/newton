@@ -8,11 +8,6 @@
 
 ### Added
 
-- Add `SolverFBA` Projective Dynamics solver for cloth (ARAP, corotational, or Neo-Hookean stretching with bending), volumetric soft bodies, and rigid bodies with fixed, revolute, prismatic, ball, and D6 joints, resolving frictional contact among all of them with one semismooth Newton step per local-global iteration over a prefactored Cholesky and sparse-inverse linear solve. It offers a full or a lite (per-particle and sparse) contact operator, face contacts against shape edges and corners, a contact thickness, cloth self-contact, moving pins (`SolverFBA.set_pin_targets()`), particle position and length constraints (`SolverFBA.set_particle_constraints()`, `SolverFBA.Cable`), and rigid bodies stepped by another solver (`integrate_with_external_rigid_solver`)
-- Add `method="isotropic"` to `newton.utils.remesh_mesh()`, which remeshes an open or closed triangle surface to edges of about `edge_length` (Botsch and Kobbelt)
-- Add `SolverFBA` examples for cloth, soft bodies, multi-physics, and robot manipulation (`*_fba` in `newton/examples`)
-- Add opt-in `validate_mesh` parameter to `ModelBuilder.add_cloth_mesh()`, `ModelBuilder.add_soft_mesh()`, and `style3d.add_cloth_mesh()` that warns on degenerate geometry; add public `newton.utils.validate_triangle_mesh()` and `newton.utils.validate_tet_mesh()` utilities
-- Add `ViewerGL.show_loading_splash()` / `ViewerGL.hide_loading_splash()` displaying a stylized Newton's-cradle overlay while the GL viewer waits on Warp kernel compilation; raised automatically by `newton.examples.init()` for visible GL viewers
 - Add opt-in `ArticulationView(allow_partial_layouts=True)` so compatible joint, DOF, coordinate, body, shape, and root data remains accessible when another selected layout differs. ([#3461](https://github.com/newton-physics/newton/issues/3461))
 - Add Kamino body acceleration output so SensorIMU reports specific force and angular velocity for Kamino simulations. ([#3934](https://github.com/newton-physics/newton/issues/3934))
 - Add live scalar plots and array heatmaps to `ViewerRTX` through `log_scalar()` and `log_array()`, with configurable plot history and scalar smoothing. ([#4046](https://github.com/newton-physics/newton/issues/4046))
