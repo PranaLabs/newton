@@ -42,7 +42,7 @@ class TestParticleConstraints(unittest.TestCase):
         solver = newton.solvers.SolverFBA(model, iterations=10)
         if rows is not None:
             solver.set_particle_constraints(*rows)
-        pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.02)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.02)
         contacts, s0, s1 = pipeline.contacts(), model.state(), model.state()
         for _ in range(steps):
             pipeline.collide(s0, contacts)
@@ -82,9 +82,10 @@ class TestParticleConstraints(unittest.TestCase):
 
     def _run_on_box(self, model, solver, steps):
         """The state after ``steps`` steps of 5 ms and the particle velocities before the last one."""
-        contacts, s0, s1 = model.contacts(), model.state(), model.state()
+        pipeline = newton.CollisionPipeline(model)
+        contacts, s0, s1 = pipeline.contacts(), model.state(), model.state()
         for _ in range(steps):
-            model.collide(s0, contacts)
+            pipeline.collide(s0, contacts)
             v = s0.particle_qd.numpy()
             solver.step(s0, s1, None, contacts, 0.005)
             s0, s1 = s1, s0
@@ -134,12 +135,13 @@ class TestParticleConstraints(unittest.TestCase):
         builder.add_cloth_grid(pos=wp.vec3(-0.2, -0.2, 0.0), rot=wp.quat_identity(), vel=wp.vec3(0.0), mass=1.0, **grid)
         model = builder.finalize()
         solver = newton.solvers.SolverFBA(model, iterations=10, nsn_schur_mode="lite")
-        contacts, s0, s1 = model.contacts(), model.state(), model.state()
+        pipeline = newton.CollisionPipeline(model)
+        contacts, s0, s1 = pipeline.contacts(), model.state(), model.state()
         x0 = model.particle_q.numpy()[12]
         for k in range(60):
             target = x0 + ([0.0, 0.0, -0.002] if k < 30 else [0.2 * (k - 29) / 60.0, 0.0, 0.05])
             solver.set_particle_constraints([[12]] * 3, [[1.0]] * 3, target, np.eye(3))
-            model.collide(s0, contacts)
+            pipeline.collide(s0, contacts)
             solver.step(s0, s1, None, contacts, 1.0 / 60.0)
             s0, s1 = s1, s0
             if k in (29, 59):
@@ -162,14 +164,15 @@ class TestParticleConstraints(unittest.TestCase):
         )
         model = builder.finalize()
         solver = newton.solvers.SolverFBA(model, iterations=10, nsn_schur_mode="lite")
-        contacts, s0, s1 = model.contacts(), model.state(), model.state()
+        pipeline = newton.CollisionPipeline(model)
+        contacts, s0, s1 = pipeline.contacts(), model.state(), model.state()
         held = [0, 1, 5, 6]
         x0 = model.particle_q.numpy()[held]
         for k in range(20):
             target = x0 + np.array([0.0, 0.0, 0.05 * (k + 1) / 20])
             rows = np.repeat(held, 3)[:, None], np.ones((12, 1)), target.reshape(-1), np.tile(np.eye(3), (4, 1))
             solver.set_particle_constraints(*rows)
-            model.collide(s0, contacts)
+            pipeline.collide(s0, contacts)
             solver.step(s0, s1, None, contacts, 1.0 / 60.0)
             s0, s1 = s1, s0
             np.testing.assert_allclose(s0.particle_q.numpy()[held], target, atol=1e-6)

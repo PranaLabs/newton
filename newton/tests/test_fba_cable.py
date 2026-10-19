@@ -19,10 +19,22 @@ class TestCable(unittest.TestCase):
             raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
 
     def _finger(self, z=0.018):
-        builder = newton.ModelBuilder(gravity=0.0)
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         mu, lam = 1.0e6 / 2.6, 1.0e6 * 0.3 / (1.3 * 0.4)  # young 1 MPa, poisson 0.3
         builder.add_soft_grid(
-            wp.vec3(0.0), wp.quat_identity(), wp.vec3(0.0), 16, 4, 4, 0.005, 0.005, 0.005, 1000.0, mu, lam, 0.0
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=16,
+            dim_y=4,
+            dim_z=4,
+            cell_x=0.005,
+            cell_y=0.005,
+            cell_z=0.005,
+            density=1000.0,
+            k_mu=mu,
+            k_lambda=lam,
+            k_damp=0.0,
         )
         model = builder.finalize()
         x = model.particle_q.numpy()

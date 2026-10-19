@@ -154,7 +154,7 @@ class TestSelfContactSolve(unittest.TestCase):
         if mu is not None:
             model.particle_mu = mu
         solver = newton.solvers.SolverFBA(model, iterations=10, **solver_args)
-        pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.01)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.01)
         detector = TriMeshCollisionDetector(model)
         contacts, s0, s1, worst = pipeline.contacts(), model.state(), model.state(), 0
         for _ in range(steps):
@@ -215,7 +215,7 @@ class TestSelfContactSolve(unittest.TestCase):
         solver = newton.solvers.SolverFBA(
             model, iterations=10, nsn_schur_mode="lite", particle_enable_self_contact=True, **kw
         )
-        pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.01)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.01)
         detector = TriMeshCollisionDetector(model)
         contacts, s0, s1 = pipeline.contacts(), model.state(), model.state()
         held = [0, 1, 7, 8, 49, 50, 56, 57]

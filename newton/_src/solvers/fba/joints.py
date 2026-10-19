@@ -327,13 +327,14 @@ _TILE_KERNELS = {}
 def _tile_kernels(tile: int):
     """Cholesky factor and solve kernels for blocks padded to ``tile`` rows."""
     if tile not in _TILE_KERNELS:
+        # No adjoints: the one of a 64-row factor needs 65792 bytes of static shared memory, over the 48 KiB limit.
 
-        @wp.kernel(module="unique")
+        @wp.kernel(module="unique", enable_backward=False)
         def factor(W: wp.array3d[wp.float64], L: wp.array3d[wp.float64]):
             k = wp.tid()
             wp.tile_store(L[k], wp.tile_cholesky(wp.tile_load(W[k], shape=(tile, tile))))
 
-        @wp.kernel(module="unique")
+        @wp.kernel(module="unique", enable_backward=False)
         def solve(L: wp.array3d[wp.float64], rhs: wp.array2d[wp.float64], x: wp.array2d[wp.float64]):
             k = wp.tid()
             L_k = wp.tile_load(L[k], shape=(tile, tile))

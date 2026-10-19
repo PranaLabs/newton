@@ -14,7 +14,7 @@ from typing import Literal
 import numpy as np
 import warp as wp
 
-from ...sim import BodyFlags, Contacts, Control, Model, State
+from ...sim import BodyFlags, Contacts, Control, Model, ModelFlags, State
 from ..solver import SolverBase
 from .cable import Cable
 
@@ -2432,11 +2432,9 @@ class SolverFBA(SolverBase):
         """Particles, directions and coefficients of the bilateral rows, each on one particle."""
         return self._constraint_rows_h
 
-    def notify_model_changed(self, flags: int) -> None:
+    def notify_model_changed(self, flags: ModelFlags | int) -> None:
         # On any geometry/inertial change, force a full re-setup at the next step.
-        from ..flags import SolverNotifyFlags  # noqa: PLC0415
-
-        if flags & (SolverNotifyFlags.SHAPE_PROPERTIES | SolverNotifyFlags.BODY_INERTIAL_PROPERTIES):
+        if flags & (ModelFlags.SHAPE_PROPERTIES | ModelFlags.BODY_INERTIAL_PROPERTIES):
             self._linear_solver = None
             self._dt_setup = None
             self._invalidate_schur_cache()

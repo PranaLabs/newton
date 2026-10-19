@@ -37,6 +37,7 @@ https://newton-physics.github.io/newton/stable/solvers/index.html.
    :nosignatures:
 
    SolverBase
+   SolverFBA
    SolverFeatherstone
    SolverImplicitMPM
    SolverKamino

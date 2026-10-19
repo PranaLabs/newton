@@ -250,7 +250,7 @@ class TestSolverFBARigidStep(unittest.TestCase):
     def _model(self, inertia, gravity=-9.81, cloth=True):
         import newton  # noqa: PLC0415
 
-        builder = newton.ModelBuilder(gravity=gravity)
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, gravity))
         if cloth:  # far from the body, so it never interacts
             builder.add_cloth_mesh(
                 pos=wp.vec3(0.0, 0.0, 5.0),

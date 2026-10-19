@@ -36,7 +36,10 @@ def _box_scene(device):
     builder.add_shape_box(kinematic)
     model = builder.finalize(device=device)
     state = model.state()
-    return model, state, model.collide(state)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    pipeline.collide(state, contacts)
+    return model, state, contacts
 
 
 class TestGatherRigidContacts(unittest.TestCase):
@@ -315,9 +318,10 @@ class TestSolverFBARigidContacts(unittest.TestCase):
         solver = SolverFBA(model, **{"iterations": 10, **solver_args})
         s0, s1 = model.state(), model.state()
         s0.body_qd.assign([[*v0, 0.0, 0.0, 0.0]])
-        contacts, traj = model.contacts(), []
+        pipeline = newton.CollisionPipeline(model)
+        contacts, traj = pipeline.contacts(), []
         for _ in range(steps):
-            model.collide(s0, contacts)
+            pipeline.collide(s0, contacts)
             solver.step(s0, s1, None, contacts, self.H)
             s0, s1 = s1, s0
             traj.append(np.concatenate([s0.body_q.numpy()[0], s0.body_qd.numpy()[0]]))
@@ -414,9 +418,10 @@ class TestSolverFBAArticulationContacts(unittest.TestCase):
         model = builder.finalize()
         solver = SolverFBA(model, iterations=10)
         s0, s1 = model.state(), model.state()
-        contacts = model.contacts()
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
         for _ in range(50):
-            model.collide(s0, contacts)
+            pipeline.collide(s0, contacts)
             solver.step(s0, s1, None, contacts, 0.01)
             s0, s1 = s1, s0
 
@@ -461,9 +466,10 @@ class TestSolverFBAArticulationContacts(unittest.TestCase):
         model = builder.finalize()
         solver = SolverFBA(model, iterations=10)
         s0, s1 = model.state(), model.state()
-        contacts = model.contacts()
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
         for _ in range(20):
-            model.collide(s0, contacts)
+            pipeline.collide(s0, contacts)
             solver.step(s0, s1, None, contacts, 0.005)
             s0, s1 = s1, s0
         np.testing.assert_allclose(s0.body_q.numpy()[:, 2], half_height, atol=1e-6)
@@ -498,10 +504,11 @@ class TestSolverFBAArticulationContacts(unittest.TestCase):
         solver = SolverFBA(model, iterations=10)
         s0, s1 = model.state(), model.state()
         start = s0.body_q.numpy()[:, :3]
-        contacts = model.contacts()
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
         speed = []
         for _ in range(60):
-            model.collide(s0, contacts)
+            pipeline.collide(s0, contacts)
             solver.step(s0, s1, None, contacts, 1.0 / 120.0)
             s0, s1 = s1, s0
             speed.append(np.abs(s0.body_qd.numpy()).max())
@@ -522,7 +529,7 @@ class TestSolverFBATwoWayContacts(unittest.TestCase):
     def _run(self, gravity, cloth_z, v_cloth, box_density, particle_mass, steps, ground=False):
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
-        builder = newton.ModelBuilder(gravity=gravity)
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, gravity))
         if ground:
             builder.add_ground_plane()
         box = builder.add_body(xform=wp.transform((0.0, 0.0, 0.5), wp.quat_identity()))
@@ -533,10 +540,11 @@ class TestSolverFBATwoWayContacts(unittest.TestCase):
         model = builder.finalize()
         solver = SolverFBA(model, iterations=10)
         s0, s1 = model.state(), model.state()
-        contacts, momentum = model.contacts(), []
+        pipeline = newton.CollisionPipeline(model)
+        contacts, momentum = pipeline.contacts(), []
         m_p, m_b = model.particle_mass.numpy(), model.body_mass.numpy()[0]
         for _ in range(steps):
-            model.collide(s0, contacts)
+            pipeline.collide(s0, contacts)
             solver.step(s0, s1, None, contacts, 0.005)
             s0, s1 = s1, s0
             momentum.append(m_p @ s0.particle_qd.numpy() + m_b * s0.body_qd.numpy()[0, :3])

@@ -428,7 +428,7 @@ class TestUpdateContactsIntegration(unittest.TestCase):
         particle_q_np[:, 1] = -0.01  # below the plane
         state.particle_q.assign(particle_q_np)
 
-        pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.5)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.5)
         contacts = pipeline.contacts()
         pipeline.collide(state, contacts)
         solver.update_contacts(contacts, state)
@@ -588,7 +588,7 @@ class TestUpdateContactsMovingBody(unittest.TestCase):
         state.body_q.assign([_make_transform(tuple(p), tuple(q))])
         state.body_qd.assign([wp.spatial_vector(*v, *omega)])
 
-        pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.5)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.5)
         contacts = pipeline.contacts()
         pipeline.collide(state, contacts)
         solver.update_contacts(contacts, state)

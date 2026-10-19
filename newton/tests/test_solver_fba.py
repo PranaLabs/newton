@@ -683,7 +683,7 @@ class SolverFBABendingCurvedRestTests(unittest.TestCase):
         # grid has 9 particles; the centre vertex is at index 4.
         vertices = np.array(grid.particle_q)
         vertices[4, 2] += 0.2
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=0.0)
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, 0.0))
         builder.add_cloth_mesh(
             pos=wp.vec3(0.0, 0.0, 0.0),
             rot=wp.quat_identity(),
@@ -733,7 +733,7 @@ class SolverFBABendingCurvedRestTests(unittest.TestCase):
 
         def angle_after(zero_rest: bool, steps: int) -> float:
             h, fold = np.sqrt(3.0) / 2.0, np.radians(60.0)
-            builder = newton.ModelBuilder(gravity=0.0)
+            builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
             builder.add_cloth_mesh(
                 pos=wp.vec3(0.0),
                 rot=wp.quat_identity(),
@@ -1263,7 +1263,6 @@ class TestSolverFBAReconfigure(unittest.TestCase):
         self.assertIs(linsolver_a, linsolver_b, "linear solver should not rebuild when dt unchanged")
 
     def test_notify_shape_properties_forces_resetup(self):
-        from newton._src.solvers import SolverNotifyFlags  # noqa: PLC0415
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
@@ -1291,7 +1290,7 @@ class TestSolverFBAReconfigure(unittest.TestCase):
         linsolver_a = solver._linear_solver
         self.assertIsNotNone(linsolver_a)
 
-        solver.notify_model_changed(SolverNotifyFlags.SHAPE_PROPERTIES)
+        solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
         self.assertIsNone(solver._linear_solver, "notify_model_changed should clear _linear_solver")
         self.assertIsNone(solver._dt_setup, "notify_model_changed should clear _dt_setup")
 
@@ -1369,7 +1368,6 @@ class TestSolverFBAReconfigure(unittest.TestCase):
         np.testing.assert_allclose(solver._omega_coulomb_persistent, 0.321)
 
     def test_notify_unrelated_flag_no_resetup(self):
-        from newton._src.solvers import SolverNotifyFlags  # noqa: PLC0415
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
@@ -1397,7 +1395,7 @@ class TestSolverFBAReconfigure(unittest.TestCase):
         linsolver_a = solver._linear_solver
 
         # JOINT_PROPERTIES shouldn't affect FBA cloth.
-        solver.notify_model_changed(SolverNotifyFlags.JOINT_PROPERTIES)
+        solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
         self.assertIs(solver._linear_solver, linsolver_a, "FBA should ignore JOINT_PROPERTIES")
 
 
@@ -1558,7 +1556,7 @@ class TestFBARealSimAgreement(unittest.TestCase):
             total_area += 0.5 * float(np.linalg.norm(np.cross(e1, e2)))
         density = 1.0 / total_area  # so that sum-of-area-weights ≈ 1 kg total
 
-        builder = _newton.ModelBuilder(up_axis=_newton.Axis.Z, gravity=-10.0)
+        builder = _newton.ModelBuilder(up_axis=_newton.Axis.Z, gravity=(0.0, 0.0, -10.0))
         builder.add_cloth_mesh(
             pos=wp.vec3(0.0, 0.0, 0.0),
             rot=wp.quat_identity(),
@@ -2033,7 +2031,7 @@ class TestFBARealSimAgreementNH(unittest.TestCase):
             total_area += 0.5 * float(np.linalg.norm(np.cross(e1, e2)))
         density = 1.0 / total_area  # so that sum-of-area-weights ≈ 1 kg total
 
-        builder = _newton.ModelBuilder(up_axis=_newton.Axis.Z, gravity=-10.0)
+        builder = _newton.ModelBuilder(up_axis=_newton.Axis.Z, gravity=(0.0, 0.0, -10.0))
         builder.add_cloth_mesh(
             pos=wp.vec3(0.0, 0.0, 0.0),
             rot=wp.quat_identity(),
@@ -3443,7 +3441,7 @@ class TestPhase4StageBFriction(unittest.TestCase):
         tilt_quat = wp.quat(qx, 0.0, 0.0, qw)
         cylinder_center_z = 0.5
 
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=-9.81)
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
         builder.add_shape_cylinder(
             body=-1,
             xform=wp.transform(wp.vec3(0.0, 0.0, cylinder_center_z), tilt_quat),
@@ -3470,7 +3468,7 @@ class TestPhase4StageBFriction(unittest.TestCase):
         )
         model = builder.finalize()
 
-        pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.08)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.08)
         contacts = pipeline.contacts()
 
         particle_count = model.particle_count
@@ -3520,9 +3518,9 @@ class TestPhase4StageCShapePrimitives(unittest.TestCase):
 
     # ------------------------------------------------------------------ helpers
 
-    def _make_pipeline(self, model, soft_contact_margin=0.2):
-        """Create a CollisionPipeline with an explicit soft contact margin."""
-        return newton.CollisionPipeline(model, soft_contact_margin=soft_contact_margin)
+    def _make_pipeline(self, model, soft_contact_gap=0.2):
+        """Create a CollisionPipeline with an explicit soft contact gap."""
+        return newton.CollisionPipeline(model, soft_contact_gap=soft_contact_gap)
 
     # ------------------------------------------------------------------ test 1
 
@@ -3677,7 +3675,7 @@ class TestPhase4StageCShapePrimitives(unittest.TestCase):
         )
         model = builder.finalize()
 
-        pipeline = self._make_pipeline(model, soft_contact_margin=0.15)
+        pipeline = self._make_pipeline(model, soft_contact_gap=0.15)
         contacts = pipeline.contacts()
         solver = SolverFBA(model, iterations=10, friction=False)
         s_in, s_out = model.state(), model.state()
@@ -3736,7 +3734,7 @@ class TestPhase4StageCShapePrimitives(unittest.TestCase):
         )
         model = builder.finalize()
 
-        pipeline = self._make_pipeline(model, soft_contact_margin=0.15)
+        pipeline = self._make_pipeline(model, soft_contact_gap=0.15)
         contacts = pipeline.contacts()
         solver = SolverFBA(model, iterations=10, friction=False)
         s_in, s_out = model.state(), model.state()
@@ -3798,7 +3796,7 @@ class TestPhase4StageCShapePrimitives(unittest.TestCase):
         )
         model = builder.finalize()
 
-        pipeline = self._make_pipeline(model, soft_contact_margin=0.15)
+        pipeline = self._make_pipeline(model, soft_contact_gap=0.15)
         contacts = pipeline.contacts()
         solver = SolverFBA(model, iterations=10, friction=False)
         s_in, s_out = model.state(), model.state()
@@ -3878,7 +3876,7 @@ class TestPhase4StageCShapePrimitives(unittest.TestCase):
         # gravity while being pushed out of the sphere.
         model.gravity.assign(wp.zeros(1, dtype=wp.vec3))
 
-        pipeline = self._make_pipeline(model, soft_contact_margin=0.2)
+        pipeline = self._make_pipeline(model, soft_contact_gap=0.2)
         contacts = pipeline.contacts()
         solver = SolverFBA(model, iterations=15, friction=False)
         s_in, s_out = model.state(), model.state()
@@ -3908,7 +3906,7 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
     """Constructor exposes NSN iter count and lambda cap."""
 
     def _tiny_cloth_model(self):
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=-9.81)
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
         builder.add_cloth_grid(
             pos=wp.vec3(-0.1, -0.1, 0.2),
             rot=wp.quat_identity(),
@@ -4006,7 +4004,7 @@ class SolverFBAStageAStageBEquivalenceTests(unittest.TestCase):
     """
 
     def _tiny_cloth_model(self):
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=-9.81)
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
         builder.add_cloth_grid(
             pos=wp.vec3(-0.1, -0.1, 0.2),
             rot=wp.quat_identity(),
@@ -4121,7 +4119,7 @@ class SolverFBALambdaWarmStartTests(unittest.TestCase):
     """
 
     def _cloth_on_plane_model(self):
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=-9.81)
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
         builder.add_ground_plane()
         builder.add_cloth_grid(
             pos=wp.vec3(-0.2, -0.2, 0.15),
@@ -4154,7 +4152,7 @@ class SolverFBALambdaWarmStartTests(unittest.TestCase):
         model = self._cloth_on_plane_model()
         solver = SolverFBA(model, friction=False)
         s_in, s_out = model.state(), model.state()
-        pipeline = CollisionPipeline(model, soft_contact_margin=0.05)
+        pipeline = CollisionPipeline(model, soft_contact_gap=0.05)
         contacts = pipeline.contacts()
 
         # The flat cloth falls 0.15 m and lands on the plane at step 11; step
@@ -4184,7 +4182,7 @@ class SolverFBAKinematicCylinderTests(unittest.TestCase):
 
         import newton
 
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=-10.0)
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, -10.0, 0.0))
         builder.add_soft_grid(
             pos=wp.vec3(0.0, 0.5, 0.0),
             rot=wp.quat_identity(),
@@ -4212,7 +4210,7 @@ class SolverFBAKinematicCylinderTests(unittest.TestCase):
             half_height=2.0,
         )
         model = builder.finalize()
-        pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.1)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.1)
         contacts = pipeline.contacts()
         return model, pipeline, contacts
 
@@ -4373,7 +4371,7 @@ class SolverFBATetArapDeterminismTests(unittest.TestCase):
         import newton
         from newton.solvers import SolverFBA
 
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=-10.0)
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, -10.0, 0.0))
         builder.add_soft_grid(
             pos=wp.vec3(0.0, 1.0, 0.0),
             rot=wp.quat_identity(),
@@ -4412,7 +4410,7 @@ class SolverFBATetCorotDeterminismTests(unittest.TestCase):
         import newton
         from newton.solvers import SolverFBA
 
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=-10.0)
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, -10.0, 0.0))
         builder.add_soft_grid(
             pos=wp.vec3(0.0, 1.0, 0.0),
             rot=wp.quat_identity(),
@@ -4458,7 +4456,7 @@ class SolverFBATetNHDeterminismTests(unittest.TestCase):
         import newton
         from newton.solvers import SolverFBA
 
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=-10.0)
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, -10.0, 0.0))
         builder.add_soft_grid(
             pos=wp.vec3(0.0, 1.0, 0.0),
             rot=wp.quat_identity(),
@@ -4504,7 +4502,7 @@ class SolverFBATriDeterminismTests(unittest.TestCase):
         import newton
         from newton.solvers import SolverFBA
 
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=-9.81)
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
         builder.add_cloth_grid(
             pos=wp.vec3(-0.2, -0.2, 0.5),
             rot=wp.quat_identity(),
@@ -4555,7 +4553,7 @@ class SolverFBABendingDeterminismTests(unittest.TestCase):
         import newton
         from newton.solvers import SolverFBA
 
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=-9.81)
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
         # Cloth with bending edges enabled.
         builder.add_cloth_grid(
             pos=wp.vec3(-0.2, -0.2, 0.5),
@@ -4596,7 +4594,7 @@ class SolverFBAIsodofJtLambdaDeterminismTests(unittest.TestCase):
         from newton import CollisionPipeline
         from newton.solvers import SolverFBA
 
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=-9.81)
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
         builder.add_ground_plane()
         # Cloth that develops Stage B friction contacts on the plane.
         builder.add_cloth_grid(
@@ -4617,7 +4615,7 @@ class SolverFBAIsodofJtLambdaDeterminismTests(unittest.TestCase):
             mu_arr = model.shape_material_mu.numpy()
             mu_arr[0] = 0.3
             model.shape_material_mu.assign(mu_arr.astype(np.float32))
-        pipeline = CollisionPipeline(model, soft_contact_margin=0.1)
+        pipeline = CollisionPipeline(model, soft_contact_gap=0.1)
         contacts = pipeline.contacts()
         solver = SolverFBA(
             model,
@@ -5244,15 +5242,37 @@ class TestDroppedDualGauge(unittest.TestCase):
 
     def _modulus_ratio(self, tetrahedra, stretching_model, young=1.0e6, poisson=0.4):
         mu, lam = young / (2 * (1 + poisson)), young * poisson / ((1 + poisson) * (1 - 2 * poisson))
-        builder = newton.ModelBuilder(gravity=-10.0)
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -10.0))
         if tetrahedra:  # 0.1 x 0.1 x 0.8 m
             builder.add_soft_grid(
-                wp.vec3(0.0), wp.quat_identity(), wp.vec3(0.0), 2, 2, 16, 0.05, 0.05, 0.05, 1.0, mu, lam, 0.0
+                pos=wp.vec3(0.0),
+                rot=wp.quat_identity(),
+                vel=wp.vec3(0.0),
+                dim_x=2,
+                dim_y=2,
+                dim_z=16,
+                cell_x=0.05,
+                cell_y=0.05,
+                cell_z=0.05,
+                density=1.0,
+                k_mu=mu,
+                k_lambda=lam,
+                k_damp=0.0,
             )
             modulus, width = young, 0.01
         else:  # 0.1 x 0.8 m, plane-stress membrane modulus [N/m]
             rot = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.5 * np.pi)
-            builder.add_cloth_grid(wp.vec3(0.0), rot, wp.vec3(0.0), 4, 32, 0.025, 0.025, 1.0e-4, tri_ke=2.0 * mu)
+            builder.add_cloth_grid(
+                pos=wp.vec3(0.0),
+                rot=rot,
+                vel=wp.vec3(0.0),
+                dim_x=4,
+                dim_y=32,
+                cell_x=0.025,
+                cell_y=0.025,
+                mass=1.0e-4,
+                tri_ke=2.0 * mu,
+            )
             modulus, width = 4 * mu * (mu + lam) / (2 * mu + lam), 0.1
         model = builder.finalize()
         z = model.particle_q.numpy()[:, 2]

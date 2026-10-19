@@ -66,7 +66,7 @@ def _build_minimal_solver(friction: bool, lambda_cap: float | None = None) -> So
     pin energy, etc.) is irrelevant for these tests. We just need the
     constructor to succeed and have a Warp device wired up.
     """
-    builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=0.0)
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, 0.0))
     builder.add_cloth_grid(
         pos=wp.vec3(0.0, 0.0, 0.0),
         rot=wp.quat_identity(),

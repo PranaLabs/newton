@@ -268,7 +268,7 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
         solver = newton.solvers.SolverFBA(
             model, iterations=10, face_contacts=face_contacts, soft_contact_thickness=thickness
         )
-        pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.05)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.05)
         contacts, s0, s1, speed = pipeline.contacts(), model.state(), model.state(), 0.0
         for _ in range(steps):
             pipeline.collide(s0, contacts)
@@ -330,7 +330,7 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
             solver = newton.solvers.SolverFBA(
                 model, iterations=10, face_contacts=True, soft_contact_thickness=3e-3, face_contact_margin=margin
             )
-            pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.01)
+            pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.01)
             contacts, s0, s1 = pipeline.contacts(), model.state(), model.state()
             for _ in range(30):
                 pipeline.collide(s0, contacts)
