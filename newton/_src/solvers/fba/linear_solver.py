@@ -1576,110 +1576,6 @@ class FBALinearSolver:
         self._inv_mass_d = wp.array(inv_mass_h, dtype=wp.float64, device=dev)
         self._lite_dt2 = dt2
 
-    def build_schur_lite(
-        self,
-        num_contacts: int,
-        j_indices: wp.array,
-        j_normals: wp.array,
-        j_alpha: wp.array,
-        j_tangent1: wp.array | None = None,
-        j_tangent2: wp.array | None = None,
-    ) -> "wps.BsrMatrix":
-        """Build the LiteNSN sparse Schur complement ``W = H · M⁻¹ · Hᵀ``.
-
-        ``H`` is the contact Jacobian as a sparse ``(total_rows, N)`` BSR matrix
-        with ``1×3`` blocks (one block per row at column ``row_particle[r]``,
-        value ``alpha[r] · dir[r]``).  ``M⁻¹`` is the block-diagonal mass-inverse
-        BSR cached by :meth:`setup_lite_mass`.  The product collapses to a
-        ``(total_rows, total_rows)`` BSR with ``1×1`` blocks; a nonzero appears
-        at ``(c', c)`` iff ``row_particle[c'] == row_particle[c]``.
-
-        Unlike :meth:`build_schur_complement`, this method does not download
-        ``W`` to the host — the sparse PCR path consumes the BsrMatrix on
-        device.  Callers that need a numpy view should call
-        ``W.to_scipy_sparse().toarray()`` (slow, debug only).
-
-        Args:
-            num_contacts: Active contact count ``M``.
-            j_indices, j_normals, j_alpha, j_tangent1, j_tangent2: Same layout
-                as :meth:`build_schur_complement`.
-
-        Returns:
-            ``BsrMatrix[mat1x1[float64]]`` of shape ``(total_rows, total_rows)``.
-            The matrix is owned by the linear solver and reused across calls;
-            do not modify it externally.
-        """
-        if not hasattr(self, "_M_inv_dt2_bsr") or self._M_inv_dt2_bsr is None:
-            raise RuntimeError(
-                "build_schur_lite called before setup_lite_mass; SolverFBA must"
-                " invoke setup_lite_mass on every _setup_pd_system pass."
-            )
-
-        has_friction = j_tangent1 is not None and j_tangent2 is not None
-        rows_per_contact = 3 if has_friction else 1
-        M = int(num_contacts)
-        total_rows = M * rows_per_contact
-        if total_rows == 0:
-            # Caller treats absent W as zero.
-            return None
-        dev = self.device
-        n = self.n
-
-        # ---- Assemble per-row (particle, alpha · dir) on host ----
-        idx_np = j_indices.numpy()[:M].astype(np.int32)
-        n_np = j_normals.numpy()[:M].astype(np.float64)
-        a_np = j_alpha.numpy()[:M].astype(np.float64)
-        row_particle = np.empty(total_rows, dtype=np.int32)
-        row_dir = np.empty((total_rows, 3), dtype=np.float64)
-        row_alpha = np.empty(total_rows, dtype=np.float64)
-        if has_friction:
-            t1_np = j_tangent1.numpy()[:M].astype(np.float64)
-            t2_np = j_tangent2.numpy()[:M].astype(np.float64)
-            row_particle[0::3] = idx_np; row_particle[1::3] = idx_np; row_particle[2::3] = idx_np
-            row_dir[0::3] = n_np; row_dir[1::3] = t1_np; row_dir[2::3] = t2_np
-            row_alpha[0::3] = a_np; row_alpha[1::3] = a_np; row_alpha[2::3] = a_np
-        else:
-            row_particle[:] = idx_np; row_dir[:] = n_np; row_alpha[:] = a_np
-
-        # Block value per row: 1×3 row-vector ``alpha · dir``.
-        h_blocks = (row_alpha[:, None] * row_dir).reshape(total_rows, 1, 3)
-
-        if not hasattr(self, "_mat1x3_dtype"):
-            self._mat1x3_dtype = wp.types.matrix((1, 3), wp.float64)
-
-        # ---- Build / reuse H BSR (1×3 blocks, total_rows × N) ----
-        if not hasattr(self, "_H_lite_bsr") or self._H_lite_bsr is None:
-            self._H_lite_bsr = wps.bsr_zeros(
-                rows_of_blocks=total_rows,
-                cols_of_blocks=n,
-                block_type=self._mat1x3_dtype,
-                device=dev,
-            )
-        else:
-            # ``bsr_set_from_triplets`` accepts a destination of any size; the
-            # destination shape is updated to match the new triplet extents.
-            self._H_lite_bsr.nrow = total_rows
-        rows_d = wp.array(np.arange(total_rows, dtype=np.int32), dtype=wp.int32, device=dev)
-        cols_d = wp.array(row_particle, dtype=wp.int32, device=dev)
-        vals_d = wp.array(h_blocks, dtype=self._mat1x3_dtype, device=dev)
-        wps.bsr_set_from_triplets(
-            self._H_lite_bsr, rows_d, cols_d, vals_d, prune_numerical_zeros=False
-        )
-
-        # ---- M_inv · Hᵀ (3×1 blocks, N × total_rows) ----
-        HT = wps.bsr_transposed(self._H_lite_bsr)
-        Minv_HT = wps.bsr_mm(self._M_inv_dt2_bsr, HT)
-
-        # ---- W = H · (M_inv · Hᵀ)  (1×1 blocks, total_rows × total_rows) ----
-        self._W_lite_bsr = wps.bsr_mm(self._H_lite_bsr, Minv_HT)
-        self._W_lite_total_rows = total_rows
-        # Stash per-row metadata in case the lite path needs the lambda
-        # correction at the same granularity as the dense path.
-        self._row_particle_h = row_particle
-        self._row_dir_h = row_dir
-        self._row_alpha_h = row_alpha
-        return self._W_lite_bsr
-
     def _set_row_slots(self, row_particle, row_alpha, extra_p, extra_a) -> np.ndarray:
         """Keep the extra slots of rows on several particles, with a CSR from particle to ``row * K + slot``.
 
@@ -2076,7 +1972,7 @@ class FBALinearSolver:
         single-env validation (Phase 2.4): the dense ``W_lite`` slots into the
         existing dense-PCR NSN inner.  At larger N (Phase 3), the dense buffer
         is the bottleneck — switch to the truly-sparse path through
-        :meth:`build_schur_lite` + ``solve_sparse`` instead.
+        :meth:`build_schur_lite_triplets` + ``solve_sparse`` instead.
 
         Side effects: populates ``_W_device_d[:total_rows, :total_rows]`` and
         ``_W_device_active_rows`` so subsequent :meth:`W_device_view` calls

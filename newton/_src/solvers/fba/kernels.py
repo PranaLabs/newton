@@ -2798,35 +2798,6 @@ def project_pin_kernel(
 
 
 @wp.kernel
-def build_contact_jacobian_vec3_kernel(
-    particle_count: int,
-    contact_idx: int,
-    j_indices: wp.array[wp.int32],
-    j_normals: wp.array[wp.vec3],
-    j_alpha: wp.array[wp.float32],
-    out: wp.array[wp.vec3],
-):
-    """Set out[j_indices[contact_idx]] = j_alpha[contact_idx] * j_normals[contact_idx].
-
-    Called with ``dim=1`` (single thread).  All other slots are left as-is
-    (caller is responsible for zeroing ``out`` before launch).
-
-    Args:
-        particle_count: Total particle count (unused at runtime, guards bounds).
-        contact_idx: Index of the contact to materialise.
-        j_indices: Particle index per contact row, shape ``[M]``.
-        j_normals: World-frame contact normal per contact row, shape ``[M]``.
-        j_alpha: Jacobian coefficient per contact row (1.0 for particle-shape).
-        out: Output vec3 array of length ``particle_count``; only the slot at
-            ``j_indices[contact_idx]`` is written.
-    """
-    _tid = wp.tid()
-    idx = j_indices[contact_idx]
-    if idx >= 0 and idx < particle_count:
-        out[idx] = wp.float32(j_alpha[contact_idx]) * j_normals[contact_idx]
-
-
-@wp.kernel
 def accumulate_vec3_kernel(
     src: wp.array[wp.vec3],
     dst: wp.array[wp.vec3],
@@ -3243,7 +3214,7 @@ def compose_W_lite_kernel(
                        = 0                               otherwise
 
     This is the dense projection of the sparse Schur the BSR pipeline produces
-    (:meth:`FBALinearSolver.build_schur_lite`); using it from the NSN inner
+    (:meth:`FBALinearSolver.build_schur_lite_triplets`); using it from the NSN inner
     keeps the existing dense-PCR consumer path intact while still exercising
     the LiteNSN mathematical approximation.
 
