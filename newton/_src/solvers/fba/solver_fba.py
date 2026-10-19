@@ -1666,6 +1666,7 @@ class SolverFBA(SolverBase):
                                 self._contact_tangent2_d,
                                 bilateral=self._lite_constraint_rows() if n_b else None,
                                 **self._contact_extra_args(),
+                                host=(self._contact_particle_h, self._contact_alpha_h, *(self._contact_extra_h or ())),
                             )
                             self._lite_slot_rows = None if self._contact_extra is None else self._slot_rows(M, ls, n_b)
                             self._lite_nsn_graph = None
@@ -2306,6 +2307,9 @@ class SolverFBA(SolverBase):
         arrays = [(particles, np.int32, wp.int32), (coefficients, np.float32, wp.float32)]
         arrays += [(directions, np.float32, wp.vec3), (targets, np.float64, wp.float64)]
         self._constraint_rows = [wp.array(np.asarray(a, dtype=n), dtype=t, device=self._device) for a, n, t in arrays]
+        # The lite rows' particles, directions and coefficients, which hold until the rows change.
+        rows_h = (np.asarray(particles, dtype=np.int32)[:, 0], np.asarray(directions, dtype=np.float32))
+        self._constraint_rows_h = (*rows_h, np.asarray(coefficients, dtype=np.float32)[:, 0])
         if self.nsn_schur_mode == "lite":
             self._hold_at_points(np.asarray(particles)[:, 0], np.asarray(coefficients)[:, 0], np.asarray(directions))
 
@@ -2401,8 +2405,7 @@ class SolverFBA(SolverBase):
 
     def _lite_constraint_rows(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Particles, directions and coefficients of the bilateral rows, each on one particle."""
-        particles, coefficients, directions, _ = self._constraint_rows
-        return particles.numpy()[:, 0], directions.numpy(), coefficients.numpy()[:, 0]
+        return self._constraint_rows_h
 
     def notify_model_changed(self, flags: int) -> None:
         # On any geometry/inertial change, force a full re-setup at the next step.
@@ -2501,7 +2504,7 @@ class SolverFBA(SolverBase):
         # Contact data is about to change → drop the Schur cache so the
         # next ``step()`` rebuilds ``W`` / ``A⁻¹·Jᵀ`` with fresh J.
         self._invalidate_schur_cache()
-        self._contact_extra = None
+        self._contact_extra = self._contact_extra_h = None
 
         # With a face contact margin, triangles can touch shapes that no particle touches.
         other_contacts = self._face_query is not None and self.face_contact_margin is not None
@@ -2595,6 +2598,7 @@ class SolverFBA(SolverBase):
                 M = len(particle_h)
         if extra is not None:
             self._contact_extra = [wp.array(a, device=self._device) for a in extra]
+            self._contact_extra_h = extra
         if M == 0:
             self._contact_count = 0
             return
@@ -2692,7 +2696,6 @@ class SolverFBA(SolverBase):
         self._contact_particle_h = particle_h.astype(np.int32)
         self._contact_normal_h = normal_h.astype(np.float32)
         self._contact_alpha_h = alpha_h
-        self._contact_offset_h = self._contact_offset_d.numpy()[:M].copy()
         self._contact_count = M
 
         # Stage B: tangent basis, tangent offsets, kinematic anchor velocity.
@@ -2844,6 +2847,7 @@ class SolverFBA(SolverBase):
             ``[r_n_0, r_t1_0, r_t2_0, r_n_1, ...]``.
         """
         M = self._contact_count
+        offset = self._contact_offset_d.numpy()[:M]
         r = np.zeros(3 * M, dtype=np.float64)
         for c in range(M):
             ip = int(self._contact_particle_h[c])
@@ -2852,7 +2856,7 @@ class SolverFBA(SolverBase):
             n = self._contact_normal_h[c].astype(np.float64)
             t1 = self._contact_tangent1_h[c].astype(np.float64)
             t2 = self._contact_tangent2_h[c].astype(np.float64)
-            r[3 * c + 0] = float(self._contact_offset_h[c]) - alpha * float(np.dot(n, xp))
+            r[3 * c + 0] = float(offset[c]) - alpha * float(np.dot(n, xp))
             r[3 * c + 1] = float(self._contact_tangent1_offset_h[c]) - alpha * float(np.dot(t1, xp))
             r[3 * c + 2] = float(self._contact_tangent2_offset_h[c]) - alpha * float(np.dot(t2, xp))
         return r
@@ -2867,13 +2871,12 @@ class SolverFBA(SolverBase):
             Residual vector of shape ``(M,)``, float64.
         """
         M = self._contact_count
+        offset = self._contact_offset_d.numpy()[:M]
         r = np.zeros(M, dtype=np.float64)
         for c in range(M):
             ip = int(self._contact_particle_h[c])
             # r[c] = c_offset - J·x_unc  (positive when particle penetrates)
-            r[c] = self._contact_offset_h[c] - float(self._contact_alpha_h[c]) * float(
-                np.dot(self._contact_normal_h[c], x_np[ip])
-            )
+            r[c] = offset[c] - float(self._contact_alpha_h[c]) * float(np.dot(self._contact_normal_h[c], x_np[ip]))
         return r
 
     def _solve_nsn_unilateral(

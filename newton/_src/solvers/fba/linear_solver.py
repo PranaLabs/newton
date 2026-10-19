@@ -32,6 +32,7 @@ from .kernels import (
     apply_permutation_scalar_kernel,
     extract_component_kernel,
     insert_component_kernel,
+    lite_row_dirs_kernel,
     scale_by_diag_kernel,
 )
 
@@ -1711,6 +1712,7 @@ class FBALinearSolver:
         bilateral: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
         j_extra_indices: wp.array | None = None,
         j_extra_alpha: wp.array | None = None,
+        host: tuple | None = None,
     ) -> int:
         """Populate per-row metadata for LiteNSN paths without building ``W``.
 
@@ -1727,7 +1729,9 @@ class FBALinearSolver:
         ``bilateral`` appends rows on one particle each, as ``(particles,
         directions, coefficients)``. ``j_extra_indices`` and ``j_extra_alpha``
         hold further particles of the contacts, shape ``[M, K - 1]``, as in
-        :meth:`build_schur_complement`.
+        :meth:`build_schur_complement`. ``host`` holds host copies of
+        ``j_indices``, ``j_alpha`` and the further particles and coefficients,
+        or ``None`` for them, so that they need not be read from the device.
 
         Returns ``total_rows`` (``M`` for Stage A, ``3M`` for Stage B, plus the
         bilateral rows).
@@ -1739,37 +1743,35 @@ class FBALinearSolver:
         dev = self.device
         n = self.n
 
-        idx_np = j_indices.numpy()[:M].astype(np.int32)
-        n_np = j_normals.numpy()[:M]
-        a_np = j_alpha.numpy()[:M]
-        row_particle = np.empty(total_rows, dtype=np.int32)
-        row_dir = np.empty((total_rows, 3), dtype=np.float32)
-        row_alpha = np.empty(total_rows, dtype=np.float32)
-        if has_friction:
-            t1_np = j_tangent1.numpy()[:M]
-            t2_np = j_tangent2.numpy()[:M]
-            row_particle[0::3] = idx_np; row_particle[1::3] = idx_np; row_particle[2::3] = idx_np
-            row_dir[0::3] = n_np; row_dir[1::3] = t1_np; row_dir[2::3] = t2_np
-            row_alpha[0::3] = a_np; row_alpha[1::3] = a_np; row_alpha[2::3] = a_np
-        else:
-            row_particle[:] = idx_np; row_dir[:] = n_np; row_alpha[:] = a_np
+        if host is None:
+            host = (j_indices.numpy(), j_alpha.numpy())
+            if j_extra_indices is not None:
+                host += (j_extra_indices.numpy(), j_extra_alpha.numpy())
+        idx_np, a_np = host[0][:M].astype(np.int32), host[1][:M]
+        row_particle = np.repeat(idx_np, rows_per_contact)
+        row_alpha = np.repeat(a_np, rows_per_contact)
         extra_p = extra_a = None
         if j_extra_indices is not None:
-            extra_p = np.repeat(j_extra_indices.numpy()[:M], rows_per_contact, axis=0)
-            extra_a = np.repeat(j_extra_alpha.numpy()[:M], rows_per_contact, axis=0)
+            extra_p = np.repeat(host[2][:M], rows_per_contact, axis=0)
+            extra_a = np.repeat(host[3][:M], rows_per_contact, axis=0)
+        bilateral_dir = np.zeros((0, 3), dtype=np.float32)
         if bilateral is not None:
             row_particle = np.concatenate([row_particle, np.asarray(bilateral[0], dtype=np.int32)])
-            row_dir = np.concatenate([row_dir, np.asarray(bilateral[1], dtype=np.float32)])
+            bilateral_dir = np.asarray(bilateral[1], dtype=np.float32)
             row_alpha = np.concatenate([row_alpha, np.asarray(bilateral[2], dtype=np.float32)])
             if extra_p is not None:
                 pad = row_particle.size - total_rows
                 extra_p = np.vstack([extra_p, np.full((pad, extra_p.shape[1]), -1, dtype=np.int32)])
                 extra_a = np.vstack([extra_a, np.zeros((pad, extra_a.shape[1]), dtype=np.float32)])
-            total_rows = row_particle.size
+        contact_rows, total_rows = total_rows, row_particle.size
+        tangents = (j_tangent1, j_tangent2) if has_friction else (j_normals, j_normals)
+        self._row_dir_d = wp.empty(total_rows, dtype=wp.vec3, device=dev)
+        inputs = [j_normals, *tangents, wp.array(bilateral_dir, dtype=wp.vec3, device=dev)]
+        inputs += [rows_per_contact, contact_rows]
+        wp.launch(lite_row_dirs_kernel, total_rows, inputs, [self._row_dir_d], device=dev)
         self._set_row_slots(row_particle, row_alpha, extra_p, extra_a)
 
         self._row_particle_d = wp.array(row_particle, dtype=wp.int32, device=dev)
-        self._row_dir_d = wp.array(row_dir, dtype=wp.vec3, device=dev)
         self._row_alpha_d = wp.array(row_alpha, dtype=wp.float32, device=dev)
         self._row_total = total_rows
 

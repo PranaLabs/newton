@@ -4098,6 +4098,29 @@ def bilateral_law_kernel(
     h[i] = pene0[i]
 
 
+@wp.kernel
+def lite_row_dirs_kernel(
+    normal: wp.array[wp.vec3],  # (M,)
+    tangent1: wp.array[wp.vec3],  # (M,), unused with one row per contact
+    tangent2: wp.array[wp.vec3],
+    bilateral_dir: wp.array[wp.vec3],  # (B,)
+    rows_per_contact: int,
+    contact_rows: int,
+    # output
+    row_dir: wp.array[wp.vec3],  # (contact_rows + B,)
+):
+    """Directions of the lite rows: the normal and tangents of each contact, then the bilateral rows."""
+    r = wp.tid()
+    if r >= contact_rows:
+        row_dir[r] = bilateral_dir[r - contact_rows]
+    elif r % rows_per_contact == 0:
+        row_dir[r] = normal[r // rows_per_contact]
+    elif r % rows_per_contact == 1:
+        row_dir[r] = tangent1[r // rows_per_contact]
+    else:
+        row_dir[r] = tangent2[r // rows_per_contact]
+
+
 _mat13d = wp.types.matrix(shape=(1, 3), dtype=wp.float64)
 
 

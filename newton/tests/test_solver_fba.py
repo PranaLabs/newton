@@ -3147,10 +3147,10 @@ class TestPhase4StageAContact(unittest.TestCase):
         solver.update_contacts(contacts)
 
         # Map our shape index back to the (post-sort) contact slot by reading
-        # the per-contact shape array off the host cache.  ``update_contacts``
+        # the per-contact offsets off the device.  ``update_contacts``
         # lexsorts by ``(normal_z, normal_y, normal_x, shape, particle)``, so
         # with identical normals the sort is by shape index ascending.
-        offsets = solver._contact_offset_h
+        offsets = solver._contact_offset_d.numpy()[: solver._contact_count]
         self.assertEqual(offsets.shape[0], 3)
 
         # Solve the post-sort ordering: shapes are sorted ascending.
