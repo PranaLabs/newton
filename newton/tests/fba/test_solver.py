@@ -2790,7 +2790,7 @@ class TestTetNeoHookean(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(q)), "non-finite positions after 50 tet NH steps")
 
 
-class TestPhase4StageAContact(unittest.TestCase):
+class TestUnilateralContact(unittest.TestCase):
     """Unilateral (frictionless) plane contact via the Schur complement.
 
     Tests the hard-constraint contact path in SolverFBA — no friction,
@@ -3262,14 +3262,14 @@ class TestPhase4StageAContact(unittest.TestCase):
             self.assertAlmostEqual(float(offsets[slot_of[shape]]), base + 0.01 + margin[name], delta=1e-6)
 
 
-class TestPhase4StageBFriction(unittest.TestCase):
+class TestFrictionalContact(unittest.TestCase):
     """Coulomb friction via the semismooth Newton contact solve."""
 
     @classmethod
     def setUpClass(cls):
         wp.init()
 
-    def test_friction_disabled_matches_stage_a(self):
+    def test_friction_disabled_solvers_agree(self):
         """Step two ``friction=False`` solvers to bit-identical states, with the particle pushed out of the plane."""
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
         builder.add_cloth_mesh(
@@ -3610,7 +3610,7 @@ class TestPhase4StageBFriction(unittest.TestCase):
         )
 
 
-class TestPhase4StageCShapePrimitives(unittest.TestCase):
+class TestContactShapePrimitives(unittest.TestCase):
     """Verify the Schur-complement pipeline works for non-plane shape
     primitives (sphere, box) using Newton's real collision detection.
 
@@ -4114,7 +4114,7 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
         )
 
 
-class SolverFBAStageAStageBEquivalenceTests(unittest.TestCase):
+class SolverFBAUnilateralFrictionalEquivalenceTests(unittest.TestCase):
     """The unilateral solve (``M`` rows) equals the frictional one (``3M`` rows) at μ=0.
 
     The unilateral solve is a cheaper path for frictionless contact. The unit
@@ -4151,7 +4151,7 @@ class SolverFBAStageAStageBEquivalenceTests(unittest.TestCase):
         )
         return builder.finalize()
 
-    def _build_stage_b_inputs(
+    def _build_frictional_inputs(
         self,
         W_a: np.ndarray,
         r_a: np.ndarray,
@@ -4179,7 +4179,7 @@ class SolverFBAStageAStageBEquivalenceTests(unittest.TestCase):
         mu_b = np.zeros(M, dtype=np.float64)
         return W_b, r_b, mu_b, pene0_b
 
-    def _assert_stage_a_equiv_stage_b(
+    def _assert_unilateral_equals_frictional(
         self,
         solver: SolverFBA,
         W_a: np.ndarray,
@@ -4191,7 +4191,7 @@ class SolverFBAStageAStageBEquivalenceTests(unittest.TestCase):
         atol: float = 1e-10,
         rtol: float = 1e-10,
     ) -> None:
-        W_b, r_b, mu_b, pene0_b = self._build_stage_b_inputs(W_a, r_a, pene0_a)
+        W_b, r_b, mu_b, pene0_b = self._build_frictional_inputs(W_a, r_a, pene0_a)
 
         lam_a, omega_a, lam_apply_a = solve_nsn_unilateral(
             W_a, r_a, pene0_a, max_iters=max_iters, dt=dt, lambda_cap=solver.lambda_cap
@@ -4217,7 +4217,7 @@ class SolverFBAStageAStageBEquivalenceTests(unittest.TestCase):
         W_a = np.array([[1.0]], dtype=np.float64)
         r_a = np.array([-0.1], dtype=np.float64)
         pene0_a = np.zeros(1, dtype=np.float64)
-        self._assert_stage_a_equiv_stage_b(solver, W_a, r_a, pene0_a)
+        self._assert_unilateral_equals_frictional(solver, W_a, r_a, pene0_a)
 
     def test_three_contacts_well_conditioned(self) -> None:
         model = self._tiny_cloth_model()
@@ -4232,7 +4232,7 @@ class SolverFBAStageAStageBEquivalenceTests(unittest.TestCase):
         )
         r_a = np.array([-0.1, -0.05, -0.02], dtype=np.float64)
         pene0_a = np.zeros(3, dtype=np.float64)
-        self._assert_stage_a_equiv_stage_b(solver, W_a, r_a, pene0_a)
+        self._assert_unilateral_equals_frictional(solver, W_a, r_a, pene0_a)
 
     def test_nonzero_pene0_offset(self) -> None:
         model = self._tiny_cloth_model()
@@ -4241,7 +4241,7 @@ class SolverFBAStageAStageBEquivalenceTests(unittest.TestCase):
         r_a = np.array([-0.05, -0.03, -0.01], dtype=np.float64)
         # pene0 exercises the row anchor offset in fb_unilateral_row's `h`.
         pene0_a = np.array([0.02, -0.01, 0.005], dtype=np.float64)
-        self._assert_stage_a_equiv_stage_b(solver, W_a, r_a, pene0_a)
+        self._assert_unilateral_equals_frictional(solver, W_a, r_a, pene0_a)
 
 
 class TestContactForceObservable(unittest.TestCase):
