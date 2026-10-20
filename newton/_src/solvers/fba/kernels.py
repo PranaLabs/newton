@@ -1613,3 +1613,1080 @@ def project_pin_kernel(
     k = wp.tid()
     i = pin_indices[k]
     wp.atomic_add(rhs, i, pin_stiffness * x_ref[i])
+
+
+# ---------------------------------------------------------------------------
+# Contact Jacobian kernels
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def accumulate_vec3_kernel(
+    src: wp.array[wp.vec3],
+    dst: wp.array[wp.vec3],
+):
+    """dst[i] += src[i]: accumulate one vec3 array into another."""
+    tid = wp.tid()
+    dst[tid] = dst[tid] + src[tid]
+
+
+# ---------------------------------------------------------------------------
+# Schur build primitives restricted to the contacted DOFs (isodofs)
+# ---------------------------------------------------------------------------
+
+
+# Tile sizes for the dense GEMM used by ``compute_wi_tiled_kernel``.
+# ``32 x 32 x 32`` with ``128`` threads per block was empirically fastest for
+# k ~ 1200 contacted DOFs among N ~ 7000 particles on an RTX 5090 in fp64.
+_WI_TILE_M = wp.constant(32)
+_WI_TILE_N = wp.constant(32)
+_WI_TILE_K = wp.constant(32)
+_WI_TILE_THREADS = 128
+
+
+@wp.kernel
+def densify_S_iso_scaled_kernel(
+    ST_offsets: wp.array[wp.int32],
+    ST_columns: wp.array[wp.int32],
+    ST_values: wp.array[wp.float64],
+    D_inv: wp.array[wp.float64],
+    isodof_perm: wp.array[wp.int32],
+    S_iso_scaled: wp.array2d[wp.float64],
+):
+    """Densify selected columns of ``S`` (scaled by ``sqrt(D_inv)``) into ``(N_pad, k_pad)``.
+
+    Writes ``S_iso_scaled[i, a] = sqrt(D_inv[i]) * S[i, isodof_perm[a]]`` for
+    ``i`` in the nonzero support of column ``isodof_perm[a]`` of ``S``.
+
+    Companion to :func:`compute_wi_tiled_kernel`.  The output buffer must be
+    pre-zeroed (the kernel only writes to nonzero positions of S).  Padding
+    rows ``i >= N`` and padding columns ``a >= k`` are left as zero, so the
+    subsequent tile matmul reduces over the padded zeros without polluting
+    the result.
+
+    One thread per ``a`` in ``[0, k)``; the inner loop walks the CSR column
+    sequentially (``ST_offsets[ip..ip+1]``).
+
+    Args:
+        ST_offsets: CSR row offsets of ``S^T`` (column offsets of ``S``),
+            length ``N + 1``, int32.
+        ST_columns: CSR column indices of ``S^T`` (row indices of ``S``),
+            length ``nnz(S)``, int32, sorted within each column.
+        ST_values: CSR values of ``S^T``, length ``nnz(S)``, float64.
+        D_inv: ``D^{-1}`` diagonal of the ``LDL^T`` factorization, length
+            ``N``, float64. ``A^{-1} = P · S^T · D^{-1} · S · P^T`` so the
+            sandwich form ``S^T · diag(D^{-1}) · S`` matches the per-particle
+            Schur scaling.
+        isodof_perm: ``perm[isodofs[a]]`` for ``a = 0..k-1``, length ``k``,
+            int32. Selects which columns of ``S`` to densify.
+        S_iso_scaled: Output dense buffer of shape ``(N_pad, k_pad)``, float64.
+            Must be zero-initialized before launch; only entries at nonzero
+            positions of the selected ``S`` columns are written.
+    """
+    a = wp.tid()
+    ip = isodof_perm[a]
+    beg = ST_offsets[ip]
+    end = ST_offsets[ip + 1]
+    for p in range(beg, end):
+        i = ST_columns[p]
+        S_iso_scaled[i, a] = wp.sqrt(D_inv[i]) * ST_values[p]
+
+
+@wp.kernel
+def compute_wi_tiled_kernel(
+    S_iso_scaled: wp.array2d[wp.float64],
+    Wi: wp.array2d[wp.float64],
+    N_pad: int,
+):
+    """Compute ``Wi = X^T · X`` via blocked dense GEMM where ``X = sqrt(D_inv) · S_iso``.
+
+    A dense blocked matrix-matrix multiply instead of an O(k² · nnz_col) sparse
+    column intersection. For k≈1200, N≈7000 and a mean S column
+    nnz ≈ 1700 (``S`` columns ~24% dense), the densified GEMM is
+    >3x faster than the sparse intersection because the inner loop becomes a
+    streamed tile-mma instead of a per-(a,b) gather over ~1700 indirected
+    fp64 reads.
+
+    Computes the *full* ``(k x k)`` ``Wi`` matrix (not just the upper triangle),
+    so ``compose_W_from_wi_kernel`` can index it symmetrically without a
+    follow-up mirror pass.
+
+    Launched with ``wp.launch_tiled`` over a ``(k_pad/TILE_M, k_pad/TILE_N)``
+    grid; one CUDA block per output tile, ``_WI_TILE_THREADS`` threads per
+    block.
+
+    Args:
+        S_iso_scaled: Dense densified S-columns buffer of shape
+            ``(N_pad, k_pad)``, float64. ``S_iso_scaled[i, a] =
+            sqrt(D_inv[i]) * S[i, isodof_perm[a]]``. Padding (``i >= N``,
+            ``a >= k``) must be zero.
+        Wi: Output dense Schur factor block of shape ``(k_pad, k_pad)``,
+            float64.  Both upper and lower triangles are written.
+        N_pad: Padded row count of ``S_iso_scaled``; must be a multiple of
+            ``_WI_TILE_K``.
+    """
+    tile_i, tile_j = wp.tid()
+    acc = wp.tile_zeros(shape=(_WI_TILE_M, _WI_TILE_N), dtype=wp.float64)
+    for k_tile in range(0, N_pad, _WI_TILE_K):
+        a = wp.tile_load(S_iso_scaled, shape=(_WI_TILE_K, _WI_TILE_M), offset=(k_tile, tile_i * _WI_TILE_M))
+        b = wp.tile_load(S_iso_scaled, shape=(_WI_TILE_K, _WI_TILE_N), offset=(k_tile, tile_j * _WI_TILE_N))
+        a_T = wp.tile_transpose(a)
+        wp.tile_matmul(a_T, b, acc)
+    wp.tile_store(Wi, acc, offset=(tile_i * _WI_TILE_M, tile_j * _WI_TILE_N))
+
+
+@wp.kernel
+def compose_W_from_wi_kernel(
+    contact_particle: wp.array[wp.int32],
+    contact_dir: wp.array[wp.vec3],
+    contact_alpha: wp.array[wp.float32],
+    isodof_rank: wp.array[wp.int32],
+    Wi: wp.array2d[wp.float64],
+    W: wp.array2d[wp.float64],
+):
+    """Assemble ``W[c', c] = alpha[c'] * alpha[c] * (dir[c'] . dir[c]) * Wi[r', r]``.
+
+    For particle-vs-static-shape contact rows, the Jacobian for row ``c`` has a
+    single nonzero column at ``particle[c]`` with value
+    ``alpha[c] * dir[c]`` (vec3). The scalar ``A^{-1}`` acts component-wise on
+    each spatial axis, so
+
+        (J A^{-1} J^T)[c', c] = alpha[c'] * alpha[c] * (dir[c'] . dir[c])
+                                 * A^{-1}[particle[c'], particle[c]]
+                              = alpha[c'] * alpha[c] * (dir[c'] . dir[c])
+                                 * Wi[rank(particle[c']), rank(particle[c])].
+
+    One thread per ``(c', c)`` pair in the ``(total_rows, total_rows)`` W.
+
+    Args:
+        contact_particle: Particle index per contact row, shape ``[total_rows]``.
+        contact_dir: Contact direction per row, shape ``[total_rows]``.
+        contact_alpha: Jacobian coefficient per row, shape ``[total_rows]``.
+        isodof_rank: Per-particle rank within ``isodofs`` (``isodof_rank[p] = a``
+            iff ``isodofs[a] == p``), shape ``[N]``. Entries for non-isodof
+            particles are ``-1`` but are never indexed because every contact
+            row's particle is by construction an isodof.
+        Wi: ``(k, k)`` matrix of selected ``A^{-1}`` entries, float64.
+        W: Output ``(total_rows, total_rows)`` Schur complement, float64.
+    """
+    cp, c = wp.tid()
+    p_cp = contact_particle[cp]
+    p_c = contact_particle[c]
+    r_cp = isodof_rank[p_cp]
+    r_c = isodof_rank[p_c]
+    alpha = wp.float64(contact_alpha[cp]) * wp.float64(contact_alpha[c])
+    dot = wp.float64(wp.dot(contact_dir[cp], contact_dir[c]))
+    W[cp, c] = alpha * dot * Wi[r_cp, r_c]
+
+
+@wp.kernel
+def gather_jt_lambda_kernel(
+    row_offsets: wp.array[wp.int32],  # (N + 1,) CSR offsets into row_indices
+    row_indices: wp.array[wp.int32],  # (total_rows,) contact rows incident to each particle
+    contact_dir: wp.array[wp.vec3],  # (total_rows,) per-row direction
+    contact_alpha: wp.array[wp.float32],  # (total_rows,) per-row Jacobian coefficient
+    lam: wp.array[wp.float32],  # (total_rows,) per-row impulse
+    out: wp.array[wp.vec3],  # (N,) per-particle J^T * lambda, OVERWRITTEN
+):
+    """Compute ``out[p] = sum_{r: particle[r]=p} alpha[r] * lam[r] * dir[r]``.
+
+    Particle-centered gather, deterministic because it needs no atomics: one
+    thread per particle reads its incident contact rows from the
+    inverse-mapping CSR (built once per contact set by the Schur build, see
+    :meth:`~newton._src.solvers.fba.linear_solver.FBALinearSolver.build_schur_complement`)
+    and sums ``alpha[r] * lam[r] * dir[r]`` over them.
+
+    Frictionless (unilateral) contacts: one row per contact, ``total_rows == M``.
+    Frictional (Coulomb) contacts: three rows per contact (n, t1, t2, all sharing
+    the same particle), ``total_rows == 3*M``. Both cases use the same CSR
+    layout because rows are indexed by their position in the per-row
+    direction/alpha arrays.
+
+    Overwrites ``out`` (does not accumulate).
+
+    Args:
+        row_offsets: CSR row offsets (``N + 1`` entries), shape ``[N + 1]``.
+        row_indices: CSR entry -> contact row index, shape ``[total_rows]``.
+        contact_dir: Contact direction per row, shape ``[total_rows]``.
+        contact_alpha: Jacobian coefficient per row, shape ``[total_rows]``.
+        lam: Contact impulse per row, shape ``[total_rows]``, float32.
+        out: Per-particle accumulator, shape ``[N]``, vec3. Overwritten.
+    """
+    p = wp.tid()
+    start = row_offsets[p]
+    end = row_offsets[p + 1]
+    s = wp.vec3(0.0, 0.0, 0.0)
+    for k in range(start, end):
+        r = row_indices[k]
+        s = s + (contact_alpha[r] * lam[r]) * contact_dir[r]
+    out[p] = s
+
+
+# ---------------------------------------------------------------------------
+# NSN inner LCP: Fischer-Burmeister rows and Schur build, in fp64.
+#
+# Per-row scalar evaluators of the Fischer-Burmeister functions and the
+# ``A_schur = ωωᵀ ⊙ W + diag(c)`` assembly. The inner Schur solve runs in
+# fp64, as the host reference in the tests does.
+# ---------------------------------------------------------------------------
+
+
+@wp.func
+def fb_unilateral_row_wp(
+    penetration: wp.float64,
+    lam: wp.float64,
+    precond: wp.float64,
+    dt: wp.float64,
+    pene0: wp.float64,
+) -> wp.vec3d:
+    """Fischer-Burmeister evaluation for a unilateral (normal) contact row.
+
+    GPU version of the host reference ``fb_unilateral_row``
+    (``newton/tests/fba/_reference.py``). Returns a :class:`warp.vec3d`
+    packing ``(omega, compliance, h)``: Warp ``@wp.func`` cannot return Python
+    tuples, so the fp64 vec3 type carries the three scalars.
+
+    Args:
+        penetration: ``J·q - pene0`` at current iterate (m).
+        lam: Current normal lambda (N).
+        precond: ``1 / W_ii`` (1/N).
+        dt: Timestep (s).
+        pene0: ``n·anchor`` (m).
+
+    Returns:
+        ``vec3d(omega, compliance, h)`` matching the CPU reference's tuple
+        return semantics. The degenerate-root branch returns
+        ``(0, precond/dt², 0)``: the residual vanishes there, so the row
+        takes no Newton step.
+    """
+    pene = penetration
+    plam = precond * lam
+    root = wp.sqrt(pene * pene + plam * plam)
+    if root < wp.float64(1.0e-30):
+        return wp.vec3d(wp.float64(0.0), precond / (dt * dt), wp.float64(0.0))
+    omega = wp.float64(1.0) - pene / root
+    compliance = (wp.float64(1.0) - plam / root) * (precond / (dt * dt))
+    h = -(pene + plam - root) + omega * (penetration + pene0)
+    return wp.vec3d(omega, compliance, h)
+
+
+@wp.func
+def fb_frictional_row_wp(
+    penetration: wp.float64,
+    lam_t: wp.float64,
+    lam_n: wp.float64,
+    mu: wp.float64,
+    precond: wp.float64,
+    dt: wp.float64,
+    pene0: wp.float64,
+) -> wp.vec3d:
+    """Fischer-Burmeister evaluation for a frictional (tangent) contact row.
+
+    GPU version of the host reference ``fb_frictional_row``
+    (``newton/tests/fba/_reference.py``).
+    Returns ``(omega, compliance, h)`` packed as :class:`warp.vec3d`.
+
+    Inactive contact (``lam_n ≤ 0``): ``omega = 0``, ``compliance = 1/dt``,
+    ``h = -dt · lam_t``.
+
+    Active contact (``lam_n > 0``): smooth complementarity between slip
+    speed ``|penetration|/dt`` and cone slack ``μ·lam_n - |lam_t|``.
+    ``omega = 1``; compliance varies between near-zero (stick) and ``~1/dt``
+    (slip).
+
+    Args:
+        penetration: Tangential ``J·q - pene0`` row value (m).
+        lam_t: Current tangent lambda (N).
+        lam_n: Companion normal lambda (N).
+        mu: Coulomb friction coefficient.
+        precond: ``1 / W_ii`` for this tangent row (1/N).
+        dt: Timestep (s).
+        pene0: ``t·anchor`` (m).
+
+    Returns:
+        ``vec3d(omega, compliance, h)`` matching the CPU reference.
+    """
+    if lam_n <= wp.float64(0.0):
+        return wp.vec3d(
+            wp.float64(0.0),
+            wp.float64(1.0) / dt,
+            -dt * lam_t,
+        )
+
+    abspenevel = wp.abs(penetration / dt)
+    tmp = precond * (mu * lam_n - wp.abs(lam_t))
+    root = wp.sqrt(abspenevel * abspenevel + tmp * tmp)
+    denom = abspenevel + mu * precond * lam_n - root
+    if wp.abs(denom) < wp.float64(1.0e-30):
+        compliance = wp.float64(1.0) / dt
+    else:
+        compliance = ((root - tmp) / denom) * (precond / dt)
+    h = -(dt * dt) * compliance * lam_t + pene0
+    return wp.vec3d(wp.float64(1.0), compliance, h)
+
+
+@wp.kernel
+def build_a_schur_kernel(
+    W: wp.array2d[wp.float64],  # (n_rows, n_rows) Schur complement
+    omega: wp.array[wp.float64],  # (n_rows,) per-row weighting
+    compliance: wp.array[wp.float64],  # (n_rows,) per-row diagonal compliance
+    a_schur: wp.array2d[wp.float64],  # (n_rows, n_rows) OUTPUT
+):
+    """Assemble ``A_schur = ωωᵀ ⊙ W + diag(compliance)`` on GPU.
+
+    GPU version of the host expression in
+    ``solve_nsn_unilateral`` (``newton/tests/fba/_reference.py``),
+    ``A_schur = (omega[:, None] * omega[None, :]) * W + np.diag(compliance)``,
+    which assembles the unilateral and frictional row contributions into the
+    inner Schur LHS.
+
+    Launch with ``dim=(n_rows, n_rows)``.
+
+    Args:
+        W: Dense Schur complement, shape ``[n_rows, n_rows]``.
+        omega: Per-row Fischer-Burmeister weighting, shape ``[n_rows]``.
+        compliance: Per-row diagonal compliance, shape ``[n_rows]``.
+        a_schur: Output LHS matrix, shape ``[n_rows, n_rows]``. Overwritten.
+    """
+    i, j = wp.tid()
+    val = omega[i] * omega[j] * W[i, j]
+    if i == j:
+        val = val + compliance[i]
+    a_schur[i, j] = val
+
+
+# ---------------------------------------------------------------------------
+# NSN inner driver: residual, penetration, rhs, FB row launchers, box clamp.
+#
+# Each kernel computes a NumPy expression of ``solve_nsn_unilateral`` or
+# ``solve_nsn_coulomb`` (``newton/tests/fba/_reference.py``) on the device.
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def compute_contact_residual_unilateral_kernel(
+    contact_offset: wp.array[wp.float64],  # (M,) device, n·anchor
+    contact_alpha: wp.array[wp.float32],  # (M,)
+    contact_normal: wp.array[wp.vec3],  # (M,) world frame
+    contact_particle: wp.array[wp.int32],  # (M,)
+    x: wp.array[wp.vec3],  # (N,) particle positions (float32)
+    r: wp.array[wp.float64],  # (M,) output residual
+):
+    """Frictionless (unilateral) contact residual.
+
+    Computes ``r[c] = offset[c] - alpha[c] * dot(normal[c], x[particle[c]])``
+    one contact per thread. ``wp.dot`` on a ``vec3`` returns ``float32``; it is
+    widened to fp64 before the multiply.
+
+    Args:
+        contact_offset: ``n·anchor`` per contact (fp64), shape ``[M]``.
+        contact_alpha: Per-contact Jacobian scale (fp32), shape ``[M]``.
+        contact_normal: World-frame unit normal, shape ``[M]``.
+        contact_particle: Per-contact particle index, shape ``[M]``.
+        x: Particle positions (fp32), shape ``[N]``.
+        r: Output residual (fp64), shape ``[M]``.
+    """
+    c = wp.tid()
+    ip = contact_particle[c]
+    alpha = wp.float64(contact_alpha[c])
+    n_dot_x = wp.float64(wp.dot(contact_normal[c], x[ip]))
+    r[c] = contact_offset[c] - alpha * n_dot_x
+
+
+@wp.kernel
+def compute_contact_residual_coulomb_kernel(
+    contact_offset_n: wp.array[wp.float64],  # (M,) n·anchor
+    contact_offset_t1: wp.array[wp.float64],  # (M,) t1·anchor (with kinematic shift)
+    contact_offset_t2: wp.array[wp.float64],  # (M,) t2·anchor (with kinematic shift)
+    contact_alpha: wp.array[wp.float32],  # (M,)
+    contact_normal: wp.array[wp.vec3],  # (M,)
+    contact_t1: wp.array[wp.vec3],  # (M,)
+    contact_t2: wp.array[wp.vec3],  # (M,)
+    contact_particle: wp.array[wp.int32],  # (M,)
+    x: wp.array[wp.vec3],  # (N,) particle positions (float32)
+    r: wp.array[wp.float64],  # (3M,) output residual
+):
+    """Frictional (Coulomb) contact residual.
+
+    Emits ``r[3c+0/1/2] = offset_{n/t1/t2}[c] - alpha[c] * dot(axis, x[p[c]])``
+    where ``axis`` is normal / t1 / t2 respectively. One contact per thread
+    writes three consecutive rows in interleaved ``[r_n, r_t1, r_t2]``
+    layout.
+
+    Args:
+        contact_offset_n: ``n·anchor`` (fp64), shape ``[M]``.
+        contact_offset_t1: ``t1·anchor`` (fp64), shape ``[M]``.
+        contact_offset_t2: ``t2·anchor`` (fp64), shape ``[M]``.
+        contact_alpha: Per-contact Jacobian scale (fp32), shape ``[M]``.
+        contact_normal: World-frame unit normal, shape ``[M]``.
+        contact_t1: First tangent vectors, shape ``[M]``.
+        contact_t2: Second tangent vectors, shape ``[M]``.
+        contact_particle: Per-contact particle index, shape ``[M]``.
+        x: Particle positions (fp32), shape ``[N]``.
+        r: Output residual (fp64), shape ``[3M]``.
+    """
+    c = wp.tid()
+    ip = contact_particle[c]
+    alpha = wp.float64(contact_alpha[c])
+    xp = x[ip]
+    r[3 * c + 0] = contact_offset_n[c] - alpha * wp.float64(wp.dot(contact_normal[c], xp))
+    r[3 * c + 1] = contact_offset_t1[c] - alpha * wp.float64(wp.dot(contact_t1[c], xp))
+    r[3 * c + 2] = contact_offset_t2[c] - alpha * wp.float64(wp.dot(contact_t2[c], xp))
+
+
+@wp.kernel
+def compute_precond_unilateral_kernel(
+    W: wp.array2d[wp.float64],  # (M, M) Schur W
+    dt: wp.float64,
+    precond: wp.array[wp.float64],  # (M,) output
+):
+    """Compute ``precond[i] = dt² · max(W_ii, 1e-12)``, or ``dt²`` where ``|W_ii| <= 1e-12`` (frictionless rows).
+
+    The expression of the host reference ``solve_nsn_unilateral``
+    (``newton/tests/fba/_reference.py``):
+    ``precond = (dt*dt) * np.where(|diag_W|>1e-12, max(diag_W, 1e-12), 1.0)``.
+    The ``np.where`` falls through to ``1.0`` only when ``|diag_W| <=
+    1e-12`` (degenerate row); otherwise it takes ``max(diag_W, 1e-12)``, which
+    differs from ``|diag_W|`` for negative diagonals. The kernel keeps both
+    branches, so its output equals the host reference bit for bit.
+
+    Args:
+        W: Dense Schur complement, shape ``[M, M]``.
+        dt: Timestep (fp64).
+        precond: Output preconditioner, shape ``[M]``.
+    """
+    i = wp.tid()
+    d = W[i, i]
+    dt2 = dt * dt
+    if wp.abs(d) > wp.float64(1.0e-12):
+        if d > wp.float64(1.0e-12):
+            precond[i] = dt2 * d
+        else:
+            precond[i] = dt2 * wp.float64(1.0e-12)
+    else:
+        precond[i] = dt2 * wp.float64(1.0)
+
+
+@wp.kernel
+def compute_precond_coulomb_kernel(
+    W: wp.array2d[wp.float64],  # (3M, 3M) Schur W
+    dt: wp.float64,
+    precond: wp.array[wp.float64],  # (3M,) output
+):
+    """Compute the frictional preconditioner: ``dt²·W_ii`` for normal rows and
+    ``dt·W_ii`` for tangent rows, with ``|W_ii|`` floor of ``1e-12``.
+
+    Same as the per-contact loop of the host reference
+    ``solve_nsn_coulomb`` (``newton/tests/fba/_reference.py``) (``w_n/w_t1/w_t2 =
+    max(|diag_W[3c..]|, 1e-12)``; ``precond[3c] = dt²·w_n``;
+    ``precond[3c+1/2] = dt·w_t1/t2``).
+
+    Args:
+        W: Dense Schur complement, shape ``[3M, 3M]``.
+        dt: Timestep (fp64).
+        precond: Output preconditioner, shape ``[3M]``.
+    """
+    i = wp.tid()  # 0..3M
+    w = wp.abs(W[i, i])
+    if w < wp.float64(1.0e-12):
+        w = wp.float64(1.0e-12)
+    if (i % 3) == 0:
+        precond[i] = dt * dt * w
+    else:
+        precond[i] = dt * w
+
+
+# Tile width for the NSN matvec kernels below.  ``128`` matches the PCR
+# matvec tile size (see ``nsn_pcr_solver.py``): the NSN n_rows is the same
+# Schur dimension, and an fp64 sweep on an RTX 5090 found the same sweet
+# spot at n_rows ~ 600..1500.
+_NSN_MATVEC_TILE_K = wp.constant(128)
+_NSN_MATVEC_BLOCK_DIM = 128
+
+
+@wp.kernel
+def compute_penetration_kernel(
+    r: wp.array[wp.float64],
+    W: wp.array2d[wp.float64],
+    omega: wp.array[wp.float64],
+    lam: wp.array[wp.float64],
+    n_rows: wp.int32,
+    n_rows_pad: wp.int32,
+    dt: wp.float64,
+    penetration: wp.array[wp.float64],
+):
+    """Compute ``penetration = -r + dt² · W · (ω · λ)``.
+
+    The expression of the host reference's FB-Newton loop:
+    ``penetration = -r + (dt*dt) * (W @ (omega * lam))``.
+
+    Block-per-row tiled reduction: each block computes one ``penetration[i]``
+    cooperatively by accumulating ``TILE_K``-wide strips of
+    ``W[i, j] * omega[j] * lam[j]`` and reducing with ``wp.tile_sum``.
+    Launched via :func:`wp.launch_tiled` with ``dim=n_rows`` and
+    ``block_dim=_NSN_MATVEC_BLOCK_DIM``, about 4-5x faster than a thread per
+    row at n_rows ~ 600..1500 on an RTX 5090 in fp64.
+
+    Args:
+        r: Contact residual (fp64), shape ``[n_rows]``.
+        W: Schur complement, shape ``[n_rows, n_rows]``.
+        omega: FB row weights, shape ``[n_rows]``.
+        lam: Current lambda, shape ``[n_rows]``.
+        n_rows: Active row count (``M`` frictionless, ``3M`` frictional).
+        n_rows_pad: ``ceil(n_rows / TILE_K) * TILE_K``. The K loop runs up
+            to this so the partial last tile reduces through the same
+            ``tile_sum`` path; bounds-checked ``tile_load`` zero-pads OOB.
+        dt: Timestep.
+        penetration: Output penetration, shape ``[n_rows]``.
+    """
+    i = wp.tid()
+    wol = wp.float64(0.0)
+    for k_tile in range(0, n_rows_pad, _NSN_MATVEC_TILE_K):
+        w_row = wp.tile_load(W[i], shape=(_NSN_MATVEC_TILE_K,), offset=(k_tile,))
+        o_tile = wp.tile_load(omega, shape=(_NSN_MATVEC_TILE_K,), offset=(k_tile,))
+        l_tile = wp.tile_load(lam, shape=(_NSN_MATVEC_TILE_K,), offset=(k_tile,))
+        ol = wp.tile_map(wp.mul, o_tile, l_tile)
+        prod = wp.tile_map(wp.mul, w_row, ol)
+        s = wp.tile_sum(prod)
+        # ``tile_extract`` broadcasts the (1,) reduction to every thread in
+        # the block; folding into a scalar accumulator keeps the cross-iter
+        # state out of shared memory (re-assigning a shared tile broke the
+        # register-vs-shared promotion of Warp 1.14).
+        wol = wol + wp.tile_extract(s, 0)
+    # All threads in the block write the same value. CUDA coalesces
+    # identical writes (equivalent to a single thread emit).
+    penetration[i] = -r[i] + dt * dt * wol
+
+
+@wp.kernel
+def compute_nsn_rhs_kernel(
+    h: wp.array[wp.float64],
+    omega: wp.array[wp.float64],
+    pene0: wp.array[wp.float64],
+    r: wp.array[wp.float64],
+    W: wp.array2d[wp.float64],
+    lam: wp.array[wp.float64],
+    n_rows: wp.int32,
+    n_rows_pad: wp.int32,
+    dt: wp.float64,
+    rhs: wp.array[wp.float64],
+):
+    """Compute the NSN inner right-hand side ``rhs = (1/dt²) · (h - ω · J·x_corrected)``.
+
+    The expressions of the host reference:
+
+        J_x = (pene0 - r) + (dt*dt) * (W @ (omega * lam))
+        rhs = (1.0 / (dt*dt)) * (h - omega * J_x)
+
+    Block-per-row tiled reduction (see :func:`compute_penetration_kernel`)
+    for the ``W @ (omega · lam)`` matvec.  The two expressions stay fused in
+    a single kernel so we avoid materialising ``J_x`` to a scratch buffer.
+
+    Args:
+        h: Per-row Schur RHS contribution, shape ``[n_rows]``.
+        omega: Per-row FB weighting, shape ``[n_rows]``.
+        pene0: Per-row anchor projection, shape ``[n_rows]``.
+        r: Contact residual, shape ``[n_rows]``.
+        W: Schur complement, shape ``[n_rows, n_rows]``.
+        lam: Current lambda, shape ``[n_rows]``.
+        n_rows: Active row count.
+        n_rows_pad: ``ceil(n_rows / TILE_K) * TILE_K``. See
+            :func:`compute_penetration_kernel`.
+        dt: Timestep.
+        rhs: Output NSN RHS, shape ``[n_rows]``.
+    """
+    i = wp.tid()
+    wol = wp.float64(0.0)
+    for k_tile in range(0, n_rows_pad, _NSN_MATVEC_TILE_K):
+        w_row = wp.tile_load(W[i], shape=(_NSN_MATVEC_TILE_K,), offset=(k_tile,))
+        o_tile = wp.tile_load(omega, shape=(_NSN_MATVEC_TILE_K,), offset=(k_tile,))
+        l_tile = wp.tile_load(lam, shape=(_NSN_MATVEC_TILE_K,), offset=(k_tile,))
+        ol = wp.tile_map(wp.mul, o_tile, l_tile)
+        prod = wp.tile_map(wp.mul, w_row, ol)
+        s = wp.tile_sum(prod)
+        wol = wol + wp.tile_extract(s, 0)
+    j_x = (pene0[i] - r[i]) + dt * dt * wol
+    rhs[i] = (wp.float64(1.0) / (dt * dt)) * (h[i] - omega[i] * j_x)
+
+
+@wp.kernel
+def compute_unilateral_fb_kernel(
+    penetration: wp.array[wp.float64],
+    lam: wp.array[wp.float64],
+    precond: wp.array[wp.float64],
+    pene0: wp.array[wp.float64],
+    dt: wp.float64,
+    omega: wp.array[wp.float64],  # output
+    compliance: wp.array[wp.float64],  # output
+    h: wp.array[wp.float64],  # output
+):
+    """Evaluate :func:`fb_unilateral_row_wp` for every row.
+
+    Per-row launcher that calls the existing ``@wp.func`` FB evaluator;
+    one thread populates ``(omega[i], compliance[i], h[i])``. Matches the
+    CPU per-row ``fb_unilateral_row(...)`` loop in
+    ``solve_nsn_unilateral`` (``newton/tests/fba/_reference.py``).
+
+    Args:
+        penetration: Per-row penetration ``J·q - pene0``, shape ``[M]``.
+        lam: Per-row lambda, shape ``[M]``.
+        precond: Per-row preconditioner, shape ``[M]``.
+        pene0: Per-row anchor projection, shape ``[M]``.
+        dt: Timestep.
+        omega: Output FB weighting, shape ``[M]``.
+        compliance: Output diagonal compliance, shape ``[M]``.
+        h: Output Schur RHS contribution, shape ``[M]``.
+    """
+    i = wp.tid()
+    out = fb_unilateral_row_wp(penetration[i], lam[i], precond[i], dt, pene0[i])
+    omega[i] = out[0]
+    compliance[i] = out[1]
+    h[i] = out[2]
+
+
+@wp.kernel
+def compute_frictional_fb_kernel(
+    penetration: wp.array[wp.float64],  # (3M,)
+    lam: wp.array[wp.float64],  # (3M,)
+    mu: wp.array[wp.float64],  # (M,) per-contact
+    precond: wp.array[wp.float64],  # (3M,)
+    pene0: wp.array[wp.float64],  # (3M,)
+    dt: wp.float64,
+    omega: wp.array[wp.float64],  # (3M,) output
+    compliance: wp.array[wp.float64],  # (3M,) output
+    h: wp.array[wp.float64],  # (3M,) output
+):
+    """Evaluate the 3-row FB block (normal + 2 tangents) per contact.
+
+    One thread per contact emits the unilateral normal row plus two
+    frictional tangent rows, matching the CPU loop body in
+    ``solve_nsn_coulomb`` (``newton/tests/fba/_reference.py``). The tangent rows take the
+    *current iterate* of ``lam_n`` as their companion normal lambda, as the
+    host reference does, which reads ``lam[idx_n]`` before computing the
+    tangent rows in the same iteration.
+
+    Args:
+        penetration: Per-row penetration, shape ``[3M]``.
+        lam: Per-row lambda, shape ``[3M]``.
+        mu: Per-contact friction coefficient, shape ``[M]``.
+        precond: Per-row preconditioner, shape ``[3M]``.
+        pene0: Per-row anchor projection, shape ``[3M]``.
+        dt: Timestep.
+        omega: Output FB weighting, shape ``[3M]``.
+        compliance: Output diagonal compliance, shape ``[3M]``.
+        h: Output Schur RHS contribution, shape ``[3M]``.
+    """
+    c = wp.tid()  # 0..M
+    idx_n = 3 * c
+    idx_t1 = 3 * c + 1
+    idx_t2 = 3 * c + 2
+    lam_n = lam[idx_n]
+    mu_c = mu[c]
+    out_n = fb_unilateral_row_wp(penetration[idx_n], lam_n, precond[idx_n], dt, pene0[idx_n])
+    omega[idx_n] = out_n[0]
+    compliance[idx_n] = out_n[1]
+    h[idx_n] = out_n[2]
+    out_t1 = fb_frictional_row_wp(penetration[idx_t1], lam[idx_t1], lam_n, mu_c, precond[idx_t1], dt, pene0[idx_t1])
+    omega[idx_t1] = out_t1[0]
+    compliance[idx_t1] = out_t1[1]
+    h[idx_t1] = out_t1[2]
+    out_t2 = fb_frictional_row_wp(penetration[idx_t2], lam[idx_t2], lam_n, mu_c, precond[idx_t2], dt, pene0[idx_t2])
+    omega[idx_t2] = out_t2[0]
+    compliance[idx_t2] = out_t2[1]
+    h[idx_t2] = out_t2[2]
+
+
+@wp.kernel
+def contact_mu_kernel(
+    contact_shape: wp.array[wp.int32],  # (M,) shape of each contact, -1 for contacts without a shape
+    shape_material_mu: wp.array[wp.float32],
+    particle_mu: wp.float64,
+    # output
+    mu: wp.array[wp.float64],
+):
+    """Friction coefficient of each contact: its shape's, or the particles' for contacts without a shape."""
+    c = wp.tid()
+    s = contact_shape[c]
+    if s >= 0 and s < shape_material_mu.shape[0]:
+        mu[c] = wp.float64(shape_material_mu[s])
+    else:
+        mu[c] = particle_mu
+
+
+@wp.kernel
+def axpy_lambda_kernel(
+    dlam: wp.array[wp.float64],
+    lam: wp.array[wp.float64],  # inout
+):
+    """``lam += dlam`` (NSN Newton update step)."""
+    i = wp.tid()
+    lam[i] = lam[i] + dlam[i]
+
+
+@wp.kernel
+def coulomb_box_clamp_kernel(
+    mu: wp.array[wp.float64],  # (M,)
+    lam: wp.array[wp.float64],  # (3M,) inout
+):
+    """Per-contact Coulomb box clamp on tangent lambdas.
+
+    As ``coulomb_box_clamp`` of the host reference (``newton/tests/fba/_reference.py``)
+    does: a contact whose normal multiplier ``lam_n`` is not positive carries
+    no friction, so its tangent multipliers are zeroed; the others are clamped
+    into ``[-mu·lam_n, mu·lam_n]``. ``lam_n`` keeps the value of the Newton
+    step. Bounds read from a negative ``lam_n`` would swap and leave a friction
+    force of ``mu·|lam_n|`` in an arbitrary direction.
+
+    Args:
+        mu: Per-contact friction coefficient (fp64), shape ``[M]``.
+        lam: Per-row lambda (fp64), shape ``[3M]``. Modified in place.
+    """
+    c = wp.tid()
+    lam_n = lam[3 * c]
+    if lam_n <= wp.float64(0.0):
+        lam[3 * c + 1] = wp.float64(0.0)
+        lam[3 * c + 2] = wp.float64(0.0)
+        return
+    bound = mu[c] * lam_n
+    lam[3 * c + 1] = wp.clamp(lam[3 * c + 1], -bound, bound)
+    lam[3 * c + 2] = wp.clamp(lam[3 * c + 2], -bound, bound)
+
+
+@wp.kernel
+def lambda_cap_clip_kernel(
+    cap_internal: wp.float64,
+    lam: wp.array[wp.float64],  # inout
+):
+    """Symmetric clip: ``lam[i] = clip(lam[i], -cap, +cap)``.
+
+    Implements the CPU post-loop ``np.clip(lam, -cap_internal,
+    cap_internal, out=lam)`` where ``cap_internal = lambda_cap / dt²``.
+    The conversion factor is applied at the caller; this kernel only
+    knows the internal-units cap.
+
+    Args:
+        cap_internal: Symmetric cap in internal lambda units (fp64).
+        lam: Lambda buffer (fp64), shape ``[n_rows]``. Modified in place.
+    """
+    i = wp.tid()
+    if lam[i] > cap_internal:
+        lam[i] = cap_internal
+    if lam[i] < -cap_internal:
+        lam[i] = -cap_internal
+
+
+@wp.kernel
+def compute_lam_apply_kernel(
+    lam: wp.array[wp.float64],
+    omega: wp.array[wp.float64],
+    dt: wp.float64,
+    lam_apply: wp.array[wp.float64],
+):
+    """Compute ``lam_apply = dt² · ω · lam`` (position-LCP correction units).
+
+    See ``solve_nsn_unilateral`` (``newton/tests/fba/_reference.py``) docstring for the
+    derivation: the correction is ``Δq = dt² · A⁻¹ · Jᵀ · (ω · λ)``, and
+    ``apply_lambda_correction_combined`` adds ``A⁻¹·Jᵀ·λ_apply`` directly, so
+    the multipliers are pre-scaled by ``dt²·ω`` here.
+
+    Args:
+        lam: Force-units lambda (fp64), shape ``[n_rows]``.
+        omega: Per-row FB weighting (fp64), shape ``[n_rows]``.
+        dt: Timestep (fp64).
+        lam_apply: Output correction-units lambda, shape ``[n_rows]``.
+    """
+    i = wp.tid()
+    lam_apply[i] = dt * dt * omega[i] * lam[i]
+
+
+@wp.kernel
+def build_coulomb_pene0_kernel(
+    offset_n: wp.array[wp.float64],
+    offset_t1: wp.array[wp.float64],
+    offset_t2: wp.array[wp.float64],
+    pene0: wp.array[wp.float64],
+):
+    """Interleave per-contact normal/tangent offsets into the ``(3M,)`` pene0.
+
+    One thread per contact writes ``pene0[3c:3c+3] = [offset_n, offset_t1,
+    offset_t2]`` matching the row layout consumed by
+    :func:`compute_frictional_fb_kernel` and :func:`compute_nsn_rhs_kernel`.
+
+    Args:
+        offset_n: ``n·anchor`` (fp64), shape ``[M]``.
+        offset_t1: Kinematic-shifted ``t1·anchor`` (fp64), shape ``[M]``.
+        offset_t2: Kinematic-shifted ``t2·anchor`` (fp64), shape ``[M]``.
+        pene0: Output interleaved pene0 (fp64), shape ``[>=3M]``.
+    """
+    c = wp.tid()
+    pene0[3 * c + 0] = offset_n[c]
+    pene0[3 * c + 1] = offset_t1[c]
+    pene0[3 * c + 2] = offset_t2[c]
+
+
+@wp.kernel
+def apply_tangent_kinematic_shift_kernel(
+    t1: wp.array[wp.vec3],
+    t2: wp.array[wp.vec3],
+    v_anchor: wp.array[wp.vec3d],
+    t1_offset_base: wp.array[wp.float64],
+    t2_offset_base: wp.array[wp.float64],
+    dt: wp.float64,
+    t1_offset_out: wp.array[wp.float64],
+    t2_offset_out: wp.array[wp.float64],
+):
+    """Apply per-step kinematic anchor shift to tangent offsets.
+
+    Computes ``offset_t = offset_t_base + dt · dot(t, v_anchor)`` on the
+    device, so the step downloads no tangents or anchor velocities.
+
+    Args:
+        t1: Per-contact first tangent (fp32 vec3), shape ``[M]``.
+        t2: Per-contact second tangent (fp32 vec3), shape ``[M]``.
+        v_anchor: Per-contact kinematic anchor velocity (fp64 vec3),
+            shape ``[M]``.
+        t1_offset_base: Base ``t1·anchor`` (fp64), shape ``[M]``.
+        t2_offset_base: Base ``t2·anchor`` (fp64), shape ``[M]``.
+        dt: Timestep (fp64).
+        t1_offset_out: Output shifted offset ``t1·anchor + dt·t1·v_anchor``
+            (fp64), shape ``[M]``.
+        t2_offset_out: Output shifted offset ``t2·anchor + dt·t2·v_anchor``
+            (fp64), shape ``[M]``.
+    """
+    c = wp.tid()
+    v = v_anchor[c]
+    t1c = t1[c]
+    t2c = t2[c]
+    dot1 = wp.float64(t1c[0]) * v[0] + wp.float64(t1c[1]) * v[1] + wp.float64(t1c[2]) * v[2]
+    dot2 = wp.float64(t2c[0]) * v[0] + wp.float64(t2c[1]) * v[1] + wp.float64(t2c[2]) * v[2]
+    t1_offset_out[c] = t1_offset_base[c] + dt * dot1
+    t2_offset_out[c] = t2_offset_base[c] + dt * dot2
+
+
+@wp.kernel
+def cast_fp64_to_fp32_kernel(
+    src: wp.array[wp.float64],
+    dst: wp.array[wp.float32],
+):
+    """Narrow ``fp64 -> fp32`` element-wise copy.
+
+    Used to feed the device-resident fp64 ``lam_apply`` produced by the
+    NSN inner driver into :func:`gather_jt_lambda_kernel`, which reads
+    fp32 per-row impulses (matching the rest of the linear-solver
+    arithmetic). Both arrays must have the same length; only the first
+    ``dim`` entries (set via the kernel launch dim) are touched.
+
+    Args:
+        src: Source fp64 array, shape ``[n_rows]``.
+        dst: Destination fp32 array, shape ``[n_rows]``.
+    """
+    i = wp.tid()
+    dst[i] = wp.float32(src[i])
+
+
+# ---------------------------------------------------------------------------
+# Per-contact bookkeeping of ``SolverFBA._ingest_contacts`` on the device.
+#
+# These kernels evaluate the normal offset, and for frictional contacts the
+# tangent basis and kinematic anchor velocity of each contact, after the
+# contacts are sorted into a deterministic order.
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def compute_normal_offset_kernel(
+    normal: wp.array[wp.vec3],  # (M,) world-frame unit normal per contact
+    world_anchor: wp.array[wp.vec3],  # (M,) world-frame contact anchor
+    offset: wp.array[wp.float64],  # (M,) OUTPUT
+):
+    """Compute ``offset[c] = n·world_anchor``: the contact plane through the closest shape point.
+
+    Args:
+        normal: Per-contact unit normal, shape ``[M]``.
+        world_anchor: Per-contact world-frame anchor, shape ``[M]``.
+        offset: Output ``n·anchor``, shape ``[M]``.
+    """
+    c = wp.tid()
+    offset[c] = wp.float64(wp.dot(normal[c], world_anchor[c]))
+
+
+@wp.kernel
+def soft_contact_force_kernel(
+    record: wp.array[wp.int32],
+    normal: wp.array[wp.vec3],
+    tangent1: wp.array[wp.vec3],
+    tangent2: wp.array[wp.vec3],
+    rows_per_contact: int,
+    lam_apply: wp.array[wp.float64],
+    anchor: wp.array[wp.vec3],
+    rigid_contact_max: int,
+    contact_f: wp.array[wp.spatial_vector],
+):
+    """Wrench on the shape of each particle contact ``record[c]`` of ``Contacts``, from the forces [N] the step's
+    last solve applied along the rows ``n, t1, t2`` (or ``n`` alone) of the contact: the force by the particle and its
+    torque about the world origin, in world frame."""
+    c = wp.tid()
+    r = rows_per_contact * c
+    f = normal[c] * float(lam_apply[r])
+    if rows_per_contact == 3:
+        f = f + tangent1[c] * float(lam_apply[r + 1]) + tangent2[c] * float(lam_apply[r + 2])
+    contact_f[rigid_contact_max + record[c]] = wp.spatial_vector(-f, -wp.cross(anchor[c], f))
+
+
+@wp.kernel
+def add_contact_thickness_kernel(
+    particle: wp.array[wp.int32],
+    shape: wp.array[wp.int32],
+    particle_radius: wp.array[wp.float32],
+    shape_margin: wp.array[wp.float32],
+    offset: wp.array[wp.float64],  # (M,) inout
+):
+    """Move each shape contact's plane out by the particle radius plus the shape margin.
+
+    A contact without a shape (``shape < 0``) has no margin.
+    """
+    c = wp.tid()
+    radius = particle_radius[particle[c]]
+    if shape[c] >= 0:
+        radius += shape_margin[shape[c]]
+    offset[c] = offset[c] + wp.float64(radius)
+
+
+@wp.kernel
+def compute_tangent_basis_kernel(
+    normal: wp.array[wp.vec3],  # (M,) world-frame unit normal per contact
+    shape_idx: wp.array[wp.int32],  # (M,)
+    shape_omega: wp.array[wp.float64],  # (n_shapes,) angular vel about local +Z
+    shape_transform: wp.array[wp.transform],  # (n_shapes,) shape→world transform
+    has_shape_omega: wp.int32,
+    has_shape_transform: wp.int32,
+    t1_out: wp.array[wp.vec3],  # (M,) OUTPUT first tangent
+    t2_out: wp.array[wp.vec3],  # (M,) OUTPUT second tangent
+    is_spinning_out: wp.array[wp.int32],  # (M,) OUTPUT flag for v_anchor
+):
+    """Compute per-contact orthonormal tangent basis ``(t1, t2)``.
+
+    Mirrors :func:`~newton._src.solvers.fba.solver_fba.compute_tangent_basis`
+    for the default case (pick a reference direction, cross with ``n``).
+    When the contact's shape has nonzero ``shape_omega`` and a valid
+    transform, switch to the cylinder-rolling-aligned basis used in
+    ``_ingest_contacts``: ``t1 = normalize(cross(n, axis_world))``,
+    ``t2 = normalize(cross(n, t1))``. ``is_spinning_out[c]`` is set to ``1``
+    only when the override succeeded - the v_anchor kernel uses that flag
+    to decide whether to emit a kinematic anchor velocity.
+
+    Args:
+        normal: Per-contact unit normal, shape ``[M]``.
+        shape_idx: Per-contact shape index, shape ``[M]``.
+        shape_omega: Per-shape angular velocity about local +Z, shape ``[n_shapes]``.
+        shape_transform: Per-shape transform, shape ``[n_shapes]``.
+        has_shape_omega: ``1`` when ``shape_omega`` is populated.
+        has_shape_transform: ``1`` when ``shape_transform`` is populated.
+        t1_out: Output first tangent vectors, shape ``[M]``.
+        t2_out: Output second tangent vectors, shape ``[M]``.
+        is_spinning_out: Output spinning-shape flags, shape ``[M]``.
+    """
+    c = wp.tid()
+    n = normal[c]
+    # Default arbitrary basis: pick world Y when n is nearly aligned to world X,
+    # otherwise world X (matches ``compute_tangent_basis`` exactly).
+    if wp.abs(n[0]) > 0.9:
+        ref = wp.vec3(0.0, 1.0, 0.0)
+    else:
+        ref = wp.vec3(1.0, 0.0, 0.0)
+    t1 = wp.cross(n, ref)
+    t1_len = wp.length(t1)
+    t1 = t1 / (t1_len + 1.0e-30)
+    t2 = wp.cross(n, t1)
+    t2_len = wp.length(t2)
+    t2 = t2 / (t2_len + 1.0e-30)
+    is_spin = wp.int32(0)
+
+    s = shape_idx[c]
+    if has_shape_omega == 1 and has_shape_transform == 1 and s >= 0 and s < shape_omega.shape[0]:
+        if shape_omega[s] != wp.float64(0.0):
+            xf = shape_transform[s]
+            axis_world = wp.transform_vector(xf, wp.vec3(0.0, 0.0, 1.0))
+            t1_vec = wp.cross(n, axis_world)
+            n1 = wp.length(t1_vec)
+            if n1 >= 1.0e-9:
+                t1 = t1_vec / n1
+                t2_raw = wp.cross(n, t1)
+                n2 = wp.length(t2_raw)
+                t2 = t2_raw / wp.max(n2, 1.0e-30)
+                is_spin = wp.int32(1)
+    t1_out[c] = t1
+    t2_out[c] = t2
+    is_spinning_out[c] = is_spin
+
+
+@wp.kernel
+def compute_tangent_offsets_kernel(
+    t1: wp.array[wp.vec3],
+    t2: wp.array[wp.vec3],
+    world_anchor: wp.array[wp.vec3],
+    tangent1_offset: wp.array[wp.float64],  # (M,) OUTPUT
+    tangent2_offset: wp.array[wp.float64],  # (M,) OUTPUT
+):
+    """Compute per-contact tangent offsets ``t·world_anchor``.
+
+    Provides the friction residual reference position so
+    ``r_t = t·anchor - alpha·t·x_unc`` measures tangential displacement
+    from the contact point rather than from the world origin.
+
+    Args:
+        t1: First tangent vectors, shape ``[M]``.
+        t2: Second tangent vectors, shape ``[M]``.
+        world_anchor: World-frame contact anchors, shape ``[M]``.
+        tangent1_offset: Output ``t1·anchor`` (fp64), shape ``[M]``.
+        tangent2_offset: Output ``t2·anchor`` (fp64), shape ``[M]``.
+    """
+    c = wp.tid()
+    a = world_anchor[c]
+    tangent1_offset[c] = wp.float64(wp.dot(t1[c], a))
+    tangent2_offset[c] = wp.float64(wp.dot(t2[c], a))
+
+
+@wp.kernel
+def compute_v_anchor_kernel(
+    is_spinning: wp.array[wp.int32],  # (M,) flag from compute_tangent_basis_kernel
+    shape_idx: wp.array[wp.int32],  # (M,)
+    shape_omega: wp.array[wp.float64],  # (n_shapes,)
+    shape_transform: wp.array[wp.transform],  # (n_shapes,)
+    world_anchor: wp.array[wp.vec3],  # (M,) world-frame anchor
+    v_anchor: wp.array[wp.vec3d],  # (M,) OUTPUT fp64 kinematic velocity
+):
+    """Kinematic anchor velocity for rolling cylinder contacts.
+
+    For non-spinning contacts ``v_anchor = 0``. For spinning cylinder
+    shapes ``v_anchor = -omega · cross(axis_world, r_local)`` where
+    ``r_local = world_anchor - shape_translation`` and ``axis_world`` is
+    the shape's local +Z direction in world frame. The leading minus makes
+    a positive ``omega`` move the anchor along ``cross(normal, axis_world)``.
+
+    Args:
+        is_spinning: Per-contact spinning-shape flag from
+            :func:`compute_tangent_basis_kernel`, shape ``[M]``.
+        shape_idx: Per-contact shape index, shape ``[M]``.
+        shape_omega: Per-shape angular velocity, shape ``[n_shapes]``.
+        shape_transform: Per-shape transform, shape ``[n_shapes]``.
+        world_anchor: Per-contact world-frame anchor, shape ``[M]``.
+        v_anchor: Output kinematic anchor velocity (fp64 vec3), shape ``[M]``.
+    """
+    c = wp.tid()
+    if is_spinning[c] == 0:
+        v_anchor[c] = wp.vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
+        return
+    s = shape_idx[c]
+    xf = shape_transform[s]
+    axis_world = wp.transform_vector(xf, wp.vec3(0.0, 0.0, 1.0))
+    shape_p = wp.transform_get_translation(xf)
+    a = world_anchor[c]
+    r_local = wp.vec3(a[0] - shape_p[0], a[1] - shape_p[1], a[2] - shape_p[2])
+    cross_ar = wp.cross(axis_world, r_local)
+    omega = shape_omega[s]
+    v_anchor[c] = wp.vec3d(
+        -omega * wp.float64(cross_ar[0]),
+        -omega * wp.float64(cross_ar[1]),
+        -omega * wp.float64(cross_ar[2]),
+    )
