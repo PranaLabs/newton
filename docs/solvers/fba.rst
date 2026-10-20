@@ -123,6 +123,11 @@ Model Inputs
   positions and move with :meth:`~newton.solvers.SolverFBA.set_pin_targets`.
   Particles without the ``ACTIVE`` flag that have a mass hold where the input
   state has them.
+- **Particle constraints**:
+  :meth:`~newton.solvers.SolverFBA.set_particle_constraints` holds lengths or
+  linear combinations of particle positions at targets, solved with the
+  contacts; :class:`~newton.solvers.SolverFBA.Cable` builds the constraints of
+  a cable through a tetrahedral body.
 - **Rigid bodies**: FBA integrates the dynamic bodies and passes kinematic
   bodies through, or leaves every body to another solver with
   ``integrate_with_external_rigid_solver=True``. PRISMATIC, REVOLUTE, BALL,
@@ -182,3 +187,8 @@ Examples
   pinned ends and a soft ball dragged by spinning cylinders.
 - ``softbody_franka_fba``: a Franka arm integrated by
   :class:`~newton.solvers.SolverFeatherstone` picks up a soft ball.
+- ``cable_gripper_fba``: soft fingers curled by cables lift a box.
+- ``cloth_dual_franka_fba``: two Franka arms integrated by
+  :class:`~newton.solvers.SolverFeatherstone` fold a towel.
+- ``shirt_pins_fba``, ``bunny_ears_fba``: two handles move a T-shirt by its
+  shoulders and a soft bunny by its ears, with self-contact throughout.

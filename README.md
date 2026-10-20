@@ -530,6 +530,9 @@ If you run the examples from a source checkout with uv, use
       </a>
     </td>
     <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cloth/example_shirt_pins_fba.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_shirt_pins_fba.jpg" alt="Shirt Pins FBA">
+      </a>
     </td>
     <td align="center" width="33%">
     </td>
@@ -539,6 +542,7 @@ If you run the examples from a source checkout with uv, use
       <code>python -m newton.examples stretching_cloth_fba</code>
     </td>
     <td align="center" width="33%">
+      <code>python -m newton.examples shirt_pins_fba</code>
     </td>
     <td align="center" width="33%">
     </td>
@@ -1031,8 +1035,14 @@ If you run the examples from a source checkout with uv, use
       </a>
     </td>
     <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/softbody/example_cable_gripper_fba.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cable_gripper_fba.jpg" alt="Cable Gripper FBA">
+      </a>
     </td>
     <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/softbody/example_bunny_ears_fba.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_bunny_ears_fba.jpg" alt="Bunny Ears FBA">
+      </a>
     </td>
   </tr>
   <tr>
@@ -1040,8 +1050,10 @@ If you run the examples from a source checkout with uv, use
       <code>python -m newton.examples squeezing_ball_fba</code>
     </td>
     <td align="center" width="33%">
+      <code>python -m newton.examples cable_gripper_fba</code>
     </td>
     <td align="center" width="33%">
+      <code>python -m newton.examples bunny_ears_fba</code>
     </td>
   </tr>
   <tr>

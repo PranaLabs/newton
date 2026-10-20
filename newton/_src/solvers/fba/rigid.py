@@ -186,6 +186,7 @@ def row_force_rhs_kernel(
 def rigid_delassus_kernel(
     W_soft: wp.array2d[wp.float64],
     n_soft: int,
+    soft_tail: int,
     row_slot: wp.array2d[wp.int32],
     row_jac: wp.array2d[wp.spatial_vectord],
     slot_inv_mass: wp.array[wp.spatial_matrixd],
@@ -195,13 +196,19 @@ def rigid_delassus_kernel(
     """Delassus matrix ``W = J A⁻¹ Jᵀ`` of a set of constraint rows.
 
     ``A`` is block diagonal, so ``W`` is the deformable block ``W_soft`` on the
-    first ``n_soft`` rows plus the response ``c_iᵀ A_s⁻¹ c_j`` of every body
+    first ``n_soft`` rows and on the rows from ``soft_tail`` on, which follow
+    them in ``W_soft``, plus the response ``c_iᵀ A_s⁻¹ c_j`` of every body
     slot ``s`` that rows ``i`` and ``j`` share.
     """
     i, j = wp.tid()
     w = wp.float64(0.0)
-    if i < n_soft and j < n_soft:
-        w = W_soft[i, j]
+    si, sj = i, j
+    if i >= soft_tail:
+        si = n_soft + i - soft_tail
+    if j >= soft_tail:
+        sj = n_soft + j - soft_tail
+    if (i < n_soft or i >= soft_tail) and (j < n_soft or j >= soft_tail):
+        w = W_soft[si, sj]
     for x in range(2):
         s = row_slot[i, x]
         if s >= 0:
