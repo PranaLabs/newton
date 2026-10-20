@@ -7,9 +7,11 @@ FBA
 ===
 
 :class:`~newton.solvers.SolverFBA` simulates cloth and volumetric soft bodies
-with projective dynamics. Each step runs a fixed number of local-global
+with projective dynamics and resolves their frictional contact as
+complementarity conditions. Each step runs a fixed number of local-global
 iterations: the local phase projects every element onto its constraint set,
-and the global phase solves a linear system whose matrix is factored once.
+the global phase solves a linear system whose matrix is factored once, and
+each iteration takes one semismooth Newton step of the contact multipliers.
 
 .. experimental::
 
@@ -20,16 +22,21 @@ and the global phase solves a linear system whose matrix is factored once.
 When to Choose FBA
 ------------------
 
-FBA suits stiff cloth and soft bodies:
+FBA suits scenes in which cloth or soft bodies rest on, wrap around, or are
+pressed against shapes:
 
+- With the default contact operator, contacts do not penetrate and need no
+  contact stiffness: each contact supplies the force that keeps its gap
+  closed, within its friction cone, so spinning cylinders drag a soft ball
+  between them by friction alone.
 - Stiff materials step stably at large time steps. The examples step at
   ``dt = 0.01`` s, including a Neo-Hookean bar with a Young's modulus of
   ``1e9`` Pa.
 
-Choose another solver for scenes with contacts, for models with several worlds
-or with rigid bodies, and for differentiable simulation. See the
-:ref:`Supported Features` matrix for a comparison with the other solvers. The
-solver builds on projective dynamics and a quadratic bending energy:
+Choose another solver for models with several worlds or with rigid bodies,
+and for differentiable simulation. See the :ref:`Supported Features` matrix
+for a comparison with the other solvers. The solver builds on projective
+dynamics and a quadratic bending energy:
 
 - Sofien Bouaziz, Sebastian Martin, Tiantian Liu, Ladislav Kavan, and Mark
   Pauly. 2014. Projective Dynamics: Fusing Constraint Projections for Fast
@@ -42,8 +49,8 @@ solver builds on projective dynamics and a quadratic bending energy:
 Construction and Stepping
 -------------------------
 
-Step the solver from one state to the next with
-:meth:`~newton.solvers.SolverFBA.step`:
+Detect contacts with a :class:`~newton.CollisionPipeline` on the input state
+of each step and pass them to :meth:`~newton.solvers.SolverFBA.step`:
 
 .. code-block:: python
 
@@ -52,8 +59,9 @@ Step the solver from one state to the next with
    import newton
 
    builder = newton.ModelBuilder()
+   builder.add_ground_plane()
    builder.add_cloth_grid(
-       pos=wp.vec3(0.0, 0.0, 1.0),
+       pos=wp.vec3(-0.5, -0.5, 0.5),
        rot=wp.quat_identity(),
        vel=wp.vec3(0.0),
        dim_x=20,
@@ -63,27 +71,31 @@ Step the solver from one state to the next with
        mass=0.005,
        tri_ke=1.0e4,
        edge_ke=1.0e-4,
-       fix_left=True,
+       particle_radius=0.005,
    )
    model = builder.finalize()
 
    solver = newton.solvers.SolverFBA(model, iterations=10)
+   pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.01)
+   contacts = pipeline.contacts()
    state_0, state_1 = model.state(), model.state()
 
    for _ in range(120):
-       solver.step(state_0, state_1, None, None, 1.0 / 60.0)
+       pipeline.collide(state_0, contacts)
+       solver.step(state_0, state_1, None, contacts, 1.0 / 60.0)
        state_0, state_1 = state_1, state_0
 
-The cloth swings down from its left edge, whose particles the builder pins by
-giving them zero mass. The first step factors the system matrix on the CPU and
-takes longer than the others. The matrix depends on the time step, the
-particle masses, the pinned and inactive particles, and the elements and their
-materials; the solver factors it again when the time step changes or after
+A particle contact keeps the particle its radius plus the shape's margin from
+the shape: the cloth above comes to rest 5 mm over the ground. The first step
+factors the system matrix on the CPU and takes longer than the others. The
+matrix depends on the time step, the particle masses, the pinned and inactive
+particles, and the elements and their materials; the solver factors it again
+when the time step changes or after
 :meth:`~newton.solvers.SolverFBA.notify_model_changed` with
 ``SHAPE_PROPERTIES``, and other changes to those arrays take effect only then.
-A step reads the number of soft contacts in its contacts back to the host, so
-it cannot be captured in a CUDA graph; it captures and replays its own
-local-global iterations. FBA runs on the CPU and on CUDA devices.
+A step reads its contacts back to the host, so it cannot be captured in
+a CUDA graph; it captures and replays its own local-global iterations. FBA
+runs on the CPU and on CUDA devices.
 
 Model Inputs
 ------------
@@ -103,9 +115,16 @@ Model Inputs
   Particles without the ``ACTIVE`` flag that have a mass hold where the input
   state has them.
 
-FBA does not simulate rigid bodies or contacts: a model with bodies, and
-contacts that hold soft contacts, raise ``NotImplementedError``. It does not
-simulate springs either, or the inputs of :class:`~newton.Control`.
+FBA does not simulate rigid bodies: a model with bodies raises
+``NotImplementedError``. It does not simulate springs either, cloth self
+contact, or the inputs of :class:`~newton.Control`.
+
+Contacts
+--------
+
+- The friction coefficient of a particle contact is its shape's ``mu``.
+- :attr:`~newton.solvers.SolverBase.ObservableKind.CONTACT_F` reports the
+  force of each particle contact on its shape; see :ref:`solver_observables`.
 
 Accuracy
 --------
@@ -123,4 +142,5 @@ Examples
 ``python -m newton.examples <name>`` runs each of these:
 
 - ``stretching_cloth_fba``: cloth pulled apart by pins on two opposite edges.
-- ``twisting_bar_fba``: a soft bar twisted by its pinned ends.
+- ``twisting_bar_fba``, ``squeezing_ball_fba``: a soft bar twisted by its
+  pinned ends and a soft ball dragged by spinning cylinders.

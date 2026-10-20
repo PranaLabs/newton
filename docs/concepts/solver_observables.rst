@@ -136,7 +136,8 @@ Standard observables
      - Contact spatial forces in the row layout of the step's contacts
      - :class:`~newton.solvers.SolverMuJoCo` with MuJoCo Warp,
        :class:`~newton.solvers.SolverXPBD`, :class:`~newton.solvers.SolverVBD`,
-       :class:`~newton.solvers.SolverKamino`, and :class:`~newton.solvers.SolverSteel`
+       :class:`~newton.solvers.SolverKamino`, :class:`~newton.solvers.SolverSteel`, and
+       :class:`~newton.solvers.SolverFBA` (its particle contacts)
 
 :class:`~newton.solvers.SolverKamino` computes acceleration as the discrete
 step-average ``(body_qd_out - body_qd_in) / dt``. Across an impact, this includes

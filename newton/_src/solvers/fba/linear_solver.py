@@ -27,10 +27,24 @@ from ...sim import Model
 from .kernels import (
     apply_permutation_scalar_kernel,
     extract_component_kernel,
+    host_head,
     insert_component_kernel,
     scale_by_diag_kernel,
 )
 from .sparse_ldlt import CscMatrix, CsrMatrix, factor_ldlt
+
+
+def dense_schur_capacity(required: int, current: int) -> int:
+    """Rows of a square dense Schur buffer that holds ``required`` rows and replaces one of ``current`` rows.
+
+    Below 1024 rows the buffer grows by half again, so that a slowly climbing contact count does not reallocate it at
+    every step. Larger buffers grow by 5%, in multiples of 128 rows: half again per side would more than double the
+    memory of the largest allocation of the step, at the moment both buffers are held.
+    """
+    if max(required, current) < 1024:
+        return max(required, int(current * 1.5) + 1)
+    capacity = max(required, (105 * current + 99) // 100)
+    return ((capacity + 127) // 128) * 128
 
 
 def particle_masses(model: Model) -> tuple[np.ndarray, np.ndarray]:
@@ -766,3 +780,477 @@ class FBALinearSolver:
         wp.launch(scale_by_diag_kernel, dim=n, inputs=[self._Sb, self._Dinv], outputs=[self._DSb], device=dev)
         wps.bsr_mv(self._ST_bsr, self._DSb, self._SDSb, tile_size=tile)
         wp.launch(apply_permutation_scalar_kernel, dim=n, inputs=[self._SDSb, self._perm], outputs=[x], device=dev)
+
+    def build_schur_complement(
+        self,
+        num_contacts: int,
+        j_indices: wp.array,
+        j_normals: wp.array,
+        j_alpha: wp.array,
+        j_tangent1: wp.array | None = None,
+        j_tangent2: wp.array | None = None,
+        download: bool = True,
+    ) -> np.ndarray | None:
+        """Build ``W = J · A⁻¹ · Jᵀ`` as a dense NumPy array (batched GPU implementation).
+
+        Frictionless (``j_tangent1`` and ``j_tangent2`` are ``None``): emits an ``(M, M)``
+        matrix with one row per contact (normal direction only).
+
+        Frictional (both tangent arrays provided): emits a ``(3M, 3M)`` matrix with
+        three rows per contact ordered ``[n_c, t1_c, t2_c]`` for c = 0..M-1.
+        Off-diagonal coupling between contacts is fully included.
+
+        It computes only the entries ``A^{-1}[i, j]`` for ``i, j`` in the set of
+        unique particles of the rows (the "isolated DOFs" / isodofs), read from the
+        sparse inverse, and assembles ``W`` from them, the per-row directions and
+        the Jacobian coefficients entirely on device, without solving with ``A``.
+
+        Args:
+            num_contacts: Number of active contacts ``M``.
+            j_indices: Particle index per contact, shape ``[M]``, dtype int32.
+            j_normals: World-frame contact normal per contact, shape ``[M]``, dtype vec3.
+            j_alpha: Jacobian coefficient per contact, shape ``[M]``, dtype float32.
+            j_tangent1: First tangent direction per contact, shape ``[M]``, dtype vec3.
+                When ``None``, frictionless behavior (M x M W).
+            j_tangent2: Second tangent direction per contact, shape ``[M]``, dtype vec3.
+                Must be provided together with ``j_tangent1``.
+            download: If ``True`` (default) pull the result back as a NumPy
+                array.  Set ``False`` from callers that consume ``W`` directly
+                on device via :meth:`W_device_view`. This skips a multi-MB
+                device-to-host copy that dominates the Schur build cost on
+                large contact sets.  When ``False`` the method
+                returns ``None``; the device-side ``W`` remains accessible
+                through :meth:`W_device_view`.
+
+        Returns:
+            Dense float64 NumPy array of shape ``(M, M)`` (frictionless) or
+            ``(3M, 3M)`` (frictional) when ``download=True``; otherwise ``None``.
+        """
+        from .kernels import (  # noqa: PLC0415
+            compute_wi_tiled_kernel,
+            densify_S_iso_scaled_kernel,
+        )
+
+        has_friction = j_tangent1 is not None and j_tangent2 is not None
+        rows_per_contact = 3 if has_friction else 1
+        M = num_contacts
+        total_rows = M * rows_per_contact
+        n = self.n
+        dev = self.device
+
+        # --- Build unified per-row direction and particle arrays on device ---
+        # Frictionless: total_rows == M, each row uses normal direction.
+        # Frictional: total_rows == 3M, rows interleaved [n_c, t1_c, t2_c].
+        # ``j_*`` arrays may be over-allocated (capacity > M); slice to active range.
+        idx_np = host_head(j_indices, M)  # (M,) int32, small, needed for row dir array
+        n_np = host_head(j_normals, M)  # (M, 3) float32
+        a_np = host_head(j_alpha, M)  # (M,) float32
+        if has_friction:
+            t1_np = host_head(j_tangent1, M)  # (M, 3) float32
+            t2_np = host_head(j_tangent2, M)  # (M, 3) float32
+
+        # Build (total_rows,) arrays for particle index, direction, alpha.
+        row_particle = np.empty(total_rows, dtype=np.int32)
+        row_dir = np.empty((total_rows, 3), dtype=np.float32)
+        row_alpha = np.empty(total_rows, dtype=np.float32)
+        if has_friction:
+            # Frictional: 3 rows per contact, interleaved (n, t1, t2).
+            row_particle[0::3] = idx_np
+            row_particle[1::3] = idx_np
+            row_particle[2::3] = idx_np
+            row_dir[0::3] = n_np
+            row_dir[1::3] = t1_np
+            row_dir[2::3] = t2_np
+            row_alpha[0::3] = a_np
+            row_alpha[1::3] = a_np
+            row_alpha[2::3] = a_np
+        else:
+            row_particle[:] = idx_np
+            row_dir[:] = n_np
+            row_alpha[:] = a_np
+
+        # Upload direction arrays to device.
+        row_particle_d = wp.array(row_particle, dtype=wp.int32, device=dev)
+        row_dir_d = wp.array(row_dir, dtype=wp.vec3, device=dev)
+        row_alpha_d = wp.array(row_alpha, dtype=wp.float32, device=dev)
+
+        # --- Allocate/reuse the W device buffer, grown by :func:`dense_schur_capacity`. ---
+        # ``M`` can spike by 10s of contacts between frames in a squeezed soft body, and a (cap, cap) dense float64
+        # buffer is the dominant device alloc on the FBA hot path.
+        if (
+            not hasattr(self, "_W_device_d")
+            or self._W_device_d.shape[0] < total_rows
+            or self._W_device_d.shape[1] < total_rows
+        ):
+            prev = getattr(self, "_W_device_d", None)
+            prev_cap = prev.shape[0] if prev is not None else 0
+            cap = dense_schur_capacity(total_rows, prev_cap)
+            self._W_device_d = wp.empty(shape=(cap, cap), dtype=wp.float64, device=dev)
+        # Active row count for the populated sub-block, consumed by the NSN
+        # GPU drivers to build a (M, M) wp.array view of ``_W_device_d`` without
+        # touching the host.
+        self._W_device_active_rows = total_rows
+
+        # Stash per-row contact metadata for the lambda correction
+        # (:meth:`apply_lambda_correction_combined`).
+        self._row_particle_d = row_particle_d
+        self._row_dir_d = row_dir_d
+        self._row_alpha_d = row_alpha_d
+        self._row_total = total_rows
+
+        # Inverse mapping (particle → incident contact rows) for the
+        # deterministic ``J^T·lambda`` gather in
+        # :meth:`apply_lambda_correction_combined`. Each contact row maps to
+        # exactly one particle (frictionless: 1 row/contact; frictional: 3 rows/contact
+        # all sharing one particle), so a stable-sort by particle yields a
+        # CSR adjacency. Built once per contact-set update. Host-side cost is
+        # ``O(total_rows log total_rows)`` and ``total_rows`` is small (~1k).
+        order = np.argsort(row_particle, kind="stable").astype(np.int32)
+        sorted_particles = row_particle[order]
+        counts = np.bincount(sorted_particles, minlength=n).astype(np.int32)
+        offsets = np.zeros(n + 1, dtype=np.int32)
+        offsets[1:] = np.cumsum(counts)
+        self._isodof_row_offsets_d = wp.array(offsets, dtype=wp.int32, device=dev)
+        self._isodof_row_indices_d = wp.array(order, dtype=wp.int32, device=dev)
+
+        # Build ``Wi`` of size (k, k) for the unique contacted particles, then
+        # assemble W with a 2D kernel reading
+        # ``Wi[isodof_rank(p_cp), isodof_rank(p_c)]``.
+        return self._build_schur_isodof(
+            row_particle,
+            row_particle_d,
+            row_dir_d,
+            row_alpha_d,
+            total_rows,
+            compute_wi_tiled_kernel,
+            densify_S_iso_scaled_kernel,
+            download=download,
+        )
+
+    def _build_schur_isodof(
+        self,
+        row_particle: np.ndarray,
+        row_particle_d: wp.array,
+        row_dir_d: wp.array,
+        row_alpha_d: wp.array,
+        total_rows: int,
+        compute_wi_tiled_kernel,
+        densify_S_iso_scaled_kernel,
+        download: bool = True,
+    ) -> np.ndarray | None:
+        """Isodof-restricted Schur build.
+
+        Collects the unique contacted DOFs ``isodofs``, computes the dense
+        ``k x k`` matrix ``Wi[a, b] = A^{-1}[isodofs[a], isodofs[b]]`` via a
+        column-intersection kernel over the sparse-inverse factor ``S``, and
+        then assembles ``W[c', c]`` from per-contact ``(particle, dir, alpha)``
+        triples and an ``isodof_rank`` lookup.
+
+        This skips the solves with ``A`` for the ``M`` columns of ``Jᵀ``, which
+        dominate the cost on sparse meshes, where
+        ``k^2 * nnz_col(S) << M * nnz(S)``.
+
+        ``Wi`` is computed via blocked dense ``X^T X`` GEMM (``wp.tile_matmul``):
+        densify the selected columns of ``S`` into a padded ``(N_pad, k_pad)``
+        buffer with ``sqrt(D_inv)`` baked into the values, then run a tiled
+        SYRK-style matmul. A sparse column intersection would cost
+        O(k² · nnz_col), which dominates the Schur build of the squeezing ball
+        example, where ``nnz_col(S) ≈ 1700``.
+        """
+        N = self.n
+        dev = self.device
+
+        # --- Build isodofs (unique sorted particle indices) on host ---
+        # Frictionless: row_particle has one entry per contact.
+        # Frictional: each contact contributes 3 identical particle entries
+        # (n/t1/t2 share a particle), so dedup gives the same set.
+        # M is small (~1000), so np.unique is cheap.
+        isodofs_h = np.unique(row_particle.astype(np.int64)).astype(np.int32)
+        k = int(isodofs_h.size)
+
+        # --- Build per-particle rank table (-1 for non-isodof particles) ---
+        # We use a dense ``[N]`` int32 array so the composition kernel can do
+        # ``rank = isodof_rank[particle]`` in O(1). Memory: 4*N bytes (e.g.
+        # 21 KB for N = 5325). Allocated on host then uploaded.
+        isodof_rank_h = np.full(N, -1, dtype=np.int32)
+        isodof_rank_h[isodofs_h] = np.arange(k, dtype=np.int32)
+
+        # --- Build perm[isodofs[a]] for the Wi kernel ---
+        # The runtime solve computes ``A^{-1} = P · S^T · D^{-1} · S · P^T``
+        # (see :meth:`solve`), where ``P[i, k] = δ_{k, perm[i]}``. Therefore
+        # ``A^{-1}[i, j] = M[perm[i], perm[j]]`` with ``M = S^T D^{-1} S``,
+        # which gives
+        #     Wi[a, b] = sum_k S[k, perm[isodofs[a]]] * Dinv[k]
+        #                      * S[k, perm[isodofs[b]]].
+        # We precompute ``perm[isodofs[a]]`` per isodof. Using ``invperm`` here
+        # silently builds the wrong matrix (different particles map under the
+        # two permutations) and produces NaN downstream once contacts engage.
+        perm_h = self._perm.numpy()
+        isodof_perm_h = perm_h[isodofs_h].astype(np.int32)
+
+        # --- Upload to device (allocate / reuse buffers) ---
+        # ``Wi`` and ``S_iso_scaled`` are padded to multiples of the GEMM tile
+        # dimensions so the inner-loop ``wp.tile_matmul`` can step in fixed
+        # ``_WI_TILE_*`` strides without per-iteration bound checks.
+        from .kernels import _WI_TILE_K, _WI_TILE_M, _WI_TILE_N, _WI_TILE_THREADS  # noqa: PLC0415
+
+        tile_m = int(_WI_TILE_M)
+        tile_n = int(_WI_TILE_N)
+        tile_k = int(_WI_TILE_K)
+        k_pad = ((k + tile_m - 1) // tile_m) * tile_m
+        if k_pad == 0:
+            # No contacts touch any particle: nothing to compute.  Caller
+            # treats an empty ``W`` view as a zero matrix.
+            return None if not download else np.zeros((total_rows, total_rows), dtype=np.float64)
+        N_pad = ((N + tile_k - 1) // tile_k) * tile_k
+
+        # Wi buffer: padded ``(k_pad, k_pad)`` so the tiled GEMM writes a
+        # contiguous block.  The cap-based reuse grows by 1.5x to amortize
+        # reallocation when ``k`` climbs over a step.
+        if not hasattr(self, "_isodofs_cap") or self._isodofs_cap < k_pad:
+            cap_iso = max(k_pad, int(getattr(self, "_isodofs_cap", 0) * 1.5) + 1)
+            # Round cap up to a multiple of the tile size so ``Wi_v`` slicing
+            # below stays tile-aligned across resizes.
+            cap_iso = ((cap_iso + tile_m - 1) // tile_m) * tile_m
+            self._isodofs_cap = cap_iso
+            self._isodof_perm_d = wp.empty(cap_iso, dtype=wp.int32, device=dev)
+            self._Wi_device_d = wp.empty(shape=(cap_iso, cap_iso), dtype=wp.float64, device=dev)
+        # Densified ``S_iso_scaled`` buffer: padded ``(N_pad, k_pad)``.
+        # Width grows with a 1.5x headroom factor so a contact-count climb does
+        # not realloc every frame; height is fixed at ``N_pad`` (set by the
+        # immutable mesh DOF count).
+        if (
+            not hasattr(self, "_S_iso_scaled_d")
+            or self._S_iso_scaled_d.shape[0] < N_pad
+            or self._S_iso_scaled_d.shape[1] < k_pad
+        ):
+            cur_k = self._S_iso_scaled_d.shape[1] if hasattr(self, "_S_iso_scaled_d") else 0
+            cap_k = max(k_pad, int(cur_k * 1.5) + 1)
+            cap_k = ((cap_k + tile_m - 1) // tile_m) * tile_m
+            self._S_iso_scaled_d = wp.empty(shape=(N_pad, cap_k), dtype=wp.float64, device=dev)
+        if not hasattr(self, "_isodof_rank_d") or self._isodof_rank_d.shape[0] != N:
+            self._isodof_rank_d = wp.empty(N, dtype=wp.int32, device=dev)
+        # Upload host-prepared isodof arrays.
+        self._isodof_perm_d.assign(isodof_perm_h)
+        self._isodof_rank_d.assign(isodof_rank_h)
+
+        # Active sub-views of the Wi / S_iso_scaled buffers, sized to the
+        # padded extents the tiled GEMM expects.  ``Wi`` is materialized as
+        # a contiguous ``(k_pad, k_pad)`` block because the buffer was
+        # allocated at the same padded size (no stride trickery needed).
+        Wi_cap = int(self._Wi_device_d.shape[0])
+        if Wi_cap == k_pad:
+            Wi_v = self._Wi_device_d
+        else:
+            # Cap is larger than k_pad: slice a top-left ``(k_pad, k_pad)``
+            # view with explicit strides so tile_load reads the correct
+            # row stride (== Wi_cap, not k_pad).
+            Wi_v = wp.array(
+                ptr=self._Wi_device_d.ptr,
+                dtype=wp.float64,
+                shape=(k_pad, k_pad),
+                strides=(Wi_cap * 8, 8),
+                device=dev,
+            )
+        S_iso_cap_n = int(self._S_iso_scaled_d.shape[0])
+        S_iso_cap_k = int(self._S_iso_scaled_d.shape[1])
+        if S_iso_cap_n == N_pad and S_iso_cap_k == k_pad:
+            S_iso_v = self._S_iso_scaled_d
+        else:
+            S_iso_v = wp.array(
+                ptr=self._S_iso_scaled_d.ptr,
+                dtype=wp.float64,
+                shape=(N_pad, k_pad),
+                strides=(S_iso_cap_k * 8, 8),
+                device=dev,
+            )
+
+        # --- Compute Wi = X^T · X where X = sqrt(D_inv) * S_iso ---
+        # Step 1: densify selected columns of S into ``S_iso_scaled`` with the
+        # sqrt(D_inv) factor baked in.  The buffer is zeroed first so padding
+        # rows/cols and untouched (zero) entries of S contribute zero to the
+        # subsequent dot products.
+        S_iso_v.zero_()
+        wp.launch(
+            densify_S_iso_scaled_kernel,
+            dim=k,
+            inputs=[
+                self._ST_bsr.offsets,
+                self._ST_bsr.columns,
+                self._ST_bsr.values,
+                self._Dinv,
+                self._isodof_perm_d,
+            ],
+            outputs=[S_iso_v],
+            device=dev,
+        )
+
+        # Step 2: tiled dense GEMM ``Wi = S_iso_scaled^T · S_iso_scaled``.
+        wp.launch_tiled(
+            compute_wi_tiled_kernel,
+            dim=(k_pad // tile_m, k_pad // tile_n),
+            inputs=[S_iso_v, Wi_v, N_pad],
+            block_dim=_WI_TILE_THREADS,
+            device=dev,
+        )
+
+        self._Wi_v = Wi_v
+        self._compose_schur()
+
+        # Single host pull for the (total_rows x total_rows) W matrix.
+        # Skipped when callers (e.g. the GPU NSN driver) consume ``W`` via
+        # :meth:`W_device_view`. A multi-MB copy of a padded dense buffer
+        # otherwise dominates the Schur build on large contact sets.
+        if not download:
+            return None
+        W = self._W_device_d.numpy()[:total_rows, :total_rows].copy()
+        return W
+
+    def _compose_schur(self) -> None:
+        """Compose ``W`` from ``Wi`` and the row particles, directions and coefficients."""
+        from .kernels import compose_W_from_wi_kernel  # noqa: PLC0415
+
+        n = self._row_total
+        # W[c', c] = alpha[c'] * alpha[c] * dot(dir[c'], dir[c]) * Wi[r', r], written densely; one thread per
+        # (c', c) pair. ``isodof_rank[N]`` provides the rank lookup per particle.
+        wp.launch(
+            compose_W_from_wi_kernel,
+            dim=(n, n),
+            inputs=[self._row_particle_d, self._row_dir_d, self._row_alpha_d, self._isodof_rank_d, self._Wi_v],
+            outputs=[self._W_device_d],
+            device=self.device,
+        )
+
+    def W_device_view(self) -> wp.array2d[wp.float64]:
+        """Return a ``(M, M)`` device view of the most recently built Schur W.
+
+        The view aliases :attr:`_W_device_d` for the active row block populated
+        by the most recent :meth:`build_schur_complement` call.  Because the
+        underlying buffer has capacity ``(cap, cap)`` (with ``cap >= M`` and
+        ``cap`` grown by the 1.5x headroom factor), the view is non-contiguous
+        in its outer dimension and explicit strides matching the parent buffer
+        are passed; without them the default contiguous strides would misplace
+        every row beyond the first.
+
+        Returns:
+            ``wp.array2d[wp.float64]`` of shape ``(M, M)`` sharing storage with
+            the persistent device buffer, or ``None`` if no W exists.
+        """
+        if not hasattr(self, "_W_device_d") or not hasattr(self, "_W_device_active_rows"):
+            return None
+        m = int(self._W_device_active_rows)
+        if m == 0:
+            return None
+        cap = int(self._W_device_d.shape[0])
+        dtype_size = 8  # wp.float64
+        return wp.array(
+            ptr=self._W_device_d.ptr,
+            dtype=wp.float64,
+            shape=(m, m),
+            strides=(cap * dtype_size, dtype_size),
+            device=self.device,
+        )
+
+    def apply_lambda_correction_combined(
+        self,
+        lam: np.ndarray | wp.array,
+        rhs_inout: wp.array[wp.vec3],
+        x_out: wp.array[wp.vec3],
+    ) -> None:
+        """Compute ``x_out = A⁻¹ · (rhs_inout + Jᵀ · lam)`` with in-place rhs update.
+
+        Applies the constraint correction in combined form:
+
+            b += dt² · Jᵀ · (ω · λ)
+            x = A⁻¹ · b
+
+        :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA.step` uses it
+        instead of the split form ``x_cur += A⁻¹ · Jᵀ · lam_apply``, which is
+        algebraically equivalent but rounds differently in float32: the
+        combined form takes a single ``A⁻¹`` solve over the incremented ``b``.
+
+        The implementation:
+
+        1. Gathers ``Jᵀ · lam`` into the cached ``_jt_lambda_d`` buffer, a
+           particle-centered gather over the inverse-mapping CSR, without atomics.
+        2. Accumulates that into ``rhs_inout`` in-place (``rhs_inout[p] +=
+           (Jᵀ·lam)[p]``).
+        3. Runs a single solve ``x_out = A⁻¹ · rhs_inout`` with the factored ``A``.
+
+        Every Schur build populates the per-row metadata (``_row_*_d``,
+        ``_isodof_row_*_d``) that the gather reads.
+
+        Args:
+            lam: Contact impulse vector, shape ``(total_rows,)``. Accepts
+                either a host ``numpy`` array, as the tests pass, or a
+                device-resident ``wp.array[wp.float64]`` produced by the
+                NSN inner driver. ``total_rows == M`` frictionless,
+                ``3 * M`` frictional.
+            rhs_inout: Right-hand side vec3 array of length ``N``,
+                MUTATED in place to ``rhs_inout + Jᵀ·lam``.
+            x_out: Output position correction, shape ``[N]``, vec3.
+                Overwritten with ``A⁻¹ · (rhs_inout + Jᵀ·lam)``.
+        """
+        from .kernels import accumulate_vec3_kernel, cast_fp64_to_fp32_kernel, gather_jt_lambda_kernel  # noqa: PLC0415
+
+        if not hasattr(self, "_row_particle_d") or not hasattr(self, "_isodof_row_offsets_d"):
+            raise RuntimeError(
+                "apply_lambda_correction_combined requires a prior "
+                "build_schur_complement call (which sets _row_*_d / "
+                "_isodof_row_*_d arrays)."
+            )
+
+        n = self.n
+        dev = self.device
+        n_rows = self._row_total
+
+        if not hasattr(self, "_jt_lambda_d") or self._jt_lambda_d.shape[0] != n:
+            self._jt_lambda_d = wp.empty(n, dtype=wp.vec3, device=dev)
+        if not hasattr(self, "_lam_d") or self._lam_d.shape[0] < n_rows:
+            cap = max(n_rows, int(getattr(self, "_lam_cap", 0) * 1.5) + 1)
+            self._lam_cap = cap
+            self._lam_d = wp.empty(cap, dtype=wp.float32, device=dev)
+
+        # Accept either a host numpy array, as the tests pass, or a
+        # device-resident fp64 array: the solver passes ``_nsn_lam_apply_d``
+        # directly, without a round trip through the host in every PD
+        # iteration.
+        if isinstance(lam, wp.array):
+            wp.launch(
+                cast_fp64_to_fp32_kernel,
+                dim=n_rows,
+                inputs=[lam],
+                outputs=[self._lam_d],
+                device=dev,
+            )
+        else:
+            self._lam_d.assign(lam.astype(np.float32))
+
+        # Step 1: particle-centered gather Jᵀ·lam into _jt_lambda_d.
+        wp.launch(
+            gather_jt_lambda_kernel,
+            dim=n,
+            inputs=[
+                self._isodof_row_offsets_d,
+                self._isodof_row_indices_d,
+                self._row_dir_d,
+                self._row_alpha_d,
+                self._lam_d,
+            ],
+            outputs=[self._jt_lambda_d],
+            device=dev,
+        )
+
+        # Step 2: rhs_inout += Jᵀ·lam, that is b += dt²·Jᵀ·(ω·λ): the dt²·ω
+        # weighting is folded into ``lam`` by the caller, see
+        # ``_solve_nsn_*`` which returns ``lam_apply = dt²·ω·λ``).
+        wp.launch(
+            accumulate_vec3_kernel,
+            dim=n,
+            inputs=[self._jt_lambda_d],
+            outputs=[rhs_inout],
+            device=dev,
+        )
+
+        # Step 3: single solve x_out = A⁻¹ · rhs_inout with the factored A.
+        self.solve(rhs_inout, x_out)

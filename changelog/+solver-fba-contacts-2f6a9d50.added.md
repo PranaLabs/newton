@@ -1,0 +1,1 @@
+Add frictional particle contacts to `SolverFBA`, solved with one semismooth Newton step per local-global iteration, report their forces as `SolverBase.ObservableKind.CONTACT_F`, and add the `squeezing_ball_fba` example.

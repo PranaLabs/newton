@@ -49,8 +49,8 @@ MuJoCo, Kamino, VBD, and FBA currently have dedicated backend guides:
   and hard frictional contacts; experimental.
 - :doc:`VBD <vbd>` — unified simulation of cloth, soft bodies, and rigid
   bodies in a single VBD-based solver; experimental.
-- :doc:`FBA <fba>`: projective dynamics for stiff cloth and soft bodies;
-  experimental.
+- :doc:`FBA <fba>`: projective dynamics for cloth and soft bodies with
+  non-penetrating frictional contact against shapes; experimental.
 
 The other solver backends are documented through their linked API references
 and the comparison tables below.
@@ -87,9 +87,9 @@ Supported Features
      - Implicit
      - ❌
      - ❌
-     - 🟨 no collisions
-     - 🟨 no collisions
-     - 🟨 no collisions
+     - ✅
+     - 🟨 no self-collision
+     - ✅
      - ❌
    * - :class:`~newton.solvers.SolverFeatherstone`
      - Semi-implicit
@@ -181,7 +181,7 @@ Supported Features
 
 .. experimental::
     :class:`~newton.solvers.SolverFBA`'s public API and behavior may change without prior notice.
-    It simulates models with one world and no rigid bodies, and solves no contacts.
+    It simulates models with one world and no rigid bodies.
 
 .. _Contact material support:
 
@@ -199,8 +199,9 @@ formulation.
   :class:`~newton.solvers.SolverSemiImplicit`,
   :class:`~newton.solvers.SolverXPBD`, :class:`~newton.solvers.SolverMuJoCo`,
   :class:`~newton.solvers.SolverVBD`, :class:`~newton.solvers.SolverKamino`,
-  :class:`~newton.solvers.SolverStyle3D`, and
-  :class:`~newton.solvers.SolverImplicitMPM`.
+  :class:`~newton.solvers.SolverStyle3D`,
+  :class:`~newton.solvers.SolverImplicitMPM`, and
+  :class:`~newton.solvers.SolverFBA` (the shape's ``mu`` for particle contacts).
 - ``ke`` / ``kd``: :class:`~newton.solvers.SolverFeatherstone`,
   :class:`~newton.solvers.SolverSemiImplicit`,
   :class:`~newton.solvers.SolverMuJoCo`, and

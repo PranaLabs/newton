@@ -1,0 +1,585 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+"""Jacobi-preconditioned Conjugate Residual (PCR) solver for the NSN Schur LCP.
+
+The solver is used inside the Non-Smooth Newton (NSN) outer loop to solve the
+dense fp64 SPD reduced (Schur) system on every Newton step.
+
+Algorithm: conjugate residuals on the symmetrically preconditioned system
+``P^1/2 A P^1/2``, with the Jacobi preconditioner ``P = diag(A)^-1``:
+
+    Initial:
+        x    = 0
+        r    = b
+        z    = P * r
+        p    = z
+        q    = A * p
+        rho  = <z, q>
+
+    While |r| > tol * |b| and iter < max_iter:
+        t     = P * q
+        den   = <q, t>
+        alpha = rho / den
+        x    += alpha * p
+        r    -= alpha * q
+        z    -= alpha * t
+        t     = A * z
+        rho_old = rho
+        rho   = <z, t>
+        beta  = rho / rho_old
+        p     = z + beta * p
+        q     = t + beta * q
+
+Notes:
+    * ``x = 0`` always: a solve takes no warm start.
+    * ``max_iter`` is capped at ``n``.
+    * A direction ``p`` whose curvature ``pᵀ A p / pᵀ diag(A) p`` falls below
+      ``1 / max_inverse_gain`` would amplify the residual by more than
+      ``max_inverse_gain``. From such a near-null direction on, and from a
+      vanishing denominator on, ``alpha`` is zero and the iterate stays put.
+
+Performance notes:
+    * Matvec is a block-per-row tiled reduction (``_matvec_tiled_kernel``)
+      using ``wp.tile_load`` + ``wp.tile_sum``: ~4-5x faster than a
+      single-thread-per-row serial inner loop at n ~ 600..1500.
+    * Dot products use ``wp.utils.array_inner`` (CUB-backed parallel reduction)
+      instead of a single-thread accumulator: ~6x faster at n ~ 900.
+    * The per-iteration scalars stay on the device: the host reads the
+      residual norm once per ``check_every`` iterations, which saves 5-10
+      syncs per PCR call.
+    * The per-iter PCR body (matvec + dots + axpy + scale-add + precond)
+      issues ~10 kernel launches per iter; at a typical 25 iters per
+      ``solve()`` call that's ~250 Python-side launch dispatches. Each Warp
+      ``wp.launch`` plus the CUDA driver call add ~3-6 us of host overhead;
+      CUDA graphs replay that batch with ~1 us per call. :meth:`NSNPCRSolver.solve`
+      captures one PCR iter into a :class:`warp.Graph` per ``n`` shape and
+      caches it by the matrix's pointer and strides. Subsequent solves at the
+      same shape replay the graph ``check_every`` times per convergence block,
+      a single ``cuGraphLaunch`` per replay on the device side.
+    * The matvec stays in Warp: cuBLAS calls fail inside graph capture
+      (``cudaErrorStreamCaptureImplicit``), and the captured Warp path ran a
+      step in 43.4 ms against ~99 ms with cuBLAS run eagerly, on an RTX 5090
+      in fp64.
+"""
+
+from __future__ import annotations
+
+import warp as wp
+
+# ---------------------------------------------------------------------------
+# Tile / block sizing for ``_matvec_tiled_kernel``
+# ---------------------------------------------------------------------------
+# K-dim tile width: each block accumulates ``TILE_K`` columns per inner step
+# and uses ``wp.tile_sum`` to reduce them in shared memory.  ``128`` is the
+# sweet spot for NSN Schur sizes n ~ 600..1500 on an RTX 5090 in fp64.  Smaller
+# tiles win at n > 1500 where occupancy beats per-block re-use; larger tiles
+# win at n < 400 where launch overhead dominates.
+_PCR_TILE_K = wp.constant(128)
+_PCR_BLOCK_DIM = 128
+
+
+# ---------------------------------------------------------------------------
+# Warp kernels
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def _compute_precond_kernel(
+    A: wp.array2d[wp.float64],
+    precond: wp.array[wp.float64],
+):
+    """Compute the Jacobi (diagonal-inverse) preconditioner ``precond[i] = 1/A[i,i]``.
+
+    A zero diagonal entry is converted to ``0.0`` (rather than ``inf``) so a
+    silently-degenerate row produces a zero update instead of NaNs.
+    """
+    i = wp.tid()
+    d = A[i, i]
+    if d == wp.float64(0.0):
+        precond[i] = wp.float64(0.0)
+    else:
+        precond[i] = wp.float64(1.0) / d
+
+
+@wp.kernel
+def _matvec_tiled_kernel(
+    A: wp.array2d[wp.float64],
+    x: wp.array[wp.float64],
+    n_pad: int,
+    out: wp.array[wp.float64],
+):
+    """Dense matvec ``out = A @ x`` with one CUDA block per output row.
+
+    Each block sums one row of ``A`` against ``x`` cooperatively: threads load a
+    ``TILE_K`` strip via ``wp.tile_load`` (bounds-checked, so a partial last
+    tile loads zero-padded), element-wise multiply, then reduce with
+    ``wp.tile_sum``.
+
+    Launched via ``wp.launch_tiled`` with ``dim=n`` (one block per active
+    row) and ``block_dim=_PCR_BLOCK_DIM``.
+
+    Args:
+        A: ``(n, n)`` dense SPD matrix slice (may be a non-contiguous slice
+            view; the per-row 1D tile_load on ``A[row]`` handles arbitrary
+            row strides).  Entries beyond ``[n, n]`` are never read because
+            ``tile_load`` bounds-checks against the slice's ``shape``.
+        x: ``(n,)`` input vector slice.  Same bounds-check applies.
+        n_pad: ``ceil(n / TILE_K) * TILE_K``. The inner loop iterates up to
+            ``n_pad`` so the partial last tile is reduced through the same
+            ``wp.tile_sum`` path; the OOB elements load as zero.
+        out: ``(n,)`` output buffer.  Only entries ``[0, n)`` are written.
+    """
+    row = wp.tid()
+    acc_s = wp.float64(0.0)
+    for k_tile in range(0, n_pad, _PCR_TILE_K):
+        a = wp.tile_load(A[row], shape=(_PCR_TILE_K,), offset=(k_tile,))
+        b = wp.tile_load(x, shape=(_PCR_TILE_K,), offset=(k_tile,))
+        prod = wp.tile_map(wp.mul, a, b)
+        s = wp.tile_sum(prod)
+        # ``tile_extract`` broadcasts the (1,) reduction result to all
+        # threads in the block; folding into a scalar accumulator keeps the
+        # cross-iter state out of shared memory (re-assigning a shared tile
+        # broke the register-vs-shared promotion of Warp 1.14).
+        acc_s = acc_s + wp.tile_extract(s, 0)
+    # All threads in the block write the same value to ``out[row]``; CUDA
+    # coalesces identical writes (equivalent to a single thread emit).
+    out[row] = acc_s
+
+
+@wp.kernel
+def _apply_precond_kernel(
+    r: wp.array[wp.float64],
+    precond: wp.array[wp.float64],
+    out: wp.array[wp.float64],
+):
+    """Apply Jacobi preconditioner: ``out = P * r`` (elementwise)."""
+    i = wp.tid()
+    out[i] = precond[i] * r[i]
+
+
+@wp.kernel
+def _axpy_arr_kernel(
+    a_arr: wp.array[wp.float64],
+    sign: wp.float64,
+    x: wp.array[wp.float64],
+    y: wp.array[wp.float64],
+):
+    """Vector AXPY in place reading the coefficient from a device array slot.
+
+    ``y[i] = y[i] + sign * a_arr[0] * x[i]``.
+
+    Used inside the per-iter PCR loop so ``alpha`` (computed from device-side
+    dot products) does not need to round-trip through host memory.  ``sign``
+    folds in the ``+/-`` so one kernel serves ``x += alpha * p``,
+    ``r -= alpha * q`` and ``z -= alpha * t``.
+    """
+    i = wp.tid()
+    y[i] = y[i] + sign * a_arr[0] * x[i]
+
+
+@wp.kernel
+def _scal_add_arr_kernel(
+    a_arr: wp.array[wp.float64],
+    x: wp.array[wp.float64],
+    y: wp.array[wp.float64],
+):
+    """Combined scale-and-add reading the coefficient from device memory.
+
+    ``y = a_arr[0] * y + x``, which computes ``p = z + beta*p`` and
+    ``q = t + beta*q``. One kernel instead of a scale and an add halves the
+    launch overhead, and it reads ``beta`` from device memory so the inner PCR
+    loop never blocks on a host transfer.
+    """
+    i = wp.tid()
+    y[i] = a_arr[0] * y[i] + x[i]
+
+
+@wp.kernel
+def _div_scalar_kernel(
+    num: wp.array[wp.float64],
+    den: wp.array[wp.float64],
+    out: wp.array[wp.float64],
+):
+    """Device-side scalar divide ``out[0] = num[0] / den[0]``.
+
+    Computes the PCR ``beta = rho / rho_old`` on the device, so the host never
+    reads it. A zero ``den[0]`` gives ``0.0``.
+    """
+    d = den[0]
+    if d == wp.float64(0.0):
+        out[0] = wp.float64(0.0)
+    else:
+        out[0] = num[0] / d
+
+
+@wp.kernel
+def _diag_scale_kernel(
+    A: wp.array2d[wp.float64],
+    v: wp.array[wp.float64],
+    out: wp.array[wp.float64],
+):
+    """``out = diag(A) v``."""
+    i = wp.tid()
+    out[i] = A[i, i] * v[i]
+
+
+@wp.kernel
+def _protected_alpha_kernel(
+    rho: wp.array[wp.float64],
+    den: wp.array[wp.float64],
+    curvature: wp.array[wp.float64],
+    chart_norm: wp.array[wp.float64],
+    eta: wp.float64,
+    alpha: wp.array[wp.float64],
+    stopped: wp.array[wp.float64],
+):
+    """Step length ``rho / den``, or zero from the first refused direction on.
+
+    In the Jacobi chart ``C = sqrt(diag A)`` the direction ``p`` has curvature
+    ``pᵀ A p / pᵀ diag(A) p``. Below ``eta`` a step along it amplifies the
+    residual by more than ``1 / eta``: such near-null directions, a vanishing
+    denominator, and non-finite values freeze the iterate instead.
+    """
+    if stopped[0] == wp.float64(0.0):
+        if not (den[0] > wp.float64(0.0) and curvature[0] > eta * chart_norm[0]):
+            stopped[0] = wp.float64(1.0)
+    if stopped[0] != wp.float64(0.0):
+        alpha[0] = wp.float64(0.0)
+    else:
+        alpha[0] = rho[0] / den[0]
+
+
+@wp.kernel
+def _copy_scalar_kernel(
+    src: wp.array[wp.float64],
+    dst: wp.array[wp.float64],
+):
+    """Copy ``dst[0] = src[0]`` on device (used to snapshot ``rho_old``)."""
+    dst[0] = src[0]
+
+
+# ---------------------------------------------------------------------------
+# Solver class
+# ---------------------------------------------------------------------------
+
+
+class NSNPCRSolver:
+    """Jacobi-preconditioned Conjugate Residual solver for SPD systems.
+
+    :meth:`solve` runs conjugate residuals on the symmetrically preconditioned
+    ``P^1/2 A P^1/2``, with the step denominator ``(A p)ᵀ P (A p)``, which stays
+    a Krylov method when the diagonal of ``A`` spans decades. It refuses
+    near-null directions, so a singular ``A`` with an inconsistent right-hand
+    side returns a bounded least-squares iterate. Used as the inner linear
+    solver for the NSN Schur LCP system.
+
+    The solver is *stateless* between ``solve`` calls: every call starts from
+    ``x = 0``. Device buffers are pre-allocated for ``max_n`` so repeated calls
+    at smaller sizes do not allocate.
+
+    Args:
+        max_n: Maximum system dimension the solver will handle. Internal
+            buffers are sized to this.
+        device: Warp device for buffer allocation (typically ``"cuda:0"``).
+        tol: Relative tolerance: :meth:`solve` stops once
+            ``|b - A x| < tol |b|``.
+        max_iter: Outer-loop cap. Effective limit is ``min(max_iter, n)``.
+        check_every: Convergence-check batching factor.  PCR runs this many
+            iterations on the device between two host reads of the residual
+            norm and the stop flag.
+        max_inverse_gain: Largest amplification a step of :meth:`solve` may
+            carry; directions with chart curvature below its inverse are
+            refused.
+    """
+
+    def __init__(
+        self,
+        max_n: int,
+        device: wp.Device | str,
+        tol: float = 1.0e-5,
+        max_iter: int = 100,
+        check_every: int = 25,
+        max_inverse_gain: float = 1.0e6,
+    ) -> None:
+        if max_n <= 0:
+            raise ValueError(f"max_n must be positive, got {max_n}")
+
+        self.max_n = int(max_n)
+        self.device = device
+        self.tol = float(tol)
+        self.max_iter = int(max_iter)
+        # Rather than syncing every iteration, which stalls the host after every PCR step, test convergence
+        # every ``check_every`` iterations. Up to ``check_every - 1`` iterations past the tolerance cost time
+        # but not accuracy: each one lowers the preconditioned residual norm.
+        self.check_every = max(1, int(check_every))
+        self._eta = wp.float64(1.0 / max_inverse_gain)
+
+        # Pre-allocate fp64 device buffers: ``_d`` holds the direction p,
+        # ``_q`` A p, ``_s`` the preconditioned residual z and ``_h`` the
+        # scratch t.
+        self._x = wp.zeros(self.max_n, dtype=wp.float64, device=device)
+        self._r = wp.zeros(self.max_n, dtype=wp.float64, device=device)
+        self._d = wp.zeros(self.max_n, dtype=wp.float64, device=device)
+        self._q = wp.zeros(self.max_n, dtype=wp.float64, device=device)
+        self._h = wp.zeros(self.max_n, dtype=wp.float64, device=device)
+        self._s = wp.zeros(self.max_n, dtype=wp.float64, device=device)
+        self._precond = wp.zeros(self.max_n, dtype=wp.float64, device=device)
+
+        # Device-resident scalars for ``rho``, ``rho_old``, ``den``, ``alpha``,
+        # ``beta``: keep the per-iter PCR coefficients on device so the inner
+        # loop never blocks on a host transfer.  ``rho`` is synced exactly
+        # once per ``solve()`` call at the end.
+        self._rho_d = wp.zeros(1, dtype=wp.float64, device=device)
+        self._rho_old_d = wp.zeros(1, dtype=wp.float64, device=device)
+        self._den_d = wp.zeros(1, dtype=wp.float64, device=device)
+        self._alpha_d = wp.zeros(1, dtype=wp.float64, device=device)
+        self._beta_d = wp.zeros(1, dtype=wp.float64, device=device)
+        # :meth:`solve` protection: chart curvature of each direction.
+        self._dd = wp.zeros(self.max_n, dtype=wp.float64, device=device)
+        self._curvature_d = wp.zeros(1, dtype=wp.float64, device=device)
+        self._chart_norm_d = wp.zeros(1, dtype=wp.float64, device=device)
+        self._stopped_d = wp.zeros(1, dtype=wp.float64, device=device)
+        self._r_norm_d = wp.zeros(1, dtype=wp.float64, device=device)
+
+        # Cache one ``wp.Graph`` per active ``n`` shape so repeated
+        # solves at the same shape replay a pre-recorded CUDA graph for the
+        # inner PCR iter, eliminating per-launch Python+driver overhead.
+        # Capture is attempted lazily on first solve at each shape; if it
+        # fails we fall back to the eager loop and remember the failure so
+        # we don't retry on every call.
+        self._pcr_graph_cache: dict[int, wp.Graph | None] = {}
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def solve(
+        self,
+        A: wp.array2d[wp.float64],
+        b: wp.array[wp.float64],
+        x_out: wp.array[wp.float64],
+    ) -> tuple[int, float]:
+        """Solve ``A @ x = b`` with Jacobi-preconditioned conjugate residual.
+
+        Args:
+            A: ``(n, n)`` dense SPD matrix, device-resident, fp64. ``n`` must
+                satisfy ``n <= max_n``.
+            b: ``(n,)`` right-hand side, device-resident, fp64.
+            x_out: ``(n,)`` output buffer, device-resident, fp64. Filled with
+                the solution on return.
+
+        Returns:
+            A ``(iterations_taken, final_rho)`` tuple where ``iterations_taken``
+            counts the number of inner PCR iterations executed and
+            ``final_rho`` is the last value of the preconditioned residual
+            scalar ``rho = <z, A z>`` with ``z = P r`` (>= 0 for an SPD ``A``).
+
+        Raises:
+            ValueError: if ``A``/``b``/``x_out`` shapes are inconsistent or
+                exceed ``max_n``.
+        """
+        n = int(b.shape[0])
+        if n <= 0:
+            raise ValueError(f"system size must be positive, got n={n}")
+        if n > self.max_n:
+            raise ValueError(f"system size n={n} exceeds preallocated max_n={self.max_n}")
+        if A.shape[0] != n or A.shape[1] != n:
+            raise ValueError(f"A shape {tuple(A.shape)} incompatible with b shape ({n},)")
+        if x_out.shape[0] != n:
+            raise ValueError(f"x_out shape ({x_out.shape[0]},) incompatible with b shape ({n},)")
+
+        device = self.device
+        max_iter = min(self.max_iter, n)
+        tile_k = int(_PCR_TILE_K)
+        n_pad = ((n + tile_k - 1) // tile_k) * tile_k
+
+        # ----- Initialize x = 0 -----------------------------------------
+        self._x.zero_()
+
+        # ----- Early exit if b == 0 -------------------------------------
+        # With b == 0, x = 0 is the exact solution.  ``array_inner`` is a
+        # CUB-style parallel reduction, far cheaper than a single-thread
+        # accumulator at the typical n ~ 600..1500 sizes.
+        dot_b = float(wp.utils.array_inner(b, b, count=n))
+        if dot_b == 0.0:
+            wp.copy(x_out, self._x, count=n)
+            return (0, 0.0)
+
+        # ----- Jacobi preconditioner: precond[i] = 1/A[i,i] -------------
+        wp.launch(
+            _compute_precond_kernel,
+            dim=n,
+            inputs=[A],
+            outputs=[self._precond],
+            device=device,
+        )
+
+        # ----- Symmetric PCR start ---------------------------------------
+        # Buffers: ``_s`` holds z = P r, ``_d`` the direction p = z, ``_q``
+        # holds A p, and ``_h`` the scratch t (P q, then A z).
+        wp.copy(self._r, b, count=n)
+        wp.launch(_apply_precond_kernel, dim=n, inputs=[self._r, self._precond], outputs=[self._s], device=device)
+        wp.copy(self._d, self._s, count=n)
+        wp.launch_tiled(
+            _matvec_tiled_kernel,
+            dim=n,
+            inputs=[A, self._d, n_pad],
+            outputs=[self._q],
+            block_dim=_PCR_BLOCK_DIM,
+            device=device,
+        )
+        wp.utils.array_inner(self._s, self._q, out=self._rho_d, count=n)
+        self._stopped_d.zero_()
+        tol_sq = self.tol * self.tol * dot_b
+        r_norm_sq = dot_b
+
+        # ---- PCR main loop --------------------------------------------
+        # Inner loop runs in ``check_every``-sized blocks fully on the device,
+        # then syncs the residual norm once per block to test convergence.  All
+        # per-iter scalars (``alpha``, ``beta``, ``rho``, ``den``) live in
+        # device memory.  Each PCR iteration lowers the preconditioned residual
+        # norm, so iterating past the tolerance between syncs is safe.
+        # Iterations past convergence or past a refused direction leave the
+        # iterate unchanged (see :func:`_protected_alpha_kernel`).
+        #
+        # Wrap one full PCR iter into a :class:`warp.Graph` and replay it
+        # ``check_every`` times per block.  Replays issue a single
+        # ``cuGraphLaunch`` on the device side instead of ~10 individual
+        # ``wp.launch`` dispatches, so the Python+driver per-launch overhead
+        # drops from ~30-50 us/iter to ~2 us/iter at n ~ 600..1500.
+        graph = self._get_or_build_pcr_iter_graph(A, n, n_pad, device)
+
+        nb_iter = 0
+        check_every = self.check_every
+        while nb_iter < max_iter and r_norm_sq > tol_sq:
+            block_end = min(nb_iter + check_every, max_iter)
+            block_iters = block_end - nb_iter
+            if graph is not None:
+                # Graph fast path: replay the captured single-iter graph
+                # ``block_iters`` times.  All PCR state lives in the pre-
+                # allocated device buffers captured at recording time, so
+                # the replays operate on the same memory as the eager path.
+                for _ in range(block_iters):
+                    wp.capture_launch(graph)
+                nb_iter = block_end
+            else:
+                while nb_iter < block_end:
+                    self._pcr_iter_eager(A, n, n_pad, device)
+                    nb_iter += 1
+
+            wp.utils.array_inner(self._r, self._r, out=self._r_norm_d, count=n)
+            r_norm_sq = float(self._r_norm_d.numpy()[0])
+            if self._stopped_d.numpy()[0] != 0.0:
+                break
+        rho = float(self._rho_d.numpy()[0])
+
+        # Copy x back to caller-provided output buffer.
+        wp.copy(x_out, self._x, count=n)
+
+        return (nb_iter, rho)
+
+    # ------------------------------------------------------------------
+    # Per-iter body + graph capture
+    # ------------------------------------------------------------------
+
+    def _pcr_iter_eager(
+        self,
+        A: wp.array2d[wp.float64] | None,
+        n: int,
+        n_pad: int,
+        device: wp.Device | str,
+    ) -> None:
+        """Issue one symmetric PCR iteration of :meth:`solve` on the active stream.
+
+        All launches are stream-ordered and safe to call inside a CUDA graph
+        capture.
+        """
+        # t = P q, den = qᵀ P q.
+        wp.launch(_apply_precond_kernel, dim=n, inputs=[self._q, self._precond], outputs=[self._h], device=device)
+        wp.utils.array_inner(self._q, self._h, out=self._den_d, count=n)
+        # Chart curvature of p: pᵀ A p against pᵀ diag(A) p.
+        wp.launch(_diag_scale_kernel, dim=n, inputs=[A, self._d], outputs=[self._dd], device=device)
+        wp.utils.array_inner(self._d, self._q, out=self._curvature_d, count=n)
+        wp.utils.array_inner(self._d, self._dd, out=self._chart_norm_d, count=n)
+        wp.launch(
+            _protected_alpha_kernel,
+            dim=1,
+            inputs=[self._rho_d, self._den_d, self._curvature_d, self._chart_norm_d, self._eta],
+            outputs=[self._alpha_d, self._stopped_d],
+            device=device,
+        )
+        # x += alpha p, r -= alpha q, z -= alpha t.
+        for vec, sign, out in ((self._d, 1.0, self._x), (self._q, -1.0, self._r), (self._h, -1.0, self._s)):
+            wp.launch(
+                _axpy_arr_kernel,
+                dim=n,
+                inputs=[self._alpha_d, wp.float64(sign), vec],
+                outputs=[out],
+                device=device,
+            )
+        # t = A z, rho = zᵀ A z, beta = rho / rho_old.
+        wp.launch_tiled(
+            _matvec_tiled_kernel,
+            dim=n,
+            inputs=[A, self._s, n_pad],
+            outputs=[self._h],
+            block_dim=_PCR_BLOCK_DIM,
+            device=device,
+        )
+        wp.launch(_copy_scalar_kernel, dim=1, inputs=[self._rho_d], outputs=[self._rho_old_d], device=device)
+        wp.utils.array_inner(self._s, self._h, out=self._rho_d, count=n)
+        wp.launch(
+            _div_scalar_kernel,
+            dim=1,
+            inputs=[self._rho_d, self._rho_old_d],
+            outputs=[self._beta_d],
+            device=device,
+        )
+        # p = z + beta p, q = t + beta q.
+        wp.launch(_scal_add_arr_kernel, dim=n, inputs=[self._beta_d, self._s], outputs=[self._d], device=device)
+        wp.launch(_scal_add_arr_kernel, dim=n, inputs=[self._beta_d, self._h], outputs=[self._q], device=device)
+
+    def _get_or_build_pcr_iter_graph(
+        self,
+        A: wp.array2d[wp.float64],
+        n: int,
+        n_pad: int,
+        device: wp.Device | str,
+    ) -> wp.Graph | None:
+        """Look up (or capture on first miss) the single-PCR-iter CUDA graph.
+
+        The graph is keyed by ``(n, A.ptr, A.strides)``: ``n`` controls the
+        launch dimensions, and the pointer and strides control which matrix
+        block the captured matvec reads from.  When any of them changes
+        between solve calls we re-capture; PCR is called repeatedly with the same matrix view
+        within a Newton step so amortised capture overhead is near zero.
+
+        Returns ``None`` if capture is impossible on the active device
+        (e.g.  CPU device) so callers fall through to the eager loop.
+        """
+        # CUDA graphs require a CUDA device.
+        dev_obj = wp.get_device(device) if isinstance(device, str) else device
+        if not dev_obj.is_cuda:
+            return None
+
+        a_ptr = int(A.__cuda_array_interface__["data"][0])
+        # Cache hash combines ``n`` (drives launch dims + n_pad) and the
+        # matrix data pointer and strides: a reallocated buffer can return
+        # at the same address with a different row pitch.
+        key = (n, a_ptr, tuple(A.strides))
+        cached = self._pcr_graph_cache.get(key, "missing")
+        if cached == "missing":
+            # Capture lazily. Failures are sticky: we cache ``None`` so
+            # we don't retry capture every solve once it has failed (e.g.
+            # if some kernel inside the iter body issues an implicit host
+            # allocation that traps the capture).
+            try:
+                with wp.ScopedCapture(device=device) as cap:
+                    self._pcr_iter_eager(A, n, n_pad, device)
+                self._pcr_graph_cache = {key: cap.graph}
+                return cap.graph
+            except RuntimeError:
+                self._pcr_graph_cache = {key: None}
+                return None
+        return cached
