@@ -515,6 +515,55 @@ class TestSelfContactSolve(unittest.TestCase):
         self.assertIs(self.solver._lite_iter_graph, False)
         np.testing.assert_array_equal(launched, replayed)
 
+    def test_lite_rows_hold_particles_among_self_contacts(self):
+        """Lift a 2 x 2 corner of both 6-cell sheets 3 cm in 0.1 s with rows, the upper corner held 2 mm over the lower
+        one.
+
+        That is inside the 5 mm contact radius. Contacts on held particles carry no force, so the conflict does not
+        throw the cloth, and the other contacts keep every triangle apart.
+        """
+        builder = newton.ModelBuilder()
+        builder.add_shape_box(-1, xform=wp.transform((0.0, 0.0, 0.25), wp.quat_identity()), hx=0.25, hy=0.25, hz=0.25)
+        grid = {
+            "dim_x": 6,
+            "dim_y": 6,
+            "cell_x": 0.02,
+            "cell_y": 0.02,
+            "mass": 0.004,
+            "tri_ke": 500.0,
+            "tri_ka": 1e3,
+            "particle_radius": 0.0,
+        }
+        for z, shift in ((0.5, 0.0), (0.505, 0.004)):
+            corner = wp.vec3(shift - 0.06, shift - 0.06, z)
+            builder.add_cloth_grid(pos=corner, rot=wp.quat_identity(), vel=wp.vec3(0.0), **grid)
+        model = builder.finalize()
+        kw = {"particle_self_contact_margin": 0.005, "particle_self_contact_gap": 0.005}
+        solver = newton.solvers.SolverFBA(
+            model, iterations=10, nsn_schur_mode="lite", particle_enable_self_contact=True, **kw
+        )
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.11)
+        detector = TriMeshCollisionDetector(model)
+        contacts, s0, s1 = pipeline.contacts(), model.state(), model.state()
+        held = [0, 1, 7, 8, 49, 50, 56, 57]
+        base = model.particle_q.numpy()[held]
+        base[4:] = base[:4] + np.array([0.004, 0.004, 0.002])
+        for k in range(120):
+            target = base + np.array([0.0, 0.0, 0.03 * min(1.0, (k + 1) / 60.0)])
+            directions = np.tile(np.eye(3), (8, 1))
+            solver.set_particle_constraints(
+                np.repeat(held, 3)[:, None], np.ones((24, 1)), target.reshape(-1), directions=directions
+            )
+            pipeline.collide(s0, contacts)
+            solver.step(s0, s1, None, contacts, 1.0 / 600.0)
+            s0, s1 = s1, s0
+            if k % 10 == 9:
+                detector.refit(s0.particle_q)
+                detector.triangle_triangle_intersection_detection()
+                self.assertEqual(int(detector.triangle_intersecting_triangles_count.numpy().sum()), 0)
+        self.assertLess(float(np.abs(s0.particle_qd.numpy()).max()), 0.01)
+        np.testing.assert_allclose(s0.particle_q.numpy()[held], target, atol=1e-6)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

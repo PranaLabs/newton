@@ -1982,6 +1982,80 @@ def subtract_slot_residual_kernel(
             r[3 * c + 2] = r[3 * c + 2] - w * wp.float64(wp.dot(contact_t2[c], x[p]))
 
 
+@wp.kernel
+def particle_constraint_residual_kernel(
+    particles: wp.array2d[wp.int32],  # (B, K), -1 when unused
+    coefficients: wp.array2d[wp.float32],  # (B, K)
+    direction: wp.array[wp.vec3],
+    target: wp.array[wp.float64],
+    x: wp.array[wp.vec3],
+    row_offset: wp.int32,
+    r: wp.array[wp.float64],  # out, rows from row_offset
+    pene0: wp.array[wp.float64],  # out, rows from row_offset
+):
+    """Residual ``target - sum_k c_k dot(d, x[p_k])`` and anchor value ``target`` of bilateral particle rows."""
+    b = wp.tid()
+    s = wp.float64(0.0)
+    for k in range(particles.shape[1]):
+        p = particles[b, k]
+        if p >= 0:
+            s += wp.float64(coefficients[b, k]) * wp.float64(wp.dot(direction[b], x[p]))
+    r[row_offset + b] = target[b] - s
+    pene0[row_offset + b] = target[b]
+
+
+@wp.kernel
+def held_row_update_kernel(
+    rows: wp.array[wp.int32],
+    x: wp.array2d[wp.float64],  # (1, tile) Newton step of the rows, W^-1 r
+    dt: wp.float64,
+    lam: wp.array[wp.float64],  # out, bilateral rows
+    omega: wp.array[wp.float64],  # out, bilateral rows
+    lam_apply: wp.array[wp.float64],  # out, bilateral rows
+):
+    """Multipliers of the bilateral rows that hold particles at points, from their Newton step ``x``."""
+    k = wp.tid()
+    r = rows[k]
+    lam_apply[r] = x[0, k]
+    lam[r] = x[0, k] / (dt * dt)
+    omega[r] = wp.float64(1.0)
+
+
+@wp.kernel
+def held_row_correction_kernel(
+    rows: wp.array[wp.int32],
+    column: wp.array[wp.int32],  # column of A^-1 at the particle of each row
+    coefficient: wp.array[wp.float64],
+    direction: wp.array[wp.vec3d],
+    columns: wp.array2d[wp.float64],  # (U, N) columns of A^-1 at the held particles
+    x: wp.array2d[wp.float64],  # (1, tile) multipliers of the rows
+    q: wp.array[wp.vec3],  # inout
+):
+    """``q += A^-1 J^T x`` for the rows that hold particles at points, by the columns of ``A^-1``."""
+    i = wp.tid()
+    dq = wp.vec3d(0.0)
+    for k in range(rows.shape[0]):
+        dq += columns[column[k], i] * coefficient[k] * x[0, k] * direction[k]
+    q[i] = q[i] + wp.vec3(dq)
+
+
+@wp.kernel
+def particle_constraint_direction_kernel(
+    particles: wp.array2d[wp.int32],  # (B, K), -1 when unused
+    coefficients: wp.array2d[wp.float32],  # (B, K)
+    x: wp.array[wp.vec3],
+    direction: wp.array[wp.vec3],  # out
+):
+    """Direction of ``sum_k c_k x[p_k]`` of bilateral particle rows that hold a length."""
+    b = wp.tid()
+    v = wp.vec3(0.0)
+    for k in range(particles.shape[1]):
+        p = particles[b, k]
+        if p >= 0:
+            v += coefficients[b, k] * x[p]
+    direction[b] = wp.normalize(v)
+
+
 # ---------------------------------------------------------------------------
 # NSN inner LCP: Fischer-Burmeister rows and Schur build, in fp64.
 #
@@ -2562,7 +2636,10 @@ def lite_row_slots_kernel(
     contact_alpha: wp.array[wp.float32],  # (M,)
     extra_particle: wp.array2d[wp.int32],  # (M, E) further particles of each contact, -1 where unused
     extra_alpha: wp.array2d[wp.float32],  # (M, E)
+    bilateral_particle: wp.array[wp.int32],  # (B,) particle of each bilateral row
+    bilateral_alpha: wp.array[wp.float32],  # (B,)
     rows_per_contact: int,
+    contact_rows: int,
     # outputs
     row_particle: wp.array[wp.int32],  # (R,)
     row_alpha: wp.array[wp.float32],  # (R,)
@@ -2576,11 +2653,17 @@ def lite_row_slots_kernel(
     slot_count: wp.array[wp.int32],  # (N,) further slots of each particle, zeroed, incremented
 ):
     """The particles and coefficients of the lite rows in slots, and the keys and counts of the CSRs from each
-    particle to its rows and to its further slots."""
+    particle to its rows and to its further slots: contact rows first, then the bilateral rows."""
     r = wp.tid()
     c = r // rows_per_contact
-    p = contact_particle[c]
-    a = contact_alpha[c]
+    p = wp.int32(-1)
+    a = wp.float32(0.0)
+    if r < contact_rows:
+        p = contact_particle[c]
+        a = contact_alpha[c]
+    else:
+        p = bilateral_particle[r - contact_rows]
+        a = bilateral_alpha[r - contact_rows]
     row_particle[r] = p
     row_alpha[r] = a
     slot_particle[r, 0] = p
@@ -2590,8 +2673,11 @@ def lite_row_slots_kernel(
     wp.atomic_add(row_count, p, 1)
     width = extra_particle.shape[1]
     for k in range(width):
-        q = extra_particle[c, k]
-        b = extra_alpha[c, k]
+        q = wp.int32(-1)
+        b = wp.float32(0.0)
+        if r < contact_rows:
+            q = extra_particle[c, k]
+            b = extra_alpha[c, k]
         slot_particle[r, k + 1] = q
         slot_alpha[r, k + 1] = b
         slot_keys[r * width + k] = wp.where(q >= 0, q, row_count.shape[0])
@@ -2605,13 +2691,17 @@ def lite_row_dirs_kernel(
     normal: wp.array[wp.vec3],  # (M,)
     tangent1: wp.array[wp.vec3],  # (M,), unused with one row per contact
     tangent2: wp.array[wp.vec3],
+    bilateral_dir: wp.array[wp.vec3],  # (B,)
     rows_per_contact: int,
+    contact_rows: int,
     # output
-    row_dir: wp.array[wp.vec3],  # (rows_per_contact M,)
+    row_dir: wp.array[wp.vec3],  # (contact_rows + B,)
 ):
-    """Directions of the lite rows: the normal and tangents of each contact."""
+    """Directions of the lite rows: the normal and tangents of each contact, then the bilateral rows."""
     r = wp.tid()
-    if r % rows_per_contact == 0:
+    if r >= contact_rows:
+        row_dir[r] = bilateral_dir[r - contact_rows]
+    elif r % rows_per_contact == 0:
         row_dir[r] = normal[r // rows_per_contact]
     elif r % rows_per_contact == 1:
         row_dir[r] = tangent1[r // rows_per_contact]
@@ -2628,26 +2718,41 @@ def lite_row_triplets_kernel(
     contact_alpha: wp.array[wp.float32],  # (M,) its coefficient
     extra_particle: wp.array2d[wp.int32],  # (M, E) further particles of each contact, -1 where unused
     extra_alpha: wp.array2d[wp.float32],  # (M, E) their coefficients
-    row_dir: wp.array[wp.vec3],  # (3 M,) direction of each row
+    row_particle: wp.array2d[wp.int32],  # (B, K) particle of each bilateral row in slot 0
+    row_coefficient: wp.array2d[wp.float32],  # (B, K) its coefficient
+    row_dir: wp.array[wp.vec3],  # (3 M + B,) direction of each row
+    held_particle: wp.array[wp.int32],  # (N,) 1 for particles that bilateral rows hold at a point
+    contacts: int,
     # outputs
     columns: wp.array[wp.int32],
     values: wp.array[_mat13d],
+    held: wp.array[wp.int32],  # (M,) 1 when a particle of the contact is held at a point
 ):
-    """The blocks ``c_k d`` of the lite Jacobian in four slots per row, the three rows of each contact, with a
-    negative column where a slot has no particle or a zero coefficient."""
+    """The blocks ``c_k d`` of the lite Jacobian in four slots per row, the three rows of each contact and then
+    the bilateral rows, with a negative column where a slot has no particle or a zero coefficient."""
     r = wp.tid()
     d = row_dir[r]
+    on_held = wp.int32(0)
     for k in range(4):
         p = wp.int32(-1)
         c = wp.float32(0.0)
-        if k == 0:
-            p = contact_particle[r // 3]
-            c = contact_alpha[r // 3]
-        elif k - 1 < extra_particle.shape[1]:
-            p = extra_particle[r // 3, k - 1]
-            c = extra_alpha[r // 3, k - 1]
+        if r < 3 * contacts:
+            if k == 0:
+                p = contact_particle[r // 3]
+                c = contact_alpha[r // 3]
+            elif k - 1 < extra_particle.shape[1]:
+                p = extra_particle[r // 3, k - 1]
+                c = extra_alpha[r // 3, k - 1]
+        elif k == 0:
+            p = row_particle[r - 3 * contacts, 0]
+            c = row_coefficient[r - 3 * contacts, 0]
         columns[4 * r + k] = wp.where(p >= 0 and c != wp.float32(0.0), p, -1)
         values[4 * r + k] = wp.matrix_from_rows(wp.float64(c) * wp.vec3d(d))
+        if p >= 0:
+            if held_particle[p] != 0:
+                on_held = 1
+    if r < 3 * contacts and r % 3 == 0:
+        held[r // 3] = on_held
 
 
 @wp.kernel
@@ -2763,6 +2868,25 @@ def lite_w_row_fill_kernel(
     if last >= 0:
         w_columns[out] = last
         w_values[out] = acc
+
+
+@wp.kernel
+def held_contact_law_kernel(
+    held: wp.array[wp.int32],  # (M,) 1 when a particle of the contact is held at a point
+    # inout
+    omega: wp.array[wp.float64],
+    compliance: wp.array[wp.float64],
+    h: wp.array[wp.float64],
+):
+    """Contacts on a particle that bilateral rows hold at a point carry no force: without weight or target, and
+    with unit compliance, the NSN step leaves their zero multipliers unchanged."""
+    c = wp.tid()
+    if held[c] == 0:
+        return
+    for k in range(3):
+        omega[3 * c + k] = wp.float64(0.0)
+        compliance[3 * c + k] = wp.float64(1.0)
+        h[3 * c + k] = wp.float64(0.0)
 
 
 @wp.kernel
@@ -3142,6 +3266,7 @@ def fb_newton_lite_coulomb_per_particle_kernel(
     dt: wp.float64,
     cap_internal: wp.float64,  # lambda_cap / dt²
     use_cap: wp.int32,
+    n_contact_rows: wp.int32,  # 3M; the rows after them are bilateral
     # ---- inout / outputs ----
     lam: wp.array[wp.float64],  # (3M,) inout
     omega: wp.array[wp.float64],  # (3M,) inout
@@ -3158,8 +3283,11 @@ def fb_newton_lite_coulomb_per_particle_kernel(
     Local state lives in registers / L1 (warp ``mat12``).  Cholesky on a
     ``3·k_p x 3·k_p`` PSD matrix runs in-place over the same buffer.
 
-    The rows of a particle with more than ``_MAX_ROWS_PER_PARTICLE`` keep their
-    multipliers.
+    Rows from ``n_contact_rows`` on are bilateral rows on one particle each, with
+    the identity law of :func:`bilateral_law_kernel`. A particle whose bilateral
+    rows span all three directions is held at a point, and its contact rows carry
+    no force: their law gives no update to their zero multipliers. The rows of a
+    particle with more than ``_MAX_ROWS_PER_PARTICLE`` keep their multipliers.
     """
     iso = wp.tid()
     p = isodof_unique[iso]
@@ -3188,6 +3316,23 @@ def fb_newton_lite_coulomb_per_particle_kernel(
             alpha_b = wp.float64(row_alpha[rb])
             dir_b = row_dir[rb]
             W[ai, bi] = alpha_a * alpha_b * wp.float64(wp.dot(dir_a, dir_b)) * dt2 * inv_m
+
+    # Rank of the bilateral row directions, by Gram-Schmidt.
+    e0 = wp.vec3(0.0)
+    e1 = wp.vec3(0.0)
+    rank = wp.int32(0)
+    for ai in range(k_total):
+        ra = isodof_row_indices[row_start + ai]
+        if ra >= n_contact_rows:
+            u = row_dir[ra]
+            u = u - wp.dot(u, e0) * e0 - wp.dot(u, e1) * e1
+            if wp.length(u) > 1.0e-3 * wp.length(row_dir[ra]):
+                if rank == wp.int32(0):
+                    e0 = wp.normalize(u)
+                elif rank == wp.int32(1):
+                    e1 = wp.normalize(u)
+                rank += wp.int32(1)
+    held = rank >= wp.int32(3)
 
     # Load per-row state into vec12 locals.
     lam_l = _VEC12_F64(wp.float64(0.0))
@@ -3230,7 +3375,16 @@ def fb_newton_lite_coulomb_per_particle_kernel(
     for ai in range(k_total):
         ra = isodof_row_indices[row_start + ai]
         rmod = ra % 3
-        if rmod == 0:
+        if ra >= n_contact_rows:
+            om_l[ai] = wp.float64(1.0)
+            c_l[ai] = wp.float64(0.0)
+            h_l[ai] = pene0_l[ai]
+        elif held:
+            # rhs = 0 and a decoupled pivot: no update.
+            om_l[ai] = wp.float64(0.0)
+            c_l[ai] = wp.float64(1.0)
+            h_l[ai] = wp.float64(0.0)
+        elif rmod == 0:
             # Normal row.
             out_n = fb_unilateral_row_wp(pen_l[ai], lam_l[ai], precond_l[ai], dt, pene0_l[ai])
             om_l[ai] = out_n[0]
@@ -3323,9 +3477,11 @@ def fb_newton_lite_coulomb_per_particle_kernel(
         for ai in range(k_total):
             lam_l[ai] = lam_l[ai] + dlam_l[ai]
 
-    # Optional symmetric lambda cap, before the Coulomb clamp as in the dense path.
+    # Optional symmetric lambda cap on the contact rows, before the Coulomb clamp as in the dense path.
     if use_cap == wp.int32(1):
         for ai in range(k_total):
+            if isodof_row_indices[row_start + ai] >= n_contact_rows:
+                continue
             v = lam_l[ai]
             if v > cap_internal:
                 v = cap_internal
@@ -3337,7 +3493,7 @@ def fb_newton_lite_coulomb_per_particle_kernel(
     # multiplier, else within [-mu lam_n, mu lam_n]. Identify contact-c normal local index, clamp its t1 and t2.
     for ai in range(k_total):
         ra = isodof_row_indices[row_start + ai]
-        if (ra % 3) != 0:
+        if ra >= n_contact_rows or (ra % 3) != 0:
             continue
         # Find t1, t2 local indices (ra+1, ra+2 global).
         t1_g = ra + 1

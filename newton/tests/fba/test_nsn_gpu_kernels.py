@@ -382,6 +382,7 @@ class TestLiteCoulombKernel(unittest.TestCase):
                         wp.float64(dt),
                         wp.float64(0.0 if lambda_cap is None else lambda_cap / (dt * dt)),
                         wp.int32(lambda_cap is not None),
+                        wp.int32(3 * M),
                     ],
                     outputs=[lam, omega, lam_apply],
                 )

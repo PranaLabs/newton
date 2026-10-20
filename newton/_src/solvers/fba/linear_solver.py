@@ -890,6 +890,9 @@ class FBALinearSolver:
         download: bool = True,
         j_extra_indices: wp.array | None = None,
         j_extra_alpha: wp.array | None = None,
+        bilateral_particles: wp.array | None = None,
+        bilateral_alpha: wp.array | None = None,
+        bilateral_dir: wp.array | None = None,
     ) -> np.ndarray | None:
         """Build ``W = J · A⁻¹ · Jᵀ`` as a dense NumPy array (batched GPU implementation).
 
@@ -926,6 +929,11 @@ class FBALinearSolver:
                 contact then acts on ``alpha_k`` times its direction on each
                 of its ``K`` particles.
             j_extra_alpha: Their Jacobian coefficients, shape ``[M, K - 1]``, dtype float32.
+            bilateral_particles: Optional particles of bilateral rows that
+                follow the contact rows, shape ``[B, K]``, dtype int32, ``-1``
+                when unused; slot 0 must be used.
+            bilateral_alpha: Their coefficients, shape ``[B, K]``, dtype float32.
+            bilateral_dir: Direction of each bilateral row, shape ``[B]``, dtype vec3.
 
         Returns:
             Dense float64 NumPy array of shape ``(M, M)`` (frictionless) or
@@ -979,6 +987,21 @@ class FBALinearSolver:
         if extra_h is not None and (extra_h >= 0).any():
             extra_p = np.repeat(extra_h, rows_per_contact, axis=0)
             extra_a = np.repeat(host_head(j_extra_alpha, M), rows_per_contact, axis=0)
+        if bilateral_particles is not None and bilateral_particles.shape[0]:
+            # Bilateral rows follow the contact rows; their first particle takes slot 0.
+            b_p, b_a = bilateral_particles.numpy(), bilateral_alpha.numpy()
+            k = max(b_p.shape[1], 1 if extra_p is None else extra_p.shape[1] + 1) - 1
+            if extra_p is None:
+                extra_p, extra_a = np.full((total_rows, 0), -1, np.int32), np.zeros((total_rows, 0), np.float32)
+            pad = [(0, 0), (0, k - extra_p.shape[1])], [(0, 0), (0, k + 1 - b_p.shape[1])]
+            extra_p = np.vstack(
+                [np.pad(extra_p, pad[0], constant_values=-1), np.pad(b_p[:, 1:], pad[1], constant_values=-1)]
+            )
+            extra_a = np.vstack([np.pad(extra_a, pad[0]), np.pad(b_a[:, 1:], pad[1])])
+            row_particle = np.concatenate([row_particle, b_p[:, 0]]).astype(np.int32)
+            row_dir = np.concatenate([row_dir, bilateral_dir.numpy()]).astype(np.float32)
+            row_alpha = np.concatenate([row_alpha, b_a[:, 0]]).astype(np.float32)
+            total_rows += len(b_p)
 
         isodof_particles = self._set_row_slots(row_particle, row_alpha, extra_p, extra_a)
 
@@ -1242,6 +1265,15 @@ class FBALinearSolver:
                 device=self.device,
             )
 
+    def update_row_directions(self, directions: wp.array, offset: int) -> None:
+        """Set the directions of the rows from ``offset`` on and recompose ``W``.
+
+        Reuses the ``A⁻¹`` entries of the last isodof :meth:`build_schur_complement`, so new directions cost
+        one composition of ``W`` instead of a build. The lambda correction uses them too.
+        """
+        wp.copy(self._row_dir_d, directions, dest_offset=offset, count=directions.shape[0])
+        self._compose_schur()
+
     def setup_lite_mass(self, inv_mass_d: wp.array, dt: float) -> None:
         """Cache the LiteNSN mass operator ``dt² · inv_mass`` of each particle.
 
@@ -1291,21 +1323,26 @@ class FBALinearSolver:
         )
         return np.concatenate([row_particle, extra_p[rows, slots]])
 
-    def _setup_lite_rows_on_device(self, M, rows_per_contact, directions, j_indices, j_alpha, extra) -> int:
+    def _setup_lite_rows_on_device(self, M, rows_per_contact, directions, j_indices, j_alpha, extra, bilateral) -> int:
         """:meth:`setup_lite_row_meta` on the device for rows on several particles, without the list of particles
         that the rows touch, which only the per-particle lite kernel reads: the CSRs keep the order of a stable
         sort of the rows, and of the further slots row by row."""
         dev, n, width = self.device, self.n, extra[0].shape[1]
-        R = M * rows_per_contact
+        bilateral = bilateral or (np.zeros(0), np.zeros((0, 3)), np.zeros(0))
+        types = (wp.int32, wp.vec3, wp.float32)
+        b_p, b_d, b_a = (wp.array(np.asarray(a), dtype=t, device=dev) for a, t in zip(bilateral, types, strict=True))
+        contact_rows = M * rows_per_contact
+        R = contact_rows + b_p.shape[0]
         self._row_dir_d = wp.empty(R, dtype=wp.vec3, device=dev)
-        wp.launch(lite_row_dirs_kernel, R, [*directions, rows_per_contact], [self._row_dir_d], device=dev)
+        inputs = [*directions, b_d, rows_per_contact, contact_rows]
+        wp.launch(lite_row_dirs_kernel, R, inputs, [self._row_dir_d], device=dev)
         self._row_particle_d = wp.empty(R, dtype=wp.int32, device=dev)
         self._row_alpha_d = wp.empty(R, dtype=wp.float32, device=dev)
         slots = [wp.empty((R, width + 1), dtype=t, device=dev) for t in (wp.int32, wp.float32)]
         row_kv = [wp.empty(2 * R, dtype=wp.int32, device=dev) for _ in range(2)]
         slot_kv = [wp.empty(2 * R * width, dtype=wp.int32, device=dev) for _ in range(2)]
         counts = [wp.zeros(n, dtype=wp.int32, device=dev) for _ in range(2)]
-        inputs = [j_indices, j_alpha, *extra, rows_per_contact]
+        inputs = [j_indices, j_alpha, *extra, b_p, b_a, rows_per_contact, contact_rows]
         outputs = [self._row_particle_d, self._row_alpha_d, *slots, *row_kv, counts[0], *slot_kv, counts[1]]
         wp.launch(lite_row_slots_kernel, R, inputs, outputs, device=dev)
         offsets = [wp.zeros(n + 1, dtype=wp.int32, device=dev) for _ in range(2)]
@@ -1326,6 +1363,7 @@ class FBALinearSolver:
         j_alpha: wp.array,
         j_tangent1: wp.array | None = None,
         j_tangent2: wp.array | None = None,
+        bilateral: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
         j_extra_indices: wp.array | None = None,
         j_extra_alpha: wp.array | None = None,
         host: tuple | None = None,
@@ -1347,8 +1385,11 @@ class FBALinearSolver:
         With ``j_extra_indices`` and ``j_extra_alpha``, the further particles
         of the contacts, shape ``[M, K - 1]``, as in
         :meth:`build_schur_complement`, the rows are set up on the device.
+        ``bilateral`` appends rows on one particle each, as ``(particles,
+        directions, coefficients)``.
 
-        Returns ``total_rows`` (``M`` frictionless, ``3M`` frictional).
+        Returns ``total_rows`` (``M`` frictionless, ``3M`` frictional, plus the
+        bilateral rows).
         """
         has_friction = j_tangent1 is not None and j_tangent2 is not None
         rows_per_contact = 3 if has_friction else 1
@@ -1359,16 +1400,23 @@ class FBALinearSolver:
         if j_extra_indices is not None:
             normals = (j_normals, j_tangent1, j_tangent2) if has_friction else (j_normals, j_normals, j_normals)
             extra = (j_extra_indices, j_extra_alpha)
-            return self._setup_lite_rows_on_device(M, rows_per_contact, normals, j_indices, j_alpha, extra)
+            return self._setup_lite_rows_on_device(M, rows_per_contact, normals, j_indices, j_alpha, extra, bilateral)
 
         if host is None:
             host = (j_indices.numpy(), j_alpha.numpy())
         idx_np, a_np = host[0][:M].astype(np.int32), host[1][:M]
         row_particle = np.repeat(idx_np, rows_per_contact)
         row_alpha = np.repeat(a_np, rows_per_contact)
+        bilateral_dir = np.zeros((0, 3), dtype=np.float32)
+        if bilateral is not None:
+            row_particle = np.concatenate([row_particle, np.asarray(bilateral[0], dtype=np.int32)])
+            bilateral_dir = np.asarray(bilateral[1], dtype=np.float32)
+            row_alpha = np.concatenate([row_alpha, np.asarray(bilateral[2], dtype=np.float32)])
+        contact_rows, total_rows = total_rows, row_particle.size
         tangents = (j_tangent1, j_tangent2) if has_friction else (j_normals, j_normals)
         self._row_dir_d = wp.empty(total_rows, dtype=wp.vec3, device=dev)
-        inputs = [j_normals, *tangents, rows_per_contact]
+        inputs = [j_normals, *tangents, wp.array(bilateral_dir, dtype=wp.vec3, device=dev)]
+        inputs += [rows_per_contact, contact_rows]
         wp.launch(lite_row_dirs_kernel, total_rows, inputs, [self._row_dir_d], device=dev)
         self._row_slots = None
 
