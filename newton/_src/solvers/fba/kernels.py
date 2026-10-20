@@ -183,6 +183,20 @@ def damping_rhs_kernel(
 
 
 @wp.kernel
+def sub_vec3_kernel(a: wp.array[wp.vec3], b: wp.array[wp.vec3], out: wp.array[wp.vec3]):
+    """``out = a - b`` elementwise."""
+    i = wp.tid()
+    out[i] = a[i] - b[i]
+
+
+@wp.kernel
+def add_scaled_f64_kernel(x: wp.array[wp.float64], scale: wp.float64, y: wp.array[wp.float64]):
+    """``y += scale * x`` elementwise."""
+    i = wp.tid()
+    y[i] = y[i] + scale * x[i]
+
+
+@wp.kernel
 def copy_particles_kernel(
     particles: wp.array[wp.int32],
     source: wp.array[wp.vec3],
@@ -2443,6 +2457,68 @@ def compute_frictional_fb_kernel(
 
 
 @wp.kernel
+def soft_contact_keys_kernel(
+    particle: wp.array[wp.int32],
+    shape: wp.array[wp.int32],
+    shape_count: int,
+    # outputs
+    keys: wp.array[wp.int64],
+    values: wp.array[wp.int32],
+):
+    """Keys that sort the particle-shape contacts by particle and then shape, and their indices."""
+    i = wp.tid()
+    keys[i] = wp.int64(particle[i]) * wp.int64(shape_count) + wp.int64(shape[i])
+    values[i] = i
+
+
+@wp.kernel
+def assemble_contacts_kernel(
+    order: wp.array[wp.int32],  # indices of the particle-shape contacts in their sorted order
+    soft_particle: wp.array[wp.int32],
+    soft_shape: wp.array[wp.int32],
+    soft_body_pos: wp.array[wp.vec3],
+    soft_normal: wp.array[wp.vec3],
+    self_particles: wp.array2d[wp.int32],  # (S, 4) vertex-face self contacts: the particle, then the triangle
+    self_alpha: wp.array2d[wp.float32],  # (S, 4)
+    self_normal: wp.array[wp.vec3],  # (S,)
+    shape_contacts: int,
+    self_radius: float,
+    # outputs
+    particle: wp.array[wp.int32],
+    normal: wp.array[wp.vec3],
+    alpha: wp.array[wp.float32],
+    shape: wp.array[wp.int32],
+    body_pos: wp.array[wp.vec3],
+    extra_particle: wp.array2d[wp.int32],  # (M, 3)
+    extra_alpha: wp.array2d[wp.float32],  # (M, 3)
+):
+    """The particle-shape contacts in their sorted order and then the self contacts, anchored the self-contact
+    radius along their normals, with the further particles of each contact."""
+    c = wp.tid()
+    if c < shape_contacts:
+        i = order[c]
+        particle[c] = soft_particle[i]
+        normal[c] = soft_normal[i]
+        alpha[c] = 1.0
+        shape[c] = soft_shape[i]
+        body_pos[c] = soft_body_pos[i]
+        for k in range(3):
+            extra_particle[c, k] = -1
+            extra_alpha[c, k] = 0.0
+    else:
+        s = c - shape_contacts
+        n = self_normal[s]
+        particle[c] = self_particles[s, 0]
+        normal[c] = n
+        alpha[c] = self_alpha[s, 0]
+        shape[c] = -1
+        body_pos[c] = self_radius * n
+        for k in range(3):
+            extra_particle[c, k] = self_particles[s, k + 1]
+            extra_alpha[c, k] = self_alpha[s, k + 1]
+
+
+@wp.kernel
 def contact_mu_kernel(
     contact_shape: wp.array[wp.int32],  # (M,) shape of each contact, -1 for contacts without a shape
     shape_material_mu: wp.array[wp.float32],
@@ -2457,6 +2533,50 @@ def contact_mu_kernel(
         mu[c] = wp.float64(shape_material_mu[s])
     else:
         mu[c] = particle_mu
+
+
+@wp.kernel
+def lite_row_slots_kernel(
+    contact_particle: wp.array[wp.int32],  # (M,) first particle of each contact
+    contact_alpha: wp.array[wp.float32],  # (M,)
+    extra_particle: wp.array2d[wp.int32],  # (M, E) further particles of each contact, -1 where unused
+    extra_alpha: wp.array2d[wp.float32],  # (M, E)
+    rows_per_contact: int,
+    # outputs
+    row_particle: wp.array[wp.int32],  # (R,)
+    row_alpha: wp.array[wp.float32],  # (R,)
+    slot_particle: wp.array2d[wp.int32],  # (R, E + 1)
+    slot_alpha: wp.array2d[wp.float32],  # (R, E + 1)
+    row_keys: wp.array[wp.int32],  # (2 R,) particle of each row, to sort
+    row_values: wp.array[wp.int32],  # (2 R,)
+    row_count: wp.array[wp.int32],  # (N,) rows of each particle, zeroed, incremented
+    slot_keys: wp.array[wp.int32],  # (2 R E,) particle of each further slot, row-major, or a past-the-end key
+    slot_values: wp.array[wp.int32],  # (2 R E,) row * (E + 1) + slot
+    slot_count: wp.array[wp.int32],  # (N,) further slots of each particle, zeroed, incremented
+):
+    """The particles and coefficients of the lite rows in slots, and the keys and counts of the CSRs from each
+    particle to its rows and to its further slots."""
+    r = wp.tid()
+    c = r // rows_per_contact
+    p = contact_particle[c]
+    a = contact_alpha[c]
+    row_particle[r] = p
+    row_alpha[r] = a
+    slot_particle[r, 0] = p
+    slot_alpha[r, 0] = a
+    row_keys[r] = p
+    row_values[r] = r
+    wp.atomic_add(row_count, p, 1)
+    width = extra_particle.shape[1]
+    for k in range(width):
+        q = extra_particle[c, k]
+        b = extra_alpha[c, k]
+        slot_particle[r, k + 1] = q
+        slot_alpha[r, k + 1] = b
+        slot_keys[r * width + k] = wp.where(q >= 0, q, row_count.shape[0])
+        slot_values[r * width + k] = r * (width + 1) + k + 1
+        if q >= 0:
+            wp.atomic_add(slot_count, q, 1)
 
 
 @wp.kernel
@@ -2476,6 +2596,152 @@ def lite_row_dirs_kernel(
         row_dir[r] = tangent1[r // rows_per_contact]
     else:
         row_dir[r] = tangent2[r // rows_per_contact]
+
+
+_mat13d = wp.types.matrix(shape=(1, 3), dtype=wp.float64)
+
+
+@wp.kernel
+def lite_row_triplets_kernel(
+    contact_particle: wp.array[wp.int32],  # (M,) first particle of each contact
+    contact_alpha: wp.array[wp.float32],  # (M,) its coefficient
+    extra_particle: wp.array2d[wp.int32],  # (M, E) further particles of each contact, -1 where unused
+    extra_alpha: wp.array2d[wp.float32],  # (M, E) their coefficients
+    row_dir: wp.array[wp.vec3],  # (3 M,) direction of each row
+    # outputs
+    columns: wp.array[wp.int32],
+    values: wp.array[_mat13d],
+):
+    """The blocks ``c_k d`` of the lite Jacobian in four slots per row, the three rows of each contact, with a
+    negative column where a slot has no particle or a zero coefficient."""
+    r = wp.tid()
+    d = row_dir[r]
+    for k in range(4):
+        p = wp.int32(-1)
+        c = wp.float32(0.0)
+        if k == 0:
+            p = contact_particle[r // 3]
+            c = contact_alpha[r // 3]
+        elif k - 1 < extra_particle.shape[1]:
+            p = extra_particle[r // 3, k - 1]
+            c = extra_alpha[r // 3, k - 1]
+        columns[4 * r + k] = wp.where(p >= 0 and c != wp.float32(0.0), p, -1)
+        values[4 * r + k] = wp.matrix_from_rows(wp.float64(c) * wp.vec3d(d))
+
+
+@wp.kernel
+def lite_triplet_key_kernel(
+    columns: wp.array[wp.int32],  # (4 R,) particle of each slot of H, -1 when unused
+    n_particles: int,
+    # outputs
+    keys: wp.array[wp.int32],  # (>= 8 R,) particle, n_particles for unused slots
+    index: wp.array[wp.int32],  # (>= 8 R,) the slot
+    counts: wp.array[wp.int32],  # (N,) slots per particle, zeroed by the caller
+):
+    """Sort keys of the slots of ``H`` by particle, and the number of slots of each particle."""
+    t = wp.tid()
+    p = columns[t]
+    keys[t] = wp.where(p >= 0, p, n_particles)
+    index[t] = t
+    if p >= 0:
+        wp.atomic_add(counts, p, 1)
+
+
+@wp.func
+def _lite_w_next(
+    index: wp.array[wp.int32],
+    lo: wp.vec4i,
+    hi: wp.vec4i,
+):
+    """The list, among the particles of a row, whose next slot has the lowest row, first list first on ties;
+    -1 when all are done."""
+    best = int(2147483647)
+    bk = int(-1)
+    for k in range(4):
+        if lo[k] < hi[k]:
+            r = index[lo[k]] // 4
+            if r < best:
+                best = r
+                bk = k
+    return bk, best
+
+
+@wp.kernel
+def lite_w_row_nnz_kernel(
+    columns: wp.array[wp.int32],
+    index: wp.array[wp.int32],  # slots sorted by particle, rows ascending within a particle
+    starts: wp.array[wp.int32],  # (N,) first sorted slot of each particle
+    counts: wp.array[wp.int32],  # (N,)
+    # outputs
+    row_nnz: wp.array[wp.int32],  # (R + 1,) entries of each row of W
+):
+    """The number of rows that share a particle with row ``i``, itself included."""
+    i = wp.tid()
+    lo = wp.vec4i(0)
+    hi = wp.vec4i(0)
+    for k in range(4):
+        p = columns[4 * i + k]
+        if p >= 0:
+            lo[k] = starts[p]
+            hi[k] = starts[p] + counts[p]
+    n = int(0)
+    last = int(-1)
+    bk, best = _lite_w_next(index, lo, hi)
+    while bk >= 0:
+        lo[bk] = lo[bk] + 1
+        if best != last:
+            n += 1
+            last = best
+        bk, best = _lite_w_next(index, lo, hi)
+    row_nnz[i] = n
+
+
+@wp.kernel
+def lite_w_row_fill_kernel(
+    columns: wp.array[wp.int32],
+    values: wp.array[_mat13d],  # (4 R,) blocks c d of H
+    index: wp.array[wp.int32],
+    starts: wp.array[wp.int32],
+    counts: wp.array[wp.int32],
+    s: wp.array[wp.float64],  # (N,) dt^2 inv_mass
+    offsets: wp.array[wp.int32],  # (R + 1,)
+    # outputs
+    w_columns: wp.array[wp.int32],
+    w_values: wp.array[wp.float64],
+):
+    """Row ``i`` of ``W``: for each row ``j`` sharing a particle ``p`` with it, the sum of ``s_p h_i . h_j`` over the
+    slots on shared particles, in the order of the rows."""
+    i = wp.tid()
+    lo = wp.vec4i(0)
+    hi = wp.vec4i(0)
+    for k in range(4):
+        p = columns[4 * i + k]
+        if p >= 0:
+            lo[k] = starts[p]
+            hi[k] = starts[p] + counts[p]
+    out = offsets[i]
+    last = int(-1)
+    acc = wp.float64(0.0)
+    bk, best = _lite_w_next(index, lo, hi)
+    while bk >= 0:
+        t = index[lo[bk]]
+        lo[bk] = lo[bk] + 1
+        a = values[4 * i + bk]
+        b = values[t]
+        v = s[columns[4 * i + bk]] * (a[0, 0] * b[0, 0] + a[0, 1] * b[0, 1] + a[0, 2] * b[0, 2])
+        if best != last:
+            if last >= 0:
+                w_columns[out] = last
+                w_values[out] = acc
+                out += 1
+            last = best
+            acc = v
+        else:
+            acc += v
+        bk, best = _lite_w_next(index, lo, hi)
+    if last >= 0:
+        w_columns[out] = last
+        w_values[out] = acc
 
 
 @wp.kernel
@@ -2711,6 +2977,110 @@ def fb_newton_lite_coulomb_kernel(
     lam_apply[i_n] = dt2 * om_n * lam_n
     lam_apply[i_t1] = dt2 * om_t1 * lam_t1
     lam_apply[i_t2] = dt2 * om_t2 * lam_t2
+
+
+# ----- Per-row kernels of the sparse lite NSN -----
+
+
+@wp.kernel
+def precond_from_bsr_diag_coulomb_kernel(
+    diag: wp.array[wp.float64],
+    dt: wp.float64,
+    precond: wp.array[wp.float64],
+):
+    """Compute the frictional precond (dt²·|W_ii| for normals, dt·|W_ii| for tangents)
+    from the diagonal of the scalar sparse ``W``.  Companion to the dense
+    :func:`compute_precond_coulomb_kernel`.
+    """
+    i = wp.tid()
+    w = wp.abs(diag[i])
+    if w < wp.float64(1.0e-12):
+        w = wp.float64(1.0e-12)
+    if (i % 3) == 0:
+        precond[i] = dt * dt * w
+    else:
+        precond[i] = dt * w
+
+
+@wp.kernel
+def compute_penetration_sparse_kernel(
+    r: wp.array[wp.float64],
+    w_omega_lam: wp.array[wp.float64],
+    dt: wp.float64,
+    penetration: wp.array[wp.float64],
+):
+    """Per-row ``penetration = -r + dt² · W·(ω·λ)`` for the sparse path.
+
+    Sparse equivalent of the matvec embedded in
+    :func:`compute_penetration_kernel`: caller supplies the precomputed
+    ``W·(ω·λ)`` (from its sparse product) so this kernel is a trivial 1-line
+    fused multiply-add.
+    """
+    i = wp.tid()
+    penetration[i] = -r[i] + dt * dt * w_omega_lam[i]
+
+
+@wp.kernel
+def build_a_schur_lite_bsr_kernel(
+    w_offsets: wp.array[wp.int32],
+    w_columns: wp.array[wp.int32],
+    w_values: wp.array[wp.float64],  # collapsed scalar values for 1x1 BSR
+    omega: wp.array[wp.float64],
+    compliance: wp.array[wp.float64],
+    a_values: wp.array[wp.float64],  # output, same shape as w_values
+):
+    """Build A_schur = ωωᵀ ⊙ W + diag(c) in BSR with W's sparsity (scalar
+    values since ``warp.sparse`` collapses 1x1 block BSR to scalar storage).
+    """
+    i = wp.tid()
+    start = w_offsets[i]
+    end = w_offsets[i + 1]
+    om_i = omega[i]
+    c_i = compliance[i]
+    for k in range(start, end):
+        j = w_columns[k]
+        om_j = omega[j]
+        a_ij = om_i * om_j * w_values[k]
+        if i == j:
+            a_ij = a_ij + c_i
+        a_values[k] = a_ij
+
+
+@wp.kernel
+def compute_nsn_rhs_lite_bsr_kernel(
+    h: wp.array[wp.float64],
+    omega: wp.array[wp.float64],
+    pene0: wp.array[wp.float64],
+    r: wp.array[wp.float64],
+    w_omega_lam: wp.array[wp.float64],  # W · (ω · λ), from the sparse product
+    dt: wp.float64,
+    rhs: wp.array[wp.float64],
+):
+    """Per-row RHS for the sparse LiteNSN PCR.
+
+    Mirrors the dense ``compute_nsn_rhs_kernel`` but takes a pre-computed
+    ``W · (ω · λ)`` vector (the caller's sparse product) instead of
+    inlining the matvec. That path is what makes the rhs build sparse
+    instead of dense.
+
+        J_x = (pene0 - r) + dt² · w_omega_lam
+        rhs = (1/dt²) · (h - omega · J_x)
+    """
+    i = wp.tid()
+    dt2 = dt * dt
+    Jx = (pene0[i] - r[i]) + dt2 * w_omega_lam[i]
+    rhs[i] = (wp.float64(1.0) / dt2) * (h[i] - omega[i] * Jx)
+
+
+@wp.kernel
+def compute_omega_times_lam_kernel(
+    omega: wp.array[wp.float64],
+    lam: wp.array[wp.float64],
+    out: wp.array[wp.float64],
+):
+    """Elementwise ``out[i] = omega[i] · lam[i]``, the input of the sparse product ``W (ω λ)``."""
+    i = wp.tid()
+    out[i] = omega[i] * lam[i]
 
 
 # ----- Per-particle fused FB-Newton kernel for LiteNSN -----

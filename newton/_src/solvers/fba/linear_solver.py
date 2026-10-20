@@ -30,6 +30,7 @@ from .kernels import (
     host_head,
     insert_component_kernel,
     lite_row_dirs_kernel,
+    lite_row_slots_kernel,
     scale_by_diag_kernel,
 )
 from .sparse_ldlt import CscMatrix, CsrMatrix, factor_ldlt
@@ -1200,6 +1201,9 @@ class FBALinearSolver:
         ``M / dt²`` inverts to ``dt² · inv_mass``.  Without this factor,
         ``W_lite`` would be ``1/dt²`` times the full NSN's ``J A⁻¹ Jᵀ`` in
         scale, and FB-Newton's linearization would not match it.
+
+        The sparse lite Schur complement of :meth:`build_schur_lite_triplets`
+        reads the scalars ``dt² · inv_mass`` too.
         """
         n = inv_mass_d.shape[0]
         if n != self.n:
@@ -1209,6 +1213,7 @@ class FBALinearSolver:
         # when dt or the pin layout changes.
         self._inv_mass_d = wp.array(inv_mass_h, dtype=wp.float64, device=self.device)
         self._lite_dt2 = float(dt) * float(dt)
+        self._lite_s_d = wp.array(self._lite_dt2 * inv_mass_h, dtype=wp.float64, device=self.device)
 
     def _set_row_slots(self, row_particle, row_alpha, extra_p, extra_a) -> np.ndarray:
         """Keep the extra slots of rows on several particles, with a CSR from particle to ``row * K + slot``.
@@ -1232,6 +1237,33 @@ class FBALinearSolver:
         )
         return np.concatenate([row_particle, extra_p[rows, slots]])
 
+    def _setup_lite_rows_on_device(self, M, rows_per_contact, directions, j_indices, j_alpha, extra) -> int:
+        """:meth:`setup_lite_row_meta` on the device for rows on several particles, without the list of particles
+        that the rows touch, which only the per-particle lite kernel reads: the CSRs keep the order of a stable
+        sort of the rows, and of the further slots row by row."""
+        dev, n, width = self.device, self.n, extra[0].shape[1]
+        R = M * rows_per_contact
+        self._row_dir_d = wp.empty(R, dtype=wp.vec3, device=dev)
+        wp.launch(lite_row_dirs_kernel, R, [*directions, rows_per_contact], [self._row_dir_d], device=dev)
+        self._row_particle_d = wp.empty(R, dtype=wp.int32, device=dev)
+        self._row_alpha_d = wp.empty(R, dtype=wp.float32, device=dev)
+        slots = [wp.empty((R, width + 1), dtype=t, device=dev) for t in (wp.int32, wp.float32)]
+        row_kv = [wp.empty(2 * R, dtype=wp.int32, device=dev) for _ in range(2)]
+        slot_kv = [wp.empty(2 * R * width, dtype=wp.int32, device=dev) for _ in range(2)]
+        counts = [wp.zeros(n, dtype=wp.int32, device=dev) for _ in range(2)]
+        inputs = [j_indices, j_alpha, *extra, rows_per_contact]
+        outputs = [self._row_particle_d, self._row_alpha_d, *slots, *row_kv, counts[0], *slot_kv, counts[1]]
+        wp.launch(lite_row_slots_kernel, R, inputs, outputs, device=dev)
+        offsets = [wp.zeros(n + 1, dtype=wp.int32, device=dev) for _ in range(2)]
+        for kv, size, count, offset in zip((row_kv, slot_kv), (R, R * width), counts, offsets, strict=True):
+            wp.utils.radix_sort_pairs(*kv, size)
+            wp.utils.array_scan(count, offset[1:], inclusive=True)
+        self._row_slots = (*slots, offsets[1], slot_kv[1])
+        self._isodof_row_offsets_d, self._isodof_row_indices_d = offsets[0], row_kv[1]
+        self._isodof_unique_d, self._n_isodofs, self._isodof_max_rows = None, 0, 0
+        self._row_total = R
+        return R
+
     def setup_lite_row_meta(
         self,
         num_contacts: int,
@@ -1240,6 +1272,8 @@ class FBALinearSolver:
         j_alpha: wp.array,
         j_tangent1: wp.array | None = None,
         j_tangent2: wp.array | None = None,
+        j_extra_indices: wp.array | None = None,
+        j_extra_alpha: wp.array | None = None,
         host: tuple | None = None,
     ) -> int:
         """Populate per-row metadata for LiteNSN paths without building ``W``.
@@ -1256,6 +1290,9 @@ class FBALinearSolver:
 
         ``host`` holds host copies of ``j_indices`` and ``j_alpha``, or
         ``None`` for them, so that they need not be read from the device.
+        With ``j_extra_indices`` and ``j_extra_alpha``, the further particles
+        of the contacts, shape ``[M, K - 1]``, as in
+        :meth:`build_schur_complement`, the rows are set up on the device.
 
         Returns ``total_rows`` (``M`` frictionless, ``3M`` frictional).
         """
@@ -1265,6 +1302,11 @@ class FBALinearSolver:
         total_rows = M * rows_per_contact
         dev = self.device
         n = self.n
+        if j_extra_indices is not None:
+            normals = (j_normals, j_tangent1, j_tangent2) if has_friction else (j_normals, j_normals, j_normals)
+            extra = (j_extra_indices, j_extra_alpha)
+            return self._setup_lite_rows_on_device(M, rows_per_contact, normals, j_indices, j_alpha, extra)
+
         if host is None:
             host = (j_indices.numpy(), j_alpha.numpy())
         idx_np, a_np = host[0][:M].astype(np.int32), host[1][:M]
@@ -1301,6 +1343,118 @@ class FBALinearSolver:
         self._isodof_max_rows = int(counts.max()) if unique_isodofs.size else 0
 
         return total_rows
+
+    def build_schur_lite_triplets(self, total_rows: int, cols_d: wp.array, vals_d: wp.array) -> wps.BsrMatrix:
+        """``W = H (dt^2 M^-1) H^T`` from the triplets of ``H``, rows of 1 x 3 blocks over the particles in four
+        slots per row, so that slot ``t`` lies in row ``t // 4``; slots with a negative column are skipped.
+
+        Two rows couple where they share a particle. The slots are sorted by particle, and each row of ``W`` merges
+        the rows on its particles in row order, summing ``dt^2 / m_p`` times the products of their blocks over the
+        particles they share, without a general sparse product. ``W`` is a scalar CSR matrix in BSR form, with each
+        row's columns in order.
+        """
+        from .kernels import lite_triplet_key_kernel, lite_w_row_fill_kernel, lite_w_row_nnz_kernel  # noqa: PLC0415
+
+        dev, n, R = self.device, self.n, int(total_rows)
+        slots = 4 * R
+        # The radix sort takes keys and values twice the count it sorts.
+        if getattr(self, "_lw_slot_cap", 0) < slots:
+            self._lw_slot_cap = cap = max(slots, int(1.5 * getattr(self, "_lw_slot_cap", 0)))
+            self._lw_keys = wp.empty(2 * cap, dtype=wp.int32, device=dev)
+            self._lw_index = wp.empty(2 * cap, dtype=wp.int32, device=dev)
+        if getattr(self, "_lw_counts", None) is None:
+            self._lw_counts = wp.zeros(n, dtype=wp.int32, device=dev)
+            self._lw_starts = wp.zeros(n, dtype=wp.int32, device=dev)
+        if getattr(self, "_lw_row_cap", 0) < R + 1:
+            self._lw_row_cap = cap = max(R + 1, int(1.5 * getattr(self, "_lw_row_cap", 0)))
+            self._lw_row_nnz = wp.zeros(cap, dtype=wp.int32, device=dev)
+            self._lw_offsets = wp.zeros(cap, dtype=wp.int32, device=dev)
+        self._lw_counts.zero_()
+        outputs = [self._lw_keys, self._lw_index, self._lw_counts]
+        wp.launch(lite_triplet_key_kernel, slots, [cols_d, n], outputs, device=dev)
+        wp.utils.radix_sort_pairs(self._lw_keys, self._lw_index, slots)
+        wp.utils.array_scan(self._lw_counts, self._lw_starts, inclusive=False)
+        row_nnz, offsets = self._lw_row_nnz[: R + 1], self._lw_offsets[: R + 1]
+        row_nnz.zero_()
+        inputs = [cols_d, self._lw_index, self._lw_starts, self._lw_counts]
+        wp.launch(lite_w_row_nnz_kernel, R, inputs, [row_nnz], device=dev)
+        wp.utils.array_scan(row_nnz, offsets, inclusive=False)
+        nnz = int(offsets[R : R + 1].numpy()[0])
+        if getattr(self, "_lw_nnz_cap", 0) < nnz:
+            self._lw_nnz_cap = cap = max(nnz, int(1.5 * getattr(self, "_lw_nnz_cap", 0)))
+            self._lw_columns = wp.empty(cap, dtype=wp.int32, device=dev)
+            self._lw_values = wp.empty(cap, dtype=wp.float64, device=dev)
+        inputs = [cols_d, vals_d, self._lw_index, self._lw_starts, self._lw_counts, self._lite_s_d, offsets]
+        wp.launch(lite_w_row_fill_kernel, R, inputs, [self._lw_columns, self._lw_values], device=dev)
+        W = getattr(self, "_lw_W", None)
+        if W is None:
+            W = self._lw_W = wps.bsr_zeros(rows_of_blocks=R, cols_of_blocks=R, block_type=wp.float64, device=dev)
+        W.nrow, W.ncol, W.nnz = R, R, nnz
+        W.offsets, W.columns, W.values = offsets, self._lw_columns, self._lw_values
+        return W
+
+    def reserve_a_schur_lite_bsr(self, W_bsr: wps.BsrMatrix) -> wps.BsrMatrix:
+        """Storage for ``A_schur`` with the sparsity of ``W_bsr``, which it shares; its values are not set."""
+        nnz = int(W_bsr.nnz)
+        n_rows = int(W_bsr.nrow)
+
+        if (
+            not hasattr(self, "_A_schur_lite_bsr")
+            or self._A_schur_lite_bsr is None
+            or int(self._A_schur_lite_bsr.values.shape[0]) < nnz
+        ):
+            # Allocate a placeholder via bsr_zeros (scalar block_type = fp64).
+            self._A_schur_lite_bsr = wps.bsr_zeros(
+                rows_of_blocks=n_rows,
+                cols_of_blocks=n_rows,
+                block_type=wp.float64,
+                device=self.device,
+            )
+            self._A_schur_lite_values_cap = max(nnz, 32)
+            self._A_schur_lite_bsr.values = wp.empty(
+                self._A_schur_lite_values_cap,
+                dtype=wp.float64,
+                device=self.device,
+            )
+
+        # Share W's pattern arrays (offsets + columns), no copy.
+        self._A_schur_lite_bsr.nrow = n_rows
+        self._A_schur_lite_bsr.ncol = n_rows
+        self._A_schur_lite_bsr.nnz = nnz
+        self._A_schur_lite_bsr.offsets = W_bsr.offsets
+        self._A_schur_lite_bsr.columns = W_bsr.columns
+
+        return self._A_schur_lite_bsr
+
+    def build_a_schur_lite_bsr(
+        self,
+        W_bsr: wps.BsrMatrix,
+        omega_d: wp.array,  # (total_rows,) fp64
+        compliance_d: wp.array,  # (total_rows,) fp64
+    ) -> wps.BsrMatrix:
+        """Construct ``A_schur = ωωᵀ ⊙ W + diag(c)`` in BSR (same sparsity as W).
+
+        ``warp.sparse`` collapses 1x1-block BSR storage to scalar fp64 values,
+        so ``W_bsr.values.dtype == wp.float64`` (not ``mat1x1``).  We allocate
+        the sibling A_schur matrix with the same convention.
+        """
+        from .kernels import build_a_schur_lite_bsr_kernel  # noqa: PLC0415
+
+        A = self.reserve_a_schur_lite_bsr(W_bsr)
+        wp.launch(
+            build_a_schur_lite_bsr_kernel,
+            dim=int(W_bsr.nrow),
+            inputs=[
+                W_bsr.offsets,
+                W_bsr.columns,
+                W_bsr.values,
+                omega_d,
+                compliance_d,
+            ],
+            outputs=[A.values],
+            device=self.device,
+        )
+        return A
 
     def build_schur_lite_dense(
         self,
@@ -1472,6 +1626,17 @@ class FBALinearSolver:
             device=self.device,
         )
 
+    def reserve_lambda_correction(self) -> None:
+        """Allocate the buffers of :meth:`apply_lambda_correction_combined` for the rows of the last Schur build,
+        so that a graph capture of it allocates nothing."""
+        n_rows = self._row_total
+        if not hasattr(self, "_jt_lambda_d") or self._jt_lambda_d.shape[0] != self.n:
+            self._jt_lambda_d = wp.empty(self.n, dtype=wp.vec3, device=self.device)
+        if not hasattr(self, "_lam_d") or self._lam_d.shape[0] < n_rows:
+            cap = max(n_rows, int(getattr(self, "_lam_cap", 0) * 1.5) + 1)
+            self._lam_cap = cap
+            self._lam_d = wp.empty(cap, dtype=wp.float32, device=self.device)
+
     def apply_lambda_correction_combined(
         self,
         lam: np.ndarray | wp.array,
@@ -1524,13 +1689,7 @@ class FBALinearSolver:
         n = self.n
         dev = self.device
         n_rows = self._row_total
-
-        if not hasattr(self, "_jt_lambda_d") or self._jt_lambda_d.shape[0] != n:
-            self._jt_lambda_d = wp.empty(n, dtype=wp.vec3, device=dev)
-        if not hasattr(self, "_lam_d") or self._lam_d.shape[0] < n_rows:
-            cap = max(n_rows, int(getattr(self, "_lam_cap", 0) * 1.5) + 1)
-            self._lam_cap = cap
-            self._lam_d = wp.empty(cap, dtype=wp.float32, device=dev)
+        self.reserve_lambda_correction()
 
         # Accept either a host numpy array, as the tests pass, or a
         # device-resident fp64 array: the solver passes ``_nsn_lam_apply_d``

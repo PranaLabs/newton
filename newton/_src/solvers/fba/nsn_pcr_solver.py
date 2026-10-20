@@ -4,7 +4,8 @@
 """Jacobi-preconditioned Conjugate Residual (PCR) solver for the NSN Schur LCP.
 
 The solver is used inside the Non-Smooth Newton (NSN) outer loop to solve the
-dense fp64 SPD reduced (Schur) system on every Newton step.
+dense fp64 SPD reduced (Schur) system on every Newton step, and the sparse
+Schur system of the lite mode.
 
 Algorithm: conjugate residuals on the symmetrically preconditioned system
 ``P^1/2 A P^1/2``, with the Jacobi preconditioner ``P = diag(A)^-1``:
@@ -77,6 +78,10 @@ import warp as wp
 # win at n < 400 where launch overhead dominates.
 _PCR_TILE_K = wp.constant(128)
 _PCR_BLOCK_DIM = 128
+# Block size of the fused sparse iteration of :meth:`NSNPCRSolver.solve_sparse_fused`, and the most blocks whose
+# partial sums each block reduces in one tile: up to 262144 rows.
+_FUSED_BLOCK = wp.constant(256)
+_FUSED_MAX_BLOCKS = wp.constant(1024)
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +101,26 @@ def _compute_precond_kernel(
     """
     i = wp.tid()
     d = A[i, i]
+    if d == wp.float64(0.0):
+        precond[i] = wp.float64(0.0)
+    else:
+        precond[i] = wp.float64(1.0) / d
+
+
+@wp.kernel
+def _precond_from_bsr_diag_kernel(
+    diag: wp.array[wp.float64],
+    precond: wp.array[wp.float64],
+):
+    """Build ``precond[i] = 1/diag[i]`` for the LiteNSN sparse Schur.
+
+    ``warp.sparse`` stores 1x1-block BSR values as scalar fp64, so
+    :func:`warp.sparse.bsr_get_diag` returns an ``array[wp.float64]``
+    rather than ``array[mat1x1]``.  The zero-guard mirrors the dense
+    :func:`_compute_precond_kernel`.
+    """
+    i = wp.tid()
+    d = diag[i]
     if d == wp.float64(0.0):
         precond[i] = wp.float64(0.0)
     else:
@@ -259,6 +284,159 @@ def _copy_scalar_kernel(
     dst[0] = src[0]
 
 
+@wp.kernel
+def csr_mv_kernel(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    x: wp.array[wp.float64],
+    y: wp.array[wp.float64],
+):
+    """``y = W x`` for a scalar CSR ``W``, one thread per row, summed in column order."""
+    i = wp.tid()
+    acc = wp.float64(0.0)
+    for k in range(offsets[i], offsets[i + 1]):
+        acc += values[k] * x[columns[k]]
+    y[i] = acc
+
+
+@wp.kernel
+def csr_diag_kernel(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    diag: wp.array[wp.float64],
+):
+    """The diagonal of a scalar CSR matrix, zero where a row stores none."""
+    i = wp.tid()
+    d = wp.float64(0.0)
+    for k in range(offsets[i], offsets[i + 1]):
+        if columns[k] == i:
+            d = values[k]
+    diag[i] = d
+
+
+@wp.kernel
+def _fused_pcr_dots_kernel(
+    q: wp.array[wp.float64],
+    precond: wp.array[wp.float64],
+    d: wp.array[wp.float64],
+    diag: wp.array[wp.float64],
+    h: wp.array[wp.float64],
+    partial_den: wp.array[wp.float64],
+    partial_curvature: wp.array[wp.float64],
+    partial_chart: wp.array[wp.float64],
+):
+    """``h = P q`` and the block sums of ``q . h``, ``d . q`` and ``d . diag(A) d``."""
+    b = wp.tid()
+    off = b * _FUSED_BLOCK
+    q_t = wp.tile_load(q, shape=(_FUSED_BLOCK,), offset=(off,))
+    p_t = wp.tile_load(precond, shape=(_FUSED_BLOCK,), offset=(off,))
+    d_t = wp.tile_load(d, shape=(_FUSED_BLOCK,), offset=(off,))
+    g_t = wp.tile_load(diag, shape=(_FUSED_BLOCK,), offset=(off,))
+    h_t = wp.tile_map(wp.mul, p_t, q_t)
+    wp.tile_store(h, h_t, offset=(off,))
+    wp.tile_store(partial_den, wp.tile_sum(wp.tile_map(wp.mul, q_t, h_t)), offset=(b,))
+    wp.tile_store(partial_curvature, wp.tile_sum(wp.tile_map(wp.mul, d_t, q_t)), offset=(b,))
+    dd_t = wp.tile_map(wp.mul, g_t, d_t)
+    wp.tile_store(partial_chart, wp.tile_sum(wp.tile_map(wp.mul, d_t, dd_t)), offset=(b,))
+
+
+@wp.kernel
+def _fused_pcr_step_kernel(
+    partial_den: wp.array[wp.float64],
+    partial_curvature: wp.array[wp.float64],
+    partial_chart: wp.array[wp.float64],
+    rho_buf: wp.array[wp.float64],
+    slot: int,
+    eta: wp.float64,
+    n: int,
+    d: wp.array[wp.float64],
+    q: wp.array[wp.float64],
+    h: wp.array[wp.float64],
+    stopped: wp.array[wp.float64],
+    x: wp.array[wp.float64],
+    r: wp.array[wp.float64],
+    s: wp.array[wp.float64],
+):
+    """The protected step length from the summed blocks, which every block forms alike, and ``x += alpha d``,
+    ``r -= alpha q``, ``s -= alpha h``."""
+    b, lane = wp.tid()
+    den = wp.tile_extract(wp.tile_sum(wp.tile_load(partial_den, shape=(_FUSED_MAX_BLOCKS,))), 0)
+    curvature = wp.tile_extract(wp.tile_sum(wp.tile_load(partial_curvature, shape=(_FUSED_MAX_BLOCKS,))), 0)
+    chart = wp.tile_extract(wp.tile_sum(wp.tile_load(partial_chart, shape=(_FUSED_MAX_BLOCKS,))), 0)
+    stop = stopped[0] != wp.float64(0.0)
+    if not stop:
+        if not (den > wp.float64(0.0) and curvature > eta * chart):
+            stop = True
+    alpha = wp.float64(0.0)
+    if not stop:
+        alpha = rho_buf[slot] / den
+    if stop and b == 0 and lane == 0:
+        stopped[0] = wp.float64(1.0)
+    i = b * _FUSED_BLOCK + lane
+    if i < n:
+        x[i] = x[i] + alpha * d[i]
+        r[i] = r[i] - alpha * q[i]
+        s[i] = s[i] - alpha * h[i]
+
+
+@wp.kernel
+def _fused_pcr_mv_kernel(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    s: wp.array[wp.float64],
+    n: int,
+    h: wp.array[wp.float64],
+    partial_rho: wp.array[wp.float64],
+):
+    """``h = W s`` and the block sums of ``s . h``."""
+    b, lane = wp.tid()
+    i = b * _FUSED_BLOCK + lane
+    y = wp.float64(0.0)
+    si = wp.float64(0.0)
+    if i < n:
+        for k in range(offsets[i], offsets[i + 1]):
+            y += values[k] * s[columns[k]]
+        h[i] = y
+        si = s[i]
+    wp.tile_store(partial_rho, wp.tile_sum(wp.tile(y * si)), offset=(b,))
+
+
+@wp.kernel
+def _fused_pcr_direction_kernel(
+    partial_rho: wp.array[wp.float64],
+    rho_buf: wp.array[wp.float64],
+    slot: int,
+    n: int,
+    s: wp.array[wp.float64],
+    h: wp.array[wp.float64],
+    d: wp.array[wp.float64],
+    q: wp.array[wp.float64],
+):
+    """``beta = rho_new / rho`` from the summed blocks, ``d = beta d + s`` and ``q = beta q + h``; the first thread
+    keeps ``rho_new`` in the other slot."""
+    b, lane = wp.tid()
+    rho_new = wp.tile_extract(wp.tile_sum(wp.tile_load(partial_rho, shape=(_FUSED_MAX_BLOCKS,))), 0)
+    rho = rho_buf[slot]
+    beta = wp.float64(0.0)
+    if rho != wp.float64(0.0):
+        beta = rho_new / rho
+    i = b * _FUSED_BLOCK + lane
+    if i < n:
+        d[i] = beta * d[i] + s[i]
+        q[i] = beta * q[i] + h[i]
+    if b == 0 and lane == 0:
+        rho_buf[1 - slot] = rho_new
+
+
+def csr_mv(W, x: wp.array, y: wp.array) -> None:
+    """``y = W x`` for a scalar sparse matrix of ``warp.sparse``, read as CSR, through :func:`csr_mv_kernel`."""
+    inputs = [W.offsets, W.columns, W.values, x]
+    wp.launch(csr_mv_kernel, dim=int(W.nrow), inputs=inputs, outputs=[y], device=x.device)
+
+
 # ---------------------------------------------------------------------------
 # Solver class
 # ---------------------------------------------------------------------------
@@ -271,8 +449,10 @@ class NSNPCRSolver:
     ``P^1/2 A P^1/2``, with the step denominator ``(A p)ᵀ P (A p)``, which stays
     a Krylov method when the diagonal of ``A`` spans decades. It refuses
     near-null directions, so a singular ``A`` with an inconsistent right-hand
-    side returns a bounded least-squares iterate. Used as the inner linear
-    solver for the NSN Schur LCP system.
+    side returns a bounded least-squares iterate. :meth:`solve_sparse` runs the
+    same iteration on a sparse matrix, and :meth:`solve_sparse_fused` runs a
+    fixed count of its iterations in four launches each. Used as the inner
+    linear solver for the NSN Schur LCP system.
 
     The solver is *stateless* between ``solve`` calls: every call starts from
     ``x = 0``. Device buffers are pre-allocated for ``max_n`` so repeated calls
@@ -282,8 +462,8 @@ class NSNPCRSolver:
         max_n: Maximum system dimension the solver will handle. Internal
             buffers are sized to this.
         device: Warp device for buffer allocation (typically ``"cuda:0"``).
-        tol: Relative tolerance: :meth:`solve` stops once
-            ``|b - A x| < tol |b|``.
+        tol: Relative tolerance: :meth:`solve` and :meth:`solve_sparse` stop
+            once ``|b - A x| < tol |b|``.
         max_iter: Outer-loop cap. Effective limit is ``min(max_iter, n)``.
         check_every: Convergence-check batching factor.  PCR runs this many
             iterations on the device between two host reads of the residual
@@ -325,6 +505,8 @@ class NSNPCRSolver:
         self._h = wp.zeros(self.max_n, dtype=wp.float64, device=device)
         self._s = wp.zeros(self.max_n, dtype=wp.float64, device=device)
         self._precond = wp.zeros(self.max_n, dtype=wp.float64, device=device)
+        # Diagonal of the sparse matrix of :meth:`solve_sparse`.
+        self._diag = wp.zeros(self.max_n, dtype=wp.float64, device=device)
 
         # Device-resident scalars for ``rho``, ``rho_old``, ``den``, ``alpha``,
         # ``beta``: keep the per-iter PCR coefficients on device so the inner
@@ -341,6 +523,9 @@ class NSNPCRSolver:
         self._chart_norm_d = wp.zeros(1, dtype=wp.float64, device=device)
         self._stopped_d = wp.zeros(1, dtype=wp.float64, device=device)
         self._r_norm_d = wp.zeros(1, dtype=wp.float64, device=device)
+        # Block sums of the fused sparse iteration of :meth:`solve_sparse_fused` and its double-buffered ``rho``.
+        self._fused_partials = wp.zeros((4, _FUSED_MAX_BLOCKS), dtype=wp.float64, device=device)
+        self._fused_rho = wp.zeros(2, dtype=wp.float64, device=device)
 
         # Cache one ``wp.Graph`` per active ``n`` shape so repeated
         # solves at the same shape replay a pre-recorded CUDA graph for the
@@ -479,6 +664,157 @@ class NSNPCRSolver:
 
         return (nb_iter, rho)
 
+    def solve_sparse(
+        self,
+        W_bsr,
+        b: wp.array[wp.float64],
+        x_out: wp.array[wp.float64],
+    ) -> int:
+        """LiteNSN sparse-Schur PCR: ``W_bsr @ x = b`` for a BSR ``W`` with
+        ``1x1`` blocks.
+
+        Matches :meth:`solve` numerically: same termination criterion, same
+        Jacobi preconditioner, same ``check_every`` host-sync cadence, but
+        replaces the dense tiled matvec with :func:`warp.sparse.bsr_mv`. The
+        sparse lite NSN takes it through :meth:`solve_sparse_fused` for runs
+        that check the residual.
+
+        The residual is first checked after ``check_every`` iterations. When all
+        ``max_iter`` iterations fit before it, the tolerance cannot end the run
+        early, and they run without reading the device: a zero ``b`` then leaves
+        ``x = 0`` through the protected step.
+
+        Args:
+            W_bsr: ``BsrMatrix`` of block shape ``(1, 1)`` and scalar type
+                ``wp.float64``, such as the Newton matrix of the sparse lite NSN.
+            b: ``(n,)`` RHS, fp64.
+            x_out: ``(n,)`` output, fp64.
+
+        Returns:
+            The iterations taken.
+
+        Raises:
+            ValueError: when shapes are inconsistent.
+        """
+        import warp.sparse as wps  # noqa: PLC0415
+
+        n = int(b.shape[0])
+        if n <= 0:
+            raise ValueError(f"system size must be positive, got n={n}")
+        if n > self.max_n:
+            raise ValueError(f"system size n={n} exceeds preallocated max_n={self.max_n}")
+        if int(W_bsr.shape[0]) != n or int(W_bsr.shape[1]) != n:
+            raise ValueError(f"W_bsr shape {tuple(W_bsr.shape)} incompatible with b shape ({n},)")
+        if x_out.shape[0] != n:
+            raise ValueError(f"x_out shape ({x_out.shape[0]},) incompatible with b shape ({n},)")
+
+        device = self.device
+        max_iter = min(self.max_iter, n)
+        unchecked = max_iter <= self.check_every
+
+        # ----- x = 0 ----------------------------------------------------
+        self._x.zero_()
+
+        # ----- Early exit if b == 0 -------------------------------------
+        if not unchecked:
+            dot_b = float(wp.utils.array_inner(b, b, count=n))
+            if dot_b == 0.0:
+                wp.copy(x_out, self._x, count=n)
+                return 0
+
+        # ----- Build Jacobi preconditioner from W's diagonal ------------
+        diag_blocks = wps.bsr_get_diag(W_bsr, out=self._diag)
+        wp.launch(
+            _precond_from_bsr_diag_kernel,
+            dim=n,
+            inputs=[diag_blocks],
+            outputs=[self._precond],
+            device=device,
+        )
+
+        # ----- Symmetric PCR, as in :meth:`solve` -------------------------
+        # ``wps.bsr_mv`` checks that x.shape[0] == W.cols, so the scratch
+        # buffers (sized to max_n) are sliced to the active size ``n``.
+        wp.copy(self._r, b, count=n)
+        wp.launch(_apply_precond_kernel, dim=n, inputs=[self._r, self._precond], outputs=[self._s], device=device)
+        wp.copy(self._d, self._s, count=n)
+        wps.bsr_mv(W_bsr, self._d[:n], self._q[:n])
+        wp.utils.array_inner(self._s, self._q, out=self._rho_d, count=n)
+        self._stopped_d.zero_()
+        if unchecked:
+            for _ in range(max_iter):
+                self._pcr_iter_eager(None, n, n, device, W_bsr=W_bsr, diag=diag_blocks)
+            wp.copy(x_out, self._x, count=n)
+            return max_iter
+        tol_sq = self.tol * self.tol * dot_b
+        r_norm_sq = dot_b
+        # The checked iterations read the residual norm from the device, so
+        # they run eagerly; ``check_every`` bounds the host round trips.
+        nb_iter = 0
+        while nb_iter < max_iter and r_norm_sq > tol_sq:
+            block_end = min(nb_iter + self.check_every, max_iter)
+            while nb_iter < block_end:
+                self._pcr_iter_eager(None, n, n, device, W_bsr=W_bsr, diag=diag_blocks)
+                nb_iter += 1
+            wp.utils.array_inner(self._r, self._r, out=self._r_norm_d, count=n)
+            r_norm_sq = float(self._r_norm_d.numpy()[0])
+            if self._stopped_d.numpy()[0] != 0.0:
+                break
+        wp.copy(x_out, self._x, count=n)
+        return nb_iter
+
+    def solve_sparse_fused(self, W_bsr, b: wp.array[wp.float64], x_out: wp.array[wp.float64]) -> int:
+        """:meth:`solve_sparse` for a fixed iteration count, in four launches per iteration that read nothing from
+        the device.
+
+        The scalars of an iteration reduce in blocks of rows, and every block sums the blocks' partial sums
+        alike, so that the run is deterministic; the matrix products run one thread per row in column order. Sums
+        run in another order than :meth:`solve_sparse`'s, so results differ by rounding. Runs that
+        :meth:`solve_sparse` checks for convergence, systems of more than 262144 rows, and solves off CUDA take
+        :meth:`solve_sparse`.
+
+        Args:
+            W_bsr: Scalar ``BsrMatrix`` with its columns in order in each row.
+            b: ``(n,)`` RHS, fp64.
+            x_out: ``(n,)`` output, fp64.
+
+        Returns:
+            The iterations taken.
+        """
+        n = int(b.shape[0])
+        nb = (n + _FUSED_BLOCK - 1) // _FUSED_BLOCK
+        max_iter = min(self.max_iter, n)
+        device = self.device
+        if max_iter > self.check_every or nb > _FUSED_MAX_BLOCKS or not wp.get_device(device).is_cuda:
+            return self.solve_sparse(W_bsr, b, x_out)
+        if n <= 0 or n > self.max_n:
+            raise ValueError(f"system size n={n} outside 1..{self.max_n}")
+        pden, pcurv, pchart, prho = (self._fused_partials[k][:nb] for k in range(4))
+        x, r, s, d, q, h = (a[:n] for a in (self._x, self._r, self._s, self._d, self._q, self._h))
+        precond, diag = self._precond[:n], self._diag[:n]
+        matrix = [W_bsr.offsets, W_bsr.columns, W_bsr.values]
+        x.zero_()
+        wp.launch(csr_diag_kernel, n, matrix, [diag], device=device)
+        wp.launch(_precond_from_bsr_diag_kernel, n, [diag], [precond], device=device)
+        wp.copy(r, b, count=n)
+        wp.launch(_apply_precond_kernel, n, [r, precond], [s], device=device)
+        wp.copy(d, s, count=n)
+        wp.launch(csr_mv_kernel, n, [*matrix, d], [q], device=device)
+        wp.utils.array_inner(s, q, out=self._fused_rho[0:1], count=n)
+        self._stopped_d.zero_()
+        for k in range(max_iter):
+            slot = k % 2
+            inputs = [q, precond, d, diag, h, pden, pcurv, pchart]
+            wp.launch_tiled(_fused_pcr_dots_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
+            inputs = [pden, pcurv, pchart, self._fused_rho, slot, self._eta, n, d, q, h, self._stopped_d, x, r, s]
+            wp.launch_tiled(_fused_pcr_step_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
+            inputs = [*matrix, s, n, h, prho]
+            wp.launch_tiled(_fused_pcr_mv_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
+            inputs = [prho, self._fused_rho, slot, n, s, h, d, q]
+            wp.launch_tiled(_fused_pcr_direction_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
+        wp.copy(x_out, x, count=n)
+        return max_iter
+
     # ------------------------------------------------------------------
     # Per-iter body + graph capture
     # ------------------------------------------------------------------
@@ -489,17 +825,25 @@ class NSNPCRSolver:
         n: int,
         n_pad: int,
         device: wp.Device | str,
+        W_bsr=None,
+        diag: wp.array[wp.float64] | None = None,
     ) -> None:
         """Issue one symmetric PCR iteration of :meth:`solve` on the active stream.
 
         All launches are stream-ordered and safe to call inside a CUDA graph
         capture.
+
+        With ``W_bsr`` and its ``diag``, the iteration of :meth:`solve_sparse`
+        multiplies by the sparse matrix instead of ``A``.
         """
         # t = P q, den = qᵀ P q.
         wp.launch(_apply_precond_kernel, dim=n, inputs=[self._q, self._precond], outputs=[self._h], device=device)
         wp.utils.array_inner(self._q, self._h, out=self._den_d, count=n)
         # Chart curvature of p: pᵀ A p against pᵀ diag(A) p.
-        wp.launch(_diag_scale_kernel, dim=n, inputs=[A, self._d], outputs=[self._dd], device=device)
+        if W_bsr is None:
+            wp.launch(_diag_scale_kernel, dim=n, inputs=[A, self._d], outputs=[self._dd], device=device)
+        else:
+            wp.launch(_apply_precond_kernel, dim=n, inputs=[self._d, diag], outputs=[self._dd], device=device)
         wp.utils.array_inner(self._d, self._q, out=self._curvature_d, count=n)
         wp.utils.array_inner(self._d, self._dd, out=self._chart_norm_d, count=n)
         wp.launch(
@@ -519,14 +863,19 @@ class NSNPCRSolver:
                 device=device,
             )
         # t = A z, rho = zᵀ A z, beta = rho / rho_old.
-        wp.launch_tiled(
-            _matvec_tiled_kernel,
-            dim=n,
-            inputs=[A, self._s, n_pad],
-            outputs=[self._h],
-            block_dim=_PCR_BLOCK_DIM,
-            device=device,
-        )
+        if W_bsr is None:
+            wp.launch_tiled(
+                _matvec_tiled_kernel,
+                dim=n,
+                inputs=[A, self._s, n_pad],
+                outputs=[self._h],
+                block_dim=_PCR_BLOCK_DIM,
+                device=device,
+            )
+        else:
+            import warp.sparse as wps  # noqa: PLC0415
+
+            wps.bsr_mv(W_bsr, self._s[:n], self._h[:n])
         wp.launch(_copy_scalar_kernel, dim=1, inputs=[self._rho_d], outputs=[self._rho_old_d], device=device)
         wp.utils.array_inner(self._s, self._h, out=self._rho_d, count=n)
         wp.launch(
