@@ -41,7 +41,7 @@ method details. For symptom-driven diagnosis and parameter tuning, start with
 Choosing a Solver
 -----------------
 
-MuJoCo, Kamino, and VBD currently have dedicated backend guides:
+MuJoCo, Kamino, VBD, and FBA currently have dedicated backend guides:
 
 - :doc:`MuJoCo <mujoco>` — generalized-coordinate rigid-body simulation and
   MuJoCo or MJCF workflows.
@@ -49,6 +49,7 @@ MuJoCo, Kamino, and VBD currently have dedicated backend guides:
   and hard frictional contacts; experimental.
 - :doc:`VBD <vbd>` — unified simulation of cloth, soft bodies, and rigid
   bodies in a single VBD-based solver; experimental.
+- :doc:`FBA <fba>`: projective dynamics for stiff cloth; experimental.
 
 The other solver backends are documented through their linked API references
 and the comparison tables below.
@@ -81,6 +82,14 @@ Supported Features
      - Cloth
      - Soft bodies
      - Differentiable
+   * - :class:`~newton.solvers.SolverFBA`
+     - Implicit
+     - ❌
+     - ❌
+     - 🟨 no collisions
+     - 🟨 no collisions
+     - ❌
+     - ❌
    * - :class:`~newton.solvers.SolverFeatherstone`
      - Semi-implicit
      - ✅
@@ -169,6 +178,10 @@ Supported Features
 .. experimental::
     :class:`~newton.solvers.SolverVBD`'s public API and behavior may change without prior notice.
 
+.. experimental::
+    :class:`~newton.solvers.SolverFBA`'s public API and behavior may change without prior notice.
+    It simulates cloth in models with one world and no rigid bodies, and solves no contacts.
+
 .. _Contact material support:
 
 Contact Material Support
@@ -223,7 +236,8 @@ The maximal-coordinate solvers (:class:`~newton.solvers.SolverSemiImplicit`,
 enforce joints as pairwise body constraints but do not use the articulation kinematic-tree structure.
 :class:`~newton.solvers.SolverVBD` supports a subset of joint types through maximal-coordinate
 constraints, with unified compliant ALM by default and a deprecated legacy AVBD path.
-:class:`~newton.solvers.SolverStyle3D` and :class:`~newton.solvers.SolverImplicitMPM` do not support joints.
+:class:`~newton.solvers.SolverStyle3D`, :class:`~newton.solvers.SolverImplicitMPM`, and
+:class:`~newton.solvers.SolverFBA` do not support joints.
 
 **Joint types**
 

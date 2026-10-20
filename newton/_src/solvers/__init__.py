@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from . import mujoco, style3d
+    from .fba import SolverFBA
     from .featherstone import SolverFeatherstone
     from .implicit_mpm import SolverImplicitMPM
     from .kamino import SolverKamino
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "SolverBase",
+    "SolverFBA",
     "SolverFeatherstone",
     "SolverImplicitMPM",
     "SolverKamino",
@@ -38,6 +40,7 @@ __all__ = [
 # not pay the import cost of every solver backend.
 _LAZY_IMPORTS: dict[str, tuple[str, str | None]] = {
     "SolverBase": (".solver", "SolverBase"),
+    "SolverFBA": (".fba", "SolverFBA"),
     "SolverFeatherstone": (".featherstone", "SolverFeatherstone"),
     "SolverImplicitMPM": (".implicit_mpm", "SolverImplicitMPM"),
     "SolverKamino": (".kamino", "SolverKamino"),
