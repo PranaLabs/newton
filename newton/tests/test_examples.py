@@ -919,13 +919,6 @@ add_example_test(
 )
 add_example_test(
     TestClothExamples,
-    name="cloth.example_cloth_on_sphere_fba",
-    devices=cuda_test_devices,
-    test_options={"num-frames": 300},
-    use_viewer=True,
-)
-add_example_test(
-    TestClothExamples,
     name="cloth.example_stretching_cloth_fba",
     devices=cuda_test_devices,
     test_options={"num-frames": 300},

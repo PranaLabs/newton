@@ -28,8 +28,9 @@ held by other objects:
 
 - With the default contact operator, contacts do not penetrate and need no
   contact stiffness: each contact supplies the force that keeps its gap
-  closed, within its friction cone, so a 1000 kg sheet rests on a sphere and
-  a soft ball hangs between two fingertip pads by friction alone.
+  closed, within its friction cone, so cloth rests on stacked boxes and on
+  notched blades, and a soft ball hangs between two fingertip pads by
+  friction alone.
 - Stiff materials step stably at large time steps. The examples step at
   ``dt = 0.01`` s, including a Neo-Hookean bar with a Young's modulus of
   ``1e9`` Pa.
@@ -177,8 +178,6 @@ Examples
 
 - ``cloth_hanging_fba``, ``hanging_cloth_fba``, ``hanging_cloth_fba_cm``,
   ``stretching_cloth_fba``: cloth pinned at corners or edges.
-- ``cloth_on_sphere_fba``: a sheet draped over a sphere, with
-  ``--schur-mode lite`` for the lite operator.
 - ``cloth_on_boxes_fba``, ``cloth_on_knives_fba``: cloth on rigid bodies
   with joints, and on notched blades with face contacts.
 - ``softbody_hanging_fba``, ``twisting_bar_fba``, ``squeezing_ball_fba``:
