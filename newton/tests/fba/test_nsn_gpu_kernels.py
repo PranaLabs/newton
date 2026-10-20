@@ -8,7 +8,9 @@ Verifies
 :func:`~newton._src.solvers.fba.kernels.fb_frictional_row_wp`,
 :func:`~newton._src.solvers.fba.kernels.build_a_schur_kernel` and
 :func:`~newton._src.solvers.fba.kernels.coulomb_box_clamp_kernel` against
-their CPU numpy/Python references.
+their CPU numpy/Python references, and
+:func:`~newton._src.solvers.fba.kernels.fb_newton_lite_coulomb_kernel`
+against the host NSN step with the lite mass operator.
 """
 
 import unittest
@@ -17,7 +19,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.fba import kernels as K
-from newton.tests.fba._reference import coulomb_box_clamp, fb_frictional_row, fb_unilateral_row
+from newton.tests.fba._reference import coulomb_box_clamp, fb_frictional_row, fb_unilateral_row, solve_nsn_coulomb
 
 
 @wp.kernel
@@ -251,6 +253,147 @@ class TestCoulombBoxClampKernel(unittest.TestCase):
         np.testing.assert_array_equal(
             expected.reshape(4, 3), [[2.0, 0.5, -0.3], [2.0, 1.0, -1.0], [0.0, 0.0, 0.0], [-1.5, 0.0, 0.0]]
         )
+
+
+class TestLiteCoulombKernel(unittest.TestCase):
+    """The per-contact lite FB-Newton kernel against the host NSN step."""
+
+    def test_lite_kernel_keeps_friction_in_the_cone(self):
+        """Take one warm-started lite Newton step that matches the host NSN step and leaves every tangent multiplier
+        within the friction cone of its normal multiplier.
+
+        The warm start is what the solver's local-global iterations pass on; from it the Newton step pushes the
+        tangent multipliers of nearly separating contacts far outside the cone, which the clamp brings back.
+        """
+        rng = np.random.default_rng(0)
+        M, dt = 16, 0.01
+        normal = rng.normal(size=(M, 3))
+        normal /= np.linalg.norm(normal, axis=1, keepdims=True)
+        helper = np.where(np.abs(normal[:, :1]) < 0.9, [[1.0, 0.0, 0.0]], [[0.0, 1.0, 0.0]])
+        t1 = np.cross(normal, helper)
+        t1 /= np.linalg.norm(t1, axis=1, keepdims=True)
+        t2 = np.cross(normal, t1)
+        inv_mass = rng.uniform(0.5, 2.0, M)
+        mu = rng.uniform(0.1, 0.8, M)
+        r = rng.normal(scale=1.0e-3, size=3 * M)
+        pene0 = rng.normal(scale=1.0e-3, size=3 * M)
+        lam0 = rng.normal(scale=10.0, size=3 * M)
+        lam0[0::3] = np.abs(lam0[0::3])
+        omega0 = rng.uniform(0.2, 1.0, 3 * M)
+        # Each contact's block of the lite operator is dt^2 / m times the identity of its orthonormal frame.
+        W = np.kron(np.diag(dt * dt * inv_mass), np.eye(3))
+        lam_ref, omega_ref, lam_apply_ref = solve_nsn_coulomb(
+            W, r, mu, pene0, max_iters=1, lam_init=lam0, omega_init=omega0, dt=dt
+        )
+
+        def vec3(a):
+            return wp.array(a.astype(np.float32), dtype=wp.vec3)
+
+        lam = wp.array(lam0, dtype=wp.float64)
+        omega = wp.array(omega0, dtype=wp.float64)
+        lam_apply = wp.zeros(3 * M, dtype=wp.float64)
+        wp.launch(
+            K.fb_newton_lite_coulomb_kernel,
+            dim=M,
+            inputs=[
+                wp.array(np.arange(M, dtype=np.int32), dtype=wp.int32),
+                vec3(normal),
+                vec3(t1),
+                vec3(t2),
+                wp.array(np.ones(M, dtype=np.float32), dtype=wp.float32),
+                wp.array(mu, dtype=wp.float64),
+                wp.array(r, dtype=wp.float64),
+                wp.array(pene0, dtype=wp.float64),
+                wp.array(inv_mass, dtype=wp.float64),
+                wp.float64(dt),
+                wp.float64(0.0),
+                wp.int32(0),
+            ],
+            outputs=[lam, omega, lam_apply],
+        )
+        lam = lam.numpy()
+        cone = mu * np.abs(lam[0::3]) * (1.0 + 1.0e-12)
+        self.assertTrue((np.abs(lam[1::3]) <= cone).all() and (np.abs(lam[2::3]) <= cone).all())
+        # The kernel takes float32 directions; the multipliers still agree to rounding.
+        np.testing.assert_allclose(lam, lam_ref, rtol=0.0, atol=1.0e-6 * np.abs(lam_ref).max())
+        np.testing.assert_allclose(omega.numpy(), omega_ref, rtol=0.0, atol=1.0e-6)
+        np.testing.assert_allclose(
+            lam_apply.numpy(), lam_apply_ref, rtol=0.0, atol=1.0e-6 * np.abs(lam_apply_ref).max()
+        )
+
+    def test_per_particle_kernel_matches_the_host_step(self):
+        """Take one warm-started lite Newton step on particles with one, two and four contacts, as the host NSN step
+        does on the block-diagonal lite operator, with no force cap and with one that halves the largest normal
+        multiplier.
+
+        The warm start lies within the friction cones, as the local-global iterations pass it on, and makes two
+        contacts slide on each of the particles with two and four contacts, so the cap shrinks cones that bound their
+        tangent multipliers.
+        """
+        rng = np.random.default_rng(0)
+        dt = 0.01
+        contact_particle = np.array([0, 1, 1, 2, 2, 2, 2])
+        M, N = contact_particle.size, 3
+        normal = rng.normal(size=(M, 3))
+        normal /= np.linalg.norm(normal, axis=1, keepdims=True)
+        helper = np.where(np.abs(normal[:, :1]) < 0.9, [[1.0, 0.0, 0.0]], [[0.0, 1.0, 0.0]])
+        t1 = np.cross(normal, helper)
+        t1 /= np.linalg.norm(t1, axis=1, keepdims=True)
+        t2 = np.cross(normal, t1)
+        # Rows interleave [n, t1, t2] per contact; the kernel reads float32 directions.
+        row_dir = np.stack([normal, t1, t2], axis=1).reshape(-1, 3).astype(np.float32)
+        row_particle = np.repeat(contact_particle, 3).astype(np.int32)
+        inv_mass = rng.uniform(0.5, 2.0, N)
+        mu = rng.uniform(0.1, 0.8, M)
+        r = rng.normal(scale=1.0e-3, size=3 * M)
+        pene0 = rng.normal(scale=1.0e-3, size=3 * M)
+        lam0 = rng.normal(scale=1.0e5, size=3 * M)
+        lam0[0::3] = np.abs(lam0[0::3])
+        coulomb_box_clamp(lam0, mu)
+        omega0 = rng.uniform(0.2, 1.0, 3 * M)
+        # The lite operator couples the rows of a particle by the products of their directions.
+        d = row_dir.astype(np.float64)
+        same = row_particle[:, None] == row_particle[None, :]
+        W = np.where(same, (d @ d.T) * (dt * dt * inv_mass[row_particle])[:, None], 0.0)
+        offsets = np.concatenate([[0], np.cumsum(np.bincount(row_particle, minlength=N))]).astype(np.int32)
+        lam_free = solve_nsn_coulomb(W, r, mu, pene0, max_iters=1, lam_init=lam0, omega_init=omega0, dt=dt)[0]
+        for lambda_cap in (None, 0.5 * lam_free[0::3].max() * dt * dt):
+            with self.subTest(lambda_cap=lambda_cap):
+                lam_ref, omega_ref, lam_apply_ref = solve_nsn_coulomb(
+                    W, r, mu, pene0, max_iters=1, lam_init=lam0, omega_init=omega0, dt=dt, lambda_cap=lambda_cap
+                )
+                lam = wp.array(lam0, dtype=wp.float64)
+                omega = wp.array(omega0, dtype=wp.float64)
+                lam_apply = wp.zeros(3 * M, dtype=wp.float64)
+                wp.launch(
+                    K.fb_newton_lite_coulomb_per_particle_kernel,
+                    dim=N,
+                    inputs=[
+                        wp.array(np.arange(N, dtype=np.int32), dtype=wp.int32),
+                        wp.array(offsets, dtype=wp.int32),
+                        wp.array(np.argsort(row_particle, kind="stable").astype(np.int32), dtype=wp.int32),
+                        wp.array(row_particle, dtype=wp.int32),
+                        wp.array(row_dir, dtype=wp.vec3),
+                        wp.array(np.ones(3 * M, dtype=np.float32), dtype=wp.float32),
+                        wp.array(mu, dtype=wp.float64),
+                        wp.array(r, dtype=wp.float64),
+                        wp.array(pene0, dtype=wp.float64),
+                        wp.array(inv_mass, dtype=wp.float64),
+                        wp.float64(dt),
+                        wp.float64(0.0 if lambda_cap is None else lambda_cap / (dt * dt)),
+                        wp.int32(lambda_cap is not None),
+                    ],
+                    outputs=[lam, omega, lam_apply],
+                )
+                lam = lam.numpy()
+                cone = mu * np.maximum(lam[0::3], 0.0) * (1.0 + 1.0e-12)
+                self.assertTrue((np.abs(lam[1::3]) <= cone).all() and (np.abs(lam[2::3]) <= cone).all())
+                # Float32 directions again: the multipliers agree to rounding.
+                np.testing.assert_allclose(lam, lam_ref, rtol=0.0, atol=1.0e-6 * np.abs(lam_ref).max())
+                np.testing.assert_allclose(omega.numpy(), omega_ref, rtol=0.0, atol=1.0e-6)
+                np.testing.assert_allclose(
+                    lam_apply.numpy(), lam_apply_ref, rtol=0.0, atol=1.0e-6 * np.abs(lam_apply_ref).max()
+                )
 
 
 if __name__ == "__main__":

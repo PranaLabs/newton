@@ -1744,6 +1744,47 @@ def compose_W_from_wi_kernel(
 
 
 @wp.kernel
+def compose_W_lite_kernel(
+    contact_particle: wp.array[wp.int32],
+    contact_dir: wp.array[wp.vec3],
+    contact_alpha: wp.array[wp.float32],
+    inv_mass: wp.array[wp.float64],
+    dt2: wp.float64,
+    W: wp.array2d[wp.float64],
+):
+    """Assemble the LiteNSN dense Schur ``W_lite = H · (dt²·M⁻¹) · Hᵀ``.
+
+    LiteNSN replaces the full ``A⁻¹`` in :func:`compose_W_from_wi_kernel`'s
+    :math:`(J A^{-1} J^T)[c', c]` formula with the diagonal mass-inverse
+    approximation :math:`dt² · inv_m[p] · I_3`, so off-particle entries
+    collapse to zero:
+
+        W_lite[c', c] = alpha[c'] · alpha[c] · (dir[c'] · dir[c])
+                         · dt² · inv_m[particle[c]]      if particle[c'] == particle[c]
+                       = 0                               otherwise
+
+    The NSN inner solve consumes it through the dense-PCR path.
+
+    Pinned particles (``inv_mass == 0``) zero their entire row+column block,
+    matching the full-NSN behavior where ``A`` has an infinite mass on those
+    rows.
+
+    One thread per ``(c', c)`` pair.  ``W`` may be a larger pre-allocated buffer
+    sliced to the active ``(total_rows, total_rows)`` block; entries outside
+    the launch domain are not touched.
+    """
+    cp, c = wp.tid()
+    p_cp = contact_particle[cp]
+    p_c = contact_particle[c]
+    if p_cp != p_c:
+        W[cp, c] = wp.float64(0.0)
+        return
+    alpha = wp.float64(contact_alpha[cp]) * wp.float64(contact_alpha[c])
+    dot = wp.float64(wp.dot(contact_dir[cp], contact_dir[c]))
+    W[cp, c] = alpha * dot * dt2 * inv_mass[p_c]
+
+
+@wp.kernel
 def gather_jt_lambda_kernel(
     row_offsets: wp.array[wp.int32],  # (N + 1,) CSR offsets into row_indices
     row_indices: wp.array[wp.int32],  # (total_rows,) contact rows incident to each particle
@@ -2275,6 +2316,513 @@ def contact_mu_kernel(
         mu[c] = wp.float64(shape_material_mu[s])
     else:
         mu[c] = particle_mu
+
+
+@wp.kernel
+def lite_row_dirs_kernel(
+    normal: wp.array[wp.vec3],  # (M,)
+    tangent1: wp.array[wp.vec3],  # (M,), unused with one row per contact
+    tangent2: wp.array[wp.vec3],
+    rows_per_contact: int,
+    # output
+    row_dir: wp.array[wp.vec3],  # (rows_per_contact M,)
+):
+    """Directions of the lite rows: the normal and tangents of each contact."""
+    r = wp.tid()
+    if r % rows_per_contact == 0:
+        row_dir[r] = normal[r // rows_per_contact]
+    elif r % rows_per_contact == 1:
+        row_dir[r] = tangent1[r // rows_per_contact]
+    else:
+        row_dir[r] = tangent2[r // rows_per_contact]
+
+
+@wp.kernel
+def fb_newton_lite_coulomb_kernel(
+    # ---- contact metadata (M entries each) ----
+    contact_particle: wp.array[wp.int32],  # (M,)
+    contact_normal: wp.array[wp.vec3],  # (M,)
+    contact_tangent1: wp.array[wp.vec3],  # (M,)
+    contact_tangent2: wp.array[wp.vec3],  # (M,)
+    contact_alpha: wp.array[wp.float32],  # (M,)
+    contact_mu: wp.array[wp.float64],  # (M,)
+    # ---- per-row inputs (3M entries each) ----
+    r: wp.array[wp.float64],  # (3M,)
+    pene0: wp.array[wp.float64],  # (3M,)
+    # ---- global state ----
+    inv_mass: wp.array[wp.float64],  # (N,)
+    dt: wp.float64,
+    cap_internal: wp.float64,  # lambda_cap / dt² (or sentinel; see caller)
+    use_cap: wp.int32,  # 1 = clip, 0 = no-op
+    # ---- inout / outputs ----
+    lam: wp.array[wp.float64],  # (3M,) inout
+    omega: wp.array[wp.float64],  # (3M,) inout: warm-started on entry, written on exit
+    lam_apply: wp.array[wp.float64],  # (3M,) output: dt² · ω · λ_final
+):
+    """Fused per-contact FB-Newton step for LiteNSN with Coulomb friction.
+
+    Under the lite approximation ``W = H · (dt²·M⁻¹) · Hᵀ``, contacts that touch
+    distinct particles decouple completely.  For cloth on a sphere (and all
+    scenes where each cloth particle touches at most one shape), every
+    particle is touched by exactly one contact, so the
+    ``3M x 3M`` Schur system block-diagonalises into ``M`` independent ``3x3``
+    blocks.  Each thread of this kernel processes one contact end-to-end:
+
+    1. Build the local ``3x3`` ``W`` block from ``alpha``, ``dir``, and ``dt² · inv_m``.
+    2. Compute the local penetration ``-r + dt² · W · (ω·λ)``.
+    3. Evaluate the FB rows (normal + 2 tangents) to refresh ``(ω, c, h)``.
+    4. Build ``A_schur = ωωᵀ ⊙ W + diag(c)`` and ``rhs = (1/dt²)·(h - ω · J_x)``.
+    5. Invert the ``3x3`` ``A_schur`` and apply ``dλ``.
+    6. Optional symmetric ``lambda_cap``, then the Coulomb clamp.
+    7. Write ``lam_apply = dt² · ω · λ`` for the correction step.
+
+    Memory cost: ``O(M)`` (no Schur matrix materialised).  Scales linearly
+    with contact count.
+
+    Args:
+        contact_particle, contact_normal, contact_tangent1, contact_tangent2,
+        contact_alpha, contact_mu: Per-contact arrays of length ``M``.
+        r, pene0: Per-row arrays of length ``3M`` (rows interleaved ``[n, t1, t2]``).
+        inv_mass: Per-particle inverse mass, length ``N``.
+        dt: Timestep.
+        cap_internal: ``lambda_cap / dt²`` (in solver-internal units); only
+            applied when ``use_cap == 1``.
+        use_cap: ``1`` to enable the symmetric ``[-cap, +cap]`` clip,
+            ``0`` to disable.
+        lam: Per-row lambda buffer, length ``3M``.  Warm-started on entry,
+            updated on exit.
+        omega: Per-row FB weight buffer, length ``3M``.  Warm-started on entry,
+            overwritten with the FB-loop's final value on exit.
+        lam_apply: Output per-row impulse to apply to ``x_cur``, length ``3M``.
+    """
+    c = wp.tid()
+    p = contact_particle[c]
+    inv_m = inv_mass[p]
+    dt2 = dt * dt
+
+    # Per-row indices.
+    i_n = 3 * c
+    i_t1 = 3 * c + 1
+    i_t2 = 3 * c + 2
+
+    # Direction vectors (fp64-promoted dots for accumulation).
+    n_d = contact_normal[c]
+    t1_d = contact_tangent1[c]
+    t2_d = contact_tangent2[c]
+
+    # Local W_3x3 = α² · dot(dir_a, dir_b) · dt² · inv_m.
+    # ``alpha`` is the same for all three rows of a contact (set by the host build).
+    a_n = wp.float64(contact_alpha[c])
+    coef = a_n * a_n * dt2 * inv_m
+    W_nn = coef * wp.float64(wp.dot(n_d, n_d))
+    W_nt1 = coef * wp.float64(wp.dot(n_d, t1_d))
+    W_nt2 = coef * wp.float64(wp.dot(n_d, t2_d))
+    W_t1t1 = coef * wp.float64(wp.dot(t1_d, t1_d))
+    W_t1t2 = coef * wp.float64(wp.dot(t1_d, t2_d))
+    W_t2t2 = coef * wp.float64(wp.dot(t2_d, t2_d))
+
+    # Precond (matches compute_precond_coulomb_kernel: dt² for normal, dt for tangent).
+    eps = wp.float64(1.0e-12)
+    w_n_a = wp.abs(W_nn)
+    w_t1_a = wp.abs(W_t1t1)
+    w_t2_a = wp.abs(W_t2t2)
+    if w_n_a < eps:
+        w_n_a = eps
+    if w_t1_a < eps:
+        w_t1_a = eps
+    if w_t2_a < eps:
+        w_t2_a = eps
+    precond_n = dt2 * w_n_a
+    precond_t1 = dt * w_t1_a
+    precond_t2 = dt * w_t2_a
+
+    # Per-row state at entry.
+    lam_n = lam[i_n]
+    lam_t1 = lam[i_t1]
+    lam_t2 = lam[i_t2]
+    om_n = omega[i_n]
+    om_t1 = omega[i_t1]
+    om_t2 = omega[i_t2]
+    r_n = r[i_n]
+    r_t1 = r[i_t1]
+    r_t2 = r[i_t2]
+    p0_n = pene0[i_n]
+    p0_t1 = pene0[i_t1]
+    p0_t2 = pene0[i_t2]
+    mu_c = contact_mu[c]
+
+    # penetration = -r + dt² · W · (ω · λ).  Pure 3x3 matvec.
+    ol_n = om_n * lam_n
+    ol_t1 = om_t1 * lam_t1
+    ol_t2 = om_t2 * lam_t2
+    Wol_n = W_nn * ol_n + W_nt1 * ol_t1 + W_nt2 * ol_t2
+    Wol_t1 = W_nt1 * ol_n + W_t1t1 * ol_t1 + W_t1t2 * ol_t2
+    Wol_t2 = W_nt2 * ol_n + W_t1t2 * ol_t1 + W_t2t2 * ol_t2
+    pen_n = -r_n + dt2 * Wol_n
+    pen_t1 = -r_t1 + dt2 * Wol_t1
+    pen_t2 = -r_t2 + dt2 * Wol_t2
+
+    # FB evaluation refreshes (ω, c, h) using the current λ.  The tangent
+    # rows read ``lam_n``, their companion normal multiplier.
+    out_n = fb_unilateral_row_wp(pen_n, lam_n, precond_n, dt, p0_n)
+    om_n = out_n[0]
+    c_n = out_n[1]
+    h_n = out_n[2]
+    out_t1 = fb_frictional_row_wp(pen_t1, lam_t1, lam_n, mu_c, precond_t1, dt, p0_t1)
+    om_t1 = out_t1[0]
+    c_t1 = out_t1[1]
+    h_t1 = out_t1[2]
+    out_t2 = fb_frictional_row_wp(pen_t2, lam_t2, lam_n, mu_c, precond_t2, dt, p0_t2)
+    om_t2 = out_t2[0]
+    c_t2 = out_t2[1]
+    h_t2 = out_t2[2]
+
+    # A_schur_3x3 = ωωᵀ ⊙ W + diag(c).
+    A00 = om_n * om_n * W_nn + c_n
+    A01 = om_n * om_t1 * W_nt1
+    A02 = om_n * om_t2 * W_nt2
+    A11 = om_t1 * om_t1 * W_t1t1 + c_t1
+    A12 = om_t1 * om_t2 * W_t1t2
+    A22 = om_t2 * om_t2 * W_t2t2 + c_t2
+
+    # rhs = (1/dt²) · (h - ω · J_x) with J_x = (pene0 - r) + dt²·W·(ω·λ) under the updated weights, as the
+    # dense driver takes it; the penetration above holds the weights of the previous iteration.
+    wl_n = om_n * lam_n
+    wl_t1 = om_t1 * lam_t1
+    wl_t2 = om_t2 * lam_t2
+    Jx_n = p0_n - r_n + dt2 * (W_nn * wl_n + W_nt1 * wl_t1 + W_nt2 * wl_t2)
+    Jx_t1 = p0_t1 - r_t1 + dt2 * (W_nt1 * wl_n + W_t1t1 * wl_t1 + W_t1t2 * wl_t2)
+    Jx_t2 = p0_t2 - r_t2 + dt2 * (W_nt2 * wl_n + W_t1t2 * wl_t1 + W_t2t2 * wl_t2)
+    inv_dt2 = wp.float64(1.0) / dt2
+    rhs_n = inv_dt2 * (h_n - om_n * Jx_n)
+    rhs_t1 = inv_dt2 * (h_t1 - om_t1 * Jx_t1)
+    rhs_t2 = inv_dt2 * (h_t2 - om_t2 * Jx_t2)
+
+    # 3x3 symmetric solve via cofactor expansion (no Cholesky needed at
+    # this size; the matrix is SPD by construction modulo the ωωᵀ Hadamard
+    # which preserves SPD when c > 0 and W is SPD).
+    # Determinant of A (symmetric).
+    m11 = A11 * A22 - A12 * A12
+    m12 = A01 * A22 - A02 * A12
+    m13 = A01 * A12 - A02 * A11
+    det = A00 * m11 - A01 * m12 + A02 * m13
+    # A singular system takes no step: λ keeps its warm start.
+    if wp.abs(det) >= wp.float64(1.0e-30):
+        inv_det = wp.float64(1.0) / det
+        # Inverse of symmetric 3x3 via cofactor matrix.
+        i00 = (A11 * A22 - A12 * A12) * inv_det
+        i01 = -(A01 * A22 - A02 * A12) * inv_det
+        i02 = (A01 * A12 - A02 * A11) * inv_det
+        i11 = (A00 * A22 - A02 * A02) * inv_det
+        i12 = -(A00 * A12 - A02 * A01) * inv_det
+        i22 = (A00 * A11 - A01 * A01) * inv_det
+
+        dlam_n = i00 * rhs_n + i01 * rhs_t1 + i02 * rhs_t2
+        dlam_t1 = i01 * rhs_n + i11 * rhs_t1 + i12 * rhs_t2
+        dlam_t2 = i02 * rhs_n + i12 * rhs_t1 + i22 * rhs_t2
+
+        lam_n = lam_n + dlam_n
+        lam_t1 = lam_t1 + dlam_t1
+        lam_t2 = lam_t2 + dlam_t2
+
+    # Optional symmetric lambda cap, before the Coulomb clamp as in the dense path.
+    if use_cap == wp.int32(1):
+        if lam_n > cap_internal:
+            lam_n = cap_internal
+        if lam_n < -cap_internal:
+            lam_n = -cap_internal
+        if lam_t1 > cap_internal:
+            lam_t1 = cap_internal
+        if lam_t1 < -cap_internal:
+            lam_t1 = -cap_internal
+        if lam_t2 > cap_internal:
+            lam_t2 = cap_internal
+        if lam_t2 < -cap_internal:
+            lam_t2 = -cap_internal
+
+    # Coulomb box clamp of the tangent multipliers, as the dense NSN and the per-particle lite kernel apply it:
+    # no friction without a positive normal multiplier, else within [-mu lam_n, mu lam_n].
+    if lam_n <= wp.float64(0.0):
+        lam_t1 = wp.float64(0.0)
+        lam_t2 = wp.float64(0.0)
+    else:
+        bound = mu_c * lam_n
+        lam_t1 = wp.clamp(lam_t1, -bound, bound)
+        lam_t2 = wp.clamp(lam_t2, -bound, bound)
+
+    # Write back λ, ω, and lam_apply = dt² · ω · λ_final.
+    lam[i_n] = lam_n
+    lam[i_t1] = lam_t1
+    lam[i_t2] = lam_t2
+    omega[i_n] = om_n
+    omega[i_t1] = om_t1
+    omega[i_t2] = om_t2
+    lam_apply[i_n] = dt2 * om_n * lam_n
+    lam_apply[i_t1] = dt2 * om_t1 * lam_t1
+    lam_apply[i_t2] = dt2 * om_t2 * lam_t2
+
+
+# ----- Per-particle fused FB-Newton kernel for LiteNSN -----
+#
+# Generalises ``fb_newton_lite_coulomb_kernel`` to handle ``k_p ∈ {1..4}``
+# contacts per particle.  Each thread processes one *unique-contacted* particle
+# end-to-end; the local 3·k_p x 3·k_p Schur block is constructed in registers
+# (fp64 ``mat12``) and solved via in-place Cholesky.  Sparsity stays
+# block-diagonal by particle.
+#
+# SolverFBA gives the kernel no particle with more than ``_MAX_KP_PER_PARTICLE``
+# contacts; one would keep its multipliers. A cloth vertex pinched
+# between two pads on a table has 3 contacts, so k_max=4 leaves headroom.
+# ``mat12`` is the largest type we materialise per thread.
+_MAX_KP_PER_PARTICLE = wp.constant(4)
+_MAX_ROWS_PER_PARTICLE = wp.constant(12)  # 3 · _MAX_KP_PER_PARTICLE
+_MAT12_F64 = wp.types.matrix((12, 12), wp.float64)
+_VEC12_F64 = wp.types.vector(12, wp.float64)
+
+
+@wp.kernel
+def fb_newton_lite_coulomb_per_particle_kernel(
+    # ---- per-isodof iteration metadata ----
+    isodof_unique: wp.array[wp.int32],  # (K,) unique contacted particle indices
+    isodof_row_offsets: wp.array[wp.int32],  # (N+1,) CSR over ALL particles
+    isodof_row_indices: wp.array[wp.int32],  # (total_rows,) row idx sorted by particle
+    # ---- per-row data (3M entries, interleaved [n, t1, t2] per contact) ----
+    row_particle: wp.array[wp.int32],  # (3M,) particle index per row
+    row_dir: wp.array[wp.vec3],  # (3M,) direction per row (fp32)
+    row_alpha: wp.array[wp.float32],  # (3M,) Jacobian coef per row
+    # ---- per-contact data (M entries) ----
+    contact_mu: wp.array[wp.float64],  # (M,) friction coef per contact
+    # ---- per-row force inputs (3M entries) ----
+    r: wp.array[wp.float64],  # (3M,)
+    pene0: wp.array[wp.float64],  # (3M,)
+    # ---- global state ----
+    inv_mass: wp.array[wp.float64],  # (N,)
+    dt: wp.float64,
+    cap_internal: wp.float64,  # lambda_cap / dt²
+    use_cap: wp.int32,
+    # ---- inout / outputs ----
+    lam: wp.array[wp.float64],  # (3M,) inout
+    omega: wp.array[wp.float64],  # (3M,) inout
+    lam_apply: wp.array[wp.float64],  # (3M,) output
+):
+    """Per-particle fused FB-Newton for LiteNSN with Coulomb friction, k_p ∈ {1..4}.
+
+    Each thread handles one unique-contacted particle ``p``.  Its ``k_p`` contact
+    rows live consecutively in ``isodof_row_indices[start:end]``; each row carries
+    its own ``(particle, dir, alpha)`` triple and its own (n, t1, t2) sub-triplet
+    in the global row arrays.  Under the lite approximation, ``W_lite`` is
+    block-diagonal-by-particle, so this thread is fully independent.
+
+    Local state lives in registers / L1 (warp ``mat12``).  Cholesky on a
+    ``3·k_p x 3·k_p`` PSD matrix runs in-place over the same buffer.
+
+    The rows of a particle with more than ``_MAX_ROWS_PER_PARTICLE`` keep their
+    multipliers.
+    """
+    iso = wp.tid()
+    p = isodof_unique[iso]
+    row_start = isodof_row_offsets[p]
+    row_end = isodof_row_offsets[p + 1]
+    k_total = row_end - row_start  # = 3 · k_p
+    if k_total <= 0:
+        return
+    inv_m = inv_mass[p]
+    dt2 = dt * dt
+    if k_total > _MAX_ROWS_PER_PARTICLE:
+        for ai in range(k_total):
+            ra = isodof_row_indices[row_start + ai]
+            lam_apply[ra] = dt2 * omega[ra] * lam[ra]
+        return
+
+    # Build local W (3kx3k) directly from (alpha, dir) triples.
+    # W[a, b] = alpha_a · alpha_b · dot(dir_a, dir_b) · dt² · inv_m
+    W = _MAT12_F64(wp.float64(0.0))
+    for ai in range(k_total):
+        ra = isodof_row_indices[row_start + ai]
+        alpha_a = wp.float64(row_alpha[ra])
+        dir_a = row_dir[ra]
+        for bi in range(k_total):
+            rb = isodof_row_indices[row_start + bi]
+            alpha_b = wp.float64(row_alpha[rb])
+            dir_b = row_dir[rb]
+            W[ai, bi] = alpha_a * alpha_b * wp.float64(wp.dot(dir_a, dir_b)) * dt2 * inv_m
+
+    # Load per-row state into vec12 locals.
+    lam_l = _VEC12_F64(wp.float64(0.0))
+    om_l = _VEC12_F64(wp.float64(0.0))
+    r_l = _VEC12_F64(wp.float64(0.0))
+    pene0_l = _VEC12_F64(wp.float64(0.0))
+    for ai in range(k_total):
+        ra = isodof_row_indices[row_start + ai]
+        lam_l[ai] = lam[ra]
+        om_l[ai] = omega[ra]
+        r_l[ai] = r[ra]
+        pene0_l[ai] = pene0[ra]
+
+    # Precond per row: dt²·|W_ii| for normals, dt·|W_ii| for tangents.
+    # Rows interleave (n, t1, t2) per contact => row_mod3 == 0 is normal.
+    eps = wp.float64(1.0e-12)
+    precond_l = _VEC12_F64(wp.float64(0.0))
+    for ai in range(k_total):
+        ra = isodof_row_indices[row_start + ai]
+        w_abs = wp.abs(W[ai, ai])
+        if w_abs < eps:
+            w_abs = eps
+        if (ra % 3) == 0:
+            precond_l[ai] = dt2 * w_abs
+        else:
+            precond_l[ai] = dt * w_abs
+
+    # penetration = -r + dt²·W·(ω·λ).  3k_p dot products.
+    pen_l = _VEC12_F64(wp.float64(0.0))
+    for ai in range(k_total):
+        acc = wp.float64(0.0)
+        for bi in range(k_total):
+            acc = acc + W[ai, bi] * om_l[bi] * lam_l[bi]
+        pen_l[ai] = -r_l[ai] + dt2 * acc
+
+    # FB evaluation (rows interleave [n, t1, t2] within each contact; the
+    # tangent rows read lam_n from the same contact's normal).
+    c_l = _VEC12_F64(wp.float64(0.0))
+    h_l = _VEC12_F64(wp.float64(0.0))
+    for ai in range(k_total):
+        ra = isodof_row_indices[row_start + ai]
+        rmod = ra % 3
+        if rmod == 0:
+            # Normal row.
+            out_n = fb_unilateral_row_wp(pen_l[ai], lam_l[ai], precond_l[ai], dt, pene0_l[ai])
+            om_l[ai] = out_n[0]
+            c_l[ai] = out_n[1]
+            h_l[ai] = out_n[2]
+        else:
+            # Tangent row.  Find the companion normal row in this particle's
+            # local block: same contact c = ra // 3, normal row = 3·c.
+            # The normal might not be at local index ai-rmod because the
+            # local order = sorted-by-row order which preserves
+            # n,t1,t2 grouping (rows from one contact are consecutive,
+            # since they share a particle and are inserted contiguously).
+            # Find the local index of the companion normal row.
+            companion_global = 3 * (ra // 3)
+            # Linear scan over local rows (k_total ≤ 12) to find it.
+            lam_n_local = wp.float64(0.0)
+            for ci in range(k_total):
+                if isodof_row_indices[row_start + ci] == companion_global:
+                    lam_n_local = lam_l[ci]
+            contact_idx = ra // 3
+            mu_c = contact_mu[contact_idx]
+            out_t = fb_frictional_row_wp(pen_l[ai], lam_l[ai], lam_n_local, mu_c, precond_l[ai], dt, pene0_l[ai])
+            om_l[ai] = out_t[0]
+            c_l[ai] = out_t[1]
+            h_l[ai] = out_t[2]
+
+    # A_schur = ωωᵀ ⊙ W + diag(c), block-PSD by construction.
+    A = _MAT12_F64(wp.float64(0.0))
+    for ai in range(k_total):
+        for bi in range(k_total):
+            a_ij = om_l[ai] * om_l[bi] * W[ai, bi]
+            if ai == bi:
+                a_ij = a_ij + c_l[ai]
+            A[ai, bi] = a_ij
+
+    # rhs = (1/dt²) · (h - ω · J_x) with J_x = (pene0 - r) + dt²·W·(ω·λ) under the updated weights, as the
+    # dense driver takes it; the penetration above holds the weights of the previous iteration.
+    inv_dt2 = wp.float64(1.0) / dt2
+    rhs_l = _VEC12_F64(wp.float64(0.0))
+    for ai in range(k_total):
+        acc = wp.float64(0.0)
+        for bi in range(k_total):
+            acc = acc + W[ai, bi] * om_l[bi] * lam_l[bi]
+        Jx = pene0_l[ai] - r_l[ai] + dt2 * acc
+        rhs_l[ai] = inv_dt2 * (h_l[ai] - om_l[ai] * Jx)
+
+    # In-place Cholesky: A = L·Lᵀ.  L overwrites the lower triangle of A.
+    # PSD by construction; bail with sentinel diagonal (1) if a diagonal
+    # underflows so the subsequent solve produces zero update.
+    ok = wp.int32(1)
+    for j in range(k_total):
+        s = A[j, j]
+        for kk in range(j):
+            s = s - A[j, kk] * A[j, kk]
+        if s < eps:
+            ok = wp.int32(0)
+            # break early by setting all remaining diags to 1; rhs solve
+            # will then produce ~zero update.  Don't actually break: warp
+            # doesn't always promote early-return cleanly in nested loops.
+            A[j, j] = wp.float64(1.0)
+            continue
+        ljj = wp.sqrt(s)
+        A[j, j] = ljj
+        inv_ljj = wp.float64(1.0) / ljj
+        for ii in range(j + 1, k_total):
+            t = A[ii, j]
+            for kk in range(j):
+                t = t - A[ii, kk] * A[j, kk]
+            A[ii, j] = t * inv_ljj
+
+    # Forward substitute L·y = rhs.
+    y_l = _VEC12_F64(wp.float64(0.0))
+    for ii in range(k_total):
+        t = rhs_l[ii]
+        for kk in range(ii):
+            t = t - A[ii, kk] * y_l[kk]
+        y_l[ii] = t / A[ii, ii]
+
+    # Back substitute Lᵀ·dlam = y.
+    dlam_l = _VEC12_F64(wp.float64(0.0))
+    for ii_rev in range(k_total):
+        ii = k_total - 1 - ii_rev
+        t = y_l[ii]
+        for kk in range(ii + 1, k_total):
+            t = t - A[kk, ii] * dlam_l[kk]
+        dlam_l[ii] = t / A[ii, ii]
+
+    # λ += dlam.  Skip the update for singular A (ok==0).
+    if ok == wp.int32(1):
+        for ai in range(k_total):
+            lam_l[ai] = lam_l[ai] + dlam_l[ai]
+
+    # Optional symmetric lambda cap, before the Coulomb clamp as in the dense path.
+    if use_cap == wp.int32(1):
+        for ai in range(k_total):
+            v = lam_l[ai]
+            if v > cap_internal:
+                v = cap_internal
+            if v < -cap_internal:
+                v = -cap_internal
+            lam_l[ai] = v
+
+    # Coulomb box clamp per contact (each contact = 3 consecutive rows): no friction without a positive normal
+    # multiplier, else within [-mu lam_n, mu lam_n]. Identify contact-c normal local index, clamp its t1 and t2.
+    for ai in range(k_total):
+        ra = isodof_row_indices[row_start + ai]
+        if (ra % 3) != 0:
+            continue
+        # Find t1, t2 local indices (ra+1, ra+2 global).
+        t1_g = ra + 1
+        t2_g = ra + 2
+        t1_local = wp.int32(-1)
+        t2_local = wp.int32(-1)
+        for ci in range(k_total):
+            rc = isodof_row_indices[row_start + ci]
+            if rc == t1_g:
+                t1_local = ci
+            elif rc == t2_g:
+                t2_local = ci
+        if t1_local >= wp.int32(0) and t2_local >= wp.int32(0):
+            lam_n_val = lam_l[ai]
+            contact_idx = ra // 3
+            bound = wp.float64(0.0)
+            if lam_n_val > wp.float64(0.0):
+                bound = contact_mu[contact_idx] * lam_n_val
+            lam_l[t1_local] = wp.clamp(lam_l[t1_local], -bound, bound)
+            lam_l[t2_local] = wp.clamp(lam_l[t2_local], -bound, bound)
+
+    # Write back λ, ω, lam_apply = dt² · ω · λ.
+    for ai in range(k_total):
+        ra = isodof_row_indices[row_start + ai]
+        lam[ra] = lam_l[ai]
+        omega[ra] = om_l[ai]
+        lam_apply[ra] = dt2 * om_l[ai] * lam_l[ai]
 
 
 @wp.kernel

@@ -122,6 +122,12 @@ contact, or the inputs of :class:`~newton.Control`.
 Contacts
 --------
 
+- ``nsn_schur_mode`` selects the contact operator of the Newton steps.
+  ``"full"`` (default) builds it from the factored system matrix. ``"lite"``
+  replaces the inverse system matrix by the inverse masses, which decouples
+  the contacts of different particles and costs far less, but lets a pressed
+  contact settle inside its shape by up to ``dt² F / m`` for a normal force
+  ``F`` on a particle of mass ``m``.
 - The friction coefficient of a particle contact is its shape's ``mu``.
 - :attr:`~newton.solvers.SolverBase.ObservableKind.CONTACT_F` reports the
   force of each particle contact on its shape; see :ref:`solver_observables`.
