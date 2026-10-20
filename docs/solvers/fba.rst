@@ -136,6 +136,13 @@ Model Inputs
   positions and move with :meth:`~newton.solvers.SolverFBA.set_pin_targets`.
   Particles without the ``ACTIVE`` flag that have a mass hold where the input
   state has them.
+- **Particle constraints**:
+  :meth:`~newton.solvers.SolverFBA.set_particle_constraints` holds lengths or
+  linear combinations of particle positions at targets, solved with the
+  contacts. With the lite operator, the rows that hold particles at points,
+  or all rows with ``exact=True``, take one exact Newton step of their own.
+  The ``cable_gripper_fba`` example builds the rows of cables through
+  tetrahedral bodies.
 - **Rigid bodies**: FBA integrates the dynamic bodies and passes kinematic
   bodies through, or leaves every body to another solver with
   ``integrate_with_external_rigid_solver=True``. PRISMATIC, REVOLUTE, BALL,
@@ -204,5 +211,12 @@ Examples
   pinned ends and a soft ball dragged by spinning cylinders.
 - ``softbody_franka_fba``: a Franka arm integrated by
   :class:`~newton.solvers.SolverFeatherstone` picks up a soft ball.
+- ``cable_gripper_fba``: soft fingers curled by cables lift a box.
+- ``cloth_dual_franka_fba``: two Franka arms integrated by
+  :class:`~newton.solvers.SolverFeatherstone` pinch the corners of a square
+  towel and fold it twice into a square, with light Rayleigh mass damping.
+- ``shirt_pins_fba``, ``bunny_ears_fba``: two handles move a T-shirt by its
+  shoulders, with self-contact and light Rayleigh stiffness damping, and a
+  soft bunny by its ears.
 - ``softbody_cantilever_fba``: two soft cantilevers swing under gravity, one
   with Rayleigh damping.

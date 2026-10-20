@@ -842,6 +842,20 @@ add_example_test(
 )
 add_example_test(
     TestClothExamples,
+    name="cloth.example_cloth_dual_franka_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 990},
+    use_viewer=True,
+)
+add_example_test(
+    TestClothExamples,
+    name="cloth.example_shirt_pins_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 1320},
+    use_viewer=True,
+)
+add_example_test(
+    TestClothExamples,
     name="cloth.example_cloth_twist",
     devices=cuda_test_devices,
     test_options={"num-frames": 100},
@@ -1812,6 +1826,20 @@ add_example_test(
     devices=test_devices,
     test_options={"num-frames": 120},
     test_options_cpu={"num-frames": 2},
+    use_viewer=True,
+)
+add_example_test(
+    TestSoftbodyExamples,
+    name="softbody.example_cable_gripper_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 400},
+    use_viewer=True,
+)
+add_example_test(
+    TestSoftbodyExamples,
+    name="softbody.example_bunny_ears_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 1080},
     use_viewer=True,
 )
 add_example_test(
