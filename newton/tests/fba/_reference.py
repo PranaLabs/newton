@@ -50,6 +50,33 @@ def quat_rotate_z_axis(q: np.ndarray) -> np.ndarray:
     )
 
 
+def transform_point(pos: np.ndarray, quat: np.ndarray, p: np.ndarray) -> np.ndarray:
+    """Apply a rigid transform ``T = (pos, quat)`` to point ``p``.
+
+    Warp stores transforms as ``[px, py, pz, qx, qy, qz, qw]``.
+
+    Args:
+        pos: Translation [m], shape ``(3,)``.
+        quat: Quaternion ``[qx, qy, qz, qw]``.
+        p: Point to transform, shape ``(3,)``.
+
+    Returns:
+        Transformed point, shape ``(3,)``.
+    """
+    qx, qy, qz, qw = float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])
+    px, py, pz = float(p[0]), float(p[1]), float(p[2])
+    # Rotate p by quaternion then add translation.
+    # Formula: q * p * q_conj where q = (qx, qy, qz, qw).
+    # Using Rodrigues formula: v' = v + 2*qw*(q_vec x v) + 2*(q_vec x (q_vec x v))
+    tx = 2.0 * (qy * pz - qz * py)
+    ty = 2.0 * (qz * px - qx * pz)
+    tz = 2.0 * (qx * py - qy * px)
+    rx = px + qw * tx + (qy * tz - qz * ty)
+    ry = py + qw * ty + (qz * tx - qx * tz)
+    rz = pz + qw * tz + (qx * ty - qy * tx)
+    return np.array([rx + float(pos[0]), ry + float(pos[1]), rz + float(pos[2])], dtype=np.float64)
+
+
 def fb_unilateral_row(
     penetration: float,
     lam: float,

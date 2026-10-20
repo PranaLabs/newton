@@ -26,7 +26,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.fba import SolverFBA
-from newton.tests.fba._reference import solve_nsn_coulomb, solve_nsn_unilateral
+from newton.tests.fba._reference import fb_frictional_row, fb_unilateral_row, solve_nsn_coulomb, solve_nsn_unilateral
 
 
 def _make_unilateral_inputs(M: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -257,6 +257,36 @@ class TestNSNCoulombGpuDriver(unittest.TestCase):
             bound = mu[c] * max(lam_gpu[3 * c], 0.0)
             self.assertLessEqual(abs(lam_gpu[3 * c + 1]), bound + 1.0e-9)
             self.assertLessEqual(abs(lam_gpu[3 * c + 2]), bound + 1.0e-9)
+
+    def test_bilateral_rows_take_newton_step(self):
+        """Solve bilateral rows after the contact rows by the identity law in the same Schur solve."""
+        M, R, dt = 20, 6, 0.01
+        n = 3 * M + R
+        rng = np.random.default_rng(23)
+        aux = rng.standard_normal((n, n))
+        W = aux @ aux.T / n + np.eye(n)
+        r, pene0, mu = rng.standard_normal(n) * 1.0e-3, np.zeros(n), 0.3 + 0.2 * rng.random(M)
+        solver = _build_minimal_solver(friction=True, lambda_cap=1.0e-7)
+        lam_gpu, omega_gpu, lam_apply_gpu = solver._solve_nsn_coulomb_gpu(W, r, mu, pene0, dt=dt, n_bilateral=R)
+
+        # One FB-Newton step from lam = 0, with the identity law on the last R rows.
+        precond = dt * np.diag(W) * np.where(np.arange(n) % 3 == 0, dt, 1.0)
+        omega, compliance, h = np.ones(n), np.zeros(n), pene0.copy()
+        for c in range(M):
+            k = 3 * c
+            omega[k], compliance[k], h[k] = fb_unilateral_row(-r[k], 0.0, precond[k], dt, 0.0)
+            for t in (k + 1, k + 2):
+                omega[t], compliance[t], h[t] = fb_frictional_row(-r[t], 0.0, 0.0, mu[c], precond[t], dt, 0.0)
+        A_schur = np.outer(omega, omega) * W + np.diag(compliance)
+        lam = np.linalg.solve(A_schur, (h - omega * (pene0 - r)) / (dt * dt))
+
+        np.testing.assert_allclose(omega_gpu, omega, rtol=0, atol=1.0e-12)
+        np.testing.assert_allclose(lam_gpu[3 * M :], lam[3 * M :], rtol=1.0e-6)
+        # The step zeroes the bilateral violation; lambda_cap only clips contact rows.
+        np.testing.assert_allclose((-r + W @ (dt * dt * omega * lam))[3 * M :], 0.0, atol=1.0e-12)
+        self.assertGreater(np.abs(lam_gpu[3 * M :]).max(), 1.0e-7 / (dt * dt))
+        self.assertLessEqual(np.abs(lam_gpu[: 3 * M]).max(), 1.0e-7 / (dt * dt) * (1.0 + 1.0e-12))
+        np.testing.assert_allclose(lam_apply_gpu, dt * dt * omega_gpu * lam_gpu, rtol=1.0e-12)
 
     def test_gpu_path_coulomb_no_contacts(self):
         """Return empty arrays from the Coulomb driver for ``M=0``."""

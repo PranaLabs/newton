@@ -7,11 +7,12 @@ FBA
 ===
 
 :class:`~newton.solvers.SolverFBA` simulates cloth and volumetric soft bodies
-with projective dynamics and resolves their frictional contact as
-complementarity conditions. Each step runs a fixed number of local-global
-iterations: the local phase projects every element onto its constraint set,
-the global phase solves a linear system whose matrix is factored once, and
-each iteration takes one semismooth Newton step of the contact multipliers.
+with projective dynamics, together with rigid bodies, and resolves the
+frictional contact among them as complementarity conditions. Each step runs a
+fixed number of local-global iterations: the local phase projects every
+element onto its constraint set, the global phase solves a linear system whose
+matrix is factored once, and each iteration takes one semismooth Newton step
+of the contact and constraint multipliers.
 
 .. experimental::
 
@@ -23,20 +24,28 @@ When to Choose FBA
 ------------------
 
 FBA suits scenes in which cloth or soft bodies rest on, wrap around, or are
-pressed against shapes:
+held by other objects:
 
 - With the default contact operator, contacts do not penetrate and need no
   contact stiffness: each contact supplies the force that keeps its gap
-  closed, within its friction cone, so cloth rests on notched blades, and
-  spinning cylinders drag a soft ball between them by friction alone.
+  closed, within its friction cone, so cloth rests on stacked boxes and on
+  notched blades, and a soft ball hangs between two fingertip pads by
+  friction alone.
 - Stiff materials step stably at large time steps. The examples step at
   ``dt = 0.01`` s, including a Neo-Hookean bar with a Young's modulus of
   ``1e9`` Pa.
+- Cloth, tetrahedral soft bodies, and rigid bodies with joints share one
+  solve, or rigid bodies come from another solver, such as an arm that
+  :class:`~newton.solvers.SolverFeatherstone` integrates.
 
-Choose another solver for models with several worlds or with rigid bodies,
-and for differentiable simulation. See the :ref:`Supported Features` matrix
-for a comparison with the other solvers. The solver builds on projective
-dynamics and a quadratic bending energy:
+Choose another solver for models with several worlds, for differentiable
+simulation, and for articulations that need joint limits, drives, or
+actuators: FBA treats joints as bilateral constraints only, so integrate such
+an articulation with another solver and pass
+``integrate_with_external_rigid_solver=True``. See the :ref:`Supported
+Features` matrix and the :ref:`Joint feature support` tables for a comparison
+with the other solvers. The solver builds on projective dynamics and a
+quadratic bending energy:
 
 - Sofien Bouaziz, Sebastian Martin, Tiantian Liu, Ladislav Kavan, and Mark
   Pauly. 2014. Projective Dynamics: Fusing Constraint Projections for Fast
@@ -92,10 +101,10 @@ matrix depends on the time step, the particle masses, the pinned and inactive
 particles, and the elements and their materials; the solver factors it again
 when the time step changes or after
 :meth:`~newton.solvers.SolverFBA.notify_model_changed` with
-``SHAPE_PROPERTIES``, and other changes to those arrays take effect only then.
-A step reads its contact counts back to the host, so it cannot be captured in
-a CUDA graph; it captures and replays its own local-global iterations. FBA
-runs on the CPU and on CUDA devices.
+``SHAPE_PROPERTIES`` or ``BODY_INERTIAL_PROPERTIES``, and other changes to
+those arrays take effect only then. A step reads its contact counts back to
+the host, so it cannot be captured in a CUDA graph; it captures and replays
+its own local-global iterations. FBA runs on the CPU and on CUDA devices.
 
 Model Inputs
 ------------
@@ -114,10 +123,15 @@ Model Inputs
   positions and move with :meth:`~newton.solvers.SolverFBA.set_pin_targets`.
   Particles without the ``ACTIVE`` flag that have a mass hold where the input
   state has them.
+- **Rigid bodies**: FBA integrates the dynamic bodies and passes kinematic
+  bodies through, or leaves every body to another solver with
+  ``integrate_with_external_rigid_solver=True``. PRISMATIC, REVOLUTE, BALL,
+  FIXED, and D6 joints are bilateral constraints, at most 64 rows per
+  articulation; DISTANCE and ROD joints raise ``NotImplementedError``.
 
-FBA does not simulate rigid bodies: a model with bodies raises
-``NotImplementedError``. It does not simulate springs either, or the inputs of
-:class:`~newton.Control`.
+FBA does not simulate springs, equality constraints, mimic joints,
+particle-body attachments, joint limits, drives, armature, or friction, or
+the inputs of :class:`~newton.Control`.
 
 Contacts
 --------
@@ -134,10 +148,17 @@ Contacts
   meshes. It needs the full operator.
 - ``particle_enable_self_contact=True`` makes the triangles collide with each
   other, through vertex-face or vertex-vertex contacts.
-- The friction coefficient of a particle contact is its shape's ``mu``, and
-  ``model.particle_mu`` for self contacts.
+- Rigid contacts between shapes on bodies that FBA integrates need
+  ``friction=True`` and the full operator.
+- A contact on a body that FBA integrates acts at the contact point of the
+  step start, which moves with the body to first order in its rotation over
+  the step, so a ball keeps rolling at its speed on flat ground.
+- The friction coefficient of a particle contact is its shape's ``mu``,
+  ``model.particle_mu`` for self contacts, and the mean of the two shapes'
+  ``mu`` for rigid contacts.
 - :attr:`~newton.solvers.SolverBase.ObservableKind.CONTACT_F` reports the
-  force of each particle contact on its shape; see :ref:`solver_observables`.
+  force of each particle contact on its shape's body; see
+  :ref:`solver_observables`.
 
 Accuracy
 --------
@@ -156,5 +177,8 @@ Examples
 
 - ``stretching_cloth_fba``: cloth pulled apart by pins on two opposite edges.
 - ``cloth_on_knives_fba``: cloth on notched blades with face contacts.
+- ``cloth_on_boxes_fba``: cloth on rigid bodies with joints.
 - ``twisting_bar_fba``, ``squeezing_ball_fba``: a soft bar twisted by its
   pinned ends and a soft ball dragged by spinning cylinders.
+- ``softbody_franka_fba``: a Franka arm integrated by
+  :class:`~newton.solvers.SolverFeatherstone` picks up a soft ball.

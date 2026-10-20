@@ -270,6 +270,60 @@ def build_pd_system(
     return A, meta
 
 
+def build_rigid_system(model: Model, bodies: np.ndarray, dt: float) -> CsrMatrix:
+    """Assemble the constant rigid-body block of the PD system matrix.
+
+    Body ``bodies[k]`` owns DOFs ``6k .. 6k+5``: the translation ``chi`` and the
+    rotation vector ``rho``, both expressed in the body's pinned frame. Its block
+    is ``diag(m·I₃, I) / dt²`` with ``I`` the inertia about the COM in the body
+    frame, so the matrix stays constant while the body rotates and is factored
+    once like the deformable block.
+
+    Args:
+        model: The Newton model providing ``body_mass`` and ``body_inertia``.
+        bodies: Model body indices that own DOFs, shape ``[m]``.
+        dt: Time step [s].
+
+    Returns:
+        The ``6m x 6m`` symmetric positive definite CSR matrix.
+
+    Raises:
+        ValueError: If a body has non-positive mass or an inertia tensor that is
+            not positive definite.
+    """
+    bodies = np.asarray(bodies, dtype=np.int32)
+    m = bodies.size
+    if m == 0:
+        return CsrMatrix.from_triplets((0, 0), [], [], [])
+    mass = model.body_mass.numpy()[bodies].astype(np.float64)
+    inertia = model.body_inertia.numpy()[bodies].astype(np.float64)
+    bad = (mass <= 0.0) | (np.linalg.eigvalsh(inertia)[:, 0] <= 0.0)
+    if np.any(bad):
+        raise ValueError(f"Bodies {bodies[bad].tolist()} need positive mass and a positive definite inertia tensor.")
+
+    blocks = np.zeros((m, 6, 6), dtype=np.float64)
+    blocks[:, :3, :3] = mass[:, None, None] * np.eye(3)
+    blocks[:, 3:, 3:] = inertia
+    blocks /= dt * dt
+    body, row, col = np.nonzero(blocks)
+    return CsrMatrix.from_triplets((6 * m, 6 * m), 6 * body + row, 6 * body + col, blocks[body, row, col])
+
+
+def rigid_block_inverses(A_rigid: CsrMatrix) -> np.ndarray:
+    """Inverse of each 6x6 diagonal block of the rigid system matrix, shape [m, 6, 6].
+
+    Raises:
+        ValueError: If ``A_rigid`` is not block diagonal in 6x6 blocks.
+    """
+    A_rigid = CsrMatrix.from_matrix(A_rigid)
+    rows, cols = A_rigid.row_of_entries(), A_rigid.indices
+    if np.any(rows // 6 != cols // 6):
+        raise ValueError("The rigid system matrix must be block diagonal")
+    blocks = np.zeros((A_rigid.shape[0] // 6, 6, 6))
+    blocks[rows // 6, rows % 6, cols % 6] = A_rigid.data
+    return np.linalg.inv(blocks)
+
+
 def _compute_rest_inv_from_positions(model: Model) -> np.ndarray:
     """Recompute the 2x2 rest-pose inverse per triangle from particle_q.
 

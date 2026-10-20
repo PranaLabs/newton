@@ -66,6 +66,8 @@ Performance notes:
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import warp as wp
 
 # ---------------------------------------------------------------------------
@@ -384,6 +386,7 @@ class NSNPCRSolver:
         # fails we fall back to the eager loop and remember the failure so
         # we don't retry on every call.
         self._pcr_graph_cache: dict[int, wp.Graph | None] = {}
+        self._block_precond = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -394,6 +397,7 @@ class NSNPCRSolver:
         A: wp.array2d[wp.float64],
         b: wp.array[wp.float64],
         x_out: wp.array[wp.float64],
+        block_precond: Callable[[wp.array, wp.array], None] | None = None,
     ) -> tuple[int, float]:
         """Solve ``A @ x = b`` with Jacobi-preconditioned conjugate residual.
 
@@ -403,6 +407,10 @@ class NSNPCRSolver:
             b: ``(n,)`` right-hand side, device-resident, fp64.
             x_out: ``(n,)`` output buffer, device-resident, fp64. Filled with
                 the solution on return.
+            block_precond: Optional ``f(v, out)`` that overwrites rows of the
+                Jacobi product ``out = P v`` with an exact block solve, such
+                as the joint rows' Cholesky factor, a block preconditioner of
+                the bilateral rows. It runs eagerly, without the CUDA graph.
 
         Returns:
             A ``(iterations_taken, final_rho)`` tuple where ``iterations_taken``
@@ -455,6 +463,9 @@ class NSNPCRSolver:
         # holds A p, and ``_h`` the scratch t (P q, then A z).
         wp.copy(self._r, b, count=n)
         wp.launch(_apply_precond_kernel, dim=n, inputs=[self._r, self._precond], outputs=[self._s], device=device)
+        self._block_precond = block_precond
+        if block_precond is not None:
+            block_precond(self._r, self._s)
         wp.copy(self._d, self._s, count=n)
         wp.launch_tiled(
             _matvec_tiled_kernel,
@@ -484,7 +495,7 @@ class NSNPCRSolver:
         # ``cuGraphLaunch`` on the device side instead of ~10 individual
         # ``wp.launch`` dispatches, so the Python+driver per-launch overhead
         # drops from ~30-50 us/iter to ~2 us/iter at n ~ 600..1500.
-        graph = self._get_or_build_pcr_iter_graph(A, n, n_pad, device)
+        graph = None if block_precond is not None else self._get_or_build_pcr_iter_graph(A, n, n_pad, device)
 
         nb_iter = 0
         check_every = self.check_every
@@ -585,6 +596,7 @@ class NSNPCRSolver:
         # ----- Symmetric PCR, as in :meth:`solve` -------------------------
         # ``wps.bsr_mv`` checks that x.shape[0] == W.cols, so the scratch
         # buffers (sized to max_n) are sliced to the active size ``n``.
+        self._block_precond = None
         wp.copy(self._r, b, count=n)
         wp.launch(_apply_precond_kernel, dim=n, inputs=[self._r, self._precond], outputs=[self._s], device=device)
         wp.copy(self._d, self._s, count=n)
@@ -637,6 +649,8 @@ class NSNPCRSolver:
         """
         # t = P q, den = qᵀ P q.
         wp.launch(_apply_precond_kernel, dim=n, inputs=[self._q, self._precond], outputs=[self._h], device=device)
+        if self._block_precond is not None:
+            self._block_precond(self._q, self._h)
         wp.utils.array_inner(self._q, self._h, out=self._den_d, count=n)
         # Chart curvature of p: pᵀ A p against pᵀ diag(A) p.
         if W_bsr is None:

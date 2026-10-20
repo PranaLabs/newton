@@ -77,7 +77,9 @@ def face_contact_kernel(
     tri_indices: wp.array2d[wp.int32],
     pair_face: wp.array[wp.int32],
     pair_shape: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
     shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[wp.int32],
     shape_type: wp.array[wp.int32],
     shape_scale: wp.array[wp.vec3],
     shape_source_ptr: wp.array[wp.uint64],
@@ -91,13 +93,16 @@ def face_contact_kernel(
     normal: wp.array[wp.vec3],
 ):
     """Deepest point of each candidate ``(triangle, shape)`` pair, emitted if it lies inside the triangle
-    or on an edge, below every vertex. ``body_pos`` is the closest surface point in world frame, as
-    ``Contacts.soft_contact_body_pos`` holds it for a static shape.
+    or on an edge, below every vertex. ``body_pos`` is the closest surface point in the body frame, as
+    ``Contacts.soft_contact_body_pos``.
     """
     i = wp.tid()
     f = pair_face[i]
     s = pair_shape[i]
-    X_ws = shape_transform[s]
+    X_bs = shape_transform[s]
+    X_ws = X_bs
+    if shape_body[s] >= 0:
+        X_ws = wp.transform_multiply(body_q[shape_body[s]], X_bs)
     X_sw = wp.transform_inverse(X_ws)
     P = wp.matrix_from_rows(
         wp.transform_point(X_sw, particle_q[tri_indices[f, 0]]),
@@ -135,7 +140,7 @@ def face_contact_kernel(
     pair[idx] = i
     bary[idx] = w
     depth[idx] = sd[0]
-    body_pos[idx] = wp.transform_point(X_ws, x - sd[0] * n)
+    body_pos[idx] = wp.transform_point(X_bs, x - sd[0] * n)
     normal[idx] = wp.transform_vector(X_ws, n)
 
 
@@ -144,7 +149,9 @@ def near_face_kernel(
     particle_q: wp.array[wp.vec3],
     tri_indices: wp.array2d[wp.int32],
     particle_world: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
     shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[wp.int32],
     shape_type: wp.array[wp.int32],
     shape_scale: wp.array[wp.vec3],
     shape_source_ptr: wp.array[wp.uint64],
@@ -165,6 +172,8 @@ def near_face_kernel(
     ):
         return
     X_ws = shape_transform[s]
+    if shape_body[s] >= 0:
+        X_ws = wp.transform_multiply(body_q[shape_body[s]], X_ws)
     X_sw = wp.transform_inverse(X_ws)
     a = wp.transform_point(X_sw, particle_q[tri_indices[f, 0]])
     b = wp.transform_point(X_sw, particle_q[tri_indices[f, 1]])
@@ -195,7 +204,9 @@ def mesh_minima_kernel(
     contact_shape: wp.array[wp.int32],
     contact_body_pos: wp.array[wp.vec3],
     contact_normal: wp.array[wp.vec3],
+    body_q: wp.array[wp.transform],
     shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[wp.int32],
     shape_type: wp.array[wp.int32],
     shape_scale: wp.array[wp.vec3],
     shape_source_ptr: wp.array[wp.uint64],
@@ -219,11 +230,14 @@ def mesh_minima_kernel(
     s = contact_shape[c]
     if s < 0 or shape_type[s] != GeoType.MESH:
         return
-    X_ws = shape_transform[s]
+    X_bs = shape_transform[s]
+    X_ws = X_bs
+    if shape_body[s] >= 0:
+        X_ws = wp.transform_multiply(body_q[shape_body[s]], X_bs)
     X_sw = wp.transform_inverse(X_ws)
     p = contact_particle[c]
     x = wp.transform_point(X_sw, particle_q[p])
-    closest = wp.transform_point(X_sw, contact_body_pos[c])
+    closest = wp.transform_point(wp.transform_inverse(X_bs), contact_body_pos[c])
     # Inside the mesh, the faces around the particle would push it out of opposite sides.
     if wp.dot(wp.transform_vector(X_sw, contact_normal[c]), x - closest) <= 0.0:
         return
@@ -266,7 +280,7 @@ def mesh_minima_kernel(
             normal[c, emitted] = delta / dist
             emitted += 1
     for e in range(emitted):
-        body_pos[c, e] = wp.transform_point(X_ws, body_pos[c, e])
+        body_pos[c, e] = wp.transform_point(X_bs, body_pos[c, e])
         normal[c, e] = wp.transform_vector(X_ws, normal[c, e])
 
 
@@ -305,12 +319,14 @@ class FaceContactQuery:
         self.offsets = np.searchsorted(self.tri.ravel()[order], np.arange(particle_count + 1))
         self.incident = (order // 3).astype(np.int64)
         self.tri_d = wp.array(self.tri, dtype=wp.int32, device=device)
+        self.no_bodies = wp.empty(1, dtype=wp.transform, device=device)
         self.device = device
 
     def query(
         self,
         model,
         particle_q,
+        body_q,
         particle,
         shape,
         edge_radius: float,
@@ -329,6 +345,7 @@ class FaceContactQuery:
         counts, n_tri, device = stop - start, len(self.tri), self.device
         faces = self.incident[np.repeat(start - np.cumsum(counts) + counts, counts) + np.arange(counts.sum())]
         candidates = np.unique(np.repeat(np.asarray(shape, dtype=np.int64), counts) * n_tri + faces)
+        bodies = self.no_bodies if body_q is None or not body_q.shape[0] else body_q
         if margin is not None and model.shape_count:
             near_count = wp.zeros(1, dtype=wp.int32, device=device)
             near = wp.empty(n_tri * model.shape_count, dtype=wp.int64, device=device)
@@ -336,8 +353,8 @@ class FaceContactQuery:
                 near_face_kernel,
                 dim=(n_tri, model.shape_count),
                 inputs=[
-                    *(particle_q, self.tri_d, model.particle_world),
-                    *(model.shape_transform, model.shape_type, model.shape_scale),
+                    *(particle_q, self.tri_d, model.particle_world, bodies),
+                    *(model.shape_transform, model.shape_body, model.shape_type, model.shape_scale),
                     *(model.shape_source_ptr, model.shape_flags, model.shape_world, margin, edge_radius),
                 ],
                 outputs=[near_count, near],
@@ -356,7 +373,8 @@ class FaceContactQuery:
                 inputs=[
                     *(particle_q, self.tri_d),
                     *(wp.array(a.astype(np.int32), dtype=wp.int32, device=device) for a in (cand_face, cand_shape)),
-                    *(model.shape_transform, model.shape_type),
+                    bodies,
+                    *(model.shape_transform, model.shape_body, model.shape_type),
                     *(model.shape_scale, model.shape_source_ptr),
                     *(iterations, edge_radius),
                 ],
@@ -378,7 +396,7 @@ class FaceContactQuery:
         sel = np.sort(deepest)
         return face[sel], shp[sel], bary[sel], body_pos[sel], normal[sel]
 
-    def mesh_minima(self, model, particle_q, particle, shape, body_pos, normal, alarm: float, slots: int = 3):
+    def mesh_minima(self, model, particle_q, body_q, particle, shape, body_pos, normal, alarm: float, slots: int = 3):
         """The other local minima of each particle contact's distance to a mesh, within the particle radius plus
         the shape margin plus ``alarm`` [m], as ``(particle, shape, body_pos, normal, contact)`` arrays, where
         ``contact`` indexes the particle contact each comes from.
@@ -392,6 +410,7 @@ class FaceContactQuery:
         found = wp.zeros((max(m, 1), slots), dtype=wp.int32, device=device)
         out = [wp.zeros((max(m, 1), slots), dtype=wp.vec3, device=device) for _ in range(2)]
         if m:
+            bodies = self.no_bodies if body_q is None or not body_q.shape[0] else body_q
             contact = [
                 wp.array(np.asarray(a, dtype=np.int32), dtype=wp.int32, device=device) for a in (particle, shape)
             ]
@@ -402,8 +421,8 @@ class FaceContactQuery:
                 mesh_minima_kernel,
                 dim=m,
                 inputs=[
-                    *(particle_q, model.particle_radius, *contact),
-                    *(model.shape_transform, model.shape_type, model.shape_scale),
+                    *(particle_q, model.particle_radius, *contact, bodies),
+                    *(model.shape_transform, model.shape_body, model.shape_type, model.shape_scale),
                     *(model.shape_source_ptr, model.shape_margin, *self._mesh_neighbors, alarm),
                 ],
                 outputs=[found, *out],

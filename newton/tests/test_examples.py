@@ -1788,6 +1788,13 @@ add_example_test(
 )
 add_example_test(
     TestMultiphysicsExamples,
+    name="multiphysics.example_cloth_on_boxes_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 300},
+    use_viewer=True,
+)
+add_example_test(
+    TestMultiphysicsExamples,
     name="multiphysics.example_cloth_on_knives_fba",
     devices=cuda_test_devices,
     test_options={"num-frames": 300},
@@ -1819,6 +1826,13 @@ add_example_test(
     name="softbody.example_squeezing_ball_fba",
     devices=cuda_test_devices,
     test_options={"num-frames": 150},
+    use_viewer=True,
+)
+add_example_test(
+    TestSoftbodyExamples,
+    name="softbody.example_softbody_franka_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 600},
     use_viewer=True,
 )
 
