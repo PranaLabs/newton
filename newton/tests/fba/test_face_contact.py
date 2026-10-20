@@ -82,12 +82,13 @@ def _draped_triangle(scale=0.15):
 class TestFaceContactKernel(unittest.TestCase):
     """Deepest points of triangles in a box with half extents 0.5 m."""
 
-    def _query(self, points, edge_radius=0.0, half=HALF, mesh=None):
+    def _query(self, points, X_wb=None, X_bs=None, edge_radius=0.0, half=HALF, mesh=None):
         """Bary, depth, body_pos and normal of the contacts between one triangle and the box or its ``mesh``."""
+        X_bs, body = (wp.transform_identity(), -1) if X_wb is None else (X_bs, 0)
         geo, scale, mesh_id = (GeoType.BOX, half, 0) if mesh is None else (GeoType.MESH, np.ones(3), mesh.finalize())
         inputs = [(points, wp.vec3), ([[0, 1, 2]], wp.int32), ([0], wp.int32), ([0], wp.int32)]
-        inputs += [([wp.transform_identity()], wp.transform)]
-        inputs += [([int(geo)], wp.int32), ([scale], wp.vec3), ([mesh_id], wp.uint64)]
+        inputs += [([X_bs if X_wb is None else X_wb], wp.transform), ([X_bs], wp.transform)]
+        inputs += [([body], wp.int32), ([int(geo)], wp.int32), ([scale], wp.vec3), ([mesh_id], wp.uint64)]
         outputs = [wp.zeros(1, dtype=t) for t in (wp.int32, wp.int32, wp.vec3, wp.float32, wp.vec3, wp.vec3)]
         inputs = [wp.array(a, dtype=t) for a, t in inputs]
         wp.launch(face_contact_kernel, dim=1, inputs=[*inputs, 128, edge_radius], outputs=outputs)
@@ -139,6 +140,20 @@ class TestFaceContactKernel(unittest.TestCase):
         points = np.array([[-0.2, -0.2, 0.501], [0.2, -0.2, 0.501], [0.0, 0.2, 0.502]])
         self.assertEqual(len(self._query(points)[1]), 0)
 
+    def test_moving_body(self):
+        """Move the face contact with the body that carries the box, its anchor kept in the body frame."""
+        local = _draped_triangle()
+        X_wb = wp.transform((1.0, -2.0, 0.5), wp.quat_from_axis_angle(wp.normalize(wp.vec3(0.3, 0.8, 0.5)), 0.7))
+        X_bs = wp.transform((0.1, 0.0, -0.2), wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), 0.4))
+        X_ws = wp.transform_multiply(X_wb, X_bs)
+        world = np.array([wp.transform_point(X_ws, wp.vec3(*p)) for p in local])
+        bary, depth, body_pos, normal = self._query(local)
+        moved = self._query(world, X_wb, X_bs)
+        np.testing.assert_allclose(moved[0], bary, atol=1e-5)
+        np.testing.assert_allclose(moved[1], depth, atol=1e-5)
+        np.testing.assert_allclose(moved[2][0], wp.transform_point(X_bs, wp.vec3(*body_pos[0])), atol=1e-5)
+        np.testing.assert_allclose(moved[3][0], wp.transform_vector(X_ws, wp.vec3(*normal[0])), atol=1e-5)
+
 
 class TestFaceContactQuery(unittest.TestCase):
     """Triangles folded up from an edge that passes 1 cm inside a sphere of radius 2 cm."""
@@ -155,7 +170,7 @@ class TestFaceContactQuery(unittest.TestCase):
         model = builder.finalize()
         query = FaceContactQuery(model.tri_indices.numpy(), model.particle_count, model.device)
         particles = np.array(contact_particles)
-        return query.query(model, model.particle_q, particles, np.zeros_like(particles), 0.0)
+        return query.query(model, model.particle_q, None, particles, np.zeros_like(particles), 0.0)
 
     def test_shared_edge_reports_one_contact(self):
         """Keep one contact, on the sphere, when both triangles find the optimum on their shared edge."""
@@ -177,8 +192,8 @@ class TestFaceContactQuery(unittest.TestCase):
         _add_triangle_over_tip(builder)
         model = builder.finalize()
         query, none = FaceContactQuery(model.tri_indices.numpy(), model.particle_count, model.device), np.zeros(0, int)
-        self.assertEqual(len(query.query(model, model.particle_q, none, none, 0.0)[0]), 0)
-        face, _shape, _bary, body_pos, normal = query.query(model, model.particle_q, none, none, 0.0, 0.01)
+        self.assertEqual(len(query.query(model, model.particle_q, None, none, none, 0.0)[0]), 0)
+        face, _shape, _bary, body_pos, normal = query.query(model, model.particle_q, None, none, none, 0.0, 0.01)
         self.assertEqual(len(face), 1)
         np.testing.assert_allclose(body_pos[0], 0.0, atol=1e-5)
         self.assertGreater(float(normal[0][2]), 0.9)
@@ -462,7 +477,7 @@ class TestMeshContactMinima(unittest.TestCase):
         fields += (contacts.soft_contact_body_pos, contacts.soft_contact_normal)
         primary = [a.numpy()[:m] for a in fields]
         query = FaceContactQuery(np.zeros((0, 3), dtype=np.int32), model.particle_count, model.device)
-        return primary, query.mesh_minima(model, model.particle_q, *primary, alarm=0.02)
+        return primary, query.mesh_minima(model, model.particle_q, None, *primary, alarm=0.02)
 
     def test_notch_holds_against_both_faces(self):
         """Add the left face as a second distance minimum of a particle above the notch, nearer its right face.

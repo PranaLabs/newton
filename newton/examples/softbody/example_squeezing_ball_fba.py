@@ -53,7 +53,7 @@ _CYLINDERS: list[tuple[np.ndarray, np.ndarray, float]] = [
 ]
 
 
-def _ball_mesh(n: int = 19) -> tuple[np.ndarray, np.ndarray]:
+def ball_mesh(n: int = 19) -> tuple[np.ndarray, np.ndarray]:
     """Vertices and tetrahedra of the unit ball, from an ``n^3`` grid on the cube ``[-1, 1]^3``.
 
     Each cell is split into six tetrahedra around its diagonal that points away from the center, mirrored
@@ -184,7 +184,7 @@ class Example:
         self.frame_dt = _DT
         self.sim_time = 0.0
 
-        verts_local, tets = _ball_mesh()  # 6859 particles
+        verts_local, tets = ball_mesh()  # 6859 particles
         verts_world = verts_local * _BALL_SCALE + _BALL_TRANS
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, _GRAVITY, 0.0))

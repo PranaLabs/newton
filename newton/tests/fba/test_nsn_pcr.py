@@ -223,6 +223,34 @@ class TestPCRScaledAndSingular(_PCRTestCase):
         self.assertLess(np.linalg.norm(b - A @ x), 3.0 * np.linalg.norm(b - A @ x_ls))
 
 
+class TestPCRBlockPreconditioner(_PCRTestCase):
+    def test_block_preconditioner_cuts_iterations(self):
+        """Halve the iterations with an exact block preconditioner on an ill-conditioned trailing block, as for joint
+        rows."""
+        n, m = 80, 20
+        rng = np.random.default_rng(13)
+        A = _make_spd(n, seed=13)
+        Q = np.linalg.qr(rng.standard_normal((m, m)))[0]
+        A[n - m :, n - m :] += Q @ np.diag(10.0 ** np.linspace(-2.0, 3.0, m)) @ Q.T
+        b = rng.standard_normal(n)
+        block_inv = np.linalg.inv(A[n - m :, n - m :])
+
+        def block_precond(v, out):
+            values = out.numpy()
+            values[n - m :] = block_inv @ v.numpy()[n - m : n]
+            out.assign(values)
+
+        iterations = []
+        for precond in (None, block_precond):
+            solver = NSNPCRSolver(max_n=n, device=self.device, tol=1.0e-10, max_iter=1000, check_every=1)
+            x = wp.zeros(n, dtype=wp.float64, device=self.device)
+            A_d = wp.array2d(A, dtype=wp.float64, device=self.device)
+            iters, _ = solver.solve(A_d, wp.array(b, dtype=wp.float64, device=self.device), x, block_precond=precond)
+            self.assertLess(np.linalg.norm(b - A @ x.numpy()) / np.linalg.norm(b), 1.0e-9)
+            iterations.append(iters)
+        self.assertLess(iterations[1], 0.5 * iterations[0])
+
+
 class TestPCRFusedSparse(_PCRTestCase):
     """The fused sparse iterations of ``solve_sparse_fused`` against ``solve_sparse``."""
 

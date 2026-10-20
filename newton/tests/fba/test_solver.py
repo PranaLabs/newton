@@ -11,8 +11,11 @@ import newton
 from newton import CollisionPipeline
 from newton._src.solvers.fba import SolverFBA
 from newton._src.solvers.fba.linear_solver import (
+    FBALinearSolver,
     build_particle_element_csr,
     build_pd_system,
+    build_rigid_system,
+    factorize_and_sparse_inverse,
 )
 
 
@@ -344,6 +347,58 @@ class TestFBALinearSolver(unittest.TestCase):
 
         np.testing.assert_array_equal(y.numpy(), x_np[perm])
         np.testing.assert_array_equal(z.numpy(), x_np)
+
+
+class TestBuildRigidSystem(unittest.TestCase):
+    """Rigid-body block of the PD system: ``diag(m·I₃, I) / dt²`` per body."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _model(self):
+        builder = newton.ModelBuilder()
+        # Body 0: products of inertia exceed I_xx (needs diagonal pivoting).
+        builder.add_body(mass=2.0, inertia=wp.mat33(0.1, 0.2, 0.0, 0.2, 0.5, 0.0, 0.0, 0.0, 0.3), lock_inertia=True)
+        builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)), is_kinematic=True)
+        builder.add_body(mass=3.0, inertia=wp.mat33(0.4, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.6), lock_inertia=True)
+        return builder.finalize()
+
+    def test_blocks(self):
+        """Assemble ``diag(m I3, I) / dt²`` blocks for the integrated bodies, and an empty matrix for none."""
+        model = self._model()
+        dt = 0.01
+        A = build_rigid_system(model, np.array([0, 2]), dt).toarray()
+
+        inertia = model.body_inertia.numpy().astype(np.float64)
+        expected = np.zeros((12, 12))
+        expected[0:3, 0:3] = 2.0 * np.eye(3)
+        expected[3:6, 3:6] = inertia[0]
+        expected[6:9, 6:9] = 3.0 * np.eye(3)
+        expected[9:12, 9:12] = inertia[2]
+        np.testing.assert_allclose(A, expected / dt**2, rtol=1e-12)
+        self.assertEqual(build_rigid_system(model, np.zeros(0, dtype=np.int32), dt).shape, (0, 0))
+
+    def test_solve_scalar_matches_dense(self):
+        """Solve the rigid system with ``solve_scalar`` as a dense solve does."""
+        A = build_rigid_system(self._model(), np.array([0, 2]), 0.01)
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        solver = FBALinearSolver(factorize_and_sparse_inverse(A), device=device)
+
+        b_np = np.random.default_rng(3).standard_normal(12)
+        b = wp.array(b_np, dtype=wp.float64, device=device)
+        x = wp.empty(12, dtype=wp.float64, device=device)
+        solver.solve_scalar(b, x)
+
+        x_ref = np.linalg.solve(A.toarray(), b_np)
+        np.testing.assert_allclose(x.numpy(), x_ref, rtol=1e-9, atol=1e-12 * np.abs(x_ref).max())
+
+    def test_rejects_massless_body(self):
+        """Refuse a body without mass in the rigid system."""
+        builder = newton.ModelBuilder()
+        builder.add_body(mass=0.0)
+        with self.assertRaises(ValueError):
+            build_rigid_system(builder.finalize(), np.array([0]), 0.01)
 
 
 class TestARAPProjection(unittest.TestCase):
@@ -3540,25 +3595,6 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
         builder = newton.ModelBuilder()
         builder.replicate(cloth, 2)
         with self.assertRaisesRegex(ValueError, "one world"):
-            SolverFBA(builder.finalize())
-
-    def test_rigid_bodies_are_refused(self) -> None:
-        """Refuse a model with a rigid body, which SolverFBA does not simulate."""
-        builder = newton.ModelBuilder()
-        builder.add_cloth_grid(
-            pos=wp.vec3(0.0),
-            rot=wp.quat_identity(),
-            vel=wp.vec3(0.0),
-            dim_x=2,
-            dim_y=2,
-            cell_x=0.1,
-            cell_y=0.1,
-            mass=0.1,
-            tri_ke=50.0,
-        )
-        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()))
-        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
-        with self.assertRaisesRegex(NotImplementedError, "rigid bodies"):
             SolverFBA(builder.finalize())
 
     def test_full_surface_contacts_are_refused(self) -> None:

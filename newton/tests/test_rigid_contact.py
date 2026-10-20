@@ -176,10 +176,14 @@ def test_shapes_on_plane(test, device, solver_fn):
         collision_pipeline = newton.CollisionPipeline(model)
         contacts = collision_pipeline.contacts()
 
-    use_cuda_graph = device.is_cuda and wp.is_mempool_enabled(device)
+    # SolverFBA reads contacts back to the host every step, which rules out graph capture.
+    is_fba = isinstance(solver, newton.solvers.SolverFBA)
+    use_cuda_graph = device.is_cuda and wp.is_mempool_enabled(device) and not is_fba
     # Increased substeps for better stability (more substeps = smaller time steps = more stable)
     # More substeps help reduce contact oscillations
     substeps = 30  # Increased from 10 for better contact stability
+    if is_fba:
+        substeps = 2  # implicit, so stable at a larger time step
     sim_dt = 1.0 / 60.0
     if use_cuda_graph:
         with wp.ScopedCapture(device) as capture:
@@ -852,6 +856,7 @@ solvers = {
     "steel": lambda model: newton.solvers.SolverSteel(
         model, solve_mode="matrix_free" if model.device.is_cuda else "split"
     ),
+    "fba": lambda model: newton.solvers.SolverFBA(model, iterations=10),
 }
 
 
@@ -898,10 +903,10 @@ add_function_test(
     devices=cuda_devices,
 )
 
-# Register box drop tests for MuJoCo and XPBD solvers
+# Register box drop tests for MuJoCo, XPBD and FBA solvers
 for device in devices:
     for solver_name, solver_fn in solvers.items():
-        if solver_name not in ("mujoco_cpu", "mujoco_warp", "xpbd", "steel"):
+        if solver_name not in ("mujoco_cpu", "mujoco_warp", "xpbd", "steel", "fba"):
             continue
         if device.is_cpu and solver_name == "mujoco_warp":
             continue
