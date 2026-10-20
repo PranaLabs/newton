@@ -2457,6 +2457,27 @@ def compute_frictional_fb_kernel(
 
 
 @wp.kernel
+def bilateral_law_kernel(
+    pene0: wp.array[wp.float64],
+    row_offset: wp.int32,
+    # outputs
+    omega: wp.array[wp.float64],
+    compliance: wp.array[wp.float64],
+    h: wp.array[wp.float64],
+):
+    """Identity law of the bilateral rows starting at ``row_offset``.
+
+    With ``omega = 1``, no compliance and ``h = pene0``, the NSN step solves
+    ``W dλ = -penetration / dt²`` on these rows: a Newton step that drives
+    their violation to zero.
+    """
+    i = row_offset + wp.tid()
+    omega[i] = wp.float64(1.0)
+    compliance[i] = wp.float64(0.0)
+    h[i] = pene0[i]
+
+
+@wp.kernel
 def soft_contact_keys_kernel(
     particle: wp.array[wp.int32],
     shape: wp.array[wp.int32],
@@ -3520,10 +3541,49 @@ def cast_fp64_to_fp32_kernel(
 # ---------------------------------------------------------------------------
 # Per-contact bookkeeping of ``SolverFBA._ingest_contacts`` on the device.
 #
-# These kernels evaluate the normal offset, and for frictional contacts the
-# tangent basis and kinematic anchor velocity of each contact, after the
-# contacts are sorted into a deterministic order.
+# These kernels evaluate the body transform, the normal offset, and for
+# frictional contacts the tangent basis and kinematic anchor velocity of each
+# contact, after the contacts are sorted into a deterministic order.
 # ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def compute_world_anchor_kernel(
+    body_pos: wp.array[wp.vec3],  # (M,) contact anchor in body-local or world frame
+    shape_idx: wp.array[wp.int32],  # (M,) shape index per contact
+    shape_body: wp.array[wp.int32],  # (n_shapes,) body index per shape (-1 = static)
+    body_q: wp.array[wp.transform],  # (n_bodies,) world-frame body transform
+    has_body_q: wp.int32,  # 1 if body_q is valid (n_bodies > 0)
+    has_shape_body: wp.int32,  # 1 if shape_body is valid
+    world_anchor: wp.array[wp.vec3],  # (M,) OUTPUT contact anchor in world frame
+):
+    """Promote per-contact ``body_pos`` to world frame.
+
+    If the contact's shape is attached to a body, transform ``body_pos``
+    by the body's transform; otherwise pass it through (static shapes
+    already store world-frame anchors per the collision pipeline
+    convention).
+
+    Args:
+        body_pos: Per-contact anchor, shape ``[M]``.
+        shape_idx: Per-contact shape index, shape ``[M]``; ``< 0`` skips body lookup.
+        shape_body: Body index per shape (``-1`` for static), shape ``[n_shapes]``.
+        body_q: World-frame body transforms, shape ``[n_bodies]``.
+        has_body_q: ``1`` when ``body_q`` is populated; ``0`` triggers pass-through.
+        has_shape_body: ``1`` when ``shape_body`` is populated; ``0`` triggers pass-through.
+        world_anchor: Output world-frame anchors, shape ``[M]``.
+    """
+    c = wp.tid()
+    bpos = body_pos[c]
+    s = shape_idx[c]
+    if s < 0 or has_shape_body == 0 or has_body_q == 0:
+        world_anchor[c] = bpos
+        return
+    b_idx = shape_body[s]
+    if b_idx < 0:
+        world_anchor[c] = bpos
+        return
+    world_anchor[c] = wp.transform_point(body_q[b_idx], bpos)
 
 
 @wp.kernel
@@ -3553,17 +3613,25 @@ def soft_contact_force_kernel(
     rows_per_contact: int,
     lam_apply: wp.array[wp.float64],
     anchor: wp.array[wp.vec3],
+    shape: wp.array[wp.int32],
+    shape_body: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
     rigid_contact_max: int,
     contact_f: wp.array[wp.spatial_vector],
 ):
-    """Wrench on the shape of each particle contact ``record[c]`` of ``Contacts``, from the forces [N] the step's
-    last solve applied along the rows ``n, t1, t2`` (or ``n`` alone) of the contact: the force by the particle and its
-    torque about the world origin, in world frame. The rows of a contact's other minima follow its row and add to
-    it."""
+    """Wrench on the shape's body of each particle contact ``record[c]`` of ``Contacts``, from the forces [N] the
+    step's last solve applied along the rows ``n, t1, t2`` (or ``n`` alone) of the contact: the force by the particle
+    and its torque about the body's center of mass, or the world origin for a static shape, in world frame. The rows
+    of a contact's other minima follow its row and add to it."""
     c = wp.tid()
     i = record[c]
     if i < 0 or (c > 0 and record[c - 1] == i):
         return
+    origin = wp.vec3(0.0)
+    if shape[c] >= 0 and shape_body[shape[c]] >= 0:
+        b = shape_body[shape[c]]
+        origin = wp.transform_point(body_q[b], body_com[b])
     force = wp.vec3(0.0)
     torque = wp.vec3(0.0)
     k = c
@@ -3573,7 +3641,7 @@ def soft_contact_force_kernel(
         if rows_per_contact == 3:
             f = f + tangent1[k] * float(lam_apply[r + 1]) + tangent2[k] * float(lam_apply[r + 2])
         force = force - f
-        torque = torque - wp.cross(anchor[k], f)
+        torque = torque - wp.cross(anchor[k] - origin, f)
         k += 1
     contact_f[rigid_contact_max + i] = wp.spatial_vector(force, torque)
 
@@ -3753,3 +3821,41 @@ def compute_v_anchor_kernel(
         omega * wp.float64(cross_ar[1]),
         omega * wp.float64(cross_ar[2]),
     )
+
+
+@wp.kernel
+def compute_v_anchor_from_body_kernel(
+    shape_idx: wp.array[wp.int32],  # (M,) shape index per contact
+    shape_body: wp.array[wp.int32],  # (n_shapes,) body index per shape (-1 = static)
+    body_q: wp.array[wp.transform],  # (n_bodies,) body origin world transforms
+    body_qd: wp.array[wp.spatial_vector],  # (n_bodies,) (v_com, ω) in world frame
+    body_com: wp.array[wp.vec3],  # (n_bodies,) COM in the body frame
+    world_anchor: wp.array[wp.vec3],  # (M,) world-frame anchor
+    v_anchor: wp.array[wp.vec3d],  # (M,) inout: accumulate body-driven motion
+):
+    """Add body-driven kinematic anchor velocity for contacts whose rigid side
+    is parented to a dynamic body.
+
+    For each contact ``c`` with ``parent = shape_body[shape_idx[c]] >= 0``:
+    ``v_anchor[c] = v_com + cross(ω, world_anchor[c] - com_world)``, where
+    ``com_world = transform_point(body_q[parent], body_com[parent])``.
+    Contacts on static shapes (``parent < 0``) are left untouched so the
+    spinning-cylinder value from :func:`compute_v_anchor_kernel` survives.
+
+    Newton's ``body_qd`` stores ``(linear, angular)`` with the linear part
+    being the COM velocity, so ``spatial_top`` is ``v_com`` and
+    ``spatial_bottom`` is ``ω``.
+    """
+    c = wp.tid()
+    s = shape_idx[c]
+    if s < 0:
+        return
+    parent = shape_body[s]
+    if parent < 0:
+        return
+    qd = body_qd[parent]
+    v_com = wp.spatial_top(qd)
+    omega = wp.spatial_bottom(qd)
+    com_world = wp.transform_point(body_q[parent], body_com[parent])
+    v = v_com + wp.cross(omega, world_anchor[c] - com_world)
+    v_anchor[c] = wp.vec3d(wp.float64(v[0]), wp.float64(v[1]), wp.float64(v[2]))
