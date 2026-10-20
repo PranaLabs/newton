@@ -889,7 +889,7 @@ def remesh_convex_hull(vertices: np.ndarray, maxhullvert: int = 0, eps: float = 
     return verts, faces
 
 
-RemeshingMethod = Literal["ftetwild", "alphashape", "quadratic", "convex_hull", "poisson"]
+RemeshingMethod = Literal["ftetwild", "alphashape", "quadratic", "convex_hull", "poisson", "isotropic"]
 
 
 def remesh(
@@ -906,7 +906,9 @@ def remesh(
         vertices: A numpy array of shape (N, 3) containing the vertex positions.
         faces: A numpy array of shape (M, 3) containing the vertex indices of the faces.
         method: The remeshing method to use. One of "ftetwild", "quadratic", "convex_hull",
-            "alphashape", or "poisson".
+            "alphashape", "poisson", or "isotropic", which evens out the edges of open or closed
+            surfaces toward ``edge_length`` [m], the input's mean edge length by default, in
+            ``iterations`` passes, 10 by default.
         visualize: Whether to render the input and output meshes using matplotlib.
         **remeshing_kwargs: Additional keyword arguments passed to the remeshing function.
 
@@ -925,6 +927,10 @@ def remesh(
         from newton._src.geometry.remesh import remesh_poisson  # noqa: PLC0415
 
         new_vertices, new_faces = remesh_poisson(vertices, faces, **remeshing_kwargs)
+    elif method == "isotropic":
+        from newton._src.geometry.remesh_isotropic import remesh_isotropic  # noqa: PLC0415
+
+        new_vertices, new_faces = remesh_isotropic(vertices, faces, **remeshing_kwargs)
     else:
         raise ValueError(f"Unknown remeshing method: {method}")
 
@@ -953,8 +959,10 @@ def remesh_mesh(
     Args:
         mesh: The mesh to be remeshed.
         method: The remeshing method to use.
-            One of "ftetwild", "quadratic", "convex_hull", "alphashape", or "poisson".
-            Defaults to "quadratic".
+            One of "ftetwild", "quadratic", "convex_hull", "alphashape", "poisson", or "isotropic".
+            Defaults to "quadratic". "isotropic" evens out the edges of open or closed surfaces
+            toward the keyword argument ``edge_length`` [m], the input's mean edge length by
+            default, in ``iterations`` passes, 10 by default.
         recompute_inertia: If True, recompute the mass, center of mass,
             and inertia tensor of the mesh after remeshing. Defaults to False.
         inplace: If True, modify the mesh in place. If False,
