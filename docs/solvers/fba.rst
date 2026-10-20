@@ -116,8 +116,8 @@ Model Inputs
   state has them.
 
 FBA does not simulate rigid bodies: a model with bodies raises
-``NotImplementedError``. It does not simulate springs either, cloth self
-contact, or the inputs of :class:`~newton.Control`.
+``NotImplementedError``. It does not simulate springs either, or the inputs of
+:class:`~newton.Control`.
 
 Contacts
 --------
@@ -132,7 +132,10 @@ Contacts
   inside a shape, so shape edges and corners cannot pass between the
   particles of coarse cloth, and holds particles in concave corners of
   meshes. It needs the full operator.
-- The friction coefficient of a particle contact is its shape's ``mu``.
+- ``particle_enable_self_contact=True`` makes the triangles collide with each
+  other, through vertex-face or vertex-vertex contacts.
+- The friction coefficient of a particle contact is its shape's ``mu``, and
+  ``model.particle_mu`` for self contacts.
 - :attr:`~newton.solvers.SolverBase.ObservableKind.CONTACT_F` reports the
   force of each particle contact on its shape; see :ref:`solver_observables`.
 

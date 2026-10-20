@@ -29,6 +29,7 @@ from .kernels import (
     extract_component_kernel,
     insert_component_kernel,
     lite_row_dirs_kernel,
+    lite_row_slots_kernel,
     scale_by_diag_kernel,
 )
 from .sparse_ldlt import CscMatrix, CsrMatrix, factor_ldlt
@@ -1177,6 +1178,10 @@ class FBALinearSolver:
         ``M / dt²`` inverts to ``dt² · inv_mass``.  Without this factor,
         ``W_lite`` would be ``1/dt²`` times the full NSN's ``J A⁻¹ Jᵀ`` in
         scale, and FB-Newton's linearization would not match it.
+
+        The sparse lite Schur complement of :meth:`build_schur_lite_triplets`
+        takes the operator as the block-diagonal BSR matrix
+        ``diag(dt² · inv_mass) ⊗ I₃``, which is built here too.
         """
         n = inv_mass_d.shape[0]
         if n != self.n:
@@ -1187,6 +1192,29 @@ class FBALinearSolver:
         # when dt or the pin layout changes.
         self._inv_mass_d = wp.array(inv_mass_h, dtype=wp.float64, device=self.device)
         self._lite_dt2 = float(dt) * float(dt)
+
+        # The BSR matrix of the 3x3 fp64 blocks ``dt² · inv_mass[p] · I₃``.
+        dev = self.device
+        if not hasattr(self, "_mat3x3_dtype"):
+            self._mat3x3_dtype = wp.types.matrix((3, 3), wp.float64)
+        blocks = np.zeros((n, 3, 3), dtype=np.float64)
+        diag = self._lite_dt2 * inv_mass_h
+        blocks[:, 0, 0] = diag
+        blocks[:, 1, 1] = diag
+        blocks[:, 2, 2] = diag
+
+        if not hasattr(self, "_M_inv_dt2_bsr") or self._M_inv_dt2_bsr is None:
+            self._M_inv_dt2_bsr = wps.bsr_zeros(
+                rows_of_blocks=n,
+                cols_of_blocks=n,
+                block_type=self._mat3x3_dtype,
+                device=dev,
+            )
+
+        rows = wp.array(np.arange(n, dtype=np.int32), dtype=wp.int32, device=dev)
+        cols = wp.array(np.arange(n, dtype=np.int32), dtype=wp.int32, device=dev)
+        vals = wp.array(blocks, dtype=self._mat3x3_dtype, device=dev)
+        wps.bsr_set_from_triplets(self._M_inv_dt2_bsr, rows, cols, vals, prune_numerical_zeros=False)
 
     def _set_row_slots(self, row_particle, row_alpha, extra_p, extra_a) -> np.ndarray:
         """Keep the extra slots of rows on several particles, with a CSR from particle to ``row * K + slot``.
@@ -1210,6 +1238,33 @@ class FBALinearSolver:
         )
         return np.concatenate([row_particle, extra_p[rows, slots]])
 
+    def _setup_lite_rows_on_device(self, M, rows_per_contact, directions, j_indices, j_alpha, extra) -> int:
+        """:meth:`setup_lite_row_meta` on the device for rows on several particles, without the list of particles
+        that the rows touch, which only the per-particle lite kernel reads: the CSRs keep the order of a stable
+        sort of the rows, and of the further slots row by row."""
+        dev, n, width = self.device, self.n, extra[0].shape[1]
+        R = M * rows_per_contact
+        self._row_dir_d = wp.empty(R, dtype=wp.vec3, device=dev)
+        wp.launch(lite_row_dirs_kernel, R, [*directions, rows_per_contact], [self._row_dir_d], device=dev)
+        self._row_particle_d = wp.empty(R, dtype=wp.int32, device=dev)
+        self._row_alpha_d = wp.empty(R, dtype=wp.float32, device=dev)
+        slots = [wp.empty((R, width + 1), dtype=t, device=dev) for t in (wp.int32, wp.float32)]
+        row_kv = [wp.empty(2 * R, dtype=wp.int32, device=dev) for _ in range(2)]
+        slot_kv = [wp.empty(2 * R * width, dtype=wp.int32, device=dev) for _ in range(2)]
+        counts = [wp.zeros(n, dtype=wp.int32, device=dev) for _ in range(2)]
+        inputs = [j_indices, j_alpha, *extra, rows_per_contact]
+        outputs = [self._row_particle_d, self._row_alpha_d, *slots, *row_kv, counts[0], *slot_kv, counts[1]]
+        wp.launch(lite_row_slots_kernel, R, inputs, outputs, device=dev)
+        offsets = [wp.zeros(n + 1, dtype=wp.int32, device=dev) for _ in range(2)]
+        for kv, size, count, offset in zip((row_kv, slot_kv), (R, R * width), counts, offsets, strict=True):
+            wp.utils.radix_sort_pairs(*kv, size)
+            wp.utils.array_scan(count, offset[1:], inclusive=True)
+        self._row_slots = (*slots, offsets[1], slot_kv[1])
+        self._isodof_row_offsets_d, self._isodof_row_indices_d = offsets[0], row_kv[1]
+        self._isodof_unique_d, self._n_isodofs, self._isodof_max_k = None, 0, 0
+        self._row_total = R
+        return R
+
     def setup_lite_row_meta(
         self,
         num_contacts: int,
@@ -1218,6 +1273,8 @@ class FBALinearSolver:
         j_alpha: wp.array,
         j_tangent1: wp.array | None = None,
         j_tangent2: wp.array | None = None,
+        j_extra_indices: wp.array | None = None,
+        j_extra_alpha: wp.array | None = None,
         host: tuple | None = None,
     ) -> int:
         """Populate per-row metadata for LiteNSN paths without building ``W``.
@@ -1234,6 +1291,9 @@ class FBALinearSolver:
 
         ``host`` holds host copies of ``j_indices`` and ``j_alpha``, or
         ``None`` for them, so that they need not be read from the device.
+        With ``j_extra_indices`` and ``j_extra_alpha``, the further particles
+        of the contacts, shape ``[M, K - 1]``, as in
+        :meth:`build_schur_complement`, the rows are set up on the device.
 
         Returns ``total_rows`` (``M`` frictionless, ``3M`` frictional).
         """
@@ -1243,6 +1303,11 @@ class FBALinearSolver:
         total_rows = M * rows_per_contact
         dev = self.device
         n = self.n
+        if j_extra_indices is not None:
+            normals = (j_normals, j_tangent1, j_tangent2) if has_friction else (j_normals, j_normals, j_normals)
+            extra = (j_extra_indices, j_extra_alpha)
+            return self._setup_lite_rows_on_device(M, rows_per_contact, normals, j_indices, j_alpha, extra)
+
         if host is None:
             host = (j_indices.numpy(), j_alpha.numpy())
         idx_np, a_np = host[0][:M].astype(np.int32), host[1][:M]
@@ -1279,6 +1344,93 @@ class FBALinearSolver:
         self._isodof_max_k = int(counts.max()) if unique_isodofs.size else 0
 
         return total_rows
+
+    def build_schur_lite_triplets(
+        self, total_rows: int, rows_d: wp.array, cols_d: wp.array, vals_d: wp.array
+    ) -> wps.BsrMatrix:
+        """``W = H (dt^2 M^-1) H^T`` from the triplets of ``H``, rows of 1 x 3 blocks over the particles;
+        triplets with a negative column are skipped."""
+        # Build H BSR fresh each call.  ``bsr_set_from_triplets`` writes into
+        # the destination's ``offsets`` buffer at length ``rows_of_blocks+1``,
+        # so reusing the same BsrMatrix with a different ``total_rows`` would
+        # require resizing offsets.  Allocating fresh is the safer pattern
+        # given typical call frequency (per FB-Newton step).
+        self._H_lite_uni_bsr = wps.bsr_zeros(
+            rows_of_blocks=total_rows,
+            cols_of_blocks=self.n,
+            block_type=vals_d.dtype,
+            device=self.device,
+        )
+        wps.bsr_set_from_triplets(self._H_lite_uni_bsr, rows_d, cols_d, vals_d, prune_numerical_zeros=False)
+
+        HT = wps.bsr_transposed(self._H_lite_uni_bsr)
+        Minv_HT = wps.bsr_mm(self._M_inv_dt2_bsr, HT)
+        self._W_lite_uni_bsr = wps.bsr_mm(self._H_lite_uni_bsr, Minv_HT)
+        self._W_lite_uni_total_rows = total_rows
+        return self._W_lite_uni_bsr
+
+    def reserve_a_schur_lite_bsr(self, W_bsr: wps.BsrMatrix) -> wps.BsrMatrix:
+        """Storage for ``A_schur`` with the sparsity of ``W_bsr``, which it shares; its values are not set."""
+        nnz = int(W_bsr.nnz)
+        n_rows = int(W_bsr.nrow)
+
+        if (
+            not hasattr(self, "_A_schur_lite_bsr")
+            or self._A_schur_lite_bsr is None
+            or int(self._A_schur_lite_bsr.values.shape[0]) < nnz
+        ):
+            # Allocate a placeholder via bsr_zeros (scalar block_type = fp64).
+            self._A_schur_lite_bsr = wps.bsr_zeros(
+                rows_of_blocks=n_rows,
+                cols_of_blocks=n_rows,
+                block_type=wp.float64,
+                device=self.device,
+            )
+            self._A_schur_lite_values_cap = max(nnz, 32)
+            self._A_schur_lite_bsr.values = wp.empty(
+                self._A_schur_lite_values_cap,
+                dtype=wp.float64,
+                device=self.device,
+            )
+
+        # Share W's pattern arrays (offsets + columns), no copy.
+        self._A_schur_lite_bsr.nrow = n_rows
+        self._A_schur_lite_bsr.ncol = n_rows
+        self._A_schur_lite_bsr.nnz = nnz
+        self._A_schur_lite_bsr.offsets = W_bsr.offsets
+        self._A_schur_lite_bsr.columns = W_bsr.columns
+
+        return self._A_schur_lite_bsr
+
+    def build_a_schur_lite_bsr(
+        self,
+        W_bsr: wps.BsrMatrix,
+        omega_d: wp.array,  # (total_rows,) fp64
+        compliance_d: wp.array,  # (total_rows,) fp64
+    ) -> wps.BsrMatrix:
+        """Construct ``A_schur = ωωᵀ ⊙ W + diag(c)`` in BSR (same sparsity as W).
+
+        ``warp.sparse`` collapses 1x1-block BSR storage to scalar fp64 values,
+        so ``W_bsr.values.dtype == wp.float64`` (not ``mat1x1``).  We allocate
+        the sibling A_schur matrix with the same convention.
+        """
+        from .kernels import build_a_schur_lite_bsr_kernel  # noqa: PLC0415
+
+        A = self.reserve_a_schur_lite_bsr(W_bsr)
+        wp.launch(
+            build_a_schur_lite_bsr_kernel,
+            dim=int(W_bsr.nrow),
+            inputs=[
+                W_bsr.offsets,
+                W_bsr.columns,
+                W_bsr.values,
+                omega_d,
+                compliance_d,
+            ],
+            outputs=[A.values],
+            device=self.device,
+        )
+        return A
 
     def build_schur_lite_dense(
         self,

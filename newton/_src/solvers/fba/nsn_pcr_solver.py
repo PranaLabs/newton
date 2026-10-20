@@ -4,7 +4,8 @@
 """Jacobi-preconditioned Conjugate Residual (PCR) solver for the NSN Schur LCP.
 
 The solver is used inside the Non-Smooth Newton (NSN) outer loop to solve the
-dense fp64 SPD reduced (Schur) system on every Newton step.
+dense fp64 SPD reduced (Schur) system on every Newton step, and the sparse
+Schur system of the lite mode.
 
 Algorithm: conjugate residuals on the symmetrically preconditioned system
 ``P^1/2 A P^1/2``, with the Jacobi preconditioner ``P = diag(A)^-1``:
@@ -103,6 +104,26 @@ def _compute_precond_kernel(
 
 
 _MAT1X1_F64 = wp.types.matrix((1, 1), wp.float64)
+
+
+@wp.kernel
+def _precond_from_bsr_diag_kernel(
+    diag: wp.array[wp.float64],
+    precond: wp.array[wp.float64],
+):
+    """Build ``precond[i] = 1/diag[i]`` for the LiteNSN sparse Schur.
+
+    ``warp.sparse`` stores 1x1-block BSR values as scalar fp64, so
+    :func:`warp.sparse.bsr_get_diag` returns an ``array[wp.float64]``
+    rather than ``array[mat1x1]``.  The zero-guard mirrors the dense
+    :func:`_compute_precond_kernel`.
+    """
+    i = wp.tid()
+    d = diag[i]
+    if d == wp.float64(0.0):
+        precond[i] = wp.float64(0.0)
+    else:
+        precond[i] = wp.float64(1.0) / d
 
 
 @wp.kernel
@@ -274,8 +295,9 @@ class NSNPCRSolver:
     ``P^1/2 A P^1/2``, with the step denominator ``(A p)ᵀ P (A p)``, which stays
     a Krylov method when the diagonal of ``A`` spans decades. It refuses
     near-null directions, so a singular ``A`` with an inconsistent right-hand
-    side returns a bounded least-squares iterate. Used as the inner linear
-    solver for the NSN Schur LCP system.
+    side returns a bounded least-squares iterate. :meth:`solve_sparse` runs the
+    same iteration on a sparse matrix. Used as the inner linear solver for the
+    NSN Schur LCP system.
 
     The solver is *stateless* between ``solve`` calls: every call starts from
     ``x = 0``. Device buffers are pre-allocated for ``max_n`` so repeated calls
@@ -285,8 +307,8 @@ class NSNPCRSolver:
         max_n: Maximum system dimension the solver will handle. Internal
             buffers are sized to this.
         device: Warp device for buffer allocation (typically ``"cuda:0"``).
-        tol: Relative tolerance: :meth:`solve` stops once
-            ``|b - A x| < tol |b|``.
+        tol: Relative tolerance: :meth:`solve` and :meth:`solve_sparse` stop
+            once ``|b - A x| < tol |b|``.
         max_iter: Outer-loop cap. Effective limit is ``min(max_iter, n)``.
         check_every: Convergence-check batching factor.  PCR runs this many
             iters fully asynchronously on the device before pulling ``rho``
@@ -336,6 +358,8 @@ class NSNPCRSolver:
         self._h = wp.zeros(self.max_n, dtype=wp.float64, device=device)
         self._s = wp.zeros(self.max_n, dtype=wp.float64, device=device)
         self._precond = wp.zeros(self.max_n, dtype=wp.float64, device=device)
+        # Diagonal of the sparse matrix of :meth:`solve_sparse`.
+        self._diag = wp.zeros(self.max_n, dtype=wp.float64, device=device)
 
         # Device-resident scalars for ``rho``, ``rho_old``, ``den``, ``alpha``,
         # ``beta``: keep the per-iter PCR coefficients on device so the inner
@@ -491,6 +515,105 @@ class NSNPCRSolver:
 
         return (nb_iter, rho)
 
+    def solve_sparse(
+        self,
+        W_bsr,
+        b: wp.array[wp.float64],
+        x_out: wp.array[wp.float64],
+    ) -> int:
+        """LiteNSN sparse-Schur PCR: ``W_bsr @ x = b`` for a BSR ``W`` with
+        ``1x1`` blocks.
+
+        Matches :meth:`solve` numerically: same termination criterion, same
+        Jacobi preconditioner, same ``check_every`` host-sync cadence, but
+        replaces the dense tiled matvec with :func:`warp.sparse.bsr_mv`.  This
+        is the linear-solver entry point for ``SolverFBA(nsn_schur_mode="lite")``.
+
+        The residual is first checked after ``check_every`` iterations. When all
+        ``max_iter`` iterations fit before it, the tolerance cannot end the run
+        early, and they run without reading the device: a zero ``b`` then leaves
+        ``x = 0`` through the protected step.
+
+        Args:
+            W_bsr: ``BsrMatrix`` of block shape ``(1, 1)`` and scalar type
+                ``wp.float64`` (the LiteNSN Schur ``H · M⁻¹ · Hᵀ``).
+            b: ``(n,)`` RHS, fp64.
+            x_out: ``(n,)`` output, fp64.
+
+        Returns:
+            The iterations taken.
+
+        Raises:
+            ValueError: when shapes are inconsistent.
+        """
+        import warp.sparse as wps  # noqa: PLC0415
+
+        n = int(b.shape[0])
+        if n <= 0:
+            raise ValueError(f"system size must be positive, got n={n}")
+        if n > self.max_n:
+            raise ValueError(f"system size n={n} exceeds preallocated max_n={self.max_n}")
+        if int(W_bsr.shape[0]) != n or int(W_bsr.shape[1]) != n:
+            raise ValueError(f"W_bsr shape {tuple(W_bsr.shape)} incompatible with b shape ({n},)")
+        if x_out.shape[0] != n:
+            raise ValueError(f"x_out shape ({x_out.shape[0]},) incompatible with b shape ({n},)")
+
+        device = self.device
+        max_iter = min(self.max_iter, n)
+        unchecked = max_iter <= self.check_every
+
+        # ----- x = 0 ----------------------------------------------------
+        self._x.zero_()
+
+        # ----- Early exit if b == 0 -------------------------------------
+        if not unchecked:
+            dot_b = float(wp.utils.array_inner(b, b, count=n))
+            if dot_b == 0.0:
+                wp.copy(x_out, self._x, count=n)
+                return 0
+
+        # ----- Build Jacobi preconditioner from W's diagonal ------------
+        diag_blocks = wps.bsr_get_diag(W_bsr, out=self._diag)
+        wp.launch(
+            _precond_from_bsr_diag_kernel,
+            dim=n,
+            inputs=[diag_blocks],
+            outputs=[self._precond],
+            device=device,
+        )
+
+        # ----- Symmetric PCR, as in :meth:`solve` -------------------------
+        # ``wps.bsr_mv`` checks that x.shape[0] == W.cols, so the scratch
+        # buffers (sized to max_n) are sliced to the active size ``n``.
+        wp.copy(self._r, b, count=n)
+        wp.launch(_apply_precond_kernel, dim=n, inputs=[self._r, self._precond], outputs=[self._s], device=device)
+        wp.copy(self._d, self._s, count=n)
+        wps.bsr_mv(W_bsr, self._d[:n], self._q[:n])
+        wp.utils.array_inner(self._s, self._q, out=self._rho_d, count=n)
+        self._stopped_d.zero_()
+        if unchecked:
+            for _ in range(max_iter):
+                self._pcr_iter_eager(None, n, n, device, W_bsr=W_bsr, diag=diag_blocks)
+            wp.copy(x_out, self._x, count=n)
+            return max_iter
+        tol_sq = self.tol * self.tol * dot_b
+        r_norm_sq = dot_b
+        # No CUDA-graph capture here: bsr_mv issues internal allocations on
+        # shape change that defeat capture; ``check_every`` bounds the host
+        # round-trips per solve.
+        nb_iter = 0
+        while nb_iter < max_iter and r_norm_sq > tol_sq:
+            block_end = min(nb_iter + self.check_every, max_iter)
+            while nb_iter < block_end:
+                self._pcr_iter_eager(None, n, n, device, W_bsr=W_bsr, diag=diag_blocks)
+                nb_iter += 1
+            wp.utils.array_inner(self._r, self._r, out=self._r_norm_d, count=n)
+            r_norm_sq = float(self._r_norm_d.numpy()[0])
+            if self._stopped_d.numpy()[0] != 0.0:
+                break
+        wp.copy(x_out, self._x, count=n)
+        return nb_iter
+
     # ------------------------------------------------------------------
     # Per-iter body + graph capture
     # ------------------------------------------------------------------
@@ -501,17 +624,25 @@ class NSNPCRSolver:
         n: int,
         n_pad: int,
         device: wp.Device | str,
+        W_bsr=None,
+        diag: wp.array[wp.float64] | None = None,
     ) -> None:
         """Issue one symmetric PCR iteration of :meth:`solve` on the active stream.
 
         All launches are stream-ordered and safe to call inside a CUDA graph
         capture.
+
+        With ``W_bsr`` and its ``diag``, the iteration of :meth:`solve_sparse`
+        multiplies by the sparse matrix instead of ``A``.
         """
         # t = P q, den = qᵀ P q.
         wp.launch(_apply_precond_kernel, dim=n, inputs=[self._q, self._precond], outputs=[self._h], device=device)
         wp.utils.array_inner(self._q, self._h, out=self._den_d, count=n)
         # Chart curvature of p: pᵀ A p against pᵀ diag(A) p.
-        wp.launch(_diag_scale_kernel, dim=n, inputs=[A, self._d], outputs=[self._dd], device=device)
+        if W_bsr is None:
+            wp.launch(_diag_scale_kernel, dim=n, inputs=[A, self._d], outputs=[self._dd], device=device)
+        else:
+            wp.launch(_apply_precond_kernel, dim=n, inputs=[self._d, diag], outputs=[self._dd], device=device)
         wp.utils.array_inner(self._d, self._q, out=self._curvature_d, count=n)
         wp.utils.array_inner(self._d, self._dd, out=self._chart_norm_d, count=n)
         wp.launch(
@@ -531,14 +662,19 @@ class NSNPCRSolver:
                 device=device,
             )
         # t = A z, rho = zᵀ A z, beta = rho / rho_old.
-        wp.launch_tiled(
-            _matvec_tiled_kernel,
-            dim=n,
-            inputs=[A, self._s, n_pad],
-            outputs=[self._h],
-            block_dim=_PCR_BLOCK_DIM,
-            device=device,
-        )
+        if W_bsr is None:
+            wp.launch_tiled(
+                _matvec_tiled_kernel,
+                dim=n,
+                inputs=[A, self._s, n_pad],
+                outputs=[self._h],
+                block_dim=_PCR_BLOCK_DIM,
+                device=device,
+            )
+        else:
+            import warp.sparse as wps  # noqa: PLC0415
+
+            wps.bsr_mv(W_bsr, self._s[:n], self._h[:n])
         wp.launch(_copy_scalar_kernel, dim=1, inputs=[self._rho_d], outputs=[self._rho_old_d], device=device)
         wp.utils.array_inner(self._s, self._h, out=self._rho_d, count=n)
         wp.launch(

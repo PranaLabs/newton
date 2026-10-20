@@ -4951,11 +4951,11 @@ class TestLiteContactsOnBoxes(unittest.TestCase):
         heights, _ = self._drop_on_boxes(1, "lite")
         np.testing.assert_allclose(heights, 0.055, rtol=0.0, atol=1.0e-5)
 
-    def test_five_contacts_on_a_particle_are_refused(self):
-        """Refuse a lite step in which a particle has five contacts, more than its Newton step holds."""
-        self._drop_on_boxes(4, "lite")
-        with self.assertRaises(NotImplementedError):
-            self._drop_on_boxes(5, "lite")
+    def test_five_contacts_on_a_particle_hold(self):
+        """Rest a cloth on five identical boxes in the lite NSN, five contacts on each particle, as on one box."""
+        heights, count = self._drop_on_boxes(5, "lite")
+        self.assertEqual(count, 5 * 25)
+        np.testing.assert_allclose(heights, self._drop_on_boxes(1, "lite")[0], rtol=0.0, atol=1.0e-4)
 
 
 if __name__ == "__main__":

@@ -866,7 +866,13 @@ class ClothSim:
         elif self.solver_name == "semi_implicit":
             self.solver = newton.solvers.SolverSemiImplicit(self.model)
         elif self.solver_name == "fba":
-            self.solver = newton.solvers.SolverFBA(self.model, iterations=self.iterations)
+            self.solver = newton.solvers.SolverFBA(
+                self.model,
+                iterations=self.iterations,
+                particle_enable_self_contact=particle_enable_self_contact,
+                particle_self_contact_margin=self.particle_self_contact_margin,
+                particle_self_contact_gap=self.particle_self_contact_gap,
+            )
         else:
             raise ValueError("Unsupported solver type: " + self.solver_name)
 
@@ -1206,16 +1212,16 @@ class TestCloth(unittest.TestCase):
 
 
 tests_to_run = {
-    # SolverFBA simulates no springs, so it leaves out the stitching case, and no self contact, so it leaves out the
-    # collision case, whose cloth folds onto itself. It leaves out two more: its bending, quadratic in the positions,
-    # holds the folds of the complex rest angle cloth 0.11 rad from their rest angles under gravity; and over the
-    # 350 cm free fall the velocities it takes from float32 positions drift the cloth by 0.08 cm.
+    # SolverFBA simulates no springs, so it leaves out the stitching case, and two more: its bending, quadratic in
+    # the positions, holds the folds of the complex rest angle cloth 0.11 rad from their rest angles under gravity;
+    # and over the 350 cm free fall the velocities it takes from float32 positions drift the cloth by 0.08 cm.
     "fba": [
         test_cloth_free_fall,
         test_cloth_sagging,
         test_cloth_bending,
         test_cloth_bending_consistent_angle_computation,
         test_cloth_bending_non_zero_rest_angle_bending,
+        test_cloth_collision,
         test_cloth_body_collision,
     ],
     "xpbd": [
@@ -1305,6 +1311,7 @@ def test_cloth_body_collision(test, device, solver):
 # Test both collision tests with collision pipeline for solvers that support it
 collision_pipeline_tests_to_run = {
     "fba": [
+        test_cloth_collision,
         test_cloth_body_collision,
     ],
     "xpbd": [
