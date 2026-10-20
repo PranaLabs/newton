@@ -1010,13 +1010,15 @@ class ViewerGL(ViewerBase):
         if color is not None:
             self.objects[name].color = (float(color[0]), float(color[1]), float(color[2]))
 
-        if roughness is not None or metallic is not None:
-            r, m, c, t = self.objects[name].material
-            if roughness is not None:
-                r = float(roughness)
-            if metallic is not None:
-                m = float(metallic)
-            self.objects[name].material = (r, m, c, t)
+        r, m, c, t = self.objects[name].material
+        if roughness is not None:
+            r = float(roughness)
+        if metallic is not None:
+            m = float(metallic)
+        # The mesh fragment shader samples the texture only where material.w is set; MeshGL drops its texture on
+        # an update without one.
+        t = 1.0 if (texture is not None and self.objects[name].texture_id is not None) else 0.0
+        self.objects[name].material = (r, m, c, t)
 
     def _update_mesh_instancer(
         self,
