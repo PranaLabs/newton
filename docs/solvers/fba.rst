@@ -129,9 +129,9 @@ Model Inputs
   state has them.
 
 FBA does not simulate rigid bodies: a model with bodies raises
-``NotImplementedError``. It does not simulate springs either, cloth self
-contact, or the inputs of :class:`~newton.Control`, and it does not read the
-damping coefficients ``tri_kd``, ``edge_kd`` and ``k_damp`` of the elements.
+``NotImplementedError``. It does not simulate springs either, or the inputs of
+:class:`~newton.Control`, and it does not read the damping coefficients
+``tri_kd``, ``edge_kd`` and ``k_damp`` of the elements.
 
 Contacts
 --------
@@ -141,12 +141,20 @@ Contacts
   replaces the inverse system matrix by the inverse masses, which decouples
   the contacts of different particles and costs far less, but lets a pressed
   contact settle inside its shape by up to ``dt² F / m`` for a normal force
-  ``F`` on a particle of mass ``m``.
+  ``F`` on a particle of mass ``m``. In steps with self contacts or more than
+  four contacts on a particle, ``nsn_lite_accumulate=True`` keeps the contact
+  forces of a step's earlier
+  iterations and models only their change, so that the iterations approach
+  the forces whose exact motion closes the gaps and stacked layers keep their
+  margin at longer steps.
 - ``face_contacts=True`` adds a contact at the deepest point of a triangle
   inside a shape, so shape edges and corners cannot pass between the
   particles of coarse cloth, and holds particles in concave corners of
   meshes. It needs friction and the full operator.
-- The friction coefficient of a particle contact is its shape's ``mu``.
+- ``particle_enable_self_contact=True`` makes the triangles collide with each
+  other, through vertex-face or vertex-vertex contacts.
+- The friction coefficient of a particle contact is its shape's ``mu``, and
+  ``model.particle_mu`` for self contacts.
 - :attr:`~newton.solvers.SolverBase.ObservableKind.CONTACT_F` reports the
   force of each particle contact on its shape; see :ref:`solver_observables`.
 

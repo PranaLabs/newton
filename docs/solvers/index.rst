@@ -88,7 +88,7 @@ Supported Features
      - ❌
      - ❌
      - ✅
-     - 🟨 no self-collision
+     - ✅
      - ✅
      - ❌
    * - :class:`~newton.solvers.SolverFeatherstone`

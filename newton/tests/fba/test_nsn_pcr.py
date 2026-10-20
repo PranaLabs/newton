@@ -185,6 +185,25 @@ class TestPCRScaledAndSingular(_PCRTestCase):
         x, _, _ = self._solve(A, b)
         self.assertLess(np.linalg.norm(b - A @ x) / np.linalg.norm(b), 1.0e-8)
 
+    def test_sparse_scaled_diagonal_converges(self):
+        """Solve the same system given as a BSR matrix, as the lite NSN builds it, with ``solve_sparse`` to the dense
+        solve's result."""
+        import warp.sparse as wps  # noqa: PLC0415
+
+        n = 120
+        rng = np.random.default_rng(7)
+        scale = np.sqrt(10.0 ** rng.uniform(-4.0, 3.0, n))
+        A = scale[:, None] * _make_spd(n, seed=7) * scale[None, :]
+        b = rng.standard_normal(n)
+        rows, cols = (wp.array(a, dtype=wp.int32, device=self.device) for a in np.nonzero(np.ones((n, n))))
+        values = wp.array(A.ravel(), dtype=wp.float64, device=self.device)
+        W = wps.bsr_from_triplets(n, n, rows, cols, values)
+        x = wp.zeros(n, dtype=wp.float64, device=self.device)
+        solver = NSNPCRSolver(max_n=n, device=self.device, tol=1.0e-10, max_iter=1000)
+        solver.solve_sparse(W, wp.array(b, dtype=wp.float64, device=self.device), x)
+        self.assertLess(np.linalg.norm(b - A @ x.numpy()) / np.linalg.norm(b), 1.0e-8)
+        np.testing.assert_allclose(x.numpy(), self._solve(A, b)[0], rtol=1.0e-6, atol=1.0e-12)
+
     def test_near_null_directions_are_refused(self):
         """Keep the iterate bounded on redundant rows with an inconsistent right-hand side.
 
@@ -202,6 +221,54 @@ class TestPCRScaledAndSingular(_PCRTestCase):
         gain = np.linalg.norm(c * x) / np.linalg.norm(b / c)
         self.assertLess(gain, 3.0 * np.linalg.norm(c * x_ls) / np.linalg.norm(b / c))
         self.assertLess(np.linalg.norm(b - A @ x), 3.0 * np.linalg.norm(b - A @ x_ls))
+
+
+class TestPCRFusedSparse(_PCRTestCase):
+    """The fused sparse iterations of ``solve_sparse_fused`` against ``solve_sparse``."""
+
+    def _both(self, A: np.ndarray, b: np.ndarray, max_iter: int) -> list[tuple[np.ndarray, int]]:
+        """The solution and iteration count of ``solve_sparse`` and of ``solve_sparse_fused`` for ``A`` in CSR form."""
+        import warp.sparse as wps  # noqa: PLC0415
+
+        n = len(b)
+        rows, cols = np.nonzero(A)
+        arrays = [wp.array(a, dtype=t, device=self.device) for a, t in ((rows, wp.int32), (cols, wp.int32))]
+        W = wps.bsr_from_triplets(n, n, *arrays, wp.array(A[rows, cols], dtype=wp.float64, device=self.device))
+        out = []
+        for name in ("solve_sparse", "solve_sparse_fused"):
+            solver = NSNPCRSolver(max_n=n, device=self.device, tol=1.0e-10, max_iter=max_iter)
+            x = wp.zeros(n, dtype=wp.float64, device=self.device)
+            iters = getattr(solver, name)(W, wp.array(b, dtype=wp.float64, device=self.device), x)
+            out.append((x.numpy(), iters))
+        return out
+
+    def _sparse_spd(self, n: int, seed: int) -> np.ndarray:
+        """A diagonally dominant sparse SPD matrix, 1 % of its entries off the diagonal."""
+        rng = np.random.default_rng(seed)
+        S = np.where(rng.random((n, n)) < 0.01, rng.standard_normal((n, n)), 0.0)
+        S = S + S.T
+        np.fill_diagonal(S, 0.0)
+        return S + np.diag(np.abs(S).sum(axis=1) + rng.uniform(0.5, 2.0, n))
+
+    def test_fused_iterations_match_solve_sparse(self):
+        """Take the ten iterations of a lite NSN step on 600 rows, three blocks, as ``solve_sparse`` does, to
+        rounding, and keep ``x = 0`` for a zero right-hand side through the protected step."""
+        A = self._sparse_spd(600, seed=3)
+        b = np.random.default_rng(4).standard_normal(600)
+        (x_ref, iters_ref), (x, iters) = self._both(A, b, max_iter=10)
+        self.assertEqual((iters, iters_ref), (10, 10))
+        np.testing.assert_allclose(x, x_ref, rtol=1.0e-12, atol=1.0e-14 * np.abs(x_ref).max())
+        (_, _), (x, _) = self._both(A, np.zeros(600), max_iter=10)
+        np.testing.assert_array_equal(x, 0.0)
+
+    def test_checked_runs_take_solve_sparse(self):
+        """Run ``solve_sparse`` itself when the iteration cap exceeds its convergence check interval."""
+        A = self._sparse_spd(300, seed=6)
+        b = np.random.default_rng(7).standard_normal(300)
+        (x_ref, iters_ref), (x, iters) = self._both(A, b, max_iter=1000)
+        self.assertEqual(iters, iters_ref)
+        np.testing.assert_array_equal(x, x_ref)
+        self.assertLess(np.linalg.norm(b - A @ x) / np.linalg.norm(b), 1.0e-9)
 
 
 class TestPCRReuse(_PCRTestCase):
