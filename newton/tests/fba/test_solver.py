@@ -1317,6 +1317,322 @@ class TestSolverFBAStability(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(q)), "64x64 cloth went NaN at realistic tri_ke=1e4")
 
 
+class TestCorotationalProjection(unittest.TestCase):
+    """Tests for the corotational stretching local projection kernel."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _make_unit_triangle(self):
+        """Return positions, Dm_inv=I₂, weight=1 for an axis-aligned triangle at rest."""
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0, 0, 1)],
+            dtype=wp.vec3,
+            device="cuda:0" if wp.is_cuda_available() else "cpu",
+        )
+        tri_indices = wp.array([0, 1, 2], dtype=wp.int32, device=positions.device)
+        Dm_inv = wp.array([wp.mat22(1.0, 0.0, 0.0, 1.0)], dtype=wp.mat22, device=positions.device)
+        weight = wp.array([1.0], dtype=wp.float32, device=positions.device)
+        return positions, tri_indices, Dm_inv, weight
+
+    def test_rest_configuration_F_equals_I_projects_to_I(self):
+        """Project to sigma_proj=1 at rest (F~=I in the local frame), where the corotational energy has zero gradient.
+
+        The contributions match the ARAP-at-identity case:
+            rhs[1] == (1, 0, 0); rhs[2] == (0, 0, 1); rhs[0] == -(rhs[1]+rhs[2]).
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_corotational_kernel  # noqa: PLC0415
+
+        positions, tri_indices, Dm_inv, weight = self._make_unit_triangle()
+        device = positions.device
+
+        mu, lam = 1.0, 0.5
+        rhs = _projection_rhs(
+            project_stretching_corotational_kernel,
+            [positions, tri_indices, Dm_inv, weight, wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device)],
+            3,
+        )
+        r = rhs
+        # At rest sigma=1: corot energy has zero gradient, projection maps to 1.
+        # P = U*diag(1,1)*Vt = I (embedding), identical to ARAP at rest.
+        np.testing.assert_allclose(r[1], [1.0, 0.0, 0.0], atol=1e-5)
+        np.testing.assert_allclose(r[2], [0.0, 0.0, 1.0], atol=1e-5)
+        np.testing.assert_allclose(r[0], -(r[1] + r[2]), atol=1e-5)
+
+    def test_isotropic_stretch_pulls_sigma_back(self):
+        """Pull an isotropic stretch s0 = (1.5, 1.5) back to the closed-form sigma_proj = (1.2, 1.2) (mu=1, lam=0.5).
+
+        Analytical derivation:
+            k = 2*mu = 2, M = 4*mu+lam = 4.5, det = M^2-lam^2 = 20.
+            b = 2*(mu+lam) + k*s0 = 3 + 3 = 6 (same for both).
+            sigma_proj = (M*b - lam*b)/det = (4.5*6 - 0.5*6)/20 = 24/20 = 1.2.
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_corotational_kernel  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        # Scale current positions by 1.5 to get isotropic stretch F = 1.5·I.
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1.5, 0, 0), wp.vec3(0, 0, 1.5)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tri_indices = wp.array([0, 1, 2], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat22(1.0, 0.0, 0.0, 1.0)], dtype=wp.mat22, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+
+        mu, lam = 1.0, 0.5
+        rhs = _projection_rhs(
+            project_stretching_corotational_kernel,
+            [positions, tri_indices, Dm_inv, weight, wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device)],
+            3,
+        )
+        r = rhs
+
+        # For isotropic stretch by 1.5 with Dm_inv=I: F=1.5*I, U=V=I.
+        # P = U*diag(1.2,1.2)*Vt = 1.2*I (the 3x2 embedding scaled by 1.2).
+        # Contributions: row0 = Dm_inv[0,:]*Pt*w = (1.2, 0, 0); row1 = (0, 0, 1.2).
+        np.testing.assert_allclose(r[1], [1.2, 0.0, 0.0], atol=1e-5)
+        np.testing.assert_allclose(r[2], [0.0, 0.0, 1.2], atol=1e-5)
+        np.testing.assert_allclose(r[0], -(r[1] + r[2]), atol=1e-5)
+
+    def test_solver_corotational_runs_no_nan(self):
+        """Step a small cloth 50 times with ``stretching_model='corotational'`` to finite positions."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 2, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=8,
+            dim_y=8,
+            cell_x=0.05,
+            cell_y=0.05,
+            mass=0.1,
+            tri_ke=3571.0,
+            tri_ka=4286.0,
+            tri_kd=0.0,
+            edge_ke=0.1,
+            edge_kd=0.0,
+            fix_left=False,
+        )
+        # Pin top-left and top-right corners.
+        top_left = 8 * (8 + 1)
+        top_right = 8 * (8 + 1) + 8
+        builder.particle_mass[top_left] = 0.0
+        builder.particle_mass[top_right] = 0.0
+        model = builder.finalize()
+
+        solver = SolverFBA(model, iterations=8, stretching_model="corotational")
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+        for _ in range(50):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite values in corotational simulation")
+
+    def test_solver_init_requires_lame_for_corot(self):
+        """Refuse triangles without a positive k_lambda with ``stretching_model='corotational'``."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=50.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+            fix_left=True,
+        )
+        model = builder.finalize()
+
+        with self.assertRaises(ValueError):
+            SolverFBA(model, stretching_model="corotational")  # k_lambda = tri_ka = 0
+
+    def test_lame_parameters_come_from_each_element(self):
+        """Project each triangle with its own k_mu and k_lambda, scaled by its own gauge."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder()
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            **{"dim_x": 2, "dim_y": 1, "cell_x": 0.1, "cell_y": 0.1, "mass": 0.01, "tri_ke": 1.0e3, "tri_ka": 2.0e3},
+        )
+        model = builder.finalize()
+        materials = model.tri_materials.numpy()
+        materials[1, :2] = (3.0e3, 5.0e2)
+        model.tri_materials.assign(materials)
+        lame = SolverFBA(model, stretching_model="corotational")._tri_lame_d.numpy()
+        mu, lam = materials[:, 0].astype(np.float64), materials[:, 1].astype(np.float64)
+        gauge = (4.0 * mu + 3.0 * lam) / (2.0 * mu + lam)
+        np.testing.assert_allclose(lame, np.stack([mu * gauge, lam * gauge], axis=1), rtol=1e-6)
+
+
+class TestNeoHookeanProjection(unittest.TestCase):
+    """Unit tests for the Neo-Hookean triangle projection kernel."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _device(self):
+        return "cuda:0" if wp.is_cuda_available() else "cpu"
+
+    def test_rest_configuration_projects_to_identity(self):
+        """Leave sigma=(1,1) unchanged at rest, where J=1, log_J=0 and the gradient vanishes.
+
+        With sigma_sq=(1,1): sigma0=(1,1), k=2*mu, J=1, log_J=0, inv=(1,1).
+        grad_0 = mu*(1-1) + lam*0*1 + k*(1-1) = 0.
+        grad_1 = 0 similarly, so the projection keeps sigma at (1,1).
+        The contributions match ARAP-at-rest: rhs[1]=(1,0,0), rhs[2]=(0,0,1).
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_neohookean_kernel  # noqa: PLC0415
+
+        device = self._device()
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0, 0, 1)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tri_indices = wp.array([0, 1, 2], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat22(1.0, 0.0, 0.0, 1.0)], dtype=wp.mat22, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+
+        mu, lam = 1.0, 0.5
+        rhs = _projection_rhs(
+            project_stretching_neohookean_kernel,
+            [positions, tri_indices, Dm_inv, weight, wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device)],
+            3,
+        )
+        r = rhs
+        # At rest: sigma=(1,1), P = U*I*Vt = embedding I (3x2). Contributions as for ARAP.
+        np.testing.assert_allclose(r[1], [1.0, 0.0, 0.0], atol=1e-5)
+        np.testing.assert_allclose(r[2], [0.0, 0.0, 1.0], atol=1e-5)
+        np.testing.assert_allclose(r[0], -(r[1] + r[2]), atol=1e-5)
+
+    def test_isotropic_stretch_NH_returns_finite_sigma(self):
+        """Pull sigma_0=(1.5,1.5) (mu=1, lam=0.5) back to a finite, positive sigma below 1.5, with a gradient norm
+        below 1e-3.
+
+        NH energy pulls sigma back toward 1 (incompressibility); the result should
+        lie strictly between 0 and 1.5.  We also verify the gradient at the final
+        sigma is small: the L-BFGS projection converges.
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_neohookean_kernel  # noqa: PLC0415
+
+        device = self._device()
+        # Scale current positions by 1.5: sigma_sq = (1.5^2, 1.5^2) = (2.25, 2.25)
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1.5, 0, 0), wp.vec3(0, 0, 1.5)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tri_indices = wp.array([0, 1, 2], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat22(1.0, 0.0, 0.0, 1.0)], dtype=wp.mat22, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+
+        mu, lam = 1.0, 0.5
+        rhs = _projection_rhs(
+            project_stretching_neohookean_kernel,
+            [positions, tri_indices, Dm_inv, weight, wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device)],
+            3,
+        )
+        r = rhs
+        # With Dm_inv=I and isotropic stretch, u0=(1,0,0), u1=(0,0,1), V=I.
+        # P = diag(sigma_proj, sigma_proj) (embedded). Row0=(sigma_proj,0,0), row1=(0,0,sigma_proj).
+        # rhs[1] = (sigma_proj, 0, 0), rhs[2] = (0, 0, sigma_proj).
+        sigma_proj = r[1][0]
+        self.assertTrue(np.isfinite(sigma_proj), "sigma_proj is not finite")
+        self.assertGreater(sigma_proj, 0.0, "sigma_proj must be positive")
+        self.assertLess(sigma_proj, 1.5, "NH should pull sigma back from 1.5 toward 1")
+
+        # Verify gradient is small at the converged sigma.
+        k = 2.0 * mu
+        sigma0 = 1.5
+        J = sigma_proj * sigma_proj
+        log_J = np.log(J)
+        inv_s = 1.0 / sigma_proj
+        grad = mu * (sigma_proj - inv_s) + lam * log_J * inv_s + k * (sigma_proj - sigma0)
+        self.assertLess(abs(grad), 1e-3, f"Gradient at converged sigma too large: {abs(grad):.2e}")
+
+    def test_solver_neohookean_runs_no_nan(self):
+        """Step a small cloth 50 times with ``stretching_model='neohookean'`` to finite positions."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 2, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=8,
+            dim_y=8,
+            cell_x=0.05,
+            cell_y=0.05,
+            mass=0.1,
+            tri_ke=3571.4285714285716,
+            tri_ka=14285.71428571429,
+            tri_kd=0.0,
+            edge_ke=0.1,
+            edge_kd=0.0,
+            fix_left=False,
+        )
+        # Pin top-left and top-right corners.
+        top_left = 8 * (8 + 1)
+        top_right = 8 * (8 + 1) + 8
+        builder.particle_mass[top_left] = 0.0
+        builder.particle_mass[top_right] = 0.0
+        model = builder.finalize()
+
+        solver = SolverFBA(model, iterations=5, stretching_model="neohookean")
+        s_in, s_out = model.state(), model.state()
+        dt = 0.01
+        for _ in range(50):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite values in neohookean simulation")
+
+    def test_solver_init_requires_lame_for_neohookean(self):
+        """Refuse triangles without a positive k_lambda with ``stretching_model='neohookean'``."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=50.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+            fix_left=True,
+        )
+        model = builder.finalize()
+
+        with self.assertRaises(ValueError):
+            SolverFBA(model, stretching_model="neohookean")  # k_lambda = tri_ka = 0
+
+
 class TestDynamicPin(unittest.TestCase):
     """Verify SolverFBA.set_pin_targets moves pinned particle to new targets."""
 
@@ -1430,11 +1746,504 @@ class TestDynamicPin(unittest.TestCase):
         np.testing.assert_array_equal(s0.particle_qd.numpy()[top], 0.0)
 
 
+class TestTetHessianAssembly(unittest.TestCase):
+    """Verify tet Hessian block assembly in build_pd_system."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _build_single_tet_model(self):
+        """Single tetrahedron: (0,0,0),(1,0,0),(0,1,0),(0,0,1). Pin vertex 0."""
+        builder = newton.ModelBuilder()
+        p0 = builder.add_particle(pos=wp.vec3(0.0, 0.0, 0.0), vel=wp.vec3(0.0, 0.0, 0.0), mass=1.0)
+        p1 = builder.add_particle(pos=wp.vec3(1.0, 0.0, 0.0), vel=wp.vec3(0.0, 0.0, 0.0), mass=1.0)
+        p2 = builder.add_particle(pos=wp.vec3(0.0, 1.0, 0.0), vel=wp.vec3(0.0, 0.0, 0.0), mass=1.0)
+        p3 = builder.add_particle(pos=wp.vec3(0.0, 0.0, 1.0), vel=wp.vec3(0.0, 0.0, 0.0), mass=1.0)
+        builder.add_tetrahedron(p0, p1, p2, p3, k_mu=1.0e3, k_lambda=1.0e3)
+        builder.particle_mass[p0] = 0.0
+        return builder.finalize(device="cpu")
+
+    def test_tet_meta_populated(self):
+        """Record a tetrahedron's indices, rest inverse, weight and volume in the PD system's metadata."""
+        model = self._build_single_tet_model()
+        _A, meta = build_pd_system(model, dt=1.0 / 60.0, pin_stiffness=1e12)
+        self.assertEqual(meta["tet_indices"].shape, (1, 4))
+        self.assertEqual(meta["tet_rest_inv"].shape, (1, 3, 3))
+        self.assertEqual(meta["tet_weight"].shape, (1,))
+        # volume of canonical tet = 1/6
+        np.testing.assert_allclose(meta["tet_volume"][0], 1.0 / 6.0, rtol=1e-5)
+
+    def test_tet_hessian_symmetric(self):
+        """Assemble a symmetric PD matrix for a single tetrahedron."""
+        model = self._build_single_tet_model()
+        A = build_pd_system(model, dt=1.0 / 60.0, pin_stiffness=1e12)[0].toarray()
+        diff = A - A.T
+        self.assertLess(np.abs(diff).max(), 1e-10, "tet Hessian is not symmetric")
+
+    def test_tet_hessian_psd(self):
+        """Assemble a positive semi-definite PD matrix for a single tetrahedron."""
+        model = self._build_single_tet_model()
+        A, _meta = build_pd_system(model, dt=1.0 / 60.0, pin_stiffness=1e12)
+        eigenvalues = np.linalg.eigvalsh(A.toarray())
+        self.assertGreater(eigenvalues.min(), -1e-8, "tet Hessian has negative eigenvalue")
+
+
+class TestTetARAP(unittest.TestCase):
+    """Tests for the tet ARAP projection kernel, project_stretching_arap_tet_kernel."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_rest_tet_projects_to_identity(self):
+        """Contribute w times the identity rows at rest (F=I).
+
+        For canonical tet (0,0,0),(1,0,0),(0,1,0),(0,0,1):
+        Ds = I, Dm_inv = I (since Dm = I), F = I, R = I.
+        proj = w * I * I^T = w * I.
+        row0=(1,0,0)*w, row1=(0,1,0)*w, row2=(0,0,1)*w
+        rhs[0] = -(row0+row1+row2) = -(1,1,1)*w
+        rhs[1] = (1,0,0)*w; rhs[2] = (0,1,0)*w; rhs[3] = (0,0,1)*w
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_arap_tet_kernel  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0, 1, 0), wp.vec3(0, 0, 1)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tet_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
+        # Dm_inv = I for canonical tet
+        Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+
+        rhs = _projection_rhs(project_stretching_arap_tet_kernel, [positions, tet_indices, Dm_inv, weight], 4)
+        r = rhs
+        np.testing.assert_allclose(r[1], [1.0, 0.0, 0.0], atol=1e-6)
+        np.testing.assert_allclose(r[2], [0.0, 1.0, 0.0], atol=1e-6)
+        np.testing.assert_allclose(r[3], [0.0, 0.0, 1.0], atol=1e-6)
+        np.testing.assert_allclose(r[0], -(r[1] + r[2] + r[3]), atol=1e-6)
+
+    def test_rotation_invariance(self):
+        """Sum the contributions of a pure rotation F = R0 to zero."""
+        from newton._src.solvers.fba.kernels import project_stretching_arap_tet_kernel  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        # 30-degree rotation about z-axis
+        angle = np.pi / 6.0
+        c, s = np.cos(angle), np.sin(angle)
+        R0 = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float32)
+        # Rotated tet: apply R0 to canonical vertices
+        verts = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
+        verts_rot = verts @ R0.T  # (4,3)
+
+        positions = wp.array([wp.vec3(*v) for v in verts_rot], dtype=wp.vec3, device=device)
+        tet_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
+        # Dm_inv = I for canonical tet
+        Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+
+        rhs = _projection_rhs(project_stretching_arap_tet_kernel, [positions, tet_indices, Dm_inv, weight], 4)
+        r = rhs
+        # Momentum conservation: rhs[0] + rhs[1] + rhs[2] + rhs[3] = 0
+        total = r[0] + r[1] + r[2] + r[3]
+        np.testing.assert_allclose(total, [0.0, 0.0, 0.0], atol=1e-5)
+
+    def test_momentum_conservation_arbitrary_deformation(self):
+        """Sum the contributions to zero under an arbitrary deformation (momentum conservation)."""
+        from newton._src.solvers.fba.kernels import project_stretching_arap_tet_kernel  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        # Arbitrary (non-rest, non-rotated) positions
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1.3, 0.1, 0), wp.vec3(0.2, 1.2, 0.1), wp.vec3(0.1, 0.2, 1.1)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tet_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
+        weight = wp.array([2.0], dtype=wp.float32, device=device)
+
+        rhs = _projection_rhs(project_stretching_arap_tet_kernel, [positions, tet_indices, Dm_inv, weight], 4)
+        r = rhs
+        total = r[0] + r[1] + r[2] + r[3]
+        np.testing.assert_allclose(total, [0.0, 0.0, 0.0], atol=1e-5)
+
+
+class TestTetARAPIntegration(unittest.TestCase):
+    """Smoke and integration tests for SolverFBA with tet softbody."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _build_tet_grid(self, dim: int = 4):
+        """Build a dim x dim x dim tet grid, pinning the left face via fix_left=True."""
+        builder = newton.ModelBuilder()
+        builder.add_soft_grid(
+            pos=wp.vec3(0.0, 0.0, 0.1),  # lift off ground
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=dim,
+            dim_y=dim,
+            dim_z=dim,
+            cell_x=0.1,
+            cell_y=0.1,
+            cell_z=0.1,
+            density=1.0e3,
+            k_mu=1.0e4,
+            k_lambda=1.0e4,
+            k_damp=0.0,
+            fix_left=True,
+        )
+        return builder.finalize()
+
+    def test_softbody_cube_smoke_no_nan(self):
+        """Run 100 steps on a 4x4x4 tet grid; verify no NaN."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._build_tet_grid(dim=4)
+        self.assertGreater(model.tet_count, 0, "model should have tets")
+        solver = SolverFBA(model, iterations=10)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+        for _ in range(100):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite positions after 100 tet steps")
+
+    def test_softbody_gravity_sag(self):
+        """Deform a tet grid pinned on its left face under gravity."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._build_tet_grid(dim=4)
+        solver = SolverFBA(model, iterations=10)
+        s_in, s_out = model.state(), model.state()
+        q_initial = s_in.particle_q.numpy().copy()
+        dt = 1.0 / 60.0
+        for _ in range(200):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q_final = s_in.particle_q.numpy()
+        # At least some free particles should have moved under gravity.
+        max_displacement = np.abs(q_final - q_initial).max()
+        self.assertGreater(max_displacement, 1e-3, "tet softbody did not deform under gravity")
+
+
+class TestTetCorotational(unittest.TestCase):
+    """Tests for 3D corotational tet projection kernel."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _device(self):
+        return "cuda:0" if wp.is_cuda_available() else "cpu"
+
+    def test_rest_tet_corot_projects_to_identity(self):
+        """Project to sigma_proj=(1,1,1) at rest (F=I), where the corotational gradient vanishes.
+
+        For canonical tet with Dm_inv=I: F=I, sigma=(1,1,1).
+        At rest, energy gradient is zero, so sigma_proj = (1,1,1).
+        The contributions match ARAP-at-rest:
+            rhs[1]=(1,0,0), rhs[2]=(0,1,0), rhs[3]=(0,0,1), rhs[0]=-(sum).
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_corotational_tet_kernel  # noqa: PLC0415
+
+        device = self._device()
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0, 1, 0), wp.vec3(0, 0, 1)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tet_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+
+        mu, lam = 1.0, 0.5
+        rhs = _projection_rhs(
+            project_stretching_corotational_tet_kernel,
+            [positions, tet_indices, Dm_inv, weight, wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device)],
+            4,
+        )
+        r = rhs
+        # At rest: sigma=(1,1,1), corot energy gradient=0, sigma_proj=(1,1,1).
+        # P = U*diag(1,1,1)*Vt = I. proj = w*Dm_inv*I = I. Contributions as ARAP-at-rest.
+        np.testing.assert_allclose(r[1], [1.0, 0.0, 0.0], atol=1e-5)
+        np.testing.assert_allclose(r[2], [0.0, 1.0, 0.0], atol=1e-5)
+        np.testing.assert_allclose(r[3], [0.0, 0.0, 1.0], atol=1e-5)
+        np.testing.assert_allclose(r[0], -(r[1] + r[2] + r[3]), atol=1e-5)
+
+    def test_isotropic_stretch_corot_3d(self):
+        """Pull sigma_0=(1.5,1.5,1.5) (mu=1, lam=0.5) back to the closed-form sigma_proj≈1.18182 in all three.
+
+        Closed-form derivation:
+            sum_b = 6*mu + 9*lam + 2*mu*(sigma_0_0+sigma_0_1+sigma_0_2)
+                  = 6 + 4.5 + 2*(3*1.5) = 6 + 4.5 + 9 = 19.5
+            alpha = 4*mu = 4
+            alpha + 3*lam = 4 + 1.5 = 5.5
+            sigma_proj_i = (2*mu + 3*lam + 2*mu*sigma_0_i)/(4*mu) - lam*sum_b/(4*mu*(4*mu+3*lam))
+                         = (2 + 1.5 + 3)/4 - 0.5*19.5/(4*5.5)
+                         = 6.5/4 - 9.75/22
+                         = 1.625 - 0.443182...
+                         = 1.18182...
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_corotational_tet_kernel  # noqa: PLC0415
+
+        device = self._device()
+        # Isotropic 1.5x stretch: move vertices to make F = 1.5*I.
+        # Ds = 1.5*I (edge vectors scaled by 1.5), Dm_inv = I -> F = 1.5*I.
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1.5, 0, 0), wp.vec3(0, 1.5, 0), wp.vec3(0, 0, 1.5)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tet_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+
+        mu, lam = 1.0, 0.5
+        rhs = _projection_rhs(
+            project_stretching_corotational_tet_kernel,
+            [positions, tet_indices, Dm_inv, weight, wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device)],
+            4,
+        )
+        r = rhs
+
+        # F = 1.5*I -> U=V=I, sigma=(1.5,1.5,1.5).
+        # sigma_proj ~= 1.18182 for all three.
+        # P = I*diag(sigma_proj)*I = sigma_proj*I.
+        # proj = w*Dm_inv*P^T = sigma_proj*I.
+        # row0=(sigma_proj,0,0), row1=(0,sigma_proj,0), row2=(0,0,sigma_proj)
+        expected = 1.625 - 0.5 * 19.5 / (4.0 * 5.5)  # ~1.18182
+        np.testing.assert_allclose(r[1], [expected, 0.0, 0.0], atol=1e-5)
+        np.testing.assert_allclose(r[2], [0.0, expected, 0.0], atol=1e-5)
+        np.testing.assert_allclose(r[3], [0.0, 0.0, expected], atol=1e-5)
+        np.testing.assert_allclose(r[0], -(r[1] + r[2] + r[3]), atol=1e-5)
+
+    def test_momentum_conservation_corot_3d(self):
+        """Sum the contributions to zero under an arbitrary deformation (momentum conservation)."""
+        from newton._src.solvers.fba.kernels import project_stretching_corotational_tet_kernel  # noqa: PLC0415
+
+        device = self._device()
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1.3, 0.1, 0), wp.vec3(0.2, 1.2, 0.1), wp.vec3(0.1, 0.2, 1.1)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tet_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
+        weight = wp.array([2.0], dtype=wp.float32, device=device)
+
+        mu, lam = 1.0e3, 5.0e2
+        rhs = _projection_rhs(
+            project_stretching_corotational_tet_kernel,
+            [positions, tet_indices, Dm_inv, weight, wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device)],
+            4,
+        )
+        r = rhs
+        total = r[0] + r[1] + r[2] + r[3]
+        np.testing.assert_allclose(total, [0.0, 0.0, 0.0], atol=1e-4)
+
+    def test_solver_corot_tet_softbody_runs(self):
+        """Step a 4x4x4 tet grid 50 times with ``stretching_model='corotational'`` to finite positions."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder()
+        builder.add_soft_grid(
+            pos=wp.vec3(0.0, 0.0, 0.1),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=4,
+            dim_y=4,
+            dim_z=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            cell_z=0.1,
+            density=1.0e3,
+            k_mu=1.0e4,
+            k_lambda=1.0e4,
+            k_damp=0.0,
+            fix_left=True,
+        )
+        model = builder.finalize()
+
+        solver = SolverFBA(model, iterations=10, stretching_model="corotational")
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+        for _ in range(50):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite positions after 50 tet Corot steps")
+
+
+class TestTetNeoHookean(unittest.TestCase):
+    """Tests for 3D Neo-Hookean tet projection kernel."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _device(self):
+        return "cuda:0" if wp.is_cuda_available() else "cpu"
+
+    def test_rest_tet_nh_projects_to_identity(self):
+        """Leave sigma=(1,1,1) unchanged at rest, where J=1, log_J=0 and the gradient vanishes.
+
+        With sigma=(1,1,1): J=1, log_J=0, inv_i=1.
+        grad_i = mu*(1-1) + lam*0*1 + k*(1-1) = 0 for all i,
+        so the projection keeps sigma at (1,1,1).
+        The contributions match ARAP-at-rest.
+        """
+        from newton._src.solvers.fba.kernels import (  # noqa: PLC0415
+            project_stretching_neohookean_tet_kernel,
+        )
+
+        device = self._device()
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0, 1, 0), wp.vec3(0, 0, 1)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tet_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+
+        mu, lam = 1.0, 0.5
+        rhs = _projection_rhs(
+            project_stretching_neohookean_tet_kernel,
+            [positions, tet_indices, Dm_inv, weight, wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device)],
+            4,
+        )
+        r = rhs
+        # At rest: sigma=(1,1,1), NH gradient=0, sigma_proj=(1,1,1). Contributions as ARAP-at-rest.
+        np.testing.assert_allclose(r[1], [1.0, 0.0, 0.0], atol=1e-5)
+        np.testing.assert_allclose(r[2], [0.0, 1.0, 0.0], atol=1e-5)
+        np.testing.assert_allclose(r[3], [0.0, 0.0, 1.0], atol=1e-5)
+        np.testing.assert_allclose(r[0], -(r[1] + r[2] + r[3]), atol=1e-5)
+
+    def test_isotropic_stretch_nh_3d(self):
+        """Pull sigma_0=(1.5,1.5,1.5) (mu=1, lam=0.5, k=2) back toward 1.
+
+        sigma_proj must be:
+          - all three equal (by symmetry)
+          - positive
+          - less than 1.5 (NH pulls toward incompressibility)
+          - gradient magnitude < 1e-4 at convergence
+        """
+        from newton._src.solvers.fba.kernels import (  # noqa: PLC0415
+            project_stretching_neohookean_tet_kernel,
+        )
+
+        device = self._device()
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1.5, 0, 0), wp.vec3(0, 1.5, 0), wp.vec3(0, 0, 1.5)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tet_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+
+        mu, lam = 1.0, 0.5
+        rhs = _projection_rhs(
+            project_stretching_neohookean_tet_kernel,
+            [positions, tet_indices, Dm_inv, weight, wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device)],
+            4,
+        )
+        r = rhs
+        # F=1.5*I -> U=V=I, sigma_0=(1.5,1.5,1.5).
+        # rhs[1]=(sigma_proj,0,0), rhs[2]=(0,sigma_proj,0), rhs[3]=(0,0,sigma_proj).
+        sigma_proj = float(r[1][0])
+        self.assertTrue(np.isfinite(sigma_proj), "sigma_proj is not finite")
+        self.assertGreater(sigma_proj, 0.0, "sigma_proj must be positive")
+        self.assertLess(sigma_proj, 1.5, "NH should pull sigma back from 1.5 toward 1")
+
+        # All three should be equal by symmetry.
+        np.testing.assert_allclose(r[2][1], sigma_proj, atol=1e-5)
+        np.testing.assert_allclose(r[3][2], sigma_proj, atol=1e-5)
+
+        # Verify gradient is small at the converged sigma (3D NH: J = sigma_proj^3).
+        k = 2.0 * mu
+        sigma0 = 1.5
+        J3 = sigma_proj**3
+        log_J3 = np.log(J3)
+        inv_s = 1.0 / sigma_proj
+        grad = mu * (sigma_proj - inv_s) + lam * log_J3 * inv_s + k * (sigma_proj - sigma0)
+        self.assertLess(abs(grad), 1e-4, f"Gradient at converged sigma too large: {abs(grad):.2e}")
+
+    def test_momentum_conservation_nh_3d(self):
+        """Sum the contributions to zero under an arbitrary deformation (momentum conservation)."""
+        from newton._src.solvers.fba.kernels import (  # noqa: PLC0415
+            project_stretching_neohookean_tet_kernel,
+        )
+
+        device = self._device()
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1.3, 0.1, 0), wp.vec3(0.2, 1.2, 0.1), wp.vec3(0.1, 0.2, 1.1)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tet_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
+        weight = wp.array([2.0], dtype=wp.float32, device=device)
+
+        mu, lam = 1.0e3, 5.0e2
+        rhs = _projection_rhs(
+            project_stretching_neohookean_tet_kernel,
+            [positions, tet_indices, Dm_inv, weight, wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device)],
+            4,
+        )
+        r = rhs
+        total = r[0] + r[1] + r[2] + r[3]
+        np.testing.assert_allclose(total, [0.0, 0.0, 0.0], atol=1e-4)
+
+    def test_solver_nh_tet_softbody_runs(self):
+        """Step a 4x4x4 tet grid 50 times with ``stretching_model='neohookean'`` to finite positions."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder()
+        builder.add_soft_grid(
+            pos=wp.vec3(0.0, 0.0, 0.1),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=4,
+            dim_y=4,
+            dim_z=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            cell_z=0.1,
+            density=1.0e3,
+            k_mu=1.0e4,
+            k_lambda=1.0e4,
+            k_damp=0.0,
+            fix_left=True,
+        )
+        model = builder.finalize()
+
+        solver = SolverFBA(model, iterations=10, stretching_model="neohookean")
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+        for _ in range(50):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite positions after 50 tet NH steps")
+
+
 class SolverFBAConstructorOptionsTests(unittest.TestCase):
     """The models and contacts SolverFBA refuses."""
 
     def test_solver_init_rejects_no_geometry(self):
-        """Refuse a model with no triangles."""
+        """Refuse a model without triangles or tetrahedra."""
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
         builder = newton.ModelBuilder()
@@ -1442,27 +2251,6 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
         model = builder.finalize()
         with self.assertRaises(ValueError):
             SolverFBA(model, iterations=1)
-
-    def test_tetrahedra_are_refused(self) -> None:
-        """Refuse a model with tetrahedra, which SolverFBA does not simulate."""
-        builder = newton.ModelBuilder()
-        builder.add_soft_grid(
-            pos=wp.vec3(0.0),
-            rot=wp.quat_identity(),
-            vel=wp.vec3(0.0),
-            dim_x=1,
-            dim_y=1,
-            dim_z=1,
-            cell_x=0.1,
-            cell_y=0.1,
-            cell_z=0.1,
-            density=100.0,
-            k_mu=1.0e4,
-            k_lambda=1.0e4,
-            k_damp=0.0,
-        )
-        with self.assertRaisesRegex(NotImplementedError, "cloth only"):
-            SolverFBA(builder.finalize())
 
     def test_several_worlds_are_refused(self) -> None:
         """Refuse a model with two worlds, whose contact solve and self contacts would couple them."""
@@ -1565,23 +2353,25 @@ class ParticleElementCsrTests(unittest.TestCase):
         self.assertEqual(local_v.shape, (0,))
 
 
-class SolverFBATriDeterminismTests(unittest.TestCase):
-    """The triangle stretching projections give bit-identical positions in two runs."""
+class SolverFBATetArapDeterminismTests(unittest.TestCase):
+    """The tetrahedral ARAP projection gives bit-identical positions in two runs."""
 
     def _run_once(self) -> np.ndarray:
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
-        builder.add_cloth_grid(
-            pos=wp.vec3(-0.2, -0.2, 0.5),
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, -10.0, 0.0))
+        builder.add_soft_grid(
+            pos=wp.vec3(0.0, 1.0, 0.0),
             rot=wp.quat_identity(),
             vel=wp.vec3(0.0, 0.0, 0.0),
-            dim_x=5,
-            dim_y=5,
+            dim_x=3,
+            dim_y=3,
+            dim_z=3,
             cell_x=0.1,
             cell_y=0.1,
-            mass=0.05,
-            tri_ke=5000.0,
-            tri_ka=0.0,
-            tri_kd=0.0,
+            cell_z=0.1,
+            density=500.0,
+            k_mu=5.0e3,
+            k_lambda=5.0e3,
+            k_damp=0.0,
         )
         model = builder.finalize()
         solver = SolverFBA(model, iterations=1)
@@ -1593,11 +2383,140 @@ class SolverFBATriDeterminismTests(unittest.TestCase):
             s_in, s_out = s_out, s_in
         return s_in.particle_q.numpy().copy()
 
-    def test_arap_two_runs_identical(self) -> None:
-        """Produce bit-identical triangle ARAP positions in two runs."""
+    def test_two_runs_identical(self) -> None:
+        """Produce bit-identical tetrahedral ARAP positions in two runs."""
         q1 = self._run_once()
         q2 = self._run_once()
+        np.testing.assert_array_equal(q1, q2, err_msg="tet ARAP projection produced non-deterministic output")
+
+
+class SolverFBATetCorotDeterminismTests(unittest.TestCase):
+    """The tetrahedral corotational projection gives bit-identical positions in two runs."""
+
+    def _run_once(self) -> np.ndarray:
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, -10.0, 0.0))
+        builder.add_soft_grid(
+            pos=wp.vec3(0.0, 1.0, 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=3,
+            dim_y=3,
+            dim_z=3,
+            cell_x=0.1,
+            cell_y=0.1,
+            cell_z=0.1,
+            density=500.0,
+            k_mu=5.0e3,
+            k_lambda=5.0e3,
+            k_damp=0.0,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(
+            model,
+            iterations=1,
+            stretching_model="corotational",
+        )
+        s_in = model.state()
+        s_out = model.state()
+        for _ in range(3):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+        return s_in.particle_q.numpy().copy()
+
+    def test_two_runs_identical(self) -> None:
+        """Produce bit-identical tetrahedral corotational positions in two runs."""
+        q1 = self._run_once()
+        q2 = self._run_once()
+        np.testing.assert_array_equal(q1, q2, err_msg="tet Corot projection produced non-deterministic output")
+
+
+class SolverFBATetNHDeterminismTests(unittest.TestCase):
+    """The tetrahedral Neo-Hookean projection gives bit-identical positions in two runs."""
+
+    def _run_once(self) -> np.ndarray:
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, -10.0, 0.0))
+        builder.add_soft_grid(
+            pos=wp.vec3(0.0, 1.0, 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=3,
+            dim_y=3,
+            dim_z=3,
+            cell_x=0.1,
+            cell_y=0.1,
+            cell_z=0.1,
+            density=500.0,
+            k_mu=5.0e3,
+            k_lambda=5.0e3,
+            k_damp=0.0,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(
+            model,
+            iterations=1,
+            stretching_model="neohookean",
+        )
+        s_in = model.state()
+        s_out = model.state()
+        for _ in range(3):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+        return s_in.particle_q.numpy().copy()
+
+    def test_two_runs_identical(self) -> None:
+        """Produce bit-identical tetrahedral Neo-Hookean positions in two runs."""
+        q1 = self._run_once()
+        q2 = self._run_once()
+        np.testing.assert_array_equal(q1, q2, err_msg="tet NH projection produced non-deterministic output")
+
+
+class SolverFBATriDeterminismTests(unittest.TestCase):
+    """The triangle stretching projections give bit-identical positions in two runs."""
+
+    def _run_once(self, stretching_model: str, mu_val: float = 0.0, lam_val: float = 0.0) -> np.ndarray:
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.2, -0.2, 0.5),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=5,
+            dim_y=5,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.05,
+            tri_ke=5000.0 if stretching_model == "arap" else mu_val,
+            tri_ka=lam_val,
+            tri_kd=0.0,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=1, stretching_model=stretching_model)
+        s_in = model.state()
+        s_out = model.state()
+        for _ in range(3):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+        return s_in.particle_q.numpy().copy()
+
+    def test_arap_two_runs_identical(self) -> None:
+        """Produce bit-identical triangle ARAP positions in two runs."""
+        q1 = self._run_once("arap")
+        q2 = self._run_once("arap")
         np.testing.assert_array_equal(q1, q2, err_msg="tri ARAP projection non-deterministic")
+
+    def test_corot_two_runs_identical(self) -> None:
+        """Produce bit-identical triangle corotational positions in two runs."""
+        q1 = self._run_once("corotational", mu_val=1.0e3, lam_val=1.0e3)
+        q2 = self._run_once("corotational", mu_val=1.0e3, lam_val=1.0e3)
+        np.testing.assert_array_equal(q1, q2, err_msg="tri Corot projection non-deterministic")
+
+    def test_nh_two_runs_identical(self) -> None:
+        """Produce bit-identical triangle Neo-Hookean positions in two runs."""
+        q1 = self._run_once("neohookean", mu_val=1.0e3, lam_val=1.0e3)
+        q2 = self._run_once("neohookean", mu_val=1.0e3, lam_val=1.0e3)
+        np.testing.assert_array_equal(q1, q2, err_msg="tri NH projection non-deterministic")
 
 
 class SolverFBABendingDeterminismTests(unittest.TestCase):
@@ -1636,6 +2555,302 @@ class SolverFBABendingDeterminismTests(unittest.TestCase):
         q1 = self._run_once()
         q2 = self._run_once()
         np.testing.assert_array_equal(q1, q2, err_msg="bending projection non-deterministic")
+
+
+class TestNeoHookeanLBFGS(unittest.TestCase):
+    """Unit tests for the L-BFGS local projection of the Tri/Tet Neo-Hookean models.
+
+    Validates :func:`project_neohookean_sigma2d_lbfgs` and
+    :func:`project_neohookean_sigma3d_lbfgs` against ``scipy.optimize.minimize``
+    (L-BFGS-B reference) on the same objective ``Psi(sigma) + (k/2)*||sigma-sigma_0||^2``.
+    Also cross-validates the analytic gradient via finite differences.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        wp.init()
+
+    def _device(self) -> str:
+        return "cuda:0" if wp.is_cuda_available() else "cpu"
+
+    @staticmethod
+    def _nh_obj_2d(sigma, sigma0, mu, lam):
+        k = 2.0 * mu
+        s0, s1 = sigma
+        if s0 <= 0.0 or s1 <= 0.0:
+            return np.inf
+        j = s0 * s1
+        log_i3 = 2.0 * np.log(j)
+        i1 = s0 * s0 + s1 * s1
+        psi = 0.5 * mu * (i1 - log_i3 - 3.0) + 0.125 * lam * log_i3 * log_i3
+        return psi + 0.5 * k * np.sum((np.asarray(sigma) - np.asarray(sigma0)) ** 2)
+
+    @staticmethod
+    def _nh_obj_3d(sigma, sigma0, mu, lam):
+        k = 2.0 * mu
+        s0, s1, s2 = sigma
+        if s0 <= 0.0 or s1 <= 0.0 or s2 <= 0.0:
+            return np.inf
+        j = s0 * s1 * s2
+        log_i3 = 2.0 * np.log(j)
+        i1 = s0 * s0 + s1 * s1 + s2 * s2
+        psi = 0.5 * mu * (i1 - log_i3 - 3.0) + 0.125 * lam * log_i3 * log_i3
+        return psi + 0.5 * k * np.sum((np.asarray(sigma) - np.asarray(sigma0)) ** 2)
+
+    @staticmethod
+    def _build_drivers():
+        # Local kernels that drive the @wp.func directly so we can test the
+        # math in isolation (same pattern as the existing SVD/projection tests).
+        from newton._src.solvers.fba.kernels import (  # noqa: PLC0415
+            nh_gradient_2d,
+            nh_gradient_3d,
+            project_neohookean_sigma2d_lbfgs,
+            project_neohookean_sigma3d_lbfgs,
+        )
+
+        @wp.kernel
+        def drive_lbfgs2d(
+            sigma_init: wp.array[wp.vec2d],
+            mu: wp.array[wp.float64],
+            lam: wp.array[wp.float64],
+            out: wp.array[wp.vec2d],
+        ):
+            tid = wp.tid()
+            out[tid] = project_neohookean_sigma2d_lbfgs(sigma_init[tid], mu[tid], lam[tid])
+
+        @wp.kernel
+        def drive_lbfgs3d(
+            sigma_init: wp.array[wp.vec3d],
+            mu: wp.array[wp.float64],
+            lam: wp.array[wp.float64],
+            out: wp.array[wp.vec3d],
+        ):
+            tid = wp.tid()
+            out[tid] = project_neohookean_sigma3d_lbfgs(sigma_init[tid], mu[tid], lam[tid])
+
+        @wp.kernel
+        def drive_grad2d(
+            sigma: wp.array[wp.vec2d],
+            sigma_init: wp.array[wp.vec2d],
+            mu: wp.array[wp.float64],
+            lam: wp.array[wp.float64],
+            out: wp.array[wp.vec2d],
+        ):
+            tid = wp.tid()
+            k = wp.float64(2.0) * mu[tid]
+            out[tid] = nh_gradient_2d(sigma[tid], sigma_init[tid], mu[tid], lam[tid], k)
+
+        @wp.kernel
+        def drive_grad3d(
+            sigma: wp.array[wp.vec3d],
+            sigma_init: wp.array[wp.vec3d],
+            mu: wp.array[wp.float64],
+            lam: wp.array[wp.float64],
+            out: wp.array[wp.vec3d],
+        ):
+            tid = wp.tid()
+            k = wp.float64(2.0) * mu[tid]
+            out[tid] = nh_gradient_3d(sigma[tid], sigma_init[tid], mu[tid], lam[tid], k)
+
+        return drive_lbfgs2d, drive_lbfgs3d, drive_grad2d, drive_grad3d
+
+    def test_lbfgs_2d_matches_scipy_lbfgsb(self):
+        """Match SciPy's L-BFGS-B to 1e-6 with the triangle Neo-Hookean L-BFGS projection on five anchors."""
+        try:
+            import scipy.optimize as opt
+        except ImportError:
+            self.skipTest("scipy required for LBFGS reference")
+
+        device = self._device()
+        drive2, _, _, _ = self._build_drivers()
+        anchors = np.array(
+            [
+                [1.0, 1.0],  # rest
+                [1.5, 0.7],  # mild stretch + compression
+                [0.1, 0.1],  # extreme compression
+                [3.0, 1.0],  # extreme stretch
+                [0.05, 2.0],  # mixed extreme
+            ]
+        )
+        mu = 3571.43
+        lam = 14285.71
+        sigma_d = wp.array(anchors.astype(np.float64), dtype=wp.vec2d, device=device)
+        mu_d = wp.array([mu] * len(anchors), dtype=wp.float64, device=device)
+        lam_d = wp.array([lam] * len(anchors), dtype=wp.float64, device=device)
+        out = wp.zeros(len(anchors), dtype=wp.vec2d, device=device)
+        wp.launch(drive2, dim=len(anchors), inputs=[sigma_d, mu_d, lam_d], outputs=[out], device=device)
+        res = out.numpy()
+        for anchor, r in zip(anchors, res, strict=True):
+            sc = opt.minimize(
+                self._nh_obj_2d,
+                anchor,
+                args=(anchor, mu, lam),
+                method="L-BFGS-B",
+                bounds=[(1e-6, None), (1e-6, None)],
+                options={"maxiter": 50, "ftol": 1e-12, "gtol": 1e-9, "maxcor": 8},
+            )
+            np.testing.assert_allclose(r, sc.x, atol=1e-6, err_msg=f"anchor={anchor}, warp={r}, scipy={sc.x}")
+            # Objective at warp output should match scipy's at <= 1e-10 (both are
+            # near-stationary points).
+            f_warp = self._nh_obj_2d(r, anchor, mu, lam)
+            f_scipy = self._nh_obj_2d(sc.x, anchor, mu, lam)
+            self.assertLess(
+                abs(f_warp - f_scipy),
+                1e-8,
+                f"anchor={anchor}: |Δf|={abs(f_warp - f_scipy):.2e}",
+            )
+
+    def test_lbfgs_3d_matches_scipy_lbfgsb(self):
+        """Match SciPy's L-BFGS-B to 1e-6 with the tetrahedral Neo-Hookean L-BFGS projection on five anchors."""
+        try:
+            import scipy.optimize as opt
+        except ImportError:
+            self.skipTest("scipy required for LBFGS reference")
+
+        device = self._device()
+        _, drive3, _, _ = self._build_drivers()
+        anchors = np.array(
+            [
+                [1.0, 1.0, 1.0],
+                [1.5, 0.7, 0.9],
+                [0.1, 0.1, 0.1],
+                [3.0, 1.0, 1.0],
+                [1.0, 1.0, 0.05],
+            ]
+        )
+        mu = 3571.43
+        lam = 14285.71
+        sigma_d = wp.array(anchors.astype(np.float64), dtype=wp.vec3d, device=device)
+        mu_d = wp.array([mu] * len(anchors), dtype=wp.float64, device=device)
+        lam_d = wp.array([lam] * len(anchors), dtype=wp.float64, device=device)
+        out = wp.zeros(len(anchors), dtype=wp.vec3d, device=device)
+        wp.launch(drive3, dim=len(anchors), inputs=[sigma_d, mu_d, lam_d], outputs=[out], device=device)
+        res = out.numpy()
+        for anchor, r in zip(anchors, res, strict=True):
+            sc = opt.minimize(
+                self._nh_obj_3d,
+                anchor,
+                args=(anchor, mu, lam),
+                method="L-BFGS-B",
+                bounds=[(1e-6, None)] * 3,
+                options={"maxiter": 50, "ftol": 1e-12, "gtol": 1e-9, "maxcor": 8},
+            )
+            np.testing.assert_allclose(r, sc.x, atol=1e-6, err_msg=f"anchor={anchor}, warp={r}, scipy={sc.x}")
+            f_warp = self._nh_obj_3d(r, anchor, mu, lam)
+            f_scipy = self._nh_obj_3d(sc.x, anchor, mu, lam)
+            self.assertLess(abs(f_warp - f_scipy), 1e-7)
+
+    def test_nh_gradient_2d_matches_finite_difference(self):
+        """Match ``nh_gradient_2d`` with SciPy's ``approx_fprime`` finite differences."""
+        try:
+            import scipy.optimize as opt
+        except ImportError:
+            self.skipTest("scipy required for FD reference")
+
+        device = self._device()
+        _, _, drive_g2, _ = self._build_drivers()
+        sigma = np.array([[1.3, 0.8], [0.4, 1.7]])
+        sigma0 = np.array([[1.0, 1.0], [0.5, 1.5]])
+        mu = 100.0
+        lam = 200.0
+        sd = wp.array(sigma.astype(np.float64), dtype=wp.vec2d, device=device)
+        s0d = wp.array(sigma0.astype(np.float64), dtype=wp.vec2d, device=device)
+        mu_d = wp.array([mu] * len(sigma), dtype=wp.float64, device=device)
+        lam_d = wp.array([lam] * len(sigma), dtype=wp.float64, device=device)
+        out = wp.zeros(len(sigma), dtype=wp.vec2d, device=device)
+        wp.launch(drive_g2, dim=len(sigma), inputs=[sd, s0d, mu_d, lam_d], outputs=[out], device=device)
+        g_warp = out.numpy()
+        for i, (s, s0) in enumerate(zip(sigma, sigma0, strict=True)):
+            g_fd = opt.approx_fprime(s, self._nh_obj_2d, 1e-7, s0, mu, lam)
+            np.testing.assert_allclose(g_warp[i], g_fd, rtol=1e-4, atol=1e-3)
+
+    def test_nh_gradient_3d_matches_finite_difference(self):
+        """Match ``nh_gradient_3d`` with SciPy's ``approx_fprime`` finite differences."""
+        try:
+            import scipy.optimize as opt
+        except ImportError:
+            self.skipTest("scipy required for FD reference")
+
+        device = self._device()
+        _, _, _, drive_g3 = self._build_drivers()
+        sigma = np.array([[1.3, 0.8, 0.9], [0.6, 1.5, 1.1]])
+        sigma0 = np.array([[1.0, 1.0, 1.0], [0.8, 1.2, 1.0]])
+        mu = 100.0
+        lam = 200.0
+        sd = wp.array(sigma.astype(np.float64), dtype=wp.vec3d, device=device)
+        s0d = wp.array(sigma0.astype(np.float64), dtype=wp.vec3d, device=device)
+        mu_d = wp.array([mu] * len(sigma), dtype=wp.float64, device=device)
+        lam_d = wp.array([lam] * len(sigma), dtype=wp.float64, device=device)
+        out = wp.zeros(len(sigma), dtype=wp.vec3d, device=device)
+        wp.launch(drive_g3, dim=len(sigma), inputs=[sd, s0d, mu_d, lam_d], outputs=[out], device=device)
+        g_warp = out.numpy()
+        for i, (s, s0) in enumerate(zip(sigma, sigma0, strict=True)):
+            g_fd = opt.approx_fprime(s, self._nh_obj_3d, 1e-7, s0, mu, lam)
+            np.testing.assert_allclose(g_warp[i], g_fd, rtol=1e-4, atol=1e-3)
+
+
+class TestDroppedDualGauge(unittest.TestCase):
+    """A bar of tetrahedra and a strip of triangles hang 10 N; their extension gives the small-strain modulus."""
+
+    def _modulus_ratio(self, tetrahedra, stretching_model, young=1.0e6, poisson=0.4):
+        mu, lam = young / (2 * (1 + poisson)), young * poisson / ((1 + poisson) * (1 - 2 * poisson))
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -10.0))
+        if tetrahedra:  # 0.1 x 0.1 x 0.8 m
+            builder.add_soft_grid(
+                pos=wp.vec3(0.0),
+                rot=wp.quat_identity(),
+                vel=wp.vec3(0.0),
+                dim_x=2,
+                dim_y=2,
+                dim_z=16,
+                cell_x=0.05,
+                cell_y=0.05,
+                cell_z=0.05,
+                density=1.0,
+                k_mu=mu,
+                k_lambda=lam,
+                k_damp=0.0,
+            )
+            modulus, width = young, 0.01
+        else:  # 0.1 x 0.8 m, plane-stress membrane modulus [N/m]
+            rot = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.5 * np.pi)
+            builder.add_cloth_grid(
+                pos=wp.vec3(0.0),
+                rot=rot,
+                vel=wp.vec3(0.0),
+                dim_x=4,
+                dim_y=32,
+                cell_x=0.025,
+                cell_y=0.025,
+                mass=1.0e-4,
+                tri_ke=mu,
+                tri_ka=lam,
+            )
+            modulus, width = 4 * mu * (mu + lam) / (2 * mu + lam), 0.1
+        model = builder.finalize()
+        z = model.particle_q.numpy()[:, 2]
+        top, bottom = np.isclose(z, z.max()), np.isclose(z, z.min())
+        mass = np.where(top, 0.0, np.where(bottom, 1.0 / bottom.sum(), model.particle_mass.numpy()))
+        model.particle_mass.assign(mass)
+        model.particle_inv_mass.assign(np.divide(1.0, mass, out=np.zeros_like(mass), where=mass > 0))
+        solver = SolverFBA(model, iterations=50, stretching_model=stretching_model)
+        s0, s1 = model.state(), model.state()
+        for _ in range(30):  # implicit steps much longer than the 56 ms period settle the load
+            solver.step(s0, s1, None, None, 0.1)
+            s0, s1 = s1, s0
+        extension = z[bottom].mean() - s0.particle_q.numpy()[bottom, 2].mean()
+        return 10.0 * 0.8 / (width * extension) / modulus
+
+    def test_small_strain_modulus_is_the_material_modulus(self):
+        """Recover the material's small-strain modulus to 3% with the corotational and Neo-Hookean models on tetrahedra
+        and triangles.
+
+        Without the gauge the moduli come out 1 / (2 + nu) and (2 mu + lam) / (4 mu + 3 lam) as large.
+        """
+        for tetrahedra in (True, False):
+            for stretching_model in ("corotational", "neohookean"):
+                with self.subTest(tetrahedra=tetrahedra, stretching_model=stretching_model):
+                    self.assertAlmostEqual(self._modulus_ratio(tetrahedra, stretching_model), 1.0, delta=0.03)
 
 
 if __name__ == "__main__":

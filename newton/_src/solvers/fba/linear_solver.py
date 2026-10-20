@@ -48,6 +48,8 @@ def build_pd_system(
     model: Model,
     dt: float,
     pin_stiffness: float,
+    tri_weight_scale: float | np.ndarray = 1.0,
+    tet_weight_scale: float | np.ndarray = 1.0,
 ) -> tuple[CsrMatrix, dict[str, Any]]:
     """Assemble the constant scalar PD Hessian ``A`` for cloth.
 
@@ -57,6 +59,8 @@ def build_pd_system(
             ``particle_inv_mass == 0``.
         dt: Time step [s]. Enters as ``m_i / dt^2`` on the diagonal.
         pin_stiffness: PD soft-pin weight ``w_pin``. Larger means harder pin.
+        tri_weight_scale: Factor on each triangle's stretching weight: a scalar or one per triangle.
+        tet_weight_scale: Factor on each tetrahedron's stretching weight: a scalar or one per tetrahedron.
 
     Returns:
         A tuple ``(A, meta)`` where ``A`` is an ``N x N`` symmetric PSD CSR
@@ -120,7 +124,7 @@ def build_pd_system(
         tri_area = model.tri_areas.numpy().astype(np.float64)
         # tri_materials column 0 is k_mu, the first Lamé parameter [Pa]: PD weight 2 * k_mu * area.
         tri_materials = model.tri_materials.numpy().astype(np.float64)
-        tri_weight = 2.0 * tri_materials[:, 0] * tri_area
+        tri_weight = 2.0 * tri_materials[:, 0] * tri_area * tri_weight_scale
 
         # Vectorized 3x3 stencil scatter: G_t = ST @ Dm_inv_t, K_t = G_t @ G_t.T.
         # Then for each triangle we contribute w_t * K_t[a,b] to A[v_a, v_b]
@@ -178,6 +182,61 @@ def build_pd_system(
             # since CSR builder duplicates-sum, and they don't change A.
             coo_parts.append((rows_e.astype(np.int32), cols_e.astype(np.int32), vals_e))
 
+    # ---- Tetrahedral stretching contribution ----
+    tet_indices = np.zeros((0, 4), dtype=np.int32)
+    tet_rest_inv = np.zeros((0, 3, 3), dtype=np.float64)
+    tet_volume = np.zeros((0,), dtype=np.float64)
+    tet_weight = np.zeros((0,), dtype=np.float64)
+    mu_tet = np.zeros((0,), dtype=np.float64)
+    if hasattr(model, "tet_count") and model.tet_count > 0:
+        tet_indices_flat = model.tet_indices.numpy().astype(np.int32)
+        tet_indices = tet_indices_flat.reshape(-1, 4)
+        tet_rest_inv = model.tet_poses.numpy().astype(np.float64)
+        # Volume from Dm_inv: det(Dm_inv) = 1/(6*V) => V = 1/(6*|det(Dm_inv)|)
+        det_dm_inv = np.linalg.det(tet_rest_inv)
+        tet_volume = 1.0 / (6.0 * np.abs(det_dm_inv) + 1.0e-30)
+        tet_materials = model.tet_materials.numpy().astype(np.float64)
+        mu_tet = tet_materials[:, 0]
+        # PD weight: w = 2*mu * volume  (ARAP: singular values project to 1)
+        tet_weight = 2.0 * mu_tet * tet_volume * tet_weight_scale
+
+        # Stencil selector ST is 4x3 (row = which edge coefficient for each tet vertex).
+        ST_tet = np.array(
+            [
+                [-1.0, -1.0, -1.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )  # (4, 3)
+        # G_all[T, 4, 3] = ST @ Dm_inv per tet
+        G_all = np.einsum("ab,tbc->tac", ST_tet, tet_rest_inv)  # (T, 4, 3)
+        # K_all[T, 4, 4] = G @ G^T per tet (symmetric PSD)
+        K_all = np.einsum("tac,tbc->tab", G_all, G_all)  # (T, 4, 4)
+        wK_all = tet_weight[:, None, None] * K_all  # (T, 4, 4)
+
+        # Vectorized scatter: for each (a,b) in 4x4, contribute wK[t,a,b] to A[tet[t,a], tet[t,b]]
+        a_idx, b_idx = np.meshgrid(np.arange(4), np.arange(4), indexing="ij")
+        a_flat = a_idx.flatten()  # 16
+        b_flat = b_idx.flatten()  # 16
+        # Gather all 16 (row, col, val) arrays, then concatenate once.
+        tet_rows_parts = []
+        tet_cols_parts = []
+        tet_vals_parts = []
+        for a, b in zip(a_flat, b_flat, strict=True):
+            tet_rows_parts.append(tet_indices[:, a])
+            tet_cols_parts.append(tet_indices[:, b])
+            tet_vals_parts.append(wK_all[:, a, b])
+        if len(tet_rows_parts) > 0:
+            coo_parts.append(
+                (
+                    np.concatenate(tet_rows_parts).astype(np.int32),
+                    np.concatenate(tet_cols_parts).astype(np.int32),
+                    np.concatenate(tet_vals_parts),
+                )
+            )
+
     if coo_parts:
         rows = np.concatenate([p[0] for p in coo_parts])
         cols = np.concatenate([p[1] for p in coo_parts])
@@ -200,6 +259,11 @@ def build_pd_system(
         "edge_weight": edge_weight,
         "pin_indices": pin_indices,
         "pin_weight": pin_stiffness,
+        "tet_indices": tet_indices,
+        "tet_rest_inv": tet_rest_inv,
+        "tet_volume": tet_volume,
+        "tet_weight": tet_weight,
+        "tet_mu": mu_tet,
     }
     return A, meta
 
@@ -506,7 +570,7 @@ def build_particle_element_csr(
     n_particles: int,
     n_verts_per_element: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build CSR adjacency from elements (tri / edge stencil) to particles.
+    """Build CSR adjacency from elements (tri / tet / edge stencil) to particles.
 
     For each particle ``p``, the entries in ``element_idx[offsets[p]:offsets[p+1]]``
     name the elements incident on ``p``, with the corresponding entry in
@@ -516,7 +580,8 @@ def build_particle_element_csr(
     Args:
         element_indices: ``(num_elements, n_verts_per_element)`` particle indices.
         n_particles: Total particle count in the model.
-        n_verts_per_element: 3 for triangles, 4 for 4-vertex bending stencils.
+        n_verts_per_element: 3 for triangles, 4 for tetrahedra or 4-vertex
+            bending stencils.
 
     Returns:
         ``(offsets, element_idx, local_vertex_idx)``:

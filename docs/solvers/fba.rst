@@ -6,10 +6,10 @@
 FBA
 ===
 
-:class:`~newton.solvers.SolverFBA` simulates cloth with projective dynamics.
-Each step runs a fixed number of local-global iterations: the local phase
-projects every element onto its constraint set, and the global phase solves a
-linear system whose matrix is factored once.
+:class:`~newton.solvers.SolverFBA` simulates cloth and volumetric soft bodies
+with projective dynamics. Each step runs a fixed number of local-global
+iterations: the local phase projects every element onto its constraint set,
+and the global phase solves a linear system whose matrix is factored once.
 
 .. experimental::
 
@@ -20,14 +20,16 @@ linear system whose matrix is factored once.
 When to Choose FBA
 ------------------
 
-FBA suits stiff cloth: each step is implicit, so stiff cloth steps stably at
-large time steps.
+FBA suits stiff cloth and soft bodies:
 
-Choose another solver for soft bodies, for scenes with contacts, for models
-with several worlds or with rigid bodies, and for differentiable simulation.
-See the :ref:`Supported Features` matrix for a comparison with the other
-solvers. The solver builds on projective dynamics and a quadratic bending
-energy:
+- Stiff materials step stably at large time steps. The examples step at
+  ``dt = 0.01`` s, including a Neo-Hookean bar with a Young's modulus of
+  ``1e9`` Pa.
+
+Choose another solver for scenes with contacts, for models with several worlds
+or with rigid bodies, and for differentiable simulation. See the
+:ref:`Supported Features` matrix for a comparison with the other solvers. The
+solver builds on projective dynamics and a quadratic bending energy:
 
 - Sofien Bouaziz, Sebastian Martin, Tiantian Liu, Ladislav Kavan, and Mark
   Pauly. 2014. Projective Dynamics: Fusing Constraint Projections for Fast
@@ -86,22 +88,24 @@ local-global iterations. FBA runs on the CPU and on CUDA devices.
 Model Inputs
 ------------
 
-- **Cloth**: triangles with As-Rigid-As-Possible stretching, which takes
-  ``tri_ke`` as the stiffness. Interior edges add the isometric bending
-  energy of Bergou et al. with ``edge_ke`` as a bending modulus [N·m] and
-  ``edge_rest_angle`` as the rest angle. The same ``edge_ke`` bends an FBA
-  cloth more stiffly than a :class:`~newton.solvers.SolverVBD` one, which
-  scales it by the edge length.
+- **Cloth**: triangles with a stretching model chosen by ``stretching_model``:
+  ``"arap"`` takes ``tri_ke`` as the stiffness, and ``"corotational"`` and
+  ``"neohookean"`` take the elements' Lamé parameters; the
+  :class:`~newton.solvers.SolverFBA` reference states how projective dynamics
+  scales them. Interior edges add the isometric bending energy of Bergou et
+  al. with ``edge_ke`` as a bending modulus [N·m] and ``edge_rest_angle`` as
+  the rest angle. The same ``edge_ke`` bends an FBA cloth more stiffly than a
+  :class:`~newton.solvers.SolverVBD` one, which scales it by the edge length.
+- **Soft bodies**: tetrahedra with the same stretching models.
 - **Pins**: particles with zero inverse mass follow their pin targets through
   a stiff spring of ``pin_stiffness`` [N/m]. The targets start at the model
   positions and move with :meth:`~newton.solvers.SolverFBA.set_pin_targets`.
   Particles without the ``ACTIVE`` flag that have a mass hold where the input
   state has them.
 
-FBA does not simulate tetrahedra, rigid bodies or contacts: a model with
-tetrahedra or bodies, and contacts that hold soft contacts, raise
-``NotImplementedError``. It does not simulate springs either, or the inputs
-of :class:`~newton.Control`.
+FBA does not simulate rigid bodies or contacts: a model with bodies, and
+contacts that hold soft contacts, raise ``NotImplementedError``. It does not
+simulate springs either, or the inputs of :class:`~newton.Control`.
 
 Accuracy
 --------
@@ -112,3 +116,11 @@ drifts by 0.08 cm. The bending energy is quadratic in the positions, so a
 fold with a large rest angle settles a little away from that angle under
 load; in Newton's shared cloth tests the folds of a curved cloth settle
 0.11 rad from their rest angles.
+
+Examples
+--------
+
+``python -m newton.examples <name>`` runs each of these:
+
+- ``stretching_cloth_fba``: cloth pulled apart by pins on two opposite edges.
+- ``twisting_bar_fba``: a soft bar twisted by its pinned ends.
