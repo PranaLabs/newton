@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import numpy as np
 import warp as wp
 
@@ -11,21 +13,30 @@ from ...sim import Contacts, Control, Model, ModelFlags, State
 from ..solver import SolverBase
 
 
+def _element_lame(materials: wp.array | None, count: int) -> tuple[np.ndarray, np.ndarray]:
+    """First and second Lamé parameters [Pa] of each element, from its material row."""
+    if count == 0:
+        return np.zeros(0), np.zeros(0)
+    rows = materials.numpy().astype(np.float64)
+    return rows[:, 0], rows[:, 1]
+
+
 class SolverFBA(SolverBase):
-    """Fast But Accurate projective-dynamics cloth solver.
+    """Fast But Accurate projective-dynamics solver for cloth and soft bodies.
 
     .. experimental::
 
         :class:`SolverFBA`, its constructor options and its solver-specific
         attributes may change without the normal deprecation period. It
-        simulates cloth in models with one world and no rigid bodies.
+        simulates models with one world and no rigid bodies.
 
     A step depends only on its input state and control, and on the pin
     targets last set, so the solver keeps no history for :meth:`reset` to
     discard.
 
     Implements a Projective Dynamics (PD) local-global iteration for cloth
-    with ARAP stretching, isometric bending and soft pin constraints. The PD
+    and tetrahedral soft bodies, with ARAP, corotational or Neo-Hookean
+    stretching, isometric bending of cloth and soft pin constraints. The PD
     Hessian is prefactored once (nested dissection ordering, multifrontal
     LDLᵀ); the sparse inverse ``S = L⁻¹`` is computed exactly on the
     elimination tree and uploaded to Warp BSR matrices. The runtime linear
@@ -33,10 +44,33 @@ class SolverFBA(SolverBase):
     coordinate component, avoiding the inherently sequential GPU triangular
     solve.
 
-    Stretching is As-Rigid-As-Possible (ARAP): the local step projects each
-    triangle's deformation gradient to the nearest rotation, its singular
-    values clamped to 1, with the stretching weight ``2 * tri_ke`` times the
-    triangle's rest area.
+    Stretching models:
+
+    - ``"arap"`` (As-Rigid-As-Possible) projects the deformation gradient
+      ``F`` to the nearest rotation, its singular values set to 1. It
+      takes no ``k_lambda``: the stretching weight below sets its stiffness.
+    - ``"corotational"`` (corotational linear elasticity) solves in closed
+      form on the singular values of ``F``, 2x2 for cloth and 3x3 with
+      Sherman-Morrison for tetrahedra. It takes each element's ``k_mu`` and
+      ``k_lambda``, the first and second Lamé parameters [Pa].
+    - ``"neohookean"`` (Neo-Hookean hyperelasticity) runs L-BFGS with an
+      Armijo cubic backtracking line search (memory 8, ``c_1 = 1e-4``,
+      tolerance ``1e-6``, at most 50 iterations) on the singular values of
+      ``F``. It takes each element's ``k_mu`` and ``k_lambda``, the first and
+      second Lamé parameters [Pa].
+
+    Corotational and Neo-Hookean take the true Lamé parameters. Projective
+    dynamics drops the dual variable of the local projection, so its fixed
+    point reacts to the stress at the projected deformation rather than at
+    ``F`` and comes out softer than the material: with the projection weight
+    ``2 * mu`` the small-strain modulus falls by ``c = 2 + nu`` for
+    tetrahedra, ``nu = lam / (2 * (lam + mu))``, and by
+    ``c = (4 * mu + 3 * lam) / (2 * mu + lam)`` for triangles. SolverFBA
+    scales ``mu``, ``lam`` and the stretching weights of these models by
+    ``c``, which restores the modulus: at every strain for
+    corotational elasticity, at small strain for Neo-Hookean. The stretching
+    weight of every element is ``2 * k_mu`` times its rest area or volume
+    (``tri_ke`` is a triangle's ``k_mu``). ARAP is exact and unscaled.
 
     Bending follows :class:`~newton.solvers.SolverStyle3D`: each interior edge
     adds the isometric bending energy of Bergou et al. (2006),
@@ -73,12 +107,14 @@ class SolverFBA(SolverBase):
         *,
         iterations: int = 10,
         pin_stiffness: float = 1e12,
+        stretching_model: Literal["arap", "corotational", "neohookean"] = "arap",
     ) -> None:
         """
         Args:
-            model: The :class:`~newton.Model` containing the cloth to integrate.
+            model: The :class:`~newton.Model` containing cloth/tet attributes to integrate.
             iterations: Number of PD local-global iterations per step.
             pin_stiffness: Soft-pin stiffness [N/m].
+            stretching_model: The stretching model, ``"arap"``, ``"corotational"`` or ``"neohookean"``.
         """
         super().__init__(model)
         if model.world_count > 1:
@@ -87,14 +123,15 @@ class SolverFBA(SolverBase):
         if model.body_count > 0:
             raise NotImplementedError(f"SolverFBA does not simulate rigid bodies, but the model has {model.body_count}")
 
-        if model.tet_count > 0:
-            raise NotImplementedError(f"SolverFBA simulates cloth only, but the model has {model.tet_count} tetrahedra")
-
         # ---- Validate ----
         if model.particle_count == 0:
             raise ValueError("SolverFBA requires deformable elements")
-        if model.tri_count == 0:
-            raise ValueError("SolverFBA requires at least one cloth triangle")
+        if model.tri_count == 0 and model.tet_count == 0:
+            raise ValueError("SolverFBA requires at least one cloth triangle or tetrahedral element")
+        if stretching_model not in ("arap", "corotational", "neohookean"):
+            raise ValueError(
+                f"stretching_model={stretching_model!r} not supported; choose 'arap', 'corotational' or 'neohookean'"
+            )
 
         if pin_stiffness <= 0:
             raise ValueError("pin_stiffness must be positive")
@@ -103,6 +140,8 @@ class SolverFBA(SolverBase):
 
         self.iterations = int(iterations)
         self.pin_stiffness = float(pin_stiffness)
+        self.stretching_model = stretching_model
+        self._update_materials()
         # PD setup is dt-dependent; we cache the assembly at a reference dt and
         # rebuild lazily inside `step` if the dt changes.
         self._dt_setup: float | None = None
@@ -128,6 +167,13 @@ class SolverFBA(SolverBase):
         self._edge_norm_d = None
         self._pin_indices_d = self._inactive_d = None
 
+        # Tet device data (filled by _setup_pd_system).
+        self._tet_indices_d = None
+        self._tet_rest_inv_d = None
+        self._tet_weight_d = None
+        # Per-(tet, local vertex) scratch for deterministic (compute → gather)
+        # PD scatter; allocated in _setup_pd_system, reused per step.
+        self._tet_contrib_d: wp.array | None = None
         # Per-(tri, local vertex) scratch for deterministic (compute → gather)
         # PD cloth-stretching scatter; allocated in _setup_pd_system, reused per step.
         self._tri_contrib_d: wp.array | None = None
@@ -137,6 +183,9 @@ class SolverFBA(SolverBase):
 
         # Particle-centered CSR adjacency for deterministic PD reductions.
         # Lets the PD scatter use (compute → gather) instead of atomic_add.
+        self._particle_tet_offsets_d = None
+        self._particle_tet_element_d = None
+        self._particle_tet_local_d = None
         self._particle_tri_offsets_d = None
         self._particle_tri_element_d = None
         self._particle_tri_local_d = None
@@ -155,9 +204,36 @@ class SolverFBA(SolverBase):
         self._k_pin = _K.project_pin_kernel
         self._k_bending = _K.project_bending_kernel
         self._k_tri_arap = _K.project_stretching_arap_kernel
+        self._k_tet_arap = _K.project_stretching_arap_tet_kernel
+        self._k_tri_corot = _K.project_stretching_corotational_kernel
+        self._k_tet_corot = _K.project_stretching_corotational_tet_kernel
+        self._k_tri_nh = _K.project_stretching_neohookean_kernel
+        self._k_tet_nh = _K.project_stretching_neohookean_tet_kernel
+
+    def _update_materials(self) -> None:
+        """Check the elements' materials, and set the gauge of the corotational and Neo-Hookean projections (see
+        the class notes) and the gauged Lamé parameters of each element."""
+        model, stretching_model = self.model, self.stretching_model
+        # The dropped-dual gauge of the corotational and Neo-Hookean projections (see the class notes), per element.
+        self._tri_gauge = self._tet_gauge = 1.0
+        if stretching_model in ("corotational", "neohookean"):
+            tri_mu, tri_lam = _element_lame(model.tri_materials, model.tri_count)
+            tet_mu, tet_lam = _element_lame(model.tet_materials, model.tet_count)
+            # Elements with k_mu = 0, such as the surface triangles of a soft body, carry no stretching.
+            mu, lam = np.concatenate([tri_mu, tet_mu]), np.concatenate([tri_lam, tet_lam])
+            if (mu < 0).any() or (lam[mu > 0] <= 0).any():
+                raise ValueError(f"stretching_model={stretching_model!r} needs k_lambda > 0 wherever k_mu > 0")
+            with np.errstate(divide="ignore", invalid="ignore"):
+                self._tri_gauge = np.where(tri_mu > 0, (4.0 * tri_mu + 3.0 * tri_lam) / (2.0 * tri_mu + tri_lam), 1.0)
+                self._tet_gauge = np.where(tet_mu > 0, 2.0 + tet_lam / (2.0 * (tet_lam + tet_mu)), 1.0)
+            tri_lame = np.stack([tri_mu * self._tri_gauge, tri_lam * self._tri_gauge], axis=1)
+            tet_lame = np.stack([tet_mu * self._tet_gauge, tet_lam * self._tet_gauge], axis=1)
+            self._tri_lame_d = wp.array(tri_lame, dtype=wp.vec2, device=model.device)
+            self._tet_lame_d = wp.array(tet_lame, dtype=wp.vec2, device=model.device)
 
     def _setup_pd_system(self, dt: float) -> None:
         """Build / rebuild the PD Hessian, factor it, and upload device data."""
+        self._update_materials()
         from .linear_solver import (  # noqa: PLC0415
             FBALinearSolver,
             build_pd_system,
@@ -169,6 +245,8 @@ class SolverFBA(SolverBase):
             self.model,
             dt=dt,
             pin_stiffness=self.pin_stiffness,
+            tri_weight_scale=self._tri_gauge,
+            tet_weight_scale=self._tet_gauge,
         )
         fs = factorize_and_sparse_inverse(A, self.model.particle_q.numpy())
         self._linear_solver = FBALinearSolver(fs, device=self._device)
@@ -243,13 +321,50 @@ class SolverFBA(SolverBase):
                 dtype=wp.int32,
                 device=device,
             )
+        if meta["tet_indices"].shape[0] > 0:
+            self._tet_indices_d = wp.array(
+                meta["tet_indices"].flatten().astype(np.int32),
+                dtype=wp.int32,
+                device=device,
+            )
+            self._tet_rest_inv_d = wp.array(
+                meta["tet_rest_inv"].astype(np.float32),
+                dtype=wp.mat33,
+                device=device,
+            )
+            self._tet_weight_d = wp.array(
+                meta["tet_weight"].astype(np.float32),
+                dtype=wp.float32,
+                device=device,
+            )
+
         # Particle-centered CSR adjacency for deterministic PD reductions.
         # Lets the PD scatter use (compute → gather) instead of atomic_add.
         from .linear_solver import build_particle_element_csr  # noqa: PLC0415
 
         n_p = int(self.model.particle_count)
+        tet_indices_np = meta["tet_indices"]
         tri_indices_np = meta["tri_indices"]
         edge_indices_np = meta["edge_indices"]
+
+        if tet_indices_np is not None and tet_indices_np.size > 0:
+            offs, elem_idx, local_v = build_particle_element_csr(tet_indices_np, n_p, 4)
+            self._particle_tet_offsets_d = wp.array(offs, dtype=wp.int32, device=device)
+            self._particle_tet_element_d = wp.array(elem_idx, dtype=wp.int32, device=device)
+            self._particle_tet_local_d = wp.array(local_v, dtype=wp.int32, device=device)
+            # Per-(tet, local vertex) scratch buffer for deterministic
+            # (compute → gather) PD reduction. Reused across energies
+            # (only one stretching_model is active per step).
+            self._tet_contrib_d = wp.zeros(
+                shape=(int(self.model.tet_count), 4),
+                dtype=wp.vec3,
+                device=device,
+            )
+        else:
+            self._particle_tet_offsets_d = None
+            self._particle_tet_element_d = None
+            self._particle_tet_local_d = None
+            self._tet_contrib_d = None
 
         if tri_indices_np is not None and tri_indices_np.size > 0:
             offs, elem_idx, local_v = build_particle_element_csr(tri_indices_np, n_p, 3)
@@ -257,7 +372,8 @@ class SolverFBA(SolverBase):
             self._particle_tri_element_d = wp.array(elem_idx, dtype=wp.int32, device=device)
             self._particle_tri_local_d = wp.array(local_v, dtype=wp.int32, device=device)
             # Per-(tri, local vertex) scratch buffer for deterministic
-            # (compute → gather) PD reduction.
+            # (compute → gather) PD reduction. Reused across energies
+            # (only one stretching_model is active per step).
             self._tri_contrib_d = wp.zeros(
                 shape=(int(tri_indices_np.shape[0]), 3),
                 dtype=wp.vec3,
@@ -420,30 +536,83 @@ class SolverFBA(SolverBase):
             )
         # Tri (cloth) stretching projection: deterministic compute+gather.
         if self._tri_indices_d is not None and model.tri_count > 0:
-            wp.launch(
-                self._k_tri_arap,
-                dim=model.tri_count,
-                inputs=[
-                    self._x_cur,
-                    self._tri_indices_d,
-                    self._tri_rest_inv_d,
-                    self._tri_weight_d,
-                ],
-                outputs=[self._tri_contrib_d],
-                device=device,
-            )
-            wp.launch(
-                self._k_gather,
-                dim=N,
-                inputs=[
-                    self._tri_contrib_d,
-                    self._particle_tri_offsets_d,
-                    self._particle_tri_element_d,
-                    self._particle_tri_local_d,
-                ],
-                outputs=[self._rhs],
-                device=device,
-            )
+            if self.stretching_model == "arap":
+                wp.launch(
+                    self._k_tri_arap,
+                    dim=model.tri_count,
+                    inputs=[
+                        self._x_cur,
+                        self._tri_indices_d,
+                        self._tri_rest_inv_d,
+                        self._tri_weight_d,
+                    ],
+                    outputs=[self._tri_contrib_d],
+                    device=device,
+                )
+                wp.launch(
+                    self._k_gather,
+                    dim=N,
+                    inputs=[
+                        self._tri_contrib_d,
+                        self._particle_tri_offsets_d,
+                        self._particle_tri_element_d,
+                        self._particle_tri_local_d,
+                    ],
+                    outputs=[self._rhs],
+                    device=device,
+                )
+            elif self.stretching_model == "corotational":
+                wp.launch(
+                    self._k_tri_corot,
+                    dim=model.tri_count,
+                    inputs=[
+                        self._x_cur,
+                        self._tri_indices_d,
+                        self._tri_rest_inv_d,
+                        self._tri_weight_d,
+                        self._tri_lame_d,
+                    ],
+                    outputs=[self._tri_contrib_d],
+                    device=device,
+                )
+                wp.launch(
+                    self._k_gather,
+                    dim=N,
+                    inputs=[
+                        self._tri_contrib_d,
+                        self._particle_tri_offsets_d,
+                        self._particle_tri_element_d,
+                        self._particle_tri_local_d,
+                    ],
+                    outputs=[self._rhs],
+                    device=device,
+                )
+            elif self.stretching_model == "neohookean":
+                wp.launch(
+                    self._k_tri_nh,
+                    dim=model.tri_count,
+                    inputs=[
+                        self._x_cur,
+                        self._tri_indices_d,
+                        self._tri_rest_inv_d,
+                        self._tri_weight_d,
+                        self._tri_lame_d,
+                    ],
+                    outputs=[self._tri_contrib_d],
+                    device=device,
+                )
+                wp.launch(
+                    self._k_gather,
+                    dim=N,
+                    inputs=[
+                        self._tri_contrib_d,
+                        self._particle_tri_offsets_d,
+                        self._particle_tri_element_d,
+                        self._particle_tri_local_d,
+                    ],
+                    outputs=[self._rhs],
+                    device=device,
+                )
         # Bending projection: deterministic (compute → gather) scatter.
         if self._edge_indices_d is not None:
             wp.launch(
@@ -471,6 +640,85 @@ class SolverFBA(SolverBase):
                 outputs=[self._rhs],
                 device=device,
             )
+        # Tet stretching projection: deterministic compute+gather.
+        if self._tet_indices_d is not None and model.tet_count > 0:
+            if self.stretching_model == "arap":
+                wp.launch(
+                    self._k_tet_arap,
+                    dim=model.tet_count,
+                    inputs=[
+                        self._x_cur,
+                        self._tet_indices_d,
+                        self._tet_rest_inv_d,
+                        self._tet_weight_d,
+                    ],
+                    outputs=[self._tet_contrib_d],
+                    device=device,
+                )
+                wp.launch(
+                    self._k_gather,
+                    dim=N,
+                    inputs=[
+                        self._tet_contrib_d,
+                        self._particle_tet_offsets_d,
+                        self._particle_tet_element_d,
+                        self._particle_tet_local_d,
+                    ],
+                    outputs=[self._rhs],
+                    device=device,
+                )
+            elif self.stretching_model == "corotational":
+                wp.launch(
+                    self._k_tet_corot,
+                    dim=model.tet_count,
+                    inputs=[
+                        self._x_cur,
+                        self._tet_indices_d,
+                        self._tet_rest_inv_d,
+                        self._tet_weight_d,
+                        self._tet_lame_d,
+                    ],
+                    outputs=[self._tet_contrib_d],
+                    device=device,
+                )
+                wp.launch(
+                    self._k_gather,
+                    dim=N,
+                    inputs=[
+                        self._tet_contrib_d,
+                        self._particle_tet_offsets_d,
+                        self._particle_tet_element_d,
+                        self._particle_tet_local_d,
+                    ],
+                    outputs=[self._rhs],
+                    device=device,
+                )
+            elif self.stretching_model == "neohookean":
+                wp.launch(
+                    self._k_tet_nh,
+                    dim=model.tet_count,
+                    inputs=[
+                        self._x_cur,
+                        self._tet_indices_d,
+                        self._tet_rest_inv_d,
+                        self._tet_weight_d,
+                        self._tet_lame_d,
+                    ],
+                    outputs=[self._tet_contrib_d],
+                    device=device,
+                )
+                wp.launch(
+                    self._k_gather,
+                    dim=N,
+                    inputs=[
+                        self._tet_contrib_d,
+                        self._particle_tet_offsets_d,
+                        self._particle_tet_element_d,
+                        self._particle_tet_local_d,
+                    ],
+                    outputs=[self._rhs],
+                    device=device,
+                )
         # Global linear solve: x_unc = A^-1 . rhs.
         self._linear_solver.solve(self._rhs, self._x_cur)
 

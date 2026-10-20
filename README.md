@@ -511,6 +511,9 @@ If you run the examples from a source checkout with uv, use
       </a>
     </td>
     <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cloth/example_stretching_cloth_fba.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_stretching_cloth_fba.jpg" alt="Stretching Cloth FBA">
+      </a>
     </td>
   </tr>
   <tr>
@@ -521,6 +524,7 @@ If you run the examples from a source checkout with uv, use
       <code>python -m newton.examples cloth_poker_cards</code>
     </td>
     <td align="center" width="33%">
+      <code>python -m newton.examples stretching_cloth_fba</code>
     </td>
   </tr>
   <tr>
@@ -964,6 +968,9 @@ If you run the examples from a source checkout with uv, use
       </a>
     </td>
     <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/softbody/example_twisting_bar_fba.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_twisting_bar_fba.jpg" alt="Twisting Bar FBA">
+      </a>
     </td>
   </tr>
   <tr>
@@ -974,6 +981,7 @@ If you run the examples from a source checkout with uv, use
       <code>python -m newton.examples softbody_franka</code>
     </td>
     <td align="center" width="33%">
+      <code>python -m newton.examples twisting_bar_fba</code>
     </td>
   </tr>
   <tr>

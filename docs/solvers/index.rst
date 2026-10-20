@@ -49,7 +49,8 @@ MuJoCo, Kamino, VBD, and FBA currently have dedicated backend guides:
   and hard frictional contacts; experimental.
 - :doc:`VBD <vbd>` — unified simulation of cloth, soft bodies, and rigid
   bodies in a single VBD-based solver; experimental.
-- :doc:`FBA <fba>`: projective dynamics for stiff cloth; experimental.
+- :doc:`FBA <fba>`: projective dynamics for stiff cloth and soft bodies;
+  experimental.
 
 The other solver backends are documented through their linked API references
 and the comparison tables below.
@@ -88,7 +89,7 @@ Supported Features
      - ❌
      - 🟨 no collisions
      - 🟨 no collisions
-     - ❌
+     - 🟨 no collisions
      - ❌
    * - :class:`~newton.solvers.SolverFeatherstone`
      - Semi-implicit
@@ -180,7 +181,7 @@ Supported Features
 
 .. experimental::
     :class:`~newton.solvers.SolverFBA`'s public API and behavior may change without prior notice.
-    It simulates cloth in models with one world and no rigid bodies, and solves no contacts.
+    It simulates models with one world and no rigid bodies, and solves no contacts.
 
 .. _Contact material support:
 
