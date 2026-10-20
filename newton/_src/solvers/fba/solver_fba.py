@@ -54,7 +54,9 @@ class SolverFBA(SolverBase):
     requested, a step writes row ``rigid_contact_max + i`` for each particle
     contact ``i`` of its contacts: the force [N] on the shape by the
     particle and its torque [N·m] about the world origin, in world frame,
-    from the forces the step's last solve applied.
+    from the forces the step's last solve applied. The other distance minima
+    of a particle on a mesh add to its contact's row. Face contacts are not
+    exported: their rows are zero.
 
     Implements a Projective Dynamics (PD) local-global iteration for cloth
     and tetrahedral soft bodies, with ARAP, corotational or Neo-Hookean
@@ -140,7 +142,11 @@ class SolverFBA(SolverBase):
         lambda_cap: float | None = None,
         shape_angular_velocity: dict[int, float] | None = None,
         nsn_schur_mode: Literal["full", "lite"] = "full",
+        contact_regularization: float = 1.0e-2,
+        face_contacts: bool = False,
+        face_contact_edge_radius: float = 3.0e-3,
         nsn_linear_iterations: int | None = None,
+        face_contact_margin: float | None = None,
     ) -> None:
         """
         Args:
@@ -178,10 +184,48 @@ class SolverFBA(SolverBase):
                 up to ``dt² F / m`` for a normal force ``F`` [N] on a particle
                 of mass ``m`` [kg], and more iterations do not reduce that.
                 With friction, it holds at most four contacts on a particle.
+                Face contacts need ``"full"``.
+            contact_regularization: Relative regularization ``gamma`` of the
+                contact rows in the NSN Newton steps that involve face
+                contacts, whose rows span several particles: each step solves
+                with ``A_cc + gamma diag(A_cc)``. Face contacts act on
+                particles that also carry particle contacts, which makes the
+                Newton matrix nearly singular, and an unregularized step
+                answers a sub-micrometer inconsistency there with forces far
+                above the weights involved. The term bounds the gain along
+                contact directions by ``1 / gamma`` and leaves the
+                complementarity conditions unchanged. Steps with particle
+                contacts only are not regularized.
+            face_contacts: If ``True``, a triangle next to a particle contact
+                also gets a contact at its deepest point inside the shape when
+                that point lies between its particles, so shape edges and
+                corners cannot pass through the triangle. Needs
+                ``friction=True`` and ``nsn_schur_mode="full"``. Mesh
+                and convex hull shapes must be closed. Warp's sign query
+                treats faces within 1e-3 of the mean edge length as equally
+                close, so parts thinner than that need a finer mesh. A
+                particle contact on a mesh also gets a contact at each other
+                local minimum of the particle's distance to the mesh inside a
+                face or on an edge, within the particle radius plus the shape
+                margin plus ``face_contact_margin``: in a concave corner, such
+                as a V notch, the closest point alone holds the particle
+                against one side, and it slides through the other.
+            face_contact_edge_radius: Radius [m] by which box and cylinder
+                edges are rounded in the signed distance the face contacts
+                minimize, at most half the shape's smallest extent. Inside a
+                sharp edge the gradient jumps between the two faces, so a
+                triangle point that sinks into the edge flips its normal and
+                pushes the cloth sideways; the rounding keeps the normal
+                continuous.
             nsn_linear_iterations: Iteration cap of the conjugate residual
                 solve in each NSN step. ``None`` solves to a relative
                 residual of ``1e-10``. A capped step is inexact, and the next
                 LG iteration's NSN step continues from it.
+            face_contact_margin: Distance [m] within which every triangle is
+                also tested for face contacts.
+                ``None`` tests only the triangles next to particle contacts,
+                which misses a shape tip or edge poking into a triangle whose
+                particles all lie beyond the particle contact margin.
         """
         super().__init__(model)
         if model.world_count > 1:
@@ -234,6 +278,20 @@ class SolverFBA(SolverBase):
         self.friction = bool(friction)
         self.nsn_linear_iterations = None if nsn_linear_iterations is None else int(nsn_linear_iterations)
         self.lambda_cap = lambda_cap
+        self.contact_regularization = float(contact_regularization)
+        self.face_contacts = bool(face_contacts)
+        self.face_contact_edge_radius = float(face_contact_edge_radius)
+        self.face_contact_margin = None if face_contact_margin is None else float(face_contact_margin)
+        self._face_query, self._contact_extra, self._mesh_shapes = None, None, False
+        if self.face_contacts:
+            if not self.friction or nsn_schur_mode != "full":
+                raise ValueError("face_contacts needs friction=True and nsn_schur_mode='full'")
+            if model.tri_count:
+                from ...geometry.types import GeoType  # noqa: PLC0415
+                from .face_contact import FaceContactQuery  # noqa: PLC0415
+
+                self._face_query = FaceContactQuery(model.tri_indices.numpy(), model.particle_count, model.device)
+                self._mesh_shapes = bool(model.shape_count) and bool((model.shape_type.numpy() == GeoType.MESH).any())
 
         # Per-shape kinematic angular velocity (rad/s about local +Z).
         n_shapes = int(model.shape_count) if hasattr(model, "shape_count") and model.shape_count else 0
@@ -367,6 +425,12 @@ class SolverFBA(SolverBase):
             self._contact_tangent2_d,
         ]
 
+    def _contact_extra_args(self) -> dict:
+        """Second and third particles of the face contacts, for ``build_schur_complement``."""
+        if self._contact_extra is None:
+            return {}
+        return {"j_extra_indices": self._contact_extra[0], "j_extra_alpha": self._contact_extra[1]}
+
     def _contact_offsets(self) -> list:
         """Normal and shifted tangent offsets of the deformable contacts."""
         return [
@@ -390,6 +454,17 @@ class SolverFBA(SolverBase):
             outputs=[r],
             device=self._device,
         )
+        if self._contact_extra is not None:
+            wp.launch(
+                K.subtract_slot_residual_kernel,
+                dim=self._contact_count,
+                inputs=[
+                    *self._contact_extra,
+                    *(self._contact_normal_d, self._contact_tangent1_d, self._contact_tangent2_d, self._x_cur),
+                ],
+                outputs=[r],
+                device=self._device,
+            )
 
     def _launch_contact_pene0(self, pene0: wp.array[wp.float64]) -> None:
         """Anchor projections of the deformable contact rows ``[n, t1, t2]``."""
@@ -620,7 +695,7 @@ class SolverFBA(SolverBase):
 
         # Ingest contact data once per step (if provided).
         if contacts is not None:
-            self._ingest_contacts(contacts)
+            self._ingest_contacts(contacts, state_in)
         else:
             # Drop the previous step's contacts.
             self._contact_count = 0
@@ -786,6 +861,7 @@ class SolverFBA(SolverBase):
                                 M,
                                 *self._contact_row_args(),
                                 download=False,
+                                **self._contact_extra_args(),
                             )
                         self._cached_W = True
                     # Residual + pene0 + warm-start all device-resident: the PD
@@ -886,6 +962,8 @@ class SolverFBA(SolverBase):
                             omega_init_device=self._omega_coulomb_persistent_d,
                             skip_download=True,
                             m_contacts=M,
+                            # Face contacts act on particles that also carry particle contacts.
+                            contact_regularization=0.0 if self._contact_extra is None else self.contact_regularization,
                         )
                     # Persist device-resident lam / omega for next PD iter.
                     wp.copy(self._lam_coulomb_persistent_d, self._nsn_lam_d, count=3 * M)
@@ -1237,7 +1315,7 @@ class SolverFBA(SolverBase):
         M, device = self._contact_count, self._device
         if M == 0:
             return
-        inputs = [self._contact_record_d, self._contact_normal_d, self._contact_tangent1_d]
+        inputs = [self._contact_record_d, M, self._contact_normal_d, self._contact_tangent1_d]
         inputs += [self._contact_tangent2_d, 3 if self.friction else 1, self._nsn_lam_apply_d]
         inputs += [self._contact_world_anchor_d, contacts.rigid_contact_max]
         wp.launch(soft_contact_force_kernel, M, inputs, [contact_f], device=device)
@@ -1298,7 +1376,7 @@ class SolverFBA(SolverBase):
         cap = max(max_contacts, 16)
         self._contact_buf_max = cap
         self._contact_particle_d = wp.empty(cap, dtype=wp.int32, device=device)
-        # The index in Contacts of the particle contact each row comes from.
+        # The index in Contacts of the particle contact each row comes from, -1 for face contacts.
         self._contact_record_d = wp.empty(cap, dtype=wp.int32, device=device)
         self._contact_normal_d = wp.empty(cap, dtype=wp.vec3, device=device)
         self._contact_alpha_d = wp.empty(cap, dtype=wp.float32, device=device)
@@ -1328,7 +1406,7 @@ class SolverFBA(SolverBase):
         # every PD iteration of the frictional NSN driver.
         self._contact_mu_d = wp.empty(cap, dtype=wp.float64, device=device)
 
-    def _ingest_contacts(self, contacts: Contacts) -> None:
+    def _ingest_contacts(self, contacts: Contacts, state: State | None = None) -> None:
         """Ingest the active particle-vs-shape contact set for the next step.
 
         Reads the soft contact fields from ``contacts`` and builds device-side
@@ -1344,14 +1422,20 @@ class SolverFBA(SolverBase):
         Args:
             contacts: :class:`~newton.Contacts` populated by a prior
                 :meth:`~newton.CollisionPipeline.collide` call.
+            state: Current :class:`~newton.State`, the one passed to
+                ``collide``. Supplies the particle positions of the face
+                contact queries; falls back to the model when ``None``.
         """
         contacts._assert_particle_only_soft_contacts("SolverFBA")
         # Contact data is about to change → drop the Schur cache so the
         # next ``step()`` rebuilds ``W`` / ``A⁻¹·Jᵀ`` with fresh J.
         self._invalidate_schur_cache()
+        self._contact_extra = None
 
+        # With a face contact margin, triangles can touch shapes that no particle touches.
+        other_contacts = self._face_query is not None and self.face_contact_margin is not None
         M_raw = int(contacts.soft_contact_count.numpy()[0])
-        if M_raw == 0:
+        if M_raw == 0 and not other_contacts:
             self._contact_count = 0
             return
 
@@ -1377,12 +1461,27 @@ class SolverFBA(SolverBase):
         record_h = np.flatnonzero(valid_mask).astype(np.int32)
         M = int(particle_h.shape[0])
 
-        if M == 0:
+        if M == 0 and not other_contacts:
             self._contact_count = 0
             return
 
-        # Deterministic contact ordering (host-side lexsort, see comment above).
+        # A particle in a concave corner of a mesh touches every face of the corner, not only the closest.
+        if self._face_query is not None and self._mesh_shapes and M:
+            src = state if state is not None else self.model
+            alarm = 0.0 if self.face_contact_margin is None else self.face_contact_margin
+            more = self._face_query.mesh_minima(
+                self.model, src.particle_q, particle_h, shape_h, body_pos_h, normal_h, alarm
+            )
+            *more, parent = more
+            contact = (particle_h, shape_h, body_pos_h, normal_h)
+            particle_h, shape_h, body_pos_h, normal_h = (np.concatenate(a) for a in zip(contact, more, strict=True))
+            record_h = np.concatenate([record_h, record_h[parent]])
+            M = int(particle_h.shape[0])
+
+        # Deterministic contact ordering (host-side lexsort, see comment above); the anchor orders the contacts
+        # of one particle and shape.
         sort_keys = (
+            *(body_pos_h[:, k].astype(np.float64) for k in (2, 1, 0)),
             normal_h[:, 2].astype(np.float64),
             normal_h[:, 1].astype(np.float64),
             normal_h[:, 0].astype(np.float64),
@@ -1396,7 +1495,33 @@ class SolverFBA(SolverBase):
         normal_h = normal_h[order]
         record_h = record_h[order]
 
-        alpha_h = np.ones(M, dtype=np.float32)
+        # Face contacts follow the particle contacts: slot 0 holds their first particle.
+        alpha_h, extra = np.ones(M, dtype=np.float32), None
+        if self._face_query is not None:
+            src = state if state is not None else self.model
+            found = self._face_query.query(
+                self.model,
+                src.particle_q,
+                particle_h,
+                shape_h,
+                self.face_contact_edge_radius,
+                self.face_contact_margin,
+            )
+            if len(found[0]):
+                tri, bary = self._face_query.tri[found[0]], found[2]
+                particle_h, alpha_h = np.concatenate([particle_h, tri[:, 0]]), np.concatenate([alpha_h, bary[:, 0]])
+                shape_h, body_pos_h = np.concatenate([shape_h, found[1]]), np.concatenate([body_pos_h, found[3]])
+                normal_h = np.concatenate([normal_h, found[4]])
+                record_h = np.concatenate([record_h, np.full(len(found[0]), -1, dtype=np.int32)])
+                extra = [np.full((M, 2), -1, dtype=np.int32), np.zeros((M, 2), dtype=np.float32)]
+                extra = [np.concatenate([extra[0], tri[:, 1:]]), np.concatenate([extra[1], bary[:, 1:]])]
+                M = len(particle_h)
+        if extra is not None:
+            self._contact_extra = [wp.array(a, device=self._device) for a in extra]
+        if M == 0:
+            self._contact_count = 0
+            return
+
         self._ensure_contact_buffers(M)
 
         # Per-contact bookkeeping (n·anchor offset, tangent basis, t·anchor
@@ -1439,11 +1564,18 @@ class SolverFBA(SolverBase):
             outputs=[self._contact_offset_d],
             device=device,
         )
-        # Particle contacts stop the particle radius plus the shape margin outside the shape surface, as Newton's
-        # contact margins place them.
+        # Particle and face contacts stop the particle radius plus the shape margin outside the shape surface, as
+        # Newton's contact margins place them.
         from .kernels import add_contact_thickness_kernel  # noqa: PLC0415
 
-        inputs = [self._contact_particle_d, self._contact_shape_d, model.particle_radius, model.shape_margin]
+        extra = self._contact_extra
+        if extra is None:
+            extra = [
+                wp.empty((1, 1), dtype=wp.int32, device=device),
+                wp.empty((1, 1), dtype=wp.float32, device=device),
+            ]
+        inputs = [self._contact_particle_d, *extra, int(self._contact_extra is not None)]
+        inputs += [self._contact_shape_d, model.particle_radius, model.shape_margin]
         wp.launch(add_contact_thickness_kernel, M, inputs, [self._contact_offset_d], device=device)
 
         # Host mirrors of the basic contact fields, for the host paths that still read them.
@@ -1883,6 +2015,7 @@ class SolverFBA(SolverBase):
         omega_init_device: wp.array[wp.float64] | None = None,
         skip_download: bool = False,
         m_contacts: int | None = None,
+        contact_regularization: float = 0.0,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """GPU version of ``solve_nsn_coulomb`` (``newton/tests/fba/_reference.py``), the frictional NSN inner.
 
@@ -1923,6 +2056,9 @@ class SolverFBA(SolverBase):
                 read the device buffers directly.
             m_contacts: Override active contact count when only device
                 arrays are provided.
+            contact_regularization: Relative regularization ``gamma`` of the
+                ``3M`` contact rows of each Newton system,
+                ``A_cc += gamma diag(A_cc)``.
 
         Returns:
             ``(lam, omega, lam_apply)`` host fp64 arrays of shape ``(3M,)``.
@@ -2071,6 +2207,15 @@ class SolverFBA(SolverBase):
                 outputs=[self._nsn_a_schur_d],
                 device=device,
             )
+            if contact_regularization > 0.0:
+                wp.launch(
+                    K.scale_diagonal_kernel,
+                    dim=3 * M,
+                    inputs=[wp.float64(1.0 + contact_regularization)],
+                    outputs=[self._nsn_a_schur_d],
+                    device=device,
+                )
+
             wp.launch_tiled(
                 K.compute_nsn_rhs_kernel,
                 dim=n_rows,

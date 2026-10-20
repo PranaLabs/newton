@@ -1863,6 +1863,75 @@ def gather_jt_lambda_kernel(
     out[p] = s
 
 
+@wp.kernel
+def add_slot_terms_W_kernel(
+    slot_particle: wp.array2d[wp.int32],  # (total_rows, K) particles of each row, -1 when unused
+    slot_alpha: wp.array2d[wp.float32],  # (total_rows, K) their Jacobian coefficients
+    contact_dir: wp.array[wp.vec3],
+    isodof_rank: wp.array[wp.int32],
+    Wi: wp.array2d[wp.float64],
+    W: wp.array2d[wp.float64],  # inout
+):
+    """Add the slot pairs other than ``(0, 0)`` of rows that act on up to ``K`` particles.
+
+    A row ``a`` with particles ``p_ai`` and coefficients ``w_ai`` has the
+    Jacobian ``sum_i w_ai dir_a`` on particle ``p_ai``, so
+    ``W[a, b] = (dir_a . dir_b) sum_ij w_ai w_bj Wi[p_ai, p_bj]``;
+    :func:`compose_W_from_wi_kernel` wrote the ``(0, 0)`` term.
+    """
+    a, b = wp.tid()
+    s = wp.float64(0.0)
+    for i in range(slot_particle.shape[1]):
+        pa = slot_particle[a, i]
+        for j in range(slot_particle.shape[1]):
+            pb = slot_particle[b, j]
+            if pa >= 0 and pb >= 0 and i + j > 0:
+                w = wp.float64(slot_alpha[a, i]) * wp.float64(slot_alpha[b, j])
+                s += w * Wi[isodof_rank[pa], isodof_rank[pb]]
+    W[a, b] = W[a, b] + wp.float64(wp.dot(contact_dir[a], contact_dir[b])) * s
+
+
+@wp.kernel
+def gather_jt_lambda_slots_kernel(
+    slot_offsets: wp.array[wp.int32],  # (N + 1,) CSR offsets into slot_entries
+    slot_entries: wp.array[wp.int32],  # row * K + slot for the slots past 0 of each particle
+    contact_dir: wp.array[wp.vec3],
+    slot_alpha: wp.array2d[wp.float32],
+    lam: wp.array[wp.float32],
+    out: wp.array[wp.vec3],  # inout
+):
+    """Add the slots past 0 of the contact rows to ``out[p]``, after :func:`gather_jt_lambda_kernel`."""
+    p = wp.tid()
+    s = wp.vec3(0.0, 0.0, 0.0)
+    width = slot_alpha.shape[1]
+    for k in range(slot_offsets[p], slot_offsets[p + 1]):
+        r = slot_entries[k] // width
+        s = s + (slot_alpha[r, slot_entries[k] % width] * lam[r]) * contact_dir[r]
+    out[p] = out[p] + s
+
+
+@wp.kernel
+def subtract_slot_residual_kernel(
+    extra_particle: wp.array2d[wp.int32],  # (M, K - 1) further particles of each contact, -1 when unused
+    extra_alpha: wp.array2d[wp.float32],  # (M, K - 1)
+    contact_normal: wp.array[wp.vec3],
+    contact_t1: wp.array[wp.vec3],
+    contact_t2: wp.array[wp.vec3],
+    x: wp.array[wp.vec3],
+    r: wp.array[wp.float64],  # inout, (3M,)
+):
+    """Subtract ``alpha * dot(axis, x[p])`` of the extra particles from the residual of
+    :func:`compute_contact_residual_coulomb_kernel`."""
+    c = wp.tid()
+    for i in range(extra_particle.shape[1]):
+        p = extra_particle[c, i]
+        if p >= 0:
+            w = wp.float64(extra_alpha[c, i])
+            r[3 * c + 0] = r[3 * c + 0] - w * wp.float64(wp.dot(contact_normal[c], x[p]))
+            r[3 * c + 1] = r[3 * c + 1] - w * wp.float64(wp.dot(contact_t1[c], x[p]))
+            r[3 * c + 2] = r[3 * c + 2] - w * wp.float64(wp.dot(contact_t2[c], x[p]))
+
+
 # ---------------------------------------------------------------------------
 # NSN inner LCP: Fischer-Burmeister rows and Schur build, in fp64.
 #
@@ -2371,6 +2440,16 @@ def lite_row_dirs_kernel(
         row_dir[r] = tangent1[r // rows_per_contact]
     else:
         row_dir[r] = tangent2[r // rows_per_contact]
+
+
+@wp.kernel
+def scale_diagonal_kernel(
+    scale: wp.float64,
+    a: wp.array2d[wp.float64],  # inout
+):
+    """``a[i, i] *= scale`` on the launched rows."""
+    i = wp.tid()
+    a[i, i] = a[i, i] * scale
 
 
 @wp.kernel
@@ -3070,6 +3149,7 @@ def compute_normal_offset_kernel(
 @wp.kernel
 def soft_contact_force_kernel(
     record: wp.array[wp.int32],
+    count: int,
     normal: wp.array[wp.vec3],
     tangent1: wp.array[wp.vec3],
     tangent2: wp.array[wp.vec3],
@@ -3081,18 +3161,32 @@ def soft_contact_force_kernel(
 ):
     """Wrench on the shape of each particle contact ``record[c]`` of ``Contacts``, from the forces [N] the step's
     last solve applied along the rows ``n, t1, t2`` (or ``n`` alone) of the contact: the force by the particle and its
-    torque about the world origin, in world frame."""
+    torque about the world origin, in world frame. The rows of a contact's other minima follow its row and add to
+    it."""
     c = wp.tid()
-    r = rows_per_contact * c
-    f = normal[c] * float(lam_apply[r])
-    if rows_per_contact == 3:
-        f = f + tangent1[c] * float(lam_apply[r + 1]) + tangent2[c] * float(lam_apply[r + 2])
-    contact_f[rigid_contact_max + record[c]] = wp.spatial_vector(-f, -wp.cross(anchor[c], f))
+    i = record[c]
+    if i < 0 or (c > 0 and record[c - 1] == i):
+        return
+    force = wp.vec3(0.0)
+    torque = wp.vec3(0.0)
+    k = c
+    while k < count and record[k] == i:
+        r = rows_per_contact * k
+        f = normal[k] * float(lam_apply[r])
+        if rows_per_contact == 3:
+            f = f + tangent1[k] * float(lam_apply[r + 1]) + tangent2[k] * float(lam_apply[r + 2])
+        force = force - f
+        torque = torque - wp.cross(anchor[k], f)
+        k += 1
+    contact_f[rigid_contact_max + i] = wp.spatial_vector(force, torque)
 
 
 @wp.kernel
 def add_contact_thickness_kernel(
     particle: wp.array[wp.int32],
+    extra_particle: wp.array2d[wp.int32],
+    extra_alpha: wp.array2d[wp.float32],
+    has_extra: int,
     shape: wp.array[wp.int32],
     particle_radius: wp.array[wp.float32],
     shape_margin: wp.array[wp.float32],
@@ -3100,10 +3194,18 @@ def add_contact_thickness_kernel(
 ):
     """Move each shape contact's plane out by the particle radius plus the shape margin.
 
-    A contact without a shape (``shape < 0``) has no margin.
+    A face contact interpolates the radii of its particles at its barycentric weights, as the first particle's
+    radius plus the weighted differences of the others, so that equal radii stay exact. A contact without a shape
+    (``shape < 0``) has no margin.
     """
     c = wp.tid()
-    radius = particle_radius[particle[c]]
+    radius0 = particle_radius[particle[c]]
+    radius = radius0
+    if has_extra:
+        for k in range(extra_particle.shape[1]):
+            p = extra_particle[c, k]
+            if p >= 0:
+                radius += extra_alpha[c, k] * (particle_radius[p] - radius0)
     if shape[c] >= 0:
         radius += shape_margin[shape[c]]
     offset[c] = offset[c] + wp.float64(radius)
