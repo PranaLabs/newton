@@ -3764,7 +3764,7 @@ class TestContactForceObservable(unittest.TestCase):
             raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
 
     def test_resting_cloth_weighs_on_the_ground(self):
-        """Report the cloth's weight on the ground, with torques about the origin."""
+        """Report the cloth's weight on the ground, with torques about the origin, in the full and the lite solve."""
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
         builder.add_ground_plane()
         builder.add_cloth_grid(
@@ -3783,20 +3783,21 @@ class TestContactForceObservable(unittest.TestCase):
         weight = float(model.particle_mass.numpy().sum()) * 9.81
         pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.05)
         contacts = pipeline.contacts()
-        solver, s0, s1 = SolverFBA(model), model.state(), model.state()
-        observables = solver.observables({solver.ObservableKind.CONTACT_F}, contacts=contacts)
-        for _ in range(120):
-            pipeline.collide(s0, contacts)
-            solver.step(s0, s1, None, contacts, 1.0 / 60.0, observables=observables)
-            s0, s1 = s1, s0
-        count, rigid = int(contacts.soft_contact_count.numpy()[0]), contacts.rigid_contact_max
-        wrench = observables.contact_f.numpy()
-        soft = wrench[rigid : rigid + count]
-        # Friction holds the settling cloth with up to 2e-5 of its weight.
-        np.testing.assert_allclose(soft[:, :3].sum(axis=0), [0.0, 0.0, -weight], atol=2e-5 * weight)
-        anchor = contacts.soft_contact_body_pos.numpy()[:count]  # in world frame on the static ground
-        np.testing.assert_allclose(soft[:, 3:], np.cross(anchor, soft[:, :3]), atol=1e-6 * weight)
-        self.assertFalse(wrench[:rigid].any() or wrench[rigid + count :].any())
+        for mode in ("full", "lite"):
+            solver, s0, s1 = SolverFBA(model, nsn_schur_mode=mode), model.state(), model.state()
+            observables = solver.observables({solver.ObservableKind.CONTACT_F}, contacts=contacts)
+            for _ in range(120):
+                pipeline.collide(s0, contacts)
+                solver.step(s0, s1, None, contacts, 1.0 / 60.0, observables=observables)
+                s0, s1 = s1, s0
+            count, rigid = int(contacts.soft_contact_count.numpy()[0]), contacts.rigid_contact_max
+            wrench = observables.contact_f.numpy()
+            soft = wrench[rigid : rigid + count]
+            # Friction holds the settling cloth with up to 2e-5 of its weight.
+            np.testing.assert_allclose(soft[:, :3].sum(axis=0), [0.0, 0.0, -weight], atol=2e-5 * weight, err_msg=mode)
+            anchor = contacts.soft_contact_body_pos.numpy()[:count]  # in world frame on the static ground
+            np.testing.assert_allclose(soft[:, 3:], np.cross(anchor, soft[:, :3]), atol=1e-6 * weight, err_msg=mode)
+            self.assertFalse(wrench[:rigid].any() or wrench[rigid + count :].any(), mode)
 
 
 class SolverFBALambdaWarmStartTests(unittest.TestCase):
@@ -3832,25 +3833,26 @@ class SolverFBALambdaWarmStartTests(unittest.TestCase):
         """Step a state as a new solver steps it: the solver keeps no history for reset to discard.
 
         The cloth rests on the plane after 14 steps; the contact multipliers and weights start at zero in every
-        step."""
+        step, in the full and the lite contact solve."""
         from newton import CollisionPipeline  # noqa: PLC0415
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
         model = self._cloth_on_plane_model()
         pipeline = CollisionPipeline(model, soft_contact_gap=0.15)
         contacts = pipeline.contacts()
-        solver, s0, s1 = SolverFBA(model), model.state(), model.state()
-        for _ in range(14):
-            pipeline.collide(s0, contacts)
-            solver.step(s0, s1, None, contacts, 1.0 / 60.0)
-            s0, s1 = s1, s0
-        steps = []
-        for stepper in (solver, SolverFBA(model)):
-            pipeline.collide(s0, contacts)
-            stepper.step(s0, s1, None, contacts, 1.0 / 60.0)
-            steps.append(s1.particle_q.numpy())
-        self.assertGreater(solver._contact_count, 0)
-        np.testing.assert_array_equal(steps[0], steps[1])
+        for mode in ("full", "lite"):
+            solver, s0, s1 = SolverFBA(model, nsn_schur_mode=mode), model.state(), model.state()
+            for _ in range(14):
+                pipeline.collide(s0, contacts)
+                solver.step(s0, s1, None, contacts, 1.0 / 60.0)
+                s0, s1 = s1, s0
+            steps = []
+            for stepper in (solver, SolverFBA(model, nsn_schur_mode=mode)):
+                pipeline.collide(s0, contacts)
+                stepper.step(s0, s1, None, contacts, 1.0 / 60.0)
+                steps.append(s1.particle_q.numpy())
+            self.assertGreater(solver._contact_count, 0)
+            np.testing.assert_array_equal(steps[0], steps[1], err_msg=mode)
 
     def test_lam_persistent_initially_none(self) -> None:
         """Start a new solver without persistent multipliers."""
@@ -4903,6 +4905,57 @@ class TestDroppedDualGauge(unittest.TestCase):
             for stretching_model in ("corotational", "neohookean"):
                 with self.subTest(tetrahedra=tetrahedra, stretching_model=stretching_model):
                     self.assertAlmostEqual(self._modulus_ratio(tetrahedra, stretching_model), 1.0, delta=0.03)
+
+
+class TestLiteContactsOnBoxes(unittest.TestCase):
+    """A cloth resting on identical boxes in the lite NSN."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not wp.is_cuda_available():
+            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
+
+    @staticmethod
+    def _drop_on_boxes(boxes: int, mode: str) -> tuple[np.ndarray, int]:
+        """Drop a cloth on ``boxes`` identical boxes for 0.5 s; return its particle heights and contact count."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
+        for _ in range(boxes):
+            builder.add_shape_box(body=-1, hx=0.5, hy=0.5, hz=0.05)
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.1, -0.1, 0.07),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.05,
+            cell_y=0.05,
+            mass=0.01,
+            tri_ke=1.0e3,
+            tri_ka=1.0e3,
+            tri_kd=0.0,
+            edge_ke=1.0e-3,
+            particle_radius=0.005,
+        )
+        model = builder.finalize()
+        pipeline = CollisionPipeline(model, soft_contact_gap=0.02)
+        contacts = pipeline.contacts()
+        solver, s0, s1 = SolverFBA(model, nsn_schur_mode=mode), model.state(), model.state()
+        for _ in range(30):
+            pipeline.collide(s0, contacts)
+            solver.step(s0, s1, None, contacts, 1.0 / 60.0)
+            s0, s1 = s1, s0
+        return s0.particle_q.numpy()[:, 2], int(contacts.soft_contact_count.numpy()[0])
+
+    def test_rests_at_the_contact_distance(self):
+        """Rest a cloth on a box its particle radius above the top face, as the full NSN does."""
+        heights, _ = self._drop_on_boxes(1, "lite")
+        np.testing.assert_allclose(heights, 0.055, rtol=0.0, atol=1.0e-5)
+
+    def test_five_contacts_on_a_particle_are_refused(self):
+        """Refuse a lite step in which a particle has five contacts, more than its Newton step holds."""
+        self._drop_on_boxes(4, "lite")
+        with self.assertRaises(NotImplementedError):
+            self._drop_on_boxes(5, "lite")
 
 
 if __name__ == "__main__":
