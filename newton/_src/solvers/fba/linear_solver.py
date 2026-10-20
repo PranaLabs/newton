@@ -771,6 +771,8 @@ class FBALinearSolver:
         self.device = wp.get_device(device) if isinstance(device, str) else device
         n = factor.S.shape[0]
         self.n = n
+        # Slots of contact rows on several particles: (particles, coefficients, CSR offsets, CSR entries).
+        self._row_slots = None
 
         # Build 1x1 BSR matrices from the sparse factors.
         self._S_bsr = _csc_to_bsr_1x1(factor.S, self.device)
@@ -831,6 +833,8 @@ class FBALinearSolver:
         j_tangent1: wp.array | None = None,
         j_tangent2: wp.array | None = None,
         download: bool = True,
+        j_extra_indices: wp.array | None = None,
+        j_extra_alpha: wp.array | None = None,
     ) -> np.ndarray | None:
         """Build ``W = J · A⁻¹ · Jᵀ`` as a dense NumPy array (batched GPU implementation).
 
@@ -862,6 +866,11 @@ class FBALinearSolver:
                 large contact sets.  When ``False`` the method
                 returns ``None``; the device-side ``W`` remains accessible
                 through :meth:`W_device_view`.
+            j_extra_indices: Optional further particles of each contact,
+                shape ``[M, K - 1]``, dtype int32, ``-1`` when unused. A
+                contact then acts on ``alpha_k`` times its direction on each
+                of its ``K`` particles.
+            j_extra_alpha: Their Jacobian coefficients, shape ``[M, K - 1]``, dtype float32.
 
         Returns:
             Dense float64 NumPy array of shape ``(M, M)`` (frictionless) or
@@ -909,6 +918,14 @@ class FBALinearSolver:
             row_particle[:] = idx_np
             row_dir[:] = n_np
             row_alpha[:] = a_np
+
+        extra_p = extra_a = None
+        extra_h = None if j_extra_indices is None else host_head(j_extra_indices, M)
+        if extra_h is not None and (extra_h >= 0).any():
+            extra_p = np.repeat(extra_h, rows_per_contact, axis=0)
+            extra_a = np.repeat(host_head(j_extra_alpha, M), rows_per_contact, axis=0)
+
+        isodof_particles = self._set_row_slots(row_particle, row_alpha, extra_p, extra_a)
 
         # Upload direction arrays to device.
         row_particle_d = wp.array(row_particle, dtype=wp.int32, device=dev)
@@ -958,7 +975,7 @@ class FBALinearSolver:
         # assemble W with a 2D kernel reading
         # ``Wi[isodof_rank(p_cp), isodof_rank(p_c)]``.
         return self._build_schur_isodof(
-            row_particle,
+            isodof_particles,
             row_particle_d,
             row_dir_d,
             row_alpha_d,
@@ -1149,7 +1166,7 @@ class FBALinearSolver:
 
     def _compose_schur(self) -> None:
         """Compose ``W`` from ``Wi`` and the row particles, directions and coefficients."""
-        from .kernels import compose_W_from_wi_kernel  # noqa: PLC0415
+        from .kernels import add_slot_terms_W_kernel, compose_W_from_wi_kernel  # noqa: PLC0415
 
         n = self._row_total
         # W[c', c] = alpha[c'] * alpha[c] * dot(dir[c'], dir[c]) * Wi[r', r], written densely; one thread per
@@ -1161,6 +1178,14 @@ class FBALinearSolver:
             outputs=[self._W_device_d],
             device=self.device,
         )
+        if self._row_slots is not None:
+            wp.launch(
+                add_slot_terms_W_kernel,
+                dim=(n, n),
+                inputs=[*self._row_slots[:2], self._row_dir_d, self._isodof_rank_d, self._Wi_v],
+                outputs=[self._W_device_d],
+                device=self.device,
+            )
 
     def setup_lite_mass(self, inv_mass_d: wp.array, dt: float) -> None:
         """Cache the LiteNSN mass operator ``dt² · inv_mass`` of each particle.
@@ -1184,6 +1209,28 @@ class FBALinearSolver:
         # when dt or the pin layout changes.
         self._inv_mass_d = wp.array(inv_mass_h, dtype=wp.float64, device=self.device)
         self._lite_dt2 = float(dt) * float(dt)
+
+    def _set_row_slots(self, row_particle, row_alpha, extra_p, extra_a) -> np.ndarray:
+        """Keep the extra slots of rows on several particles, with a CSR from particle to ``row * K + slot``.
+
+        Returns every particle of the rows, the first slots first.
+        """
+        self._row_slots = None
+        if extra_p is None or not (extra_p >= 0).any():
+            return row_particle
+        dev, n = self.device, self.n
+        rows, slots = np.nonzero(extra_p >= 0)
+        width = extra_p.shape[1] + 1
+        order = np.argsort(extra_p[rows, slots], kind="stable")
+        offsets = np.zeros(n + 1, dtype=np.int32)
+        offsets[1:] = np.cumsum(np.bincount(extra_p[rows, slots], minlength=n))
+        self._row_slots = (
+            wp.array(np.column_stack([row_particle, extra_p]), dtype=wp.int32, device=dev),
+            wp.array(np.column_stack([row_alpha, extra_a]), dtype=wp.float32, device=dev),
+            wp.array(offsets, dtype=wp.int32, device=dev),
+            wp.array((rows * width + slots + 1)[order].astype(np.int32), dtype=wp.int32, device=dev),
+        )
+        return np.concatenate([row_particle, extra_p[rows, slots]])
 
     def setup_lite_row_meta(
         self,
@@ -1227,6 +1274,7 @@ class FBALinearSolver:
         self._row_dir_d = wp.empty(total_rows, dtype=wp.vec3, device=dev)
         inputs = [j_normals, *tangents, rows_per_contact]
         wp.launch(lite_row_dirs_kernel, total_rows, inputs, [self._row_dir_d], device=dev)
+        self._row_slots = None
 
         self._row_particle_d = wp.array(row_particle, dtype=wp.int32, device=dev)
         self._row_alpha_d = wp.array(row_alpha, dtype=wp.float32, device=dev)
@@ -1409,6 +1457,21 @@ class FBALinearSolver:
             device=self.device,
         )
 
+    def _gather_slot_terms(self) -> None:
+        """Add the extra slots of rows on several particles to ``_jt_lambda_d``."""
+        if self._row_slots is None:
+            return
+        from .kernels import gather_jt_lambda_slots_kernel  # noqa: PLC0415
+
+        _, slot_alpha, offsets, entries = self._row_slots
+        wp.launch(
+            gather_jt_lambda_slots_kernel,
+            dim=self.n,
+            inputs=[offsets, entries, self._row_dir_d, slot_alpha, self._lam_d],
+            outputs=[self._jt_lambda_d],
+            device=self.device,
+        )
+
     def apply_lambda_correction_combined(
         self,
         lam: np.ndarray | wp.array,
@@ -1498,6 +1561,7 @@ class FBALinearSolver:
             outputs=[self._jt_lambda_d],
             device=dev,
         )
+        self._gather_slot_terms()
 
         # Step 2: rhs_inout += Jᵀ·lam, that is b += dt²·Jᵀ·(ω·λ): the dt²·ω
         # weighting is folded into ``lam`` by the caller, see

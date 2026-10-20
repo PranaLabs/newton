@@ -27,8 +27,8 @@ pressed against shapes:
 
 - With the default contact operator, contacts do not penetrate and need no
   contact stiffness: each contact supplies the force that keeps its gap
-  closed, within its friction cone, so spinning cylinders drag a soft ball
-  between them by friction alone.
+  closed, within its friction cone, so cloth rests on notched blades, and
+  spinning cylinders drag a soft ball between them by friction alone.
 - Stiff materials step stably at large time steps. The examples step at
   ``dt = 0.01`` s, including a Neo-Hookean bar with a Young's modulus of
   ``1e9`` Pa.
@@ -142,6 +142,10 @@ Contacts
   the contacts of different particles and costs far less, but lets a pressed
   contact settle inside its shape by up to ``dt² F / m`` for a normal force
   ``F`` on a particle of mass ``m``.
+- ``face_contacts=True`` adds a contact at the deepest point of a triangle
+  inside a shape, so shape edges and corners cannot pass between the
+  particles of coarse cloth, and holds particles in concave corners of
+  meshes. It needs friction and the full operator.
 - The friction coefficient of a particle contact is its shape's ``mu``.
 - :attr:`~newton.solvers.SolverBase.ObservableKind.CONTACT_F` reports the
   force of each particle contact on its shape; see :ref:`solver_observables`.
@@ -162,6 +166,8 @@ Examples
 ``python -m newton.examples <name>`` runs each of these:
 
 - ``stretching_cloth_fba``: cloth pulled apart by pins on two opposite edges.
+- ``cloth_on_knives_fba``: cloth on notched blades with face contacts and light
+  Rayleigh stiffness damping.
 - ``twisting_bar_fba``, ``squeezing_ball_fba``: a soft bar twisted by its
   pinned ends and a soft ball dragged by spinning cylinders.
 - ``softbody_cantilever_fba``: two soft cantilevers swing under gravity, one
