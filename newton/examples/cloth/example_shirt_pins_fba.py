@@ -6,9 +6,10 @@
 #
 # A T-shirt hangs from two shoulder points that two handles move: it sways,
 # tilts, gathers its shoulders together, crosses its front over its back and
-# opens again, with cloth self-contact throughout. Each handle holds one
-# vertex with three particle-constraint rows of the lite contact operator,
-# and the test checks every frame that no two shirt triangles intersect.
+# opens again, with cloth self-contact throughout; light Rayleigh stiffness
+# damping calms its swing after each move. Each handle holds one vertex with
+# three particle-constraint rows of the lite contact operator, and the test
+# checks every frame that no two shirt triangles intersect.
 #
 # Command: python -m newton.examples shirt_pins_fba
 ###########################################################################
@@ -71,6 +72,8 @@ class Example:
             particle_topological_contact_filter_threshold=1,
             particle_rest_shape_contact_exclusion_radius=0.009,
             nsn_linear_iterations=20,
+            # Light stiffness damping [s] halves the swing left after each move of the handles.
+            rayleigh_beta=1.0e-4,
         )
         self.state_0, self.state_1 = self.model.state(), self.model.state()
         # Empty external contacts select the device-resident self-contact assembly path.

@@ -98,7 +98,8 @@ A particle contact keeps the particle its radius plus the shape's margin from
 the shape: the cloth above comes to rest 5 mm over the ground. The first step
 factors the system matrix on the CPU and takes longer than the others. The
 matrix depends on the time step, the particle masses, the pinned and inactive
-particles, and the elements and their materials; the solver factors it again
+particles, the elements and their materials, and the Rayleigh damping
+coefficients; the solver factors it again
 when the time step changes or after
 :meth:`~newton.solvers.SolverFBA.notify_model_changed` with
 ``SHAPE_PROPERTIES`` or ``BODY_INERTIAL_PROPERTIES``, and other changes to
@@ -118,6 +119,15 @@ Model Inputs
   the rest angle. The same ``edge_ke`` bends an FBA cloth more stiffly than a
   :class:`~newton.solvers.SolverVBD` one, which scales it by the edge length.
 - **Soft bodies**: tetrahedra with the same stretching models.
+- **Damping**: ``rayleigh_alpha`` [1/s] and ``rayleigh_beta`` [s] apply
+  Rayleigh damping, the forces ``-(alpha M + beta K) v`` with ``M`` the
+  particle masses and ``K`` the stretching and bending part of the constant
+  system matrix, implicitly: the damping matrix joins the prefactored system
+  matrix. Each coefficient is a scalar or one value per particle. ``K``
+  measures every change of an element's deformation gradient, rotations
+  included, so ``beta`` damps the bending of a slender part far more than its
+  bending stiffness alone suggests: in ``softbody_cantilever_fba``,
+  ``rayleigh_beta=2e-5`` brings a 2.4 m beam to rest within seconds.
 - **Pins**: particles with zero inverse mass follow their pin targets through
   a stiff spring of ``pin_stiffness`` [N/m]. The targets start at the model
   positions and move with :meth:`~newton.solvers.SolverFBA.set_pin_targets`.
@@ -136,7 +146,8 @@ Model Inputs
 
 FBA does not simulate springs, equality constraints, mimic joints,
 particle-body attachments, joint limits, drives, armature, or friction, or
-the inputs of :class:`~newton.Control`.
+the inputs of :class:`~newton.Control`, and it does not read the damping
+coefficients ``tri_kd``, ``edge_kd`` and ``k_damp`` of the elements.
 
 Contacts
 --------
@@ -192,7 +203,8 @@ Examples
 ``python -m newton.examples <name>`` runs each of these:
 
 - ``stretching_cloth_fba``: cloth pulled apart by pins on two opposite edges.
-- ``cloth_on_knives_fba``: cloth on notched blades with face contacts.
+- ``cloth_on_knives_fba``: cloth on notched blades with face contacts and light
+  Rayleigh stiffness damping.
 - ``cloth_on_boxes_fba``: cloth on rigid bodies with joints.
 - ``twisting_bar_fba``, ``squeezing_ball_fba``: a soft bar twisted by its
   pinned ends and a soft ball dragged by spinning cylinders.
@@ -202,7 +214,10 @@ Examples
 - ``cloth_dual_franka_fba``: two Franka arms integrated by
   :class:`~newton.solvers.SolverFeatherstone` fold a towel.
 - ``shirt_pins_fba``, ``bunny_ears_fba``: two handles move a T-shirt by its
-  shoulders and a soft bunny by its ears, with self-contact throughout.
+  shoulders and a soft bunny by its ears, with self-contact throughout; the
+  shirt with light Rayleigh stiffness damping.
 - ``shirt_fold_fba``: two Franka arms fold a dropped T-shirt, its sides in and
-  its hem up, with a thin self-contact margin, edge-edge contacts and friction
-  anchors.
+  its hem up, with a thin self-contact margin, edge-edge contacts, friction
+  anchors and Rayleigh stiffness damping.
+- ``softbody_cantilever_fba``: two soft cantilevers swing under gravity, one
+  with Rayleigh damping.

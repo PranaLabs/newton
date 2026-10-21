@@ -8,7 +8,8 @@
 # closed mesh that tapers from 20 mm at its base to 1 mm at its tips, so
 # particle contacts see both of its sides. The cloth triangles are larger
 # than the contact margin, and face contacts keep the blade tips and edges
-# out of them.
+# out of them. Light Rayleigh stiffness damping calms its rebound off the
+# blades.
 #
 # Command: python -m newton.examples cloth_on_knives_fba
 ###########################################################################
@@ -121,6 +122,9 @@ class Example:
             face_contacts=True,
             face_contact_margin=0.03,
             nsn_linear_iterations=10,
+            # Light stiffness damping [s]: the rebound off the blades drops from 17 to 10 cm and the cloth settles
+            # within the run; it leaves translations, and so the fall, undamped.
+            rayleigh_beta=2.0e-4,
         )
         self.pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=0.025)
         self.contacts = self.pipeline.contacts()

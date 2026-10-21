@@ -165,6 +165,31 @@ def add_inertia_to_rhs_kernel(
 
 
 @wp.kernel
+def damping_rhs_kernel(
+    indptr: wp.array[wp.int32],
+    indices: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    x_prev: wp.array[wp.vec3],
+    inv_dt: float,
+    out: wp.array[wp.vec3],
+):
+    """out = C x_prev / dt for the Rayleigh damping matrix ``C`` in CSR form: the step's right-hand side of the
+    implicit damping, whose ``C / dt`` is in the system matrix."""
+    i = wp.tid()
+    acc = wp.vec3d(0.0)
+    for k in range(indptr[i], indptr[i + 1]):
+        acc += values[k] * wp.vec3d(x_prev[indices[k]])
+    out[i] = wp.vec3(acc * wp.float64(inv_dt))
+
+
+@wp.kernel
+def add_vec3_kernel(source: wp.array[wp.vec3], target: wp.array[wp.vec3]):
+    """target += source."""
+    i = wp.tid()
+    target[i] = target[i] + source[i]
+
+
+@wp.kernel
 def copy_particles_kernel(
     particles: wp.array[wp.int32],
     source: wp.array[wp.vec3],

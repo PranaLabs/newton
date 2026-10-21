@@ -8,10 +8,11 @@
 # onto it: each side in toward the middle, the arm on that side holding the
 # shoulder while the other reaches across for the hem corner, then the hem
 # up toward the collar. The shirt lands with a 12 mm self-contact margin and
-# folds with a 6 mm one; edge-edge self contacts keep its creases apart and
-# friction anchors keep the folds from creeping open. IK poses the arms and
-# Featherstone moves them kinematically; SolverFBA steps the shirt with the
-# lite contact operator and holds the pinched layers.
+# folds with a 6 mm one; edge-edge self contacts keep its creases apart,
+# friction anchors keep the folds from creeping open and Rayleigh stiffness
+# damping settles its ringing after the landing and each release. IK poses
+# the arms and Featherstone moves them kinematically; SolverFBA steps the
+# shirt with the lite contact operator and holds the pinched layers.
 #
 # Command: python -m newton.examples shirt_fold_fba
 ###########################################################################
@@ -248,6 +249,9 @@ class Example:
             integrate_with_external_rigid_solver=True,
             # Bounds a contact row at 200 N: two self contacts of the landing layers reach it for a step.
             lambda_cap=200.0,
+            # Stiffness damping [s] settles the few-hertz ringing of the heavy, soft shirt after its landing and each
+            # release; it leaves translations, and so the fall, undamped.
+            rayleigh_beta=3.0e-3,
             friction_anchors=True,
             particle_enable_self_contact=True,
             particle_self_contact_margin=LAND_MARGIN,

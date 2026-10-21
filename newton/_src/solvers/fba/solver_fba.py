@@ -6,7 +6,7 @@ from __future__ import annotations
 import functools
 from collections.abc import Callable
 from types import SimpleNamespace
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import warp as wp
@@ -16,6 +16,9 @@ from ...sim import BodyFlags, Contacts, Control, Model, ModelFlags, State
 from ..solver import SolverBase
 from .cable import Cable
 
+if TYPE_CHECKING:
+    from numpy.typing import ArrayLike
+
 
 def _element_lame(materials: wp.array | None, count: int) -> tuple[np.ndarray, np.ndarray]:
     """First and second Lamé parameters [Pa] of each element, from its material row."""
@@ -23,6 +26,21 @@ def _element_lame(materials: wp.array | None, count: int) -> tuple[np.ndarray, n
         return np.zeros(0), np.zeros(0)
     rows = materials.numpy().astype(np.float64)
     return rows[:, 0], rows[:, 1]
+
+
+def _damping_coefficients(name: str, value, count: int) -> np.ndarray | None:
+    """One Rayleigh damping coefficient per particle from a scalar or a per-particle array, or ``None`` when all
+    are zero."""
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    values = np.asarray(value, dtype=np.float64)
+    if values.ndim == 0:
+        values = np.full(count, float(values))
+    if values.shape != (count,):
+        raise ValueError(f"{name} takes a scalar or one value per particle ({count}), got shape {values.shape}")
+    if not np.isfinite(values).all() or (values < 0.0).any():
+        raise ValueError(f"{name} must be finite and >= 0")
+    return values if values.any() else None
 
 
 def _host_mirror(name: str) -> property:
@@ -112,6 +130,14 @@ class SolverFBA(SolverBase):
     for a dihedral angle ``theta``: at small angles the same ``edge_ke``
     bends an FBA cloth ``3 * |e| / (A0 + A1)`` times as stiffly.
 
+    Rayleigh damping, ``rayleigh_alpha`` and ``rayleigh_beta``, applies the
+    forces ``-(alpha M + beta K) v`` by implicit Euler, with ``M`` the
+    particle masses and ``K`` the stretching and bending part of the PD
+    Hessian, the weights above included: the Hessian gains
+    ``(alpha M + beta K) / dt``, and each step's right-hand side
+    ``(alpha M + beta K) x_prev / dt`` for the step's start positions
+    ``x_prev``.
+
     Notes:
         - Float32 ``particle_q`` output: the interior linear solver
           operates in float64, but ``state_out.particle_q`` (vec3) is
@@ -164,6 +190,8 @@ class SolverFBA(SolverBase):
         particle_self_contact_gap: float | None = None,
         particle_topological_contact_filter_threshold: int = 2,
         particle_rest_shape_contact_exclusion_radius: float = 0.0,
+        rayleigh_alpha: float | ArrayLike = 0.0,
+        rayleigh_beta: float | ArrayLike = 0.0,
     ) -> None:
         """
         Args:
@@ -300,6 +328,23 @@ class SolverFBA(SolverBase):
                 ``model.particle_q`` within which a particle does not collide
                 with a triangle or particle, so that a fold can close only
                 between parts that start apart.
+            rayleigh_alpha: Mass-proportional Rayleigh damping coefficient
+                [1/s]: a particle of mass ``m`` moving at ``v`` feels the force
+                ``-alpha m v``. A scalar for every particle, or one value per
+                particle.
+            rayleigh_beta: Stiffness-proportional Rayleigh damping coefficient
+                [s]: the particles feel the forces ``-beta K v``, with ``K`` the
+                stretching and bending part of the solver's constant system
+                matrix. ``K`` measures every change of an element's
+                deformation gradient, rotations included, so ``beta`` also
+                damps elements that turn, and a slender part's bending more
+                than its bending stiffness alone suggests. A scalar for every
+                element, or one value per particle, of which an element takes
+                the mean. Both coefficients are integrated implicitly with the
+                rest of the step: the damping matrix enters the prefactored
+                system matrix, and its product with the step's start positions
+                the right-hand side, so a change of ``dt`` refactors both
+                together. Rigid bodies are not damped.
         """
         super().__init__(model)
         if model.world_count > 1:
@@ -329,6 +374,9 @@ class SolverFBA(SolverBase):
 
         self.iterations = int(iterations)
         self.pin_stiffness = float(pin_stiffness)
+        # Rayleigh damping coefficients per particle, None when zero.
+        self._rayleigh_alpha = _damping_coefficients("rayleigh_alpha", rayleigh_alpha, model.particle_count)
+        self._rayleigh_beta = _damping_coefficients("rayleigh_beta", rayleigh_beta, model.particle_count)
         self.stretching_model = stretching_model
         # Dropped-dual gauge of the corotational and Neo-Hookean projections (see the class notes), per element.
         self._tri_gauge = self._tet_gauge = 1.0
@@ -421,6 +469,7 @@ class SolverFBA(SolverBase):
         # rebuild lazily inside `step` if the dt changes.
         self._dt_setup: float | None = None
         self._linear_solver = None
+        self._damping_d = None  # the Rayleigh damping matrix in CSR form, set up with the system
         self._meta: dict | None = None
 
         # Device buffers (allocated lazily once we know dt - see _setup_pd_system).
@@ -507,6 +556,8 @@ class SolverFBA(SolverBase):
 
         self._k_zero_vec3 = _K.zero_vec3_kernel
         self._k_add_inertia = _K.add_inertia_to_rhs_kernel
+        self._k_damping_rhs = _K.damping_rhs_kernel
+        self._k_add_vec3 = _K.add_vec3_kernel
         self._k_gather = _K.gather_per_particle_kernel
         self._k_pin = _K.project_pin_kernel
         self._k_bending = _K.project_bending_kernel
@@ -1066,6 +1117,8 @@ class SolverFBA(SolverBase):
             pin_stiffness=self.pin_stiffness,
             tri_weight_scale=self._tri_gauge,
             tet_weight_scale=self._tet_gauge,
+            rayleigh_alpha=self._rayleigh_alpha,
+            rayleigh_beta=self._rayleigh_beta,
         )
         fs = factorize_and_sparse_inverse(A, self.model.particle_q.numpy())
         self._linear_solver = FBALinearSolver(fs, device=self._device)
@@ -1080,9 +1133,26 @@ class SolverFBA(SolverBase):
         inactive = np.flatnonzero(inactive & (self.model.particle_inv_mass.numpy() > 0.0))
         self._inactive_d = wp.array(inactive.astype(np.int32), dtype=wp.int32, device=device) if inactive.size else None
         # The lite NSN kernels and the dense lite Schur build read the inverse masses; cache them once here so the
-        # per-step Schur dispatch is allocation-free.
+        # per-step Schur dispatch is allocation-free. Mass-proportional damping adds alpha m / dt to the mass term
+        # m / dt^2 of A, which the lite operator inverts.
         if self.nsn_schur_mode == "lite":
-            self._linear_solver.setup_lite_mass(self._inv_mass_d, dt)
+            lite_inv_mass = self._inv_mass_d
+            if self._rayleigh_alpha is not None:
+                lite_inv_mass = wp.array(
+                    (inv_mass / (1.0 + self._rayleigh_alpha * dt)).astype(np.float32), dtype=wp.float32, device=device
+                )
+            self._linear_solver.setup_lite_mass(lite_inv_mass, dt)
+        # The damping matrix C in CSR form, whose product with the step's start positions over dt joins the
+        # right-hand side of every iteration.
+        damping = meta["damping"]
+        self._damping_d = None
+        if damping is not None:
+            self._damping_d = (
+                wp.array(damping.indptr.astype(np.int32), dtype=wp.int32, device=device),
+                wp.array(damping.indices.astype(np.int32), dtype=wp.int32, device=device),
+                wp.array(damping.data, dtype=wp.float64, device=device),
+            )
+            self._damping_rhs = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=device)
         self._meta = meta
         self._dt_setup = dt
         # A changed → any cached W / A^{-1} J^T is stale.
@@ -1393,6 +1463,10 @@ class SolverFBA(SolverBase):
             outputs=[self._x_inertia],
             device=device,
         )
+        # Implicit Rayleigh damping: C x_prev / dt joins the right-hand side of every iteration.
+        if self._damping_d is not None:
+            inputs = [*self._damping_d, state_in.particle_q, 1.0 / dt]
+            wp.launch(self._k_damping_rhs, dim=N, inputs=inputs, outputs=[self._damping_rhs], device=device)
         # Initialize current iterate x_cur = x_inertia (copy).
         wp.copy(self._x_cur, self._x_inertia)
 
@@ -1740,6 +1814,9 @@ class SolverFBA(SolverBase):
             outputs=[self._rhs],
             device=device,
         )
+        # Rayleigh damping term of the step.
+        if self._damping_d is not None:
+            wp.launch(self._k_add_vec3, dim=N, inputs=[self._damping_rhs], outputs=[self._rhs], device=device)
         # Pin projection.
         if self._pin_indices_d is not None:
             wp.launch(
