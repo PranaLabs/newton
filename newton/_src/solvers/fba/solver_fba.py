@@ -12,7 +12,7 @@ import numpy as np
 import warp as wp
 
 from ...geometry import ParticleFlags
-from ...sim import BodyFlags, Contacts, Control, Model, ModelFlags, State
+from ...sim import BodyFlags, Contacts, Control, Model, ModelFlags, State, StateFlags
 from ..solver import SolverBase
 from .kernels import host_head
 
@@ -67,10 +67,10 @@ class SolverFBA(SolverBase):
         attributes may change without the normal deprecation period. It
         simulates models with one world.
 
-    A step depends only on its input state, contacts and control, and on the
-    pin targets and particle constraints last set: the contact multipliers
-    and weights start at zero in every step, so the solver keeps no history
-    for :meth:`reset` to discard.
+    A step depends on its input state, contacts and control, on the pin
+    targets and particle constraints last set, and, with ``friction_anchors``,
+    on the anchors that the steps before kept, which :meth:`reset` drops. The
+    contact multipliers and weights start at zero in every step.
 
     With :attr:`~newton.solvers.SolverBase.ObservableKind.CONTACT_F`
     requested, a step writes row ``rigid_contact_max + i`` for each particle
@@ -171,6 +171,7 @@ class SolverFBA(SolverBase):
         pin_stiffness: float = 1e12,
         stretching_model: Literal["arap", "corotational", "neohookean"] = "arap",
         friction: bool = True,
+        friction_anchors: bool = False,
         lambda_cap: float | None = None,
         shape_angular_velocity: dict[int, float] | None = None,
         nsn_schur_mode: Literal["full", "lite"] = "full",
@@ -183,6 +184,8 @@ class SolverFBA(SolverBase):
         face_contact_gap: float | None = None,
         particle_enable_self_contact: bool = False,
         particle_self_contact_mode: Literal["vertex_face", "vertex_vertex"] = "vertex_face",
+        particle_self_contact_edge_edge: bool = False,
+        particle_self_contact_edge_edge_ratio: float = 0.9,
         particle_self_contact_margin: float = 2.0e-3,
         particle_self_contact_gap: float | None = None,
         particle_topological_contact_filter_threshold: int = 2,
@@ -201,6 +204,26 @@ class SolverFBA(SolverBase):
             stretching_model: The stretching model, ``"arap"``, ``"corotational"`` or ``"neohookean"``.
             friction: If ``True`` (default), contacts carry Coulomb friction;
                 otherwise they only push.
+            friction_anchors: If ``True``, a contact keeps the point it
+                presses on across steps: a point of the other layer for a
+                vertex-face self contact, or a point of a static shape. Its
+                friction rows then hold the particle at that point rather than
+                at the point the step's contact starts from, so slip that a
+                step's solve leaves is pulled back in the next step instead of
+                adding up. The lite operator leaves such slip where the
+                material spreads a friction force to the particle's neighbors,
+                which lets stacked cloth layers creep apart over seconds. The
+                friction cone still bounds the force: a contact pulled harder
+                than ``mu`` times its normal force slides as without the
+                point, which trails it by at most a quarter of the contact
+                distance (the self-contact margin, or the particle radius plus
+                the shape margin) and then moves to it; with a contact distance
+                of zero it stays where it was set. A contact drops its
+                point when it carries no normal force or acts on a particle
+                that rows hold at a point. Vertex-vertex self contacts,
+                contacts with shapes on bodies, face contacts, and the contacts
+                of a step in which one touches a body that FBA integrates keep
+                the step's point. Needs ``friction=True``.
             lambda_cap: Optional clamp on the magnitude of each contact
                 row's multiplier, in force units [N]. The multipliers are
                 forces divided by ``dt²``, so the clamp is divided by ``dt²``
@@ -304,10 +327,24 @@ class SolverFBA(SolverBase):
             particle_self_contact_mode: ``"vertex_face"`` keeps each particle
                 ``particle_self_contact_margin`` from its nearest triangle, which
                 covers crossing edges only when the margin reaches half of the
-                longest edge. ``"vertex_vertex"`` keeps particles that margin
-                apart, which covers the surface when it reaches the longest edge
-                (twice the largest circumradius of acute triangles), and leaves
-                a bumpy contact surface.
+                longest edge, or with ``particle_self_contact_edge_edge=True``.
+                ``"vertex_vertex"`` keeps particles that margin apart, which
+                covers the surface when it reaches the longest edge (twice the
+                largest circumradius of acute triangles), and leaves a bumpy
+                contact surface.
+            particle_self_contact_edge_edge: If ``True``, also keep two edges
+                ``particle_self_contact_margin`` apart where their closest
+                points lie inside both edges and come nearer than the nearest
+                triangles of their particles, as at a crease, so that crossing
+                edges are covered at any margin. Needs
+                ``particle_self_contact_mode="vertex_face"``.
+            particle_self_contact_edge_edge_ratio: An edge pair takes a
+                contact only where its edges come nearer than this times the
+                distance of its particles' nearest triangles. Below 1, between
+                flat layers the vertex-face contacts hold the edges apart, and
+                only ridges, such as creases, bring edges that near; 1 also
+                covers edges of layers whose vertex-face contacts barely hold
+                them, at a few percent more contacts.
             particle_self_contact_margin: Self-contact distance [m]: the
                 distance at which a particle and a triangle or particle stop.
             particle_self_contact_gap: Additional detection distance [m]: self
@@ -386,6 +423,19 @@ class SolverFBA(SolverBase):
         self.stretching_model = stretching_model
         self._update_materials()
         self.friction = bool(friction)
+        if friction_anchors and not self.friction:
+            raise ValueError("friction_anchors needs friction=True")
+        self.friction_anchors = bool(friction_anchors)
+        # Friction anchors: the step count that stamps the self-contact anchors kept per particle, the number of
+        # particle contacts whose keys and anchors the step before left, and the number of contacts this step set up.
+        self._anchor_step, self._anchor_count, self._anchor_rows, self._anchor_cap = 0, 0, 0, 0
+        # Particles whose contacts keep no friction anchors, as the held ones (set_friction_anchor_exclusion).
+        self._anchor_exclude = np.zeros(0, dtype=np.int32)
+        if self.friction_anchors and model.particle_count:
+            n = model.particle_count
+            self._anchor_triangle_d = wp.full(n, wp.vec3i(-1, -1, -1), dtype=wp.vec3i, device=model.device)
+            self._anchor_bary_d = wp.zeros(n, dtype=wp.vec3, device=model.device)
+            self._anchor_step_d = wp.full(n, -2, dtype=wp.int32, device=model.device)
         if nsn_linear_iterations is not None and nsn_linear_iterations < 1:
             raise ValueError(f"nsn_linear_iterations must be >= 1 or None, got {nsn_linear_iterations}")
         self.nsn_linear_iterations = None if nsn_linear_iterations is None else int(nsn_linear_iterations)
@@ -432,11 +482,23 @@ class SolverFBA(SolverBase):
                     raise ValueError(f"{name} must be >= 0, got {value}")
             from .self_contact import SelfContact  # noqa: PLC0415
 
+            if particle_self_contact_edge_edge_ratio <= 0.0:
+                raise ValueError(
+                    f"particle_self_contact_edge_edge_ratio must be > 0, got {particle_self_contact_edge_edge_ratio}"
+                )
             self.particle_self_contact_margin = float(particle_self_contact_margin)
             query_radius = particle_self_contact_margin + gap
             filter_rings = particle_topological_contact_filter_threshold
             rest_radius = particle_rest_shape_contact_exclusion_radius
-            self._self_contact = SelfContact(model, particle_self_contact_mode, query_radius, filter_rings, rest_radius)
+            self._self_contact = SelfContact(
+                model,
+                particle_self_contact_mode,
+                query_radius,
+                filter_rings,
+                rest_radius,
+                edge_edge=particle_self_contact_edge_edge,
+                edge_edge_ratio=particle_self_contact_edge_edge_ratio,
+            )
         if self.face_contacts:
             if not self.friction or nsn_schur_mode != "full":
                 raise ValueError("face_contacts needs friction=True and nsn_schur_mode='full'")
@@ -1464,6 +1526,8 @@ class SolverFBA(SolverBase):
         # Rigid contact rows are assembled after the deformable contacts they may share bodies with.
         if rigid:
             self._begin_rigid_contacts(contacts, state_in)
+        if self.friction_anchors:
+            self._apply_friction_anchors(state_in)
 
         if self._inactive_d is not None:
             inputs = [self._inactive_d, state_in.particle_q]
@@ -1772,6 +1836,9 @@ class SolverFBA(SolverBase):
                     ls.apply_lambda_correction_combined(self._nsn_lam_apply_d, self._rhs, self._x_cur)
             if rigid:
                 self._rigid_iteration(state_in, state_out, dt)
+
+        if self.friction_anchors:
+            self._update_friction_anchors()
 
         # 3) Write velocity and update state_out.
         if self._inactive_d is not None:
@@ -2087,6 +2154,25 @@ class SolverFBA(SolverBase):
         else:
             self._x_ref.assign(np.asarray(target_positions, dtype=np.float32))
 
+    def set_particle_self_contact(self, *, margin: float, gap: float | None = None) -> None:
+        """Change the self-contact distance and detection gap for the following steps.
+
+        A cloth dropped onto a surface needs a margin and gap that its layers cannot pass in one step; once it lies
+        still, a thinner margin lets folded layers stack closer. Thinner than half the longest edge, vertex-face
+        contacts need ``particle_self_contact_edge_edge=True`` to keep crossing edges apart.
+
+        Args:
+            margin: Self-contact distance [m], as ``particle_self_contact_margin``.
+            gap: Additional detection distance [m], as ``particle_self_contact_gap``. ``None`` takes the margin.
+        """
+        if self._self_contact is None:
+            raise ValueError("set_particle_self_contact needs particle_enable_self_contact=True")
+        gap = margin if gap is None else gap
+        if margin <= 0.0 or gap < 0.0:
+            raise ValueError(f"set_particle_self_contact needs margin > 0 and gap >= 0, got {margin} and {gap}")
+        self.particle_self_contact_margin = float(margin)
+        self._self_contact.query_radius = float(margin) + float(gap)
+
     def set_particle_constraints(self, particles, coefficients, targets, *, directions=None, exact=False) -> None:
         """Hold lengths or linear combinations of particle positions in the following steps.
 
@@ -2238,6 +2324,25 @@ class SolverFBA(SolverBase):
         ls.reserve_a_schur_lite_bsr(W)
         return W, held_d if n_b else None
 
+    def reset(
+        self,
+        state: State,
+        world_mask: wp.array[wp.bool] | None = None,
+        flags: StateFlags | int | None = None,
+    ) -> None:
+        """Drop the friction anchors that the steps before kept, so that the next step starts afresh.
+
+        The state is not modified. SolverFBA simulates one world, so any reset drops all of them.
+
+        Args:
+            state: The simulation state, unused.
+            world_mask: Unused.
+            flags: Unused.
+        """
+        self._anchor_count = 0
+        if self.friction_anchors and self.model.particle_count:
+            self._anchor_step_d.fill_(-2)
+
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         """Rebuild and factor the system matrices at the next step.
 
@@ -2274,6 +2379,130 @@ class SolverFBA(SolverBase):
     # ------------------------------------------------------------------
     # Contact state (allocated lazily on first call).
     # ------------------------------------------------------------------
+
+    def _anchor_extra(self) -> tuple[list, int]:
+        """The further particles and coefficients of the step's contacts, or a stand-in when no contact has any, and
+        whether they are the contacts'."""
+        if self._contact_extra is not None:
+            return self._contact_extra, 1
+        if not hasattr(self, "_anchor_no_extra"):
+            self._anchor_no_extra = [
+                wp.full((1, 3), -1, dtype=wp.int32, device=self._device),
+                wp.zeros((1, 3), dtype=wp.float32, device=self._device),
+            ]
+        return self._anchor_no_extra, 0
+
+    def _anchor_shapes(self) -> tuple[wp.array, wp.array]:
+        """The model's shape bodies and margins, or empty stand-ins for a model without shapes."""
+        model = self.model
+        if model.shape_count:
+            return model.shape_body, model.shape_margin
+        if not hasattr(self, "_anchor_no_shapes"):
+            self._anchor_no_shapes = (
+                wp.zeros(1, dtype=wp.int32, device=self._device),
+                wp.zeros(1, dtype=float, device=self._device),
+            )
+        return self._anchor_no_shapes
+
+    def _ensure_anchor_buffers(self, count: int) -> None:
+        """Size the per-contact friction anchor buffers to ``count`` contacts, keeping the step before's anchors."""
+        if count <= self._anchor_cap:
+            return
+        cap, device = max(int(count * 1.5), 64), self._device
+        previous = None
+        if self._anchor_cap:
+            previous = (self._anchor_previous_key_d, self._anchor_previous_point_d, self._anchor_previous_pressed_d)
+        self._anchor_flag_d = wp.zeros(cap, dtype=wp.int32, device=device)
+        self._anchor_key_d = wp.zeros(cap, dtype=wp.int64, device=device)
+        self._anchor_point_d = wp.zeros(cap, dtype=wp.vec3, device=device)
+        self._anchor_previous_key_d = wp.zeros(cap, dtype=wp.int64, device=device)
+        self._anchor_previous_point_d = wp.zeros(cap, dtype=wp.vec3, device=device)
+        self._anchor_previous_pressed_d = wp.zeros(cap, dtype=wp.int32, device=device)
+        self._anchor_next_key_d = wp.zeros(cap, dtype=wp.int64, device=device)
+        self._anchor_next_point_d = wp.zeros(cap, dtype=wp.vec3, device=device)
+        self._anchor_next_pressed_d = wp.zeros(cap, dtype=wp.int32, device=device)
+        if previous is not None and self._anchor_count:
+            current = (self._anchor_previous_key_d, self._anchor_previous_point_d, self._anchor_previous_pressed_d)
+            for dst, src in zip(current, previous, strict=True):
+                wp.copy(dst, src, count=self._anchor_count)
+        self._anchor_cap = cap
+
+    def _apply_friction_anchors(self, state_in: State) -> None:
+        """Move the tangent offsets of the contacts that kept a friction anchor from the step before, so that their
+        friction rows hold the particle at the anchor."""
+        from .kernels import friction_anchor_apply_kernel  # noqa: PLC0415
+
+        self._anchor_step += 1
+        self._anchor_rows = 0
+        M = self._contact_count
+        # The contacts of a step that solves rigid contact rows with them keep the step's points.
+        if M == 0 or self._two_way:
+            return
+        self._ensure_anchor_buffers(M)
+        (extra_particle, extra_alpha), has_extra = self._anchor_extra()
+        shape_body, shape_margin = self._anchor_shapes()
+        margin = self.particle_self_contact_margin if self._self_contact is not None else 0.0
+        inputs = [self._contact_shape_d, self._contact_particle_d, extra_particle, extra_alpha, wp.int32(has_extra)]
+        inputs += [self._contact_normal_d, self._contact_tangent1_d, self._contact_tangent2_d]
+        inputs += [self._contact_world_anchor_d, state_in.particle_q, self.model.particle_radius]
+        inputs += [shape_body, shape_margin, wp.int64(max(self.model.shape_count, 1)), float(margin)]
+        inputs += [wp.int32(self._anchor_step), self._anchor_triangle_d, self._anchor_bary_d, self._anchor_step_d]
+        inputs += [self._anchor_previous_key_d, self._anchor_previous_point_d, self._anchor_previous_pressed_d]
+        inputs += [wp.int32(self._anchor_count)]
+        outputs = [self._contact_tangent1_offset_shifted_d, self._contact_tangent2_offset_shifted_d]
+        outputs += [self._anchor_flag_d, self._anchor_key_d, self._anchor_point_d]
+        wp.launch(friction_anchor_apply_kernel, M, inputs, outputs, device=self._device)
+        self._anchor_rows = M
+
+    def set_friction_anchor_exclusion(self, particles: ArrayLike | None) -> None:
+        """Keep no friction anchors on the contacts that ``particles`` make from the following steps on, with shapes
+        or as the vertex of a vertex-face self contact, as on particles that rows hold at points; ``None`` frees none.
+
+        A grasp that gathers cloth between fingers frees the cloth around them, so that it slides toward the
+        fingers instead of being pulled back to where it lay.
+
+        Args:
+            particles: Particle indices, or ``None`` for none.
+        """
+        if not self.friction_anchors:
+            raise ValueError("set_friction_anchor_exclusion needs friction_anchors=True")
+        self._anchor_exclude = (
+            np.zeros(0, np.int32) if particles is None else np.unique(np.asarray(particles, np.int32))
+        )
+
+    def _update_friction_anchors(self) -> None:
+        """Keep or set the friction anchors of the contacts that pressed in the step, from its last multipliers."""
+        from .kernels import friction_anchor_update_kernel  # noqa: PLC0415
+
+        M = self._anchor_rows
+        if M == 0:
+            self._anchor_count = 0
+            return
+        (extra_particle, extra_alpha), has_extra = self._anchor_extra()
+        shape_body, _ = self._anchor_shapes()
+        held = self._held_particle_d
+        if len(self._anchor_exclude):
+            mask = np.zeros(self.model.particle_count, dtype=np.int32)
+            mask[self._held_particles] = 1
+            mask[self._anchor_exclude] = 1
+            held = wp.array(mask, dtype=wp.int32, device=self._device)
+        inputs = [self._contact_shape_d, self._contact_particle_d, extra_particle, extra_alpha, wp.int32(has_extra)]
+        inputs += [self._lam_coulomb_persistent_d]
+        inputs += [self._anchor_step_d if held is None else held, wp.int32(held is not None), shape_body]
+        inputs += [wp.int32(self._anchor_step), self._anchor_flag_d, self._anchor_key_d, self._anchor_point_d]
+        outputs = [self._anchor_triangle_d, self._anchor_bary_d, self._anchor_step_d]
+        outputs += [self._anchor_next_key_d, self._anchor_next_point_d, self._anchor_next_pressed_d]
+        wp.launch(friction_anchor_update_kernel, M, inputs, outputs, device=self._device)
+        self._anchor_previous_key_d, self._anchor_next_key_d = self._anchor_next_key_d, self._anchor_previous_key_d
+        self._anchor_previous_point_d, self._anchor_next_point_d = (
+            self._anchor_next_point_d,
+            self._anchor_previous_point_d,
+        )
+        self._anchor_previous_pressed_d, self._anchor_next_pressed_d = (
+            self._anchor_next_pressed_d,
+            self._anchor_previous_pressed_d,
+        )
+        self._anchor_count = M
 
     def _ensure_contact_buffers(self, max_contacts: int) -> None:
         """Lazily allocate per-step contact buffers sized to ``max_contacts``."""
@@ -2358,8 +2587,9 @@ class SolverFBA(SolverBase):
         # ``wp.atomic_add(soft_contact_count, 0, 1)`` so per-frame order
         # depends on GPU thread scheduling. The order of the rows sets the
         # order of the NSN's sums, hence we sort, so that a step is deterministic.
-        # The pipeline gives one contact per particle and shape, and a particle one vertex-face self contact at
-        # most: with these alone, the contacts are sorted and assembled on the device. Steps with vertex-face self
+        # The pipeline gives one contact per particle and shape, a particle one vertex-face self contact at most,
+        # and a pair of edges one edge-edge contact after them: with these alone, the contacts are sorted and
+        # assembled on the device. Steps with vertex-face self
         # contacts take that path, as their many contacts make the host round trip costly; the others keep the
         # host path.
         on_device = contacts is not None and self._face_query is None
@@ -2658,9 +2888,9 @@ class SolverFBA(SolverBase):
     # ------------------------------------------------------------------
 
     def _assemble_contacts_on_device(self, contacts: Contacts, state: State | None, M_raw: int) -> tuple[int, int]:
-        """Sort the particle-shape contacts by particle and shape and append the vertex-face self contacts in the
-        order of their particles, as the host sort orders them, on the device. Returns the number of contacts and
-        of particle-shape contacts."""
+        """Sort the particle-shape contacts by particle and shape and append the self contacts, the vertex-face ones
+        in the order of their particles and the edge-edge ones after them, as the host sort orders them, on the
+        device. Returns the number of contacts and of particle-shape contacts."""
         from .kernels import assemble_contacts_kernel, soft_contact_keys_kernel  # noqa: PLC0415
 
         device, sc = self._device, self._self_contact

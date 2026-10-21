@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import itertools
 import unittest
 from unittest import mock
 
@@ -19,6 +20,36 @@ def _closest_on_triangle(p, a, b, c):
     keep = u + v <= 1.0
     points = np.outer(1.0 - u[keep] - v[keep], a) + np.outer(u[keep], b) + np.outer(v[keep], c)
     return points[np.argmin(np.linalg.norm(points - p, axis=1))]
+
+
+def _crossing_ribbons(gap, device=None, scale=1.0):
+    """Two ribbons of nine 4 cm by 8 mm cells crossing at right angles in the middle of their long edges: the lower
+    one along y in the plane z = 0, pinned, and the upper one along x ``gap`` over it. Particle ``2 i + j`` of a
+    ribbon lies ``4 i`` cm along it and ``8 j`` mm across it, from -18 cm and -4 mm; the upper ribbon's particles
+    follow the lower one's 20. ``scale`` scales all of it."""
+    builder = newton.ModelBuilder()
+    ribbons = (((-0.004, -0.18, 0.0), (0, 1, 0), (1, 0, 0)), ((-0.18, -0.004, gap), (1, 0, 0), (0, 1, 0)))
+    for ribbon in ribbons:
+        start, along, across = (np.asarray(v, dtype=float) for v in ribbon)
+        vertices = [scale * (start + 0.04 * i * along + 0.008 * j * across) for i in range(10) for j in range(2)]
+        indices = [k for i in range(9) for k in (2 * i, 2 * i + 2, 2 * i + 1, 2 * i + 1, 2 * i + 2, 2 * i + 3)]
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0),
+            vertices=[wp.vec3(*v) for v in vertices],
+            indices=indices,
+            density=0.2,
+            tri_ke=1.0e4,
+            tri_ka=1.0e4,
+            edge_ke=1.0e-3,
+            particle_radius=0.0,
+        )
+        if builder.particle_count == 20:
+            for k in range(20):
+                builder.particle_mass[k] = 0.0
+    return builder.finalize(device=device)
 
 
 class TestSelfContactDetection(unittest.TestCase):
@@ -193,6 +224,69 @@ class TestSelfContactDetection(unittest.TestCase):
                 self.assertGreater(len(particles), 20)
                 at_rest = rest[particles[:, 0]] + np.einsum("ki,kij->kj", alpha[:, 1:], rest[particles[:, 1:]])
                 self.assertGreater(np.count_nonzero(np.linalg.norm(at_rest, axis=1) > 0.04), 10)
+
+    def test_edge_edge_takes_crossing_edges_once(self):
+        """Find each pair of crossing edges once, at its closest points, after the vertex-face contacts.
+
+        The long edges of two ribbons cross 3 mm apart in the middle of their 4 cm edges, 1.6 cm or more from every
+        particle, so no vertex-face contact reaches them within the 1 cm query radius; and as much at 1/20 of that
+        size, with 2 mm edges.
+        """
+        for device, scale in itertools.product(["cpu"] + (["cuda:0"] if wp.is_cuda_available() else []), (1.0, 0.05)):
+            model = _crossing_ribbons(0.003, device, scale)
+            q = model.particle_q.numpy() / scale
+            contact = SelfContact(model, "vertex_face", 0.01 * scale, rings=1, edge_edge=True)
+            particles, alpha, normal = contact.detect(model.particle_q)
+            edge = alpha[:, 1] > 0.0
+            self.assertTrue(edge.all(), msg=device)
+            pairs = {(tuple(p[:2]), tuple(p[2:])) for p in particles}
+            self.assertEqual(len(pairs), len(particles), msg=device)
+            for p, a, n in zip(particles, alpha, normal, strict=True):
+                gap = a @ q[p]
+                self.assertAlmostEqual(float(a.sum()), 0.0, places=6)
+                self.assertTrue(0.0 < a[1] < 1.0 and 0.0 < -a[3] < 1.0, msg=device)
+                self.assertLess(np.linalg.norm(gap), 0.01)
+                np.testing.assert_allclose(n, gap / np.linalg.norm(gap), atol=1e-5, err_msg=device)
+            # The lower ribbon's long edges x = -4 and 4 mm cross the upper one's y = -4 and 4 mm at (x, y), 3 mm under it.
+            for lower, x in (((8, 10), -0.004), ((9, 11), 0.004)):
+                for upper, y in (((28, 30), -0.004), ((29, 31), 0.004)):
+                    k = [i for i, p in enumerate(particles) if (tuple(p[:2]), tuple(p[2:])) == (lower, upper)]
+                    self.assertEqual(len(k), 1, msg=device)
+                    s, u = (y + 0.02) / 0.04, (x + 0.02) / 0.04
+                    np.testing.assert_allclose(alpha[k[0]], [1 - s, s, u - 1, -u], atol=1e-5, err_msg=device)
+                    np.testing.assert_allclose(normal[k[0]], [0.0, 0.0, -1.0], atol=1e-5, err_msg=device)
+            # Brought 1 cm under the upper ribbon's middle, the lower ribbon's particles take vertex-face contacts first.
+            moved = q.copy()
+            moved[8:12, 2] = 0.002
+            moved[8:12, 1] *= 0.1
+            particles, alpha, _ = contact.detect(wp.array(scale * moved, dtype=wp.vec3, device=device))
+            edge = alpha[:, 1] > 0.0
+            self.assertTrue((~edge).any(), msg=device)
+            if edge.any():
+                self.assertLess(np.flatnonzero(~edge).max(), np.flatnonzero(edge).min())
+
+    def test_edge_edge_ratio_admits_edges_of_flat_layers(self):
+        """Take no edge-edge contact between the flat sheets at the default ratio, whose vertex-face contacts hold the
+        edges apart, and some at a ratio of 1.2, which admits edges as near as their particles' nearest triangles."""
+        model = self._sheets()
+        counts = []
+        for ratio in (0.9, 1.2):
+            contact = SelfContact(model, "vertex_face", 0.015, rings=1, edge_edge=True, edge_edge_ratio=ratio)
+            _, alpha, _ = contact.detect(model.particle_q)
+            counts.append(int((alpha[:, 1] > 0.0).sum()))
+        self.assertEqual(counts[0], 0)
+        self.assertGreater(counts[1], 0)
+        solver = newton.solvers.SolverFBA(
+            model,
+            particle_enable_self_contact=True,
+            particle_self_contact_edge_edge=True,
+            particle_self_contact_edge_edge_ratio=1.2,
+        )
+        self.assertEqual(solver._self_contact.edge_edge_ratio, 1.2)
+        with self.assertRaises(ValueError):
+            newton.solvers.SolverFBA(
+                model, particle_enable_self_contact=True, particle_self_contact_edge_edge_ratio=0.0
+            )
 
     def test_vertex_vertex_pairs_once(self):
         """Make every pair of particles within the margin one contact.
@@ -371,6 +465,7 @@ class TestSelfContactSolve(unittest.TestCase):
             np.testing.assert_array_equal(np.sort(record[record >= 0]), np.arange(count))
             particle = solver._contact_particle_d.numpy()[:n][record >= 0]
             np.testing.assert_array_equal(particle, contacts.soft_contact_particle.numpy()[record[record >= 0]])
+        self.solver = solver
         z = s0.particle_q.numpy()[:, 2]
         return worst, z[model.particle_count // 2 :].mean() - z[: model.particle_count // 2].mean()
 
@@ -385,6 +480,91 @@ class TestSelfContactSolve(unittest.TestCase):
         worst, gap = self._drop(0.03, particle_enable_self_contact=True, **kw)
         self.assertEqual(worst, 0)
         self.assertAlmostEqual(gap, 0.005, delta=2e-4)
+
+    def test_edge_edge_leaves_flat_layers_to_vertex_face(self):
+        """Rest the upper sheet 5 mm over the lower one with edge-edge contacts on, which flat layers barely take.
+
+        Between flat layers, the vertex-face contacts hold the edges apart, and edge pairs take contacts only where
+        they come nearer than their particles' nearest triangles.
+        """
+        kw = {"particle_self_contact_margin": 0.005, "particle_self_contact_gap": 0.02}
+        worst, gap = self._drop(0.03, particle_enable_self_contact=True, particle_self_contact_edge_edge=True, **kw)
+        self.assertEqual(worst, 0)
+        self.assertAlmostEqual(gap, 0.005, delta=2e-4)
+        n = self.solver._contact_count
+        shape = self.solver._contact_shape_d.numpy()[:n]
+        edge = (shape < 0) & (self.solver._contact_extra[1].numpy()[:n, 0] > 0.0)
+        self.assertLess(edge.sum(), 0.05 * (shape < 0).sum())
+
+    def _ribbon_rest(self, **solver_args):
+        """Height [m] of the falling ribbon of :func:`_crossing_ribbons` over the pinned one where they cross after 1
+        s, the solver, and its model."""
+        model = _crossing_ribbons(0.01)
+        model.particle_mu = 0.3
+        kw = {"particle_self_contact_margin": 0.005, "particle_self_contact_gap": 0.01}
+        kw |= {"particle_topological_contact_filter_threshold": 1}
+        solver = newton.solvers.SolverFBA(model, iterations=10, particle_enable_self_contact=True, **kw, **solver_args)
+        s0, s1 = model.state(), model.state()
+        for _ in range(120):
+            solver.step(s0, s1, None, None, 1.0 / 120.0)
+            s0, s1 = s1, s0
+        q = s0.particle_q.numpy()[20:]
+        order = np.argsort(q[:, 0])
+        return float(np.interp(0.0, q[order, 0], q[order, 2])), solver, model
+
+    def test_edge_edge_holds_crossing_ribbons(self):
+        """Rest a falling ribbon on a pinned one that it crosses in the middle of their edges, the 5 mm margin over it.
+
+        The particles lie 1.6 cm or more from the crossing, beyond the reach of vertex-face contacts: without edge-edge
+        contacts the ribbon falls through. The edge-edge contacts keep no friction anchors.
+        """
+        self.assertLess(self._ribbon_rest()[0], -0.1)
+        height, solver, _ = self._ribbon_rest(particle_self_contact_edge_edge=True, friction_anchors=True)
+        self.assertAlmostEqual(height, 0.005, delta=2e-4)
+        self.assertFalse((solver._anchor_step_d.numpy() == solver._anchor_step).any())
+
+    def test_set_particle_self_contact_thins_the_layers(self):
+        """Settle the upper sheet 1 cm over a pinned one, then 4 mm over it once the margin changes to 4 mm."""
+        builder = newton.ModelBuilder()
+        grid = {"dim_x": 10, "dim_y": 10, "cell_x": 0.02, "cell_y": 0.02, "mass": 0.004, "tri_ke": 500.0}
+        for z, shift in ((0.5, 0.0), (0.51, 0.004)):
+            corner = wp.vec3(shift - 0.1, shift - 0.1, z)
+            builder.add_cloth_grid(pos=corner, rot=wp.quat_identity(), vel=wp.vec3(0.0), tri_ka=1e3, **grid)
+        model = builder.finalize()
+        lower = model.particle_count // 2
+        for array in (model.particle_mass, model.particle_inv_mass):
+            values = array.numpy()
+            values[:lower] = 0.0
+            array.assign(values)
+        kw = {"particle_self_contact_margin": 0.01, "particle_self_contact_edge_edge": True}
+        solver = newton.solvers.SolverFBA(model, iterations=10, particle_enable_self_contact=True, **kw)
+        s0, s1 = model.state(), model.state()
+        detector = TriMeshCollisionDetector(model)
+        for margin in (0.01, 0.004):
+            solver.set_particle_self_contact(margin=margin)
+            for _ in range(60):
+                solver.step(s0, s1, None, None, 1.0 / 60.0)
+                s0, s1 = s1, s0
+            z = s0.particle_q.numpy()[:, 2]
+            self.assertAlmostEqual(z[lower:].mean() - z[:lower].mean(), margin, delta=5e-4)
+        detector.refit(s0.particle_q)
+        detector.triangle_triangle_intersection_detection()
+        self.assertEqual(int(detector.triangle_intersecting_triangles_count.numpy().sum()), 0)
+        with self.assertRaises(ValueError):
+            solver.set_particle_self_contact(margin=0.0)
+
+    def test_refuse_edge_edge_without_vertex_face(self):
+        """Refuse edge-edge contacts with vertex-vertex contacts, and a self-contact margin without self contact."""
+        model = _crossing_ribbons(0.01)
+        with self.assertRaises(ValueError):
+            newton.solvers.SolverFBA(
+                model,
+                particle_enable_self_contact=True,
+                particle_self_contact_mode="vertex_vertex",
+                particle_self_contact_edge_edge=True,
+            )
+        with self.assertRaises(ValueError):
+            newton.solvers.SolverFBA(model).set_particle_self_contact(margin=0.005)
 
     def test_self_contacts_hold_without_shape_contacts(self):
         """Keep the self contacts of a step that gets no contacts: a sheet falls onto a pinned sheet and rests on it.

@@ -1,0 +1,1 @@
+Add friction anchors to `SolverFBA` (`friction_anchors=True`): a contact keeps the point it presses on across steps, so stacked cloth stays where it was laid, and `SolverFBA.set_friction_anchor_exclusion()` to free chosen particles of them.

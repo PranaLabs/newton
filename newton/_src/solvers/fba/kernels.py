@@ -2573,7 +2573,7 @@ def assemble_contacts_kernel(
     soft_shape: wp.array[wp.int32],
     soft_body_pos: wp.array[wp.vec3],
     soft_normal: wp.array[wp.vec3],
-    self_particles: wp.array2d[wp.int32],  # (S, 4) vertex-face self contacts: the particle, then the triangle
+    self_particles: wp.array2d[wp.int32],  # (S, 4) self contacts: a particle and its triangle, or two edges
     self_alpha: wp.array2d[wp.float32],  # (S, 4)
     self_normal: wp.array[wp.vec3],  # (S,)
     shape_contacts: int,
@@ -3671,6 +3671,200 @@ def apply_tangent_kinematic_shift_kernel(
     dot2 = wp.float64(t2c[0]) * v[0] + wp.float64(t2c[1]) * v[1] + wp.float64(t2c[2]) * v[2]
     t1_offset_out[c] = t1_offset_base[c] + dt * dot1
     t2_offset_out[c] = t2_offset_base[c] + dt * dot2
+
+
+# Sort key of a contact that keeps no anchor at a world point; it follows every particle-shape key.
+_FRICTION_ANCHOR_NO_KEY = wp.constant(wp.int64(9223372036854775807))
+
+
+@wp.kernel
+def friction_anchor_apply_kernel(
+    contact_shape: wp.array[wp.int32],  # (M,) shape of each contact, -1 for contacts without a shape
+    contact_particle: wp.array[wp.int32],  # (M,)
+    extra_particle: wp.array2d[wp.int32],  # (M, K - 1) further particles of each contact, -1 when unused
+    extra_alpha: wp.array2d[wp.float32],  # (M, K - 1)
+    has_extra: wp.int32,
+    normal: wp.array[wp.vec3],  # (M,)
+    t1: wp.array[wp.vec3],  # (M,)
+    t2: wp.array[wp.vec3],  # (M,)
+    world_anchor: wp.array[wp.vec3],  # (M,) the step's contact point on a static shape
+    particle_q: wp.array[wp.vec3],  # (N,) positions at the start of the step
+    particle_radius: wp.array[float],  # (N,)
+    shape_body: wp.array[wp.int32],
+    shape_margin: wp.array[float],
+    shape_count: wp.int64,
+    self_margin: float,
+    step: wp.int32,
+    anchor_triangle: wp.array[wp.vec3i],  # (N,) triangle of each particle's self-contact anchor
+    anchor_bary: wp.array[wp.vec3],  # (N,) its barycentric coordinates
+    anchor_step: wp.array[wp.int32],  # (N,) the last step that kept or set it
+    previous_key: wp.array[wp.int64],  # sorted contact keys of the step before
+    previous_point: wp.array[wp.vec3],  # their anchors
+    previous_pressed: wp.array[wp.int32],  # 1 where the contact pressed
+    previous_count: wp.int32,
+    # outputs
+    t1_offset: wp.array[wp.float64],  # (M,) inout
+    t2_offset: wp.array[wp.float64],  # (M,) inout
+    anchored: wp.array[wp.int32],  # (M,)
+    key: wp.array[wp.int64],  # (M,)
+    point: wp.array[wp.vec3],  # (M,) the world anchor the contact keeps if it sticks
+):
+    """Move the tangent offsets of the contacts that kept a friction anchor from the step before.
+
+    A vertex-face self contact (no shape, three further particles) holds its particle against the point
+    ``sum_k b_k x_k`` of a triangle; its anchor is a point of a triangle that shares a particle with the step's
+    triangle, kept per particle.
+    A particle contact with a static shape, or without a shape, holds its particle against a world point; its anchor
+    is the point that the contact of the same particle and shape kept in the step before, found by bisection of that
+    step's sorted keys. With the anchor ``p_a`` and the step's point ``p``, both from the start positions, the rows
+    take ``t . (p - p_a)`` off their offsets, so that they hold the particle at the anchor. An anchor whose tangential
+    distance exceeds the reach, a quarter of the contact distance (the self-contact margin, or the particle radius
+    plus the shape margin), lapses. Contacts with shapes on bodies and face contacts keep the step's point.
+    """
+    c = wp.tid()
+    s = contact_shape[c]
+    p = contact_particle[c]
+    anchored[c] = 0
+    key[c] = _FRICTION_ANCHOR_NO_KEY
+    point[c] = world_anchor[c]
+    first = wp.int32(-1)
+    if has_extra != 0:
+        first = extra_particle[c, 0]
+    offset = wp.vec3(0.0)
+    reach = float(0.0)
+    found = wp.int32(0)
+    # Edge-edge self contacts weigh their second particle positively; they keep the step's point.
+    vertex_face = s < 0 and first >= 0
+    if vertex_face:
+        if extra_alpha[c, 0] > 0.0:
+            vertex_face = False
+    if vertex_face:
+        reach = 0.25 * self_margin
+        # Vertex-vertex self contacts, with one further particle, keep the step's point.
+        if anchor_step[p] == step - 1 and extra_particle.shape[1] >= 3:
+            a = anchor_triangle[p]
+            b = anchor_bary[p]
+            here = wp.vec3(0.0)
+            full = wp.int32(1)
+            shared = wp.int32(0)
+            for j in range(3):
+                q = extra_particle[c, j]
+                if q < 0:
+                    full = 0
+                else:
+                    here = here - extra_alpha[c, j] * particle_q[q]
+                    if q == a[0] or q == a[1] or q == a[2]:
+                        shared = 1
+            if full != 0 and shared != 0:
+                offset = here - (b[0] * particle_q[a[0]] + b[1] * particle_q[a[1]] + b[2] * particle_q[a[2]])
+                found = 1
+    elif first < 0:
+        static = wp.int32(1)
+        reach = particle_radius[p]
+        if s >= 0:
+            reach = reach + shape_margin[s]
+            if shape_body[s] >= 0:
+                static = 0
+        reach = 0.25 * reach
+        contact_key = wp.int64(p) * (shape_count + wp.int64(1)) + wp.int64(s + 1)
+        key[c] = contact_key
+        if static != 0:
+            lo = wp.int32(0)
+            hi = previous_count
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if previous_key[mid] < contact_key:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            if lo < previous_count:
+                if previous_key[lo] == contact_key and previous_pressed[lo] != 0:
+                    # A particle with two contacts on one shape has no single anchor there.
+                    unique = wp.int32(1)
+                    if lo + 1 < previous_count:
+                        if previous_key[lo + 1] == contact_key:
+                            unique = 0
+                    if unique != 0:
+                        offset = world_anchor[c] - previous_point[lo]
+                        point[c] = previous_point[lo]
+                        found = 1
+    if found != 0:
+        n = normal[c]
+        slip = offset - wp.dot(offset, n) * n
+        if reach <= 0.0 or wp.length(slip) <= reach:
+            t1_offset[c] = t1_offset[c] - wp.float64(wp.dot(t1[c], offset))
+            t2_offset[c] = t2_offset[c] - wp.float64(wp.dot(t2[c], offset))
+            anchored[c] = 1
+        else:
+            point[c] = world_anchor[c]
+
+
+@wp.kernel
+def friction_anchor_update_kernel(
+    contact_shape: wp.array[wp.int32],  # (M,)
+    contact_particle: wp.array[wp.int32],  # (M,)
+    extra_particle: wp.array2d[wp.int32],  # (M, K - 1)
+    extra_alpha: wp.array2d[wp.float32],  # (M, K - 1)
+    has_extra: wp.int32,
+    lam: wp.array[wp.float64],  # (3M,) the step's multipliers, [n, t1, t2] per contact
+    held_particle: wp.array[wp.int32],  # (N,) 1 for particles that rows hold at points
+    has_held: wp.int32,
+    shape_body: wp.array[wp.int32],
+    step: wp.int32,
+    anchored: wp.array[wp.int32],  # (M,) from the apply kernel
+    key: wp.array[wp.int64],  # (M,)
+    point: wp.array[wp.vec3],  # (M,)
+    # outputs
+    anchor_triangle: wp.array[wp.vec3i],  # (N,)
+    anchor_bary: wp.array[wp.vec3],  # (N,)
+    anchor_step: wp.array[wp.int32],  # (N,)
+    next_key: wp.array[wp.int64],  # (M,)
+    next_point: wp.array[wp.vec3],  # (M,)
+    next_pressed: wp.array[wp.int32],  # (M,)
+):
+    """Keep or set the friction anchors of the contacts that pressed in the step.
+
+    A contact keeps its anchor while it carries a normal force and no rows hold its particle at a point, also while it
+    slides: the friction cone bounds the force that pulls it back, and the apply kernel drops an anchor it trails by
+    more than its reach. A self contact keeps its anchor or takes the step's triangle point, stamped with the step;
+    the anchors of the other particles lapse. Particle contacts write the key, point and pressing flag that the next
+    step looks up.
+    """
+    c = wp.tid()
+    s = contact_shape[c]
+    p = contact_particle[c]
+    pressed = wp.int32(0)
+    if lam[3 * c] > wp.float64(0.0):
+        pressed = 1
+    if has_held != 0:
+        if held_particle[p] != 0:
+            pressed = 0
+    next_key[c] = key[c]
+    next_point[c] = point[c]
+    next_pressed[c] = 0
+    first = wp.int32(-1)
+    if has_extra != 0:
+        first = extra_particle[c, 0]
+    vertex_face = s < 0 and first >= 0
+    if vertex_face:
+        if extra_alpha[c, 0] > 0.0:
+            vertex_face = False
+    if vertex_face:
+        if pressed != 0 and extra_particle.shape[1] >= 3:
+            if anchored[c] != 0:
+                anchor_step[p] = step
+            else:
+                q1 = extra_particle[c, 1]
+                q2 = extra_particle[c, 2]
+                if q1 >= 0 and q2 >= 0:
+                    anchor_triangle[p] = wp.vec3i(first, q1, q2)
+                    anchor_bary[p] = wp.vec3(-extra_alpha[c, 0], -extra_alpha[c, 1], -extra_alpha[c, 2])
+                    anchor_step[p] = step
+    elif first < 0 and pressed != 0:
+        if s < 0:
+            next_pressed[c] = 1
+        elif shape_body[s] < 0:
+            next_pressed[c] = 1
 
 
 @wp.kernel
