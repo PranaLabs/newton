@@ -147,6 +147,7 @@ class SolverFBA(SolverBase):
         pin_stiffness: float = 1e12,
         stretching_model: Literal["arap", "corotational", "neohookean"] = "arap",
         friction: bool = True,
+        friction_anchors: bool = False,
         lambda_cap: float | None = None,
         shape_angular_velocity: dict[int, float] | None = None,
         nsn_schur_mode: Literal["full", "lite"] = "full",
@@ -173,6 +174,25 @@ class SolverFBA(SolverBase):
             stretching_model: The stretching model, ``"arap"``, ``"corotational"`` or ``"neohookean"``.
             friction: If ``True`` (default), contacts carry Coulomb friction;
                 otherwise they only push.
+            friction_anchors: If ``True``, a contact keeps the point it
+                presses on across steps: a point of the other layer for a
+                vertex-face self contact, or a point of a static shape. Its
+                friction rows then hold the particle at that point rather than
+                at the point the step's contact starts from, so slip that a
+                step's solve leaves is pulled back in the next step instead of
+                adding up. The lite operator leaves such slip where the
+                material spreads a friction force to the particle's neighbors,
+                which lets stacked cloth layers creep apart over seconds. The
+                friction cone still bounds the force: a contact pulled harder
+                than ``mu`` times its normal force slides as without the
+                point, which trails it by at most a quarter of the contact
+                distance (the self-contact margin, or the particle radius plus
+                the shape margin) and then moves to it. A contact drops its
+                point when it carries no normal force or acts on a particle
+                that rows hold at a point. Vertex-vertex self contacts,
+                contacts with shapes on bodies, face contacts, and the contacts
+                of a step in which one touches a body that FBA integrates keep
+                the step's point. Needs ``friction=True``.
             lambda_cap: Optional clamp on the magnitude of each contact
                 row's multiplier, in force units [N]. The multipliers are
                 forces divided by ``dt²``, so the clamp is divided by ``dt²``
@@ -319,6 +339,17 @@ class SolverFBA(SolverBase):
             self._tri_lame_d = wp.array(tri_lame, dtype=wp.vec2, device=model.device)
             self._tet_lame_d = wp.array(tet_lame, dtype=wp.vec2, device=model.device)
         self.friction = bool(friction)
+        if friction_anchors and not self.friction:
+            raise ValueError("friction_anchors needs friction=True")
+        self.friction_anchors = bool(friction_anchors)
+        # Friction anchors: the step count that stamps the self-contact anchors kept per particle, the number of
+        # particle contacts whose keys and anchors the step before left, and the number of contacts this step set up.
+        self._anchor_step, self._anchor_count, self._anchor_rows, self._anchor_cap = 0, 0, 0, 0
+        if self.friction_anchors and model.particle_count:
+            n = model.particle_count
+            self._anchor_triangle_d = wp.full(n, wp.vec3i(-1, -1, -1), dtype=wp.vec3i, device=model.device)
+            self._anchor_bary_d = wp.zeros(n, dtype=wp.vec3, device=model.device)
+            self._anchor_step_d = wp.full(n, -2, dtype=wp.int32, device=model.device)
         self.nsn_linear_iterations = None if nsn_linear_iterations is None else int(nsn_linear_iterations)
         self.lambda_cap = lambda_cap
         self.integrate_with_external_rigid_solver = bool(integrate_with_external_rigid_solver)
@@ -1324,6 +1355,8 @@ class SolverFBA(SolverBase):
         # Rigid contact rows are assembled after the deformable contacts they may share bodies with.
         if rigid:
             self._begin_rigid_contacts(contacts, state_in)
+        if self.friction_anchors:
+            self._apply_friction_anchors(state_in)
 
         if self._inactive_d is not None:
             inputs = [self._inactive_d, state_in.particle_q]
@@ -1639,6 +1672,9 @@ class SolverFBA(SolverBase):
                     ls.apply_lambda_correction_combined(self._nsn_lam_apply_d, self._rhs, self._x_cur)
             if rigid:
                 self._rigid_iteration(state_in, state_out, dt)
+
+        if self.friction_anchors:
+            self._update_friction_anchors()
 
         # 3) Write velocity and update state_out.
         if self._inactive_d is not None:
@@ -2126,6 +2162,109 @@ class SolverFBA(SolverBase):
     # ------------------------------------------------------------------
     # Contact state (allocated lazily on first call).
     # ------------------------------------------------------------------
+
+    def _anchor_extra(self) -> tuple[list, int]:
+        """The further particles and coefficients of the step's contacts, or a stand-in when no contact has any, and
+        whether they are the contacts'."""
+        if self._contact_extra is not None:
+            return self._contact_extra, 1
+        if not hasattr(self, "_anchor_no_extra"):
+            self._anchor_no_extra = [
+                wp.full((1, 3), -1, dtype=wp.int32, device=self._device),
+                wp.zeros((1, 3), dtype=wp.float32, device=self._device),
+            ]
+        return self._anchor_no_extra, 0
+
+    def _anchor_shapes(self) -> tuple[wp.array, wp.array]:
+        """The model's shape bodies and margins, or empty stand-ins for a model without shapes."""
+        model = self.model
+        if model.shape_count:
+            return model.shape_body, model.shape_margin
+        if not hasattr(self, "_anchor_no_shapes"):
+            self._anchor_no_shapes = (
+                wp.zeros(1, dtype=wp.int32, device=self._device),
+                wp.zeros(1, dtype=float, device=self._device),
+            )
+        return self._anchor_no_shapes
+
+    def _ensure_anchor_buffers(self, count: int) -> None:
+        """Size the per-contact friction anchor buffers to ``count`` contacts, keeping the step before's anchors."""
+        if count <= self._anchor_cap:
+            return
+        cap, device = max(int(count * 1.5), 64), self._device
+        previous = None
+        if self._anchor_cap:
+            previous = (self._anchor_previous_key_d, self._anchor_previous_point_d, self._anchor_previous_pressed_d)
+        self._anchor_flag_d = wp.zeros(cap, dtype=wp.int32, device=device)
+        self._anchor_key_d = wp.zeros(cap, dtype=wp.int64, device=device)
+        self._anchor_point_d = wp.zeros(cap, dtype=wp.vec3, device=device)
+        self._anchor_previous_key_d = wp.zeros(cap, dtype=wp.int64, device=device)
+        self._anchor_previous_point_d = wp.zeros(cap, dtype=wp.vec3, device=device)
+        self._anchor_previous_pressed_d = wp.zeros(cap, dtype=wp.int32, device=device)
+        self._anchor_next_key_d = wp.zeros(cap, dtype=wp.int64, device=device)
+        self._anchor_next_point_d = wp.zeros(cap, dtype=wp.vec3, device=device)
+        self._anchor_next_pressed_d = wp.zeros(cap, dtype=wp.int32, device=device)
+        if previous is not None and self._anchor_count:
+            current = (self._anchor_previous_key_d, self._anchor_previous_point_d, self._anchor_previous_pressed_d)
+            for dst, src in zip(current, previous, strict=True):
+                wp.copy(dst, src, count=self._anchor_count)
+        self._anchor_cap = cap
+
+    def _apply_friction_anchors(self, state_in: State) -> None:
+        """Move the tangent offsets of the contacts that kept a friction anchor from the step before, so that their
+        friction rows hold the particle at the anchor."""
+        from .kernels import friction_anchor_apply_kernel  # noqa: PLC0415
+
+        self._anchor_step += 1
+        self._anchor_rows = 0
+        M = self._contact_count
+        # The contacts of a step that solves rigid contact rows with them keep the step's points.
+        if M == 0 or self._two_way:
+            return
+        self._ensure_anchor_buffers(M)
+        (extra_particle, extra_alpha), has_extra = self._anchor_extra()
+        shape_body, shape_margin = self._anchor_shapes()
+        margin = self.particle_self_contact_margin if self._self_contact is not None else 0.0
+        inputs = [self._contact_shape_d, self._contact_particle_d, extra_particle, extra_alpha, wp.int32(has_extra)]
+        inputs += [self._contact_normal_d, self._contact_tangent1_d, self._contact_tangent2_d]
+        inputs += [self._contact_world_anchor_d, state_in.particle_q, self.model.particle_radius]
+        inputs += [shape_body, shape_margin, wp.int64(max(self.model.shape_count, 1)), float(margin)]
+        inputs += [wp.int32(self._anchor_step), self._anchor_triangle_d, self._anchor_bary_d, self._anchor_step_d]
+        inputs += [self._anchor_previous_key_d, self._anchor_previous_point_d, self._anchor_previous_pressed_d]
+        inputs += [wp.int32(self._anchor_count)]
+        outputs = [self._contact_tangent1_offset_shifted_d, self._contact_tangent2_offset_shifted_d]
+        outputs += [self._anchor_flag_d, self._anchor_key_d, self._anchor_point_d]
+        wp.launch(friction_anchor_apply_kernel, M, inputs, outputs, device=self._device)
+        self._anchor_rows = M
+
+    def _update_friction_anchors(self) -> None:
+        """Keep or set the friction anchors of the contacts that pressed in the step, from its last multipliers."""
+        from .kernels import friction_anchor_update_kernel  # noqa: PLC0415
+
+        M = self._anchor_rows
+        if M == 0:
+            self._anchor_count = 0
+            return
+        (extra_particle, extra_alpha), has_extra = self._anchor_extra()
+        shape_body, _ = self._anchor_shapes()
+        held = self._held_particle_d
+        inputs = [self._contact_shape_d, self._contact_particle_d, extra_particle, extra_alpha, wp.int32(has_extra)]
+        inputs += [self._lam_coulomb_persistent_d]
+        inputs += [self._anchor_step_d if held is None else held, wp.int32(held is not None), shape_body]
+        inputs += [wp.int32(self._anchor_step), self._anchor_flag_d, self._anchor_key_d, self._anchor_point_d]
+        outputs = [self._anchor_triangle_d, self._anchor_bary_d, self._anchor_step_d]
+        outputs += [self._anchor_next_key_d, self._anchor_next_point_d, self._anchor_next_pressed_d]
+        wp.launch(friction_anchor_update_kernel, M, inputs, outputs, device=self._device)
+        self._anchor_previous_key_d, self._anchor_next_key_d = self._anchor_next_key_d, self._anchor_previous_key_d
+        self._anchor_previous_point_d, self._anchor_next_point_d = (
+            self._anchor_next_point_d,
+            self._anchor_previous_point_d,
+        )
+        self._anchor_previous_pressed_d, self._anchor_next_pressed_d = (
+            self._anchor_next_pressed_d,
+            self._anchor_previous_pressed_d,
+        )
+        self._anchor_count = M
 
     def _ensure_contact_buffers(self, max_contacts: int) -> None:
         """Lazily allocate per-step contact buffers sized to ``max_contacts``."""

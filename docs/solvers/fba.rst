@@ -153,6 +153,11 @@ Contacts
   meshes. It needs the full operator.
 - ``particle_enable_self_contact=True`` makes the triangles collide with each
   other, through vertex-face or vertex-vertex contacts.
+- ``friction_anchors=True`` keeps the point a contact presses on across steps,
+  on the other layer for a self contact or on a static shape, so its friction
+  rows pull back the slip that a step's solve leaves instead of letting it add
+  up. With the lite operator, that slip lets stacked cloth layers creep apart
+  over seconds.
 - Rigid contacts between shapes on bodies that FBA integrates need
   ``friction=True`` and the full operator.
 - A contact on a body that FBA integrates acts at the contact point of the
