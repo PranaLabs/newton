@@ -1113,6 +1113,38 @@ If you run the examples from a source checkout with uv, use
   </tr>
 </table>
 
+### Pin-controlled FBA demos
+
+Both demos enable vertex-face self-collision throughout. Cyan and orange markers show the two
+moving pin handles; the remaining mesh follows the simulated dynamics.
+
+| Demo | Preview | Full-story validation |
+| --- | --- | --- |
+| `python -m newton.examples bunny_ears_fba` — lift, stretch, sway, gather and reopen a volumetric bunny by its ears | <img width="320" src="docs/images/examples/example_bunny_ears_fba.jpg" alt="Bunny ear pins"> | `--viewer null --test --num-frames 1080` |
+| `python -m newton.examples shirt_pins_fba` — hang, sway, tilt, gather and cross a T-shirt by its shoulders | <img width="320" src="docs/images/examples/example_shirt_pins_fba.jpg" alt="Shirt shoulder pins"> | `--viewer null --test --num-frames 1320` |
+
+Run from the source checkout with `uv run --extra dev -m newton.examples <name>`.
+The bundled USD assets contain the final simulation meshes: `bunny_pin_fba.usd` stores
+a tetrahedral mesh, and `shirt_pin_fba.usd` stores a remeshed triangle surface.
+Both demos load these directly; no mesh generation tools are required at runtime.
+To record a checked 720p MP4, run
+`uv run --extra dev --with imageio-ffmpeg python scripts/record_pin_demo.py bunny`
+(or `shirt`). Videos, phase snapshots, and validation metrics are written to `outputs/pin_demos/`.
+
+The shirt uses a 1 cm remeshed surface, an areal density of 0.43 kg/m² (about 302 g total),
+`tri_ke=80` and `edge_ke=5e-6`, with zero rest bending angles. Its two shoulder vertices
+can rotate freely. Twelve substeps per 60 Hz frame and 20 solver iterations improve
+contact resolution. The 9 mm self-contact envelope is a numerical separation setting,
+not the physical thickness of the fabric. Surface rendering is matte.
+
+Shirt validation checks actual triangle intersections every frame, in addition to pin
+tracking, finite positions and speeds. The intersection predicate centers and rescales
+triangle pairs to avoid false positives from Warp's fixed epsilon on centimeter meshes.
+`uv run --no-sync python scripts/audit_shirt_pins.py --out outputs/pin_demos/shirt_audit`
+records intersection and edge-stretch measurements independently of the solver's
+contact candidate count. These parameters demonstrate cloth behavior; they are not a
+calibration to a measured textile.
+
 ### Example Options
 
 All examples share a common set of command-line options. The most commonly used ones are:

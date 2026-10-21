@@ -411,6 +411,10 @@ class SolverFBA(SolverBase):
 
         # Contact state (0 = no contacts registered yet).
         self._contact_count: int = 0
+        # Pin-only steps may build lite row metadata before contact ingestion runs.
+        self._contact_particle_h = None
+        self._contact_alpha_h = None
+        self._contact_extra_h = None
 
         # Cache ``W`` and the device buffer of ``A⁻¹ · Jᵀ`` across
         # PD outer iterations within a single ``step()`` call.  Both depend
@@ -1223,8 +1227,8 @@ class SolverFBA(SolverBase):
             state_out: Output simulation state. Particle and body positions and
                 velocities are written; other fields are untouched.
             control: Unused: the solver has no actuators.
-            contacts: The step's contacts, detected on ``state_in``, or ``None``
-                to step without contacts.
+            contacts: External shape contacts detected on ``state_in``, or ``None``.
+                Enabled self-contact is detected independently.
             dt: Time step [s]. The first step and a change of ``dt`` factor the
                 system again.
             observables: Optional observables from :meth:`observables`; see the
@@ -1258,10 +1262,8 @@ class SolverFBA(SolverBase):
         # Ingest contact data once per step (if provided).
         if contacts is not None or self._self_contact is not None:
             self._ingest_contacts(contacts, state_in)
-        # Note: if contacts is None, self._contact_count retains its previous value (0 by default).
-        # Call with contacts=None to keep existing behaviour; explicitly pass contacts to activate.
-        # Reset contact count when contacts=None so the path stays disabled.
-        if contacts is None:
+        # Preserve self contacts even when external shape contacts are absent.
+        else:
             self._contact_count = 0
             self._invalidate_schur_cache()
 

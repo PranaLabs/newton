@@ -135,6 +135,23 @@ class TestParticleConstraints(unittest.TestCase):
         with self.assertRaises(ValueError):
             solver.set_particle_constraints([[0]], [[1.0]], [1.0])
 
+    def test_lite_moving_pin_without_collision_contacts(self):
+        """A floating cloth can be held before any shape or self-contact has been registered."""
+        with wp.ScopedDevice("cuda:0"):
+            model = self._model()
+            solver = newton.solvers.SolverFBA(
+                model, iterations=5, nsn_schur_mode="lite", particle_enable_self_contact=True
+            )
+            a, b = model.state(), model.state()
+            target = a.particle_q.numpy()[12].copy()
+            for _ in range(4):
+                target[2] += 0.001
+                solver.set_particle_constraints([[12], [12], [12]], [[1.0]] * 3, target, directions=np.eye(3))
+                a.clear_forces()
+                solver.step(a, b, None, None, 1.0 / 120.0)
+                a, b = b, a
+                np.testing.assert_allclose(a.particle_q.numpy()[12], target, atol=1e-4)
+
     def test_lite_rows_hold_a_particle_at_a_point(self):
         """Three rows of the lite NSN hold the middle particle of a cloth on the ground, first 2 mm into the
         ground, then 5 cm over it while they drag it at 0.2 m/s, and its contacts carry no force."""

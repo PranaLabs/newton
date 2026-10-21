@@ -187,6 +187,41 @@ class TestSelfContactSolve(unittest.TestCase):
         z = s0.particle_q.numpy()[:, 2]
         return worst, z[model.particle_count // 2 :].mean() - z[: model.particle_count // 2].mean()
 
+    def test_self_contact_without_shape_contacts(self):
+        """Self contacts still stop a moving sheet when there is no external Contacts object."""
+        with wp.ScopedDevice("cuda:0"):
+            for mode in ("full", "lite"):
+                with self.subTest(mode=mode):
+                    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+                    for z, mass, vel in ((0.0, 0.0, 0.0), (0.02, 0.01, -0.2)):
+                        builder.add_cloth_grid(
+                            pos=wp.vec3(0.003 if mass else 0.0, 0.003 if mass else 0.0, z),
+                            rot=wp.quat_identity(),
+                            vel=wp.vec3(0.0, 0.0, vel),
+                            dim_x=4,
+                            dim_y=4,
+                            cell_x=0.02,
+                            cell_y=0.02,
+                            mass=mass,
+                            tri_ke=50.0,
+                            particle_radius=0.0,
+                        )
+                    model = builder.finalize()
+                    solver = newton.solvers.SolverFBA(
+                        model,
+                        iterations=10,
+                        nsn_schur_mode=mode,
+                        particle_enable_self_contact=True,
+                        particle_self_contact_margin=0.005,
+                        particle_self_contact_gap=0.02,
+                    )
+                    a, b = model.state(), model.state()
+                    for _ in range(30):
+                        a.clear_forces()
+                        solver.step(a, b, None, None, 1.0 / 120.0)
+                        a, b = b, a
+                    self.assertGreater(float(a.particle_q.numpy()[25:, 2].min()), 0.004)
+
     def test_vertex_face_holds_the_margin(self):
         """The upper sheet comes to rest 5 mm over the lower one without a single crossing triangle; without self
         contact it falls into it. Contacts are found within 2.5 cm, the 5 mm margin plus the 2 cm gap, more than the

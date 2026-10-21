@@ -1829,8 +1829,26 @@ add_example_test(
 )
 
 
+add_example_test(
+    TestClothExamples,
+    name="cloth.example_shirt_pins_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 1320},
+    use_viewer=True,
+)
+
+
 class TestSoftbodyExamples(NewtonTestCase):
     pass
+
+
+add_example_test(
+    TestSoftbodyExamples,
+    name="softbody.example_bunny_ears_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 1080},
+    use_viewer=True,
+)
 
 
 add_example_test(

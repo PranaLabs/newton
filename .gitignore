@@ -74,3 +74,7 @@ docs/_static/viser/
 
 # Notebook checkpoints
 **/*.ipynb_checkpoints/
+
+# Local pin-demo recordings and previous environment
+/outputs/pin_demos/
+/.venv-fba-1.3-backup/
