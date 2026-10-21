@@ -152,7 +152,13 @@ Contacts
   particles of coarse cloth, and holds particles in concave corners of
   meshes. It needs the full operator.
 - ``particle_enable_self_contact=True`` makes the triangles collide with each
-  other, through vertex-face or vertex-vertex contacts.
+  other, through vertex-face or vertex-vertex contacts. Vertex-face contacts
+  keep crossing edges apart when the margin reaches half of the longest edge;
+  ``particle_self_contact_edge_edge=True`` adds edge-edge contacts at creases
+  for thinner margins, and
+  :meth:`~newton.solvers.SolverFBA.set_particle_self_contact` changes the
+  margin between steps, so that a dropped cloth can land with a thick margin
+  and fold with a thin one.
 - ``friction_anchors=True`` keeps the point a contact presses on across steps,
   on the other layer for a self contact or on a static shape, so its friction
   rows pull back the slip that a step's solve leaves instead of letting it add
@@ -197,3 +203,6 @@ Examples
   :class:`~newton.solvers.SolverFeatherstone` fold a towel.
 - ``shirt_pins_fba``, ``bunny_ears_fba``: two handles move a T-shirt by its
   shoulders and a soft bunny by its ears, with self-contact throughout.
+- ``shirt_fold_fba``: two Franka arms fold a dropped T-shirt, its sides in and
+  its hem up, with a thin self-contact margin, edge-edge contacts and friction
+  anchors.

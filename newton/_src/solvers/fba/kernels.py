@@ -3588,7 +3588,12 @@ def friction_anchor_apply_kernel(
     offset = wp.vec3(0.0)
     reach = float(0.0)
     found = wp.int32(0)
-    if s < 0 and first >= 0:
+    # Edge-edge self contacts weigh their second particle positively; they keep the step's point.
+    vertex_face = s < 0 and first >= 0
+    if vertex_face:
+        if extra_alpha[c, 0] > 0.0:
+            vertex_face = False
+    if vertex_face:
         reach = 0.25 * self_margin
         # Vertex-vertex self contacts, with one further particle, keep the step's point.
         if anchor_step[p] == step - 1 and extra_particle.shape[1] >= 3:
@@ -3695,7 +3700,11 @@ def friction_anchor_update_kernel(
     first = wp.int32(-1)
     if has_extra != 0:
         first = extra_particle[c, 0]
-    if s < 0 and first >= 0:
+    vertex_face = s < 0 and first >= 0
+    if vertex_face:
+        if extra_alpha[c, 0] > 0.0:
+            vertex_face = False
+    if vertex_face:
         if pressed != 0 and extra_particle.shape[1] >= 3:
             if anchored[c] != 0:
                 anchor_step[p] = step

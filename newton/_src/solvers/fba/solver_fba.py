@@ -159,6 +159,7 @@ class SolverFBA(SolverBase):
         face_contact_margin: float | None = None,
         particle_enable_self_contact: bool = False,
         particle_self_contact_mode: Literal["vertex_face", "vertex_vertex"] = "vertex_face",
+        particle_self_contact_edge_edge: bool = False,
         particle_self_contact_margin: float = 2.0e-3,
         particle_self_contact_gap: float | None = None,
         particle_topological_contact_filter_threshold: int = 2,
@@ -275,10 +276,17 @@ class SolverFBA(SolverBase):
             particle_self_contact_mode: ``"vertex_face"`` keeps each particle
                 ``particle_self_contact_margin`` from its nearest triangle, which
                 covers crossing edges only when the margin reaches half of the
-                longest edge. ``"vertex_vertex"`` keeps particles that margin
-                apart, which covers the surface when it reaches the longest edge
-                (twice the largest circumradius of acute triangles), and leaves
-                a bumpy contact surface.
+                longest edge, or with ``particle_self_contact_edge_edge=True``.
+                ``"vertex_vertex"`` keeps particles that margin apart, which
+                covers the surface when it reaches the longest edge (twice the
+                largest circumradius of acute triangles), and leaves a bumpy
+                contact surface.
+            particle_self_contact_edge_edge: If ``True``, also keep two edges
+                ``particle_self_contact_margin`` apart where their closest
+                points lie inside both edges and come nearer than the nearest
+                triangles of their particles, as at a crease, so that crossing
+                edges are covered at any margin. Needs
+                ``particle_self_contact_mode="vertex_face"``.
             particle_self_contact_margin: Self-contact distance [m]: the
                 distance at which a particle and a triangle or particle stop.
             particle_self_contact_gap: Additional detection distance [m]: self
@@ -378,7 +386,14 @@ class SolverFBA(SolverBase):
             query_radius = particle_self_contact_margin + gap
             filter_rings = particle_topological_contact_filter_threshold
             rest_radius = particle_rest_shape_contact_exclusion_radius
-            self._self_contact = SelfContact(model, particle_self_contact_mode, query_radius, filter_rings, rest_radius)
+            self._self_contact = SelfContact(
+                model,
+                particle_self_contact_mode,
+                query_radius,
+                filter_rings,
+                rest_radius,
+                edge_edge=particle_self_contact_edge_edge,
+            )
         if self.face_contacts:
             if not self.friction or nsn_schur_mode != "full":
                 raise ValueError("face_contacts needs friction=True and nsn_schur_mode='full'")
@@ -1993,6 +2008,25 @@ class SolverFBA(SolverBase):
             self._x_ref.assign(target_positions)
         else:
             self._x_ref.assign(np.asarray(target_positions, dtype=np.float32))
+
+    def set_particle_self_contact(self, *, margin: float, gap: float | None = None) -> None:
+        """Change the self-contact distance and detection gap for the following steps.
+
+        A cloth dropped onto a surface needs a margin and gap that its layers cannot pass in one step; once it lies
+        still, a thinner margin lets folded layers stack closer. Thinner than half the longest edge, vertex-face
+        contacts need ``particle_self_contact_edge_edge=True`` to keep crossing edges apart.
+
+        Args:
+            margin: Self-contact distance [m], as ``particle_self_contact_margin``.
+            gap: Additional detection distance [m], as ``particle_self_contact_gap``. ``None`` takes the margin.
+        """
+        if self._self_contact is None:
+            raise ValueError("set_particle_self_contact needs particle_enable_self_contact=True")
+        gap = margin if gap is None else gap
+        if margin <= 0.0 or gap < 0.0:
+            raise ValueError(f"set_particle_self_contact needs margin > 0 and gap >= 0, got {margin} and {gap}")
+        self.particle_self_contact_margin = float(margin)
+        self._self_contact.query_radius = float(margin) + float(gap)
 
     def set_particle_constraints(self, particles, coefficients, targets, *, directions=None) -> None:
         """Hold lengths or linear combinations of particle positions in the following steps.

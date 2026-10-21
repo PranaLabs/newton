@@ -535,6 +535,9 @@ If you run the examples from a source checkout with uv, use
       </a>
     </td>
     <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cloth/example_shirt_fold_fba.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_shirt_fold_fba.jpg" alt="Shirt Fold FBA">
+      </a>
     </td>
   </tr>
   <tr>
@@ -545,6 +548,7 @@ If you run the examples from a source checkout with uv, use
       <code>python -m newton.examples shirt_pins_fba</code>
     </td>
     <td align="center" width="33%">
+      <code>python -m newton.examples shirt_fold_fba</code>
     </td>
   </tr>
   <tr>
