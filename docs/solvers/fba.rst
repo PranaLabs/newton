@@ -175,7 +175,20 @@ Contacts
   particles of coarse cloth, and holds particles in concave corners of
   meshes. It needs friction and the full operator.
 - ``particle_enable_self_contact=True`` makes the triangles collide with each
-  other, through vertex-face or vertex-vertex contacts.
+  other, through vertex-face or vertex-vertex contacts. Vertex-face contacts
+  keep crossing edges apart when the margin reaches half of the longest edge;
+  ``particle_self_contact_edge_edge=True`` adds edge-edge contacts at creases
+  for thinner margins, ``particle_self_contact_edge_edge_ratio`` sets how near
+  their edges must come compared with their particles' nearest triangles, and
+  :meth:`~newton.solvers.SolverFBA.set_particle_self_contact` changes the
+  margin between steps, so that a dropped cloth can land with a thick margin
+  and fold with a thin one.
+- ``friction_anchors=True`` keeps the point a contact presses on across steps,
+  on the other layer for a self contact or on a static shape, so its friction
+  rows pull back the slip that a step's solve leaves instead of letting it add
+  up. With the lite operator, that slip lets stacked cloth layers creep apart
+  over seconds. :meth:`~newton.solvers.SolverFBA.set_friction_anchor_exclusion`
+  frees chosen particles of their anchors, so that a grasp can gather cloth.
 - Rigid contacts between shapes on bodies that FBA integrates need
   ``friction=True`` and the full operator.
 - A contact on a body that FBA integrates acts at the contact point of the
@@ -218,5 +231,10 @@ Examples
 - ``shirt_pins_fba``, ``bunny_ears_fba``: two handles move a T-shirt by its
   shoulders, with self-contact and light Rayleigh stiffness damping, and a
   soft bunny by its ears.
+- ``shirt_fold_fba``: two Franka arms fold a dropped T-shirt, its sides in and
+  its hem up, their fingers squeezing the cloth into a bulge that they hold,
+  at two steps per frame with the lite operator accumulating its contact
+  forces, a self-contact margin that thins after the landing, edge-edge
+  contacts, friction anchors and corotated Rayleigh stiffness damping.
 - ``softbody_cantilever_fba``: two soft cantilevers swing under gravity, one
   with Rayleigh damping.
