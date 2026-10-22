@@ -98,14 +98,15 @@ def _launch_compute(kernel, positions, Dm_inv, weight, mu=None, lam=None):
         dtype=wp.mat33,
     )
     w = wp.array([float(weight)], dtype=wp.float32)
+    activation, direction = wp.zeros(1, dtype=wp.float32), wp.zeros(1, dtype=wp.vec3)
     contrib = wp.zeros((1, 4), dtype=wp.vec3)
     if mu is None:
-        wp.launch(kernel, dim=1, inputs=[pos, tet_idx, rest_inv, w], outputs=[contrib])
+        wp.launch(kernel, dim=1, inputs=[pos, tet_idx, rest_inv, w, activation, direction], outputs=[contrib])
     else:
         wp.launch(
             kernel,
             dim=1,
-            inputs=[pos, tet_idx, rest_inv, w, wp.array([[mu, lam]], dtype=wp.vec2)],
+            inputs=[pos, tet_idx, rest_inv, w, activation, direction, wp.array([[mu, lam]], dtype=wp.vec2)],
             outputs=[contrib],
         )
     return contrib.numpy()  # shape (1, 4, 3)

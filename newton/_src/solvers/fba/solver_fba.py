@@ -138,6 +138,25 @@ class SolverFBA(SolverBase):
     ``(alpha M + beta K) x_prev / dt`` for the step's start positions
     ``x_prev``.
 
+    Tetrahedral activations, the control's ``tet_activations``, grow each
+    tetrahedron to ``1 - a`` times its rest volume for its activation ``a``,
+    the volume ratio that the volume constraint of
+    :class:`~newton.solvers.SolverXPBD` aims for: a negative activation
+    inflates the element and a positive one contracts it. The growth is
+    isotropic, unless ``tet_activation_directions`` gives the element a
+    direction along which alone it stretches by ``1 - a``, as the chambers of
+    a pneumatic bending actuator lengthen along it. The stretching projection
+    acts on ``F G^-1`` for the growth ``G``, ``(1 - a)^(1/3) I`` or
+    ``I + (1 - a - 1) n n^T`` along the unit direction ``n``, and multiplies
+    its result by ``G``, so the prefactored system matrix stays valid and a
+    free element comes to rest at ``G`` times its rest shape. The element
+    keeps the projection weight of its rest volume: grown isotropically, it
+    is ``(1 - a)^(-1/3)`` times as stiff as the same material grown to the
+    activated shape. Grown along a direction, ``P(F G^-1) G`` is not the
+    projection of ``F`` in the solver's metric, so the element's forces are
+    not those of an energy, though a free element still comes to rest at its
+    grown shape.
+
     Notes:
         - Float32 ``particle_q`` output: the interior linear solver
           operates in float64, but ``state_out.particle_q`` (vec3) is
@@ -193,6 +212,7 @@ class SolverFBA(SolverBase):
         rayleigh_alpha: float | ArrayLike = 0.0,
         rayleigh_beta: float | ArrayLike = 0.0,
         rayleigh_corotated: bool = False,
+        tet_activation_directions: ArrayLike | None = None,
     ) -> None:
         """
         Args:
@@ -384,6 +404,12 @@ class SolverFBA(SolverBase):
                 the step's start with its current rotation. Bending and
                 tetrahedra keep the constant damping. Needs
                 ``stretching_model="arap"`` and a nonzero ``rayleigh_beta``.
+            tet_activation_directions: Direction of each tetrahedron's growth
+                in the rest frame, shape ``(tet_count, 3)``: an activation
+                ``a`` stretches it by ``1 - a`` along its direction alone,
+                which again makes ``1 - a`` its volume ratio, as the chambers
+                of a pneumatic bending actuator lengthen along it. A zero row,
+                or ``None`` for all, grows the tetrahedron isotropically.
         """
         super().__init__(model)
         if model.world_count > 1:
@@ -420,6 +446,17 @@ class SolverFBA(SolverBase):
         if rayleigh_corotated and self._rayleigh_beta is None:
             raise ValueError("rayleigh_corotated needs a nonzero rayleigh_beta")
         self.rayleigh_corotated = bool(rayleigh_corotated)
+        # Unit growth directions of the tets' activations, zero rows to grow isotropically; None for all.
+        self._tet_activation_directions = None
+        if tet_activation_directions is not None:
+            directions = np.asarray(tet_activation_directions, dtype=np.float64)
+            if directions.shape != (model.tet_count, 3) or not np.isfinite(directions).all():
+                raise ValueError(
+                    f"tet_activation_directions needs {model.tet_count} finite rows of 3, got shape {directions.shape}"
+                )
+            length = np.linalg.norm(directions, axis=1, keepdims=True)
+            directions = np.divide(directions, length, out=np.zeros_like(directions), where=length > 0.0)
+            self._tet_activation_directions = directions.astype(np.float32)
         self.stretching_model = stretching_model
         self._update_materials()
         self.friction = bool(friction)
@@ -577,6 +614,9 @@ class SolverFBA(SolverBase):
         self._tet_indices_d = None
         self._tet_rest_inv_d = None
         self._tet_weight_d = None
+        # The step's tet activations, copied from its control (zero without one), and their growth directions.
+        self._tet_activation_d: wp.array | None = None
+        self._tet_activation_direction_d: wp.array | None = None
         # Per-(tet, local vertex) scratch for deterministic (compute → gather)
         # PD scatter; allocated in _setup_pd_system, reused per step.
         self._tet_contrib_d: wp.array | None = None
@@ -1342,11 +1382,18 @@ class SolverFBA(SolverBase):
                 dtype=wp.vec3,
                 device=device,
             )
+            self._tet_activation_d = wp.zeros(int(self.model.tet_count), dtype=wp.float32, device=device)
+            directions = self._tet_activation_directions
+            if directions is None:
+                directions = np.zeros((int(self.model.tet_count), 3), dtype=np.float32)
+            self._tet_activation_direction_d = wp.array(directions, dtype=wp.vec3, device=device)
         else:
             self._particle_tet_offsets_d = None
             self._particle_tet_element_d = None
             self._particle_tet_local_d = None
             self._tet_contrib_d = None
+            self._tet_activation_d = None
+            self._tet_activation_direction_d = None
 
         if tri_indices_np is not None and tri_indices_np.size > 0:
             offs, elem_idx, local_v = build_particle_element_csr(tri_indices_np, n_p, 3)
@@ -1404,7 +1451,9 @@ class SolverFBA(SolverBase):
             state_out: Output simulation state. Particle positions and
                 velocities are written, and those of the bodies unless another
                 solver integrates them; other fields are untouched.
-            control: Unused: the solver has no actuators.
+            control: The step's ``tet_activations``, which grow or shrink the
+                tetrahedra (see the class notes), or ``None`` to step without
+                activations.
             contacts: The step's contacts, detected on ``state_in``, or ``None``
                 to step without them. With self contact on, the step still
                 finds its self contacts.
@@ -1437,6 +1486,19 @@ class SolverFBA(SolverBase):
 
         if self._linear_solver is None or self._dt_setup is None or abs(self._dt_setup - dt) > 1e-12:
             self._setup_pd_system(dt)
+
+        # The step's tet activations, which every local-global iteration's tet projections read.
+        if self._tet_activation_d is not None:
+            activations = None if control is None else control.tet_activations
+            if activations is None:
+                self._tet_activation_d.zero_()
+            elif activations.shape != (self.model.tet_count,):
+                raise ValueError(
+                    f"control.tet_activations needs one value per tetrahedron, {self.model.tet_count}, "
+                    f"got shape {activations.shape}"
+                )
+            else:
+                wp.copy(self._tet_activation_d, activations)
 
         # Ingest the step's contacts once; with self contact on, a step without contacts still has self contacts.
         if contacts is not None or self._self_contact is not None:
@@ -2025,6 +2087,8 @@ class SolverFBA(SolverBase):
                         self._tet_indices_d,
                         self._tet_rest_inv_d,
                         self._tet_weight_d,
+                        self._tet_activation_d,
+                        self._tet_activation_direction_d,
                     ],
                     outputs=[self._tet_contrib_d],
                     device=device,
@@ -2050,6 +2114,8 @@ class SolverFBA(SolverBase):
                         self._tet_indices_d,
                         self._tet_rest_inv_d,
                         self._tet_weight_d,
+                        self._tet_activation_d,
+                        self._tet_activation_direction_d,
                         self._tet_lame_d,
                     ],
                     outputs=[self._tet_contrib_d],
@@ -2076,6 +2142,8 @@ class SolverFBA(SolverBase):
                         self._tet_indices_d,
                         self._tet_rest_inv_d,
                         self._tet_weight_d,
+                        self._tet_activation_d,
+                        self._tet_activation_direction_d,
                         self._tet_lame_d,
                     ],
                     outputs=[self._tet_contrib_d],
