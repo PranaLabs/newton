@@ -301,20 +301,49 @@ def project_arap_3x3_d(F: wp.mat33d) -> wp.mat33d:
     return U * wp.transpose(V)
 
 
+@wp.func
+def tet_growth_d(activation: wp.float32, direction: wp.vec3, inverse: wp.bool) -> wp.mat33d:
+    """Growth ``G`` of a tet with activation ``a``, or its inverse: the grown rest shape is ``G`` times the rest shape.
+
+    Without a direction, a zero vector, ``G = (1 - a)^(1/3) I``; with one, ``G = I + (1 - a - 1) n n^T`` for the unit
+    direction ``n``, a stretch by ``1 - a`` along ``n``. Either way the grown rest shape holds ``1 - a`` times the
+    rest volume, clamped to at least 1e-6 times it.
+    """
+    one = wp.float64(1.0)
+    ratio = wp.max(one - wp.float64(activation), wp.float64(1.0e-6))
+    n = wp.vec3d(wp.float64(direction[0]), wp.float64(direction[1]), wp.float64(direction[2]))
+    length = wp.length(n)
+    G = wp.identity(n=3, dtype=wp.float64)
+    if length == wp.float64(0.0):
+        s = wp.pow(ratio, one / wp.float64(3.0))
+        if inverse:
+            s = one / s
+        G = s * G
+    else:
+        stretch = ratio
+        if inverse:
+            stretch = one / ratio
+        n = n / length
+        G = G + (stretch - one) * wp.outer(n, n)
+    return G
+
+
 @wp.kernel
 def project_stretching_arap_tet_kernel(
     positions: wp.array[wp.vec3],
     tet_indices: wp.array[wp.int32],  # flat shape (4*T,)
     tet_rest_inv: wp.array[wp.mat33],
     tet_weight: wp.array[wp.float32],
+    tet_activation: wp.array[wp.float32],
+    tet_activation_direction: wp.array[wp.vec3],
     # output (per-tet, per-local-vertex contributions)
     contributions: wp.array2d[wp.vec3],  # (T, 4)
 ):
     """Compute per-tet ARAP contribution to each of its 4 local vertices.
 
-    Computes ``F = Ds * Dm_inv`` (3x3), projects it to the nearest rotation ``R``
-    by an fp64 SVD with reflection handling, and writes ``w * Dm_inv * R^T`` to
-    the four stencil vertices.
+    Computes ``F = Ds * Dm_inv`` (3x3), projects ``F G^-1`` to the nearest rotation ``R``
+    by an fp64 SVD with reflection handling, for the growth ``G`` of the tet's activation
+    (:func:`tet_growth_d`), and writes ``w * Dm_inv * (R G)^T`` to the four stencil vertices.
     Writes into a pre-allocated ``(T, 4)`` scratch buffer; :func:`gather_per_particle_kernel`
     sums the contributions per particle in a fixed order, so the right-hand side is deterministic.
 
@@ -323,6 +352,9 @@ def project_stretching_arap_tet_kernel(
         tet_indices: Flat tet indices, shape ``[4 * tet_count]``.
         tet_rest_inv: Per-tet 3x3 rest-pose inverse (Dm_inv), shape ``[tet_count]``.
         tet_weight: Per-tet weight (2*mu * volume), shape ``[tet_count]``.
+        tet_activation: Per-tet activation [dimensionless], shape ``[tet_count]``.
+        tet_activation_direction: Per-tet growth direction in the rest frame, a zero vector to grow isotropically,
+            shape ``[tet_count]``.
         contributions: Output ``(tet_count, 4)`` per-local-vertex contribution.
     """
     t = wp.tid()
@@ -367,7 +399,12 @@ def project_stretching_arap_tet_kernel(
         wp.float64(F[2, 1]),
         wp.float64(F[2, 2]),
     )
+    a = tet_activation[t]
+    if a != wp.float32(0.0):
+        F_d = F_d * tet_growth_d(a, tet_activation_direction[t], True)
     R_d = project_arap_3x3_d(F_d)
+    if a != wp.float32(0.0):
+        R_d = R_d * tet_growth_d(a, tet_activation_direction[t], False)
     Dm_inv_d = wp.mat33d(
         wp.float64(Dm_inv[0, 0]),
         wp.float64(Dm_inv[0, 1]),
@@ -444,18 +481,22 @@ def project_stretching_corotational_tet_kernel(
     tet_indices: wp.array[wp.int32],  # flat shape (4*T,)
     tet_rest_inv: wp.array[wp.mat33],
     tet_weight: wp.array[wp.float32],
+    tet_activation: wp.array[wp.float32],
+    tet_activation_direction: wp.array[wp.vec3],
     lame: wp.array[wp.vec2],
     # output (per-tet, per-local-vertex contributions)
     contributions: wp.array2d[wp.vec3],  # (T, 4)
 ):
     """Compute per-tet corotational contribution to each of its 4 local vertices.
 
-    Computes ``F = Ds * Dm_inv`` (3x3), takes its singular values with
-    ``wp.svd3``, applies the closed-form 3D corotational projection to get
-    ``sigma_proj``, rebuilds ``P = U * diag(sigma_proj) * Vt`` and writes
-    ``w * Dm_inv * P^T`` to the four stencil vertices. ``wp.svd3`` returns
-    rotations ``U`` and ``V`` and signed singular values, the smallest
-    negative for an inverted tet, which the projection moves toward 1.
+    Computes ``F = Ds * Dm_inv`` (3x3), takes the singular values of
+    ``F G^-1`` with ``wp.svd3`` for the growth ``G`` of the tet's activation
+    (:func:`tet_growth_d`), applies the closed-form 3D corotational projection
+    to get ``sigma_proj``, rebuilds ``P = U * diag(sigma_proj) * Vt * G`` and
+    writes ``w * Dm_inv * P^T`` to the four stencil vertices.
+    ``wp.svd3`` returns rotations ``U`` and ``V`` and signed singular values,
+    the smallest negative for an inverted tet, which the projection moves
+    toward 1.
     Writes into a pre-allocated ``(T, 4)`` scratch buffer; :func:`gather_per_particle_kernel`
     sums the contributions per particle in a fixed order, so the right-hand side is deterministic.
 
@@ -464,6 +505,9 @@ def project_stretching_corotational_tet_kernel(
         tet_indices: Flat tet indices, shape ``[4 * tet_count]``.
         tet_rest_inv: Per-tet 3x3 rest-pose inverse (Dm_inv), shape ``[tet_count]``.
         tet_weight: Per-tet weight (2*mu * volume), shape ``[tet_count]``.
+        tet_activation: Per-tet activation [dimensionless], shape ``[tet_count]``.
+        tet_activation_direction: Per-tet growth direction in the rest frame, a zero vector to grow
+            isotropically, shape ``[tet_count]``.
         lame: First and second Lamé parameters of each element [Pa].
         contributions: Output ``(tet_count, 4)`` per-local-vertex contribution.
     """
@@ -514,6 +558,9 @@ def project_stretching_corotational_tet_kernel(
         wp.float64(F[2, 1]),
         wp.float64(F[2, 2]),
     )
+    a = tet_activation[t]
+    if a != wp.float32(0.0):
+        F_d = F_d * tet_growth_d(a, tet_activation_direction[t], True)
     U_d, sigma_d, V_d = wp.svd3(F_d)
     sigma_proj_d = project_corotational_sigma3d_d(
         wp.vec3d(sigma_d[0], sigma_d[1], sigma_d[2]), wp.float64(mu), wp.float64(lam)
@@ -534,6 +581,8 @@ def project_stretching_corotational_tet_kernel(
         U_d[2, 2] * sd2,
     )
     P_d = US_d * wp.transpose(V_d)
+    if a != wp.float32(0.0):
+        P_d = P_d * tet_growth_d(a, tet_activation_direction[t], False)
 
     Dm_inv_d = wp.mat33d(
         wp.float64(Dm_inv[0, 0]),
@@ -1111,18 +1160,21 @@ def project_stretching_neohookean_tet_kernel(
     tet_indices: wp.array[wp.int32],  # flat shape (4*T,)
     tet_rest_inv: wp.array[wp.mat33],
     tet_weight: wp.array[wp.float32],
+    tet_activation: wp.array[wp.float32],
+    tet_activation_direction: wp.array[wp.vec3],
     lame: wp.array[wp.vec2],
     # output (per-tet, per-local-vertex contributions)
     contributions: wp.array2d[wp.vec3],  # (T, 4)
 ):
     """Per-tet Neo-Hookean projection by L-BFGS.
 
-    Projects the singular values of ``F`` with
-    :func:`project_neohookean_sigma3d_lbfgs` and writes each tet's
-    contributions to its four particles for the per-particle gather. SVD,
-    L-BFGS, sigma projection and P reconstruction all run in ``wp.float64``.
-    Final ``proj`` is demoted to fp32 only at the contributions write boundary
-    (``_rhs`` itself is fp32).
+    Projects the singular values of ``F G^-1`` with
+    :func:`project_neohookean_sigma3d_lbfgs`, for the growth ``G`` of the
+    tet's activation (:func:`tet_growth_d`), rebuilds the projection times
+    ``G`` and writes each tet's contributions to its four particles for the
+    per-particle gather. SVD, L-BFGS, sigma projection and P reconstruction
+    all run in ``wp.float64``. Final ``proj`` is demoted to fp32 only at the
+    contributions write boundary (``_rhs`` itself is fp32).
     """
     t = wp.tid()
     mu, lam = lame[t][0], lame[t][1]
@@ -1170,6 +1222,9 @@ def project_stretching_neohookean_tet_kernel(
         wp.float64(F[2, 1]),
         wp.float64(F[2, 2]),
     )
+    a = tet_activation[t]
+    if a != wp.float32(0.0):
+        F_d = F_d * tet_growth_d(a, tet_activation_direction[t], True)
     U_d, sigma_d, V_d = wp.svd3(F_d)
 
     # LBFGS in fp64 on fp64 SVD output.
@@ -1193,6 +1248,8 @@ def project_stretching_neohookean_tet_kernel(
         U_d[2, 2] * sd2,
     )
     P_d = US_d * wp.transpose(V_d)
+    if a != wp.float32(0.0):
+        P_d = P_d * tet_growth_d(a, tet_activation_direction[t], False)
 
     Dm_inv_d = wp.mat33d(
         wp.float64(Dm_inv[0, 0]),

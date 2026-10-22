@@ -119,6 +119,15 @@ Model Inputs
   the rest angle. The same ``edge_ke`` bends an FBA cloth more stiffly than a
   :class:`~newton.solvers.SolverVBD` one, which scales it by the edge length.
 - **Soft bodies**: tetrahedra with the same stretching models.
+- **Activations**: the control's ``tet_activations`` grow each tetrahedron
+  to ``1 - a`` times its rest volume, so a negative activation inflates it
+  and a positive one contracts it: isotropically, or along a direction per
+  tetrahedron from ``tet_activation_directions``, as the chambers of a
+  pneumatic bending actuator lengthen along it. The local phase projects the
+  deformation gradient with the growth taken out and puts the growth back
+  into the projection, so the factored system matrix stays valid and the
+  activations may change every step. In ``pneunet_gripper_fba`` they
+  lengthen the chambers of a soft gripper along its fingers.
 - **Damping**: ``rayleigh_alpha`` [1/s] and ``rayleigh_beta`` [s] apply
   Rayleigh damping, the forces ``-(alpha M + beta K) v`` with ``M`` the
   particle masses and ``K`` the stretching and bending part of the constant
@@ -238,3 +247,6 @@ Examples
   contacts, friction anchors and corotated Rayleigh stiffness damping.
 - ``softbody_cantilever_fba``: two soft cantilevers swing under gravity, one
   with Rayleigh damping.
+- ``pneunet_gripper_fba``: a three-finger PneuNet gripper whose chambers,
+  lengthened along its fingers by tetrahedral activations, close the fingers
+  around a ball and lift it.

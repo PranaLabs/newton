@@ -31,6 +31,12 @@ def _projection_rhs(kernel, inputs, arity):
     return rhs
 
 
+def _no_activation(weight):
+    """Activations and growth directions of the elements that ``weight`` holds, all zero: no growth."""
+    count, device = weight.shape[0], weight.device
+    return wp.zeros(count, dtype=wp.float32, device=device), wp.zeros(count, dtype=wp.vec3, device=device)
+
+
 class TestSolverFBAImport(unittest.TestCase):
     def test_import_solver_fba(self):
         """Import SolverFBA from the FBA package."""
@@ -1965,7 +1971,9 @@ class TestTetARAP(unittest.TestCase):
         Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
         weight = wp.array([1.0], dtype=wp.float32, device=device)
 
-        rhs = _projection_rhs(project_stretching_arap_tet_kernel, [positions, tet_indices, Dm_inv, weight], 4)
+        rhs = _projection_rhs(
+            project_stretching_arap_tet_kernel, [positions, tet_indices, Dm_inv, weight, *_no_activation(weight)], 4
+        )
         r = rhs
         np.testing.assert_allclose(r[1], [1.0, 0.0, 0.0], atol=1e-6)
         np.testing.assert_allclose(r[2], [0.0, 1.0, 0.0], atol=1e-6)
@@ -1991,7 +1999,9 @@ class TestTetARAP(unittest.TestCase):
         Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
         weight = wp.array([1.0], dtype=wp.float32, device=device)
 
-        rhs = _projection_rhs(project_stretching_arap_tet_kernel, [positions, tet_indices, Dm_inv, weight], 4)
+        rhs = _projection_rhs(
+            project_stretching_arap_tet_kernel, [positions, tet_indices, Dm_inv, weight, *_no_activation(weight)], 4
+        )
         r = rhs
         # Momentum conservation: rhs[0] + rhs[1] + rhs[2] + rhs[3] = 0
         total = r[0] + r[1] + r[2] + r[3]
@@ -2012,7 +2022,9 @@ class TestTetARAP(unittest.TestCase):
         Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
         weight = wp.array([2.0], dtype=wp.float32, device=device)
 
-        rhs = _projection_rhs(project_stretching_arap_tet_kernel, [positions, tet_indices, Dm_inv, weight], 4)
+        rhs = _projection_rhs(
+            project_stretching_arap_tet_kernel, [positions, tet_indices, Dm_inv, weight, *_no_activation(weight)], 4
+        )
         r = rhs
         total = r[0] + r[1] + r[2] + r[3]
         np.testing.assert_allclose(total, [0.0, 0.0, 0.0], atol=1e-5)
@@ -2114,7 +2126,14 @@ class TestTetCorotational(unittest.TestCase):
         mu, lam = 1.0, 0.5
         rhs = _projection_rhs(
             project_stretching_corotational_tet_kernel,
-            [positions, tet_indices, Dm_inv, weight, wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device)],
+            [
+                positions,
+                tet_indices,
+                Dm_inv,
+                weight,
+                *_no_activation(weight),
+                wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device),
+            ],
             4,
         )
         r = rhs
@@ -2156,7 +2175,14 @@ class TestTetCorotational(unittest.TestCase):
         mu, lam = 1.0, 0.5
         rhs = _projection_rhs(
             project_stretching_corotational_tet_kernel,
-            [positions, tet_indices, Dm_inv, weight, wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device)],
+            [
+                positions,
+                tet_indices,
+                Dm_inv,
+                weight,
+                *_no_activation(weight),
+                wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device),
+            ],
             4,
         )
         r = rhs
@@ -2189,7 +2215,14 @@ class TestTetCorotational(unittest.TestCase):
         mu, lam = 1.0e3, 5.0e2
         rhs = _projection_rhs(
             project_stretching_corotational_tet_kernel,
-            [positions, tet_indices, Dm_inv, weight, wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device)],
+            [
+                positions,
+                tet_indices,
+                Dm_inv,
+                weight,
+                *_no_activation(weight),
+                wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device),
+            ],
             4,
         )
         r = rhs
@@ -2265,7 +2298,14 @@ class TestTetNeoHookean(unittest.TestCase):
         mu, lam = 1.0, 0.5
         rhs = _projection_rhs(
             project_stretching_neohookean_tet_kernel,
-            [positions, tet_indices, Dm_inv, weight, wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device)],
+            [
+                positions,
+                tet_indices,
+                Dm_inv,
+                weight,
+                *_no_activation(weight),
+                wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device),
+            ],
             4,
         )
         r = rhs
@@ -2301,7 +2341,14 @@ class TestTetNeoHookean(unittest.TestCase):
         mu, lam = 1.0, 0.5
         rhs = _projection_rhs(
             project_stretching_neohookean_tet_kernel,
-            [positions, tet_indices, Dm_inv, weight, wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device)],
+            [
+                positions,
+                tet_indices,
+                Dm_inv,
+                weight,
+                *_no_activation(weight),
+                wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device),
+            ],
             4,
         )
         r = rhs
@@ -2344,7 +2391,14 @@ class TestTetNeoHookean(unittest.TestCase):
         mu, lam = 1.0e3, 5.0e2
         rhs = _projection_rhs(
             project_stretching_neohookean_tet_kernel,
-            [positions, tet_indices, Dm_inv, weight, wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device)],
+            [
+                positions,
+                tet_indices,
+                Dm_inv,
+                weight,
+                *_no_activation(weight),
+                wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device),
+            ],
             4,
         )
         r = rhs
