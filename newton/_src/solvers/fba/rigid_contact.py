@@ -38,6 +38,8 @@ class RigidContacts:
 
     slot: np.ndarray
     """Body slot per side, -1 if not integrated, shape [count, 2]."""
+    shape: np.ndarray
+    """Model shape per side, shape [count, 2]."""
     body: wp.array2d[wp.int32]
     """Model body per side, -1 for a static shape, shape [count, 2]."""
     anchor: wp.array2d[wp.vec3]
@@ -89,6 +91,7 @@ def gather_rigid_contacts(model: Model, contacts: Contacts, body_slot: np.ndarra
     mu = model.shape_material_mu.numpy().astype(np.float64)[shape[order]].mean(axis=1)
     return RigidContacts(
         slot=slot[order],
+        shape=shape[order],
         body=wp.array(body[order], dtype=wp.int32, device=device),
         anchor=wp.array(anchor[order], dtype=wp.vec3, device=device),
         normal=wp.array(normal[order], dtype=wp.vec3, device=device),
@@ -129,6 +132,20 @@ def _moved_anchor(x: wp.vec3d, q: wp.quatd, q0: wp.quatd, r0: wp.vec3d) -> wp.ve
     """Anchor of lever ``r0`` at the step start on a body now at COM ``x`` and turned from ``q0`` to ``q``, to first
     order in the turn."""
     return x + r0 + wp.cross(_rotation_vector(q * wp.quat_inverse(q0)), r0)
+
+
+@wp.kernel
+def rigid_contact_tangents_kernel(
+    normal: wp.array[wp.vec3],
+    # outputs
+    tangent1: wp.array[wp.vec3],
+    tangent2: wp.array[wp.vec3],
+):
+    """Directions of the two friction rows of each rigid contact."""
+    c = wp.tid()
+    n = wp.vec3d(normal[c])
+    tangent1[c] = wp.vec3(_row_direction(n, 1))
+    tangent2[c] = wp.vec3(_row_direction(n, 2))
 
 
 @wp.kernel

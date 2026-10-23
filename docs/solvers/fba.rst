@@ -203,6 +203,11 @@ Contacts
 - A contact on a body that FBA integrates acts at the contact point of the
   step start, which moves with the body to first order in its rotation over
   the step, so a ball keeps rolling at its speed on flat ground.
+- ``contact_warmstart=True`` starts each step's contact multipliers from the
+  previous step's on the same contacts and constraints rather than from zero,
+  so that a resting or held object starts its step at the forces that carry
+  it, which a few iterations per step cannot build up from zero. It needs
+  friction and the full operator.
 - The friction coefficient of a particle contact is its shape's ``mu``,
   ``model.particle_mu`` for self contacts, and the mean of the two shapes'
   ``mu`` for rigid contacts.
