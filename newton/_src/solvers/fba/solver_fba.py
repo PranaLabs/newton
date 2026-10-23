@@ -68,9 +68,10 @@ class SolverFBA(SolverBase):
         simulates models with one world.
 
     A step depends on its input state, contacts and control, on the pin
-    targets and particle constraints last set, and, with ``friction_anchors``,
-    on the anchors that the steps before kept, which :meth:`reset` drops. The
-    contact multipliers and weights start at zero in every step.
+    targets and particle constraints last set, and, with ``friction_anchors``
+    or ``contact_warmstart``, on the anchors or the multipliers that the steps
+    before kept, which :meth:`reset` drops. Otherwise the contact multipliers
+    and weights start at zero in every step.
 
     With :attr:`~newton.solvers.SolverBase.ObservableKind.CONTACT_F`
     requested, a step writes row ``rigid_contact_max + i`` for each particle
@@ -213,6 +214,7 @@ class SolverFBA(SolverBase):
         rayleigh_beta: float | ArrayLike = 0.0,
         rayleigh_corotated: bool = False,
         tet_activation_directions: ArrayLike | None = None,
+        contact_warmstart: bool = False,
     ) -> None:
         """
         Args:
@@ -410,6 +412,16 @@ class SolverFBA(SolverBase):
                 which again makes ``1 - a`` its volume ratio, as the chambers
                 of a pneumatic bending actuator lengthen along it. A zero row,
                 or ``None`` for all, grows the tetrahedron isotropically.
+            contact_warmstart: If ``True``, each step's contact NSN starts
+                from the multipliers that the previous step ended with on the
+                same rows rather than from zero: particle contacts matched by
+                particle and shape, rigid contacts by shape pair and rank,
+                joint rows by index, and the particle constraint rows while
+                their count stays, with friction forces re-expressed in the
+                new tangents. A resting or held object then starts each step
+                at the contact forces that carry it, which a few iterations
+                cannot build up from zero. Face and self contacts start from
+                zero. Needs ``friction=True`` and ``nsn_schur_mode="full"``.
         """
         super().__init__(model)
         if model.world_count > 1:
@@ -462,6 +474,8 @@ class SolverFBA(SolverBase):
         self.friction = bool(friction)
         if friction_anchors and not self.friction:
             raise ValueError("friction_anchors needs friction=True")
+        if contact_warmstart and (not self.friction or nsn_schur_mode != "full"):
+            raise ValueError("contact_warmstart needs friction=True and nsn_schur_mode='full'")
         self.friction_anchors = bool(friction_anchors)
         # Friction anchors: the step count that stamps the self-contact anchors kept per particle, the number of
         # particle contacts whose keys and anchors the step before left, and the number of contacts this step set up.
@@ -571,6 +585,13 @@ class SolverFBA(SolverBase):
         N = model.particle_count
         device = model.device
         self._device = device
+        # The previous step's NSN rows, which start the next step's with contact_warmstart, and the particles,
+        # coefficients and directions of the particle constraint rows that they hold.
+        self._warm_start = self._constraint_key = None
+        if contact_warmstart:
+            from .warm_start import ContactWarmStart  # noqa: PLC0415
+
+            self._warm_start = ContactWarmStart(device)
         self._x_ref = wp.clone(model.particle_q)  # the pin targets, which start at the model positions
         self._x_inertia = wp.empty(N, dtype=wp.vec3, device=device)
         self._x_cur = wp.empty(N, dtype=wp.vec3, device=device)
@@ -685,6 +706,9 @@ class SolverFBA(SolverBase):
         )
 
         self._rigid_dt = dt
+        if self._warm_start is not None:
+            # The multipliers are forces divided by dt^2: those of another dt do not carry over.
+            self._warm_start.clear()
         self._rigid_linear_solver = None
         self._joint_rows = None
         model = self.model
@@ -836,6 +860,7 @@ class SolverFBA(SolverBase):
             blocks = self._slot_block[slots[slots >= 0]]
             joint_rows = np.flatnonzero(np.isin(self._joint_row_block, blocks[blocks >= 0])).astype(np.int32)
         self._rc_joint_rows_d = wp.array(joint_rows, dtype=wp.int32, device=device)
+        self._rc_joint_rows_h = joint_rows
         # Particle constraint rows follow the joint rows when the deformable rows join this solve.
         n_b = self._rc_n_b = 0 if self._constraint_rows is None or not m_s else self._constraint_rows[0].shape[0]
         n_s, n_c = 3 * m_s, 3 * m_r
@@ -894,6 +919,92 @@ class SolverFBA(SolverBase):
         self._rc_r_d = wp.empty(n, dtype=wp.float64, device=device)
         self._rc_lam_d = wp.zeros(n, dtype=wp.float64, device=device)
         self._rc_omega_d = wp.zeros(n, dtype=wp.float64, device=device)
+
+    def _warm_start_rows(self) -> tuple:
+        """This step's NSN rows by kind, as ``(lam, omega, first row, count)`` for the particle contacts, the rigid
+        contacts, the joint rows and the particle constraint rows, ``None`` for a kind the step does not solve."""
+        particle = rigid = joint = bilateral = None
+        if self._two_way:
+            (m_s, m_r), rows = self._rc_counts, (self._rc_lam_d, self._rc_omega_d)
+            particle, rigid = (*rows, 0, m_s), (*rows, 3 * m_s, m_r)
+            joint = (*rows, 3 * (m_s + m_r), len(self._rc_joint_rows_h))
+            bilateral = (*rows, self._rc_n - self._rc_n_b, self._rc_n_b)
+            return particle, rigid, joint, bilateral
+        M = self._contact_count
+        n_b = 0 if self._constraint_rows is None else self._constraint_rows[0].shape[0]
+        if M or n_b:
+            rows = (self._lam_coulomb_persistent_d, self._omega_coulomb_persistent_d)
+            particle, bilateral = (*rows, 0, M), (*rows, 3 * M, n_b)
+        if self._rc_n:
+            m_r, rows = self._rc_counts[1], (self._rc_lam_d, self._rc_omega_d)
+            rigid, joint = (*rows, 0, m_r), (*rows, 3 * m_r, len(self._rc_joint_rows_h))
+        return particle, rigid, joint, bilateral
+
+    def _restore_warm_start(self) -> None:
+        """Start this step's NSN rows from the rows of the same contacts and constraints that the previous step
+        ended with."""
+        from .rigid_contact import rigid_contact_tangents_kernel  # noqa: PLC0415
+        from .warm_start import index_keys_kernel, particle_contact_keys_kernel, rigid_contact_keys  # noqa: PLC0415
+
+        ws, device = self._warm_start, self._device
+        particle, rigid, joint, bilateral = self._warm_start_rows()
+
+        def particle_keys(keys, order):
+            extra = self._contact_extra
+            first = extra[0] if extra is not None else wp.full((1, 1), -1, dtype=wp.int32, device=device)
+            inputs = [self._contact_particle_d, self._contact_shape_d, first, int(extra is not None)]
+            inputs += [self.model.shape_count]
+            wp.launch(particle_contact_keys_kernel, self._contact_count, inputs, [keys, order], device=device)
+
+        def given_keys(values):
+            def write(keys, order):
+                wp.launch(
+                    index_keys_kernel,
+                    len(values),
+                    [wp.array(values, dtype=wp.int64, device=device)],
+                    [keys, order],
+                    device=device,
+                )
+
+            return write
+
+        ws.particle.begin(0 if particle is None else particle[3], particle_keys)
+        if particle is not None:
+            ws.particle.restore(*particle[:3], (self._contact_tangent1_d, self._contact_tangent2_d))
+        self._rc_tangents = None
+        if rigid is not None and rigid[3]:
+            rc = self._rigid_contacts
+            self._rc_tangents = [wp.empty(rc.count, dtype=wp.vec3, device=device) for _ in range(2)]
+            wp.launch(rigid_contact_tangents_kernel, rc.count, [rc.normal], self._rc_tangents, device=device)
+            ws.rigid.begin(rc.count, given_keys(rigid_contact_keys(rc.shape, self.model.shape_count)))
+            ws.rigid.restore(*rigid[:3], self._rc_tangents)
+        else:
+            ws.rigid.begin(0, None)
+        if joint is not None and joint[3]:
+            ws.joint.begin(joint[3], given_keys(self._rc_joint_rows_h.astype(np.int64)))
+            ws.joint.restore(*joint[:3])
+        else:
+            ws.joint.begin(0, None)
+        if bilateral is not None:
+            ws.restore_bilateral(*bilateral)
+
+    def _store_warm_start(self) -> None:
+        """Keep this step's final NSN rows for the next step's warm start."""
+        ws = self._warm_start
+        particle, rigid, joint, bilateral = self._warm_start_rows()
+        if particle is not None:
+            ws.particle.store(*particle[:3], (self._contact_tangent1_d, self._contact_tangent2_d))
+        else:
+            ws.particle.store(None, None, 0)
+        if rigid is not None and rigid[3]:
+            ws.rigid.store(*rigid[:3], self._rc_tangents)
+        else:
+            ws.rigid.store(None, None, 0)
+        if joint is not None and joint[3]:
+            ws.joint.store(*joint[:3])
+        else:
+            ws.joint.store(None, None, 0)
+        ws.store_bilateral(*(bilateral if bilateral is not None else (None, None, 0, 0)))
 
     def _compose_rigid_delassus(self) -> None:
         """Compose the two-way ``W`` from the deformable block and the body slots of the rows."""
@@ -1279,6 +1390,9 @@ class SolverFBA(SolverBase):
             self._tri_F_prev_d = wp.zeros(len(tri), dtype=mat32, device=device)
             self._tri_S_prev_d = wp.zeros(len(tri), dtype=wp.mat22, device=device)
         self._dt_setup = dt
+        if self._warm_start is not None:
+            # The multipliers are forces divided by dt^2: those of another dt do not carry over.
+            self._warm_start.clear()
         self._lg_iter_graph = None
         # A changed, so W is stale.
         self._invalidate_schur_cache()
@@ -1478,8 +1592,12 @@ class SolverFBA(SolverBase):
         if self.model.particle_count == 0:
             if rigid:
                 self._begin_rigid_contacts(contacts, state_in)
+                if self._warm_start is not None:
+                    self._restore_warm_start()
             for _ in range(self.iterations if rigid else 0):
                 self._rigid_iteration(state_in, state_out, dt)
+            if rigid and self._warm_start is not None:
+                self._store_warm_start()
             if contact_f is not None:
                 contact_f.zero_()
             return
@@ -1537,7 +1655,8 @@ class SolverFBA(SolverBase):
                 device=self._device,
             )
 
-        # λ and ω start at zero in every step, then carry across its PD outer iterations below.
+        # λ and ω start at zero in every step, or from the step before's with contact_warmstart, then carry across
+        # its PD outer iterations below.
         M = self._contact_count
         n_b = 0 if self._constraint_rows is None else self._constraint_rows[0].shape[0]
         if M > 0 or n_b:
@@ -1588,6 +1707,8 @@ class SolverFBA(SolverBase):
         # Rigid contact rows are assembled after the deformable contacts they may share bodies with.
         if rigid:
             self._begin_rigid_contacts(contacts, state_in)
+        if self._warm_start is not None:
+            self._restore_warm_start()
         if self.friction_anchors:
             self._apply_friction_anchors(state_in)
 
@@ -1899,6 +2020,8 @@ class SolverFBA(SolverBase):
             if rigid:
                 self._rigid_iteration(state_in, state_out, dt)
 
+        if self._warm_start is not None:
+            self._store_warm_start()
         if self.friction_anchors:
             self._update_friction_anchors()
 
@@ -2272,7 +2395,9 @@ class SolverFBA(SolverBase):
         """
         self._invalidate_schur_cache()
         if particles is None or len(particles) == 0:
-            self._constraint_rows = self._held_rows = None
+            self._constraint_rows = self._held_rows = self._constraint_key = None
+            if self._warm_start is not None:
+                self._warm_start.bilateral_count = 0
             self._held_particles, self._held_particle_d = np.zeros(0, dtype=np.int32), None
             return
         if not self.friction:
@@ -2289,6 +2414,13 @@ class SolverFBA(SolverBase):
             raise ValueError("the lite NSN holds only rows with a direction on one particle")
         if self.nsn_schur_mode == "lite":
             self._hold_at_points(p[:, 0], np.asarray(coefficients)[:, 0], np.asarray(directions), exact)
+        if self._warm_start is not None:
+            # The rows' multipliers carry over to the next step while the rows keep their particles, coefficients
+            # and directions.
+            key = [np.asarray(a) for a in (particles, coefficients, () if directions is None else directions)]
+            if self._constraint_key is None or not all(map(np.array_equal, key, self._constraint_key)):
+                self._warm_start.bilateral_count = 0
+            self._constraint_key = key
         self._constraint_lengths = directions is None
         if directions is None:
             directions = np.zeros((len(targets), 3))
@@ -2398,7 +2530,8 @@ class SolverFBA(SolverBase):
         world_mask: wp.array[wp.bool] | None = None,
         flags: StateFlags | int | None = None,
     ) -> None:
-        """Drop the friction anchors that the steps before kept, so that the next step starts afresh.
+        """Drop the friction anchors and the warm-start multipliers that the steps before kept, so that the next
+        step starts afresh.
 
         The state is not modified. SolverFBA simulates one world, so any reset drops all of them.
 
@@ -2410,6 +2543,8 @@ class SolverFBA(SolverBase):
         self._anchor_count = 0
         if self.friction_anchors and self.model.particle_count:
             self._anchor_step_d.fill_(-2)
+        if self._warm_start is not None:
+            self._warm_start.clear()
 
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         """Rebuild and factor the system matrices at the next step.
