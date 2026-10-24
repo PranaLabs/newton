@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import warp as wp
@@ -12,6 +12,9 @@ from ...geometry import ParticleFlags
 from ...sim import Contacts, Control, Model, ModelFlags, State
 from ..solver import SolverBase
 
+if TYPE_CHECKING:
+    from numpy.typing import ArrayLike
+
 
 def _element_lame(materials: wp.array | None, count: int) -> tuple[np.ndarray, np.ndarray]:
     """First and second Lamé parameters [Pa] of each element, from its material row."""
@@ -19,6 +22,21 @@ def _element_lame(materials: wp.array | None, count: int) -> tuple[np.ndarray, n
         return np.zeros(0), np.zeros(0)
     rows = materials.numpy().astype(np.float64)
     return rows[:, 0], rows[:, 1]
+
+
+def _damping_coefficients(name: str, value, count: int) -> np.ndarray | None:
+    """One Rayleigh damping coefficient per particle from a scalar or a per-particle array, or ``None`` when all
+    are zero."""
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    values = np.asarray(value, dtype=np.float64)
+    if values.ndim == 0:
+        values = np.full(count, float(values))
+    if values.shape != (count,):
+        raise ValueError(f"{name} takes a scalar or one value per particle ({count}), got shape {values.shape}")
+    if not np.isfinite(values).all() or (values < 0.0).any():
+        raise ValueError(f"{name} must be finite and >= 0")
+    return values if values.any() else None
 
 
 def _host_mirror(name: str) -> property:
@@ -105,6 +123,14 @@ class SolverFBA(SolverBase):
     for a dihedral angle ``theta``: at small angles the same ``edge_ke``
     bends an FBA cloth ``3 * |e| / (A0 + A1)`` times as stiffly.
 
+    Rayleigh damping, ``rayleigh_alpha`` and ``rayleigh_beta``, applies the
+    forces ``-(alpha M + beta K) v`` by implicit Euler, with ``M`` the
+    particle masses and ``K`` the stretching and bending part of the PD
+    Hessian, the weights above included: the Hessian gains
+    ``(alpha M + beta K) / dt``, and each step's right-hand side
+    ``(alpha M + beta K) x_prev / dt`` for the step's start positions
+    ``x_prev``.
+
     Notes:
         - Float32 ``particle_q`` output: the interior linear solver
           operates in float64, but ``state_out.particle_q`` (vec3) is
@@ -142,6 +168,9 @@ class SolverFBA(SolverBase):
         shape_angular_velocity: dict[int, float] | None = None,
         nsn_schur_mode: Literal["full", "lite"] = "full",
         nsn_linear_iterations: int | None = None,
+        rayleigh_alpha: float | ArrayLike = 0.0,
+        rayleigh_beta: float | ArrayLike = 0.0,
+        rayleigh_corotated: bool = False,
     ) -> None:
         """
         Args:
@@ -170,7 +199,8 @@ class SolverFBA(SolverBase):
             nsn_schur_mode: Contact operator ``W`` of the NSN steps.
                 ``"full"`` (default) builds ``J A⁻¹ Jᵀ`` from the prefactored
                 system matrix ``A``. ``"lite"`` replaces ``A⁻¹`` by
-                ``dt² M⁻¹``, the inverse of the mass term ``M / dt²`` of ``A``:
+                ``dt² M⁻¹``, the inverse of the mass term ``M / dt²`` of ``A``
+                (``(1 + alpha dt) M / dt²`` with ``rayleigh_alpha``):
                 the rows of different particles decouple, and no ``W`` is
                 built. Each local-global
                 iteration solves for the contact forces whose motion,
@@ -185,6 +215,32 @@ class SolverFBA(SolverBase):
                 solve in each NSN step. ``None`` solves to a relative
                 residual of ``1e-10``. A capped step is inexact, and the next
                 LG iteration's NSN step continues from it.
+            rayleigh_alpha: Mass-proportional Rayleigh damping coefficient
+                [1/s]: a particle of mass ``m`` moving at ``v`` feels the force
+                ``-alpha m v``. A scalar for every particle, or one value per
+                particle.
+            rayleigh_beta: Stiffness-proportional Rayleigh damping coefficient
+                [s]: the particles feel the forces ``-beta K v``, with ``K`` the
+                stretching and bending part of the solver's constant system
+                matrix. ``K`` measures every change of an element's
+                deformation gradient, rotations included, so ``beta`` also
+                damps elements that turn, and a slender part's bending more
+                than its bending stiffness alone suggests. A scalar for every
+                element, or one value per particle, of which an element takes
+                the mean. Both coefficients are integrated implicitly with the
+                rest of the step: the damping matrix enters the prefactored
+                system matrix, and its product with the step's start positions
+                the right-hand side, so a change of ``dt`` refactors both
+                together.
+            rayleigh_corotated: Damp the stretch rate of the triangles in
+                place of the rate of their deformation gradient, so that
+                ``rayleigh_beta`` spares their rotation: a flap falls and a
+                bulge flattens as fast as without damping, while stretch
+                waves stay damped. The system matrix is unchanged; each
+                iteration's right-hand side turns the triangle's stretch at
+                the step's start with its current rotation. Bending and
+                tetrahedra keep the constant damping. Needs
+                ``stretching_model="arap"`` and a nonzero ``rayleigh_beta``.
         """
         super().__init__(model)
         if model.world_count > 1:
@@ -216,6 +272,14 @@ class SolverFBA(SolverBase):
 
         self.iterations = int(iterations)
         self.pin_stiffness = float(pin_stiffness)
+        # Rayleigh damping coefficients per particle, None when zero.
+        self._rayleigh_alpha = _damping_coefficients("rayleigh_alpha", rayleigh_alpha, model.particle_count)
+        self._rayleigh_beta = _damping_coefficients("rayleigh_beta", rayleigh_beta, model.particle_count)
+        if rayleigh_corotated and stretching_model != "arap":
+            raise ValueError("rayleigh_corotated needs stretching_model='arap'")
+        if rayleigh_corotated and self._rayleigh_beta is None:
+            raise ValueError("rayleigh_corotated needs a nonzero rayleigh_beta")
+        self.rayleigh_corotated = bool(rayleigh_corotated)
         self.stretching_model = stretching_model
         self._update_materials()
         self.friction = bool(friction)
@@ -242,6 +306,8 @@ class SolverFBA(SolverBase):
         self._dt_setup: float | None = None
         self._lg_iter_graph = None  # the local-global iteration's graph, False where its capture failed
         self._linear_solver = None
+        self._damping_d = None  # the Rayleigh damping matrix in CSR form, set up with the system
+        self._tri_beta_d = None  # the triangles' coefficients of the corotated stiffness damping
 
         # Device buffers (allocated lazily once we know dt - see _setup_pd_system).
         N = model.particle_count
@@ -315,10 +381,14 @@ class SolverFBA(SolverBase):
 
         self._k_zero_vec3 = _K.zero_vec3_kernel
         self._k_add_inertia = _K.add_inertia_to_rhs_kernel
+        self._k_damping_rhs = _K.damping_rhs_kernel
+        self._k_add_vec3 = _K.accumulate_vec3_kernel
         self._k_gather = _K.gather_per_particle_kernel
         self._k_pin = _K.project_pin_kernel
         self._k_bending = _K.project_bending_kernel
         self._k_tri_arap = _K.project_stretching_arap_kernel
+        self._k_tri_stretch_state = _K.tri_stretch_state_kernel
+        self._k_tri_arap_damped = _K.project_stretching_arap_damped_kernel
         self._k_tet_arap = _K.project_stretching_arap_tet_kernel
         self._k_tri_corot = _K.project_stretching_corotational_kernel
         self._k_tet_corot = _K.project_stretching_corotational_tet_kernel
@@ -423,6 +493,8 @@ class SolverFBA(SolverBase):
             pin_stiffness=self.pin_stiffness,
             tri_weight_scale=self._tri_gauge,
             tet_weight_scale=self._tet_gauge,
+            rayleigh_alpha=self._rayleigh_alpha,
+            rayleigh_beta=self._rayleigh_beta,
         )
         fs = factorize_and_sparse_inverse(A, self.model.particle_q.numpy())
         self._linear_solver = FBALinearSolver(fs, device=self._device)
@@ -437,9 +509,36 @@ class SolverFBA(SolverBase):
         inactive = np.flatnonzero(inactive & (self.model.particle_inv_mass.numpy() > 0.0))
         self._inactive_d = wp.array(inactive.astype(np.int32), dtype=wp.int32, device=device) if inactive.size else None
         # The lite NSN kernels and the dense lite Schur build read the inverse masses; convert them once here
-        # rather than in every step.
+        # rather than in every step. Mass-proportional damping adds alpha m / dt to the mass term
+        # m / dt^2 of A, which the lite operator inverts.
         if self.nsn_schur_mode == "lite":
-            self._linear_solver.setup_lite_mass(self._inv_mass_d, dt)
+            lite_inv_mass = self._inv_mass_d
+            if self._rayleigh_alpha is not None:
+                lite_inv_mass = wp.array(
+                    (inv_mass / (1.0 + self._rayleigh_alpha * dt)).astype(np.float32), dtype=wp.float32, device=device
+                )
+            self._linear_solver.setup_lite_mass(lite_inv_mass, dt)
+        # The damping matrix C in CSR form, whose product with the step's start positions over dt joins the
+        # right-hand side of every iteration.
+        damping = meta["damping"]
+        self._damping_d = None
+        if damping is not None:
+            self._damping_d = (
+                wp.array(damping.indptr.astype(np.int32), dtype=wp.int32, device=device),
+                wp.array(damping.indices.astype(np.int32), dtype=wp.int32, device=device),
+                wp.array(damping.data, dtype=wp.float64, device=device),
+            )
+            self._damping_rhs = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=device)
+        # Corotated stiffness damping of the triangles: each triangle's coefficient, and its deformation gradient and
+        # stretch at the step's start.
+        self._tri_beta_d = None
+        tri = meta["tri_indices"]
+        if self.rayleigh_corotated and self._rayleigh_beta is not None and len(tri):
+            from .kernels import mat32  # noqa: PLC0415
+
+            self._tri_beta_d = wp.array(self._rayleigh_beta[tri].mean(axis=1).astype(np.float32), device=device)
+            self._tri_F_prev_d = wp.zeros(len(tri), dtype=mat32, device=device)
+            self._tri_S_prev_d = wp.zeros(len(tri), dtype=wp.mat22, device=device)
         self._dt_setup = dt
         self._lg_iter_graph = None
         # A changed, so W is stale.
@@ -727,6 +826,14 @@ class SolverFBA(SolverBase):
             outputs=[self._x_inertia],
             device=device,
         )
+        # Implicit Rayleigh damping: C x_prev / dt joins the right-hand side of every iteration.
+        if self._damping_d is not None:
+            inputs = [*self._damping_d, state_in.particle_q, 1.0 / dt]
+            wp.launch(self._k_damping_rhs, dim=N, inputs=inputs, outputs=[self._damping_rhs], device=device)
+        if self._tri_beta_d is not None:
+            inputs = [state_in.particle_q, self._tri_indices_d, self._tri_rest_inv_d]
+            outputs = [self._tri_F_prev_d, self._tri_S_prev_d]
+            wp.launch(self._k_tri_stretch_state, model.tri_count, inputs, outputs, device=device)
         # Initialize current iterate x_cur = x_inertia (copy).
         wp.copy(self._x_cur, self._x_inertia)
 
@@ -1004,6 +1111,9 @@ class SolverFBA(SolverBase):
             outputs=[self._rhs],
             device=device,
         )
+        # Rayleigh damping term of the step.
+        if self._damping_d is not None:
+            wp.launch(self._k_add_vec3, dim=N, inputs=[self._damping_rhs], outputs=[self._rhs], device=device)
         # Pin projection.
         if self._pin_indices_d is not None:
             wp.launch(
@@ -1015,7 +1125,14 @@ class SolverFBA(SolverBase):
             )
         # Tri (cloth) stretching projection: deterministic compute+gather.
         if self._tri_indices_d is not None and model.tri_count > 0:
-            if self.stretching_model == "arap":
+            if self.stretching_model == "arap" and self._tri_beta_d is not None:
+                inputs = [self._x_cur, self._tri_indices_d, self._tri_rest_inv_d, self._tri_weight_d, self._tri_beta_d]
+                inputs += [1.0 / dt, self._tri_F_prev_d, self._tri_S_prev_d]
+                wp.launch(self._k_tri_arap_damped, model.tri_count, inputs, [self._tri_contrib_d], device=device)
+                inputs = [self._tri_contrib_d, self._particle_tri_offsets_d, self._particle_tri_element_d]
+                inputs += [self._particle_tri_local_d]
+                wp.launch(self._k_gather, dim=N, inputs=inputs, outputs=[self._rhs], device=device)
+            elif self.stretching_model == "arap":
                 wp.launch(
                     self._k_tri_arap,
                     dim=model.tri_count,
