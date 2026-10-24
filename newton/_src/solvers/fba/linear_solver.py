@@ -65,8 +65,14 @@ def build_pd_system(
     pin_stiffness: float,
     tri_weight_scale: float | np.ndarray = 1.0,
     tet_weight_scale: float | np.ndarray = 1.0,
+    rayleigh_alpha: np.ndarray | None = None,
+    rayleigh_beta: np.ndarray | None = None,
 ) -> tuple[CsrMatrix, dict[str, Any]]:
     """Assemble the constant scalar PD Hessian ``A`` for cloth.
+
+    With Rayleigh damping, ``A`` also holds ``C / dt`` for the damping matrix ``C = alpha M + beta K``, where ``K``
+    is the stretching and bending part of ``A``: implicit Euler applies the damping force ``-C v`` with
+    ``v = (x - x_prev) / dt`` as ``C / dt`` in the matrix and ``C x_prev / dt`` in the right-hand side of each step.
 
     Args:
         model: The Newton model containing cloth triangles and (optionally)
@@ -76,6 +82,9 @@ def build_pd_system(
         pin_stiffness: PD soft-pin weight ``w_pin``. Larger means harder pin.
         tri_weight_scale: Factor on each triangle's stretching weight: a scalar or one per triangle.
         tet_weight_scale: Factor on each tetrahedron's stretching weight: a scalar or one per tetrahedron.
+        rayleigh_alpha: Mass-proportional damping coefficient of each particle [1/s], or ``None`` for none.
+        rayleigh_beta: Stiffness-proportional damping coefficient of each particle [s], or ``None`` for none. An
+            element takes the mean of its particles' coefficients.
 
     Returns:
         A tuple ``(A, meta)`` where ``A`` is an ``N x N`` symmetric PSD CSR
@@ -90,6 +99,7 @@ def build_pd_system(
         - ``meta["edge_quad_scale"]`` : ``np.ndarray[float64]`` shape (E,)  (3/(A0+A1))
         - ``meta["edge_weight"]`` : ``np.ndarray[float64]`` shape (E,)
         - ``meta["pin_indices"]`` : ``np.ndarray[int32]`` (packed pinned indices)
+        - ``meta["damping"]`` : :class:`CsrMatrix` of ``C``, or ``None`` without damping
     """
     N = model.particle_count
     mass, inv_mass = particle_masses(model)
@@ -99,6 +109,11 @@ def build_pd_system(
     # concatenated once at the end. This is dramatically faster than appending
     # Python scalars to lists for >1K particles.
     coo_parts: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    # The damping matrix C in the same form.
+    damping_parts: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+
+    def element_beta(indices: np.ndarray) -> np.ndarray:
+        return rayleigh_beta[indices].mean(axis=1)
 
     # ---- Mass diagonal ---- (only where inv_mass > 0; pinned masses go below)
     inv_dt2 = 1.0 / (dt * dt)
@@ -106,6 +121,8 @@ def build_pd_system(
     free_idx = np.where(free_mask)[0].astype(np.int32)
     if free_idx.size > 0:
         coo_parts.append((free_idx, free_idx, mass[free_idx] * inv_dt2))
+        if rayleigh_alpha is not None:
+            damping_parts.append((free_idx, free_idx, rayleigh_alpha[free_idx] * mass[free_idx]))
 
     # ---- Pin diagonal ----
     pin_indices = np.where(inv_mass == 0.0)[0].astype(np.int32)
@@ -150,6 +167,9 @@ def build_pd_system(
         rows_tri = np.repeat(tri_indices, 3, axis=1).reshape(-1)  # (T*9,)
         cols_tri = np.tile(tri_indices, (1, 3)).reshape(-1)  # (T*9,)
         coo_parts.append((rows_tri.astype(np.int32), cols_tri.astype(np.int32), vals_tri))
+        if rayleigh_beta is not None:
+            beta_vals = (element_beta(tri_indices)[:, None, None] * tri_weight[:, None, None] * K_all).reshape(-1)
+            damping_parts.append((rows_tri.astype(np.int32), cols_tri.astype(np.int32), beta_vals))
 
     # ---- Bending edge contribution (4-vertex isometric stencil) ----
     edge_indices = np.zeros((0, 4), dtype=np.int32)
@@ -190,6 +210,9 @@ def build_pd_system(
             # NB: zero-weight edges still contribute zeros; harmless to leave in
             # since CSR builder duplicates-sum, and they don't change A.
             coo_parts.append((rows_e.astype(np.int32), cols_e.astype(np.int32), vals_e))
+            if rayleigh_beta is not None:
+                beta_vals = (element_beta(edge_indices)[:, None, None] * block).reshape(-1)
+                damping_parts.append((rows_e.astype(np.int32), cols_e.astype(np.int32), beta_vals))
 
     # ---- Tetrahedral stretching contribution ----
     tet_indices = np.zeros((0, 4), dtype=np.int32)
@@ -245,6 +268,22 @@ def build_pd_system(
                     np.concatenate(tet_vals_parts),
                 )
             )
+            if rayleigh_beta is not None:
+                beta_tet = element_beta(tet_indices)
+                damping_parts.append(
+                    (
+                        coo_parts[-1][0],
+                        coo_parts[-1][1],
+                        np.concatenate([beta_tet * wK_all[:, a, b] for a, b in zip(a_flat, b_flat, strict=True)]),
+                    )
+                )
+
+    # ---- Implicit Rayleigh damping: C / dt ----
+    damping = None
+    if damping_parts:
+        rows_d, cols_d, vals_d = (np.concatenate(a) for a in zip(*damping_parts, strict=True))
+        damping = CsrMatrix.from_triplets((N, N), rows_d, cols_d, vals_d)
+        coo_parts.append((rows_d, cols_d, vals_d / dt))
 
     if coo_parts:
         rows = np.concatenate([p[0] for p in coo_parts])
@@ -271,6 +310,7 @@ def build_pd_system(
         "tet_volume": tet_volume,
         "tet_weight": tet_weight,
         "tet_mu": mu_tet,
+        "damping": damping,
     }
     return A, meta
 

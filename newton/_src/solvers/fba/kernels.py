@@ -165,6 +165,24 @@ def add_inertia_to_rhs_kernel(
 
 
 @wp.kernel
+def damping_rhs_kernel(
+    indptr: wp.array[wp.int32],
+    indices: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    x_prev: wp.array[wp.vec3],
+    inv_dt: float,
+    out: wp.array[wp.vec3],
+):
+    """out = C x_prev / dt for the Rayleigh damping matrix ``C`` in CSR form: the step's right-hand side of the
+    implicit damping, whose ``C / dt`` is in the system matrix."""
+    i = wp.tid()
+    acc = wp.vec3d(0.0)
+    for k in range(indptr[i], indptr[i + 1]):
+        acc += values[k] * wp.vec3d(x_prev[indices[k]])
+    out[i] = wp.vec3(acc * wp.float64(inv_dt))
+
+
+@wp.kernel
 def copy_particles_kernel(
     particles: wp.array[wp.int32],
     source: wp.array[wp.vec3],
@@ -1252,6 +1270,60 @@ def project_stretching_arap_kernel(
         w * (Dm_inv[1, 0] * PT02 + Dm_inv[1, 1] * PT12),
     )
 
+    contributions[t, 0] = -(row0 + row1)
+    contributions[t, 1] = row0
+    contributions[t, 2] = row1
+
+
+@wp.kernel
+def tri_stretch_state_kernel(
+    positions: wp.array[wp.vec3],
+    tri_indices: wp.array[wp.int32],
+    tri_rest_inv: wp.array[wp.mat22],
+    tri_F: wp.array[mat32],
+    tri_S: wp.array[wp.mat22],
+):
+    """Each triangle's deformation gradient ``F`` and its stretch ``S = P^T F``, with ``P = svd_3x2(F)``, at the
+    step's start: the corotated stiffness damping damps the change of ``S``, not of ``F``."""
+    t = wp.tid()
+    p0 = positions[tri_indices[3 * t + 0]]
+    d0 = positions[tri_indices[3 * t + 1]] - p0
+    d1 = positions[tri_indices[3 * t + 2]] - p0
+    F = mat32(d0[0], d1[0], d0[1], d1[1], d0[2], d1[2]) * tri_rest_inv[t]
+    tri_F[t] = F
+    tri_S[t] = wp.transpose(svd_3x2(F)) * F
+
+
+@wp.kernel
+def project_stretching_arap_damped_kernel(
+    positions: wp.array[wp.vec3],
+    tri_indices: wp.array[wp.int32],
+    tri_rest_inv: wp.array[wp.mat22],
+    tri_weight: wp.array[wp.float32],
+    tri_beta: wp.array[wp.float32],
+    inv_dt: float,
+    tri_F: wp.array[mat32],
+    tri_S: wp.array[wp.mat22],
+    contributions: wp.array2d[wp.vec3],
+):
+    """:func:`project_stretching_arap_kernel` plus the corotated part of the triangle's stiffness damping.
+
+    The constant damping matrix ``beta w K`` damps ``F``'s change over the step, rotations included; its
+    right-hand side holds ``beta w / dt F_prev G^T``. Adding ``beta w / dt (P S_prev - F_prev) G^T`` here turns it
+    into ``beta w / dt P S_prev G^T``: the target of ``F`` is the start stretch ``S_prev`` turned by the current
+    rotation ``P``, so the damping acts on the stretch rate and spares the triangle's rotation.
+    """
+    t = wp.tid()
+    p0 = positions[tri_indices[3 * t + 0]]
+    d0 = positions[tri_indices[3 * t + 1]] - p0
+    d1 = positions[tri_indices[3 * t + 2]] - p0
+    Dm_inv = tri_rest_inv[t]
+    F = mat32(d0[0], d1[0], d0[1], d1[1], d0[2], d1[2]) * Dm_inv
+    P = svd_3x2(F)
+    target = P + (tri_beta[t] * inv_dt) * (P * tri_S[t] - tri_F[t])
+    rows = tri_weight[t] * target * wp.transpose(Dm_inv)
+    row0 = wp.vec3(rows[0, 0], rows[1, 0], rows[2, 0])
+    row1 = wp.vec3(rows[0, 1], rows[1, 1], rows[2, 1])
     contributions[t, 0] = -(row0 + row1)
     contributions[t, 1] = row0
     contributions[t, 2] = row1
