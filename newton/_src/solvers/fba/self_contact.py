@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Contacts of a cloth with itself for :class:`~newton.solvers.SolverFBA`."""
+"""Particle and surface self contacts for :class:`~newton.solvers.SolverFBA`."""
 
 from __future__ import annotations
 
@@ -35,6 +35,7 @@ def _in_ring(ring_offsets: wp.array[wp.int32], ring: wp.array[wp.int32], v: wp.i
 @wp.kernel
 def triangle_candidates_kernel(
     q: wp.array[wp.vec3],
+    query_particle_mask: wp.array[wp.int32],
     bvh: wp.uint64,
     query_radius: float,
     candidates: wp.array2d[wp.int32],
@@ -45,6 +46,9 @@ def triangle_candidates_kernel(
     query, as many as fit; ``count[1]`` takes the most of any particle. The search runs apart from the tests
     of :func:`vertex_face_contacts_kernel`, whose registers would otherwise spill in its loop."""
     v = wp.tid()
+    if query_particle_mask[v] == 0:
+        candidate_count[v] = 0
+        return
     p = q[v]
     query = wp.bvh_query_aabb(bvh, p - wp.vec3(query_radius), p + wp.vec3(query_radius))
     t = wp.int32(0)
@@ -187,13 +191,21 @@ def vertex_vertex_contacts_kernel(
             normal[k] = (p - q[b]) / d
 
 
-def particle_rings(tri_indices: np.ndarray, particle_count: int, rings: int) -> tuple[np.ndarray, np.ndarray]:
-    """Sorted CSR of the particles within ``rings`` mesh edges of each particle, the particle included."""
+def particle_rings(
+    tri_indices: np.ndarray, particle_count: int, rings: int, tet_indices: np.ndarray | None = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sorted CSR of particles within ``rings`` triangle or optional tetrahedron edges, including self."""
     neighbors = [set() for _ in range(particle_count)]
     for a, b, c in tri_indices:
         neighbors[a].update((b, c))
         neighbors[b].update((a, c))
         neighbors[c].update((a, b))
+    if tet_indices is not None:
+        for a, b, c, d in tet_indices:
+            neighbors[a].update((b, c, d))
+            neighbors[b].update((a, c, d))
+            neighbors[c].update((a, b, d))
+            neighbors[d].update((a, b, c))
     reached = []
     for v in range(particle_count):
         reach, front = {v}, {v}
@@ -213,7 +225,10 @@ class SelfContact:
     the direction between its two points at detection: the particle and its closest point on the triangle,
     or the two particles. Particles within ``rings`` mesh edges of each other, and triangles with such a
     particle, never collide, nor do a particle and a triangle or particle closer than ``rest_radius`` in the
-    model's particle positions.
+    model's particle positions. Vertex-face queries exclude tetrahedron interior particles absent from
+    the triangle surface; independent particles and all vertex-vertex queries remain eligible.
+    Vertex-face neighbor rings include tetrahedron edges when present; vertex-vertex rings use only
+    triangle edges, as do cloth-only models.
 
     Args:
         model: Model with the triangles.
@@ -228,9 +243,20 @@ class SelfContact:
             raise ValueError(f"self contact mode {mode!r} is not 'vertex_face' or 'vertex_vertex'")
         self.mode, self.query_radius, self.device = mode, float(query_radius), model.device
         self.rest, self.rest_radius = wp.clone(model.particle_q), float(rest_radius)
-        rings_csr = particle_rings(model.tri_indices.numpy(), model.particle_count, rings)
+        triangles = model.tri_indices.numpy()
+        # Opposite faces of a thin solid can be far apart on its surface graph while
+        # sharing a volume cell. Include those material edges for solid VF queries.
+        tets = model.tet_indices.numpy() if mode == "vertex_face" and model.tet_count else None
+        rings_csr = particle_rings(triangles, model.particle_count, rings, tet_indices=tets)
         self.ring_offsets, self.ring = (wp.array(a, dtype=wp.int32, device=self.device) for a in rings_csr)
         if mode == "vertex_face":
+            # Solid interior nodes cannot contact a shell; particles outside tetrahedra still can.
+            query_mask = np.ones(model.particle_count, dtype=np.int32)
+            if model.tet_count:
+                query_mask[tets.ravel()] = 0
+                query_mask[triangles.ravel()] = 1
+            self.query_particle_mask = wp.array(query_mask, dtype=wp.int32, device=self.device)
+            self.query_particle_count = int(np.count_nonzero(query_mask))
             self.tri_indices = model.tri_indices
             self.lower = wp.zeros(model.tri_count, dtype=wp.vec3, device=self.device)
             self.upper = wp.zeros(model.tri_count, dtype=wp.vec3, device=self.device)
@@ -283,7 +309,7 @@ class SelfContact:
             filters = [self.ring_offsets, self.ring, self.rest, self.rest_radius, self.query_radius]
             if self.mode == "vertex_face":
                 found = [self.candidates, self.candidate_count]
-                inputs = [q, self.bvh.id, self.query_radius]
+                inputs = [q, self.query_particle_mask, self.bvh.id, self.query_radius]
                 wp.launch(triangle_candidates_kernel, q.shape[0], inputs, [*found, self.count], device=self.device)
                 inputs = [q, self.tri_indices, *found, *filters]
                 kernel, outputs = vertex_face_contacts_kernel, [*outputs, self.found]

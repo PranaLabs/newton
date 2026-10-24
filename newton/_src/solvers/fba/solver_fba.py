@@ -149,6 +149,7 @@ class SolverFBA(SolverBase):
         shape_angular_velocity: dict[int, float] | None = None,
         nh_solver: Literal["newton5", "lbfgs"] = "lbfgs",
         nsn_schur_mode: Literal["full", "lite"] = "full",
+        nsn_sparse_storage: bool = False,
         integrate_with_external_rigid_solver: bool = False,
         contact_regularization: float = 1.0e-2,
         face_contacts: bool = False,
@@ -161,6 +162,8 @@ class SolverFBA(SolverBase):
         particle_self_contact_gap: float | None = None,
         particle_topological_contact_filter_threshold: int = 2,
         particle_rest_shape_contact_exclusion_radius: float = 0.0,
+        particle_self_contact_group_ids: np.ndarray | None = None,
+        particle_self_contact_group_margins: np.ndarray | None = None,
     ) -> None:
         """
         Args:
@@ -212,6 +215,21 @@ class SolverFBA(SolverBase):
                 up to ``dt² F / m`` for a normal force ``F`` [N] on a particle
                 of mass ``m`` [kg], and more iterations do not reduce that.
                 Rigid contacts and face contacts need ``"full"``.
+            nsn_sparse_storage: Experimental, opt-in exact-zero sparse storage for
+                Full NSN with friction and ``use_isodof=True``. Retains the full
+                operator and all nonzero fp64 entries, avoids dense intermediate
+                inverse columns and NSN scratch matrices. The dense full contact
+                operator is still allocated; memory savings depend on sparsity.
+                Floating-point reduction order differs from the dense path.
+            particle_self_contact_group_ids: Experimental integer particle-to-group
+                map, shape ``(particle_count,)``. Requires frictional vertex-face
+                self contact and ``particle_self_contact_group_margins``. A surface
+                triangle must belong to one group. Defaults to no group override.
+            particle_self_contact_group_margins: Experimental positive per-group
+                self-contact margins in metres. Between different groups, use
+                ``particle_self_contact_margin``. Candidate selection minimizes
+                distance minus the applicable margin. Rest/topology filters remain
+                active. Supply together with ``particle_self_contact_group_ids``.
             integrate_with_external_rigid_solver: If ``True``, rigid bodies are
                 integrated by another solver: ``state_in`` holds their previous
                 state, ``state_out`` their current one, and FBA leaves both
@@ -499,6 +517,25 @@ class SolverFBA(SolverBase):
         self._k_tri_nh_lbfgs = _K.project_stretching_neohookean_compute_kernel_lbfgs
         self._k_tet_nh = _K.project_stretching_neohookean_tet_compute_kernel
         self._k_tet_nh_lbfgs = _K.project_stretching_neohookean_tet_compute_kernel_lbfgs
+
+        self.nsn_sparse_storage = bool(nsn_sparse_storage)
+        if self.nsn_sparse_storage:
+            if nsn_schur_mode != "full" or not friction or not use_isodof:
+                raise ValueError("nsn_sparse_storage requires Full NSN, friction and use_isodof")
+            from .sparse_full import configure_sparse_full  # noqa: PLC0415
+
+            configure_sparse_full(self)
+        if (particle_self_contact_group_ids is None) != (particle_self_contact_group_margins is None):
+            raise ValueError("Self-contact group IDs and margins must be supplied together")
+        if particle_self_contact_group_ids is not None:
+            from .group_contact import configure_pair_margins  # noqa: PLC0415
+
+            configure_pair_margins(
+                self,
+                particle_self_contact_group_ids,
+                particle_self_contact_group_margins,
+                particle_self_contact_margin,
+            )
 
     @property
     def _contact_v_anchor_h(self) -> np.ndarray:
@@ -1047,6 +1084,8 @@ class SolverFBA(SolverBase):
         )
         fs = factorize_and_sparse_inverse(A, self.model.particle_q.numpy())
         self._linear_solver = FBALinearSolver(fs, device=self._device)
+        if self.nsn_sparse_storage:
+            self._configure_sparse_linear(self._linear_solver)
         device = self._device
         # Particles with zero inverse mass hold at their pin targets, so a mass they keep must not pull them toward
         # their inertial predictions; inactive ones with mass hold where the input state has them, as Newton's
@@ -2807,18 +2846,18 @@ class SolverFBA(SolverBase):
     def _ensure_nsn_inner_buffers(self, n_rows: int, alloc_2d: bool = True) -> None:
         """Allocate or resize the device-resident NSN inner-loop scratch.
 
-        Buffers grow with a 1.5x headroom factor so a slowly climbing contact
-        count does not realloc the dense ``(cap, cap)`` matrices every frame.
-        Contact counts can ramp by tens of contacts between frames; a
-        per-frame realloc otherwise pegs the device allocator and stalls.
+        Dense square buffers share the linear solver's bounded growth policy;
+        large buffers keep five percent headroom with 128-row alignment. Small
+        and one-dimensional-only buffers retain their existing growth policy.
 
         Args:
             n_rows: Minimum capacity needed for 1D buffers.
             alloc_2d: When ``True`` (default), allocates the
-                ``(cap, cap)`` dense ``_nsn_W_d`` and ``_nsn_a_schur_d`` scratch
-                buffers used by the dense NSN inner.  Set to ``False`` in
-                ``nsn_schur_mode="lite"`` (block-diagonal-by-particle), where
-                neither buffer is touched; skipping the alloc keeps the lite
+                ``(cap, cap)`` dense ``_nsn_a_schur_d`` scratch buffer.
+                Host-supplied W is uploaded lazily by the calling driver.
+                Set to ``False`` in ``nsn_schur_mode="lite"``
+                (block-diagonal-by-particle), where dense scratch is unused;
+                skipping the allocation keeps the lite
                 memory cost ``O(n_rows)`` so the solver fits on a single 32 GB
                 GPU up to ``N=25`` envs / 50k+ contact rows.
         """
@@ -2826,10 +2865,12 @@ class SolverFBA(SolverBase):
         existing_2d = bool(getattr(self, "_nsn_inner_has_2d", False))
         if existing_n >= n_rows and (existing_2d or not alloc_2d):
             return
-        # 1.5x growth factor on top of the strict minimum.  ``max`` against the
-        # current capacity ensures monotonic growth and avoids shrinking after
-        # a transient contact-count spike.
-        cap = max(n_rows, int(existing_n * 1.5) + 1, 16)
+        if alloc_2d:
+            from .linear_solver import _dense_schur_capacity  # noqa: PLC0415
+
+            cap = max(_dense_schur_capacity(n_rows, existing_n), 16)
+        else:
+            cap = max(n_rows, int(existing_n * 1.5) + 1, 16)
         device = self._device
         self._nsn_inner_n = cap
         self._nsn_lam_d = wp.zeros(cap, dtype=wp.float64, device=device)
@@ -2844,12 +2885,8 @@ class SolverFBA(SolverBase):
         self._nsn_dlam_d = wp.zeros(cap, dtype=wp.float64, device=device)
         self._nsn_lam_apply_d = wp.zeros(cap, dtype=wp.float64, device=device)
         if alloc_2d:
-            # 2D buffers are square in the NSN setting.  ``_nsn_W_d`` is used only
-            # as a fallback when the caller passes W as a host array (tests / CPU
-            # parity path).  The hot solver path passes the device-resident
-            # ``FBALinearSolver._W_device_d`` directly via ``W_device=`` and never
-            # touches this buffer, so its memory cost is only paid in test mode.
-            self._nsn_W_d = wp.zeros((cap, cap), dtype=wp.float64, device=device)
+            # Device-W calls need only Schur scratch; the drivers allocate
+            # the host-W upload buffer only when their fallback is used.
             self._nsn_a_schur_d = wp.zeros((cap, cap), dtype=wp.float64, device=device)
             self._nsn_inner_has_2d = True
 
@@ -2948,6 +2985,9 @@ class SolverFBA(SolverBase):
         else:
             W_pad = np.zeros((cap, cap), dtype=np.float64)
             W_pad[:M, :M] = W.astype(np.float64)
+            host_w = getattr(self, "_nsn_W_d", None)
+            if host_w is None or host_w.shape != (cap, cap):
+                self._nsn_W_d = wp.empty((cap, cap), dtype=wp.float64, device=device)
             self._nsn_W_d.assign(W_pad)
             W_d = self._nsn_W_d
         # Residual / pene0: prefer device buffers when supplied, which avoids
@@ -3253,6 +3293,9 @@ class SolverFBA(SolverBase):
         else:
             W_pad = np.zeros((cap, cap), dtype=np.float64)
             W_pad[:n_rows, :n_rows] = W.astype(np.float64)
+            host_w = getattr(self, "_nsn_W_d", None)
+            if host_w is None or host_w.shape != (cap, cap):
+                self._nsn_W_d = wp.empty((cap, cap), dtype=wp.float64, device=device)
             self._nsn_W_d.assign(W_pad)
             W_d = self._nsn_W_d
         # Residual / pene0: prefer device buffers when supplied.

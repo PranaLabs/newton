@@ -36,6 +36,19 @@ from .kernels import (
 from .sparse_ldlt import CscMatrix, CsrMatrix, factor_ldlt
 
 
+def _dense_schur_capacity(required: int, current: int) -> int:
+    """Grow square storage without changing the active Schur row count.
+
+    Keep the established growth for small buffers. Large square buffers use
+    five percent headroom and 128-row alignment: fifty percent per dimension
+    would more than double their memory, including at reallocation peaks.
+    """
+    if max(required, current) < 1024:
+        return max(required, int(current * 1.5) + 1)
+    capacity = max(required, (105 * current + 99) // 100)
+    return ((capacity + 127) // 128) * 128
+
+
 def particle_masses(model: Model) -> tuple[np.ndarray, np.ndarray]:
     """Masses [kg] and inverse masses [1/kg] of the particles, both zero for those the solver holds: the pinned
     ones, which have zero inverse mass, and the inactive ones."""
@@ -1127,10 +1140,8 @@ class FBALinearSolver:
         row_alpha_d = wp.array(row_alpha, dtype=wp.float32, device=dev)
 
         # --- Allocate/reuse W device buffer (used by both paths). ---
-        # Grow with a 1.5x headroom factor so a slow contact-count climb does
-        # not realloc every frame.  ``M`` can spike by 10s of contacts between
-        # frames in a squeezed soft body, and a (cap, cap) dense float64 buffer
-        # is the dominant device alloc on the FBA hot path.
+        # Reuse square storage as contacts change; large buffers need limited
+        # headroom because both dimensions contribute to the allocation size.
         if (
             not hasattr(self, "_W_device_d")
             or self._W_device_d.shape[0] < total_rows
@@ -1138,7 +1149,7 @@ class FBALinearSolver:
         ):
             prev = getattr(self, "_W_device_d", None)
             prev_cap = prev.shape[0] if prev is not None else 0
-            cap = max(total_rows, int(prev_cap * 1.5) + 1)
+            cap = _dense_schur_capacity(total_rows, prev_cap)
             self._W_device_d = wp.empty(shape=(cap, cap), dtype=wp.float64, device=dev)
         # Active row count for the populated sub-block — consumed by the NSN
         # GPU drivers to build a (M, M) wp.array view of ``_W_device_d`` without
@@ -1988,7 +1999,7 @@ class FBALinearSolver:
         ):
             prev = getattr(self, "_W_device_d", None)
             prev_cap = prev.shape[0] if prev is not None else 0
-            cap = max(total_rows, int(prev_cap * 1.5) + 1)
+            cap = _dense_schur_capacity(total_rows, prev_cap)
             self._W_device_d = wp.empty(shape=(cap, cap), dtype=wp.float64, device=dev)
         self._W_device_active_rows = total_rows
 

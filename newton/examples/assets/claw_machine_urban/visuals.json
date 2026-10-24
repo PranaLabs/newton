@@ -1,0 +1,1462 @@
+[
+  {
+    "path": "/Scene/cabinet_000",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 112,
+    "roughness": 0.09448818862438202,
+    "metallic": 0.05511811003088951,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_001",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 70,
+    "roughness": 0.2800000011920929,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_002",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 4,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": "cabinet_002.png"
+  },
+  {
+    "path": "/Scene/cabinet_003",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 4,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": "cabinet_003.png"
+  },
+  {
+    "path": "/Scene/cabinet_004",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 382,
+    "roughness": 0.6818181872367859,
+    "metallic": 0.968181848526001,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_005",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 496,
+    "roughness": 0.6811023950576782,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_006",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 237,
+    "roughness": 0.09055116772651672,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_007",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 64,
+    "roughness": 0.9,
+    "metallic": 0.0,
+    "texture": "cabinet_007.png"
+  },
+  {
+    "path": "/Scene/cabinet_008",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 4,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_009",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 4,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_010",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 145,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_011",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 4,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_012",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 4,
+    "roughness": 0.9,
+    "metallic": 0.0,
+    "texture": "cabinet_012.png"
+  },
+  {
+    "path": "/Scene/cabinet_013",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 145,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_014",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 4,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_015",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 4,
+    "roughness": 0.9,
+    "metallic": 0.0,
+    "texture": "cabinet_015.png"
+  },
+  {
+    "path": "/Scene/cabinet_016",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 236,
+    "roughness": 0.6818181872367859,
+    "metallic": 0.968181848526001,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_017",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 98,
+    "roughness": 0.2800000011920929,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_018",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 8,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_019",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 43,
+    "roughness": 0.09842520952224731,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_020",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 116,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_021",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 116,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_022",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 8,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_023",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 389,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_024",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 48,
+    "roughness": 0.9,
+    "metallic": 0.0,
+    "texture": "cabinet_024.png"
+  },
+  {
+    "path": "/Scene/cabinet_025",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 68,
+    "roughness": 0.2800000011920929,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_026",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 264,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_027",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 4,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_028",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 2704,
+    "roughness": 0.2800000011920929,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_029",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 29582,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_030",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 128,
+    "roughness": 0.35039371252059937,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_031",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 352,
+    "roughness": 0.2800000011920929,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_032",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 32,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_033",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 88,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": "cabinet_033.png"
+  },
+  {
+    "path": "/Scene/cabinet_034",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 4,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": "cabinet_034.png"
+  },
+  {
+    "path": "/Scene/cabinet_035",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 358,
+    "roughness": 0.21653541922569275,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_036",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 12,
+    "roughness": 0.8661417365074158,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_037",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 202,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_038",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 4,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_039",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 740,
+    "roughness": 0.05905511975288391,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_040",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 740,
+    "roughness": 0.05905511975288391,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_041",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 423,
+    "roughness": 0.26377952098846436,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_042",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 92,
+    "roughness": 0.6818181872367859,
+    "metallic": 0.968181848526001,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_043",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 224,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_044",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 128,
+    "roughness": 0.09055116772651672,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_045",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 32,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": "cabinet_045.png"
+  },
+  {
+    "path": "/Scene/cabinet_046",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 64,
+    "roughness": 0.2800000011920929,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_047",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 448,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_048",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 198,
+    "roughness": 0.6811023950576782,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_049",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 329,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_050",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 329,
+    "roughness": 0.09055116772651672,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_051",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 198,
+    "roughness": 0.6811023950576782,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_052",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 329,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_053",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 329,
+    "roughness": 0.09055116772651672,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_054",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 724,
+    "roughness": 0.6811023950576782,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_055",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 66,
+    "roughness": 0.18897637724876404,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/cabinet_056",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 205,
+    "roughness": 0.2800000011920929,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/fixed_upper_000",
+    "body": 2,
+    "toy": -1,
+    "start": 0,
+    "count": 608,
+    "roughness": 0.2800000011920929,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/moving_plate_000",
+    "body": 3,
+    "toy": -1,
+    "start": 0,
+    "count": 96,
+    "roughness": 0.2800000011920929,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/center_rod_000",
+    "body": 3,
+    "toy": -1,
+    "start": 0,
+    "count": 64,
+    "roughness": 0.18897637724876404,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/fixed_upper_arm_01_000",
+    "body": 2,
+    "toy": -1,
+    "start": 0,
+    "count": 8,
+    "roughness": 0.18897637724876404,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/bolt_upper_01_000",
+    "body": 2,
+    "toy": -1,
+    "start": 0,
+    "count": 910,
+    "roughness": 0.18897637724876404,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/bolt_upper_01_001",
+    "body": 2,
+    "toy": -1,
+    "start": 0,
+    "count": 185,
+    "roughness": 0.14251181483268738,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/upper_link_01_000",
+    "body": 5,
+    "toy": -1,
+    "start": 0,
+    "count": 66,
+    "roughness": 0.18897637724876404,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/radial_arm_01_000",
+    "body": 4,
+    "toy": -1,
+    "start": 0,
+    "count": 36,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/curved_finger_01_000",
+    "body": 4,
+    "toy": -1,
+    "start": 0,
+    "count": 254,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/bolt_lower_01_000",
+    "body": 4,
+    "toy": -1,
+    "start": 0,
+    "count": 910,
+    "roughness": 0.18897637724876404,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/bolt_lower_01_001",
+    "body": 4,
+    "toy": -1,
+    "start": 0,
+    "count": 182,
+    "roughness": 0.14251181483268738,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/fixed_upper_arm_02_000",
+    "body": 2,
+    "toy": -1,
+    "start": 0,
+    "count": 12,
+    "roughness": 0.18897637724876404,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/bolt_upper_02_000",
+    "body": 2,
+    "toy": -1,
+    "start": 0,
+    "count": 910,
+    "roughness": 0.18897637724876404,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/bolt_upper_02_001",
+    "body": 2,
+    "toy": -1,
+    "start": 0,
+    "count": 183,
+    "roughness": 0.14251181483268738,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/upper_link_02_000",
+    "body": 7,
+    "toy": -1,
+    "start": 0,
+    "count": 66,
+    "roughness": 0.18897637724876404,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/radial_arm_02_000",
+    "body": 6,
+    "toy": -1,
+    "start": 0,
+    "count": 36,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/curved_finger_02_000",
+    "body": 6,
+    "toy": -1,
+    "start": 0,
+    "count": 254,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/bolt_lower_02_000",
+    "body": 6,
+    "toy": -1,
+    "start": 0,
+    "count": 910,
+    "roughness": 0.18897637724876404,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/bolt_lower_02_001",
+    "body": 6,
+    "toy": -1,
+    "start": 0,
+    "count": 174,
+    "roughness": 0.14251181483268738,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/fixed_upper_arm_03_000",
+    "body": 2,
+    "toy": -1,
+    "start": 0,
+    "count": 8,
+    "roughness": 0.18897637724876404,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/bolt_upper_03_000",
+    "body": 2,
+    "toy": -1,
+    "start": 0,
+    "count": 910,
+    "roughness": 0.18897637724876404,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/bolt_upper_03_001",
+    "body": 2,
+    "toy": -1,
+    "start": 0,
+    "count": 177,
+    "roughness": 0.14251181483268738,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/upper_link_03_000",
+    "body": 9,
+    "toy": -1,
+    "start": 0,
+    "count": 66,
+    "roughness": 0.18897637724876404,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/radial_arm_03_000",
+    "body": 8,
+    "toy": -1,
+    "start": 0,
+    "count": 36,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/curved_finger_03_000",
+    "body": 8,
+    "toy": -1,
+    "start": 0,
+    "count": 254,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/bolt_lower_03_000",
+    "body": 8,
+    "toy": -1,
+    "start": 0,
+    "count": 910,
+    "roughness": 0.18897637724876404,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/bolt_lower_03_001",
+    "body": 8,
+    "toy": -1,
+    "start": 0,
+    "count": 177,
+    "roughness": 0.14251181483268738,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/carriage_000",
+    "body": 1,
+    "toy": -1,
+    "start": 0,
+    "count": 414,
+    "roughness": 0.6818181872367859,
+    "metallic": 0.968181848526001,
+    "texture": null
+  },
+  {
+    "path": "/Scene/carriage_001",
+    "body": 1,
+    "toy": -1,
+    "start": 0,
+    "count": 242,
+    "roughness": 0.09448818862438202,
+    "metallic": 0.05511811003088951,
+    "texture": null
+  },
+  {
+    "path": "/Scene/carriage_002",
+    "body": 1,
+    "toy": -1,
+    "start": 0,
+    "count": 24,
+    "roughness": 0.35039371252059937,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/hoist_000",
+    "body": 2,
+    "toy": -1,
+    "start": 0,
+    "count": 194,
+    "roughness": 0.09448818862438202,
+    "metallic": 0.05511811003088951,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_00_00",
+    "body": -1,
+    "toy": 0,
+    "start": 0,
+    "count": 2649,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_01_00",
+    "body": -1,
+    "toy": 1,
+    "start": 0,
+    "count": 2869,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_01_01",
+    "body": -1,
+    "toy": 1,
+    "start": 2869,
+    "count": 574,
+    "roughness": 0.20000000298023224,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_01_02",
+    "body": -1,
+    "toy": 1,
+    "start": 3443,
+    "count": 318,
+    "roughness": 0.800000011920929,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_02_00",
+    "body": -1,
+    "toy": 2,
+    "start": 0,
+    "count": 2869,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_02_01",
+    "body": -1,
+    "toy": 2,
+    "start": 2869,
+    "count": 574,
+    "roughness": 0.20000000298023224,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_02_02",
+    "body": -1,
+    "toy": 2,
+    "start": 3443,
+    "count": 318,
+    "roughness": 0.800000011920929,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_03_00",
+    "body": -1,
+    "toy": 3,
+    "start": 0,
+    "count": 2869,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_03_01",
+    "body": -1,
+    "toy": 3,
+    "start": 2869,
+    "count": 574,
+    "roughness": 0.20000000298023224,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_03_02",
+    "body": -1,
+    "toy": 3,
+    "start": 3443,
+    "count": 318,
+    "roughness": 0.800000011920929,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_04_00",
+    "body": -1,
+    "toy": 4,
+    "start": 0,
+    "count": 2217,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_05_00",
+    "body": -1,
+    "toy": 5,
+    "start": 0,
+    "count": 2869,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_05_01",
+    "body": -1,
+    "toy": 5,
+    "start": 2869,
+    "count": 574,
+    "roughness": 0.20000000298023224,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_05_02",
+    "body": -1,
+    "toy": 5,
+    "start": 3443,
+    "count": 318,
+    "roughness": 0.800000011920929,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_06_00",
+    "body": -1,
+    "toy": 6,
+    "start": 0,
+    "count": 2869,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_06_01",
+    "body": -1,
+    "toy": 6,
+    "start": 2869,
+    "count": 574,
+    "roughness": 0.20000000298023224,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_06_02",
+    "body": -1,
+    "toy": 6,
+    "start": 3443,
+    "count": 318,
+    "roughness": 0.800000011920929,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_07_00",
+    "body": -1,
+    "toy": 7,
+    "start": 0,
+    "count": 2869,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_07_01",
+    "body": -1,
+    "toy": 7,
+    "start": 2869,
+    "count": 574,
+    "roughness": 0.20000000298023224,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_07_02",
+    "body": -1,
+    "toy": 7,
+    "start": 3443,
+    "count": 318,
+    "roughness": 0.800000011920929,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_08_00",
+    "body": -1,
+    "toy": 8,
+    "start": 0,
+    "count": 1539,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": "toy_08_00.png"
+  },
+  {
+    "path": "/Scene/toy_08_01",
+    "body": -1,
+    "toy": 8,
+    "start": 1539,
+    "count": 1484,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_08_02",
+    "body": -1,
+    "toy": 8,
+    "start": 3023,
+    "count": 53,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_09_00",
+    "body": -1,
+    "toy": 9,
+    "start": 0,
+    "count": 2869,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_09_01",
+    "body": -1,
+    "toy": 9,
+    "start": 2869,
+    "count": 574,
+    "roughness": 0.20000000298023224,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_09_02",
+    "body": -1,
+    "toy": 9,
+    "start": 3443,
+    "count": 318,
+    "roughness": 0.800000011920929,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_10_00",
+    "body": -1,
+    "toy": 10,
+    "start": 0,
+    "count": 2869,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_10_01",
+    "body": -1,
+    "toy": 10,
+    "start": 2869,
+    "count": 574,
+    "roughness": 0.20000000298023224,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_10_02",
+    "body": -1,
+    "toy": 10,
+    "start": 3443,
+    "count": 318,
+    "roughness": 0.800000011920929,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_11_00",
+    "body": -1,
+    "toy": 11,
+    "start": 0,
+    "count": 2869,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_11_01",
+    "body": -1,
+    "toy": 11,
+    "start": 2869,
+    "count": 574,
+    "roughness": 0.20000000298023224,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_11_02",
+    "body": -1,
+    "toy": 11,
+    "start": 3443,
+    "count": 318,
+    "roughness": 0.800000011920929,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_12_00",
+    "body": -1,
+    "toy": 12,
+    "start": 0,
+    "count": 2649,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_13_00",
+    "body": -1,
+    "toy": 13,
+    "start": 0,
+    "count": 2217,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_14_00",
+    "body": -1,
+    "toy": 14,
+    "start": 0,
+    "count": 1539,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": "toy_14_00.png"
+  },
+  {
+    "path": "/Scene/toy_14_01",
+    "body": -1,
+    "toy": 14,
+    "start": 1539,
+    "count": 1484,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_14_02",
+    "body": -1,
+    "toy": 14,
+    "start": 3023,
+    "count": 53,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_15_00",
+    "body": -1,
+    "toy": 15,
+    "start": 0,
+    "count": 2217,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_16_00",
+    "body": -1,
+    "toy": 16,
+    "start": 0,
+    "count": 2649,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_17_00",
+    "body": -1,
+    "toy": 17,
+    "start": 0,
+    "count": 2869,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_17_01",
+    "body": -1,
+    "toy": 17,
+    "start": 2869,
+    "count": 574,
+    "roughness": 0.20000000298023224,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_17_02",
+    "body": -1,
+    "toy": 17,
+    "start": 3443,
+    "count": 318,
+    "roughness": 0.800000011920929,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_18_00",
+    "body": -1,
+    "toy": 18,
+    "start": 0,
+    "count": 2217,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_19_00",
+    "body": -1,
+    "toy": 19,
+    "start": 0,
+    "count": 1539,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": "toy_19_00.png"
+  },
+  {
+    "path": "/Scene/toy_19_01",
+    "body": -1,
+    "toy": 19,
+    "start": 1539,
+    "count": 1484,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_19_02",
+    "body": -1,
+    "toy": 19,
+    "start": 3023,
+    "count": 53,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_20_00",
+    "body": -1,
+    "toy": 20,
+    "start": 0,
+    "count": 2869,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_20_01",
+    "body": -1,
+    "toy": 20,
+    "start": 2869,
+    "count": 574,
+    "roughness": 0.20000000298023224,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_20_02",
+    "body": -1,
+    "toy": 20,
+    "start": 3443,
+    "count": 318,
+    "roughness": 0.800000011920929,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_21_00",
+    "body": -1,
+    "toy": 21,
+    "start": 0,
+    "count": 2649,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_22_00",
+    "body": -1,
+    "toy": 22,
+    "start": 0,
+    "count": 2869,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_22_01",
+    "body": -1,
+    "toy": 22,
+    "start": 2869,
+    "count": 574,
+    "roughness": 0.20000000298023224,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_22_02",
+    "body": -1,
+    "toy": 22,
+    "start": 3443,
+    "count": 318,
+    "roughness": 0.800000011920929,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_23_00",
+    "body": -1,
+    "toy": 23,
+    "start": 0,
+    "count": 2217,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_24_00",
+    "body": -1,
+    "toy": 24,
+    "start": 0,
+    "count": 1539,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": "toy_24_00.png"
+  },
+  {
+    "path": "/Scene/toy_24_01",
+    "body": -1,
+    "toy": 24,
+    "start": 1539,
+    "count": 1484,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/toy_24_02",
+    "body": -1,
+    "toy": 24,
+    "start": 3023,
+    "count": 53,
+    "roughness": 0.88,
+    "metallic": 0.0,
+    "texture": null
+  },
+  {
+    "path": "/Scene/tray",
+    "body": -1,
+    "toy": -1,
+    "start": 0,
+    "count": 8,
+    "roughness": 0.5,
+    "metallic": 0.0,
+    "texture": null
+  }
+]

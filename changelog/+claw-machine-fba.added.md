@@ -1,0 +1,1 @@
+Add the Urban claw-machine FBA example with 25 free soft toys, prepared visual/FEM assets, force-controlled green-bear grasp and optional settled-state starts. Add opt-in, instance-local exact sparse Full NSN storage and per-group self-contact margins used by this scene; existing solver defaults are unchanged.

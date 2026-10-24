@@ -1,0 +1,32 @@
+Urban claw-machine example assets
+=================================
+
+Cabinet, articulated claw, bear and elephant:
+  Derived from the user-supplied ClawMachineUrban_Newton_Handoff_v1.zip,
+  including the prepared front-glass-hidden cabinet and pastel toy materials
+  used in the accepted green-bear demonstration.
+  These supplied third-party model assets retain their original license terms;
+  the repository source-code license does not relicense the models or textures.
+  The handoff did not include a separate license document.
+
+Bunny and T2 toy:
+  Prepared toy_bunny_demo and toy_t2_demo meshes used in the same demonstration,
+  derived from the previously available Newton demo assets. Their upstream
+  asset terms continue to apply.
+
+Prepared simulation:
+  Exact rest mesh and per-tetrahedron material field from the accepted
+  four25_green_bear9_deep_20261025 scene. The checkpoints are the original
+  settled state at 6.0 s and open-gripper approach state at 9.8 s. Positions
+  AND velocities are included; the original rest geometry remains unchanged.
+
+Visuals:
+  visuals.usdc: original visual surfaces and display colors, source Z-up metres,
+  shifted by scene.json origin. Rigid mesh points are body-local.
+  visuals.json: body/toy mappings, material factors, optional texture paths.
+  skin_bindings.npz: original shared-surface gathering or convex FEM anchors
+  with polar-rotated residuals. Bindings affect rendering only.
+  PNG files: textures extracted from the supplied/prepared GLB materials.
+
+No generated animation, video, full trajectory cache or asset-generation script
+is required to run the example. The two compact checkpoints are optional starts.

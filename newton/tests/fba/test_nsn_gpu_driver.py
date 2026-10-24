@@ -111,26 +111,78 @@ class TestNSNUnilateralGpuDriver(unittest.TestCase):
         np.testing.assert_allclose(lam_apply_gpu, lam_apply_cpu, rtol=0, atol=1.0e-8)
 
     def test_unilateral_gpu_matches_cpu_multi_contact(self):
-        """Larger Schur block (M=50) where PCR converges well.
-
-        At ``n=50`` PCR reaches ~1e-7 relative accuracy (see
-        ``test_fba_nsn_pcr.TestPCRReuse``), so the GPU vs CPU drivers
-        agree at fp64-noise level on a single FB-Newton iter.
-        """
+        """Preserve CPU parity across device/host W switches and capacity growth."""
         solver = _build_minimal_solver(friction=False)
-        W, r, pene0 = _make_unilateral_inputs(M=50, seed=7)
         dt = 0.01
 
-        lam_cpu, omega_cpu, lam_apply_cpu = solve_nsn_unilateral(
-            W, r, pene0, max_iters=1, dt=dt, lambda_cap=solver.lambda_cap
-        )
-        lam_gpu, omega_gpu, lam_apply_gpu = solver._solve_nsn_unilateral_gpu(W, r, pene0, max_iters=1, dt=dt)
+        for M, expected_capacity in ((50, 50), (80, 80)):
+            W, r, pene0 = _make_unilateral_inputs(M=M, seed=7)
+            W_device = wp.array(W, dtype=wp.float64, device=solver._device)
+            lam_cpu, omega_cpu, lam_apply_cpu = solve_nsn_unilateral(
+                W, r, pene0, max_iters=1, dt=dt, lambda_cap=solver.lambda_cap
+            )
+            for path in ("device", "host", "device"):
+                with self.subTest(M=M, path=path):
+                    host_w_before = getattr(solver, "_nsn_W_d", None)
+                    lam_gpu, omega_gpu, lam_apply_gpu = solver._solve_nsn_unilateral_gpu(
+                        W if path == "host" else None,
+                        r,
+                        pene0,
+                        max_iters=1,
+                        dt=dt,
+                        W_device=W_device if path == "device" else None,
+                    )
 
-        # PCR relative accuracy ~1e-7 at n=50; absolute lambda magnitudes ~O(1),
-        # so an atol of 1e-5 covers PCR convergence + cumulative FB-row error.
-        np.testing.assert_allclose(lam_gpu, lam_cpu, rtol=0, atol=1.0e-5)
-        np.testing.assert_allclose(omega_gpu, omega_cpu, rtol=0, atol=1.0e-8)
-        np.testing.assert_allclose(lam_apply_gpu, lam_apply_cpu, rtol=0, atol=1.0e-8)
+                    # These sizes converge well; preserve the existing PCR tolerances.
+                    np.testing.assert_allclose(lam_gpu, lam_cpu, rtol=0, atol=1.0e-5)
+                    np.testing.assert_allclose(omega_gpu, omega_cpu, rtol=0, atol=1.0e-8)
+                    np.testing.assert_allclose(lam_apply_gpu, lam_apply_cpu, rtol=0, atol=1.0e-8)
+                    if path == "device":
+                        # Device W must not create or grow an unused dense host-upload copy.
+                        self.assertIs(getattr(solver, "_nsn_W_d", None), host_w_before)
+                        self.assertEqual(solver._nsn_inner_n, expected_capacity)
+                    else:
+                        self.assertGreaterEqual(solver._nsn_W_d.shape[0], M)
+                        self.assertGreaterEqual(solver._nsn_W_d.shape[1], M)
+
+    def test_large_diagonal_growth_and_device_host_switch(self):
+        """Bound large dense buffers while preserving strided-W solves across growth."""
+        solver = _build_minimal_solver(friction=False)
+        dt = 0.01
+
+        for M, expected_capacity in ((1000, 1000), (1025, 1152), (1153, 1280)):
+            diagonal = np.linspace(1.0, 3.0, M)
+            W = np.diag(diagonal)
+            r = np.linspace(-0.002, 0.003, M)
+            pene0 = 0.0003 * np.sin(np.arange(M))
+            omega, compliance, h = np.asarray(
+                [fb_unilateral_row(-ri, 0.0, dt * dt * d, dt, p) for ri, d, p in zip(r, diagonal, pene0, strict=True)]
+            ).T
+            # A diagonal Schur system has an elementwise exact solve, with no O(M^3) reference work.
+            lam = (h - omega * (pene0 - r)) / (dt * dt * (omega * omega * diagonal + compliance))
+            lam_apply = dt * dt * omega * lam
+            W_storage = wp.array(np.pad(W, ((0, 0), (0, 7))), dtype=wp.float64, device=solver._device)
+            W_device = W_storage[:, :M]
+
+            for path in ("device", "host", "device"):
+                with self.subTest(M=M, path=path):
+                    host_w_before = getattr(solver, "_nsn_W_d", None)
+                    lam_gpu, omega_gpu, lam_apply_gpu = solver._solve_nsn_unilateral_gpu(
+                        W if path == "host" else None,
+                        r,
+                        pene0,
+                        dt=dt,
+                        W_device=W_device if path == "device" else None,
+                    )
+                    np.testing.assert_allclose(lam_gpu, lam, rtol=0, atol=1.0e-8)
+                    np.testing.assert_allclose(omega_gpu, omega, rtol=0, atol=1.0e-12)
+                    np.testing.assert_allclose(lam_apply_gpu, lam_apply, rtol=0, atol=1.0e-12)
+                    if path == "device":
+                        self.assertIs(getattr(solver, "_nsn_W_d", None), host_w_before)
+                    else:
+                        self.assertEqual(solver._nsn_W_d.shape, (expected_capacity, expected_capacity))
+                    self.assertEqual(solver._nsn_inner_n, expected_capacity)
+                    self.assertEqual(solver._nsn_a_schur_d.shape, (expected_capacity, expected_capacity))
 
     def test_warm_start_persistence_gpu(self):
         """Two consecutive calls with warm start ω/λ from the prior iter
@@ -221,6 +273,41 @@ class TestNSNCoulombGpuDriver(unittest.TestCase):
         if not wp.is_cuda_available():
             raise unittest.SkipTest("CUDA device required for NSN GPU driver tests")
 
+    def test_sparse_full_storage_matches_dense_and_is_instance_local(self):
+        """Sparse storage retains coupled contacts/joints and notices external W updates."""
+        dense = _build_minimal_solver(friction=True, lambda_cap=1.0e-5)
+        original_method = type(dense)._solve_nsn_coulomb_gpu
+        sparse = SolverFBA(dense.model, iterations=1, friction=True, lambda_cap=1.0e-5, nsn_sparse_storage=True)
+        self.assertIs(type(dense)._solve_nsn_coulomb_gpu, original_method)
+        self.assertNotIn("_solve_nsn_coulomb_gpu", dense.__dict__)
+        rng = np.random.default_rng(37)
+        m, bilateral = 4, 3
+        n = 3 * m + bilateral
+        w = np.zeros((n, n))
+        for begin, end in ((0, 6), (6, n)):
+            a = rng.normal(size=(end - begin, end - begin))
+            w[begin:end, begin:end] = a @ a.T / n + np.eye(end - begin)
+        r = rng.normal(size=n) * 1.0e-3
+        pene = np.zeros(n)
+        mu = np.full(m, 0.5)
+        device_w = wp.array(w, dtype=wp.float64, device=dense._device)
+        for scale in (1.0, 1.3):
+            device_w.assign(w * scale)
+            kwargs = {
+                "dt": 0.01,
+                "max_iters": 2,
+                "n_bilateral": bilateral,
+                "contact_regularization": 0.1,
+                "W_device": device_w,
+            }
+            expected = dense._solve_nsn_coulomb_gpu(None, r, mu, pene, **kwargs)
+            actual = sparse._solve_nsn_coulomb_gpu(None, r, mu, pene, **kwargs)
+            for got, want in zip(actual, expected, strict=True):
+                np.testing.assert_allclose(got, want, rtol=1.0e-6, atol=1.0e-8)
+            self.assertFalse(sparse._full_sparse_last_stats["conversion_cached"])
+        self.assertIsNone(getattr(sparse, "_nsn_a_schur_d", None))
+        self.assertLess(sparse._full_sparse_last_stats["nnz"], n * n)
+
     def test_coulomb_gpu_matches_cpu_three_contacts(self):
         """Three-contact friction problem (9-row Schur): the PCR n-cap is
         small here so we accept ~1e-6 relative drift, but the structural
@@ -241,19 +328,38 @@ class TestNSNCoulombGpuDriver(unittest.TestCase):
         np.testing.assert_allclose(lam_apply_gpu, lam_apply_cpu, rtol=0, atol=1.0e-8)
 
     def test_coulomb_gpu_matches_cpu_large(self):
-        """Larger Schur block where PCR converges well (n=60, M=20)."""
+        """Preserve Coulomb parity across device/host W switches and capacity growth."""
         solver = _build_minimal_solver(friction=True)
-        W, r, pene0, mu = _make_coulomb_inputs(M=20, seed=11)
         dt = 0.01
 
-        lam_cpu, omega_cpu, lam_apply_cpu = solve_nsn_coulomb(
-            W, r, mu, pene0, max_iters=1, dt=dt, lambda_cap=solver.lambda_cap
-        )
-        lam_gpu, omega_gpu, lam_apply_gpu = solver._solve_nsn_coulomb_gpu(W, r, mu, pene0, max_iters=1, dt=dt)
+        for M, expected_capacity in ((20, 60), (30, 91)):
+            W, r, pene0, mu = _make_coulomb_inputs(M=M, seed=11)
+            W_device = wp.array(W, dtype=wp.float64, device=solver._device)
+            lam_cpu, omega_cpu, lam_apply_cpu = solve_nsn_coulomb(
+                W, r, mu, pene0, max_iters=1, dt=dt, lambda_cap=solver.lambda_cap
+            )
+            for path in ("device", "host", "device"):
+                with self.subTest(M=M, path=path):
+                    host_w_before = getattr(solver, "_nsn_W_d", None)
+                    lam_gpu, omega_gpu, lam_apply_gpu = solver._solve_nsn_coulomb_gpu(
+                        W if path == "host" else None,
+                        r,
+                        mu,
+                        pene0,
+                        max_iters=1,
+                        dt=dt,
+                        W_device=W_device if path == "device" else None,
+                    )
 
-        np.testing.assert_allclose(lam_gpu, lam_cpu, rtol=0, atol=1.0e-5)
-        np.testing.assert_allclose(omega_gpu, omega_cpu, rtol=0, atol=1.0e-8)
-        np.testing.assert_allclose(lam_apply_gpu, lam_apply_cpu, rtol=0, atol=1.0e-8)
+                    np.testing.assert_allclose(lam_gpu, lam_cpu, rtol=0, atol=1.0e-5)
+                    np.testing.assert_allclose(omega_gpu, omega_cpu, rtol=0, atol=1.0e-8)
+                    np.testing.assert_allclose(lam_apply_gpu, lam_apply_cpu, rtol=0, atol=1.0e-8)
+                    if path == "device":
+                        self.assertIs(getattr(solver, "_nsn_W_d", None), host_w_before)
+                        self.assertEqual(solver._nsn_inner_n, expected_capacity)
+                    else:
+                        self.assertGreaterEqual(solver._nsn_W_d.shape[0], 3 * M)
+                        self.assertGreaterEqual(solver._nsn_W_d.shape[1], 3 * M)
 
     def test_box_clamp_signed_lam_n_gpu(self):
         """Verify the device signed-cone clamp invariant: ``|lam_t| <=

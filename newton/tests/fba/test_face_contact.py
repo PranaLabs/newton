@@ -231,9 +231,25 @@ class TestContactRowsOnSeveralParticles(unittest.TestCase):
         )
 
     def test_delassus(self):
-        np.testing.assert_allclose(
-            self.solver.W_device_view().numpy(), self.J @ self.A_inv @ self.J.T, rtol=1e-5, atol=1e-8
-        )
+        """Preserve multi-particle Schur values and active strides through bounded dense growth."""
+        expected = self.J @ self.A_inv @ self.J.T
+        np.testing.assert_allclose(self.solver.W_device_view().numpy(), expected, rtol=1e-5, atol=1e-8)
+
+        # Repeat the same physical rows: the factorization stays 12x12, while W crosses 1024 rows.
+        for M, capacity in ((334, 1002), (343, 1152), (385, 1280)):
+            with self.subTest(contacts=M):
+                contacts = np.arange(M) % 3
+                args = [wp.array(a.numpy()[contacts], dtype=a.dtype, device=self.solver.device) for a in self.args]
+                extra = [wp.array(a.numpy()[contacts], dtype=a.dtype, device=self.solver.device) for a in self.extra]
+                self.solver.build_schur_complement(
+                    M, *args, download=False, j_extra_indices=extra[0], j_extra_alpha=extra[1]
+                )
+                rows = (3 * contacts[:, None] + np.arange(3)).ravel()
+                view = self.solver.W_device_view()
+                np.testing.assert_allclose(view.numpy(), expected[np.ix_(rows, rows)], rtol=1e-5, atol=1e-8)
+                self.assertEqual(view.shape, (3 * M, 3 * M))
+                self.assertEqual(self.solver._W_device_d.shape, (capacity, capacity))
+                self.assertEqual(view.strides, (capacity * 8, 8))
 
     def test_correction(self):
         """``x = A⁻¹ (rhs + Jᵀ λ)`` gathers ``Jᵀ λ`` over every particle of a row."""

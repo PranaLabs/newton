@@ -1197,3 +1197,33 @@ By participating in this community, you agree to abide by the Linux Foundation [
 ## Project Governance, Legal, and Members
 
 Please see the [newton-governance repository](https://github.com/newton-physics/newton-governance) for more information about project governance.
+
+### Urban claw machine: soft-toy grasp (FBA)
+
+<img src="docs/images/examples/example_claw_machine_fba.jpg" width="320" height="320" alt="Urban claw machine with 25 soft toys">
+
+```bash
+uv run --no-sync -m newton.examples claw_machine_fba
+```
+
+The prepared Urban cabinet and articulated claw surround 25 tetrahedral soft toys
+(bears, elephants, bunnies and T2 toys). The 19.2-second sequence starts with an
+ordered airborne pile, settles for six seconds, then grasps and lifts the rear
+green bear (toy 9) using force-limited impedance control. All toys remain dynamic.
+The original mesh, per-element materials, masses and collision clearances are retained.
+Simulation uses 240 Hz, 5 PD iterations and 10 linear iterations; it is slower than real time.
+
+To start from the saved dynamic state after settling, or immediately before closing:
+
+```bash
+uv run --no-sync -m newton.examples claw_machine_fba --start settled --num-frames 396
+uv run --no-sync -m newton.examples claw_machine_fba --start grasp --num-frames 282
+```
+
+Assets and initial states live in `newton/examples/assets/claw_machine_urban/`.
+USD contains the visual meshes; prepared NPZ files contain FEM meshes, material
+fields, skin bindings and two position/velocity checkpoints. No experiment output
+directory, video cache, external handoff script or asset-generation step is needed.
+The standard Newton viewer displays the example; the existing Prana-rendered video
+is a separate output, not an example dependency. See the asset folder's `ASSETS.txt`
+for provenance and `SCENE.rst` for retained settings.

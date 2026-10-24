@@ -9,6 +9,7 @@ import warp as wp
 import newton
 from newton._src.solvers.fba.self_contact import SelfContact, particle_rings
 from newton._src.solvers.vbd.tri_mesh_collision import TriMeshCollisionDetector
+from newton.solvers import SolverFBA
 
 
 def _closest_on_triangle(p, a, b, c):
@@ -37,6 +38,41 @@ class TestSelfContactDetection(unittest.TestCase):
                 tri_ke=50.0,
             )
         return builder.finalize(device=device)
+
+    def test_group_margins_distinguish_self_folds_from_other_objects(self):
+        """The same geometry contacts across groups but not inside a thinner group."""
+        model = self._sheets()
+        groups = np.repeat(np.arange(2, dtype=np.int32), model.particle_count // 2)
+        common = {
+            "particle_enable_self_contact": True,
+            "particle_self_contact_margin": 0.012,
+            "particle_self_contact_gap": 0.001,
+        }
+        other = SolverFBA(
+            model,
+            **common,
+            particle_self_contact_group_ids=groups,
+            particle_self_contact_group_margins=np.array([0.002, 0.002]),
+        )
+        same = SolverFBA(
+            model,
+            **common,
+            particle_self_contact_group_ids=np.zeros_like(groups),
+            particle_self_contact_group_margins=np.array([0.002]),
+        )
+        self.assertGreater(other._self_contact.find(model.particle_q), 0)
+        self.assertEqual(same._self_contact.find(model.particle_q), 0)
+        with self.assertRaises(ValueError):
+            SolverFBA(model, **common, particle_self_contact_group_ids=groups)
+        bad_groups = groups.copy()
+        bad_groups[0] = 1
+        with self.assertRaises(ValueError):
+            SolverFBA(
+                model,
+                **common,
+                particle_self_contact_group_ids=bad_groups,
+                particle_self_contact_group_margins=np.array([0.002, 0.002]),
+            )
 
     def test_vertex_face_takes_the_nearest_triangle(self):
         """Find for each particle one contact, with its nearest triangle of the other sheet, along the direction
@@ -67,6 +103,139 @@ class TestSelfContactDetection(unittest.TestCase):
         self.assertGreater(contact.candidates.shape[1], 1)
         for got, want in zip(found, expected, strict=True):
             np.testing.assert_array_equal(got, want)
+
+    def test_vertex_face_excludes_only_tet_interior_particles(self):
+        """Keep solid boundary and independent particle contacts while excluding tet interior queries.
+
+        The cloth-only fixtures have no volume-interior vertices. This small mixed model adds one
+        interior vertex near its own shell, an independent particle, and a separate cloth triangle.
+        """
+        for device in ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else []):
+            with self.subTest(device=device):
+                builder = newton.ModelBuilder()
+                builder.add_soft_mesh(
+                    pos=wp.vec3(0.0),
+                    rot=wp.quat_identity(),
+                    scale=1.0,
+                    vel=wp.vec3(0.0),
+                    vertices=[
+                        (0.0, 0.0, 0.0),
+                        (1.0, 0.0, 0.0),
+                        (0.0, 1.0, 0.0),
+                        (0.0, 0.0, 1.0),
+                        (0.1, 0.1, 0.005),
+                    ],
+                    indices=[2, 1, 3, 4, 3, 0, 2, 4, 1, 0, 3, 4, 2, 0, 1, 4],
+                    density=1.0,
+                    k_mu=1.0,
+                    k_lambda=1.0,
+                    k_damp=0.0,
+                    add_surface_mesh_edges=False,
+                )
+                interior = 4
+                cloth = [
+                    builder.add_particle(wp.vec3(p), wp.vec3(0.0), 1.0)
+                    for p in [(-0.2, -0.2, -0.01), (0.2, -0.2, -0.01), (0.0, 0.3, -0.01)]
+                ]
+                builder.add_triangle(*cloth)
+                independent = builder.add_particle(wp.vec3(0.1, 0.1, -0.002), wp.vec3(0.0), 1.0)
+                model = builder.finalize(device=device)
+                q = model.particle_q.numpy()
+                self.assertIn(interior, model.tet_indices.numpy())
+                self.assertNotIn(interior, model.tri_indices.numpy())
+
+                contact = SelfContact(model, "vertex_face", 0.02)
+                particles, alpha, normal = contact.detect(model.particle_q)
+                for vertex, expected_point, expected_normal in [
+                    (0, [0.0, 0.0, -0.01], [0.0, 0.0, 1.0]),
+                    (independent, [0.1, 0.1, 0.0], [0.0, 0.0, -1.0]),
+                ]:
+                    rows = np.flatnonzero(particles[:, 0] == vertex)
+                    self.assertEqual(len(rows), 1)
+                    row = rows[0]
+                    point = -(alpha[row, 1:] @ q[particles[row, 1:]])
+                    np.testing.assert_allclose(point, expected_point, atol=1e-7)
+                    np.testing.assert_allclose(normal[row], expected_normal, atol=1e-4)
+
+                pp, _, _ = SelfContact(model, "vertex_vertex", 0.02).detect(model.particle_q)
+                self.assertIn((interior, independent), {tuple(pair) for pair in pp[:, :2]})
+                self.assertNotIn(interior, particles[:, 0])
+
+                # A repeated query must clear ignored slots rather than retaining stale candidates.
+                contact.candidate_count.fill_(1)
+                contact.found.fill_(1)
+                repeated = contact.detect(model.particle_q)
+                for got, want in zip(repeated, (particles, alpha, normal), strict=True):
+                    np.testing.assert_array_equal(got, want)
+
+    def test_vertex_face_filters_volume_neighbors_but_keeps_separate_solids(self):
+        """The two faces of a thin solid are material neighbors, not separate colliders."""
+        for device in ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else []):
+            with self.subTest(device=device):
+                builder = newton.ModelBuilder()
+                arguments = {
+                    "rot": wp.quat_identity(),
+                    "vel": wp.vec3(0.0),
+                    "dim_x": 8,
+                    "dim_y": 4,
+                    "dim_z": 1,
+                    "cell_x": 0.02,
+                    "cell_y": 0.02,
+                    "cell_z": 0.002,
+                    "density": 1.0,
+                    "k_mu": 1.0,
+                    "k_lambda": 1.0,
+                    "k_damp": 0.0,
+                    "add_surface_mesh_edges": False,
+                }
+                builder.add_soft_grid(pos=wp.vec3(0.0), **arguments)
+                single = builder.finalize(device=device)
+                found = SelfContact(single, "vertex_face", 0.003).detect(single.particle_q)[0]
+                self.assertEqual(len(found), 0)
+
+                split = single.particle_count
+                builder.add_soft_grid(pos=wp.vec3(0.003, 0.003, 0.003), **arguments)
+                pair = builder.finalize(device=device)
+                particles, _, _ = SelfContact(pair, "vertex_face", 0.003).detect(pair.particle_q)
+                self.assertGreater(len(particles), 20)
+                for query, a, b, c in particles:
+                    self.assertTrue(all((query < split) != (vertex < split) for vertex in (a, b, c)))
+
+    def test_vertex_face_keeps_nonlocal_fold_contacts_of_a_solid(self):
+        """Volume-neighbor filtering must retain contacts between distant parts of a folded solid."""
+        for device in ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else []):
+            with self.subTest(device=device):
+                builder = newton.ModelBuilder()
+                builder.add_soft_grid(
+                    pos=wp.vec3(0.0),
+                    rot=wp.quat_identity(),
+                    vel=wp.vec3(0.0),
+                    dim_x=8,
+                    dim_y=4,
+                    dim_z=1,
+                    cell_x=0.02,
+                    cell_y=0.02,
+                    cell_z=0.002,
+                    density=1.0,
+                    k_mu=1.0,
+                    k_lambda=1.0,
+                    k_damp=0.0,
+                    add_surface_mesh_edges=False,
+                )
+                model = builder.finalize(device=device)
+                rest = model.particle_q.numpy()
+                folded = rest.copy()
+                right = rest[:, 0] > 0.08
+                folded[right, 0] = 0.16 - rest[right, 0]
+                folded[right, 2] = 0.005 - rest[right, 2]
+                contact = SelfContact(model, "vertex_face", 0.003)
+                particles, alpha, _ = contact.detect(wp.array(folded, dtype=wp.vec3, device=device))
+                self.assertGreater(len(particles), 20)
+                rest_gaps = np.linalg.norm(
+                    rest[particles[:, 0]] + np.einsum("ki,kij->kj", alpha[:, 1:], rest[particles[:, 1:]]),
+                    axis=1,
+                )
+                self.assertGreater(np.count_nonzero(rest_gaps > 0.04), 10)
 
     def test_vertex_vertex_pairs_once(self):
         """Every pair of particles within the margin is one contact; a sheet's own particles lie 2 cm apart, so

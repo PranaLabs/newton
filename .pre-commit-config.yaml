@@ -20,6 +20,8 @@ repos:
     hooks:
       - id: check-added-large-files
         args: [--maxkb=500]
+        # Prepared meshes, checkpoints and source textures required by the Urban example.
+        exclude: ^newton/examples/assets/claw_machine_urban/.*\.(npz|usdc|png)$
       - id: check-case-conflict
       - id: check-illegal-windows-names
       - id: check-json
