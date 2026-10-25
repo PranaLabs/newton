@@ -1865,6 +1865,13 @@ add_example_test(
 )
 add_example_test(
     TestSoftbodyExamples,
+    name="softbody.example_claw_machine_fba",
+    devices=cuda_test_devices,
+    test_options={"start": "grasp", "num-frames": 15},
+    use_viewer=True,
+)
+add_example_test(
+    TestSoftbodyExamples,
     name="softbody.example_twisting_bar_fba",
     devices=cuda_test_devices,
     test_options={"num-frames": 300},
