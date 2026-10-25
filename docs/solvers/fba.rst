@@ -268,3 +268,7 @@ Examples
 - ``pneunet_gripper_fba``: a three-finger PneuNet gripper whose chambers,
   lengthened along its fingers by tetrahedral activations, close the fingers
   around a ball and lift it.
+- ``claw_machine_fba``: an articulated claw driven by force-limited PD forces
+  picks a bear out of a pile of 25 soft toys that collide with each other, and
+  only the elephants with themselves, with a thinner contact against its
+  fingers and the sparse Schur storage.
