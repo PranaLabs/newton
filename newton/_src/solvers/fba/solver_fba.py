@@ -147,6 +147,7 @@ class SolverFBA(SolverBase):
         lambda_cap: float | None = None,
         use_isodof: bool = True,
         shape_angular_velocity: dict[int, float] | None = None,
+        shape_particle_radius_override: dict[int, float] | None = None,
         nh_solver: Literal["newton5", "lbfgs"] = "lbfgs",
         nsn_schur_mode: Literal["full", "lite"] = "full",
         nsn_sparse_storage: bool = False,
@@ -194,6 +195,14 @@ class SolverFBA(SolverBase):
                 into the residual of the friction rows; the shape geometry
                 itself stays static. A positive ``ω`` moves the surface along
                 ``cross(normal, axis)``. Defaults to no kinematic motion.
+            shape_particle_radius_override: Experimental per-shape reduced particle
+                contact thickness in metres. Maps shape IDs to finite nonnegative
+                radii no larger than the smallest model particle radius. The
+                smaller thickness applies to both particle and face contacts with
+                those shapes; other shapes and soft self contacts are unchanged.
+                Detection keeps the original, conservative particle radii. Useful
+                for close gripper contact while preserving tray support. ``None``
+                retains all original radii.
             nh_solver: Local-projection inner solver for the Neo-Hookean
                 stretching model. ``"lbfgs"`` (default) runs L-BFGS with an
                 Armijo cubic backtracking line search (memory 8,
@@ -411,6 +420,20 @@ class SolverFBA(SolverBase):
         # Device mirror consumed by the GPU contact kernels; the
         # host array stays the source of truth (small, rarely modified).
         self._shape_omega_d = wp.array(self._shape_omega_h, dtype=wp.float64, device=model.device)
+
+        self._shape_particle_radius_override_d = None
+        if shape_particle_radius_override:
+            if not model.particle_count:
+                raise ValueError("Per-shape particle radius overrides require particles")
+            minimum_radius = float(model.particle_radius.numpy().min())
+            reduced_radii = np.full(n_shapes, -1.0, dtype=np.float32)
+            for shape, radius in shape_particle_radius_override.items():
+                if not isinstance(shape, (int, np.integer)) or not 0 <= shape < n_shapes:
+                    raise ValueError("Particle radius override must name an existing shape")
+                if not np.isfinite(radius) or not 0 <= radius <= minimum_radius:
+                    raise ValueError("Per-shape radius must be finite, nonnegative and no larger than particle radii")
+                reduced_radii[shape] = radius
+            self._shape_particle_radius_override_d = wp.array(reduced_radii, dtype=wp.float32, device=model.device)
 
         # PD setup is dt-dependent; we cache the assembly at a reference dt and
         # rebuild lazily inside `step` if the dt changes.
@@ -2468,6 +2491,23 @@ class SolverFBA(SolverBase):
             inputs = [self._contact_particle_d, *extra, int(self._contact_extra is not None)]
             inputs += [self._contact_shape_d, model.particle_radius, model.shape_margin]
             wp.launch(add_contact_thickness_kernel, shape_contacts, inputs, [self._contact_offset_d], device=device)
+            if self._shape_particle_radius_override_d is not None:
+                from .kernels import apply_contact_radius_override_kernel  # noqa: PLC0415
+
+                wp.launch(
+                    apply_contact_radius_override_kernel,
+                    shape_contacts,
+                    inputs=[
+                        self._contact_particle_d,
+                        *extra,
+                        int(self._contact_extra is not None),
+                        self._contact_shape_d,
+                        model.particle_radius,
+                        self._shape_particle_radius_override_d,
+                    ],
+                    outputs=[self._contact_offset_d],
+                    device=device,
+                )
 
         # Host mirrors of the basic contact fields, for the host paths that still read them.
         self._contact_particle_h = None if particle_h is None else particle_h.astype(np.int32)

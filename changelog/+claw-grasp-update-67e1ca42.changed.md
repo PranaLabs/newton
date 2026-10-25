@@ -1,0 +1,1 @@
+Update `claw_machine_fba` to the 20-second, 2 mm gripper-contact grasp with staged motor forces and a wider, more frontal camera. Use 420 frames for `--start settled` or 285 frames for `--start grasp` (now 10.5 s).

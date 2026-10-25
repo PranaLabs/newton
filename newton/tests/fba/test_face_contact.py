@@ -283,7 +283,7 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
         if not wp.is_cuda_available():
             raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
 
-    def _run(self, face_contacts, pos, cells, steps, thickness=0.0, mesh_half=None):
+    def _run(self, face_contacts, pos, cells, steps, thickness=0.0, mesh_half=None, radius_overrides=None):
         """Final particle positions, the largest particle speed and the solver; ``mesh_half`` swaps the box for
         a closed mesh box with these half extents, its base also at ``z = 0``."""
         builder = newton.ModelBuilder()
@@ -310,7 +310,9 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
             particle_radius=thickness,
         )
         model = builder.finalize()
-        solver = newton.solvers.SolverFBA(model, iterations=10, face_contacts=face_contacts)
+        solver = newton.solvers.SolverFBA(
+            model, iterations=10, face_contacts=face_contacts, shape_particle_radius_override=radius_overrides
+        )
         pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.15 - thickness)
         contacts, s0, s1, speed = pipeline.contacts(), model.state(), model.state(), 0.0
         for _ in range(steps):
@@ -349,6 +351,14 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
         x, speed, solver = self._run(True, (0.0, -0.3, 0.65), 12, 240, thickness=3e-3)
         self.assertGreater(self._deepest(x, solver), 1e-3)
         self.assertLess(speed, 1.5)
+
+    def test_reduced_shape_radius_preserves_particle_radii(self):
+        """Keep cloth 2 mm from a selected support without changing its 28 mm particle radii."""
+        x, _, solver = self._run(True, (-0.1, -0.1, 0.64), 4, 60, thickness=0.028, radius_overrides={0: 0.002})
+        np.testing.assert_allclose(x[:, 2] - 0.6, 0.002, atol=1.0e-5)
+        np.testing.assert_allclose(solver.model.particle_radius.numpy(), 0.028)
+        x, _, _ = self._run(True, (-0.1, -0.1, 0.64), 4, 60, thickness=0.028)
+        np.testing.assert_allclose(x[:, 2] - 0.6, 0.028, atol=1.0e-5)
 
     def test_thin_mesh_blade(self):
         """A closed 2 mm blade under the gap between two particle rows cuts through a cloth held by particle

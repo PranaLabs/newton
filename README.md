@@ -1207,17 +1207,20 @@ uv run --no-sync -m newton.examples claw_machine_fba
 ```
 
 The prepared Urban cabinet and articulated claw surround 25 tetrahedral soft toys
-(bears, elephants, bunnies and T2 toys). The 19.2-second sequence starts with an
+(bears, elephants, bunnies and T2 toys). The 20-second sequence starts with an
 ordered airborne pile, settles for six seconds, then grasps and lifts the rear
 green bear (toy 9) using force-limited impedance control. All toys remain dynamic.
-The original mesh, per-element materials, masses and collision clearances are retained.
+The gripper uses 2 mm contact thickness and a centered, staged-force grasp.
+The original meshes, per-element materials, masses, floor/wall radii and 41 mm
+soft self-contact margin are retained. The camera transitions smoothly to a
+fixed 18-degree left view, pulled back 25% from the previous close view.
 Simulation uses 240 Hz, 5 PD iterations and 10 linear iterations; it is slower than real time.
 
 To start from the saved dynamic state after settling, or immediately before closing:
 
 ```bash
-uv run --no-sync -m newton.examples claw_machine_fba --start settled --num-frames 396
-uv run --no-sync -m newton.examples claw_machine_fba --start grasp --num-frames 282
+uv run --no-sync -m newton.examples claw_machine_fba --start settled --num-frames 420
+uv run --no-sync -m newton.examples claw_machine_fba --start grasp --num-frames 285
 ```
 
 Assets and initial states live in `newton/examples/assets/claw_machine_urban/`.

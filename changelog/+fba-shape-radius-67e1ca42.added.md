@@ -1,0 +1,1 @@
+Add an experimental per-shape reduced particle-contact radius to SolverFBA, allowing closer gripper contact without changing floor support or soft self-contact settings. Expose the option as `--finger-contact-radius` in the Urban claw-machine example.

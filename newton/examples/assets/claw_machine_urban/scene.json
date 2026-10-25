@@ -1940,70 +1940,80 @@
       "LOWER TO NECK"
     ],
     [
-      4.7,
+      5.1,
       [
-        -0.48169812008738516,
-        0.5250591659545898,
+        -0.535857695523986,
+        0.44250308354370504,
         -1.54482,
-        0
+        0.0
       ],
-      "HOLD OPEN / DEEP GRIP"
+      "RECENTER OPEN CLAW"
     ],
     [
-      6.0,
+      5.3,
       [
-        -0.48169812008738516,
-        0.5250591659545898,
+        -0.535857695523986,
+        0.44250308354370504,
+        -1.54482,
+        0.0
+      ],
+      "OPEN / CENTERED"
+    ],
+    [
+      6.8,
+      [
+        -0.535857695523986,
+        0.44250308354370504,
         -1.54482,
         0.07
       ],
-      "CLOSE / FORCE CONTROL"
+      "CLOSE GENTLY"
     ],
     [
-      6.3,
+      7.1,
       [
-        -0.48169812008738516,
-        0.5250591659545898,
+        -0.535857695523986,
+        0.44250308354370504,
         -1.54482,
         0.07
       ],
-      "HOLD GRIP"
+      "BUILD HOLDING FORCE"
     ],
     [
-      9.3,
+      10.1,
       [
-        -0.48169812008738516,
-        0.5250591659545898,
+        -0.535857695523986,
+        0.44250308354370504,
         -0.39482000000000017,
         0.07
       ],
-      "LIFT CLEAR"
+      "LIFT"
     ],
     [
-      9.7,
+      10.5,
       [
-        -0.48169812008738516,
-        0.5250591659545898,
+        -0.535857695523986,
+        0.44250308354370504,
         -0.39482000000000017,
         0.07
       ],
-      "HOLD / CLEAR PILE"
+      "CLEAR PILE"
     ],
     [
-      11.2,
+      12.0,
       [
-        -0.28169812008738515,
-        0.2750591659545898,
+        -0.335857695523986,
+        0.19250308354370504,
         -0.39482000000000017,
         0.07
       ],
-      "CARRY TOWARD CENTER"
+      "CARRY"
     ],
     [
-      13.2,
+      14.0,
       [
-        -0.28169812008738515,
-        0.2750591659545898,
+        -0.335857695523986,
+        0.19250308354370504,
         -0.39482000000000017,
         0.07
       ],
@@ -2018,16 +2028,67 @@
       "final_kp_N_per_m": 3000.0
     },
     "plate_force_limit_schedule": {
-      "start_time_s": 4.7,
-      "ramp_duration_s": 0.5,
+      "start_time_s": 5.3,
+      "ramp_duration_s": 0.4,
       "initial_force_limit_N": 60.0,
-      "final_force_limit_N": 35.0
-    }
+      "final_force_limit_N": 14.0
+    },
+    "plate_force_limit_overrides": [
+      {
+        "start_time_s": 6.8,
+        "ramp_duration_s": 0.3,
+        "initial_force_limit_N": 14.0,
+        "final_force_limit_N": 20.0
+      },
+      {
+        "start_time_s": 7.5,
+        "ramp_duration_s": 0.4,
+        "initial_force_limit_N": 20.0,
+        "final_force_limit_N": 35.0
+      }
+    ]
   },
   "target_toy_index": 9,
-  "duration": 19.2,
+  "duration": 20.0,
   "sim_hz": 240,
   "fps": 30,
   "iterations": 5,
-  "linear_iterations": 10
+  "linear_iterations": 10,
+  "finger_contact_radius": 0.002,
+  "solver_reset_times_s": [
+    4.5,
+    7.5
+  ],
+  "checkpoint_times_s": {
+    "initial": 0.0,
+    "settled": 6.0,
+    "grasp": 10.5
+  },
+  "camera": {
+    "initial_position_exact": [
+      8.070434205419271,
+      4.464086841083855,
+      1.6140868410838543
+    ],
+    "initial_target": [
+      0.0,
+      2.85,
+      0.0
+    ],
+    "final_position_y_up": [
+      4.986777032813171,
+      4.3,
+      1.58528601792947
+    ],
+    "final_target_y_up": [
+      -0.2,
+      3.3,
+      -0.1
+    ],
+    "transition_seconds": [
+      6.0,
+      8.5
+    ],
+    "fov_fixed_degrees": 31.0
+  }
 }

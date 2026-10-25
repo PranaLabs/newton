@@ -17,7 +17,7 @@ Bunny and T2 toy:
 Prepared simulation:
   Exact rest mesh and per-tetrahedron material field from the accepted
   four25_green_bear9_deep_20261025 scene. The checkpoints are the original
-  settled state at 6.0 s and open-gripper approach state at 9.8 s. Positions
+  settled state at 6.0 s and the 2 mm contact run's open-gripper state at 10.5 s. Positions
   AND velocities are included; the original rest geometry remains unchanged.
 
 Visuals:

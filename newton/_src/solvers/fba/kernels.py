@@ -5293,3 +5293,29 @@ def compute_v_anchor_from_body_kernel(
     com_world = wp.transform_point(body_q[parent], body_com[parent])
     v = v_com + wp.cross(omega, world_anchor[c] - com_world)
     v_anchor[c] = wp.vec3d(wp.float64(v[0]), wp.float64(v[1]), wp.float64(v[2]))
+
+
+@wp.kernel
+def apply_contact_radius_override_kernel(
+    particle: wp.array[wp.int32],
+    extra_particle: wp.array2d[wp.int32],
+    extra_alpha: wp.array2d[wp.float32],
+    has_extra: int,
+    shape: wp.array[wp.int32],
+    particle_radius: wp.array[wp.float32],
+    radius_override: wp.array[wp.float32],
+    offset: wp.array[wp.float64],
+):
+    """Replace only a selected shape's particle thickness; retain its shape margin."""
+    c = wp.tid()
+    s = shape[c]
+    if s < 0 or radius_override[s] < 0.0:
+        return
+    radius0 = particle_radius[particle[c]]
+    radius = radius0
+    if has_extra:
+        for k in range(extra_particle.shape[1]):
+            p = extra_particle[c, k]
+            if p >= 0:
+                radius += extra_alpha[c, k] * (particle_radius[p] - radius0)
+    offset[c] += wp.float64(radius_override[s]) - wp.float64(radius)
