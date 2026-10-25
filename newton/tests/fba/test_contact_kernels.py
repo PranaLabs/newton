@@ -140,9 +140,24 @@ class TestAddContactThicknessKernel(unittest.TestCase):
         extra_alpha = wp.array(np.array([[0.0, 0.0], [0.25, 0.25], [0.0, 0.0]]), dtype=wp.float32)
         shape = wp.array([0, 0, -1], dtype=wp.int32)
         offset = wp.array([1.0, 2.0, 3.0], dtype=wp.float64)
-        inputs = [particle, extra_particle, extra_alpha, 1, shape, radius, margin]
+        inputs = [particle, extra_particle, extra_alpha, 1, shape, radius, margin, wp.empty(1, dtype=wp.float32), 0]
         wp.launch(K.add_contact_thickness_kernel, dim=3, inputs=inputs, outputs=[offset])
         np.testing.assert_allclose(offset.numpy(), [1.0025, 2.0025, 3.004], rtol=0.0, atol=1e-9)
+
+    def test_shape_radius(self):
+        """Replace the particle radius, or the radius interpolated at a face contact's weights, by the shape's
+        radius where it has one, keeping the shape margin; a shape without one keeps the particle radius."""
+        radius = wp.array([0.001, 0.002, 0.004], dtype=wp.float32)
+        margin = wp.array([0.0005, 0.0], dtype=wp.float32)
+        particle = wp.array([1, 0, 2], dtype=wp.int32)
+        extra_particle = wp.array(np.array([[-1, -1], [1, 2], [-1, -1]]), dtype=wp.int32)
+        extra_alpha = wp.array(np.array([[0.0, 0.0], [0.25, 0.25], [0.0, 0.0]]), dtype=wp.float32)
+        shape = wp.array([0, 0, 1], dtype=wp.int32)
+        offset = wp.array([1.0, 2.0, 3.0], dtype=wp.float64)
+        shape_radius = wp.array([0.0002, -1.0], dtype=wp.float32)
+        inputs = [particle, extra_particle, extra_alpha, 1, shape, radius, margin, shape_radius, 1]
+        wp.launch(K.add_contact_thickness_kernel, dim=3, inputs=inputs, outputs=[offset])
+        np.testing.assert_allclose(offset.numpy(), [1.0007, 2.0007, 3.004], rtol=0.0, atol=1e-9)
 
     def test_equal_radii_stay_exact(self):
         """Give a face contact exactly the radius its particles share, whatever its weights."""
@@ -150,7 +165,13 @@ class TestAddContactThicknessKernel(unittest.TestCase):
         extra_alpha = wp.array(np.array([[0.3, 0.3]]), dtype=wp.float32)
         offset = wp.zeros(1, dtype=wp.float64)
         inputs = [wp.array([0], dtype=wp.int32), wp.array(np.array([[1, 2]]), dtype=wp.int32), extra_alpha, 1]
-        inputs += [wp.array([0], dtype=wp.int32), radius, wp.zeros(1, dtype=wp.float32)]
+        inputs += [
+            wp.array([0], dtype=wp.int32),
+            radius,
+            wp.zeros(1, dtype=wp.float32),
+            wp.empty(1, dtype=wp.float32),
+            0,
+        ]
         wp.launch(K.add_contact_thickness_kernel, dim=1, inputs=inputs, outputs=[offset])
         self.assertEqual(offset.numpy()[0], float(np.float32(0.01)))
 

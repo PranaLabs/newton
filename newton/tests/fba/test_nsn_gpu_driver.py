@@ -26,6 +26,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.fba import SolverFBA
+from newton._src.solvers.fba.linear_solver import csr_without_zeros
 from newton.tests.fba._reference import fb_frictional_row, fb_unilateral_row, solve_nsn_coulomb, solve_nsn_unilateral
 
 
@@ -55,7 +56,7 @@ def _make_coulomb_inputs(M: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.
     return W.astype(np.float64), r.astype(np.float64), pene0.astype(np.float64), mu.astype(np.float64)
 
 
-def _build_minimal_solver(friction: bool, lambda_cap: float | None = None) -> SolverFBA:
+def _build_minimal_solver(friction: bool, lambda_cap: float | None = None, **solver_args) -> SolverFBA:
     """Construct a 2x2 cloth model so :class:`SolverFBA` initialises.
 
     The GPU NSN drivers operate purely on host-supplied ``W`` / ``r`` /
@@ -80,7 +81,7 @@ def _build_minimal_solver(friction: bool, lambda_cap: float | None = None) -> So
         edge_kd=0.0,
     )
     model = builder.finalize()
-    return SolverFBA(model, iterations=1, friction=friction, lambda_cap=lambda_cap)
+    return SolverFBA(model, iterations=1, friction=friction, lambda_cap=lambda_cap, **solver_args)
 
 
 class TestNSNUnilateralGpuDriver(unittest.TestCase):
@@ -370,6 +371,33 @@ class TestNSNCoulombGpuDriver(unittest.TestCase):
         self.assertGreater(np.abs(lam_gpu[3 * M :]).max(), 1.0e-7 / (dt * dt))
         self.assertLessEqual(np.abs(lam_gpu[: 3 * M]).max(), 1.0e-7 / (dt * dt) * (1.0 + 1.0e-12))
         np.testing.assert_allclose(lam_apply_gpu, dt * dt * omega_gpu * lam_gpu, rtol=1.0e-12)
+
+    def test_sparse_storage_matches_dense(self):
+        """Take the dense path's Newton steps on a ``W`` of two blocks, the second with bilateral rows, from its CSR
+        form without the zero blocks."""
+        dense = _build_minimal_solver(friction=True, lambda_cap=1.0e-5)
+        sparse = _build_minimal_solver(friction=True, lambda_cap=1.0e-5, nsn_sparse_storage=True)
+        rng = np.random.default_rng(37)
+        m, bilateral = 4, 3
+        n = 3 * m + bilateral
+        W = np.zeros((n, n))
+        for begin, end in ((0, 6), (6, n)):
+            aux = rng.standard_normal((end - begin, end - begin))
+            W[begin:end, begin:end] = aux @ aux.T / n + np.eye(end - begin)
+        r, pene0, mu = rng.standard_normal(n) * 1.0e-3, np.zeros(n), np.full(m, 0.5)
+        device = dense._device
+        offsets = wp.array(np.arange(0, n * n + 1, n, dtype=np.int32), dtype=wp.int32, device=device)
+        columns = wp.array(np.tile(np.arange(n, dtype=np.int32), n), dtype=wp.int32, device=device)
+        values = wp.array(W.ravel(), dtype=wp.float64, device=device)
+        W_sparse = csr_without_zeros(offsets, columns, values, n, n * n)
+        self.assertEqual(W_sparse[0].nnz, 6 * 6 + (n - 6) ** 2)
+        args = {"dt": 0.01, "max_iters": 2, "n_bilateral": bilateral, "contact_regularization": 0.1}
+        W_device = wp.array(W, dtype=wp.float64, device=device)
+        expected = dense._solve_nsn_coulomb_gpu(None, r, mu, pene0, W_device=W_device, **args)
+        got = sparse._solve_nsn_coulomb_gpu(None, r, mu, pene0, W_sparse=W_sparse, **args)
+        for g, e in zip(got, expected, strict=True):
+            np.testing.assert_allclose(g, e, rtol=1.0e-6, atol=1.0e-8)
+        self.assertIsNone(sparse._nsn_a_schur_d)
 
     def test_gpu_path_coulomb_no_contacts(self):
         """Return empty arrays from the Coulomb driver for ``M=0``."""

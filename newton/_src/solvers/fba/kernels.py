@@ -1742,6 +1742,66 @@ def accumulate_vec3_kernel(
 # ---------------------------------------------------------------------------
 
 
+@wp.kernel
+def compute_wi_blocks_kernel(
+    ST_offsets: wp.array[wp.int32],
+    ST_columns: wp.array[wp.int32],
+    ST_values: wp.array[wp.float64],
+    D_inv: wp.array[wp.float64],
+    isodof_perm: wp.array[wp.int32],
+    members: wp.array[wp.int32],  # the ranks of the contacted DOFs, by block, ascending within a block
+    block_start: wp.array[wp.int32],  # (B + 1,) where each block's ranks start in ``members``
+    pair_start: wp.array[wp.int32],  # (B + 1,) where each block's ``size * size`` threads start
+    Wi: wp.array2d[wp.float64],
+):
+    """``Wi[a, b] = A⁻¹[isodofs[a], isodofs[b]]`` for the pairs of contacted DOFs within each block, from the sparse
+    columns of ``S``, without dense intermediates.
+
+    ``A⁻¹ = P Sᵀ D⁻¹ S Pᵀ`` gives ``Wi[a, b] = sum_k S[k, ip[a]] D_inv[k] S[k, ip[b]]`` with ``ip = isodof_perm``,
+    a sum over the rows that the two columns of ``S`` share. ``S`` comes as its transpose in CSR form, whose
+    rows list the rows of the columns of ``S`` in ascending order, so the sum merges two sorted lists. The blocks are
+    connected components of ``A``: the columns of two components share no row, and their entries, which stay
+    untouched, are zero. Each block of ``m`` DOFs takes ``m * m`` threads, of which those of pairs ``a <= b`` write
+    ``Wi[a, b]`` and ``Wi[b, a]``; launch with ``dim=pair_start[B]``.
+    """
+    t = wp.tid()
+    lo = int(0)
+    hi = block_start.shape[0] - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if pair_start[mid] <= t:
+            lo = mid
+        else:
+            hi = mid
+    size = block_start[lo + 1] - block_start[lo]
+    local = t - pair_start[lo]
+    i = local // size
+    j = local - i * size
+    if j < i:
+        return
+    a = members[block_start[lo] + i]
+    b = members[block_start[lo] + j]
+    pi = ST_offsets[isodof_perm[a]]
+    end_i = ST_offsets[isodof_perm[a] + 1]
+    pj = ST_offsets[isodof_perm[b]]
+    end_j = ST_offsets[isodof_perm[b] + 1]
+    acc = wp.float64(0.0)
+    while pi < end_i and pj < end_j:
+        ki = ST_columns[pi]
+        kj = ST_columns[pj]
+        if ki == kj:
+            acc = acc + ST_values[pi] * D_inv[ki] * ST_values[pj]
+            pi = pi + 1
+            pj = pj + 1
+        elif ki < kj:
+            pi = pi + 1
+        else:
+            pj = pj + 1
+    Wi[a, b] = acc
+    if b != a:
+        Wi[b, a] = acc
+
+
 # Tile sizes for the dense GEMM used by ``compute_wi_tiled_kernel``.
 # ``32 x 32 x 32`` with ``128`` threads per block was empirically fastest for
 # k ~ 1200 contacted DOFs among N ~ 7000 particles on an RTX 5090 in fp64.
@@ -2635,6 +2695,9 @@ def assemble_contacts_kernel(
     self_normal: wp.array[wp.vec3],  # (S,)
     shape_contacts: int,
     self_radius: float,
+    groups: wp.array[wp.int32],  # (N,) self-contact group of each particle, with has_groups
+    group_margins: wp.array[wp.float32],  # self-contact margin within each group
+    has_groups: int,
     # outputs
     particle: wp.array[wp.int32],
     normal: wp.array[wp.vec3],
@@ -2645,7 +2708,8 @@ def assemble_contacts_kernel(
     extra_alpha: wp.array2d[wp.float32],  # (M, 3)
 ):
     """The particle-shape contacts in their sorted order and then the self contacts, anchored the self-contact
-    radius along their normals, with the further particles of each contact."""
+    radius along their normals, or with ``has_groups`` the margin of the group of a particle and a triangle of one
+    group, with the further particles of each contact."""
     c = wp.tid()
     if c < shape_contacts:
         i = order[c]
@@ -2664,7 +2728,12 @@ def assemble_contacts_kernel(
         normal[c] = n
         alpha[c] = self_alpha[s, 0]
         shape[c] = -1
-        body_pos[c] = self_radius * n
+        radius = self_radius
+        if has_groups:
+            group = groups[self_particles[s, 0]]
+            if group == groups[self_particles[s, 1]]:
+                radius = group_margins[group]
+        body_pos[c] = radius * n
         for k in range(3):
             extra_particle[c, k] = self_particles[s, k + 1]
             extra_alpha[c, k] = self_alpha[s, k + 1]
@@ -3202,6 +3271,174 @@ def precond_from_bsr_diag_coulomb_kernel(
         precond[i] = dt * dt * w
     else:
         precond[i] = dt * w
+
+
+# The most groups a row of a sparse Schur matrix belongs to: the components of its particles and its bodies.
+_MAX_ROW_GROUPS = 8
+_vec_row_groups = wp.types.vector(length=_MAX_ROW_GROUPS, dtype=wp.int32)
+
+
+@wp.kernel
+def group_pattern_kernel(
+    row_groups: wp.array2d[wp.int32],  # (n, G) the groups of each row, -1 where unused
+    group_offsets: wp.array[wp.int32],  # (groups + 1,)
+    group_rows: wp.array[wp.int32],  # the rows of each group, ascending
+    offsets: wp.array[wp.int32],  # (n + 1,) where each row's columns start, with ``fill``
+    fill: int,
+    # outputs
+    counts: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+):
+    """The rows that share a group with each row, ascending and once each: their number, and with ``fill`` the rows
+    themselves, from ``offsets``. A row's lists of rows, one per group, merge."""
+    r = wp.tid()
+    head = _vec_row_groups()
+    end = _vec_row_groups()
+    lists = int(0)
+    for g in range(row_groups.shape[1]):
+        group = row_groups[r, g]
+        if group >= 0:
+            head[lists] = group_offsets[group]
+            end[lists] = group_offsets[group + 1]
+            lists += 1
+    count = int(0)
+    k = int(0)
+    if fill:
+        k = offsets[r]
+    while True:
+        best = wp.int32(2147483647)
+        for i in range(lists):
+            if head[i] < end[i]:
+                best = wp.min(best, group_rows[head[i]])
+        if best == wp.int32(2147483647):
+            break
+        for i in range(lists):
+            if head[i] < end[i]:
+                if group_rows[head[i]] == best:
+                    head[i] = head[i] + 1
+        if fill:
+            columns[k] = best
+            k += 1
+        count += 1
+    counts[r] = count
+
+
+@wp.func
+def csr_row_of(offsets: wp.array[wp.int32], k: int) -> int:
+    """The row of entry ``k`` of a CSR matrix with row ``offsets``: the last row that starts at or before it."""
+    lo = int(0)
+    hi = offsets.shape[0] - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if offsets[mid] <= k:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+@wp.kernel
+def compose_W_csr_kernel(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    contact_particle: wp.array[wp.int32],
+    contact_dir: wp.array[wp.vec3],
+    contact_alpha: wp.array[wp.float32],
+    isodof_rank: wp.array[wp.int32],
+    Wi: wp.array2d[wp.float64],
+    slot_particle: wp.array2d[wp.int32],  # (total_rows, K) particles of each row, -1 when unused
+    slot_alpha: wp.array2d[wp.float32],
+    has_slots: int,
+    # outputs
+    values: wp.array[wp.float64],
+):
+    """The entries of ``W`` at a CSR pattern, one thread per entry, as :func:`compose_W_from_wi_kernel` and, with
+    ``has_slots``, :func:`add_slot_terms_W_kernel` compute them densely."""
+    k = wp.tid()
+    a = csr_row_of(offsets, k)
+    b = columns[k]
+    alpha = wp.float64(contact_alpha[a]) * wp.float64(contact_alpha[b])
+    dot = wp.float64(wp.dot(contact_dir[a], contact_dir[b]))
+    w = alpha * dot * Wi[isodof_rank[contact_particle[a]], isodof_rank[contact_particle[b]]]
+    if has_slots:
+        s = wp.float64(0.0)
+        for i in range(slot_particle.shape[1]):
+            pa = slot_particle[a, i]
+            for j in range(slot_particle.shape[1]):
+                pb = slot_particle[b, j]
+                if pa >= 0 and pb >= 0 and i + j > 0:
+                    ws = wp.float64(slot_alpha[a, i]) * wp.float64(slot_alpha[b, j])
+                    s += ws * Wi[isodof_rank[pa], isodof_rank[pb]]
+        w = w + wp.float64(wp.dot(contact_dir[a], contact_dir[b])) * s
+    values[k] = w
+
+
+@wp.kernel
+def csr_kept_entries_kernel(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    # outputs
+    kept: wp.array[wp.int32],
+):
+    """Whether each entry of a CSR matrix is nonzero or on the diagonal."""
+    k = wp.tid()
+    kept[k] = wp.where(columns[k] == csr_row_of(offsets, k) or values[k] != wp.float64(0.0), 1, 0)
+
+
+@wp.kernel
+def csr_keep_kernel(
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    kept: wp.array[wp.int32],
+    position: wp.array[wp.int32],  # exclusive scan of ``kept``
+    # outputs
+    kept_columns: wp.array[wp.int32],
+    kept_values: wp.array[wp.float64],
+):
+    """The kept entries of a CSR matrix, in their order."""
+    k = wp.tid()
+    if kept[k]:
+        kept_columns[position[k]] = columns[k]
+        kept_values[position[k]] = values[k]
+
+
+@wp.kernel
+def csr_kept_offsets_kernel(
+    offsets: wp.array[wp.int32],
+    position: wp.array[wp.int32],  # exclusive scan of the kept entries, one past the last entry
+    # outputs
+    kept_offsets: wp.array[wp.int32],
+):
+    """The row offsets of the kept entries."""
+    r = wp.tid()
+    kept_offsets[r] = position[offsets[r]]
+
+
+@wp.kernel
+def build_a_schur_csr_kernel(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    w_values: wp.array[wp.float64],
+    omega: wp.array[wp.float64],
+    compliance: wp.array[wp.float64],
+    regularized: int,
+    scale: wp.float64,
+    # outputs
+    a_values: wp.array[wp.float64],
+):
+    """``A_schur = ωωᵀ ⊙ W + diag(c)`` at the pattern of ``W`` in CSR form, one thread per entry, as
+    :func:`build_a_schur_lite_bsr_kernel` computes it, with the diagonal of the first ``regularized`` rows scaled by
+    ``scale`` after."""
+    k = wp.tid()
+    i = csr_row_of(offsets, k)
+    j = columns[k]
+    a = omega[i] * omega[j] * w_values[k]
+    if i == j:
+        a = a + compliance[i]
+        if i < regularized:
+            a = a * scale
+    a_values[k] = a
 
 
 @wp.kernel
@@ -4062,12 +4299,15 @@ def add_contact_thickness_kernel(
     shape: wp.array[wp.int32],
     particle_radius: wp.array[wp.float32],
     shape_margin: wp.array[wp.float32],
+    shape_radius: wp.array[wp.float32],  # (S,) the particle radius against each shape, negative for none
+    has_shape_radius: int,
     offset: wp.array[wp.float64],  # (M,) inout
 ):
     """Move each shape contact's plane out by the particle radius plus the shape margin.
 
     A face contact interpolates the radii of its particles at its barycentric weights, as the first particle's
-    radius plus the weighted differences of the others, so that equal radii stay exact. A contact without a shape
+    radius plus the weighted differences of the others, so that equal radii stay exact. With ``has_shape_radius``, a
+    nonnegative ``shape_radius`` of the contact's shape replaces the particle radius. A contact without a shape
     (``shape < 0``) has no margin.
     """
     c = wp.tid()
@@ -4078,8 +4318,12 @@ def add_contact_thickness_kernel(
             p = extra_particle[c, k]
             if p >= 0:
                 radius += extra_alpha[c, k] * (particle_radius[p] - radius0)
-    if shape[c] >= 0:
-        radius += shape_margin[shape[c]]
+    s = shape[c]
+    if s >= 0:
+        if has_shape_radius:
+            if shape_radius[s] >= 0.0:
+                radius = shape_radius[s]
+        radius += shape_margin[s]
     offset[c] = offset[c] + wp.float64(radius)
 
 

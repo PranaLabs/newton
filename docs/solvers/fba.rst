@@ -191,7 +191,11 @@ Contacts
   their edges must come compared with their particles' nearest triangles, and
   :meth:`~newton.solvers.SolverFBA.set_particle_self_contact` changes the
   margin between steps, so that a dropped cloth can land with a thick margin
-  and fold with a thin one.
+  and fold with a thin one. ``particle_self_contact_group_ids`` gives each
+  particle a group, such as one per body of a pile: the particles and
+  triangles of two groups keep the margin apart, and those of one group the
+  group's margin from ``particle_self_contact_group_margins``, or do not
+  collide.
 - ``friction_anchors=True`` keeps the point a contact presses on across steps,
   on the other layer for a self contact or on a static shape, so its friction
   rows pull back the slip that a step's solve leaves instead of letting it add
@@ -208,6 +212,15 @@ Contacts
   so that a resting or held object starts its step at the forces that carry
   it, which a few iterations per step cannot build up from zero. It needs
   friction and the full operator.
+- ``shape_particle_radius_override`` sets the particles' contact thickness
+  against chosen shapes, between zero and the smallest particle radius, so
+  that a gripper can close on a body whose particle radius holds it off the
+  floor.
+- ``nsn_sparse_storage=True`` keeps the contact operator and the Newton
+  matrix of the full operator's steps in CSR form without their zero entries,
+  such as those between separate bodies, which saves most of their memory and
+  work for many contacts on many bodies, as in a pile of soft bodies. It
+  needs friction and the full operator.
 - The friction coefficient of a particle contact is its shape's ``mu``,
   ``model.particle_mu`` for self contacts, and the mean of the two shapes'
   ``mu`` for rigid contacts.

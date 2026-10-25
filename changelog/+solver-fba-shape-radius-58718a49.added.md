@@ -1,0 +1,1 @@
+Add `shape_particle_radius_override` to `SolverFBA`, the particle contact thickness against chosen shapes in place of the particle radius, so that a gripper can close on a body whose particle radius holds it off the floor.

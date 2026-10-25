@@ -19,6 +19,8 @@ names the body slot ``row_slot[r, k]`` (-1 for none) and its coefficients
 import numpy as np
 import warp as wp
 
+from .kernels import csr_row_of
+
 # Stability clamp on the rotation per step, |omega| * dt <= 0.5 [rad].
 _MAX_STEP_ROTATION = wp.constant(wp.float64(0.5))
 # Step rotations with squared norm below this are treated as numerical noise.
@@ -216,6 +218,53 @@ def rigid_delassus_kernel(
                 if row_slot[j, y] == s:
                     w += wp.dot(row_jac[i, x], slot_inv_mass[s] * row_jac[j, y])
     W[i, j] = w
+
+
+@wp.kernel
+def rigid_delassus_csr_kernel(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    soft_offsets: wp.array[wp.int32],
+    soft_columns: wp.array[wp.int32],
+    soft_values: wp.array[wp.float64],
+    n_soft: int,
+    soft_tail: int,
+    row_slot: wp.array2d[wp.int32],
+    row_jac: wp.array2d[wp.spatial_vectord],
+    slot_inv_mass: wp.array[wp.spatial_matrixd],
+    # outputs
+    values: wp.array[wp.float64],
+):
+    """The entries of :func:`rigid_delassus_kernel`'s ``W`` at a CSR pattern, one thread per entry, from the
+    deformable block ``W_soft`` in CSR form, without its zero entries."""
+    k = wp.tid()
+    i = csr_row_of(offsets, k)
+    j = columns[k]
+    w = wp.float64(0.0)
+    if (i < n_soft or i >= soft_tail) and (j < n_soft or j >= soft_tail):
+        si, sj = i, j
+        if i >= soft_tail:
+            si = n_soft + i - soft_tail
+        if j >= soft_tail:
+            sj = n_soft + j - soft_tail
+        lo = soft_offsets[si]
+        hi = soft_offsets[si + 1]
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if soft_columns[mid] < sj:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo < soft_offsets[si + 1]:
+            if soft_columns[lo] == sj:
+                w = soft_values[lo]
+    for x in range(2):
+        s = row_slot[i, x]
+        if s >= 0:
+            for y in range(2):
+                if row_slot[j, y] == s:
+                    w += wp.dot(row_jac[i, x], slot_inv_mass[s] * row_jac[j, y])
+    values[k] = w
 
 
 @wp.kernel

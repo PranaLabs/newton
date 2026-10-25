@@ -1,0 +1,1 @@
+Add `nsn_sparse_storage` to `SolverFBA`, which runs the full NSN steps of frictional contacts on the Schur matrix in CSR form without its zero entries, such as those between separate bodies, and takes the entries of the inverse system matrix that it needs from the sparse factor without a dense copy.

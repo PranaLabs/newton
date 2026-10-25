@@ -74,6 +74,11 @@ def vertex_face_contacts_kernel(
     rest: wp.array[wp.vec3],
     rest_radius: float,
     query_radius: float,
+    groups: wp.array[wp.int32],
+    group_margins: wp.array[wp.float32],
+    margin: float,
+    gap: float,
+    has_groups: int,
     count: wp.array[wp.int32],
     particles: wp.array2d[wp.int32],
     alpha: wp.array2d[wp.float32],
@@ -84,14 +89,21 @@ def vertex_face_contacts_kernel(
     """The nearest triangle of each particle within ``query_radius``, outside its rings and ``rest_radius`` from it
     at rest, the first of equals among its candidates, in the particle's slot; ``found`` marks the particles
     that have one. The threads of a block, ``_LANES`` on CUDA and one on the CPU, take the candidates
-    of one particle in turn, and test the rings and rest distance of only those nearer than their nearest yet."""
+    of one particle in turn, and test the rings and rest distance of only those nearer than their nearest yet.
+
+    With ``has_groups``, a particle and a triangle of two groups keep ``margin`` apart, and of one group the group's
+    ``group_margins``, or do not collide where it is 0: the nearest triangle is the one whose distance less that margin
+    is least, below ``gap``."""
     v, lane = wp.tid()
     p = q[v]
     best = query_radius
+    if has_groups:
+        best = gap
     best_k = wp.int32(2147483647)
     best_t = wp.int32(-1)
     best_bary = wp.vec3(0.0)
     best_point = wp.vec3(0.0)
+    best_distance = query_radius
     for k in range(lane, wp.min(candidate_count[v], candidates.shape[1]), wp.block_dim()):
         t = candidates[v, k]
         a = tri_indices[t, 0]
@@ -99,7 +111,15 @@ def vertex_face_contacts_kernel(
         c = tri_indices[t, 2]
         point, bary, _feature = triangle_closest_point(q[a], q[b], q[c], p)
         d = wp.length(p - point)
-        if d >= best:
+        key = d
+        if has_groups:
+            pair = margin
+            if groups[v] == groups[a]:
+                pair = group_margins[groups[v]]
+                if pair <= 0.0:
+                    continue
+            key = d - pair
+        if key >= best:
             continue
         if (
             _in_ring(ring_offsets, ring, v, a)
@@ -111,17 +131,21 @@ def vertex_face_contacts_kernel(
             rest_point, _rest_bary, _rest_feature = triangle_closest_point(rest[a], rest[b], rest[c], rest[v])
             if wp.length(rest[v] - rest_point) < rest_radius:
                 continue
-        best = d
+        best = key
         best_k = k
         best_t = t
         best_bary = bary
         best_point = point
+        best_distance = d
     nearest = wp.tile_min(wp.tile(best))[0]
     first = wp.tile_min(wp.tile(wp.where(best == nearest, best_k, wp.int32(2147483647))))[0]
-    hit = first != wp.int32(2147483647) and nearest >= 1.0e-6 * query_radius
+    distance = nearest
+    if has_groups:
+        distance = wp.tile_min(wp.tile(wp.where(best_k == first, best_distance, query_radius)))[0]
+    hit = first != wp.int32(2147483647) and distance >= 1.0e-6 * query_radius
     if lane == 0:
         found[v] = wp.where(hit, 1, 0)
-        nearest_distance[v] = wp.where(hit, nearest, query_radius)
+        nearest_distance[v] = wp.where(hit, distance, query_radius)
     if not hit or best_k != first:
         return
     wp.atomic_add(count, 0, 1)
@@ -130,7 +154,7 @@ def vertex_face_contacts_kernel(
     for i in range(3):
         particles[v, i + 1] = tri_indices[best_t, i]
         alpha[v, i + 1] = -best_bary[i]
-    normal[v] = (p - best_point) / best
+    normal[v] = (p - best_point) / best_distance
 
 
 @wp.kernel
@@ -358,6 +382,8 @@ class SelfContact:
     lie on no triangle take no contact. In both modes the tetrahedron edges count as mesh edges for the rings, since
     the two faces of a thin solid share its tetrahedra while lying far apart on its surface.
 
+    :meth:`set_groups` gives the vertex-face contacts a margin within each group of particles, or none.
+
     Args:
         model: Model with the triangles.
         mode: ``"vertex_face"`` or ``"vertex_vertex"``.
@@ -412,6 +438,9 @@ class SelfContact:
             self.found_normal = wp.empty(model.particle_count, dtype=wp.vec3, device=self.device)
             # Each particle's distance to its nearest triangle, the query radius when it has none.
             self.nearest_distance = wp.empty(model.particle_count, dtype=float, device=self.device)
+            # The groups of the particles and their margins, from set_groups.
+            self.groups, self.group_margins, self.margin, self.gap = None, None, 0.0, 0.0
+            self.within_groups = True
         else:
             self.grid = wp.HashGrid(128, 128, 128, device=self.device)
         # Contacts found, and the most candidate triangles of a particle.
@@ -431,6 +460,40 @@ class SelfContact:
             self.edge_contact_count = wp.zeros(1, dtype=wp.int32, device=self.device)
             self.edge_edge_ratio = float(edge_edge_ratio)
             self._allocate_edge_contacts(n_edges)
+
+    def set_groups(self, groups: np.ndarray, group_margins: np.ndarray | None, margin: float, gap: float) -> None:
+        """Keep a particle and a triangle of two groups ``margin`` apart and of one group ``group_margins[group]``,
+        or let them pass where it is 0 or without ``group_margins``, finding the contacts within the margin plus
+        ``gap``.
+
+        Args:
+            groups: Group of each particle, shape ``(particle_count,)``; the particles of a triangle share one.
+            group_margins: Margin [m] within each group, 0 for none, or ``None`` for none in any group.
+            margin: Margin [m] between groups.
+            gap: Detection distance [m] beyond the margin.
+        """
+        if self.mode != "vertex_face" or self.edge_edge:
+            raise ValueError("self-contact groups need vertex-face contacts without edge-edge contacts")
+        self._groups_h = np.asarray(groups, dtype=np.int32)
+        if group_margins is None:
+            group_margins = np.zeros(int(self._groups_h.max()) + 1)
+        self._group_margins_h = np.asarray(group_margins, dtype=np.float32)
+        # Whether any group collides with itself.
+        self.within_groups = bool((self._group_margins_h > 0.0).any())
+        self.groups = wp.array(self._groups_h, dtype=wp.int32, device=self.device)
+        self.group_margins = wp.array(self._group_margins_h, dtype=wp.float32, device=self.device)
+        self.set_margin(margin, gap)
+
+    def set_margin(self, margin: float, gap: float) -> None:
+        """Change the margin between groups and the detection gap of :meth:`set_groups`."""
+        self.margin, self.gap = float(margin), float(gap)
+        self.query_radius = max(self.margin, float(self._group_margins_h.max())) + self.gap
+
+    def contact_margins(self, particles: np.ndarray) -> np.ndarray:
+        """Margins [m] of vertex-face contacts on ``particles``, shape ``(C, 4)``, under :meth:`set_groups`; float32."""
+        group = self._groups_h[particles[:, 0]]
+        same = group == self._groups_h[particles[:, 1]]
+        return np.where(same, self._group_margins_h[group], np.float32(self.margin)).astype(np.float32)
 
     def _bounds(self, q: wp.array) -> None:
         inputs = [q, self.tri_indices]
@@ -510,7 +573,11 @@ class SelfContact:
                 found = [self.candidates, self.candidate_count]
                 inputs = [q, self.query_mask, self.bvh.id, self.query_radius]
                 wp.launch(triangle_candidates_kernel, q.shape[0], inputs, [*found, self.count], device=self.device)
-                inputs = [q, self.tri_indices, *found, *filters]
+                groups = [self.groups, self.group_margins, self.margin, self.gap, 1]
+                if self.groups is None:
+                    empty = (wp.empty(1, dtype=t, device=self.device) for t in (wp.int32, wp.float32))
+                    groups = [*empty, 0.0, 0.0, 0]
+                inputs = [q, self.tri_indices, *found, *filters, *groups]
                 kernel, outputs = vertex_face_contacts_kernel, [*outputs, self.found, self.nearest_distance]
                 wp.launch_tiled(
                     kernel, dim=[q.shape[0]], inputs=inputs, outputs=outputs, block_dim=_LANES, device=self.device

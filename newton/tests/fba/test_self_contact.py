@@ -12,6 +12,7 @@ import newton
 from newton._src.solvers.fba.kernels import _mat13d
 from newton._src.solvers.fba.self_contact import SelfContact, particle_rings
 from newton._src.solvers.vbd.tri_mesh_collision import TriMeshCollisionDetector
+from newton.solvers import SolverFBA
 
 
 def _closest_on_triangle(p, a, b, c):
@@ -100,6 +101,35 @@ class TestSelfContactDetection(unittest.TestCase):
         self.assertGreater(contact.candidates.shape[1], 1)
         for got, want in zip(found, expected, strict=True):
             np.testing.assert_array_equal(got, want)
+
+    def test_group_margins(self):
+        """Find the sheets 1 cm apart within a 1.2 cm margin between groups, with or without margins within groups, but
+        not as one group with a 2 mm margin or without contacts within it; refuse margins without groups, and a
+        triangle across two groups."""
+        model = self._sheets()
+        half = model.particle_count // 2
+        two = np.repeat(np.arange(2, dtype=np.int32), half)
+        common = {"particle_enable_self_contact": True, "particle_self_contact_margin": 0.012}
+        common["particle_self_contact_gap"] = 0.001
+        groups = {"particle_self_contact_group_ids": two, "particle_self_contact_group_margins": [0.002, 0.002]}
+        self.assertEqual(
+            SolverFBA(model, **common, **groups)._self_contact.find(model.particle_q), model.particle_count
+        )
+        groups = {"particle_self_contact_group_ids": 0 * two, "particle_self_contact_group_margins": [0.002]}
+        self.assertEqual(SolverFBA(model, **common, **groups)._self_contact.find(model.particle_q), 0)
+        found = SolverFBA(model, **common, particle_self_contact_group_ids=two)._self_contact.find(model.particle_q)
+        self.assertEqual(found, model.particle_count)
+        self.assertEqual(
+            SolverFBA(model, **common, particle_self_contact_group_ids=0 * two)._self_contact.find(model.particle_q), 0
+        )
+        with self.assertRaises(ValueError):
+            SolverFBA(model, **common, particle_self_contact_group_margins=[0.002])
+        mixed = two.copy()
+        mixed[0] = 1
+        with self.assertRaises(ValueError):
+            SolverFBA(
+                model, **common, particle_self_contact_group_ids=mixed, particle_self_contact_group_margins=[1, 1]
+            )
 
     def test_vertex_face_skips_the_interior_particles_of_solids(self):
         """Give a solid's interior particle no vertex-face contact, and its surface particles, a cloth's and a free
@@ -480,6 +510,32 @@ class TestSelfContactSolve(unittest.TestCase):
         worst, gap = self._drop(0.03, particle_enable_self_contact=True, **kw)
         self.assertEqual(worst, 0)
         self.assertAlmostEqual(gap, 0.005, delta=2e-4)
+
+    def test_groups_hold_their_margins(self):
+        """Rest the upper sheet 8 mm over the lower one, the margin between the sheets' groups, with or without margins
+        within the groups, or 5 mm as one group with that margin, through the device and the host contact assembly
+        (face contacts); as one group without contacts within it, without margins or with a 0 margin, the upper sheet
+        falls through the lower one."""
+        kw = {"particle_enable_self_contact": True, "particle_self_contact_margin": 0.008}
+        kw["particle_self_contact_gap"] = 0.02
+        half = 11 * 11  # particles of a sheet
+        for face_contacts in (False, True):
+            for ids, margins, expected in (
+                ([0] * half + [1] * half, [0.002, 0.002], 0.008),
+                ([0] * half + [1] * half, None, 0.008),
+                ([0] * 2 * half, [0.005], 0.005),
+                ([0] * 2 * half, None, None),
+                ([0] * 2 * half, [0.0], None),
+            ):
+                with self.subTest(face_contacts=face_contacts, margins=margins, expected=expected):
+                    groups = {"particle_self_contact_group_ids": np.array(ids)}
+                    groups["particle_self_contact_group_margins"] = margins
+                    worst, gap = self._drop(0.03, face_contacts=face_contacts, **kw, **groups)
+                    if expected is None:
+                        self.assertGreater(worst, 100)
+                    else:
+                        self.assertEqual(worst, 0)
+                        self.assertAlmostEqual(gap, expected, delta=2e-4)
 
     def test_edge_edge_leaves_flat_layers_to_vertex_face(self):
         """Rest the upper sheet 5 mm over the lower one with edge-edge contacts on, which flat layers barely take.
