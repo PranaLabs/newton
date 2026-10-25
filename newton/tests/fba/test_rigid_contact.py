@@ -602,7 +602,9 @@ class TestSolverFBATwoWayContacts(unittest.TestCase):
         if not wp.is_cuda_available():
             raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
 
-    def _run(self, gravity, cloth_z, v_cloth, box_density, particle_mass, steps, ground=False, observe=False):
+    def _run(
+        self, gravity, cloth_z, v_cloth, box_density, particle_mass, steps, ground=False, observe=False, **solver_args
+    ):
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, gravity))
@@ -616,7 +618,7 @@ class TestSolverFBATwoWayContacts(unittest.TestCase):
             pos=pos, rot=wp.quat_identity(), vel=vel, mass=particle_mass, particle_radius=0.0, **grid
         )
         model = builder.finalize()
-        solver = SolverFBA(model, iterations=10)
+        solver = SolverFBA(model, iterations=10, **solver_args)
         s0, s1 = model.state(), model.state()
         pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.11)
         contacts, momentum = pipeline.contacts(), []
@@ -634,6 +636,14 @@ class TestSolverFBATwoWayContacts(unittest.TestCase):
         solver, state, momentum, m_cloth, m_box, _ = self._run(0.0, 1.05, -1.0, 1.0, 0.02, 60)
         self.assertTrue(solver._two_way)
         # Each step rounds the float32 particle positions, by up to m_cloth ulp(1) / dt of momentum.
+        np.testing.assert_allclose(momentum[:20], np.tile([0.0, 0.0, -m_cloth], (20, 1)), atol=5e-5)
+        self.assertAlmostEqual(state.body_qd.numpy()[0, 2], -m_cloth / (m_cloth + m_box), delta=1e-3)
+
+    def test_sparse_storage_conserves_momentum(self):
+        """Conserve momentum in the same collision with the two-way rows solved from the sparse storage."""
+        solver, state, momentum, m_cloth, m_box, _ = self._run(0.0, 1.05, -1.0, 1.0, 0.02, 60, nsn_sparse_storage=True)
+        self.assertTrue(solver._two_way)
+        self.assertGreater(solver._rc_W_sparse[0].nnz, 0)
         np.testing.assert_allclose(momentum[:20], np.tile([0.0, 0.0, -m_cloth], (20, 1)), atol=5e-5)
         self.assertAlmostEqual(state.body_qd.numpy()[0, 2], -m_cloth / (m_cloth + m_box), delta=1e-3)
 

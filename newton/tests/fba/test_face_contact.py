@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -255,6 +256,76 @@ class TestContactRowsOnSeveralParticles(unittest.TestCase):
                 self.assertEqual(self.solver._W_device_d.shape, (capacity, capacity))
                 self.assertEqual(view.strides, (capacity * 8, 8))
 
+    def test_delassus_from_exact_inverse_entries(self):
+        """Build the same Schur matrix from the entries of ``A⁻¹`` taken from the sparse columns of the factor."""
+        self.solver.exact_inverse_entries = True
+        self.solver.build_schur_complement(
+            3, *self.args, download=False, j_extra_indices=self.extra[0], j_extra_alpha=self.extra[1]
+        )
+        np.testing.assert_allclose(
+            self.solver.W_device_view().numpy(), self.J @ self.A_inv @ self.J.T, rtol=1e-5, atol=1e-8
+        )
+
+    def test_delassus_from_component_blocks(self):
+        """Build the Schur matrix of a system of two unconnected parts, with a row on particles of both, from the
+        entries of ``A⁻¹`` within each part, as dense algebra does, densely and in CSR form without zero entries."""
+        import scipy.sparse as sp
+
+        from newton._src.solvers.fba.linear_solver import (  # noqa: PLC0415
+            FBALinearSolver,
+            connected_components,
+            factorize_and_sparse_inverse,
+        )
+
+        rng = np.random.default_rng(11)
+        blocks = []
+        for _ in range(2):
+            off = rng.uniform(-0.3, 0.3, 5)
+            blocks.append(sp.diags([off, rng.uniform(5.0, 15.0, 6), off], [-1, 0, 1]))
+        A = sp.block_diag(blocks, format="csr")
+        components = connected_components(A)
+        np.testing.assert_array_equal(components, [0] * 6 + [6] * 6)
+        A_inv = np.kron(np.linalg.inv(A.toarray()), np.eye(3))
+        factor = factorize_and_sparse_inverse(A)
+        particle, alpha = np.array([1, 4, 8, 2]), np.array([1.0, 0.7, 1.0, 1.0])
+        extra = np.full((4, 3), -1)
+        extra[3] = [9, 10, 11]  # a contact of particle 2 with a triangle of the other part
+        extra_alpha = np.zeros((4, 3))
+        extra_alpha[3] = [-0.2, -0.5, -0.3]
+        frames = np.linalg.qr(rng.standard_normal((4, 3, 3)))[0]
+        J = np.zeros((12, 36))
+        for c in range(4):
+            for p, w in zip([particle[c], *extra[c]], [alpha[c], *extra_alpha[c]], strict=True):
+                if p >= 0:
+                    J[3 * c : 3 * c + 3, 3 * p : 3 * p + 3] += w * frames[c].T
+        args = [(particle, wp.int32), (frames[:, :, 0], wp.vec3), (alpha, wp.float32)]
+        args += [(frames[:, :, 1], wp.vec3), (frames[:, :, 2], wp.vec3)]
+        expected = J @ A_inv @ J.T
+        for sparse in (False, True):
+            solver = FBALinearSolver(factor, device=wp.get_device())
+            solver.exact_inverse_entries, solver.components, solver.sparse_W = True, components, sparse
+            solver.build_schur_complement(
+                4,
+                *[wp.array(a, dtype=t) for a, t in args],
+                download=False,
+                j_extra_indices=wp.array(extra, dtype=wp.int32),
+                j_extra_alpha=wp.array(extra_alpha, dtype=wp.float32),
+            )
+            if not sparse:
+                np.testing.assert_allclose(solver.W_device_view().numpy(), expected, rtol=1e-5, atol=1e-8)
+                continue
+            W = solver.W_sparse[0]
+            rows = np.repeat(np.arange(12), np.diff(W.offsets.numpy()))
+            columns, values = W.columns.numpy()[: W.nnz], W.values.numpy()[: W.nnz]
+            dense = np.zeros((12, 12))
+            dense[rows, columns] = values
+            np.testing.assert_allclose(dense, expected, rtol=1e-5, atol=1e-8)
+            self.assertTrue(((values != 0.0) | (rows == columns)).all())
+            # Each row lists its columns once, ascending: row 3 has three particles in the second part.
+            self.assertTrue((np.diff(columns)[np.diff(rows) == 0] > 0).all())
+            # Contacts 0 and 1 lie in one part, contact 2 in the other, and contact 3 in both.
+            self.assertFalse(dense[0:6, 6:9].any())
+
     def test_correction(self):
         """Gather ``Jᵀ λ`` over every particle of a row in the correction ``x = A⁻¹ (rhs + Jᵀ λ)``."""
         rng = np.random.default_rng(3)
@@ -287,9 +358,10 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
         if not wp.is_cuda_available():
             raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
 
-    def _run(self, face_contacts, pos, cells, steps, thickness=0.0, mesh_half=None):
+    def _run(self, face_contacts, pos, cells, steps, thickness=0.0, mesh_half=None, shape_radius=None, **solver_args):
         """Final particle positions, the largest particle speed and the solver; ``mesh_half`` swaps the box for
-        a closed mesh box with these half extents, its base also at ``z = 0``."""
+        a closed mesh box with these half extents, its base also at ``z = 0``, and ``shape_radius`` is the
+        solver's ``shape_particle_radius_override``."""
         builder = newton.ModelBuilder()
         cfg = newton.ModelBuilder.ShapeConfig(mu=0.6)
         if mesh_half is None:
@@ -314,7 +386,13 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
             particle_radius=thickness,
         )
         model = builder.finalize()
-        solver = newton.solvers.SolverFBA(model, iterations=10, face_contacts=face_contacts)
+        solver = newton.solvers.SolverFBA(
+            model,
+            iterations=10,
+            face_contacts=face_contacts,
+            shape_particle_radius_override=shape_radius,
+            **solver_args,
+        )
         pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.15 - thickness)
         contacts, s0, s1, speed = pipeline.contacts(), model.state(), model.state(), 0.0
         for _ in range(steps):
@@ -352,6 +430,38 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
         x, _, _ = self._run(True, (-0.1, -0.1, 0.62), 4, 60, thickness=3e-3)
         np.testing.assert_allclose(x[:, 2] - 0.6, 3e-3, atol=1e-5)
         x, speed, solver = self._run(True, (0.0, -0.3, 0.65), 12, 240, thickness=3e-3)
+        self.assertGreater(self._deepest(x, solver), 1e-3)
+        self.assertLess(speed, 1.5)
+
+    def test_shape_radius_override(self):
+        """Rest a cloth of 28 mm particle radii 2 mm above the top face with a 2 mm radius against the box, which
+        leaves the model's particle radii as they are; refuse a radius beyond the particle radii or an unknown shape."""
+        x, _, solver = self._run(True, (-0.1, -0.1, 0.64), 4, 60, thickness=0.028, shape_radius={0: 0.002})
+        np.testing.assert_allclose(x[:, 2] - 0.6, 0.002, atol=1e-5)
+        np.testing.assert_allclose(solver.model.particle_radius.numpy(), 0.028)
+        for override in ({0: 0.03}, {0: -0.001}, {1: 0.002}):
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                newton.solvers.SolverFBA(solver.model, shape_particle_radius_override=override)
+        with self.assertRaises(ValueError):
+            newton.solvers.SolverFBA(solver.model, friction_anchors=True, shape_particle_radius_override={0: 0.002})
+
+    def test_sparse_storage(self):
+        """Rest the cloth on the top face where the dense full NSN does, to rounding, and clear the edge where it drapes
+        over it, with the sparse storage; sliding over the edge, the two drift apart by more than rounding. A step
+        replayed from a graph moves the cloth as one launched without it."""
+        dense, _, _ = self._run(True, (-0.1, -0.1, 0.62), 4, 60, thickness=3e-3)
+        sparse, _, solver = self._run(True, (-0.1, -0.1, 0.62), 4, 60, thickness=3e-3, nsn_sparse_storage=True)
+        np.testing.assert_allclose(sparse, dense, atol=1e-6)
+        self.assertIsNone(solver._nsn_a_schur_d)
+        # Ten conjugate residual iterations, which read nothing back, let a graph replay each NSN step; launched
+        # without it, the step moves the cloth alike.
+        capped = {"thickness": 3e-3, "nsn_sparse_storage": True, "nsn_linear_iterations": 10}
+        graphed, _, solver = self._run(True, (-0.1, -0.1, 0.62), 4, 60, **capped)
+        self.assertIsNotNone(solver._nsn_graph[1])
+        with mock.patch.object(wp, "ScopedCapture", side_effect=RuntimeError):
+            launched, _, _ = self._run(True, (-0.1, -0.1, 0.62), 4, 60, **capped)
+        np.testing.assert_array_equal(launched, graphed)
+        x, speed, solver = self._run(True, (0.0, -0.3, 0.65), 12, 240, thickness=3e-3, nsn_sparse_storage=True)
         self.assertGreater(self._deepest(x, solver), 1e-3)
         self.assertLess(speed, 1.5)
 

@@ -680,15 +680,15 @@ class NSNPCRSolver:
         W_bsr,
         b: wp.array[wp.float64],
         x_out: wp.array[wp.float64],
+        block_precond: Callable[[wp.array, wp.array], None] | None = None,
     ) -> int:
-        """LiteNSN sparse-Schur PCR: ``W_bsr @ x = b`` for a BSR ``W`` with
-        ``1x1`` blocks.
+        """Sparse PCR: ``W_bsr @ x = b`` for a BSR ``W`` with ``1x1`` blocks.
 
         Matches :meth:`solve` numerically: same termination criterion, same
         Jacobi preconditioner, same ``check_every`` host-sync cadence, but
         replaces the dense tiled matvec with :func:`warp.sparse.bsr_mv`. The
         sparse lite NSN takes it through :meth:`solve_sparse_fused` for runs
-        that check the residual.
+        that check the residual, and the sparse full NSN calls it directly.
 
         The residual is first checked after ``check_every`` iterations. When all
         ``max_iter`` iterations fit before it, the tolerance cannot end the run
@@ -700,6 +700,8 @@ class NSNPCRSolver:
                 ``wp.float64``, such as the Newton matrix of the sparse lite NSN.
             b: ``(n,)`` RHS, fp64.
             x_out: ``(n,)`` output, fp64.
+            block_precond: Optional exact block solve over the Jacobi
+                product, as in :meth:`solve`.
 
         Returns:
             The iterations taken.
@@ -746,9 +748,11 @@ class NSNPCRSolver:
         # ----- Symmetric PCR, as in :meth:`solve` -------------------------
         # ``wps.bsr_mv`` checks that x.shape[0] == W.cols, so the scratch
         # buffers (sized to max_n) are sliced to the active size ``n``.
-        self._block_precond = None
+        self._block_precond = block_precond
         wp.copy(self._r, b, count=n)
         wp.launch(_apply_precond_kernel, dim=n, inputs=[self._r, self._precond], outputs=[self._s], device=device)
+        if block_precond is not None:
+            block_precond(self._r, self._s)
         wp.copy(self._d, self._s, count=n)
         wps.bsr_mv(W_bsr, self._d[:n], self._q[:n])
         wp.utils.array_inner(self._s, self._q, out=self._rho_d, count=n)

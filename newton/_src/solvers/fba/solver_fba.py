@@ -194,7 +194,9 @@ class SolverFBA(SolverBase):
         friction_anchors: bool = False,
         lambda_cap: float | None = None,
         shape_angular_velocity: dict[int, float] | None = None,
+        shape_particle_radius_override: dict[int, float] | None = None,
         nsn_schur_mode: Literal["full", "lite"] = "full",
+        nsn_sparse_storage: bool = False,
         integrate_with_external_rigid_solver: bool = False,
         contact_regularization: float = 1.0e-2,
         face_contacts: bool = False,
@@ -210,6 +212,8 @@ class SolverFBA(SolverBase):
         particle_self_contact_gap: float | None = None,
         particle_topological_contact_filter_threshold: int = 2,
         particle_rest_shape_contact_exclusion_radius: float = 0.0,
+        particle_self_contact_group_ids: ArrayLike | None = None,
+        particle_self_contact_group_margins: ArrayLike | None = None,
         rayleigh_alpha: float | ArrayLike = 0.0,
         rayleigh_beta: float | ArrayLike = 0.0,
         rayleigh_corotated: bool = False,
@@ -260,6 +264,16 @@ class SolverFBA(SolverBase):
                 velocity ``ω · cross(axis_world, world_anchor - shape_center)``
                 enters the residual of the friction rows; the shape geometry
                 itself stays static. Defaults to no kinematic motion.
+            shape_particle_radius_override: Optional ``{shape_index: radius}``
+                mapping of the contact thickness [m] of the particles against
+                the listed shapes: their particle and face contacts stop this
+                radius plus the shape margin outside the shape surface, in
+                place of the particle radius, so that a gripper can close on
+                a body whose particle radius holds it off the floor. A radius
+                lies between 0 and the smallest particle radius, since the
+                collision pipeline still finds the contacts at the particle
+                radii. Other shapes and self contacts keep the particle
+                radii. Not supported with ``friction_anchors``.
             nsn_schur_mode: Contact operator ``W`` of the NSN steps.
                 ``"full"`` (default) builds ``J A⁻¹ Jᵀ`` from the prefactored
                 system matrix ``A``. ``"lite"`` replaces ``A⁻¹`` by
@@ -276,6 +290,19 @@ class SolverFBA(SolverBase):
                 up to ``dt² F / m`` for a normal force ``F`` [N] on a particle
                 of mass ``m`` [kg], and more iterations do not reduce that.
                 Contacts on integrated bodies and face contacts need ``"full"``.
+            nsn_sparse_storage: If ``True``, the full NSN steps of frictional
+                contacts keep ``W`` and their Newton matrix in CSR form
+                without the entries that are zero, such as those between the
+                contacts of separate bodies, and ``W`` takes the entries of
+                ``A⁻¹`` it needs from the sparse inverse factor directly,
+                without a dense copy of its columns. For many contacts on many
+                separate bodies, such as a pile of soft bodies, this saves the
+                dense Newton matrix and most of the work of the conjugate
+                residual iterations. ``W`` is composed in CSR form once per
+                step; the block of ``A⁻¹`` on the contacted particles stays
+                dense. Sums run in another order than the dense path's,
+                so results differ by rounding. Needs ``friction=True`` and
+                ``nsn_schur_mode="full"``.
             integrate_with_external_rigid_solver: If ``True``, rigid bodies are
                 integrated by another solver: FBA reads their poses and
                 velocities from ``state_in``, at which the step's contacts were
@@ -380,6 +407,21 @@ class SolverFBA(SolverBase):
                 ``model.particle_q`` within which a particle does not collide
                 with a triangle or particle, so that a fold can close only
                 between parts that start apart.
+            particle_self_contact_group_ids: Optional group of each particle,
+                shape ``(particle_count,)``, such as one group per body of a
+                pile; the particles of a triangle share one. A particle and a
+                triangle of two groups keep ``particle_self_contact_margin``
+                apart, and of one group its margin from
+                ``particle_self_contact_group_margins``, or do not collide
+                where it is 0 or without it. Needs
+                ``particle_enable_self_contact=True`` with
+                ``particle_self_contact_mode="vertex_face"``;
+                not supported with ``particle_self_contact_edge_edge`` or
+                ``friction_anchors``.
+            particle_self_contact_group_margins: Self-contact margin [m]
+                within each group of ``particle_self_contact_group_ids``; 0
+                lets the particles of a group pass through its triangles, and
+                ``None`` those of every group.
             rayleigh_alpha: Mass-proportional Rayleigh damping coefficient
                 [1/s]: a particle of mass ``m`` moving at ``v`` feels the force
                 ``-alpha m v``. A scalar for every particle, or one value per
@@ -487,6 +529,10 @@ class SolverFBA(SolverBase):
             self._anchor_triangle_d = wp.full(n, wp.vec3i(-1, -1, -1), dtype=wp.vec3i, device=model.device)
             self._anchor_bary_d = wp.zeros(n, dtype=wp.vec3, device=model.device)
             self._anchor_step_d = wp.full(n, -2, dtype=wp.int32, device=model.device)
+        if nsn_sparse_storage and (not self.friction or nsn_schur_mode != "full"):
+            raise ValueError("nsn_sparse_storage needs friction=True and nsn_schur_mode='full'")
+        self.nsn_sparse_storage = bool(nsn_sparse_storage)
+        self._nsn_graph = None
         if nsn_linear_iterations is not None and nsn_linear_iterations < 1:
             raise ValueError(f"nsn_linear_iterations must be >= 1 or None, got {nsn_linear_iterations}")
         self.nsn_linear_iterations = None if nsn_linear_iterations is None else int(nsn_linear_iterations)
@@ -550,6 +596,30 @@ class SolverFBA(SolverBase):
                 edge_edge=particle_self_contact_edge_edge,
                 edge_edge_ratio=particle_self_contact_edge_edge_ratio,
             )
+        if particle_self_contact_group_margins is not None and particle_self_contact_group_ids is None:
+            raise ValueError("particle_self_contact_group_margins needs particle_self_contact_group_ids")
+        self._self_contact_groups = particle_self_contact_group_ids is not None
+        if self._self_contact_groups:
+            if self._self_contact is None or self.friction_anchors:
+                raise ValueError("self-contact groups need particle_enable_self_contact and no friction_anchors")
+            groups = np.asarray(particle_self_contact_group_ids)
+            if not np.issubdtype(groups.dtype, np.integer) or groups.shape != (model.particle_count,):
+                raise ValueError("particle_self_contact_group_ids needs one integer group per particle")
+            if groups.min() < 0:
+                raise ValueError("particle_self_contact_group_ids must be nonnegative")
+            margins = particle_self_contact_group_margins
+            if margins is not None:
+                margins = np.asarray(margins, dtype=np.float64)
+                if margins.ndim != 1 or len(margins) <= groups.max():
+                    raise ValueError("particle_self_contact_group_margins needs a margin for each group")
+                if not np.isfinite(margins).all() or (margins < 0.0).any():
+                    raise ValueError("particle_self_contact_group_margins must be nonnegative")
+            triangles = model.tri_indices.numpy()
+            if (groups[triangles] != groups[triangles[:, :1]]).any():
+                raise ValueError("the particles of a triangle must share one self-contact group")
+            self._self_contact.set_groups(
+                groups, margins, particle_self_contact_margin, query_radius - particle_self_contact_margin
+            )
         if self.face_contacts:
             if not self.friction or nsn_schur_mode != "full":
                 raise ValueError("face_contacts needs friction=True and nsn_schur_mode='full'")
@@ -572,6 +642,23 @@ class SolverFBA(SolverBase):
         # Device mirror consumed by the GPU contact kernels; the
         # host array stays the source of truth (small, rarely modified).
         self._shape_omega_d = wp.array(self._shape_omega_h, dtype=wp.float64, device=model.device)
+        # Per-shape particle contact thickness, -1 where the particle radius holds; None without overrides.
+        self._shape_radius_d = None
+        if shape_particle_radius_override:
+            if self.friction_anchors:
+                raise ValueError("shape_particle_radius_override is not supported with friction_anchors")
+            smallest = float(model.particle_radius.numpy().min()) if model.particle_count else 0.0
+            radii = np.full(max(n_shapes, 1), -1.0, dtype=np.float32)
+            for shape, radius in shape_particle_radius_override.items():
+                if not isinstance(shape, (int, np.integer)) or not 0 <= shape < n_shapes:
+                    raise ValueError(f"shape_particle_radius_override names shape {shape}, which the model lacks")
+                if not np.isfinite(radius) or not 0.0 <= radius <= smallest:
+                    raise ValueError(
+                        f"shape_particle_radius_override radius {radius} of shape {shape} is not between 0 and the "
+                        f"smallest particle radius {smallest}"
+                    )
+                radii[shape] = radius
+            self._shape_radius_d = wp.array(radii, dtype=wp.float32, device=model.device)
 
         # PD setup is dt-dependent; we cache the assembly at a reference dt and
         # rebuild lazily inside `step` if the dt changes.
@@ -911,7 +998,10 @@ class SolverFBA(SolverBase):
                 outputs=[self._rc_row_slot_d, self._rc_row_jac_d],
                 device=device,
             )
-        self._rc_W_d = wp.empty((n, n), dtype=wp.float64, device=device)
+        if self.nsn_sparse_storage:
+            self._rc_W_pattern = self._two_way_pattern(n, n_s, n - n_b)
+        else:
+            self._rc_W_d = wp.empty((n, n), dtype=wp.float64, device=device)
         self._compose_rigid_delassus()
         incidence = row_incidence(np.repeat(slots, 3, axis=0), self._rigid_bodies_d.shape[0])
         self._rc_incidence = [wp.array(a, dtype=wp.int32, device=device) for a in incidence]
@@ -1006,11 +1096,44 @@ class SolverFBA(SolverBase):
             ws.joint.store(None, None, 0)
         ws.store_bilateral(*(bilateral if bilateral is not None else (None, None, 0, 0)))
 
+    def _two_way_pattern(self, n: int, n_s: int, soft_tail: int) -> tuple:
+        """CSR pattern of the two-way ``W`` of ``nsn_sparse_storage``: rows couple where their deformable rows'
+        particles share a component of the system, or where they share a body slot."""
+        from .linear_solver import group_pattern  # noqa: PLC0415
+
+        slots = self._rc_row_slot_d.numpy()
+        width = 0 if not n_s else self._linear_solver._row_groups.shape[1]
+        groups = np.full((n, width + 2), -1, dtype=np.int64)
+        if n_s:
+            # The deformable rows: the contact rows, and after the rigid and joint rows the constraint rows.
+            soft = np.concatenate([np.arange(n_s), np.arange(soft_tail, n)])
+            groups[soft, :width] = self._linear_solver._row_groups[: len(soft)]
+        # Body slots number after every particle, which numbers the components.
+        groups[:, width:] = np.where(slots >= 0, self.model.particle_count + slots, -1)
+        return group_pattern(groups, self._device)
+
     def _compose_rigid_delassus(self) -> None:
         """Compose the two-way ``W`` from the deformable block and the body slots of the rows."""
         from .rigid import rigid_delassus_kernel  # noqa: PLC0415
 
         n, n_s, device = self._rc_n, 3 * self._rc_counts[0], self._device
+        if self.nsn_sparse_storage:
+            from .linear_solver import csr_without_zeros  # noqa: PLC0415
+            from .rigid import rigid_delassus_csr_kernel  # noqa: PLC0415
+
+            offsets, columns, nnz = self._rc_W_pattern
+            values = wp.empty(max(nnz, 1), dtype=wp.float64, device=device)
+            soft = self._linear_solver.W_sparse[0] if n_s else None
+            soft = (
+                [soft.offsets, soft.columns, soft.values] if n_s else [wp.zeros(1, dtype=wp.int32, device=device)] * 2
+            )
+            if not n_s:
+                soft.append(wp.empty(1, dtype=wp.float64, device=device))
+            inputs = [offsets, columns, *soft, n_s, n - self._rc_n_b]
+            inputs += [self._rc_row_slot_d, self._rc_row_jac_d, self._slot_inv_mass_d]
+            wp.launch(rigid_delassus_csr_kernel, nnz, inputs=inputs, outputs=[values], device=device)
+            self._rc_W_sparse = csr_without_zeros(offsets, columns, values, n, nnz)
+            return
         W_soft = self._linear_solver.W_device_view() if n_s else wp.empty((0, 0), dtype=wp.float64, device=device)
         wp.launch(
             rigid_delassus_kernel,
@@ -1042,7 +1165,7 @@ class SolverFBA(SolverBase):
         joint rows solved here get their forces written back to the joint forces.
         Deformable rows also correct the particle positions.
         """
-        from .joints import gather_values_kernel, scatter_values_kernel  # noqa: PLC0415
+        from .joints import gather_values_kernel  # noqa: PLC0415
         from .kernels import particle_constraint_residual_kernel  # noqa: PLC0415
         from .rigid import rigid_row_residual_kernel  # noqa: PLC0415
         from .rigid_contact import rigid_contact_gap_kernel  # noqa: PLC0415
@@ -1109,6 +1232,13 @@ class SolverFBA(SolverBase):
                 outputs=[self._rc_r_d, self._rc_pene0_d],
                 device=device,
             )
+        if m_s:
+            self._linear_solver.reserve_lambda_correction()
+        tail_objects = (self._linear_solver, self._rc_lam_d, self._rc_omega_d, self._rc_lam_soft_d, self._rhs)
+        tail_objects += tuple(
+            getattr(self, name, None)
+            for name in ("_x_cur", "_lam_coulomb_persistent_d", "_omega_coulomb_persistent_d", "_joint_force_d")
+        )
         self._solve_nsn_coulomb_gpu(
             None,
             None,
@@ -1116,7 +1246,11 @@ class SolverFBA(SolverBase):
             None,
             max_iters=1,
             dt=dt,
-            W_device=self._rc_W_d,
+            W_device=None if self.nsn_sparse_storage else self._rc_W_d,
+            W_sparse=self._rc_W_sparse if self.nsn_sparse_storage else None,
+            graph="two-way",
+            graph_tail=functools.partial(self._two_way_contact_tail, m_s, n, n_s, n_b, n_c, joint_rows),
+            graph_tail_objects=tail_objects,
             r_device=self._rc_r_d,
             pene0_device=self._rc_pene0_d,
             mu_device=self._rc_mu_d,
@@ -1129,6 +1263,12 @@ class SolverFBA(SolverBase):
             block_precond=functools.partial(self._joint_system.solve_rows, joint_rows, n_c) if n_j else None,
             contact_regularization=self.contact_regularization,
         )
+        return self._nsn_lam_apply_d
+
+    def _two_way_contact_tail(self, m_s: int, n: int, n_s: int, n_b: int, n_c: int, joint_rows: wp.array) -> None:
+        """Keep the two-way NSN step's multipliers, correct the particle positions and write the joint forces."""
+        from .joints import scatter_values_kernel  # noqa: PLC0415
+
         wp.copy(self._rc_lam_d, self._nsn_lam_d, count=n)
         wp.copy(self._rc_omega_d, self._nsn_omega_d, count=n)
         if m_s:
@@ -1141,15 +1281,14 @@ class SolverFBA(SolverBase):
             self._linear_solver.apply_lambda_correction_combined(lam_soft, self._rhs, self._x_cur)
             wp.copy(self._lam_coulomb_persistent_d, self._rc_lam_d, count=n_s)
             wp.copy(self._omega_coulomb_persistent_d, self._rc_omega_d, count=n_s)
-        if n_j:
+        if joint_rows.shape[0]:
             wp.launch(
                 scatter_values_kernel,
-                dim=n_j,
+                dim=joint_rows.shape[0],
                 inputs=[self._nsn_lam_apply_d, n_c, joint_rows],
                 outputs=[self._joint_force_d],
-                device=device,
+                device=self._device,
             )
-        return self._nsn_lam_apply_d
 
     def _retract_rigid(self, state_in: State, state_out: State, dt: float) -> None:
         from .rigid import retract_rigid_kernel  # noqa: PLC0415
@@ -1333,6 +1472,7 @@ class SolverFBA(SolverBase):
         from .linear_solver import (  # noqa: PLC0415
             FBALinearSolver,
             build_pd_system,
+            connected_components,
             factorize_and_sparse_inverse,
             particle_masses,
         )
@@ -1348,6 +1488,10 @@ class SolverFBA(SolverBase):
         )
         fs = factorize_and_sparse_inverse(A, self.model.particle_q.numpy())
         self._linear_solver = FBALinearSolver(fs, device=self._device)
+        self._linear_solver.exact_inverse_entries = self.nsn_sparse_storage
+        self._linear_solver.sparse_W = self.nsn_sparse_storage
+        if self.nsn_sparse_storage:
+            self._linear_solver.components = connected_components(A)
         device = self._device
         # Particles with zero inverse mass hold at their pin targets, so a mass they keep must not pull them toward
         # their inertial predictions; inactive ones with mass hold where the input state has them, as Newton's
@@ -1828,7 +1972,9 @@ class SolverFBA(SolverBase):
                     # Residual + pene0 + warm-start all device-resident: the PD
                     # outer iter does no host<->device transfers around the NSN
                     # call.
-                    self._ensure_nsn_inner_buffers(3 * M + n_b, alloc_2d=not use_lite_block_diag)
+                    self._ensure_nsn_inner_buffers(
+                        3 * M + n_b, alloc_2d=not use_lite_block_diag and not self.nsn_sparse_storage
+                    )
                     if use_lite_block_diag and self._lite_W is not None:
                         # Rows on several particles couple them: the sparse lite NSN, whose whole correction runs
                         # from one graph per step where it can.
@@ -1930,6 +2076,14 @@ class SolverFBA(SolverBase):
                                 scatter_values_kernel, h.rows.shape[0], [h.zeros, 0, h.rows], outputs, device=device
                             )
                     else:
+                        # With the sparse storage, the copies and the correction below follow the NSN step in its
+                        # graph.
+                        tail, tail_objects = None, ()
+                        if self.nsn_sparse_storage:
+                            ls.reserve_lambda_correction()
+                            tail = functools.partial(self._deformable_contact_tail, ls, 3 * M + n_b)
+                            tail_objects = (ls, self._lam_coulomb_persistent_d, self._omega_coulomb_persistent_d)
+                            tail_objects += (self._rhs, self._x_cur)
                         self._solve_nsn_coulomb_gpu(
                             None,
                             None,
@@ -1937,7 +2091,11 @@ class SolverFBA(SolverBase):
                             None,
                             max_iters=1,
                             dt=dt,
-                            W_device=ls.W_device_view(),
+                            W_device=None if self.nsn_sparse_storage else ls.W_device_view(),
+                            W_sparse=ls.W_sparse if self.nsn_sparse_storage else None,
+                            graph="deformable",
+                            graph_tail=tail,
+                            graph_tail_objects=tail_objects,
                             r_device=self._nsn_r_d,
                             pene0_device=self._nsn_pene0_d,
                             mu_device=self._contact_mu_d,
@@ -1949,13 +2107,8 @@ class SolverFBA(SolverBase):
                             # Face contacts act on particles that also carry particle contacts.
                             contact_regularization=0.0 if self._contact_extra is None else self.contact_regularization,
                         )
-                    # Persist device-resident lam / omega for next PD iter.
-                    wp.copy(self._lam_coulomb_persistent_d, self._nsn_lam_d, count=3 * M + n_b)
-                    wp.copy(self._omega_coulomb_persistent_d, self._nsn_omega_d, count=3 * M + n_b)
-                    # Apply the contact forces in combined form, with one solve over the incremented right-hand
-                    # side. It runs even when the forces vanish: the solve costs less than reading them back to
-                    # check.
-                    ls.apply_lambda_correction_combined(self._nsn_lam_apply_d, self._rhs, self._x_cur)
+                    if use_lite_block_diag or not self.nsn_sparse_storage:
+                        self._deformable_contact_tail(ls, 3 * M + n_b)
                     if use_lite_block_diag and self._held_rows is not None:
                         self._step_held_rows(ls, M, dt)
                 else:
@@ -2362,7 +2515,10 @@ class SolverFBA(SolverBase):
         if margin <= 0.0 or gap < 0.0:
             raise ValueError(f"set_particle_self_contact needs margin > 0 and gap >= 0, got {margin} and {gap}")
         self.particle_self_contact_margin = float(margin)
-        self._self_contact.query_radius = float(margin) + float(gap)
+        if self._self_contact_groups:
+            self._self_contact.set_margin(margin, gap)
+        else:
+            self._self_contact.query_radius = float(margin) + float(gap)
 
     def set_particle_constraints(self, particles, coefficients, targets, *, directions=None, exact=False) -> None:
         """Hold lengths or linear combinations of particle positions in the following steps.
@@ -2578,6 +2734,8 @@ class SolverFBA(SolverBase):
         that is decoupled from Schur factor invalidation.
         """
         self._cached_W = False
+        # The graph of the sparse NSN step holds its matrices.
+        self._nsn_graph = None
 
     # ------------------------------------------------------------------
     # Contact state (allocated lazily on first call).
@@ -2887,7 +3045,10 @@ class SolverFBA(SolverBase):
                 if len(sp):
                     particle_h, alpha_h = np.concatenate([particle_h, sp[:, 0]]), np.concatenate([alpha_h, sa[:, 0]])
                     shape_h, normal_h = np.concatenate([shape_h, np.full(len(sp), -1)]), np.concatenate([normal_h, sn])
-                    body_pos_h = np.concatenate([body_pos_h, self.particle_self_contact_margin * sn])
+                    margin = self.particle_self_contact_margin
+                    if self._self_contact_groups and self._self_contact.within_groups:
+                        margin = self._self_contact.contact_margins(sp)[:, None]
+                    body_pos_h = np.concatenate([body_pos_h, margin * sn])
                     record_h = np.concatenate([record_h, np.full(len(sp), -1, dtype=np.int32)])
                     if extra is None:
                         extra = [np.full((M, 3), -1, dtype=np.int32), np.zeros((M, 3), dtype=np.float32)]
@@ -2980,7 +3141,7 @@ class SolverFBA(SolverBase):
             device=device,
         )
         # Particle and face contacts stop the particle radius plus the shape margin outside the shape surface, as
-        # Newton's contact margins place them.
+        # Newton's contact margins place them, or the shape's radius from shape_particle_radius_override.
         if shape_contacts:
             from .kernels import add_contact_thickness_kernel  # noqa: PLC0415
 
@@ -2990,8 +3151,12 @@ class SolverFBA(SolverBase):
                     wp.empty((1, 1), dtype=wp.int32, device=device),
                     wp.empty((1, 1), dtype=wp.float32, device=device),
                 ]
+            shape_radius = self._shape_radius_d
+            if shape_radius is None:
+                shape_radius = wp.empty(1, dtype=wp.float32, device=device)
             inputs = [self._contact_particle_d, *extra, int(self._contact_extra is not None)]
             inputs += [self._contact_shape_d, model.particle_radius, model.shape_margin]
+            inputs += [shape_radius, int(self._shape_radius_d is not None)]
             wp.launch(add_contact_thickness_kernel, shape_contacts, inputs, [self._contact_offset_d], device=device)
 
         # Host mirrors of the basic contact fields, for the host paths that still read them.
@@ -3108,7 +3273,11 @@ class SolverFBA(SolverBase):
         extra = [wp.empty((M, 3), dtype=t, device=device) for t in (wp.int32, wp.float32)]
         inputs = [order, contacts.soft_contact_particle, contacts.soft_contact_shape, contacts.soft_contact_body_pos]
         inputs += [contacts.soft_contact_normal, sc.found_particles, sc.found_alpha, sc.found_normal, Ms]
-        inputs += [self.particle_self_contact_margin]
+        groups = [sc.groups, sc.group_margins, 1]
+        # Without contacts within groups, every self contact joins two groups and keeps the margin between groups.
+        if not self._self_contact_groups or not sc.within_groups:
+            groups = [wp.empty(1, dtype=wp.int32, device=device), wp.empty(1, dtype=wp.float32, device=device), 0]
+        inputs += [self.particle_self_contact_margin, *groups]
         outputs = [self._contact_particle_d, self._contact_normal_d, self._contact_alpha_d, self._contact_shape_d]
         outputs += [self._contact_body_pos_d, *extra]
         wp.launch(assemble_contacts_kernel, M, inputs, outputs, device=device)
@@ -3365,10 +3534,7 @@ class SolverFBA(SolverBase):
             h = self._held_row_factor(ls)
             outputs = [self._nsn_lam_apply_d[3 * M :]]
             wp.launch(scatter_values_kernel, h.rows.shape[0], [h.zeros, 0, h.rows], outputs, device=device)
-        # Keep the multipliers for the next iteration and apply the forces in combined form.
-        wp.copy(self._lam_coulomb_persistent_d, self._nsn_lam_d, count=n_rows)
-        wp.copy(self._omega_coulomb_persistent_d, self._nsn_omega_d, count=n_rows)
-        ls.apply_lambda_correction_combined(self._nsn_lam_apply_d, self._rhs, self._x_cur)
+        self._deformable_contact_tail(ls, n_rows)
         if accumulate:
             self._accumulate_displacement()
         if self._held_rows is not None:
@@ -3762,6 +3928,155 @@ class SolverFBA(SolverBase):
         lam_apply = self._nsn_lam_apply_d.numpy()[:M].astype(np.float64, copy=True)
         return lam, omega, lam_apply
 
+    def _deformable_contact_tail(self, ls, rows: int) -> None:
+        """Keep the NSN step's multipliers for the next local-global iteration and correct the positions."""
+        # Persist device-resident lam / omega for next PD iter.
+        wp.copy(self._lam_coulomb_persistent_d, self._nsn_lam_d, count=rows)
+        wp.copy(self._omega_coulomb_persistent_d, self._nsn_omega_d, count=rows)
+        # Apply the contact forces in combined form, with one solve over the incremented right-hand side. It runs
+        # even when the forces vanish: the solve costs less than reading them back to check.
+        ls.apply_lambda_correction_combined(self._nsn_lam_apply_d, self._rhs, self._x_cur)
+
+    def _ensure_nsn_sparse_scratch(self, n_rows: int) -> None:
+        """Allocate the vectors of the sparse NSN steps for ``n_rows`` rows."""
+        if getattr(self, "_nsn_sparse_scratch", None) is None or self._nsn_sparse_scratch[0].shape[0] < n_rows:
+            cap = max(self._nsn_inner_n, n_rows)
+            self._nsn_sparse_scratch = [wp.empty(cap, dtype=wp.float64, device=self._device) for _ in range(3)]
+
+    def _nsn_sparse_graph_step(
+        self, name: str, W_sparse: tuple, inputs: tuple, sizes: tuple, block_precond, tail: tuple
+    ) -> None:
+        """The sparse NSN step of :meth:`_solve_nsn_coulomb_gpu` on the device inputs ``(r, pene0, mu, lam_init,
+        omega_init)``, its launches captured in a graph at the first call and replayed while the matrices, the
+        buffers, the sizes ``(M, n_rows, n_bilateral, dt, max_iters, contact_regularization)`` and the block
+        preconditioner stay those of the capture, followed by the launches of ``tail = (function, objects)``, keyed
+        by the objects. The graph holds the objects whose identities key it.
+
+        It runs eagerly where the linear solve reads the device to stop, or the block preconditioner is not the
+        joint rows' solve."""
+        from . import kernels as K  # noqa: PLC0415
+
+        r_d, pene0_d, mu_d, lam_d, omega_d = inputs
+        M, n_rows, n_bilateral, dt, max_iters, regularization = sizes
+        device, cap = self._device, self._nsn_inner_n
+        self._ensure_nsn_sparse_scratch(n_rows)
+
+        def run():
+            for src, dst in ((lam_d, self._nsn_lam_d), (omega_d, self._nsn_omega_d)):
+                wp.copy(dst, src, count=n_rows)
+                if cap > n_rows:
+                    dst[n_rows:cap].zero_()
+            args = (W_sparse, r_d, pene0_d, mu_d, M, n_rows, n_bilateral, dt, max_iters)
+            self._nsn_coulomb_sparse_steps(*args, block_precond, regularization)
+            if self.lambda_cap is not None:
+                limit = wp.float64(float(self.lambda_cap) / (dt * dt))
+                wp.launch(K.lambda_cap_clip_kernel, 3 * M, inputs=[limit], outputs=[self._nsn_lam_d], device=device)
+            inputs = [self._nsn_lam_d, self._nsn_omega_d, wp.float64(dt)]
+            wp.launch(K.compute_lam_apply_kernel, n_rows, inputs=inputs, outputs=[self._nsn_lam_apply_d], device=device)
+            if tail[0] is not None:
+                tail[0]()
+
+        pcr = self._pcr_solver
+        precond_key = None
+        if block_precond is not None:
+            # The joint rows' solve: its system and rows.
+            func = getattr(block_precond, "func", None)
+            owner = getattr(func, "__self__", None)
+            if owner is None or getattr(block_precond, "keywords", None):
+                run()
+                return
+            precond_key = (id(owner), *(id(a) if isinstance(a, wp.array) else a for a in block_precond.args))
+        if pcr.max_iter > pcr.check_every or not wp.get_device(device).is_cuda:
+            run()
+            return
+        key = (name, *(id(a) for a in (*W_sparse, *inputs, *tail[1])), sizes, precond_key, id(pcr))
+        cached = self._nsn_graph
+        if cached is None or cached[0] != key:
+            try:
+                with wp.ScopedCapture(device=device) as capture:
+                    run()
+                graph = capture.graph
+            except RuntimeError:
+                graph = None
+            # The objects of the key stay alive with the graph, so that no new object takes one of their identities.
+            cached = self._nsn_graph = (key, graph, (W_sparse, inputs, block_precond, pcr, tail[1]))
+            if graph is None:
+                run()
+                return
+        if cached[1] is None:
+            run()
+        else:
+            wp.capture_launch(cached[1])
+
+    def _nsn_coulomb_sparse_steps(
+        self,
+        W_sparse: tuple,
+        r_d: wp.array[wp.float64],
+        pene0_d: wp.array[wp.float64],
+        mu_d: wp.array[wp.float64],
+        M: int,
+        n_rows: int,
+        n_bilateral: int,
+        dt: float,
+        max_iters: int,
+        block_precond: Callable[[wp.array, wp.array], None] | None,
+        contact_regularization: float,
+    ) -> None:
+        """The Newton steps of :meth:`_solve_nsn_coulomb_gpu` on ``W`` in CSR form, ``W_sparse``, with a matrix of
+        its pattern for the Newton matrix: the same expressions, with the products by ``W`` and the Newton matrix
+        sparse."""
+        import warp.sparse as wps  # noqa: PLC0415
+
+        from . import kernels as K  # noqa: PLC0415
+
+        device, dt_w = self._device, wp.float64(dt)
+        W_sp, A_sp = W_sparse
+        self._ensure_nsn_sparse_scratch(n_rows)
+        ol, wol, diag = (a[:n_rows] for a in self._nsn_sparse_scratch)
+        lam, omega = self._nsn_lam_d[:n_rows], self._nsn_omega_d[:n_rows]
+        # Frictional precond: dt²·W_ii for normal rows; dt·W_ii for tangents.
+        wps.bsr_get_diag(W_sp, out=diag)
+        wp.launch(K.precond_from_bsr_diag_coulomb_kernel, n_rows, [diag, dt_w], [self._nsn_precond_d], device=device)
+        for _ in range(max_iters):
+            wp.launch(K.compute_omega_times_lam_kernel, n_rows, [omega, lam], [ol], device=device)
+            wps.bsr_mv(W_sp, ol, wol)
+            outputs = [self._nsn_penetration_d]
+            wp.launch(K.compute_penetration_sparse_kernel, n_rows, [r_d, wol, dt_w], outputs, device=device)
+            wp.launch(
+                K.compute_frictional_fb_kernel,
+                dim=M,
+                inputs=[self._nsn_penetration_d, self._nsn_lam_d, mu_d, self._nsn_precond_d, pene0_d, dt_w],
+                outputs=[self._nsn_omega_d, self._nsn_compliance_d, self._nsn_h_d],
+                device=device,
+            )
+            if n_bilateral > 0:
+                wp.launch(
+                    K.bilateral_law_kernel,
+                    dim=n_bilateral,
+                    inputs=[pene0_d, wp.int32(3 * M)],
+                    outputs=[self._nsn_omega_d, self._nsn_compliance_d, self._nsn_h_d],
+                    device=device,
+                )
+            # The Newton matrix, with the diagonal of the contact rows regularized.
+            regularized = 3 * M if contact_regularization > 0.0 else 0
+            inputs = [W_sp.offsets, W_sp.columns, W_sp.values, self._nsn_omega_d, self._nsn_compliance_d, regularized]
+            inputs.append(wp.float64(1.0 + contact_regularization))
+            wp.launch(K.build_a_schur_csr_kernel, int(W_sp.nnz), inputs, [A_sp.values], device=device)
+            wp.launch(K.compute_omega_times_lam_kernel, n_rows, [omega, lam], [ol], device=device)
+            wps.bsr_mv(W_sp, ol, wol)
+            wp.launch(
+                K.compute_nsn_rhs_lite_bsr_kernel,
+                dim=n_rows,
+                inputs=[self._nsn_h_d, self._nsn_omega_d, pene0_d, r_d, wol, dt_w],
+                outputs=[self._nsn_rhs_d],
+                device=device,
+            )
+            rhs, dlam = self._nsn_rhs_d[:n_rows], self._nsn_dlam_d[:n_rows]
+            self._pcr_solver.solve_sparse(A_sp, rhs, dlam, block_precond=block_precond)
+            wp.launch(K.axpy_lambda_kernel, n_rows, inputs=[self._nsn_dlam_d], outputs=[self._nsn_lam_d], device=device)
+            # Per-contact box clamp of the tangent multipliers; no friction without a positive normal multiplier.
+            wp.launch(K.coulomb_box_clamp_kernel, M, inputs=[mu_d], outputs=[self._nsn_lam_d], device=device)
+
     def _solve_nsn_coulomb_gpu(
         self,
         W: np.ndarray | None,
@@ -3773,6 +4088,10 @@ class SolverFBA(SolverBase):
         omega_init: np.ndarray | None = None,
         dt: float = 0.01,
         W_device: wp.array2d[wp.float64] | None = None,
+        W_sparse: tuple | None = None,
+        graph: str | None = None,
+        graph_tail: Callable[[], None] | None = None,
+        graph_tail_objects: tuple = (),
         r_device: wp.array[wp.float64] | None = None,
         pene0_device: wp.array[wp.float64] | None = None,
         mu_device: wp.array[wp.float64] | None = None,
@@ -3809,6 +4128,18 @@ class SolverFBA(SolverBase):
             W_device: Optional pre-populated ``(3M, 3M)`` device-resident view
                 of the Schur W.  When provided, ``W`` is ignored and the
                 per-PD-iter ``cap*cap*8`` host -> device upload is skipped.
+            W_sparse: With ``nsn_sparse_storage``, ``W`` in CSR form and a
+                matrix of its pattern for the Newton matrix, in place of
+                ``W`` and ``W_device``.
+            graph: With ``W_sparse``, device inputs and ``skip_download``, a
+                name under which the step's launches are captured in a CUDA
+                graph at the first call and replayed at the following calls
+                with the same matrices and buffers, as the local-global
+                iterations of a time step make them.
+            graph_tail: Launches that follow the step, captured with it,
+                such as the correction of the positions; the objects whose
+                identities key them are ``graph_tail_objects``. Without the
+                graph, they follow the step eagerly.
             r_device: Optional device-resident ``(>=3M,)`` fp64 residual.
             pene0_device: Optional device-resident ``(>=3M,)`` fp64 anchor
                 projection (interleaved ``[n, t1, t2]`` per contact).
@@ -3856,9 +4187,17 @@ class SolverFBA(SolverBase):
             )
         device = self._device
 
-        self._ensure_nsn_inner_buffers(n_rows)
+        self._ensure_nsn_inner_buffers(n_rows, alloc_2d=not self.nsn_sparse_storage)
         self._ensure_pcr_solver(n_rows)
         cap = self._nsn_inner_n
+        if graph is not None and W_sparse is not None and skip_download:
+            inputs = (r_device, pene0_device, mu_device, lam_init_device, omega_init_device)
+            if all(a is not None for a in inputs):
+                sizes = (M, n_rows, int(n_bilateral), float(dt), int(max_iters), float(contact_regularization))
+                tail = (graph_tail, graph_tail_objects)
+                self._nsn_sparse_graph_step(graph, W_sparse, inputs, sizes, block_precond, tail)
+                empty = np.zeros(0, dtype=np.float64)
+                return empty, empty, empty
 
         # Friction mu is a separate per-contact (size-M) array.
         mu_cap = max(M, 16)
@@ -3875,7 +4214,9 @@ class SolverFBA(SolverBase):
 
         # Prefer the caller-supplied device W when given, which avoids a
         # cap*cap fp64 upload in every PD outer iter.
-        if W_device is not None and W_device.shape[0] >= n_rows and W_device.shape[1] >= n_rows:
+        if W_sparse is not None:
+            W_d = None
+        elif W_device is not None and W_device.shape[0] >= n_rows and W_device.shape[1] >= n_rows:
             W_d = W_device
         else:
             W_pad = np.zeros((cap, cap), dtype=np.float64)
@@ -3926,120 +4267,124 @@ class SolverFBA(SolverBase):
         n_rows_pad_w = wp.int32(((n_rows + tile_k - 1) // tile_k) * tile_k)
         block_dim_nsn = int(K._NSN_MATVEC_BLOCK_DIM)
 
-        # Frictional precond: dt²·W_ii for normal rows; dt·W_ii for tangents.
-        wp.launch(
-            K.compute_precond_coulomb_kernel,
-            dim=n_rows,
-            inputs=[W_d, dt_w],
-            outputs=[self._nsn_precond_d],
-            device=device,
-        )
-
-        for _ in range(int(max_iters)):
-            wp.launch_tiled(
-                K.compute_penetration_kernel,
-                dim=n_rows,
-                inputs=[
-                    r_d,
-                    W_d,
-                    self._nsn_omega_d,
-                    self._nsn_lam_d,
-                    n_rows_w,
-                    n_rows_pad_w,
-                    dt_w,
-                ],
-                outputs=[self._nsn_penetration_d],
-                block_dim=block_dim_nsn,
-                device=device,
-            )
-
+        if self.nsn_sparse_storage:
+            sparse = (W_sparse, r_d, pene0_d, mu_d, M, n_rows, n_bilateral, dt)
+            self._nsn_coulomb_sparse_steps(*sparse, int(max_iters), block_precond, contact_regularization)
+        else:
+            # Frictional precond: dt²·W_ii for normal rows; dt·W_ii for tangents.
             wp.launch(
-                K.compute_frictional_fb_kernel,
-                dim=M,
-                inputs=[
-                    self._nsn_penetration_d,
-                    self._nsn_lam_d,
-                    mu_d,
-                    self._nsn_precond_d,
-                    pene0_d,
-                    dt_w,
-                ],
-                outputs=[
-                    self._nsn_omega_d,
-                    self._nsn_compliance_d,
-                    self._nsn_h_d,
-                ],
+                K.compute_precond_coulomb_kernel,
+                dim=n_rows,
+                inputs=[W_d, dt_w],
+                outputs=[self._nsn_precond_d],
                 device=device,
             )
-            if n_bilateral > 0:
-                wp.launch(
-                    K.bilateral_law_kernel,
-                    dim=n_bilateral,
-                    inputs=[pene0_d, wp.int32(3 * M)],
-                    outputs=[self._nsn_omega_d, self._nsn_compliance_d, self._nsn_h_d],
+
+            for _ in range(int(max_iters)):
+                wp.launch_tiled(
+                    K.compute_penetration_kernel,
+                    dim=n_rows,
+                    inputs=[
+                        r_d,
+                        W_d,
+                        self._nsn_omega_d,
+                        self._nsn_lam_d,
+                        n_rows_w,
+                        n_rows_pad_w,
+                        dt_w,
+                    ],
+                    outputs=[self._nsn_penetration_d],
+                    block_dim=block_dim_nsn,
                     device=device,
                 )
 
-            wp.launch(
-                K.build_a_schur_kernel,
-                dim=(n_rows, n_rows),
-                inputs=[
-                    W_d,
-                    self._nsn_omega_d,
-                    self._nsn_compliance_d,
-                ],
-                outputs=[self._nsn_a_schur_d],
-                device=device,
-            )
-            if contact_regularization > 0.0:
                 wp.launch(
-                    K.scale_diagonal_kernel,
-                    dim=3 * M,
-                    inputs=[wp.float64(1.0 + contact_regularization)],
+                    K.compute_frictional_fb_kernel,
+                    dim=M,
+                    inputs=[
+                        self._nsn_penetration_d,
+                        self._nsn_lam_d,
+                        mu_d,
+                        self._nsn_precond_d,
+                        pene0_d,
+                        dt_w,
+                    ],
+                    outputs=[
+                        self._nsn_omega_d,
+                        self._nsn_compliance_d,
+                        self._nsn_h_d,
+                    ],
+                    device=device,
+                )
+                if n_bilateral > 0:
+                    wp.launch(
+                        K.bilateral_law_kernel,
+                        dim=n_bilateral,
+                        inputs=[pene0_d, wp.int32(3 * M)],
+                        outputs=[self._nsn_omega_d, self._nsn_compliance_d, self._nsn_h_d],
+                        device=device,
+                    )
+
+                wp.launch(
+                    K.build_a_schur_kernel,
+                    dim=(n_rows, n_rows),
+                    inputs=[
+                        W_d,
+                        self._nsn_omega_d,
+                        self._nsn_compliance_d,
+                    ],
                     outputs=[self._nsn_a_schur_d],
                     device=device,
                 )
+                if contact_regularization > 0.0:
+                    wp.launch(
+                        K.scale_diagonal_kernel,
+                        dim=3 * M,
+                        inputs=[wp.float64(1.0 + contact_regularization)],
+                        outputs=[self._nsn_a_schur_d],
+                        device=device,
+                    )
 
-            wp.launch_tiled(
-                K.compute_nsn_rhs_kernel,
-                dim=n_rows,
-                inputs=[
-                    self._nsn_h_d,
-                    self._nsn_omega_d,
-                    pene0_d,
-                    r_d,
-                    W_d,
-                    self._nsn_lam_d,
-                    n_rows_w,
-                    n_rows_pad_w,
-                    dt_w,
-                ],
-                outputs=[self._nsn_rhs_d],
-                block_dim=block_dim_nsn,
-                device=device,
-            )
+                wp.launch_tiled(
+                    K.compute_nsn_rhs_kernel,
+                    dim=n_rows,
+                    inputs=[
+                        self._nsn_h_d,
+                        self._nsn_omega_d,
+                        pene0_d,
+                        r_d,
+                        W_d,
+                        self._nsn_lam_d,
+                        n_rows_w,
+                        n_rows_pad_w,
+                        dt_w,
+                    ],
+                    outputs=[self._nsn_rhs_d],
+                    block_dim=block_dim_nsn,
+                    device=device,
+                )
 
-            a_view = self._nsn_a_schur_d[:n_rows, :n_rows]
-            rhs_view = self._nsn_rhs_d[:n_rows]
-            dlam_view = self._nsn_dlam_d[:n_rows]
-            self._pcr_solver.solve(a_view, rhs_view, dlam_view, block_precond=block_precond)
+                a_view = self._nsn_a_schur_d[:n_rows, :n_rows]
+                rhs_view = self._nsn_rhs_d[:n_rows]
+                dlam_view = self._nsn_dlam_d[:n_rows]
+                self._pcr_solver.solve(a_view, rhs_view, dlam_view, block_precond=block_precond)
 
-            wp.launch(
-                K.axpy_lambda_kernel,
-                dim=n_rows,
-                inputs=[self._nsn_dlam_d],
-                outputs=[self._nsn_lam_d],
-                device=device,
-            )
+                wp.launch(
+                    K.axpy_lambda_kernel,
+                    dim=n_rows,
+                    inputs=[self._nsn_dlam_d],
+                    outputs=[self._nsn_lam_d],
+                    device=device,
+                )
 
-            # Per-contact box clamp of the tangent multipliers; no friction without a positive normal multiplier.
-            wp.launch(
-                K.coulomb_box_clamp_kernel,
-                dim=M,
-                inputs=[mu_d],
-                outputs=[self._nsn_lam_d],
-                device=device,
-            )
+                # Per-contact box clamp of the tangent multipliers; no friction without a positive normal multiplier.
+                wp.launch(
+                    K.coulomb_box_clamp_kernel,
+                    dim=M,
+                    inputs=[mu_d],
+                    outputs=[self._nsn_lam_d],
+                    device=device,
+                )
 
         if self.lambda_cap is not None:
             # Capping a normal multiplier shrinks its friction cone: clamp the tangent multipliers again after it.
@@ -4061,6 +4406,8 @@ class SolverFBA(SolverBase):
             device=device,
         )
 
+        if graph_tail is not None:
+            graph_tail()
         if skip_download:
             empty = np.zeros(0, dtype=np.float64)
             return empty, empty, empty

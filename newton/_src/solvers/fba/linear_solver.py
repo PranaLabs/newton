@@ -49,6 +49,96 @@ def dense_schur_capacity(required: int, current: int) -> int:
     return ((capacity + 127) // 128) * 128
 
 
+def connected_components(A: CsrMatrix) -> np.ndarray:
+    """Connected component of each DOF of the symmetric sparsity of ``A``, numbered by their smallest DOF."""
+    n = A.shape[0]
+    rows = np.repeat(np.arange(n, dtype=np.int64), np.diff(A.indptr))
+    cols = A.indices.astype(np.int64)
+    parent = np.arange(n, dtype=np.int64)
+    while True:
+        # Hook the larger of the two roots of every edge that joins two trees onto the smaller, then flatten.
+        root_r, root_c = parent[rows], parent[cols]
+        joined = root_r != root_c
+        if not joined.any():
+            return parent.astype(np.int32)
+        parent[np.maximum(root_r[joined], root_c[joined])] = np.minimum(root_r[joined], root_c[joined])
+        while True:
+            grand = parent[parent]
+            if np.array_equal(grand, parent):
+                break
+            parent = grand
+
+
+def group_pattern(groups: np.ndarray, device) -> tuple[wp.array, wp.array, int]:
+    """CSR pattern of a matrix whose rows couple where they share a group: the rows that share a group with each row.
+
+    Args:
+        groups: Groups of each row, shape ``(n, G)``, ``-1`` where unused.
+        device: Warp device of the pattern.
+
+    Returns:
+        ``(offsets, columns, nnz)``: the row offsets, shape ``(n + 1,)``, and the columns, ascending in each row.
+    """
+    from .kernels import _MAX_ROW_GROUPS, group_pattern_kernel  # noqa: PLC0415
+
+    n = groups.shape[0]
+    # Each row takes each of its groups once, so that no row repeats in a group's rows.
+    groups = np.sort(groups, axis=1)
+    repeated = groups[:, 1:] == groups[:, :-1]
+    groups[:, 1:][repeated] = -1
+    valid = groups >= 0
+    if valid.sum(axis=1).max(initial=0) > _MAX_ROW_GROUPS:
+        raise NotImplementedError(
+            f"a row of SolverFBA's sparse Schur storage belongs to at most {_MAX_ROW_GROUPS} groups"
+        )
+    ids, dense = np.unique(groups[valid], return_inverse=True)
+    row_groups = np.full(groups.shape, -1, dtype=np.int32)
+    row_groups[valid] = dense
+    rows = np.broadcast_to(np.arange(n, dtype=np.int32)[:, None], groups.shape)[valid]
+    order = np.lexsort((rows, dense))
+    group_offsets = np.concatenate([[0], np.cumsum(np.bincount(dense, minlength=len(ids)))]).astype(np.int32)
+    inputs = [
+        wp.array(row_groups, dtype=wp.int32, device=device),
+        wp.array(group_offsets, dtype=wp.int32, device=device),
+    ]
+    inputs.append(wp.array(rows[order], dtype=wp.int32, device=device))
+    counts = wp.empty(n, dtype=wp.int32, device=device)
+    offsets = wp.zeros(n + 1, dtype=wp.int32, device=device)
+    columns = wp.empty(1, dtype=wp.int32, device=device)
+    wp.launch(group_pattern_kernel, n, inputs=[*inputs, offsets, 0], outputs=[counts, columns], device=device)
+    wp.utils.array_scan(counts, offsets[1:], inclusive=True)
+    nnz = int(offsets[n : n + 1].numpy()[0])
+    columns = wp.empty(max(nnz, 1), dtype=wp.int32, device=device)
+    wp.launch(group_pattern_kernel, n, inputs=[*inputs, offsets, 1], outputs=[counts, columns], device=device)
+    return offsets, columns, nnz
+
+
+def csr_without_zeros(offsets: wp.array, columns: wp.array, values: wp.array, n: int, nnz: int) -> tuple:
+    """The CSR matrix ``(offsets, columns, values)`` of ``n`` rows and ``nnz`` entries without its zero off-diagonal
+    entries, as a ``BsrMatrix`` of scalar blocks, and a matrix of its pattern for values to come."""
+    from .kernels import csr_keep_kernel, csr_kept_entries_kernel, csr_kept_offsets_kernel  # noqa: PLC0415
+
+    device = offsets.device
+    kept = wp.empty(nnz + 1, dtype=wp.int32, device=device)
+    position = wp.empty(nnz + 1, dtype=wp.int32, device=device)
+    kept[nnz : nnz + 1].zero_()
+    wp.launch(csr_kept_entries_kernel, nnz, inputs=[offsets, columns, values], outputs=[kept], device=device)
+    wp.utils.array_scan(kept, position, inclusive=False)
+    kept_nnz = int(position[nnz : nnz + 1].numpy()[0])
+    kept_offsets = wp.empty(n + 1, dtype=wp.int32, device=device)
+    kept_columns = wp.empty(kept_nnz, dtype=wp.int32, device=device)
+    kept_values = wp.empty(kept_nnz, dtype=wp.float64, device=device)
+    inputs = [columns, values, kept, position]
+    wp.launch(csr_keep_kernel, nnz, inputs=inputs, outputs=[kept_columns, kept_values], device=device)
+    wp.launch(csr_kept_offsets_kernel, n + 1, inputs=[offsets, position], outputs=[kept_offsets], device=device)
+    matrices = []
+    for vals in (kept_values, wp.empty(kept_nnz, dtype=wp.float64, device=device)):
+        m = wps.bsr_zeros(rows_of_blocks=n, cols_of_blocks=n, block_type=wp.float64, device=device)
+        m.offsets, m.columns, m.values, m.nnz = kept_offsets, kept_columns, vals, kept_nnz
+        matrices.append(m)
+    return tuple(matrices)
+
+
 def particle_masses(model: Model) -> tuple[np.ndarray, np.ndarray]:
     """Masses [kg] and inverse masses [1/kg] of the particles, both zero for those the solver holds: the pinned
     ones, which have zero inverse mass, and the inactive ones."""
@@ -828,6 +918,16 @@ class FBALinearSolver:
         self.n = n
         # Slots of contact rows on several particles: (particles, coefficients, CSR offsets, CSR entries).
         self._row_slots = None
+        # Compute the entries of A⁻¹ that W needs from the sparse columns of S, without the dense (N, k) copy of
+        # those columns that the tiled product reads: for many contacted particles among many particles. Only the
+        # pairs within one connected component of A, from ``components`` (one per DOF; None for one component).
+        self.exact_inverse_entries = False
+        self.components = None
+        # Compose W in CSR form without its zero entries, coupling only rows whose particles share a component, in
+        # place of the dense W: ``W_sparse`` holds it and a matrix of its pattern.
+        self.sparse_W = False
+        self.W_sparse = None
+        self._W_pattern = None
 
         # Build 1x1 BSR matrices from the sparse factors.
         self._S_bsr = _csc_to_bsr_1x1(factor.S, self.device)
@@ -1004,6 +1104,12 @@ class FBALinearSolver:
             total_rows += len(b_p)
 
         isodof_particles = self._set_row_slots(row_particle, row_alpha, extra_p, extra_a)
+        if self.sparse_W:
+            # The components of each row's particles, for the pattern of W.
+            parts = row_particle[:, None] if extra_p is None else np.column_stack([row_particle, extra_p])
+            component = np.zeros(self.n, dtype=np.int32) if self.components is None else self.components
+            self._row_groups = np.where(parts >= 0, component[np.maximum(parts, 0)], -1).astype(np.int32)
+            self._W_pattern = None
 
         # Upload direction arrays to device.
         row_particle_d = wp.array(row_particle, dtype=wp.int32, device=dev)
@@ -1013,7 +1119,7 @@ class FBALinearSolver:
         # --- Allocate/reuse the W device buffer, grown by :func:`dense_schur_capacity`. ---
         # ``M`` can spike by 10s of contacts between frames in a squeezed soft body, and a (cap, cap) dense float64
         # buffer is the dominant device alloc on the FBA hot path.
-        if (
+        if not self.sparse_W and (
             not hasattr(self, "_W_device_d")
             or self._W_device_d.shape[0] < total_rows
             or self._W_device_d.shape[1] < total_rows
@@ -1091,7 +1197,11 @@ class FBALinearSolver:
         buffer with ``sqrt(D_inv)`` baked into the values, then run a tiled
         SYRK-style matmul. A sparse column intersection would cost
         O(k² · nnz_col), which dominates the Schur build of the squeezing ball
-        example, where ``nnz_col(S) ≈ 1700``.
+        example, where ``nnz_col(S) ≈ 1700``. With ``exact_inverse_entries``
+        it computes them so (:func:`compute_wi_blocks_kernel`), without the
+        dense ``(N, k)`` buffer of the GEMM, which many contacted particles
+        among many particles cannot afford, and only within the connected
+        components of ``A`` in ``components``: the others are zero.
         """
         N = self.n
         dev = self.device
@@ -1138,7 +1248,7 @@ class FBALinearSolver:
             # No contacts touch any particle: nothing to compute.  Caller
             # treats an empty ``W`` view as a zero matrix.
             return None if not download else np.zeros((total_rows, total_rows), dtype=np.float64)
-        N_pad = ((N + tile_k - 1) // tile_k) * tile_k
+        N_pad = 0 if self.exact_inverse_entries else ((N + tile_k - 1) // tile_k) * tile_k
 
         # Wi buffer: padded ``(k_pad, k_pad)`` so the tiled GEMM writes a
         # contiguous block.  The cap-based reuse grows by 1.5x to amortize
@@ -1155,7 +1265,7 @@ class FBALinearSolver:
         # Width grows with a 1.5x headroom factor so a contact-count climb does
         # not realloc every frame; height is fixed at ``N_pad`` (set by the
         # immutable mesh DOF count).
-        if (
+        if not self.exact_inverse_entries and (
             not hasattr(self, "_S_iso_scaled_d")
             or self._S_iso_scaled_d.shape[0] < N_pad
             or self._S_iso_scaled_d.shape[1] < k_pad
@@ -1188,6 +1298,37 @@ class FBALinearSolver:
                 strides=(Wi_cap * 8, 8),
                 device=dev,
             )
+        if self.exact_inverse_entries:
+            from .kernels import compute_wi_blocks_kernel  # noqa: PLC0415
+
+            # The ranks of the contacted DOFs by component, ascending within each; isodofs_h is sorted.
+            component = np.zeros(k, dtype=np.int64) if self.components is None else self.components[isodofs_h]
+            members = np.argsort(component, kind="stable").astype(np.int32)
+            sizes = np.unique(component, return_counts=True)[1].astype(np.int64)
+            block_start = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int32)
+            pair_start = np.concatenate([[0], np.cumsum(sizes * sizes)])
+            if pair_start[-1] >= 2**31:
+                raise ValueError("too many pairs of contacted particles in one component of the system")
+            blocks = [
+                wp.array(a, dtype=wp.int32, device=dev) for a in (members, block_start, pair_start.astype(np.int32))
+            ]
+            # Entries between components and the padding stay zero.
+            Wi_v.zero_()
+            inputs = [self._ST_bsr.offsets, self._ST_bsr.columns, self._ST_bsr.values, self._Dinv, self._isodof_perm_d]
+            wp.launch(
+                compute_wi_blocks_kernel, dim=int(pair_start[-1]), inputs=[*inputs, *blocks], outputs=[Wi_v], device=dev
+            )
+            self._Wi_v = Wi_v
+            self._compose_schur()
+            if not download:
+                return None
+            if self.sparse_W:
+                W = np.zeros((total_rows, total_rows))
+                m = self.W_sparse[0]
+                rows = np.repeat(np.arange(total_rows), np.diff(m.offsets.numpy()))
+                W[rows, m.columns.numpy()] = m.values.numpy()
+                return W
+            return self._W_device_d.numpy()[:total_rows, :total_rows].copy()
         S_iso_cap_n = int(self._S_iso_scaled_d.shape[0])
         S_iso_cap_k = int(self._S_iso_scaled_d.shape[1])
         if S_iso_cap_n == N_pad and S_iso_cap_k == k_pad:
@@ -1244,9 +1385,25 @@ class FBALinearSolver:
 
     def _compose_schur(self) -> None:
         """Compose ``W`` from ``Wi`` and the row particles, directions and coefficients."""
-        from .kernels import add_slot_terms_W_kernel, compose_W_from_wi_kernel  # noqa: PLC0415
+        from .kernels import add_slot_terms_W_kernel, compose_W_csr_kernel, compose_W_from_wi_kernel  # noqa: PLC0415
 
         n = self._row_total
+        if self.sparse_W:
+            if self._W_pattern is None:
+                self._W_pattern = group_pattern(self._row_groups, self.device)
+            offsets, columns, nnz = self._W_pattern
+            values = wp.empty(max(nnz, 1), dtype=wp.float64, device=self.device)
+            slots = self._row_slots
+            if slots is None:
+                slots = [
+                    wp.full((n, 1), -1, dtype=wp.int32, device=self.device),
+                    wp.zeros((n, 1), dtype=wp.float32, device=self.device),
+                ]
+            inputs = [offsets, columns, self._row_particle_d, self._row_dir_d, self._row_alpha_d, self._isodof_rank_d]
+            inputs += [self._Wi_v, *slots[:2], int(self._row_slots is not None)]
+            wp.launch(compose_W_csr_kernel, nnz, inputs=inputs, outputs=[values], device=self.device)
+            self.W_sparse = csr_without_zeros(offsets, columns, values, n, nnz)
+            return
         # W[c', c] = alpha[c'] * alpha[c] * dot(dir[c'], dir[c]) * Wi[r', r], written densely; one thread per
         # (c', c) pair. ``isodof_rank[N]`` provides the rank lookup per particle.
         wp.launch(
@@ -1698,6 +1855,8 @@ class FBALinearSolver:
             ``wp.array2d[wp.float64]`` of shape ``(M, M)`` sharing storage with
             the persistent device buffer, or ``None`` if no W exists.
         """
+        if self.sparse_W:
+            raise RuntimeError("W is in sparse form: read W_sparse")
         if not hasattr(self, "_W_device_d") or not hasattr(self, "_W_device_active_rows"):
             return None
         m = int(self._W_device_active_rows)
