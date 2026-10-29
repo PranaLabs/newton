@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 import warp as wp
 
+from ...core.reset import reset_state_array
 from ...geometry import ParticleFlags
 from ...sim import BodyFlags, Contacts, Control, Model, ModelFlags, State, StateFlags
 from ..solver import SolverBase
@@ -64,8 +65,7 @@ class SolverFBA(SolverBase):
     .. experimental::
 
         :class:`SolverFBA`, its constructor options and its solver-specific
-        attributes may change without the normal deprecation period. It
-        simulates models with one world.
+        attributes may change without the normal deprecation period.
 
     A step depends on its input state, contacts and control, on the pin
     targets and particle constraints last set, and, with ``friction_anchors``
@@ -466,11 +466,44 @@ class SolverFBA(SolverBase):
                 zero. Needs ``friction=True`` and ``nsn_schur_mode="full"``.
         """
         super().__init__(model)
+        self._particle_world_h = model.particle_world.numpy()
+        self._body_world_h = model.body_world.numpy()
+        self._shape_world_h = model.shape_world.numpy()
+        self._deformable_world_rows = self._rigid_world_rows = None
+        self._constraint_world_h = np.empty(0, dtype=np.int32)
+        self._joint_world_h = np.empty(0, dtype=np.int32)
+        self._two_way_world_h = np.zeros(model.world_count, dtype=np.int32)
+        self._two_way_world_d = wp.empty(0, dtype=wp.int32, device=model.device)
+        self._empty_contact_scale = wp.empty(0, dtype=wp.float64, device=model.device)
+        self._deformable_contact_scale = self._rigid_contact_scale = self._empty_contact_scale
+        self._nsn_contact_scale = self._empty_contact_scale
+        self._lite_direct = None
+        self._empty_indices = wp.empty(0, dtype=wp.int32, device=model.device)
         if model.world_count > 1:
-            raise ValueError(
-                f"SolverFBA simulates one world, but the model has {model.world_count}: its contact solve and "
-                "self contacts span all particles of the model"
-            )
+            if (self._particle_world_h < 0).any():
+                raise ValueError("SolverFBA requires particles to belong to local worlds in multi-world models")
+            dynamic = model.body_flags.numpy() & int(BodyFlags.DYNAMIC) != 0
+            if not integrate_with_external_rigid_solver and (dynamic & (self._body_world_h < 0)).any():
+                raise ValueError("SolverFBA cannot integrate a global dynamic body shared by several worlds")
+            attached = model.shape_body.numpy()
+            attached_shapes = np.flatnonzero(attached >= 0)
+            if not integrate_with_external_rigid_solver:
+                moving = attached_shapes[dynamic[attached[attached_shapes]]]
+                if (self._shape_world_h[moving] != self._body_world_h[attached[moving]]).any():
+                    raise ValueError("shapes on integrated bodies must belong to the body's world")
+            for indices in (model.tri_indices, model.tet_indices, model.edge_indices):
+                if indices is not None and indices.size:
+                    ids = indices.numpy()
+                    worlds = self._particle_world_h[np.maximum(ids, 0)]
+                    lo = np.min(np.where(ids >= 0, worlds, model.world_count), axis=1)
+                    hi = np.max(np.where(ids >= 0, worlds, -1), axis=1)
+                    if (lo != hi).any():
+                        raise ValueError("SolverFBA elements must not connect particles in different worlds")
+            if model.joint_count:
+                parent, child = model.joint_parent.numpy(), model.joint_child.numpy()
+                valid = parent >= 0
+                if (self._body_world_h[parent[valid]] != self._body_world_h[child[valid]]).any():
+                    raise ValueError("SolverFBA joints must not connect bodies in different worlds")
 
         # ---- Validate ----
         if model.particle_count == 0 and model.body_count == 0:
@@ -838,6 +871,7 @@ class SolverFBA(SolverBase):
         self._joint_system = BilateralSystem(self._joint_rows, slot, self._slot_inv_mass_d, device)
         # Independent block of each joint row and of each slot it touches.
         rows = self._joint_rows
+        self._joint_world_h = self._body_world_h[rows.child.numpy()[rows.row_joint.numpy()]]
         self._joint_row_block = np.repeat(np.arange(len(rows.block_start) - 1), np.diff(rows.block_start))
         start, entry_row = self._joint_system.slot_entry_start.numpy(), self._joint_system.entry_row.numpy()
         self._slot_block = np.full(len(start) - 1, -1)
@@ -933,6 +967,8 @@ class SolverFBA(SolverBase):
             soft_slot = np.where(body >= 0, self._body_slot_h[np.maximum(body, 0)], -1)
             if (soft_slot >= 0).any():
                 m_s = self._contact_count
+                if model.world_count > 1:
+                    self._two_way_world_h[self._contact_world_h[soft_slot >= 0]] = 1
                 slots = np.concatenate([np.stack([soft_slot, np.full(m_s, -1)], axis=1), slots])
         self._two_way, self._rc_counts, self._rc_n = m_s > 0, (m_s, m_r), 0
         if m_s + m_r == 0:
@@ -1009,6 +1045,27 @@ class SolverFBA(SolverBase):
         self._rc_r_d = wp.empty(n, dtype=wp.float64, device=device)
         self._rc_lam_d = wp.zeros(n, dtype=wp.float64, device=device)
         self._rc_omega_d = wp.zeros(n, dtype=wp.float64, device=device)
+        if model.world_count > 1:
+            from .nsn_pcr_solver import group_world_rows  # noqa: PLC0415
+
+            soft = self._particle_world_h[host_head(self._contact_particle_d, m_s)] if m_s else np.empty(0, int)
+            rigid = np.max(self._shape_world_h[rc.shape], axis=1) if m_r else np.empty(0, int)
+            # Without two-way coupling, retain the world's separate deformable and rigid recurrences.
+            rigid_group = rigid + model.world_count * (self._two_way_world_h[rigid] == 0)
+            joint_world = self._joint_world_h[joint_rows]
+            joint_group = joint_world + model.world_count * (self._two_way_world_h[joint_world] == 0)
+            worlds = np.concatenate(
+                [
+                    np.repeat(soft, 3),
+                    np.repeat(rigid_group, 3),
+                    joint_group,
+                    self._constraint_world_h[:n_b],
+                ]
+            )
+            self._rigid_world_rows = group_world_rows(worlds, device)
+            soft_scale = (self._regularized_world_h[soft] | self._two_way_world_h[soft].astype(bool)) if m_s else []
+            scale = 1.0 + self.contact_regularization * np.r_[soft_scale, np.ones(m_r)]
+            self._rigid_contact_scale = wp.array(scale, dtype=wp.float64, device=device)
 
     def _warm_start_rows(self) -> tuple:
         """This step's NSN rows by kind, as ``(lam, omega, first row, count)`` for the particle contacts, the rigid
@@ -1249,6 +1306,8 @@ class SolverFBA(SolverBase):
             W_device=None if self.nsn_sparse_storage else self._rc_W_d,
             W_sparse=self._rc_W_sparse if self.nsn_sparse_storage else None,
             graph="two-way",
+            world_rows=self._rigid_world_rows,
+            contact_scale=self._rigid_contact_scale,
             graph_tail=functools.partial(self._two_way_contact_tail, m_s, n, n_s, n_b, n_c, joint_rows),
             graph_tail_objects=tail_objects,
             r_device=self._rc_r_d,
@@ -1731,6 +1790,7 @@ class SolverFBA(SolverBase):
         if observables is not None and observables.is_requested(SolverBase.ObservableKind.CONTACT_F):
             contact_f = observables.contact_f
         self._two_way, self._rc_n = False, 0
+        self._two_way_world_h.fill(0)
         rigid = self.model.body_count > 0 and not self.integrate_with_external_rigid_solver
         rigid = rigid and self._begin_rigid_step(state_in, state_out, dt)
         if self.model.particle_count == 0:
@@ -1771,6 +1831,20 @@ class SolverFBA(SolverBase):
             self._invalidate_schur_cache()
 
         has_contacts = self._contact_count > 0
+        if self.model.world_count > 1:
+            from .nsn_pcr_solver import group_world_rows  # noqa: PLC0415
+
+            M = self._contact_count
+            particles = host_head(self._contact_particle_d, M) if M else np.empty(0, dtype=np.int32)
+            worlds = np.repeat(self._particle_world_h[particles], 3 if self.friction else 1)
+            self._contact_world_h = self._particle_world_h[particles]
+            self._regularized_world_h = np.zeros(self.model.world_count, dtype=bool)
+            if M and self._contact_extra is not None:
+                extra = host_head(self._contact_extra[0], M)
+                self._regularized_world_h[self._contact_world_h[(extra >= 0).any(axis=1)]] = True
+            scale = 1.0 + self.contact_regularization * self._regularized_world_h[self._contact_world_h]
+            self._deformable_contact_scale = wp.array(scale, dtype=wp.float64, device=self._device)
+            self._deformable_world_rows = group_world_rows(np.r_[worlds, self._constraint_world_h], self._device)
 
         # Apply kinematic anchor advancement: tangent_offset = base + dt · dot(t, v_anchor).
         # _ingest_contacts cached base offsets + v_anchor; the dt-dependent
@@ -1854,6 +1928,8 @@ class SolverFBA(SolverBase):
         if self._warm_start is not None:
             self._restore_warm_start()
         if self.friction_anchors:
+            if model.world_count > 1:
+                self._two_way_world_d = wp.array(self._two_way_world_h, dtype=wp.int32, device=device)
             self._apply_friction_anchors(state_in)
 
         if self._inactive_d is not None:
@@ -1957,6 +2033,7 @@ class SolverFBA(SolverBase):
                             # Newton step holds, take the sparse lite NSN.
                             many = ls._isodof_max_rows > K_step._MAX_ROWS_PER_PARTICLE
                             sparse = self._contact_extra is not None or many
+                            self._prepare_lite_worlds(ls)
                             self._lite_W = self._build_lite_delassus(M, ls, n_b) if sparse else None
                             if self._lite_iter_graph is not False:
                                 self._lite_iter_graph = None
@@ -2013,7 +2090,20 @@ class SolverFBA(SolverBase):
                         # the per-particle kernel's 12x12 register footprint
                         # for what is the only common case of cloth on shapes.
                         use_per_particle = n_b or ls._isodof_max_rows > 3
-                        if use_per_particle:
+                        if model.world_count > 1:
+                            self._launch_lite_worlds(
+                                ls,
+                                M,
+                                dt,
+                                cap_internal,
+                                use_cap,
+                                self._nsn_r_d,
+                                self._nsn_pene0_d,
+                                self._nsn_lam_d,
+                                self._nsn_omega_d,
+                                self._nsn_lam_apply_d,
+                            )
+                        elif use_per_particle:
                             wp.launch(
                                 K_step.fb_newton_lite_coulomb_per_particle_kernel,
                                 dim=ls._n_isodofs,
@@ -2045,6 +2135,7 @@ class SolverFBA(SolverBase):
                                 K_step.fb_newton_lite_coulomb_kernel,
                                 dim=M,
                                 inputs=[
+                                    self._empty_indices,
                                     self._contact_particle_d,
                                     self._contact_normal_d,
                                     self._contact_tangent1_d,
@@ -2094,6 +2185,8 @@ class SolverFBA(SolverBase):
                             W_device=None if self.nsn_sparse_storage else ls.W_device_view(),
                             W_sparse=ls.W_sparse if self.nsn_sparse_storage else None,
                             graph="deformable",
+                            world_rows=self._deformable_world_rows,
+                            contact_scale=self._deformable_contact_scale,
                             graph_tail=tail,
                             graph_tail_objects=tail_objects,
                             r_device=self._nsn_r_d,
@@ -2535,7 +2628,7 @@ class SolverFBA(SolverBase):
         independent directions hold a particle at a point, and its contacts then carry no force. These rows
         take their Newton step after the correction of the other rows, with the Cholesky factor of their own
         Delassus matrix ``J A^-1 J^T`` as the joint rows of articulations do, and so reach their targets in every
-        iteration; at most 64 of them. Other rows are solved with the particle's contacts, which see its mass
+        iteration; at most 64 of them in each world. Other rows are solved with the particle's contacts, which see its mass
         alone, ``dt^2 / m`` in place of its block of ``A^-1``, and lag their targets by the share of the stiffness
         in that block.
 
@@ -2546,11 +2639,12 @@ class SolverFBA(SolverBase):
             directions: Row directions, shape ``(R, 3)``, or ``None`` for length rows.
             exact: With ``nsn_schur_mode="lite"``, give every row the exact step of the rows that hold particles at
                 points, also rows that hold a particle along one or two directions, whose contacts keep their
-                forces: such rows then reach their targets in every iteration too. At most 64 rows. The full NSN
+                forces: such rows then reach their targets in every iteration too. At most 64 rows per world. The full NSN
                 solves every row with ``A`` already.
         """
         self._invalidate_schur_cache()
         if particles is None or len(particles) == 0:
+            self._constraint_world_h = np.empty(0, dtype=np.int32)
             self._constraint_rows = self._held_rows = self._constraint_key = None
             if self._warm_start is not None:
                 self._warm_start.bilateral_count = 0
@@ -2566,6 +2660,9 @@ class SolverFBA(SolverBase):
             raise ValueError(f"directions need shape ({R}, 3)")
         if (p[:, 0] < 0).any() or (p >= self.model.particle_count).any():
             raise ValueError("particle indices out of range, or slot 0 unused")
+        worlds = self._particle_world_h[np.maximum(p, 0)]
+        if self.model.world_count > 1 and ((p >= 0) & (worlds != worlds[:, :1])).any():
+            raise ValueError("particle constraint rows must not connect different worlds")
         if self.nsn_schur_mode == "lite" and (directions is None or (p[:, 1:] >= 0).any()):
             raise ValueError("the lite NSN holds only rows with a direction on one particle")
         if self.nsn_schur_mode == "lite":
@@ -2583,6 +2680,7 @@ class SolverFBA(SolverBase):
         arrays = [(particles, np.int32, wp.int32), (coefficients, np.float32, wp.float32)]
         arrays += [(directions, np.float32, wp.vec3), (targets, np.float64, wp.float64)]
         self._constraint_rows = [wp.array(np.asarray(a, dtype=n), dtype=t, device=self._device) for a, n, t in arrays]
+        self._constraint_world_h = worlds[:, 0]
         if self.nsn_schur_mode == "lite":
             # The lite rows' particles, directions and coefficients, which hold until the rows change.
             rows_h = (p[:, 0].astype(np.int32), np.asarray(directions, dtype=np.float32))
@@ -2595,8 +2693,11 @@ class SolverFBA(SolverBase):
         rows = np.arange(len(p), dtype=np.int32) if exact else np.flatnonzero(np.isin(p, held)).astype(np.int32)
         if np.bincount(p[rows]).max(initial=3) > 3:
             raise ValueError("a particle held at a point takes three rows")
-        if len(rows) > 64:
-            raise NotImplementedError(f"SolverFBA's lite NSN takes the exact step of at most 64 rows, got {len(rows)}")
+        counts = np.unique(self._held_row_world(p[rows]), return_counts=True)[1]
+        if counts.max(initial=0) > 64:
+            raise NotImplementedError(
+                f"SolverFBA's lite NSN takes the exact step of at most 64 rows per world, got {counts.max()}"
+            )
         if self._held_particle_d is None or not np.array_equal(held, self._held_particles):
             flags = np.zeros(self.model.particle_count, dtype=np.int32)
             flags[held] = 1
@@ -2607,53 +2708,179 @@ class SolverFBA(SolverBase):
         elif self._held_rows is None or not all(map(np.array_equal, key, self._held_rows[0])):
             self._held_rows = [key, None]
 
+    def _held_row_world(self, p: np.ndarray) -> np.ndarray:
+        """The block of the held rows on particles ``p``: their world in a model of several worlds, which do not
+        couple, and one block in a model of one, whose global particles may couple to its others."""
+        return self._particle_world_h[p] if self.model.world_count > 1 else np.zeros(len(p), dtype=np.int32)
+
     def _held_row_factor(self, ls) -> SimpleNamespace:
-        """The rows that hold particles at points with the Cholesky factor ``L`` of their Delassus matrix
-        ``J A^-1 J^T``, padded with identity to ``tile`` rows, and the ``columns`` of ``A^-1`` at their particles.
-        ``A`` holds for the run, so these hold while the rows do."""
+        """The rows that hold particles at points, in one block per world, with the Cholesky factors ``L`` of
+        the blocks' Delassus matrices ``J A^-1 J^T``, each padded with identity to ``tile`` rows, the entry
+        ``slot`` of each row in the blocks, and the columns of ``A^-1`` at the held particles of each block over
+        the block's particles only: the worlds do not couple, so these hold all of ``A^-1 J^T`` and the blocks of
+        ``J A^-1 J^T`` are its only nonzero ones. ``A`` holds for the run, so these hold while the rows do."""
+        from .joints import gather_values_kernel  # noqa: PLC0415
+
         if self._held_rows[1] is None:
             rows, p, c, d = self._held_rows[0]
-            unique, index = np.unique(p, return_inverse=True)
-            e = wp.zeros(ls.n, dtype=wp.float64, device=self._device)
-            columns = wp.empty((len(unique), ls.n), dtype=wp.float64, device=self._device)
-            for k, q in enumerate(unique):
+            # Order the rows by world, keeping their order within each.
+            worlds, block = np.unique(self._held_row_world(p), return_inverse=True)
+            order = np.argsort(block, kind="stable")
+            rows, p, c, d, block = rows[order], p[order], c[order], d[order], block[order]
+            row_start = np.searchsorted(block, np.arange(len(worlds) + 1))
+            local = np.arange(len(rows)) - row_start[block]
+            # The particles of each block, ascending, and the place of each particle in its block; -1 off them.
+            world = self._held_row_world(np.arange(ls.n))
+            particle_block = np.searchsorted(worlds, world)
+            particle_block[particle_block == len(worlds)] = 0
+            particle_block = np.where(worlds[particle_block] == world, particle_block, -1)
+            particles = np.argsort(particle_block, kind="stable")[np.count_nonzero(particle_block < 0) :]
+            counts = np.bincount(particle_block[particles], minlength=len(worlds))
+            particle_local = np.full(ls.n, -1, dtype=np.int64)
+            particle_local[particles] = (
+                np.arange(len(particles)) - np.r_[0, np.cumsum(counts)][particle_block[particles]]
+            )
+            # The unique held particles of each block, ascending, and the column of each row among them.
+            unique, index = np.unique(np.stack([block, p]), axis=1, return_inverse=True)
+            columns = np.bincount(unique[0], minlength=len(worlds))
+            column = index.ravel() - np.r_[0, np.cumsum(columns)][block]
+            column_start = np.r_[0, np.cumsum(columns * counts)]
+            if column_start[-1] >= 2**31:
+                raise NotImplementedError("SolverFBA's lite NSN takes the exact rows of fewer held particles")
+            # Each block's columns of A^-1 at its held particles, over its particles, from one scratch column.
+            device, f64 = self._device, wp.float64
+            e = wp.zeros(ls.n, dtype=f64, device=device)
+            solution = wp.empty(ls.n, dtype=f64, device=device)
+            particles_d = wp.array(particles, dtype=wp.int32, device=device)
+            response = wp.empty(int(column_start[-1]), dtype=f64, device=device)
+            first = np.r_[0, np.cumsum(counts)]
+            for u, (b, q) in enumerate(unique.T):
                 e.zero_()
                 e[int(q) : int(q) + 1].fill_(1.0)
-                ls.solve_scalar(e, columns[k])
-            block = columns.numpy()[:, unique]
-            tile = max(8, 1 << int(np.ceil(np.log2(len(rows)))))
-            L = np.eye(tile)
-            L[: len(rows), : len(rows)] = np.linalg.cholesky(block[np.ix_(index, index)] * (d @ d.T) * np.outer(c, c))
-            device, f64 = self._device, wp.float64
+                ls.solve_scalar(e, solution)
+                offset = int(column_start[b] + (u - np.searchsorted(unique[0], b)) * counts[b])
+                inputs = [solution, particles_d[first[b] : first[b + 1]], offset]
+                wp.launch(gather_values_kernel, int(counts[b]), inputs, [response], device=device)
+            tile = max(8, 1 << int(np.ceil(np.log2(local.max() + 1))))
+            L = np.tile(np.eye(tile), (len(worlds), 1, 1))
+            for b in range(len(worlds)):
+                k = np.arange(row_start[b], row_start[b + 1])
+                Ainv = response[int(column_start[b]) : int(column_start[b + 1])].numpy().reshape(columns[b], -1)
+                Ainv = Ainv[np.ix_(column[k], particle_local[p[k]])]
+                W = Ainv * (d[k] @ d[k].T) * np.outer(c[k], c[k])
+                L[b, : len(k), : len(k)] = np.linalg.cholesky(W)
+            i32 = wp.int32
             self._held_rows[1] = SimpleNamespace(
                 tile=tile,
-                L=wp.array(L[None], dtype=f64, device=device),
-                rhs=wp.zeros((1, tile), dtype=f64, device=device),
-                x=wp.zeros((1, tile), dtype=f64, device=device),
+                L=wp.array(L, dtype=f64, device=device),
+                rhs=wp.zeros((len(worlds), tile), dtype=f64, device=device),
+                x=wp.zeros((len(worlds), tile), dtype=f64, device=device),
+                residual=wp.zeros(len(rows), dtype=f64, device=device),
+                slot=wp.array(block * tile + local, dtype=i32, device=device),
                 zeros=wp.zeros(len(rows), dtype=f64, device=device),
-                rows=wp.array(rows, dtype=wp.int32, device=device),
-                column=wp.array(index, dtype=wp.int32, device=device),
+                rows=wp.array(rows, dtype=i32, device=device),
+                particle_block=wp.array(particle_block, dtype=i32, device=device),
+                particle_local=wp.array(particle_local, dtype=i32, device=device),
+                row_start=wp.array(row_start, dtype=i32, device=device),
+                column_start=wp.array(column_start[:-1], dtype=i32, device=device),
+                block_particles=wp.array(counts, dtype=i32, device=device),
+                column=wp.array(column, dtype=i32, device=device),
+                response=response,
                 coefficient=wp.array(c, dtype=f64, device=device),
                 direction=wp.array(d, dtype=wp.vec3d, device=device),
-                columns=columns,
             )
         return self._held_rows[1]
 
     def _step_held_rows(self, ls, M: int, dt: float) -> None:
         """Newton step of the rows that hold particles at points, at the positions the other rows corrected."""
         from . import kernels as K  # noqa: PLC0415
-        from .joints import _tile_kernels, gather_values_kernel  # noqa: PLC0415
+        from .joints import _tile_kernels, gather_values_kernel, scatter_values_kernel  # noqa: PLC0415
 
         h, device, r = self._held_row_factor(ls), self._device, self._nsn_r_d
         inputs = [*self._constraint_rows, self._x_cur, wp.int32(3 * M)]
         n_b = self._constraint_rows[0].shape[0]
         wp.launch(K.particle_constraint_residual_kernel, n_b, inputs, [r, self._nsn_pene0_d], device=device)
-        wp.launch(gather_values_kernel, h.rows.shape[0], [r[3 * M :], h.rows, 0], [h.rhs.flatten()], device=device)
-        wp.launch_tiled(_tile_kernels(h.tile)[1], dim=1, inputs=[h.L, h.rhs, h.x], block_dim=64, device=device)
+        n_h = h.rows.shape[0]
+        wp.launch(gather_values_kernel, n_h, [r[3 * M :], h.rows, 0], [h.residual], device=device)
+        wp.launch(scatter_values_kernel, n_h, [h.residual, 0, h.slot], [h.rhs.flatten()], device=device)
+        blocks = h.L.shape[0]
+        wp.launch_tiled(_tile_kernels(h.tile)[1], dim=blocks, inputs=[h.L, h.rhs, h.x], block_dim=64, device=device)
         outputs = [a[3 * M :] for a in (self._nsn_lam_d, self._nsn_omega_d, self._nsn_lam_apply_d)]
-        wp.launch(K.held_row_update_kernel, h.rows.shape[0], [h.rows, h.x, wp.float64(dt)], outputs, device=device)
-        inputs = [h.rows, h.column, h.coefficient, h.direction, h.columns, h.x]
+        inputs = [h.rows, h.slot, h.x.flatten(), wp.float64(dt)]
+        wp.launch(K.held_row_update_kernel, n_h, inputs, outputs, device=device)
+        inputs = [h.particle_block, h.particle_local, h.row_start, h.column_start, h.block_particles, h.column]
+        inputs += [h.response, h.coefficient, h.direction, h.slot, h.x.flatten()]
         wp.launch(K.held_row_correction_kernel, ls.n, inputs, [self._x_cur], device=device)
+
+    def _prepare_lite_worlds(self, ls) -> None:
+        """Keep each world's standalone choice of cofactor, Cholesky or sparse PCR."""
+        from . import kernels as K  # noqa: PLC0415
+
+        device = self._device
+        self._lite_direct = None
+        if self.model.world_count > 1:
+            # A complex neighbor must not move a world's small exact blocks onto truncated PCR.
+            counts = np.diff(ls._isodof_row_offsets_d.numpy())
+            maximum = np.zeros(self.model.world_count, dtype=np.int32)
+            np.maximum.at(maximum, self._particle_world_h, counts)
+            direct = ~self._regularized_world_h & (maximum <= K._MAX_ROWS_PER_PARTICLE)
+            # rows built on the device, with rows on several particles, keep no list of their particles
+            unique = ls._isodof_unique_d
+            particles = np.unique(ls._row_particle_d.numpy()) if unique is None else unique.numpy()
+            particles = particles[direct[self._particle_world_h[particles]]]
+            if len(particles):
+                per_contact = direct & (maximum <= 3)
+                per_contact[self._constraint_world_h] = False
+                contacts = np.flatnonzero(per_contact[self._contact_world_h])
+                particles = particles[~per_contact[self._particle_world_h[particles]]]
+                rows = np.flatnonzero(direct[self._particle_world_h[ls._row_particle_d.numpy()]])
+                all_particles = np.flatnonzero(direct[self._particle_world_h])
+                self._lite_direct = SimpleNamespace(
+                    particles=wp.array(particles, dtype=wp.int32, device=device),
+                    contacts=wp.array(contacts, dtype=wp.int32, device=device),
+                    rows=wp.array(rows, dtype=wp.int32, device=device),
+                    all_particles=wp.array(all_particles, dtype=wp.int32, device=device),
+                    zeros=wp.zeros(len(rows), dtype=wp.float64, device=device),
+                )
+
+    def _launch_lite_worlds(self, ls, M, dt, cap_internal, use_cap, r, pene0, lam, omega, lam_apply) -> None:
+        """Advance the direct subsets once with their original single-world kernels."""
+        from . import kernels as K  # noqa: PLC0415
+
+        direct = self._lite_direct
+        if direct is None:
+            return
+        outputs = [lam, omega, lam_apply]
+        tail = [ls._inv_mass_d, wp.float64(dt), wp.float64(cap_internal), int(use_cap)]
+        if direct.particles.shape[0]:
+            inputs = [direct.particles, ls._isodof_row_offsets_d, ls._isodof_row_indices_d]
+            inputs += [ls._row_particle_d, ls._row_dir_d, ls._row_alpha_d, self._contact_mu_d, r, pene0]
+            wp.launch(
+                K.fb_newton_lite_coulomb_per_particle_kernel,
+                direct.particles.shape[0],
+                [*inputs, *tail, 3 * M],
+                outputs,
+                device=self._device,
+            )
+        if direct.contacts.shape[0]:
+            inputs = [
+                direct.contacts,
+                self._contact_particle_d,
+                self._contact_normal_d,
+                self._contact_tangent1_d,
+                self._contact_tangent2_d,
+                self._contact_alpha_d,
+                self._contact_mu_d,
+                r,
+                pene0,
+            ]
+            wp.launch(
+                K.fb_newton_lite_coulomb_kernel,
+                direct.contacts.shape[0],
+                [*inputs, *tail],
+                outputs,
+                device=self._device,
+            )
 
     def _build_lite_delassus(self, M: int, ls, n_b: int) -> tuple:
         """The sparse lite Delassus matrix of the ``M`` contacts and ``n_b`` bilateral rows, which holds for the
@@ -2686,16 +2913,118 @@ class SolverFBA(SolverBase):
         world_mask: wp.array[wp.bool] | None = None,
         flags: StateFlags | int | None = None,
     ) -> None:
-        """Drop the friction anchors and the warm-start multipliers that the steps before kept, so that the next
-        step starts afresh.
+        """Restore selected body and particle state and clear the selected worlds' solver history.
 
-        The state is not modified. SolverFBA simulates one world, so any reset drops all of them.
+        Requested fields are copied from the model defaults. Missing State arrays are skipped.
+        With ``flags=0``, the supplied physical state is preserved; friction anchors and warm-start
+        multipliers are cleared regardless of flags. Bodies are left untouched when
+        ``integrate_with_external_rigid_solver=True``.
+
+        FBA uses maximal body coordinates, so ``JOINT_Q`` and ``JOINT_QD`` are ignored. To reset
+        from joint coordinates, run :func:`~newton.eval_fk` after reset. Force flags are also ignored;
+        external forces, control inputs, pin targets and particle constraint targets remain caller-owned.
+
+        This does not reset a CollisionPipeline or actuator state. After a discontinuous state change,
+        call :meth:`~newton.CollisionPipeline.reset_contact_matching` with the same world mask and
+        regenerate contacts before stepping. Reset any actuator history through its own state reset.
 
         Args:
-            state: The simulation state, unused.
-            world_mask: Unused.
-            flags: Unused.
+            state: The simulation state to modify in place.
+            world_mask: Boolean mask of shape ``(world_count + 1,)``; the last entry selects global
+                entities. ``None`` clears every world's history.
+            flags: State fields to restore: ``BODY_Q``, ``BODY_QD``, ``PARTICLE_Q`` and ``PARTICLE_QD``.
+                ``None`` requests all supported fields; ``0`` clears only solver history.
         """
+        if state is None:
+            raise ValueError("'state' argument is required.")
+        world_mask = self._normalize_reset_world_mask(world_mask)
+        model, device = self.model, self._device
+        flags_value = int(StateFlags.ALL if flags is None else flags)
+        fields = [
+            ("particle_q", StateFlags.PARTICLE_Q, model.particle_world),
+            ("particle_qd", StateFlags.PARTICLE_QD, model.particle_world),
+        ]
+        if not self.integrate_with_external_rigid_solver:
+            fields += [
+                ("body_q", StateFlags.BODY_Q, model.body_world),
+                ("body_qd", StateFlags.BODY_QD, model.body_world),
+            ]
+        copies = []
+        # Validate every requested field before modifying state or history.
+        for name, flag, world in fields:
+            if not flags_value & int(flag):
+                continue
+            current, initial = getattr(state, name), getattr(model, name)
+            if current is None or initial is None:
+                continue
+            if current.device != device or current.shape != initial.shape or current.dtype != initial.dtype:
+                raise ValueError(f"state.{name} must match the model's shape, dtype and device")
+            copies.append((world, initial, current))
+        for world, initial, current in copies:
+            if world_mask is None:
+                wp.copy(current, initial)
+            elif current.size:
+                wp.launch(
+                    reset_state_array,
+                    current.shape[0],
+                    [world, world_mask, model.world_count, initial],
+                    [current],
+                    device=device,
+                )
+        if world_mask is not None:
+            from .warm_start import (  # noqa: PLC0415
+                clear_anchor_contacts_kernel,
+                clear_anchor_particles_kernel,
+                clear_bilateral_worlds_kernel,
+                clear_group_worlds_kernel,
+            )
+
+            if self.friction_anchors and model.particle_count:
+                inputs = [model.particle_world, world_mask]
+                wp.launch(
+                    clear_anchor_particles_kernel, model.particle_count, inputs, [self._anchor_step_d], device=device
+                )
+                if self._anchor_count:
+                    inputs = [self._anchor_previous_key_d, model.particle_world, max(model.shape_count, 1), world_mask]
+                    wp.launch(
+                        clear_anchor_contacts_kernel,
+                        self._anchor_count,
+                        inputs,
+                        [self._anchor_previous_pressed_d],
+                        device=device,
+                    )
+            ws = self._warm_start
+            if ws is not None:
+                joint_world = wp.array(self._joint_world_h, dtype=wp.int32, device=device)
+                worlds = (model.particle_world, model.shape_world, joint_world)
+                for kind, (group, world) in enumerate(zip((ws.particle, ws.rigid, ws.joint), worlds, strict=True)):
+                    if group.prev_count:
+                        inputs = [
+                            group.prev_sorted,
+                            group.prev_order,
+                            world,
+                            kind,
+                            model.shape_count,
+                            group.rows,
+                            world_mask,
+                        ]
+                        wp.launch(
+                            clear_group_worlds_kernel,
+                            group.prev_count,
+                            inputs,
+                            [group.prev_lam, group.prev_omega],
+                            device=device,
+                        )
+                if ws.bilateral_count:
+                    world = wp.array(self._constraint_world_h, dtype=wp.int32, device=device)
+                    wp.launch(
+                        clear_bilateral_worlds_kernel,
+                        ws.bilateral_count,
+                        [world, world_mask],
+                        [ws.bilateral_lam, ws.bilateral_omega],
+                        device=device,
+                    )
+            return
         self._anchor_count = 0
         if self.friction_anchors and self.model.particle_count:
             self._anchor_step_d.fill_(-2)
@@ -2797,7 +3126,7 @@ class SolverFBA(SolverBase):
         self._anchor_rows = 0
         M = self._contact_count
         # The contacts of a step that solves rigid contact rows with them keep the step's points.
-        if M == 0 or self._two_way:
+        if M == 0 or (self._two_way and self.model.world_count == 1):
             return
         self._ensure_anchor_buffers(M)
         (extra_particle, extra_alpha), has_extra = self._anchor_extra()
@@ -2810,6 +3139,7 @@ class SolverFBA(SolverBase):
         inputs += [wp.int32(self._anchor_step), self._anchor_triangle_d, self._anchor_bary_d, self._anchor_step_d]
         inputs += [self._anchor_previous_key_d, self._anchor_previous_point_d, self._anchor_previous_pressed_d]
         inputs += [wp.int32(self._anchor_count)]
+        inputs += [self.model.particle_world, self._two_way_world_d]
         outputs = [self._contact_tangent1_offset_shifted_d, self._contact_tangent2_offset_shifted_d]
         outputs += [self._anchor_flag_d, self._anchor_key_d, self._anchor_point_d]
         wp.launch(friction_anchor_apply_kernel, M, inputs, outputs, device=self._device)
@@ -2851,6 +3181,7 @@ class SolverFBA(SolverBase):
         inputs += [self._lam_coulomb_persistent_d]
         inputs += [self._anchor_step_d if held is None else held, wp.int32(held is not None), shape_body]
         inputs += [wp.int32(self._anchor_step), self._anchor_flag_d, self._anchor_key_d, self._anchor_point_d]
+        inputs += [self.model.particle_world, self._two_way_world_d]
         outputs = [self._anchor_triangle_d, self._anchor_bary_d, self._anchor_step_d]
         outputs += [self._anchor_next_key_d, self._anchor_next_point_d, self._anchor_next_pressed_d]
         wp.launch(friction_anchor_update_kernel, M, inputs, outputs, device=self._device)
@@ -3414,6 +3745,7 @@ class SolverFBA(SolverBase):
             outputs=[rhs_v],
             device=device,
         )
+        self._pcr_solver.world_rows = self._deformable_world_rows
         self._pcr_solver.solve_sparse_fused(A_bsr, rhs_v, dlam_v)
 
         wp.launch(
@@ -3449,6 +3781,18 @@ class SolverFBA(SolverBase):
         )
         wp.copy(lam_out_d, self._bsr_lam, count=n_rows)
         wp.copy(omega_out_d, self._bsr_omega, count=n_rows)
+        if self._lite_direct is not None:
+            direct = self._lite_direct
+            wp.launch(
+                K.restore_lite_direct_rows_kernel,
+                direct.rows.shape[0],
+                [direct.rows, lam_init_d, omega_init_d],
+                [lam_out_d, omega_out_d],
+                device=device,
+            )
+            self._launch_lite_worlds(
+                ls, M_total, dt, cap_internal, use_cap, r_d, pene0_d, lam_out_d, omega_out_d, lam_apply_out_d
+            )
 
     def _ensure_lite_bsr_buffers(self, n_rows: int) -> None:
         """Size the PCR solver and the per-row scratch of the sparse lite NSN for ``n_rows`` rows, with headroom,
@@ -3568,6 +3912,13 @@ class SolverFBA(SolverBase):
         omega_lam, w = self._acc_omega_lam[:n_rows], self._acc_w[:n_rows]
         inputs = [self._omega_coulomb_persistent_d, self._lam_coulomb_persistent_d]
         wp.launch(compute_omega_times_lam_kernel, n_rows, inputs, [omega_lam], device=device)
+        if self._lite_direct is not None:
+            from .joints import scatter_values_kernel  # noqa: PLC0415
+
+            direct = self._lite_direct
+            wp.launch(
+                scatter_values_kernel, direct.rows.shape[0], [direct.zeros, 0, direct.rows], [omega_lam], device=device
+            )
         # The rows that hold particles at points take their own exact step and apply nothing here.
         if self._held_rows is not None:
             from .joints import scatter_values_kernel  # noqa: PLC0415
@@ -3583,6 +3934,17 @@ class SolverFBA(SolverBase):
 
         inputs = [self._x_cur, self._acc_free]
         wp.launch(sub_vec3_kernel, self.model.particle_count, inputs, [self._acc_d], device=self._device)
+        if self._lite_direct is not None:
+            from .kernels import clear_lite_direct_displacement_kernel  # noqa: PLC0415
+
+            particles = self._lite_direct.all_particles
+            wp.launch(
+                clear_lite_direct_displacement_kernel,
+                particles.shape[0],
+                [particles],
+                [self._acc_d],
+                device=self._device,
+            )
 
     def _ensure_pcr_solver(self, max_n: int) -> None:
         """Lazily create / resize the NSN-Schur PCR solver."""
@@ -3731,6 +4093,7 @@ class SolverFBA(SolverBase):
         device = self._device
         self._ensure_nsn_inner_buffers(M)
         self._ensure_pcr_solver(M)
+        self._pcr_solver.world_rows = self._deformable_world_rows
 
         cap = self._nsn_inner_n
         # When the caller supplies a device-resident W view
@@ -3989,7 +4352,15 @@ class SolverFBA(SolverBase):
         if pcr.max_iter > pcr.check_every or not wp.get_device(device).is_cuda:
             run()
             return
-        key = (name, *(id(a) for a in (*W_sparse, *inputs, *tail[1])), sizes, precond_key, id(pcr))
+        key = (
+            name,
+            *(id(a) for a in (*W_sparse, *inputs, *tail[1])),
+            sizes,
+            precond_key,
+            id(pcr),
+            id(pcr.world_rows),
+            id(self._nsn_contact_scale),
+        )
         cached = self._nsn_graph
         if cached is None or cached[0] != key:
             try:
@@ -3999,7 +4370,11 @@ class SolverFBA(SolverBase):
             except RuntimeError:
                 graph = None
             # The objects of the key stay alive with the graph, so that no new object takes one of their identities.
-            cached = self._nsn_graph = (key, graph, (W_sparse, inputs, block_precond, pcr, tail[1]))
+            cached = self._nsn_graph = (
+                key,
+                graph,
+                (W_sparse, inputs, block_precond, pcr, tail[1], pcr.world_rows, self._nsn_contact_scale),
+            )
             if graph is None:
                 run()
                 return
@@ -4061,6 +4436,7 @@ class SolverFBA(SolverBase):
             regularized = 3 * M if contact_regularization > 0.0 else 0
             inputs = [W_sp.offsets, W_sp.columns, W_sp.values, self._nsn_omega_d, self._nsn_compliance_d, regularized]
             inputs.append(wp.float64(1.0 + contact_regularization))
+            inputs.append(self._nsn_contact_scale)
             wp.launch(K.build_a_schur_csr_kernel, int(W_sp.nnz), inputs, [A_sp.values], device=device)
             wp.launch(K.compute_omega_times_lam_kernel, n_rows, [omega, lam], [ol], device=device)
             wps.bsr_mv(W_sp, ol, wol)
@@ -4090,6 +4466,8 @@ class SolverFBA(SolverBase):
         W_device: wp.array2d[wp.float64] | None = None,
         W_sparse: tuple | None = None,
         graph: str | None = None,
+        world_rows: tuple | None = None,
+        contact_scale: wp.array | None = None,
         graph_tail: Callable[[], None] | None = None,
         graph_tail_objects: tuple = (),
         r_device: wp.array[wp.float64] | None = None,
@@ -4190,6 +4568,8 @@ class SolverFBA(SolverBase):
         self._ensure_nsn_inner_buffers(n_rows, alloc_2d=not self.nsn_sparse_storage)
         self._ensure_pcr_solver(n_rows)
         cap = self._nsn_inner_n
+        self._pcr_solver.world_rows = world_rows
+        self._nsn_contact_scale = self._empty_contact_scale if contact_scale is None else contact_scale
         if graph is not None and W_sparse is not None and skip_download:
             inputs = (r_device, pene0_device, mu_device, lam_init_device, omega_init_device)
             if all(a is not None for a in inputs):
@@ -4340,7 +4720,7 @@ class SolverFBA(SolverBase):
                     wp.launch(
                         K.scale_diagonal_kernel,
                         dim=3 * M,
-                        inputs=[wp.float64(1.0 + contact_regularization)],
+                        inputs=[wp.float64(1.0 + contact_regularization), self._nsn_contact_scale],
                         outputs=[self._nsn_a_schur_d],
                         device=device,
                     )

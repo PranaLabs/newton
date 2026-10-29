@@ -3632,8 +3632,8 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             SolverFBA(model, iterations=1)
 
-    def test_several_worlds_are_refused(self) -> None:
-        """Refuse a model with two worlds, whose contact solve and self contacts would couple them."""
+    def test_several_worlds_are_supported(self) -> None:
+        """Accept overlapping replicated worlds."""
         cloth = newton.ModelBuilder()
         cloth.add_cloth_grid(
             pos=wp.vec3(0.0),
@@ -3648,8 +3648,10 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
         )
         builder = newton.ModelBuilder()
         builder.replicate(cloth, 2)
-        with self.assertRaisesRegex(ValueError, "one world"):
-            SolverFBA(builder.finalize())
+        model = builder.finalize()
+        solver = SolverFBA(model)
+        state = model.state()
+        solver.step(state, model.state(), None, None, 0.01)
 
     def test_full_surface_contacts_are_refused(self) -> None:
         """Refuse contacts from a pipeline that reports edge and face soft contacts, as other particle solvers do."""

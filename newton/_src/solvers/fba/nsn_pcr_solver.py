@@ -68,7 +68,121 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+import numpy as np
 import warp as wp
+
+
+def group_world_rows(worlds: np.ndarray, device) -> tuple:
+    """Stable indexed segments of independent worlds, without reordering the system's rows."""
+    _, world, counts = np.unique(worlds, return_inverse=True, return_counts=True)
+    arrays = (world, np.r_[0, np.cumsum(counts)], np.argsort(world, kind="stable"))
+    return (*(wp.array(a, dtype=wp.int32, device=device) for a in arrays), int(counts.max(initial=0)))
+
+
+@wp.kernel
+def _world_dot_kernel(
+    offsets: wp.array[wp.int32],
+    rows: wp.array[wp.int32],
+    a: wp.array[wp.float64],
+    b: wp.array[wp.float64],
+    out: wp.array[wp.float64],
+):
+    world, lane = wp.tid()
+    value = wp.float64(0.0)
+    for slot in range(offsets[world] + lane, offsets[world + 1], wp.block_dim()):
+        i = rows[slot]
+        value += a[i] * b[i]
+    total = wp.tile_sum(wp.tile(value))[0]
+    if lane == 0:
+        out[world] = total
+
+
+@wp.kernel
+def _world_dense_mv_kernel(
+    A: wp.array2d[wp.float64],
+    x: wp.array[wp.float64],
+    world: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    rows: wp.array[wp.int32],
+    out: wp.array[wp.float64],
+):
+    i, lane = wp.tid()
+    w = world[i]
+    value = wp.float64(0.0)
+    # Do not even read another world's vector: zero times NaN is still NaN.
+    for slot in range(offsets[w] + lane, offsets[w + 1], wp.block_dim()):
+        j = rows[slot]
+        value += A[i, j] * x[j]
+    total = wp.tile_sum(wp.tile(value))[0]
+    if lane == 0:
+        out[i] = total
+
+
+@wp.kernel
+def _world_alpha_kernel(
+    rho: wp.array[wp.float64],
+    den: wp.array[wp.float64],
+    curvature: wp.array[wp.float64],
+    chart: wp.array[wp.float64],
+    r2: wp.array[wp.float64],
+    b2: wp.array[wp.float64],
+    offsets: wp.array[wp.int32],
+    iteration: int,
+    check_every: int,
+    tol2: wp.float64,
+    eta: wp.float64,
+    alpha: wp.array[wp.float64],
+    stopped: wp.array[wp.int32],
+):
+    w = wp.tid()
+    if iteration >= offsets[w + 1] - offsets[w] or b2[w] == wp.float64(0.0):
+        stopped[w] = 1
+    if iteration % check_every == 0 and r2[w] <= tol2 * b2[w]:
+        stopped[w] = 1
+    if not (den[w] > wp.float64(0.0) and curvature[w] > eta * chart[w] and wp.isfinite(rho[w])):
+        stopped[w] = 1
+    alpha[w] = wp.float64(0.0)
+    if stopped[w] == 0:
+        alpha[w] = rho[w] / den[w]
+
+
+@wp.kernel
+def _world_update_kernel(
+    world: wp.array[wp.int32],
+    alpha: wp.array[wp.float64],
+    p: wp.array[wp.float64],
+    q: wp.array[wp.float64],
+    t: wp.array[wp.float64],
+    x: wp.array[wp.float64],
+    r: wp.array[wp.float64],
+    z: wp.array[wp.float64],
+):
+    i = wp.tid()
+    a = alpha[world[i]]
+    if a != wp.float64(0.0):
+        x[i] += a * p[i]
+        r[i] -= a * q[i]
+        z[i] -= a * t[i]
+
+
+@wp.kernel
+def _world_direction_kernel(
+    world: wp.array[wp.int32],
+    rho: wp.array[wp.float64],
+    old: wp.array[wp.float64],
+    z: wp.array[wp.float64],
+    t: wp.array[wp.float64],
+    p: wp.array[wp.float64],
+    q: wp.array[wp.float64],
+):
+    i = wp.tid()
+    w = world[i]
+    beta = wp.float64(0.0)
+    if old[w] != wp.float64(0.0):
+        beta = rho[w] / old[w]
+    p[i] = z[i] + beta * p[i]
+    q[i] = t[i] + beta * q[i]
+
 
 # ---------------------------------------------------------------------------
 # Tile / block sizing for ``_matvec_tiled_kernel``
@@ -433,6 +547,210 @@ def _fused_pcr_direction_kernel(
         rho_buf[1 - slot] = rho_new
 
 
+# The fused iteration of independent worlds runs a grid of chunks of _FUSED_BLOCK rows: chunk c of world w is block
+# w * chunks + c and takes the world's rows offsets[w] + c * _FUSED_BLOCK + lane, through the stable row index. Each
+# block sums its world's chunk partials alike, so the worlds keep their own scalars and every block of a world agrees.
+
+
+@wp.func
+def _world_row(offsets: wp.array[wp.int32], rows: wp.array[wp.int32], w: int, c: int, k: int) -> int:
+    """The system row of row ``k`` of chunk ``c`` of world ``w``, or -1 past the world's rows. A lane takes rows
+    ``lane``, ``lane + block_dim`` and so on of its chunk: one on CUDA, all of them off it, whose tiled launches run a
+    lane per block."""
+    slot = offsets[w] + c * _FUSED_BLOCK + k
+    if slot < offsets[w + 1]:
+        return rows[slot]
+    return -1
+
+
+@wp.func
+def _world_partial(partial: wp.array[wp.float64], w: int, chunks: int, lane: int) -> wp.float64:
+    """A lane's share of the sum of world ``w``'s chunk partials."""
+    value = wp.float64(0.0)
+    for c in range(lane, chunks, wp.block_dim()):
+        value += partial[w * chunks + c]
+    return value
+
+
+@wp.kernel
+def _world_fused_start_kernel(
+    offsets: wp.array[wp.int32],
+    rows: wp.array[wp.int32],
+    chunks: int,
+    s: wp.array[wp.float64],
+    q: wp.array[wp.float64],
+    b: wp.array[wp.float64],
+    partial_rho: wp.array[wp.float64],
+    partial_b2: wp.array[wp.float64],
+):
+    """The chunk sums of ``s . q`` and ``b . b``."""
+    block, lane = wp.tid()
+    w = block // chunks
+    sq = wp.float64(0.0)
+    bb = wp.float64(0.0)
+    for k in range(lane, _FUSED_BLOCK, wp.block_dim()):
+        i = _world_row(offsets, rows, w, block - w * chunks, k)
+        if i >= 0:
+            sq += s[i] * q[i]
+            bb += b[i] * b[i]
+    wp.tile_store(partial_rho, wp.tile_sum(wp.tile(sq)), offset=(block,))
+    wp.tile_store(partial_b2, wp.tile_sum(wp.tile(bb)), offset=(block,))
+
+
+@wp.kernel
+def _world_fused_sum_kernel(partial: wp.array[wp.float64], chunks: int, out: wp.array[wp.float64]):
+    """Each world's sum of its chunk partials."""
+    w, lane = wp.tid()
+    total = wp.tile_sum(wp.tile(_world_partial(partial, w, chunks, lane)))[0]
+    if lane == 0:
+        out[w] = total
+
+
+@wp.kernel
+def _world_fused_dots_kernel(
+    offsets: wp.array[wp.int32],
+    rows: wp.array[wp.int32],
+    chunks: int,
+    q: wp.array[wp.float64],
+    precond: wp.array[wp.float64],
+    d: wp.array[wp.float64],
+    diag: wp.array[wp.float64],
+    h: wp.array[wp.float64],
+    partial_den: wp.array[wp.float64],
+    partial_curvature: wp.array[wp.float64],
+    partial_chart: wp.array[wp.float64],
+):
+    """:func:`_fused_pcr_dots_kernel` over a world's chunk."""
+    block, lane = wp.tid()
+    w = block // chunks
+    qh = wp.float64(0.0)
+    dq = wp.float64(0.0)
+    dd = wp.float64(0.0)
+    for k in range(lane, _FUSED_BLOCK, wp.block_dim()):
+        i = _world_row(offsets, rows, w, block - w * chunks, k)
+        if i >= 0:
+            hi = precond[i] * q[i]
+            h[i] = hi
+            qh += q[i] * hi
+            dq += d[i] * q[i]
+            dd += d[i] * (diag[i] * d[i])
+    wp.tile_store(partial_den, wp.tile_sum(wp.tile(qh)), offset=(block,))
+    wp.tile_store(partial_curvature, wp.tile_sum(wp.tile(dq)), offset=(block,))
+    wp.tile_store(partial_chart, wp.tile_sum(wp.tile(dd)), offset=(block,))
+
+
+@wp.kernel
+def _world_fused_step_kernel(
+    offsets: wp.array[wp.int32],
+    rows: wp.array[wp.int32],
+    chunks: int,
+    partial_den: wp.array[wp.float64],
+    partial_curvature: wp.array[wp.float64],
+    partial_chart: wp.array[wp.float64],
+    rho_buf: wp.array2d[wp.float64],
+    b2: wp.array[wp.float64],
+    slot: int,
+    iteration: int,
+    tol2: wp.float64,
+    eta: wp.float64,
+    d: wp.array[wp.float64],
+    q: wp.array[wp.float64],
+    h: wp.array[wp.float64],
+    stopped: wp.array[wp.int32],
+    x: wp.array[wp.float64],
+    r: wp.array[wp.float64],
+    s: wp.array[wp.float64],
+):
+    """Each world's protected step as :func:`_world_alpha_kernel` takes it, and its rows' update as
+    :func:`_world_update_kernel` makes it."""
+    block, lane = wp.tid()
+    w = block // chunks
+    c = block - w * chunks
+    den = wp.tile_sum(wp.tile(_world_partial(partial_den, w, chunks, lane)))[0]
+    curvature = wp.tile_sum(wp.tile(_world_partial(partial_curvature, w, chunks, lane)))[0]
+    chart = wp.tile_sum(wp.tile(_world_partial(partial_chart, w, chunks, lane)))[0]
+    rho = rho_buf[slot, w]
+    stop = stopped[w] != 0
+    if iteration >= offsets[w + 1] - offsets[w] or b2[w] == wp.float64(0.0):
+        stop = True
+    # the residual test of the first iteration, whose residual is b: the fused runs end before the next one
+    if iteration == 0 and b2[w] <= tol2 * b2[w]:
+        stop = True
+    if not (den > wp.float64(0.0) and curvature > eta * chart and wp.isfinite(rho)):
+        stop = True
+    alpha = wp.float64(0.0)
+    if not stop:
+        alpha = rho / den
+    if stop and c == 0 and lane == 0:
+        stopped[w] = 1
+    if alpha != wp.float64(0.0):
+        for k in range(lane, _FUSED_BLOCK, wp.block_dim()):
+            i = _world_row(offsets, rows, w, c, k)
+            if i >= 0:
+                x[i] += alpha * d[i]
+                r[i] -= alpha * q[i]
+                s[i] -= alpha * h[i]
+
+
+@wp.kernel
+def _world_fused_mv_kernel(
+    offsets: wp.array[wp.int32],
+    rows: wp.array[wp.int32],
+    chunks: int,
+    matrix_offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    s: wp.array[wp.float64],
+    h: wp.array[wp.float64],
+    partial_rho: wp.array[wp.float64],
+):
+    """:func:`_fused_pcr_mv_kernel` over a world's chunk."""
+    block, lane = wp.tid()
+    w = block // chunks
+    sh = wp.float64(0.0)
+    for k in range(lane, _FUSED_BLOCK, wp.block_dim()):
+        i = _world_row(offsets, rows, w, block - w * chunks, k)
+        if i >= 0:
+            y = wp.float64(0.0)
+            for e in range(matrix_offsets[i], matrix_offsets[i + 1]):
+                y += values[e] * s[columns[e]]
+            h[i] = y
+            sh += s[i] * y
+    wp.tile_store(partial_rho, wp.tile_sum(wp.tile(sh)), offset=(block,))
+
+
+@wp.kernel
+def _world_fused_direction_kernel(
+    offsets: wp.array[wp.int32],
+    rows: wp.array[wp.int32],
+    chunks: int,
+    partial_rho: wp.array[wp.float64],
+    rho_buf: wp.array2d[wp.float64],
+    slot: int,
+    s: wp.array[wp.float64],
+    h: wp.array[wp.float64],
+    d: wp.array[wp.float64],
+    q: wp.array[wp.float64],
+):
+    """Each world's ``beta`` and its rows' directions as :func:`_world_direction_kernel` forms them; the world's
+    first chunk keeps ``rho_new`` in the other slot."""
+    block, lane = wp.tid()
+    w = block // chunks
+    c = block - w * chunks
+    rho_new = wp.tile_sum(wp.tile(_world_partial(partial_rho, w, chunks, lane)))[0]
+    rho = rho_buf[slot, w]
+    beta = wp.float64(0.0)
+    if rho != wp.float64(0.0):
+        beta = rho_new / rho
+    for k in range(lane, _FUSED_BLOCK, wp.block_dim()):
+        i = _world_row(offsets, rows, w, c, k)
+        if i >= 0:
+            d[i] = s[i] + beta * d[i]
+            q[i] = h[i] + beta * q[i]
+    if c == 0 and lane == 0:
+        rho_buf[1 - slot, w] = rho_new
+
+
 def csr_mv(W, x: wp.array, y: wp.array) -> None:
     """``y = W x`` for a scalar sparse matrix of ``warp.sparse``, read as CSR, through :func:`csr_mv_kernel`."""
     inputs = [W.offsets, W.columns, W.values, x]
@@ -526,8 +844,16 @@ class NSNPCRSolver:
         self._stopped_d = wp.zeros(1, dtype=wp.float64, device=device)
         self._r_norm_d = wp.zeros(1, dtype=wp.float64, device=device)
         # Block sums of the fused sparse iteration of :meth:`solve_sparse_fused` and its double-buffered ``rho``.
-        self._fused_partials = wp.zeros((4, _FUSED_MAX_BLOCKS), dtype=wp.float64, device=device)
+        # The fused worlds take one block per chunk of each world, up to ``max_n`` blocks, so that a grid padded
+        # to the longest world fits whenever it is no larger than the system's own bound; a single system keeps its
+        # limit of 1024 blocks. Allocated once, so captured graphs keep their pointers.
+        capacity = max(int(_FUSED_MAX_BLOCKS), self.max_n)
+        self._fused_partials = wp.zeros((4, capacity), dtype=wp.float64, device=device)
         self._fused_rho = wp.zeros(2, dtype=wp.float64, device=device)
+        # The fused iteration of independent worlds: each world's double-buffered ``rho``, ``b . b`` and stop flag.
+        self._world_fused_rho = wp.zeros((2, capacity), dtype=wp.float64, device=device)
+        self._world_fused_b2 = wp.zeros(capacity, dtype=wp.float64, device=device)
+        self._world_fused_stopped = wp.zeros(capacity, dtype=wp.int32, device=device)
 
         # Cache one ``wp.Graph`` per active ``n`` shape so repeated
         # solves at the same shape replay a pre-recorded CUDA graph for the
@@ -537,6 +863,88 @@ class NSNPCRSolver:
         # we don't retry on every call.
         self._pcr_graph_cache: dict[int, wp.Graph | None] = {}
         self._block_precond = None
+        self.world_rows = None
+        self._world_scalars = None
+
+    def _solve_worlds(self, A, b, x_out, block_precond, *, sparse: bool) -> int:
+        """Run the same PCR recurrence with independent reductions, budgets and refusal flags per world."""
+        import warp.sparse as wps  # noqa: PLC0415
+
+        world, offsets, rows, max_rows = self.world_rows
+        n, nw, device = b.shape[0], offsets.shape[0] - 1, self.device
+        if world.shape[0] != n or n > self.max_n or x_out.shape[0] != n or A.shape != (n, n):
+            raise ValueError("world rows, matrix and vectors must describe the same system")
+        if self._world_scalars is None:
+            self._world_scalars = [wp.empty(self.max_n, dtype=wp.float64, device=device) for _ in range(8)]
+            self._world_stopped = wp.zeros(self.max_n, dtype=wp.int32, device=device)
+        rho, old, den, curvature, chart, alpha, r2, b2 = (a[:nw] for a in self._world_scalars)
+        x, r, z, p, q, t, diag, precond, dd = (
+            a[:n] for a in (self._x, self._r, self._s, self._d, self._q, self._h, self._diag, self._precond, self._dd)
+        )
+
+        def dot(a, b, out):
+            wp.launch_tiled(
+                _world_dot_kernel, dim=nw, inputs=[offsets, rows, a, b], outputs=[out], block_dim=128, device=device
+            )
+
+        def mv(a, out):
+            if sparse:
+                wps.bsr_mv(A, a, out)
+            else:
+                wp.launch_tiled(
+                    _world_dense_mv_kernel,
+                    dim=n,
+                    inputs=[A, a, world, offsets, rows],
+                    outputs=[out],
+                    block_dim=128,
+                    device=device,
+                )
+
+        def apply(a, out):
+            wp.launch(_apply_precond_kernel, n, [a, precond], [out], device=device)
+            if block_precond is not None:
+                block_precond(a, out)
+
+        x.zero_()
+        self._world_stopped.zero_()
+        if sparse:
+            wps.bsr_get_diag(A, out=diag)
+            wp.launch(_precond_from_bsr_diag_kernel, n, [diag], [precond], device=device)
+        else:
+            wp.launch(_compute_precond_kernel, n, [A], [precond], device=device)
+        wp.copy(r, b)
+        apply(r, z)
+        wp.copy(p, z)
+        mv(p, q)
+        dot(z, q, rho)
+        dot(b, b, b2)
+        wp.copy(r2, b2)
+        iterations = min(self.max_iter, max_rows)
+        for k in range(iterations):
+            apply(q, t)
+            dot(q, t, den)
+            if sparse:
+                wp.launch(_apply_precond_kernel, n, [p, diag], [dd], device=device)
+            else:
+                wp.launch(_diag_scale_kernel, n, [A, p], [dd], device=device)
+            dot(p, q, curvature)
+            dot(p, dd, chart)
+            if k and k % self.check_every == 0:
+                dot(r, r, r2)
+            inputs = [rho, den, curvature, chart, r2, b2, offsets, k, self.check_every]
+            inputs += [wp.float64(self.tol**2), self._eta]
+            wp.launch(_world_alpha_kernel, nw, inputs, [alpha, self._world_stopped], device=device)
+            if k and k % self.check_every == 0 and not wp.get_device(device).is_capturing:
+                if self._world_stopped[:nw].numpy().all():
+                    iterations = k
+                    break
+            wp.launch(_world_update_kernel, n, [world, alpha, p, q, t], [x, r, z], device=device)
+            mv(z, t)
+            wp.copy(old, rho)
+            dot(z, t, rho)
+            wp.launch(_world_direction_kernel, n, [world, rho, old, z, t], [p, q], device=device)
+        wp.copy(x_out, x)
+        return iterations
 
     # ------------------------------------------------------------------
     # Public API
@@ -581,6 +989,10 @@ class NSNPCRSolver:
             raise ValueError(f"A shape {tuple(A.shape)} incompatible with b shape ({n},)")
         if x_out.shape[0] != n:
             raise ValueError(f"x_out shape ({x_out.shape[0]},) incompatible with b shape ({n},)")
+
+        if self.world_rows is not None:
+            iterations = self._solve_worlds(A, b, x_out, block_precond, sparse=False)
+            return iterations, float(self._world_scalars[0][: self.world_rows[1].shape[0] - 1].numpy().sum())
 
         device = self.device
         max_iter = min(self.max_iter, n)
@@ -721,6 +1133,9 @@ class NSNPCRSolver:
         if x_out.shape[0] != n:
             raise ValueError(f"x_out shape ({x_out.shape[0]},) incompatible with b shape ({n},)")
 
+        if self.world_rows is not None:
+            return self._solve_worlds(W_bsr, b, x_out, block_precond, sparse=True)
+
         device = self.device
         max_iter = min(self.max_iter, n)
         unchecked = max_iter <= self.check_every
@@ -785,8 +1200,10 @@ class NSNPCRSolver:
 
         The scalars of an iteration reduce in blocks of rows, and every block sums the blocks' partial sums
         alike, so that the run is deterministic; the matrix products run one thread per row in column order. Sums
-        run in another order than :meth:`solve_sparse`'s, so results differ by rounding. Runs that
-        :meth:`solve_sparse` checks for convergence, systems of more than 262144 rows, and solves off CUDA take
+        run in another order than :meth:`solve_sparse`'s, so results differ by rounding. With :attr:`world_rows`,
+        each world reduces its own chunks of rows and keeps its own scalars, row budget and stop flag, as in
+        :meth:`solve_sparse`. Runs that :meth:`solve_sparse` checks for convergence, single systems of more than
+        262144 rows, worlds of more chunks of 256 rows in all than ``max(1024, max_n)``, and solves off CUDA take
         :meth:`solve_sparse`.
 
         Args:
@@ -797,6 +1214,17 @@ class NSNPCRSolver:
         Returns:
             The iterations taken.
         """
+        if self.world_rows is not None:
+            _, offsets, _, max_rows = self.world_rows
+            chunks = (max_rows + _FUSED_BLOCK - 1) // _FUSED_BLOCK
+            unchecked = min(self.max_iter, max_rows) <= self.check_every
+            if (
+                not unchecked
+                or (offsets.shape[0] - 1) * chunks > self._fused_partials.shape[1]
+                or not wp.get_device(self.device).is_cuda
+            ):
+                return self.solve_sparse(W_bsr, b, x_out)
+            return self._solve_worlds_fused(W_bsr, b, x_out)
         n = int(b.shape[0])
         nb = (n + _FUSED_BLOCK - 1) // _FUSED_BLOCK
         max_iter = min(self.max_iter, n)
@@ -830,6 +1258,66 @@ class NSNPCRSolver:
             wp.launch_tiled(_fused_pcr_direction_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
         wp.copy(x_out, x, count=n)
         return max_iter
+
+    def _solve_worlds_fused(self, W_bsr, b: wp.array[wp.float64], x_out: wp.array[wp.float64]) -> int:
+        """The recurrence of :meth:`_solve_worlds` for a fixed iteration count, fused as in
+        :meth:`solve_sparse_fused` over each world's chunks of rows; it reads nothing from the device."""
+        world, offsets, rows, max_rows = self.world_rows
+        n, nw, device = int(b.shape[0]), offsets.shape[0] - 1, self.device
+        if not 0 < n <= self.max_n:
+            raise ValueError(f"system size n={n} outside 1..{self.max_n}")
+        if world.shape[0] != n or x_out.shape[0] != n or tuple(int(k) for k in W_bsr.shape) != (n, n):
+            raise ValueError("world rows, matrix and vectors must describe the same system")
+        chunks = (max_rows + _FUSED_BLOCK - 1) // _FUSED_BLOCK
+        grid = nw * chunks
+        if grid > self._fused_partials.shape[1] or nw > self._world_fused_b2.shape[0]:
+            raise ValueError(
+                f"{nw} worlds of {chunks} chunks exceed the fused scratch of {self._fused_partials.shape[1]}"
+            )
+        pden, pcurv, pchart, prho = (self._fused_partials[k][:grid] for k in range(4))
+        x, r, s, d, q, h = (a[:n] for a in (self._x, self._r, self._s, self._d, self._q, self._h))
+        precond, diag = self._precond[:n], self._diag[:n]
+        matrix = [W_bsr.offsets, W_bsr.columns, W_bsr.values]
+        segments = [offsets, rows, chunks]
+        rho, b2, stopped = self._world_fused_rho, self._world_fused_b2, self._world_fused_stopped
+        x.zero_()
+        wp.launch(csr_diag_kernel, n, matrix, [diag], device=device)
+        wp.launch(_precond_from_bsr_diag_kernel, n, [diag], [precond], device=device)
+        wp.copy(r, b, count=n)
+        wp.launch(_apply_precond_kernel, n, [r, precond], [s], device=device)
+        wp.copy(d, s, count=n)
+        wp.launch(csr_mv_kernel, n, [*matrix, d], [q], device=device)
+        inputs = [*segments, s, q, b]
+        wp.launch_tiled(
+            _world_fused_start_kernel,
+            dim=[grid],
+            inputs=inputs,
+            outputs=[pden, pcurv],
+            block_dim=_FUSED_BLOCK,
+            device=device,
+        )
+        for partial, out in ((pden, rho[0]), (pcurv, b2)):
+            inputs = [partial, chunks]
+            wp.launch_tiled(
+                _world_fused_sum_kernel, dim=[nw], inputs=inputs, outputs=[out], block_dim=_FUSED_BLOCK, device=device
+            )
+        stopped.zero_()
+        iterations = min(self.max_iter, max_rows)
+        tol2 = wp.float64(self.tol**2)
+        for k in range(iterations):
+            slot = k % 2
+            inputs = [*segments, q, precond, d, diag, h, pden, pcurv, pchart]
+            wp.launch_tiled(_world_fused_dots_kernel, dim=[grid], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
+            inputs = [*segments, pden, pcurv, pchart, rho, b2, slot, k, tol2, self._eta, d, q, h, stopped, x, r, s]
+            wp.launch_tiled(_world_fused_step_kernel, dim=[grid], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
+            inputs = [*segments, *matrix, s, h, prho]
+            wp.launch_tiled(_world_fused_mv_kernel, dim=[grid], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
+            inputs = [*segments, prho, rho, slot, s, h, d, q]
+            wp.launch_tiled(
+                _world_fused_direction_kernel, dim=[grid], inputs=inputs, block_dim=_FUSED_BLOCK, device=device
+            )
+        wp.copy(x_out, x, count=n)
+        return iterations
 
     # ------------------------------------------------------------------
     # Per-iter body + graph capture

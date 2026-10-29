@@ -296,6 +296,7 @@ class TestLiteCoulombKernel(unittest.TestCase):
             K.fb_newton_lite_coulomb_kernel,
             dim=M,
             inputs=[
+                wp.empty(0, dtype=wp.int32),
                 wp.array(np.arange(M, dtype=np.int32), dtype=wp.int32),
                 vec3(normal),
                 vec3(t1),

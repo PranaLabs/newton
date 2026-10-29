@@ -28,6 +28,7 @@ from .kernels import (
     estimate_world_extents,
     flag_changed_floats,
     flag_changed_vec3s,
+    offset_world_points,
     repack_shape_colors,
     repack_shape_opacities,
     transform_points,
@@ -424,6 +425,20 @@ class ViewerBase(ABC):
             device=self.device,
         )
         return transformed
+
+    def _apply_world_offsets_to_particles(self, points: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
+        """The particle positions ``points`` shifted by their worlds' display offsets, as the shapes are."""
+        if self.world_offsets is None or self.model.particle_world is None:
+            return points
+        shifted = wp.empty_like(points)
+        wp.launch(
+            offset_world_points,
+            dim=len(points),
+            inputs=[points, self.model.particle_world, self.world_offsets],
+            outputs=[shifted],
+            device=self.device,
+        )
+        return shifted
 
     def _qualify(self, name: str | None) -> str | None:
         """Prefix a backend object name with the active layer's namespace.
@@ -3371,7 +3386,7 @@ class ViewerBase(ABC):
         if self.model.tri_count:
             groups, stale_groups = self._get_triangle_appearance_groups()
             visible_paths = {name for name, _, _, _ in groups}
-            points = self._apply_layer_transform_to_points(state.particle_q)
+            points = self._apply_layer_transform_to_points(self._apply_world_offsets_to_particles(state.particle_q))
             hidden = not self.show_triangles or self._layer_force_hidden()
 
             for name, indices, color, opacity in groups:
@@ -3399,7 +3414,8 @@ class ViewerBase(ABC):
 
     def _log_particles(self, state: newton.State):
         if self.model.particle_count:
-            points = state.particle_q
+            # shifted by their worlds' offsets before the inactive ones are dropped, while they line up with them
+            points = self._apply_world_offsets_to_particles(state.particle_q)
             radii = self.model.particle_radius
 
             # Filter out inactive particles so emitters/culled particles are not rendered.

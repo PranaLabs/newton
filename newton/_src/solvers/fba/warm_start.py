@@ -17,8 +17,82 @@ share their particle and shape with another contact of their step.
 import numpy as np
 import warp as wp
 
+from ...core.reset import reset_world_selected
+
 # Key of a row without identity; it sorts after every other key.
 _NO_KEY = wp.constant(wp.int64(9223372036854775807))
+
+
+@wp.kernel
+def clear_group_worlds_kernel(
+    keys: wp.array[wp.int64],
+    order: wp.array[wp.int32],
+    entity_world: wp.array[wp.int32],
+    kind: int,
+    shape_count: int,
+    rows_per_key: int,
+    mask: wp.array[wp.bool],
+    lam: wp.array[wp.float64],
+    omega: wp.array[wp.float64],
+):
+    i = wp.tid()
+    key = keys[i]
+    if key == _NO_KEY:
+        return
+    world = int(0)
+    if kind == 0:
+        world = entity_world[int(key // wp.int64(shape_count))]
+    elif kind == 1:
+        pair = key // wp.int64(1 << 20)
+        world = wp.max(
+            entity_world[int(pair // wp.int64(shape_count))], entity_world[int(pair % wp.int64(shape_count))]
+        )
+    else:
+        world = entity_world[int(key)]
+    if reset_world_selected(world, mask, mask.shape[0] - 1):
+        for j in range(rows_per_key):
+            r = rows_per_key * order[i] + j
+            lam[r] = wp.float64(0.0)
+            omega[r] = wp.float64(0.0)
+
+
+@wp.kernel
+def clear_bilateral_worlds_kernel(
+    world: wp.array[wp.int32],
+    mask: wp.array[wp.bool],
+    lam: wp.array[wp.float64],
+    omega: wp.array[wp.float64],
+):
+    i = wp.tid()
+    if reset_world_selected(world[i], mask, mask.shape[0] - 1):
+        lam[i] = wp.float64(0.0)
+        omega[i] = wp.float64(0.0)
+
+
+@wp.kernel
+def clear_anchor_particles_kernel(
+    world: wp.array[wp.int32],
+    mask: wp.array[wp.bool],
+    step: wp.array[wp.int32],
+):
+    i = wp.tid()
+    if reset_world_selected(world[i], mask, mask.shape[0] - 1):
+        step[i] = -2
+
+
+@wp.kernel
+def clear_anchor_contacts_kernel(
+    keys: wp.array[wp.int64],
+    world: wp.array[wp.int32],
+    shape_count: int,
+    mask: wp.array[wp.bool],
+    pressed: wp.array[wp.int32],
+):
+    i = wp.tid()
+    if keys[i] != _NO_KEY:
+        p = int(keys[i] // wp.int64(shape_count + 1))
+        if reset_world_selected(world[p], mask, mask.shape[0] - 1):
+            pressed[i] = 0
 
 
 @wp.kernel

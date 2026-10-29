@@ -1,0 +1,1 @@
+Reduce `SolverFBA`'s setup memory with several worlds: factor each connected component separately so co-located worlds no longer share dense fronts, and cache each world's response columns only over its own particles. Factorization order can change floating-point results for disconnected systems; numerical operators and iteration rules are unchanged. No migration is needed.

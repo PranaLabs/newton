@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import warp as wp
 
 
@@ -14,6 +16,20 @@ def reset_world_selected(world: int, world_mask: wp.array[wp.bool], world_count:
     if world >= 0 and world < world_count:
         return world_mask[world]
     return world == -1 and world_mask[world_count]
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def reset_state_array(
+    entity_world: wp.array[int],
+    world_mask: wp.array[wp.bool],
+    world_count: int,
+    initial: wp.array[Any],
+    current: wp.array[Any],
+):
+    """Restore selected rows of one state array from its reset baseline."""
+    index = wp.tid()
+    if reset_world_selected(entity_world[index], world_mask, world_count):
+        current[index] = initial[index]
 
 
 def normalize_reset_world_mask(

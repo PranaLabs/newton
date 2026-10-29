@@ -4,9 +4,12 @@
 """Tests of SolverFBA's NumPy sparse LDLᵀ factorization."""
 
 import unittest
+from unittest import mock
 
 import numpy as np
 
+from newton._src.solvers.fba import linear_solver
+from newton._src.solvers.fba.linear_solver import factorize_and_sparse_inverse
 from newton._src.solvers.fba.sparse_ldlt import CsrMatrix, factor_ldlt, nested_dissection
 
 
@@ -107,6 +110,111 @@ class TestFactorLdlt(unittest.TestCase):
         """Refuse to factor a matrix with a negative eigenvalue."""
         with self.assertRaises(np.linalg.LinAlgError):
             factor_ldlt(CsrMatrix.from_matrix(np.diag([1.0, -1.0, 2.0])))
+
+
+def _join(blocks, permutation):
+    """The block diagonal matrix of ``blocks`` with its unknowns renumbered by ``permutation``."""
+    rows, cols, values, first = [], [], [], 0
+    for block in blocks:
+        rows.append(block.row_of_entries() + first)
+        cols.append(block.indices + first)
+        values.append(block.data)
+        first += block.shape[0]
+    place = np.argsort(permutation)
+    rows, cols = place[np.concatenate(rows)], place[np.concatenate(cols)]
+    return CsrMatrix.from_triplets((first, first), rows, cols, np.concatenate(values))
+
+
+class TestFactorizeComponents(unittest.TestCase):
+    def assert_system(self, matrix, positions):
+        """``P A Pᵀ = L D Lᵀ`` with ``S = L⁻¹`` to round-off, and ``A⁻¹ b`` solves ``A x = b``; return the system."""
+        system = factorize_and_sparse_inverse(matrix, positions)
+        order = system.invperm_r
+        np.testing.assert_array_equal(np.sort(order), np.arange(matrix.shape[0]))
+        np.testing.assert_array_equal(system.perm_r[order], np.arange(matrix.shape[0]))
+        A = matrix.toarray()
+        S = system.S.toarray()
+        L = np.linalg.inv(S)
+        dense = A[np.ix_(order, order)]
+        self.assertLess(np.abs(L / system.Dinv @ L.T - dense).max(), 1e-12 * np.abs(dense).max())
+        b = np.random.default_rng(3).standard_normal(matrix.shape[0])
+        x = np.empty_like(b)
+        x[order] = S.T @ (system.Dinv * (S @ b[order]))
+        self.assertLess(np.abs(A @ x - b).max(), 1e-10 * np.abs(b).max())
+        return system
+
+    def test_interleaved_heterogeneous_components(self):
+        """Factor interleaved components of different sizes and a singleton, with and without points, as one block
+        diagonal factor whose components take consecutive places of the order."""
+        blocks = [grid_system(4, 4, 2)[0], grid_system(3, 5, 1)[0], CsrMatrix.from_matrix(np.array([[2.5]]))]
+        points = [grid_system(4, 4, 2)[1], grid_system(3, 5, 1)[1], np.zeros((1, 3))]
+        n = sum(b.shape[0] for b in blocks)
+        permutation = np.random.default_rng(7).permutation(n)
+        matrix = _join(blocks, permutation)
+        label = np.repeat(np.arange(3), [b.shape[0] for b in blocks])[permutation]
+        for positions in (np.concatenate(points)[permutation], None):
+            with self.subTest(positions=positions is not None):
+                system = self.assert_system(matrix, positions)
+                runs = label[system.invperm_r]
+                self.assertEqual(np.count_nonzero(np.diff(runs)), 2)
+                S = system.S.toarray()
+                self.assertFalse(np.any(S[runs[:, None] != runs[None, :]]))
+
+    def test_colocated_replicas_factor_alone(self):
+        """Co-located independent replicas reach the multifrontal factor one at a time, so no front spans two."""
+        block, points = grid_system(5, 5, 2)
+        replicas = 4
+        n = replicas * block.shape[0]
+        permutation = np.arange(n).reshape(replicas, -1).T.ravel()  # interleave the replicas' unknowns
+        matrix = _join([block] * replicas, permutation)
+        positions = np.tile(points, (replicas, 1))[permutation]
+        sizes = []
+
+        def factor(matrix, positions=None, leaf_size=64):
+            sizes.append(matrix.shape[0])
+            return factor_ldlt(matrix, positions, leaf_size)
+
+        with mock.patch.object(linear_solver, "factor_ldlt", side_effect=factor):
+            system = self.assert_system(matrix, positions)
+        self.assertEqual(sizes, [block.shape[0]] * replicas)
+        runs = (permutation // block.shape[0])[system.invperm_r]
+        S = system.S.toarray()
+        self.assertFalse(np.any(S[runs[:, None] != runs[None, :]]))
+        reference = factor_ldlt(block, points)[1]
+        self.assertEqual(system.S.data.size, replicas * linear_solver.compute_lower_inverse(reference).data.size)
+
+    def test_connected_matrix_keeps_one_factor(self):
+        """A connected matrix, such as replicas coupled through one global unknown, factors as a whole, exactly
+        as before."""
+        block, points = grid_system(4, 4, 1)
+        replicas, m = 3, block.shape[0]
+        matrix = _join([block] * replicas, np.arange(replicas * m))
+        rows = np.r_[matrix.row_of_entries(), np.arange(0, replicas * m, m), np.full(replicas, replicas * m)]
+        cols = np.r_[matrix.indices, np.full(replicas, replicas * m), np.arange(0, replicas * m, m)]
+        values = np.r_[matrix.data + 0.0, -0.1 * np.ones(2 * replicas)]
+        coupled = CsrMatrix.from_triplets(
+            (replicas * m + 1,) * 2, np.r_[rows, replicas * m], np.r_[cols, replicas * m], np.r_[values, 1.0]
+        )
+        points = np.r_[np.tile(points, (replicas, 1)), np.zeros((1, 3))]
+        for positions in (points, None):
+            with self.subTest(positions=positions is not None):
+                system = self.assert_system(coupled, positions)
+                order, L, d = factor_ldlt(coupled, positions)
+                np.testing.assert_array_equal(system.invperm_r, order)
+                np.testing.assert_array_equal(system.Dinv, 1.0 / d)
+                S = linear_solver.compute_lower_inverse(L, parent=linear_solver._elimination_tree(L))
+                np.testing.assert_array_equal(system.S.indptr, S.indptr)
+                np.testing.assert_array_equal(system.S.indices, S.indices)
+                np.testing.assert_array_equal(system.S.data, S.data)
+
+    def test_diagonal_and_empty_matrices(self):
+        """Factor a matrix of singletons, each its own component, and the empty matrix."""
+        diagonal = CsrMatrix.from_matrix(np.diag([2.0, 0.5, 4.0]))
+        system = self.assert_system(diagonal, np.zeros((3, 3)))
+        np.testing.assert_allclose(system.Dinv[system.perm_r], [0.5, 2.0, 0.25])
+        empty = factorize_and_sparse_inverse(CsrMatrix.from_matrix(np.zeros((0, 0))))
+        self.assertEqual(empty.S.shape, (0, 0))
+        self.assertEqual(empty.Dinv.size, 0)
 
 
 if __name__ == "__main__":

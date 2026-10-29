@@ -69,7 +69,7 @@ class TestFrictionAnchors(unittest.TestCase):
         s0, s1, start = model.state(), model.state(), None
         for k in range(steps):
             if reset:
-                solver.reset(s0)
+                solver.reset(s0, flags=0)
             if box:
                 pipeline.collide(s0, contacts)
             solver.step(s0, s1, None, contacts, 1.0 / fps)

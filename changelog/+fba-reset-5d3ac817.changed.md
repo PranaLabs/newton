@@ -1,0 +1,1 @@
+Restore selected body and particle positions and velocities from model defaults in `SolverFBA.reset`, honoring `StateFlags` and external rigid-body ownership. Pass `flags=0` to retain the supplied physical state while clearing solver history; reset collision matching and actuator history through their existing component interfaces.

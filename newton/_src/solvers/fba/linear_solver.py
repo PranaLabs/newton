@@ -861,18 +861,67 @@ class FactorizedSystem:
     invperm_r: np.ndarray  # length n, int32
 
 
+def _factor_components(
+    matrix: CsrMatrix, positions: np.ndarray | None, component: np.ndarray, counts: np.ndarray
+) -> tuple[np.ndarray, CscMatrix, np.ndarray]:
+    """:func:`~.sparse_ldlt.factor_ldlt` of each connected component of ``matrix`` on its own, as one block
+    diagonal factor: the components take consecutive places of the order, each in its own elimination order, so
+    that no front of one holds another's unknowns, such as those of co-located worlds that nested dissection would
+    otherwise group together.
+
+    Args:
+        matrix: Symmetric positive definite matrix.
+        positions: Point of each unknown [m], shape ``[n, 3]``, or ``None``.
+        component: Component of each unknown, numbered from 0, shape ``[n]``.
+        counts: Unknowns of each component.
+
+    Returns:
+        ``(order, L, d)`` as :func:`~.sparse_ldlt.factor_ldlt` returns them for the whole matrix.
+    """
+    n = matrix.shape[0]
+    start = np.r_[0, np.cumsum(counts)]
+    unknowns = np.argsort(component, kind="stable")  # each component's unknowns, ascending
+    local = np.empty(n, dtype=np.int64)
+    local[unknowns] = np.arange(n) - start[component[unknowns]]
+    # every entry joins two unknowns of one component, so the entries split by their rows' components
+    rows = matrix.row_of_entries()
+    entries = np.argsort(component[rows], kind="stable")
+    entry_start = np.searchsorted(component[rows][entries], np.arange(counts.size + 1))
+    order, d = np.empty(n, dtype=np.int64), np.empty(n)
+    indptr, indices, data, stored = [np.zeros(1, dtype=np.int64)], [], [], 0
+    for c, m in enumerate(counts):
+        first, e = start[c], entries[entry_start[c] : entry_start[c + 1]]
+        block = CsrMatrix.from_triplets((m, m), local[rows[e]], local[matrix.indices[e]], matrix.data[e])
+        dofs = unknowns[first : first + m]
+        block_order, L, d[first : first + m] = factor_ldlt(block, None if positions is None else positions[dofs])
+        order[first : first + m] = dofs[block_order]
+        indptr.append(L.indptr[1:] + stored)
+        indices.append(L.indices.astype(np.int64) + first)
+        data.append(L.data)
+        stored += L.data.size
+    L = CscMatrix((n, n), np.concatenate(indptr), np.concatenate(indices).astype(np.int32), np.concatenate(data))
+    return order, L, d
+
+
 def factorize_and_sparse_inverse(A, positions: np.ndarray | None = None) -> FactorizedSystem:
     """Factor an SPD matrix as ``P A Pᵀ = L D Lᵀ`` and compute ``S = L⁻¹``.
 
     Args:
         A: Scalar N x N PD matrix: a :class:`~.sparse_ldlt.CsrMatrix`, a dense array, or a matrix with ``tocoo()``.
-        positions: Point of each unknown [m], shape ``[N, 3]``, for the nested dissection ordering; ``None``
-            factors densely in the given order.
+        positions: Point of each unknown [m], shape ``[N, 3]``, for the nested dissection ordering of each
+            connected component; ``None`` factors each component densely in the given order of its unknowns.
+            The components of a matrix of several take consecutive places of the order, so its factor is block
+            diagonal; a connected matrix factors as a whole.
 
     Returns:
         FactorizedSystem with all data needed to construct an FBALinearSolver.
     """
-    order, L, d = factor_ldlt(CsrMatrix.from_matrix(A), positions)
+    matrix = CsrMatrix.from_matrix(A)
+    _, component, counts = np.unique(connected_components(matrix), return_inverse=True, return_counts=True)
+    if counts.size > 1:
+        order, L, d = _factor_components(matrix, positions, component, counts)
+    else:
+        order, L, d = factor_ldlt(matrix, positions)
     S = compute_lower_inverse(L, parent=_elimination_tree(L))
     perm_r = np.argsort(order).astype(np.int32)
     return FactorizedSystem(S=S, Dinv=1.0 / d, perm_r=perm_r, invperm_r=order.astype(np.int32))

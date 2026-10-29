@@ -182,7 +182,8 @@ Supported Features
 
 .. experimental::
     :class:`~newton.solvers.SolverFBA`'s public API and behavior may change without prior notice.
-    It simulates models with one world.
+    It supports independent worlds, including overlapping environments; see
+    :doc:`fba` for batching and global-entity restrictions.
 
 .. _Contact material support:
 

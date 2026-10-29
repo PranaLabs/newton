@@ -219,7 +219,7 @@ class TestSolverFBAContactWarmStart(unittest.TestCase):
             solver._restore_warm_start = keep
             for k in range(40):
                 if k == 39 and change == "reset":
-                    solver.reset(s0)
+                    solver.reset(s0, flags=0)
                 pipeline.collide(s0, contacts)
                 solver.step(s0, s1, None, contacts, 0.004 if k == 39 and change == "dt" else 0.005)
                 s0, s1 = s1, s0
