@@ -1,0 +1,1405 @@
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>FBA &#8212; Newton Physics</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=64cc4de3f052d77215f0" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/sphinx-design.min.css?v=95c83b7e" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=6036a7ed" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../_static/scripts/fontawesome.js?digest=64cc4de3f052d77215f0"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0" />
+
+    <script src="../_static/documentation_options.js?v=300cecfb"></script>
+    <script src="../_static/doctools.js?v=9bcbadda"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=f281be69"></script>
+    <script src="../_static/design-tabs.js?v=f930bc37"></script>
+    <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'solvers/fba';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = 'https://newton-physics.github.io/newton/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'dev';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+    <script src="../_static/mermaid-nbsphinx.js?v=613f558e"></script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="newton" href="../api/newton.html" />
+    <link rel="prev" title="VBD" href="vbd.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="" />
+  
+    
+    <script src="../_static/searchtools.js"></script>
+    <script src="../_static/language_data.js"></script>
+    <script src="../searchindex.js"></script>
+  
+  </head>
+  <body data-default-mode="">
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/newton-logo-light.png" class="logo__image only-light" alt="Newton Physics Logo"/>
+    <img src="../_static/newton-logo-dark.png" class="logo__image only-dark pst-js-only" alt="Newton Physics Logo"/>
+  
+  
+    <p class="title logo__title">Newton Physics <span style='font-size: 0.8em; color: #888;'>(1.8.0.dev0)</span></p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+<nav>
+  <ul class="bd-navbar-elements navbar-nav">
+    
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/overview.html">
+    Overview
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/installation.html">
+    Installation
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/compatibility.html">
+    Compatibility and Support
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/visualization.html">
+    Viewers and Debugging
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/diagnostics.html">
+    Logging and Warnings
+  </a>
+</li>
+
+            <li class="nav-item dropdown">
+                <button class="btn dropdown-toggle nav-item" type="button"
+                data-bs-toggle="dropdown" aria-expanded="false"
+                aria-controls="pst-nav-more-links">
+                    More
+                </button>
+                <ul id="pst-nav-more-links" class="dropdown-menu">
+                    
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../guide/tutorials.html">
+    Tutorials
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../guide/development.html">
+    Development
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../guide/source_code_guidelines.html">
+    Source Code Guidelines
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../guide/review_guidelines.html">
+    Review Guidelines
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../concepts/worlds.html">
+    Worlds
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../concepts/articulations.html">
+    Articulations
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../concepts/deformable_objects.html">
+    Deformable Objects
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../concepts/mass_inertia.html">
+    Mass and Inertia
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../concepts/sites.html">
+    Sites
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../concepts/sensors.html">
+    Sensors
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../concepts/conventions.html">
+    Conventions
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../concepts/usd_parsing.html">
+    USD Parsing
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../concepts/custom_attributes.html">
+    Custom Attributes
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../concepts/solver_observables.html">
+    Solver Observables
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../concepts/collisions.html">
+    Collisions and Contacts
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../concepts/simulation_tuning.html">
+    Simulation Tuning
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../concepts/coupling.html">
+    Coupled Solvers
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../concepts/actuators.html">
+    Actuators
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="index.html">
+    Overview
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="mujoco.html">
+    MuJoCo
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="kamino.html">
+    Kamino
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="vbd.html">
+    VBD
+  </a>
+</li>
+
+
+<li class=" current active">
+  <a class="nav-link dropdown-item nav-internal" href="#" aria-current="page">
+    FBA
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton.html">
+    newton
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_actuators.html">
+    newton.actuators
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_controllers.html">
+    newton.controllers
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_exceptions.html">
+    newton.exceptions
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_geometry.html">
+    newton.geometry
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_ik.html">
+    newton.ik
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_math.html">
+    newton.math
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_selection.html">
+    newton.selection
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_sensors.html">
+    newton.sensors
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_solvers.html">
+    newton.solvers
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_usd.html">
+    newton.usd
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_utils.html">
+    newton.utils
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../api/newton_viewer.html">
+    newton.viewer
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../faq.html">
+    FAQ
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../tendons.html">
+    Massless Routed Tendons
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../migration.html">
+    Migration Guide
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../lab/isaac-lab.html">
+    Isaac Lab
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-external" href="https://github.com/newton-physics/newton">
+     GitHub
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-external" href="https://github.com/newton-physics/newton/blob/main/PUBLICATIONS.md">
+     Publications
+  </a>
+</li>
+
+                </ul>
+            </li>
+            
+  </ul>
+</nav></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button type="button" class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button type="button" class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+<nav>
+  <ul class="bd-navbar-elements navbar-nav">
+    
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/overview.html">
+    Overview
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/installation.html">
+    Installation
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/compatibility.html">
+    Compatibility and Support
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/visualization.html">
+    Viewers and Debugging
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/diagnostics.html">
+    Logging and Warnings
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/tutorials.html">
+    Tutorials
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/development.html">
+    Development
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/source_code_guidelines.html">
+    Source Code Guidelines
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../guide/review_guidelines.html">
+    Review Guidelines
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../concepts/worlds.html">
+    Worlds
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../concepts/articulations.html">
+    Articulations
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../concepts/deformable_objects.html">
+    Deformable Objects
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../concepts/mass_inertia.html">
+    Mass and Inertia
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../concepts/sites.html">
+    Sites
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../concepts/sensors.html">
+    Sensors
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../concepts/conventions.html">
+    Conventions
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../concepts/usd_parsing.html">
+    USD Parsing
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../concepts/custom_attributes.html">
+    Custom Attributes
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../concepts/solver_observables.html">
+    Solver Observables
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../concepts/collisions.html">
+    Collisions and Contacts
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../concepts/simulation_tuning.html">
+    Simulation Tuning
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../concepts/coupling.html">
+    Coupled Solvers
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../concepts/actuators.html">
+    Actuators
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="index.html">
+    Overview
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="mujoco.html">
+    MuJoCo
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="kamino.html">
+    Kamino
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="vbd.html">
+    VBD
+  </a>
+</li>
+
+
+<li class="nav-item current active">
+  <a class="nav-link nav-internal" href="#" aria-current="page">
+    FBA
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton.html">
+    newton
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_actuators.html">
+    newton.actuators
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_controllers.html">
+    newton.controllers
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_exceptions.html">
+    newton.exceptions
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_geometry.html">
+    newton.geometry
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_ik.html">
+    newton.ik
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_math.html">
+    newton.math
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_selection.html">
+    newton.selection
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_sensors.html">
+    newton.sensors
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_solvers.html">
+    newton.solvers
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_usd.html">
+    newton.usd
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_utils.html">
+    newton.utils
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../api/newton_viewer.html">
+    newton.viewer
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../faq.html">
+    FAQ
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../tendons.html">
+    Massless Routed Tendons
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../migration.html">
+    Migration Guide
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../lab/isaac-lab.html">
+    Isaac Lab
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-external" href="https://github.com/newton-physics/newton">
+     GitHub
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-external" href="https://github.com/newton-physics/newton/blob/main/PUBLICATIONS.md">
+     Publications
+  </a>
+</li>
+
+  </ul>
+</nav></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">User Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../guide/overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../guide/installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../guide/compatibility.html">Compatibility and Support</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../guide/visualization.html">Viewers and Debugging</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../guide/diagnostics.html">Logging and Warnings</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../guide/tutorials.html">Tutorials</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../guide/development.html">Development</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../guide/source_code_guidelines.html">Source Code Guidelines</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../guide/review_guidelines.html">Review Guidelines</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Concepts</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../concepts/worlds.html">Worlds</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../concepts/articulations.html">Articulations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../concepts/deformable_objects.html">Deformable Objects</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../concepts/mass_inertia.html">Mass and Inertia</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../concepts/sites.html">Sites</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../concepts/sensors.html">Sensors</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../concepts/conventions.html">Conventions</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../concepts/usd_parsing.html">USD Parsing</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../concepts/custom_attributes.html">Custom Attributes</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="../concepts/solver_observables.html">Solver Observables</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../concepts/collisions.html">Collisions and Contacts</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../concepts/simulation_tuning.html">Simulation Tuning</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../concepts/coupling.html">Coupled Solvers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../concepts/actuators.html">Actuators</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Solvers</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="index.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="mujoco.html">MuJoCo</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kamino.html">Kamino</a></li>
+<li class="toctree-l1"><a class="reference internal" href="vbd.html">VBD</a></li>
+<li class="toctree-l1 current active"><a aria-current="page" class="current reference internal" href="#">FBA</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../api/newton.html">newton</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_actuators.html">newton.actuators</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_controllers.html">newton.controllers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_exceptions.html">newton.exceptions</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_geometry.html">newton.geometry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_ik.html">newton.ik</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_math.html">newton.math</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_selection.html">newton.selection</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_sensors.html">newton.sensors</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_solvers.html">newton.solvers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_usd.html">newton.usd</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_utils.html">newton.utils</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/newton_viewer.html">newton.viewer</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Further Reading</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../faq.html">FAQ</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../tendons.html">Massless Routed Tendons</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../migration.html">Migration Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../lab/isaac-lab.html">Isaac Lab</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Project Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/newton-physics/newton"> GitHub</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/newton-physics/newton/blob/main/PUBLICATIONS.md"> Publications</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">FBA</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="fba">
+<h1>FBA<a class="headerlink" href="#fba" title="Link to this heading">#</a></h1>
+<p><a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA" title="newton.solvers.SolverFBA"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverFBA</span></code></a> simulates cloth and volumetric soft bodies
+with projective dynamics, together with rigid bodies, and resolves the
+frictional contact among them as complementarity conditions. Each step runs a
+fixed number of local-global iterations: the local phase projects every
+element onto its constraint set, the global phase solves a linear system whose
+matrix is factored once, and each iteration takes one semismooth Newton step
+of the contact and constraint multipliers.</p>
+<div class="experimental admonition">
+<p class="admonition-title">Experimental</p>
+<p><a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA" title="newton.solvers.SolverFBA"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverFBA</span></code></a> is experimental. Its public API,
+behavior, feature support, performance, and implementation may change
+without prior notice.</p>
+</div>
+<section id="when-to-choose-fba">
+<h2>When to Choose FBA<a class="headerlink" href="#when-to-choose-fba" title="Link to this heading">#</a></h2>
+<p>FBA suits scenes in which cloth or soft bodies rest on, wrap around, or are
+held by other objects:</p>
+<ul class="simple">
+<li><p>With the default contact operator, contacts do not penetrate and need no
+contact stiffness: each contact supplies the force that keeps its gap
+closed, within its friction cone, so cloth rests on stacked boxes and on
+notched blades, and a soft ball hangs between two fingertip pads by
+friction alone.</p></li>
+<li><p>Stiff materials step stably at large time steps. The examples step at
+<code class="docutils literal notranslate"><span class="pre">dt</span> <span class="pre">=</span> <span class="pre">0.01</span></code> s, including a Neo-Hookean bar with a Young’s modulus of
+<code class="docutils literal notranslate"><span class="pre">1e9</span></code> Pa.</p></li>
+<li><p>Cloth, tetrahedral soft bodies, and rigid bodies with joints share one
+solve, or rigid bodies come from another solver, such as an arm that
+<a class="reference internal" href="../api/_generated/newton.solvers.SolverFeatherstone.html#newton.solvers.SolverFeatherstone" title="newton.solvers.SolverFeatherstone"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverFeatherstone</span></code></a> integrates.</p></li>
+</ul>
+<p>Choose another solver for models with several worlds, for differentiable
+simulation, and for articulations that need joint limits, drives, or
+actuators: FBA treats joints as bilateral constraints only, so integrate such
+an articulation with another solver and pass
+<code class="docutils literal notranslate"><span class="pre">integrate_with_external_rigid_solver=True</span></code>. See the <a class="reference internal" href="index.html#supported-features"><span class="std std-ref">Supported Features</span></a> matrix and the <a class="reference internal" href="index.html#joint-feature-support"><span class="std std-ref">Joint Feature Support</span></a> tables for a comparison
+with the other solvers. The solver builds on projective dynamics and a
+quadratic bending energy:</p>
+<ul class="simple">
+<li><p>Sofien Bouaziz, Sebastian Martin, Tiantian Liu, Ladislav Kavan, and Mark
+Pauly. 2014. Projective Dynamics: Fusing Constraint Projections for Fast
+Simulation. <em>ACM Trans. Graph.</em> 33, 4.
+<a class="reference external" href="https://doi.org/10.1145/2601097.2601116">https://doi.org/10.1145/2601097.2601116</a></p></li>
+<li><p>Miklós Bergou, Max Wardetzky, David Harmon, Denis Zorin, and Eitan
+Grinspun. 2006. A Quadratic Bending Model for Inextensible Surfaces.
+<em>Symposium on Geometry Processing</em>.</p></li>
+</ul>
+</section>
+<section id="construction-and-stepping">
+<h2>Construction and Stepping<a class="headerlink" href="#construction-and-stepping" title="Link to this heading">#</a></h2>
+<p>Detect contacts with a <a class="reference internal" href="../api/_generated/newton.CollisionPipeline.html#newton.CollisionPipeline" title="newton.CollisionPipeline"><code class="xref py py-class docutils literal notranslate"><span class="pre">CollisionPipeline</span></code></a> on the input state
+of each step and pass them to <a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.step" title="newton.solvers.SolverFBA.step"><code class="xref py py-meth docutils literal notranslate"><span class="pre">step()</span></code></a>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">warp</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">wp</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">newton</span>
+
+<span class="n">builder</span> <span class="o">=</span> <span class="n">newton</span><span class="o">.</span><span class="n">ModelBuilder</span><span class="p">()</span>
+<span class="n">builder</span><span class="o">.</span><span class="n">add_ground_plane</span><span class="p">()</span>
+<span class="n">builder</span><span class="o">.</span><span class="n">add_cloth_grid</span><span class="p">(</span>
+    <span class="n">pos</span><span class="o">=</span><span class="n">wp</span><span class="o">.</span><span class="n">vec3</span><span class="p">(</span><span class="o">-</span><span class="mf">0.5</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.5</span><span class="p">,</span> <span class="mf">0.5</span><span class="p">),</span>
+    <span class="n">rot</span><span class="o">=</span><span class="n">wp</span><span class="o">.</span><span class="n">quat_identity</span><span class="p">(),</span>
+    <span class="n">vel</span><span class="o">=</span><span class="n">wp</span><span class="o">.</span><span class="n">vec3</span><span class="p">(</span><span class="mf">0.0</span><span class="p">),</span>
+    <span class="n">dim_x</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span>
+    <span class="n">dim_y</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span>
+    <span class="n">cell_x</span><span class="o">=</span><span class="mf">0.05</span><span class="p">,</span>
+    <span class="n">cell_y</span><span class="o">=</span><span class="mf">0.05</span><span class="p">,</span>
+    <span class="n">mass</span><span class="o">=</span><span class="mf">0.005</span><span class="p">,</span>
+    <span class="n">tri_ke</span><span class="o">=</span><span class="mf">1.0e4</span><span class="p">,</span>
+    <span class="n">edge_ke</span><span class="o">=</span><span class="mf">1.0e-4</span><span class="p">,</span>
+    <span class="n">particle_radius</span><span class="o">=</span><span class="mf">0.005</span><span class="p">,</span>
+<span class="p">)</span>
+<span class="n">model</span> <span class="o">=</span> <span class="n">builder</span><span class="o">.</span><span class="n">finalize</span><span class="p">()</span>
+
+<span class="n">solver</span> <span class="o">=</span> <span class="n">newton</span><span class="o">.</span><span class="n">solvers</span><span class="o">.</span><span class="n">SolverFBA</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">iterations</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+<span class="n">pipeline</span> <span class="o">=</span> <span class="n">newton</span><span class="o">.</span><span class="n">CollisionPipeline</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">soft_contact_gap</span><span class="o">=</span><span class="mf">0.01</span><span class="p">)</span>
+<span class="n">contacts</span> <span class="o">=</span> <span class="n">pipeline</span><span class="o">.</span><span class="n">contacts</span><span class="p">()</span>
+<span class="n">state_0</span><span class="p">,</span> <span class="n">state_1</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">state</span><span class="p">(),</span> <span class="n">model</span><span class="o">.</span><span class="n">state</span><span class="p">()</span>
+
+<span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">120</span><span class="p">):</span>
+    <span class="n">pipeline</span><span class="o">.</span><span class="n">collide</span><span class="p">(</span><span class="n">state_0</span><span class="p">,</span> <span class="n">contacts</span><span class="p">)</span>
+    <span class="n">solver</span><span class="o">.</span><span class="n">step</span><span class="p">(</span><span class="n">state_0</span><span class="p">,</span> <span class="n">state_1</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="n">contacts</span><span class="p">,</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="mf">60.0</span><span class="p">)</span>
+    <span class="n">state_0</span><span class="p">,</span> <span class="n">state_1</span> <span class="o">=</span> <span class="n">state_1</span><span class="p">,</span> <span class="n">state_0</span>
+</pre></div>
+</div>
+<p>A particle contact keeps the particle its radius plus the shape’s margin from
+the shape: the cloth above comes to rest 5 mm over the ground. The first step
+factors the system matrix on the CPU and takes longer than the others. The
+matrix depends on the time step, the particle masses, the pinned and inactive
+particles, the elements and their materials, and the Rayleigh damping
+coefficients; the solver factors it again
+when the time step changes or after
+<a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.notify_model_changed" title="newton.solvers.SolverFBA.notify_model_changed"><code class="xref py py-meth docutils literal notranslate"><span class="pre">notify_model_changed()</span></code></a> with
+<code class="docutils literal notranslate"><span class="pre">SHAPE_PROPERTIES</span></code> or <code class="docutils literal notranslate"><span class="pre">BODY_INERTIAL_PROPERTIES</span></code>, and other changes to
+those arrays take effect only then. A step reads its contacts back to
+the host, so it cannot be captured in a CUDA graph; it captures and replays
+its own local-global iterations. FBA runs on the CPU and on CUDA devices.</p>
+</section>
+<section id="model-inputs">
+<h2>Model Inputs<a class="headerlink" href="#model-inputs" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><strong>Cloth</strong>: triangles with a stretching model chosen by <code class="docutils literal notranslate"><span class="pre">stretching_model</span></code>:
+<code class="docutils literal notranslate"><span class="pre">&quot;arap&quot;</span></code> takes <code class="docutils literal notranslate"><span class="pre">tri_ke</span></code> as the stiffness, and <code class="docutils literal notranslate"><span class="pre">&quot;corotational&quot;</span></code> and
+<code class="docutils literal notranslate"><span class="pre">&quot;neohookean&quot;</span></code> take the elements’ Lamé parameters; the
+<a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA" title="newton.solvers.SolverFBA"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverFBA</span></code></a> reference states how projective dynamics
+scales them. Interior edges add the isometric bending energy of Bergou et
+al. with <code class="docutils literal notranslate"><span class="pre">edge_ke</span></code> as a bending modulus [N·m] and <code class="docutils literal notranslate"><span class="pre">edge_rest_angle</span></code> as
+the rest angle. The same <code class="docutils literal notranslate"><span class="pre">edge_ke</span></code> bends an FBA cloth more stiffly than a
+<a class="reference internal" href="../api/_generated/newton.solvers.SolverVBD.html#newton.solvers.SolverVBD" title="newton.solvers.SolverVBD"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverVBD</span></code></a> one, which scales it by the edge length.</p></li>
+<li><p><strong>Soft bodies</strong>: tetrahedra with the same stretching models.</p></li>
+<li><p><strong>Activations</strong>: the control’s <code class="docutils literal notranslate"><span class="pre">tet_activations</span></code> grow each tetrahedron
+to <code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">-</span> <span class="pre">a</span></code> times its rest volume, so a negative activation inflates it
+and a positive one contracts it: isotropically, or along a direction per
+tetrahedron from <code class="docutils literal notranslate"><span class="pre">tet_activation_directions</span></code>, as the chambers of a
+pneumatic bending actuator lengthen along it. The local phase projects the
+deformation gradient with the growth taken out and puts the growth back
+into the projection, so the factored system matrix stays valid and the
+activations may change every step. In <code class="docutils literal notranslate"><span class="pre">pneunet_gripper_fba</span></code> they
+lengthen the chambers of a soft gripper along its fingers.</p></li>
+<li><p><strong>Damping</strong>: <code class="docutils literal notranslate"><span class="pre">rayleigh_alpha</span></code> [1/s] and <code class="docutils literal notranslate"><span class="pre">rayleigh_beta</span></code> [s] apply
+Rayleigh damping, the forces <code class="docutils literal notranslate"><span class="pre">-(alpha</span> <span class="pre">M</span> <span class="pre">+</span> <span class="pre">beta</span> <span class="pre">K)</span> <span class="pre">v</span></code> with <code class="docutils literal notranslate"><span class="pre">M</span></code> the
+particle masses and <code class="docutils literal notranslate"><span class="pre">K</span></code> the stretching and bending part of the constant
+system matrix, implicitly: the damping matrix joins the prefactored system
+matrix. Each coefficient is a scalar or one value per particle. <code class="docutils literal notranslate"><span class="pre">K</span></code>
+measures every change of an element’s deformation gradient, rotations
+included, so <code class="docutils literal notranslate"><span class="pre">beta</span></code> damps the bending of a slender part far more than its
+bending stiffness alone suggests: in <code class="docutils literal notranslate"><span class="pre">softbody_cantilever_fba</span></code>,
+<code class="docutils literal notranslate"><span class="pre">rayleigh_beta=2e-5</span></code> brings a 2.4 m beam to rest within seconds. With
+<code class="docutils literal notranslate"><span class="pre">rayleigh_corotated=True</span></code>, <code class="docutils literal notranslate"><span class="pre">beta</span></code> damps the stretch rate of ARAP
+triangles instead and spares their rotation, so a released cloth flap falls
+as fast as without damping.</p></li>
+<li><p><strong>Pins</strong>: particles with zero inverse mass follow their pin targets through
+a stiff spring of <code class="docutils literal notranslate"><span class="pre">pin_stiffness</span></code> [N/m]. The targets start at the model
+positions and move with <a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.set_pin_targets" title="newton.solvers.SolverFBA.set_pin_targets"><code class="xref py py-meth docutils literal notranslate"><span class="pre">set_pin_targets()</span></code></a>.
+Particles without the <code class="docutils literal notranslate"><span class="pre">ACTIVE</span></code> flag that have a mass hold where the input
+state has them.</p></li>
+<li><p><strong>Particle constraints</strong>:
+<a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.set_particle_constraints" title="newton.solvers.SolverFBA.set_particle_constraints"><code class="xref py py-meth docutils literal notranslate"><span class="pre">set_particle_constraints()</span></code></a> holds lengths or
+linear combinations of particle positions at targets, solved with the
+contacts. With the lite operator, the rows that hold particles at points,
+or all rows with <code class="docutils literal notranslate"><span class="pre">exact=True</span></code>, take one exact Newton step of their own.
+The <code class="docutils literal notranslate"><span class="pre">cable_gripper_fba</span></code> example builds the rows of cables through
+tetrahedral bodies.</p></li>
+<li><p><strong>Rigid bodies</strong>: FBA integrates the dynamic bodies and passes kinematic
+bodies through, or leaves every body to another solver with
+<code class="docutils literal notranslate"><span class="pre">integrate_with_external_rigid_solver=True</span></code>. PRISMATIC, REVOLUTE, BALL,
+FIXED, and D6 joints are bilateral constraints, at most 64 rows per
+articulation; DISTANCE and ROD joints, and joints that lock more directions
+of a set of connected bodies than the bodies have, as kinematic loops do,
+raise <code class="docutils literal notranslate"><span class="pre">NotImplementedError</span></code>. A body turns by at most 0.5 rad per step.</p></li>
+</ul>
+<p>FBA does not simulate springs, equality constraints, mimic joints,
+particle-body attachments, joint limits, drives, armature, or joint friction, or
+the inputs of <a class="reference internal" href="../api/_generated/newton.Control.html#newton.Control" title="newton.Control"><code class="xref py py-class docutils literal notranslate"><span class="pre">Control</span></code></a>, and it does not read the damping
+coefficients <code class="docutils literal notranslate"><span class="pre">tri_kd</span></code>, <code class="docutils literal notranslate"><span class="pre">edge_kd</span></code> and <code class="docutils literal notranslate"><span class="pre">k_damp</span></code> of the elements.</p>
+</section>
+<section id="contacts">
+<h2>Contacts<a class="headerlink" href="#contacts" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">nsn_schur_mode</span></code> selects the contact operator of the Newton steps.
+<code class="docutils literal notranslate"><span class="pre">&quot;full&quot;</span></code> (default) builds it from the factored system matrix. <code class="docutils literal notranslate"><span class="pre">&quot;lite&quot;</span></code>
+replaces the inverse system matrix by the inverse masses, which decouples
+the contacts of different particles and costs far less, but lets a pressed
+contact settle inside its shape by up to <code class="docutils literal notranslate"><span class="pre">dt²</span> <span class="pre">F</span> <span class="pre">/</span> <span class="pre">m</span></code> for a normal force
+<code class="docutils literal notranslate"><span class="pre">F</span></code> on a particle of mass <code class="docutils literal notranslate"><span class="pre">m</span></code>. In steps with self contacts or more than
+four contacts on a particle, <code class="docutils literal notranslate"><span class="pre">nsn_lite_accumulate=True</span></code> keeps the contact
+forces of a step’s earlier
+iterations and models only their change, so that the iterations approach
+the forces whose exact motion closes the gaps and stacked layers keep their
+margin at longer steps.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">face_contacts=True</span></code> adds a contact at the deepest point of a triangle
+inside a shape, so shape edges and corners cannot pass between the
+particles of coarse cloth, and holds particles in concave corners of
+meshes. It needs friction and the full operator.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">particle_enable_self_contact=True</span></code> makes the triangles collide with each
+other, through vertex-face or vertex-vertex contacts. Vertex-face contacts
+keep crossing edges apart when the margin reaches half of the longest edge;
+<code class="docutils literal notranslate"><span class="pre">particle_self_contact_edge_edge=True</span></code> adds edge-edge contacts at creases
+for thinner margins, <code class="docutils literal notranslate"><span class="pre">particle_self_contact_edge_edge_ratio</span></code> sets how near
+their edges must come compared with their particles’ nearest triangles, and
+<a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.set_particle_self_contact" title="newton.solvers.SolverFBA.set_particle_self_contact"><code class="xref py py-meth docutils literal notranslate"><span class="pre">set_particle_self_contact()</span></code></a> changes the
+margin between steps, so that a dropped cloth can land with a thick margin
+and fold with a thin one. <code class="docutils literal notranslate"><span class="pre">particle_self_contact_group_ids</span></code> gives each
+particle a group, such as one per body of a pile: the particles and
+triangles of two groups keep the margin apart, and those of one group the
+group’s margin from <code class="docutils literal notranslate"><span class="pre">particle_self_contact_group_margins</span></code>, or do not
+collide.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">friction_anchors=True</span></code> keeps the point a contact presses on across steps,
+on the other layer for a self contact or on a static shape, so its friction
+rows pull back the slip that a step’s solve leaves instead of letting it add
+up. With the lite operator, that slip lets stacked cloth layers creep apart
+over seconds. <a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.set_friction_anchor_exclusion" title="newton.solvers.SolverFBA.set_friction_anchor_exclusion"><code class="xref py py-meth docutils literal notranslate"><span class="pre">set_friction_anchor_exclusion()</span></code></a>
+frees chosen particles of their anchors, so that a grasp can gather cloth.</p></li>
+<li><p>Rigid contacts between shapes on bodies that FBA integrates need
+<code class="docutils literal notranslate"><span class="pre">friction=True</span></code> and the full operator.</p></li>
+<li><p>A contact on a body that FBA integrates acts at the contact point of the
+step start, which moves with the body to first order in its rotation over
+the step, so a ball keeps rolling at its speed on flat ground.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">contact_warmstart=True</span></code> starts each step’s contact multipliers from the
+previous step’s on the same contacts and constraints rather than from zero,
+so that a resting or held object starts its step at the forces that carry
+it, which a few iterations per step cannot build up from zero. It needs
+friction and the full operator.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">shape_particle_radius_override</span></code> sets the particles’ contact thickness
+against chosen shapes, between zero and the smallest particle radius, so
+that a gripper can close on a body whose particle radius holds it off the
+floor.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">nsn_sparse_storage=True</span></code> keeps the contact operator and the Newton
+matrix of the full operator’s steps in CSR form without their zero entries,
+such as those between separate bodies, which saves most of their memory and
+work for many contacts on many bodies, as in a pile of soft bodies. It
+needs friction and the full operator.</p></li>
+<li><p>The friction coefficient of a particle contact is its shape’s <code class="docutils literal notranslate"><span class="pre">mu</span></code>,
+<code class="docutils literal notranslate"><span class="pre">model.particle_mu</span></code> for self contacts, and the mean of the two shapes’
+<code class="docutils literal notranslate"><span class="pre">mu</span></code> for rigid contacts.</p></li>
+<li><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverBase.html#newton.solvers.SolverBase.ObservableKind.CONTACT_F" title="newton.solvers.SolverBase.ObservableKind.CONTACT_F"><code class="xref py py-attr docutils literal notranslate"><span class="pre">CONTACT_F</span></code></a> reports the
+force of each particle contact on its shape’s body; see
+<a class="reference internal" href="../concepts/solver_observables.html#solver-observables"><span class="std std-ref">Solver Observables</span></a>.</p></li>
+</ul>
+</section>
+<section id="accuracy">
+<h2>Accuracy<a class="headerlink" href="#accuracy" title="Link to this heading">#</a></h2>
+<p>Positions are float32 and velocities come from position differences, so far
+from the origin velocity rounding grows: over a 350 cm free fall a cloth
+drifts by 0.08 cm. The bending energy is quadratic in the positions, so a
+fold with a large rest angle settles a little away from that angle under
+load; in Newton’s shared cloth tests the folds of a curved cloth settle
+0.11 rad from their rest angles.</p>
+</section>
+<section id="examples">
+<h2>Examples<a class="headerlink" href="#examples" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">-m</span> <span class="pre">newton.examples</span> <span class="pre">&lt;name&gt;</span></code> runs each of these:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">stretching_cloth_fba</span></code>: cloth pulled apart by pins on two opposite edges.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">cloth_on_knives_fba</span></code>: cloth on notched blades with face contacts and light
+Rayleigh stiffness damping.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">cloth_on_boxes_fba</span></code>: cloth on rigid bodies with joints.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">twisting_bar_fba</span></code>, <code class="docutils literal notranslate"><span class="pre">squeezing_ball_fba</span></code>: a soft bar twisted by its
+pinned ends and a soft ball dragged by spinning cylinders.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">softbody_franka_fba</span></code>: a Franka arm integrated by
+<a class="reference internal" href="../api/_generated/newton.solvers.SolverFeatherstone.html#newton.solvers.SolverFeatherstone" title="newton.solvers.SolverFeatherstone"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverFeatherstone</span></code></a> picks up a soft ball.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">cable_gripper_fba</span></code>: soft fingers curled by cables lift a box.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">cloth_dual_franka_fba</span></code>: two Franka arms integrated by
+<a class="reference internal" href="../api/_generated/newton.solvers.SolverFeatherstone.html#newton.solvers.SolverFeatherstone" title="newton.solvers.SolverFeatherstone"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverFeatherstone</span></code></a> pinch the corners of a square
+towel and fold it twice into a square, with light Rayleigh mass damping.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">shirt_pins_fba</span></code>, <code class="docutils literal notranslate"><span class="pre">bunny_ears_fba</span></code>: two handles move a T-shirt by its
+shoulders, with self-contact and light Rayleigh stiffness damping, and a
+soft bunny by its ears.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">shirt_fold_fba</span></code>: two Franka arms fold a dropped T-shirt, its sides in and
+its hem up, their fingers squeezing the cloth into a bulge that they hold,
+at two steps per frame with the lite operator accumulating its contact
+forces, a self-contact margin that thins after the landing, edge-edge
+contacts, friction anchors and corotated Rayleigh stiffness damping.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">softbody_cantilever_fba</span></code>: two soft cantilevers swing under gravity, one
+with Rayleigh damping.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">pneunet_gripper_fba</span></code>: a three-finger PneuNet gripper whose chambers,
+lengthened along its fingers by tetrahedral activations, close the fingers
+around a ball and lift it.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">claw_machine_fba</span></code>: an articulated claw driven by force-limited PD forces
+picks a bear out of a pile of 25 soft toys that collide with each other, and
+only the elephants with themselves, with a thinner contact against its
+fingers and the sparse Schur storage.</p></li>
+</ul>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+            </div>
+            
+            
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#when-to-choose-fba">When to Choose FBA</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#construction-and-stepping">Construction and Stepping</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-inputs">Model Inputs</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#contacts">Contacts</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#accuracy">Accuracy</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#examples">Examples</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=64cc4de3f052d77215f0"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=64cc4de3f052d77215f0"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+
+  <p class="copyright">
+    
+      © Copyright 2026, The Newton Developers. Documentation licensed under CC-BY-4.0.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+    <div class="footer-items__end">
+      
+        <div class="footer-item">
+<p class="theme-version">
+  <!-- # L10n: Setting the PST URL as an argument as this does not need to be localized -->
+  Built with the <a href="https://pydata-sphinx-theme.readthedocs.io/en/stable/index.html">PyData Sphinx Theme</a> 0.22.0.
+</p></div>
+      
+    </div>
+  
+</div>
+
+  </footer>
+  </body>
+</html>
