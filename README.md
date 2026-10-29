@@ -10,7 +10,7 @@ volumetric soft bodies with robust frictional contact, after the paper
 (2026-05-14); everything outside `SolverFBA` and its examples is upstream Newton.
 
 <p align="center">
-  <img width="960" src="https://github.com/PranaLabs/newton/releases/download/fba-media/fba_examples.gif" alt="SolverFBA examples">
+  <img width="960" src="https://github.com/PranaLabs/newton/releases/download/fba-readme-media/fba_examples.gif" alt="SolverFBA examples">
   <br>
   <sub>Clockwise from top left: <code>cloth_dual_franka_fba</code> (1.65x speed), <code>shirt_fold_fba</code> (3.75x),
   <code>pneunet_gripper_fba</code> (1.1x), <code>cloth_on_knives_fba</code> (0.5x). Rendered with Newton's OpenGL viewer.</sub>
