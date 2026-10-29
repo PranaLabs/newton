@@ -1,1 +1,1 @@
-Add independent parallel worlds to `SolverFBA`, with world-filtered self contacts, per-world contact linear solves, and selective resets of friction anchors and contact warm starts.
+Add independent parallel worlds to `SolverFBA`, with world-filtered self contacts, per-world contact linear solves, per-world dispatch of particle contacts between the deformable and the two-way body solve, and selective resets of friction anchors and contact warm starts.

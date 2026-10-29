@@ -4,6 +4,7 @@
 """Isolation of FBA worlds, including overlapping geometry and partial resets."""
 
 import unittest
+import unittest.mock
 
 import numpy as np
 import warp as wp
@@ -1016,8 +1017,97 @@ class TestFBAWorlds(unittest.TestCase):
                 self.assertIsNotNone(solver._contact_extra)
                 np.testing.assert_allclose(results[0], np.concatenate(results[1:]), atol=2e-6, rtol=0.0)
 
+    def test_factor_splits_only_worlds(self):
+        """The particle and body systems of one world factor whole, also of disconnected cloths and bodies; those of
+        several worlds factor one world at a time."""
+        from newton._src.solvers.fba import linear_solver  # noqa: PLC0415
+        from newton._src.solvers.fba.sparse_ldlt import factor_ldlt  # noqa: PLC0415
+
+        source = _cloth()
+        source.add_builder(_cloth(0.5))
+        for x in (1.0, 2.0):
+            body = source.add_body(xform=wp.transform((x, 0.0, 0.5), wp.quat_identity()))
+            source.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        for worlds, expected in ((1, [8, 12]), (3, [8, 8, 8, 12, 12, 12])):
+            with self.subTest(worlds=worlds):
+                model = _model([source] * worlds, "cpu")
+                solver = SolverFBA(model, iterations=1)
+                sizes = []
+
+                def factor(matrix, positions=None, leaf_size=64, sizes=sizes):
+                    sizes.append(matrix.shape[0])
+                    return factor_ldlt(matrix, positions, leaf_size)
+
+                with unittest.mock.patch.object(linear_solver, "factor_ldlt", side_effect=factor):
+                    solver.step(model.state(), model.state(), None, None, 0.01)
+                self.assertEqual(sorted(sizes), expected)
+
+    def test_failed_mixed_step_keeps_rows(self):
+        """A step that refuses the two-way coupling of one world beside another world's rows leaves the solver's own
+        constraint rows and particle system in place, so that a following step runs as on a fresh solver."""
+        source = _cloth(0.105)
+        body = source.add_body(xform=wp.transform((0.05, 0.05, 0.05), wp.quat_identity()))
+        source.add_shape_box(body, hx=0.1, hy=0.1, hz=0.05)
+        model = _model([source, _cloth()], "cpu")
+        solvers = [SolverFBA(model, iterations=2, nsn_linear_iterations=2, nsn_schur_mode="lite") for _ in range(2)]
+        for solver in solvers:
+            solver.set_particle_constraints(
+                [[0], [4]], np.ones((2, 1)), np.zeros(2), directions=np.tile([1.0, 0.0, 0.0], (2, 1)), exact=True
+            )
+        state, results = model.state(), []
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.03)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+        with self.assertRaises(NotImplementedError):
+            solvers[0].step(state, model.state(), None, contacts, 0.01)
+        self.assertEqual(len(solvers[0]._constraint_world_h), 2)
+        self.assertEqual(solvers[0]._constraint_rows[0].shape[0], 2)
+        for solver in solvers:
+            out = model.state()
+            solver.step(state, out, None, None, 0.01)
+            results.append(out.particle_q.numpy())
+        np.testing.assert_allclose(results[0], results[1], atol=1e-6, rtol=0.0)
+
+    def test_two_way_rows_follow_the_factor(self):
+        """The two-way rows of split steps keep their Schur rows while the particle system keeps its factor, and
+        release the factor with them when it is factored again."""
+        import gc  # noqa: PLC0415
+        import weakref  # noqa: PLC0415
+
+        source = _cloth(0.105)
+        body = source.add_body(xform=wp.transform((0.05, 0.05, 0.05), wp.quat_identity()))
+        source.add_shape_box(body, hx=0.1, hy=0.1, hz=0.05)
+        model = _model([source, _cloth()], "cpu")
+        solver = SolverFBA(model, iterations=2, nsn_linear_iterations=2)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.03)
+        contacts = pipeline.contacts()
+        a, b = model.state(), model.state()
+        views = []
+        for _ in range(2):
+            pipeline.collide(a, contacts)
+            solver.step(a, b, None, contacts, 0.01)
+            views.append(solver._two_way_ls[1])
+            a, b = b, a
+        self.assertIs(views[0], views[1])
+        base, view = weakref.ref(solver._linear_solver), weakref.ref(views[0])
+        del views
+        solver.step(a, b, None, None, 0.02)
+        gc.collect()
+        self.assertIsNone(base())
+        self.assertIsNone(view())
+        a, b = b, a
+        pipeline.collide(a, contacts)
+        solver.step(a, b, None, contacts, 0.02)
+        self.assertIs(solver._two_way_ls[0], solver._linear_solver)
+        self.assertTrue(np.isfinite(b.particle_q.numpy()).all())
+
     def test_mixed_rigid_and_deformable_worlds(self):
-        """A two-way contact in one environment must not change another environment's cloth solve."""
+        """A two-way contact in one environment must not change another environment's cloth solve: the worlds whose
+        particles touch an integrated body solve all their particle contacts and constraint rows with the bodies, the
+        others keep the deformable NSN, and each world matches its separate solve, with its contact forces, as contacts
+        appear and vanish and the history of a world is cleared, with length rows, which turn and so recompose ``W``
+        in every iteration, and with rows along a fixed direction, whose ``W`` holds for the step so that each NSN
+        solve captures its graph once."""
         cloth_box = _cloth(0.105)
         body = cloth_box.add_body(xform=wp.transform((0.05, 0.05, 0.05), wp.quat_identity()))
         cloth_box.add_shape_box(body, hx=0.1, hy=0.1, hz=0.05)
@@ -1027,40 +1117,136 @@ class TestFBAWorlds(unittest.TestCase):
         rigid.add_articulation([rigid.add_joint_prismatic(-1, body, axis=(0.0, 0.0, 1.0), parent_xform=pose)])
         rigid.add_shape_box(body, hx=0.1, hy=0.1, hz=0.05)
         sources = [cloth_box, _cloth(), rigid]
+        iterations = 2
+
+        def expected_calls(solver):
+            """The NSN solves that each iteration of the step should take: the particle contacts and constraint rows
+            of the worlds without a contact on a body by the deformable NSN, the others with the body rows."""
+            model = solver.model
+            M = solver._contact_count if model.particle_count else 0
+            shape = solver._contact_shape_d.numpy()[:M] if M else np.empty(0, dtype=np.int32)
+            body = np.where(shape >= 0, model.shape_body.numpy()[np.maximum(shape, 0)], -1)
+            particles = solver._contact_particle_d.numpy()[:M] if M else np.empty(0, dtype=np.int32)
+            contact_world = model.particle_world.numpy()[particles]
+            coupled = np.unique(contact_world[body >= 0])
+            m_s = int(np.isin(contact_world, coupled).sum())
+            n_b = 0 if solver._constraint_rows is None else len(solver._constraint_world_h)
+            b_s = int(np.isin(solver._constraint_world_h, coupled).sum())
+            rc = getattr(solver, "_rigid_contacts", None)
+            m_r = 0 if rc is None else rc.count
+            calls = []
+            if M - m_s or n_b - b_s:
+                calls.append(("deformable", M - m_s, n_b - b_s, 3 * (M - m_s) + n_b - b_s))
+            if m_s + m_r:
+                n_j = len(solver._rc_joint_rows_h)
+                calls.append(("two-way", m_s + m_r, n_j + b_s, 3 * (m_s + m_r) + n_j + b_s))
+            return calls * iterations
+
         for device in self.devices:
-            for sparse in (False, True):
-                with self.subTest(device=device, sparse=sparse):
-                    results = []
-                    for builders in (sources, *([s] for s in sources)):
+            for sparse, lengths in ((False, True), (False, False), (True, True), (True, False)):
+                with self.subTest(device=device, sparse=sparse, lengths=lengths):
+                    results, paths = [], []
+                    for run, builders in enumerate((sources, *([s] for s in sources))):
                         model = _model(builders, device)
                         solver = SolverFBA(
                             model,
-                            iterations=2,
+                            iterations=iterations,
                             nsn_linear_iterations=2,
                             nsn_sparse_storage=sparse,
                             contact_warmstart=True,
                             friction_anchors=True,
                         )
+                        calls = []
+                        solve = solver._solve_nsn_coulomb_gpu
+
+                        def record(*args, calls=calls, solve=solve, **kwargs):
+                            W = kwargs["W_sparse"]
+                            rows = W[0].nrow if W is not None else kwargs["W_device"].shape[0]
+                            calls.append((kwargs["graph"], kwargs["m_contacts"], kwargs["n_bilateral"], rows))
+                            return solve(*args, **kwargs)
+
+                        solver._solve_nsn_coulomb_gpu = record
+                        captures = []
+                        graph_step = solver._nsn_sparse_graph_step
+
+                        def capture(*args, captures=captures, graph_step=graph_step, solver=solver):
+                            # A new graph replaces the cached one; on the CPU the step runs without one.
+                            before = solver._nsn_graph
+                            graph_step(*args)
+                            captures.extend([args[0]] if solver._nsn_graph is not before else [])
+
+                        solver._nsn_sparse_graph_step = capture
+                        cloths = [k for k, s in enumerate(builders) if s is not rigid]
+                        if cloths:
+                            first = 4 * np.arange(len(cloths))
+                            solver.set_particle_constraints(
+                                np.stack([first, first + 1], axis=1),
+                                np.tile([1.0, -1.0], (len(cloths), 1)),
+                                np.full(len(cloths), 0.1),
+                                directions=None if lengths else np.tile([-1.0, 0.0, 0.0], (len(cloths), 1)),
+                            )
                         pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.03)
                         contacts = pipeline.contacts()
+                        observables = solver.observables({solver.ObservableKind.CONTACT_F}, contacts=contacts)
                         a, b = model.state(), model.state()
-                        for _ in range(3):
-                            pipeline.collide(a, contacts)
-                            solver.step(a, b, None, contacts, 0.01)
+                        steps, step_paths = [], []
+                        for step in range(4):
+                            if step == 3 and sources[1] in builders:
+                                mask = np.zeros(model.world_count + 1, dtype=bool)
+                                mask[builders.index(sources[1])] = True
+                                mask = wp.array(mask, dtype=wp.bool, device=device)
+                                solver.reset(a, mask, flags=0)
+                                pipeline.reset_contact_matching(mask)
+                            step_contacts = None if step == 2 else contacts
+                            if step_contacts is not None:
+                                pipeline.collide(a, contacts)
+                            calls.clear()
+                            captures.clear()
+                            solver.step(a, b, None, step_contacts, 0.01, observables=None if step == 2 else observables)
+                            self.assertEqual(calls, expected_calls(solver), (run, step))
+                            if not lengths:
+                                # Each NSN solve of the step captures its graph at most once, not at every iteration.
+                                self.assertEqual(len(captures), len(set(captures)), (run, step))
+                                if sparse and wp.get_device(device).is_cuda:
+                                    # The sparse NSN solves on the device run from graphs: each path captures one.
+                                    self.assertEqual(sorted(captures), sorted({c[0] for c in calls}), (run, step))
+                            step_paths.append([c[0] for c in calls[: len(calls) // iterations]])
                             if model.world_count > 1 and solver._anchor_count:
                                 keys = solver._anchor_previous_key_d.numpy()[: solver._anchor_count]
                                 self.assertTrue(np.all(keys[1:] >= keys[:-1]))
                             a, b = b, a
-                        results.append(
-                            tuple(
+                            fields = [
                                 value.numpy() if value is not None else np.empty((0, width))
-                                for value, width in ((a.particle_q, 3), (a.body_q, 7))
+                                for value, width in (
+                                    (a.particle_q, 3),
+                                    (a.particle_qd, 3),
+                                    (a.body_q, 7),
+                                    (a.body_qd, 6),
+                                )
+                            ]
+                            wrench = np.zeros((model.particle_count, 6))
+                            if step != 2:
+                                count = int(contacts.soft_contact_count.numpy()[0])
+                                rows = observables.contact_f.numpy()[contacts.rigid_contact_max :][:count]
+                                np.add.at(wrench, contacts.soft_contact_particle.numpy()[:count], rows)
+                            steps.append([*fields, wrench])
+                        results.append(steps)
+                        paths.append(step_paths)
+                    # The batch solves its cloth beside the box with the deformable NSN, as that world alone does.
+                    self.assertEqual(paths[0][0], ["deformable", "two-way"])
+                    self.assertEqual(paths[1][0], ["two-way"])
+                    self.assertEqual(paths[2][0], ["deformable"])
+                    wrench = np.abs(results[0][0][4]).sum(axis=1)
+                    self.assertTrue(wrench[:4].any() and wrench[4:8].any())
+                    for step in range(4):
+                        for field, atol in enumerate((2e-6, 3e-5, 2e-6, 3e-5, 1e-4)):
+                            np.testing.assert_allclose(
+                                results[0][step][field],
+                                np.concatenate([r[step][field] for r in results[1:]]),
+                                atol=atol,
+                                rtol=1e-5 if field == 4 else 0.0,
+                                err_msg=f"{step=} {field=}",
                             )
-                        )
-                    for field in range(2):
-                        np.testing.assert_allclose(
-                            results[0][field], np.concatenate([r[field] for r in results[1:]]), atol=2e-6, rtol=0.0
-                        )
 
 
 if __name__ == "__main__":

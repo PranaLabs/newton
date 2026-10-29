@@ -74,6 +74,12 @@ only their own world's triangles and edges, and vertex-vertex queries share one
 spatial hash across worlds. If particles change worlds, the queries search all
 worlds' geometry and filter by world. Contacts between distinct local worlds
 are always excluded.
+With several worlds, the particle system and the system of the integrated
+bodies factor one world at a time, each world's matrix whole with all of its
+components; a model of one world factors each system whole. A world whose
+particles touch an integrated body solves all of its particle contacts and
+particle constraint rows together with the body rows, while the other worlds
+keep the deformable contact solve that they take alone.
 Lite's exact particle constraints take at most 64 rows in each world: the
 rows of each world form their own Cholesky block, since the worlds do not
 couple. A model of one world takes its global and local particles' rows in
@@ -81,7 +87,7 @@ one block, within one limit of 64 rows.
 
 Each world solves the same equations with the same algorithms and iteration
 rules as it would alone. Batching can still change floating-point results:
-disconnected systems factor separately, reductions sum in a different order,
+the worlds' systems factor separately, reductions sum in a different order,
 and the choice among self-contact triangles at equal distances follows the
 query order. Batched runs therefore do not promise bitwise equality with
 separate runs or with earlier versions, and long nonlinear contact

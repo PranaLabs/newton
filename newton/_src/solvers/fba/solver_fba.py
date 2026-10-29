@@ -474,6 +474,11 @@ class SolverFBA(SolverBase):
         self._joint_world_h = np.empty(0, dtype=np.int32)
         self._two_way_world_h = np.zeros(model.world_count, dtype=np.int32)
         self._two_way_world_d = wp.empty(0, dtype=wp.int32, device=model.device)
+        # The rows of a step whose worlds split between the two-way and the deformable NSN, and the Schur rows of the
+        # factor of the particle system that the two-way rows take beside the deformable ones.
+        self._mixed = self._two_way_ls = None
+        # The rows that :meth:`_swap_rows` exchanged into the solver, until it exchanges them back.
+        self._swapped_rows = None
         self._empty_contact_scale = wp.empty(0, dtype=wp.float64, device=model.device)
         self._deformable_contact_scale = self._rigid_contact_scale = self._empty_contact_scale
         self._nsn_contact_scale = self._empty_contact_scale
@@ -841,7 +846,11 @@ class SolverFBA(SolverBase):
         # The blocks do not couple: placing each body's DOFs at its slot along a line makes the dissection
         # split between bodies with empty separators.
         slots = np.stack([np.repeat(np.arange(bodies.size), 6), np.zeros(6 * bodies.size), np.zeros(6 * bodies.size)])
-        self._rigid_linear_solver = FBALinearSolver(factorize_and_sparse_inverse(A, slots.T), device=self._device)
+        # Several worlds factor one world at a time.
+        worlds = np.repeat(self._body_world_h[bodies], 6) if model.world_count > 1 else None
+        self._rigid_linear_solver = FBALinearSolver(
+            factorize_and_sparse_inverse(A, slots.T, worlds), device=self._device
+        )
         m = bodies.size
         device = self._device
         self._rigid_bodies_d = wp.array(bodies, dtype=wp.int32, device=device)
@@ -950,7 +959,8 @@ class SolverFBA(SolverBase):
         The joint rows of every articulation a contact touches join the contact
         rows, so one NSN solve couples them; other articulations keep their
         Cholesky-factored joint system.
-        Deformable contact rows lead when one of them touches an integrated body.
+        Deformable contact rows lead when one of them touches an integrated body; with several worlds, a step whose
+        other worlds keep the deformable NSN passes the rows of the touching worlds alone.
         """
         from .joints import select_rows_kernel  # noqa: PLC0415
         from .rigid import row_incidence  # noqa: PLC0415
@@ -1067,11 +1077,159 @@ class SolverFBA(SolverBase):
             scale = 1.0 + self.contact_regularization * np.r_[soft_scale, np.ones(m_r)]
             self._rigid_contact_scale = wp.array(scale, dtype=wp.float64, device=device)
 
+    _CONTACT_ROW_ARRAYS = (
+        "_contact_particle_d",
+        "_contact_record_d",
+        "_contact_normal_d",
+        "_contact_alpha_d",
+        "_contact_offset_d",
+        "_contact_tangent1_d",
+        "_contact_tangent2_d",
+        "_contact_shape_d",
+        "_contact_body_pos_d",
+        "_contact_world_anchor_d",
+        "_contact_is_spinning_d",
+        "_contact_tangent1_offset_d",
+        "_contact_tangent2_offset_d",
+        "_contact_v_anchor_d",
+        "_contact_tangent1_offset_shifted_d",
+        "_contact_tangent2_offset_shifted_d",
+        "_contact_mu_d",
+    )
+
+    def _group_deformable_worlds(self) -> None:
+        """The worlds of the step's particle contacts and the deformable NSN's rows grouped by world."""
+        from .nsn_pcr_solver import group_world_rows  # noqa: PLC0415
+
+        M = self._contact_count
+        particles = host_head(self._contact_particle_d, M) if M else np.empty(0, dtype=np.int32)
+        worlds = np.repeat(self._particle_world_h[particles], 3 if self.friction else 1)
+        self._contact_world_h = self._particle_world_h[particles]
+        self._regularized_world_h = np.zeros(self.model.world_count, dtype=bool)
+        if M and self._contact_extra is not None:
+            extra = host_head(self._contact_extra[0], M)
+            self._regularized_world_h[self._contact_world_h[(extra >= 0).any(axis=1)]] = True
+        scale = 1.0 + self.contact_regularization * self._regularized_world_h[self._contact_world_h]
+        self._deformable_contact_scale = wp.array(scale, dtype=wp.float64, device=self._device)
+        self._deformable_world_rows = group_world_rows(np.r_[worlds, self._constraint_world_h], self._device)
+
+    def _split_two_way_contacts(self) -> None:
+        """Split the step's rows when some worlds' particles touch an integrated body and other worlds have particle
+        contacts or constraint rows: the former worlds solve all of theirs with the body rows, the others keep the
+        deformable NSN. ``_mixed`` then holds the two-way rows' selection, the deformable ones' follows the friction
+        anchors; it stays ``None`` when one of the two NSN solves all rows."""
+        M = self._contact_count
+        if self.model.world_count == 1 or M == 0:
+            return
+        shape = host_head(self._contact_shape_d, M)
+        body = np.where(shape >= 0, self.model.shape_body.numpy()[np.maximum(shape, 0)], -1)
+        coupled = np.zeros(self.model.world_count, dtype=bool)
+        coupled[self._contact_world_h[np.where(body >= 0, self._body_slot_h[np.maximum(body, 0)], -1) >= 0]] = True
+        contact, row = coupled[self._contact_world_h], coupled[self._constraint_world_h]
+        if not contact.any() or (contact.all() and row.all()):
+            return
+        selection = (np.flatnonzero(contact), np.flatnonzero(row), np.flatnonzero(~contact), np.flatnonzero(~row))
+        two_way, rows = self._select_rows(*selection[:2])
+        base = self._linear_solver
+        if self._two_way_ls is None or self._two_way_ls[0] is not base:
+            self._two_way_ls = (base, base.schur_view())
+        # The two-way rows take their own Schur rows, ``W`` cache and NSN graph.
+        two_way.update(_linear_solver=self._two_way_ls[1], _cached_W=False, _nsn_graph=None)
+        self._mixed = SimpleNamespace(selection=selection, two_way=two_way, two_way_rows=rows)
+
+    def _select_rows(self, contacts: np.ndarray, rows: np.ndarray) -> tuple[dict, wp.array]:
+        """The per-contact arrays and constraint rows of the selected contacts and rows, in their order, with their
+        multipliers, and the rows of those multipliers in the step's ``[3 contacts | constraint rows]``."""
+        from .joints import gather_rows_2d_kernel, gather_rows_kernel  # noqa: PLC0415
+
+        device, M = self._device, self._contact_count
+
+        def gather(a, index):
+            out = wp.empty((max(index.shape[0], 1), *a.shape[1:]), dtype=a.dtype, device=device)
+            if index.shape[0]:
+                kernel = gather_rows_kernel if a.ndim == 1 else gather_rows_2d_kernel
+                wp.launch(kernel, (index.shape[0], *a.shape[1:]), [a, index], [out], device=device)
+            return out
+
+        index = wp.array(contacts, dtype=wp.int32, device=device)
+        view = {name: gather(getattr(self, name), index) for name in self._CONTACT_ROW_ARRAYS}
+        view["_contact_count"] = len(contacts)
+        view["_contact_world_h"] = self._contact_world_h[contacts]
+        view["_contact_extra"] = (
+            None if self._contact_extra is None else [gather(a, index) for a in self._contact_extra]
+        )
+        view["_contact_particle_h"] = view["_contact_alpha_h"] = None
+        rows_d = wp.array(rows, dtype=wp.int32, device=device)
+        constraints = self._constraint_rows
+        view["_constraint_rows"] = [gather(a, rows_d) for a in constraints] if len(rows) else None
+        view["_constraint_world_h"] = self._constraint_world_h[rows]
+        selected = np.r_[(3 * contacts[:, None] + np.arange(3)).reshape(-1), 3 * M + rows].astype(np.int32)
+        selected = wp.array(selected, dtype=wp.int32, device=device)
+        for name in ("_lam_coulomb_persistent_d", "_omega_coulomb_persistent_d"):
+            view[name] = gather(getattr(self, name), selected)
+        return view, selected
+
+    def _swap_rows(self, view: dict) -> None:
+        """Exchange the solver's rows with those of ``view``; a second call exchanges them back, as :meth:`step`
+        does when it raises in between."""
+        for name, value in view.items():
+            view[name] = getattr(self, name, None)
+            setattr(self, name, value)
+        self._swapped_rows = None if self._swapped_rows is view else view
+
+    def _begin_mixed_rows(self) -> int:
+        """Start the two-way rows of a split step from the step's multipliers and select the deformable rows, after
+        the friction anchors moved their offsets; returns the deformable constraint row count."""
+        from .joints import gather_values_kernel  # noqa: PLC0415
+
+        mixed, device = self._mixed, self._device
+        n_s, n, n_b = 3 * self._rc_counts[0], self._rc_n, self._rc_n_b
+        rows = mixed.two_way_rows
+        for src, dst in (
+            (self._lam_coulomb_persistent_d, self._rc_lam_d),
+            (self._omega_coulomb_persistent_d, self._rc_omega_d),
+        ):
+            if n_s:
+                wp.launch(gather_values_kernel, n_s, [src, rows[:n_s], 0], [dst], device=device)
+            if n_b:
+                wp.launch(gather_values_kernel, n_b, [src, rows[n_s:], n - n_b], [dst], device=device)
+        mixed.deformable, mixed.deformable_rows = self._select_rows(*mixed.selection[2:])
+        mixed.deformable.update(_deformable_world_rows=None, _deformable_contact_scale=None, _regularized_world_h=None)
+        self._swap_rows(mixed.deformable)
+        self._group_deformable_worlds()
+        self._swap_rows(mixed.deformable)
+        # Both NSN solves of every iteration share the NSN buffers: sized for both at once, neither's graph loses them.
+        size = max(3 * len(mixed.selection[2]) + len(mixed.selection[3]), n)
+        self._ensure_nsn_inner_buffers(size, alloc_2d=not self.nsn_sparse_storage)
+        self._ensure_pcr_solver(size)
+        if self.nsn_sparse_storage:
+            self._ensure_nsn_sparse_scratch(size)
+        return len(mixed.selection[3])
+
+    def _end_mixed_rows(self) -> None:
+        """Return the multipliers of both NSN solves of a split step to the step's rows, in the contacts' order."""
+        from .joints import scatter_values_kernel  # noqa: PLC0415
+
+        mixed, device = self._mixed, self._device
+        n_s, n, n_b = 3 * self._rc_counts[0], self._rc_n, self._rc_n_b
+        rows, deformable = mixed.deformable_rows, mixed.deformable
+        for name, two_way in (
+            ("_lam_coulomb_persistent_d", self._rc_lam_d),
+            ("_omega_coulomb_persistent_d", self._rc_omega_d),
+        ):
+            dst = getattr(self, name)
+            wp.launch(scatter_values_kernel, rows.shape[0], [deformable[name], 0, rows], [dst], device=device)
+            if n_s:
+                wp.launch(scatter_values_kernel, n_s, [two_way, 0, mixed.two_way_rows[:n_s]], [dst], device=device)
+            if n_b:
+                inputs = [two_way, n - n_b, mixed.two_way_rows[n_s:]]
+                wp.launch(scatter_values_kernel, n_b, inputs, [dst], device=device)
+
     def _warm_start_rows(self) -> tuple:
         """This step's NSN rows by kind, as ``(lam, omega, first row, count)`` for the particle contacts, the rigid
         contacts, the joint rows and the particle constraint rows, ``None`` for a kind the step does not solve."""
         particle = rigid = joint = bilateral = None
-        if self._two_way:
+        if self._two_way and self._mixed is None:
             (m_s, m_r), rows = self._rc_counts, (self._rc_lam_d, self._rc_omega_d)
             particle, rigid = (*rows, 0, m_s), (*rows, 3 * m_s, m_r)
             joint = (*rows, 3 * (m_s + m_r), len(self._rc_joint_rows_h))
@@ -1083,8 +1241,9 @@ class SolverFBA(SolverBase):
             rows = (self._lam_coulomb_persistent_d, self._omega_coulomb_persistent_d)
             particle, bilateral = (*rows, 0, M), (*rows, 3 * M, n_b)
         if self._rc_n:
-            m_r, rows = self._rc_counts[1], (self._rc_lam_d, self._rc_omega_d)
-            rigid, joint = (*rows, 0, m_r), (*rows, 3 * m_r, len(self._rc_joint_rows_h))
+            # Beside the deformable rows, the two-way particle contact rows lead the rigid rows.
+            (m_s, m_r), rows = self._rc_counts, (self._rc_lam_d, self._rc_omega_d)
+            rigid, joint = (*rows, 3 * m_s, m_r), (*rows, 3 * (m_s + m_r), len(self._rc_joint_rows_h))
         return particle, rigid, joint, bilateral
 
     def _restore_warm_start(self) -> None:
@@ -1545,8 +1704,11 @@ class SolverFBA(SolverBase):
             rayleigh_alpha=self._rayleigh_alpha,
             rayleigh_beta=self._rayleigh_beta,
         )
-        fs = factorize_and_sparse_inverse(A, self.model.particle_q.numpy())
+        worlds = self._particle_world_h if self.model.world_count > 1 else None
+        fs = factorize_and_sparse_inverse(A, self.model.particle_q.numpy(), worlds)
         self._linear_solver = FBALinearSolver(fs, device=self._device)
+        # The two-way Schur rows of the previous factor go with it.
+        self._two_way_ls = None
         self._linear_solver.exact_inverse_entries = self.nsn_sparse_storage
         self._linear_solver.sparse_W = self.nsn_sparse_storage
         if self.nsn_sparse_storage:
@@ -1779,6 +1941,23 @@ class SolverFBA(SolverBase):
             observables: Optional observables from :meth:`observables`; see the
                 class notes for :attr:`~newton.solvers.SolverBase.ObservableKind.CONTACT_F`.
         """
+        try:
+            self._step(state_in, state_out, control, contacts, dt, observables)
+        finally:
+            # A split step that raises with rows of a world selection in place returns the solver's own.
+            if self._swapped_rows is not None:
+                self._swap_rows(self._swapped_rows)
+
+    def _step(
+        self,
+        state_in: State,
+        state_out: State,
+        control: Control | None,
+        contacts: Contacts | None,
+        dt: float,
+        observables: SolverBase.Observables | None,
+    ) -> None:
+        """The body of :meth:`step`."""
         from .kernels import (  # noqa: PLC0415
             compute_inertial_kernel,
             copy_particles_kernel,
@@ -1789,7 +1968,7 @@ class SolverFBA(SolverBase):
         contact_f = None
         if observables is not None and observables.is_requested(SolverBase.ObservableKind.CONTACT_F):
             contact_f = observables.contact_f
-        self._two_way, self._rc_n = False, 0
+        self._two_way, self._rc_n, self._mixed = False, 0, None
         self._two_way_world_h.fill(0)
         rigid = self.model.body_count > 0 and not self.integrate_with_external_rigid_solver
         rigid = rigid and self._begin_rigid_step(state_in, state_out, dt)
@@ -1832,19 +2011,7 @@ class SolverFBA(SolverBase):
 
         has_contacts = self._contact_count > 0
         if self.model.world_count > 1:
-            from .nsn_pcr_solver import group_world_rows  # noqa: PLC0415
-
-            M = self._contact_count
-            particles = host_head(self._contact_particle_d, M) if M else np.empty(0, dtype=np.int32)
-            worlds = np.repeat(self._particle_world_h[particles], 3 if self.friction else 1)
-            self._contact_world_h = self._particle_world_h[particles]
-            self._regularized_world_h = np.zeros(self.model.world_count, dtype=bool)
-            if M and self._contact_extra is not None:
-                extra = host_head(self._contact_extra[0], M)
-                self._regularized_world_h[self._contact_world_h[(extra >= 0).any(axis=1)]] = True
-            scale = 1.0 + self.contact_regularization * self._regularized_world_h[self._contact_world_h]
-            self._deformable_contact_scale = wp.array(scale, dtype=wp.float64, device=self._device)
-            self._deformable_world_rows = group_world_rows(np.r_[worlds, self._constraint_world_h], self._device)
+            self._group_deformable_worlds()
 
         # Apply kinematic anchor advancement: tangent_offset = base + dt · dot(t, v_anchor).
         # _ingest_contacts cached base offsets + v_anchor; the dt-dependent
@@ -1924,13 +2091,22 @@ class SolverFBA(SolverBase):
 
         # Rigid contact rows are assembled after the deformable contacts they may share bodies with.
         if rigid:
+            self._split_two_way_contacts()
+            mixed = self._mixed
+            if mixed is not None:
+                self._swap_rows(mixed.two_way)
             self._begin_rigid_contacts(contacts, state_in)
+            if mixed is not None:
+                self._swap_rows(mixed.two_way)
         if self._warm_start is not None:
             self._restore_warm_start()
         if self.friction_anchors:
             if model.world_count > 1:
                 self._two_way_world_d = wp.array(self._two_way_world_h, dtype=wp.int32, device=device)
             self._apply_friction_anchors(state_in)
+        mixed = self._mixed
+        if mixed is not None:
+            n_b = self._begin_mixed_rows()
 
         if self._inactive_d is not None:
             inputs = [self._inactive_d, state_in.particle_q]
@@ -1983,8 +2159,11 @@ class SolverFBA(SolverBase):
             else:
                 self._run_pd_local_phase_eager(N, dt)
 
-            if (has_contacts or n_b) and not self._two_way:
+            if (has_contacts or n_b) and (not self._two_way or mixed is not None):
                 # --- Schur-complement NSN contact correction ---
+                if mixed is not None:
+                    # The rows of the worlds without two-way contacts.
+                    self._swap_rows(mixed.deformable)
                 M = self._contact_count
                 ls = self._linear_solver
                 if n_b:
@@ -2263,9 +2442,17 @@ class SolverFBA(SolverBase):
                     wp.copy(self._omega_unilateral_persistent_d, self._nsn_omega_d, count=M)
                     # Apply the contact forces in combined form, as the frictional branch above does.
                     ls.apply_lambda_correction_combined(self._nsn_lam_apply_d, self._rhs, self._x_cur)
+                if mixed is not None:
+                    self._swap_rows(mixed.deformable)
             if rigid:
+                if mixed is not None:
+                    self._swap_rows(mixed.two_way)
                 self._rigid_iteration(state_in, state_out, dt)
+                if mixed is not None:
+                    self._swap_rows(mixed.two_way)
 
+        if mixed is not None:
+            self._end_mixed_rows()
         if self._warm_start is not None:
             self._store_warm_start()
         if self.friction_anchors:
@@ -2290,7 +2477,7 @@ class SolverFBA(SolverBase):
         # The host mirrors of the persistent buffers read them when first read, so the step ends without waiting
         # for the device. When M==0 the host arrays were left at None / unchanged.
         if has_contacts:
-            self._persistent_rows = M
+            self._persistent_rows = self._contact_count
 
     def _run_pd_local_phase_eager(self, N: int, dt: float) -> None:
         """Issue the PD local-phase launches on the active stream.
@@ -2558,9 +2745,9 @@ class SolverFBA(SolverBase):
         if M == 0:
             return
         forces = self._nsn_lam_apply_d
-        if self._rc_n and not self._two_way:
+        if self._rc_n and (not self._two_way or self._mixed is not None):
             # The rigid rows took their NSN step after the particle contacts' in every iteration, in the same buffer;
-            # the particle contacts' forces come from the multipliers their own NSN kept.
+            # the particle contacts' forces come from the multipliers their own NSN kept, in the contacts' order.
             forces = wp.empty(3 * M, dtype=wp.float64, device=device)
             inputs = [self._lam_coulomb_persistent_d, self._omega_coulomb_persistent_d, wp.float64(dt)]
             wp.launch(compute_lam_apply_kernel, 3 * M, inputs, [forces], device=device)
@@ -3040,7 +3227,7 @@ class SolverFBA(SolverBase):
         integrated bodies and their joint rows.
         """
         if flags & ModelFlags.SHAPE_PROPERTIES:
-            self._linear_solver = None
+            self._linear_solver = self._two_way_ls = self._mixed = None
             self._dt_setup = None
             self._invalidate_schur_cache()
         if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.BODY_INERTIAL_PROPERTIES | ModelFlags.JOINT_PROPERTIES):
@@ -4360,6 +4547,9 @@ class SolverFBA(SolverBase):
             id(pcr),
             id(pcr.world_rows),
             id(self._nsn_contact_scale),
+            # The step's buffers, which grow with the rows of another NSN solve.
+            self._nsn_inner_n,
+            id(self._nsn_sparse_scratch[0]),
         )
         cached = self._nsn_graph
         if cached is None or cached[0] != key:
@@ -4374,6 +4564,7 @@ class SolverFBA(SolverBase):
                 key,
                 graph,
                 (W_sparse, inputs, block_precond, pcr, tail[1], pcr.world_rows, self._nsn_contact_scale),
+                self._nsn_sparse_scratch,
             )
             if graph is None:
                 run()
