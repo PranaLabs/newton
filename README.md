@@ -109,7 +109,72 @@ are still in the package; `python -m newton.examples --list` lists them all.
 
 <table>
   <tr>
-    <td colspan="3"><h3>Cloth Examples</h3></td>
+    <td colspan="3"><h3>Robot Manipulation</h3></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="newton/examples/cloth/example_cloth_dual_franka_fba.py">
+        <img width="320" src="docs/images/examples/example_cloth_dual_franka_fba.jpg" alt="Cloth Dual Franka FBA">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="newton/examples/cloth/example_shirt_fold_fba.py">
+        <img width="320" src="docs/images/examples/example_shirt_fold_fba.jpg" alt="Shirt Fold FBA">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="newton/examples/softbody/example_softbody_franka_fba.py">
+        <img width="320" src="docs/images/examples/example_softbody_franka_fba.jpg" alt="Softbody Franka FBA">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples cloth_dual_franka_fba</code><br>
+      <sub>two Franka arms fold a towel twice into a square</sub>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples shirt_fold_fba</code><br>
+      <sub>two Franka arms fold a T-shirt dropped on a table</sub>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples softbody_franka_fba</code><br>
+      <sub>a Franka arm picks up a soft ball held by friction alone</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="newton/examples/softbody/example_pneunet_gripper_fba.py">
+        <img width="320" src="docs/images/examples/example_pneunet_gripper_fba.jpg" alt="PneuNet Gripper FBA">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="newton/examples/softbody/example_cable_gripper_fba.py">
+        <img width="320" src="docs/images/examples/example_cable_gripper_fba.jpg" alt="Cable Gripper FBA">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="newton/examples/softbody/example_claw_machine_fba.py">
+        <img width="320" src="docs/images/examples/example_claw_machine_fba.jpg" alt="Claw Machine FBA">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples pneunet_gripper_fba</code><br>
+      <sub>a pneumatic three-finger gripper closes around a ball</sub>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples cable_gripper_fba</code><br>
+      <sub>soft fingers curled by embedded cables lift a box</sub>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples claw_machine_fba</code><br>
+      <sub>a claw picks a toy out of a pile of 25 soft toys</sub>
+    </td>
+  </tr>
+  <tr>
+    <td colspan="3"><h3>Cloth</h3></td>
   </tr>
   <tr>
     <td align="center" width="33%">
@@ -123,8 +188,8 @@ are still in the package; `python -m newton.examples --list` lists them all.
       </a>
     </td>
     <td align="center" width="33%">
-      <a href="newton/examples/cloth/example_cloth_dual_franka_fba.py">
-        <img width="320" src="docs/images/examples/example_cloth_dual_franka_fba.jpg" alt="Cloth Dual Franka FBA">
+      <a href="newton/examples/multiphysics/example_cloth_on_knives_fba.py">
+        <img width="320" src="docs/images/examples/example_cloth_on_knives_fba.jpg" alt="Cloth on Knives FBA">
       </a>
     </td>
   </tr>
@@ -138,40 +203,11 @@ are still in the package; `python -m newton.examples --list` lists them all.
       <sub>a T-shirt moved by two handles at its shoulders, with self-contact</sub>
     </td>
     <td align="center" width="33%">
-      <code>python -m newton.examples cloth_dual_franka_fba</code><br>
-      <sub>two Franka arms fold a towel twice into a square</sub>
+      <code>python -m newton.examples cloth_on_knives_fba</code><br>
+      <sub>cloth dropped on notched blades, held off their tips by face contacts</sub>
     </td>
   </tr>
   <tr>
-    <td align="center" width="33%">
-      <a href="newton/examples/cloth/example_shirt_fold_fba.py">
-        <img width="320" src="docs/images/examples/example_shirt_fold_fba.jpg" alt="Shirt Fold FBA">
-      </a>
-    </td>
-    <td align="center" width="33%">
-    </td>
-    <td align="center" width="33%">
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples shirt_fold_fba</code><br>
-      <sub>two Franka arms fold a T-shirt dropped on a table</sub>
-    </td>
-    <td align="center" width="33%">
-    </td>
-    <td align="center" width="33%">
-    </td>
-  </tr>
-  <tr>
-    <td colspan="3"><h3>Multi-Physics Examples</h3></td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <a href="newton/examples/multiphysics/example_cloth_on_knives_fba.py">
-        <img width="320" src="docs/images/examples/example_cloth_on_knives_fba.jpg" alt="Cloth on Knives FBA">
-      </a>
-    </td>
     <td align="center" width="33%">
       <a href="newton/examples/multiphysics/example_cloth_on_boxes_fba.py">
         <img width="320" src="docs/images/examples/example_cloth_on_boxes_fba.jpg" alt="Cloth on Boxes FBA">
@@ -179,21 +215,21 @@ are still in the package; `python -m newton.examples --list` lists them all.
     </td>
     <td align="center" width="33%">
     </td>
+    <td align="center" width="33%">
+    </td>
   </tr>
   <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples cloth_on_knives_fba</code><br>
-      <sub>cloth dropped on notched blades, held off their tips by face contacts</sub>
-    </td>
     <td align="center" width="33%">
       <code>python -m newton.examples cloth_on_boxes_fba</code><br>
       <sub>cloth on stacked boxes and a hinged plank that tips onto them</sub>
     </td>
     <td align="center" width="33%">
     </td>
+    <td align="center" width="33%">
+    </td>
   </tr>
   <tr>
-    <td colspan="3"><h3>Softbody Examples</h3></td>
+    <td colspan="3"><h3>Soft Bodies</h3></td>
   </tr>
   <tr>
     <td align="center" width="33%">
@@ -228,57 +264,21 @@ are still in the package; `python -m newton.examples --list` lists them all.
   </tr>
   <tr>
     <td align="center" width="33%">
-      <a href="newton/examples/softbody/example_softbody_franka_fba.py">
-        <img width="320" src="docs/images/examples/example_softbody_franka_fba.jpg" alt="Softbody Franka FBA">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="newton/examples/softbody/example_cable_gripper_fba.py">
-        <img width="320" src="docs/images/examples/example_cable_gripper_fba.jpg" alt="Cable Gripper FBA">
-      </a>
-    </td>
-    <td align="center" width="33%">
       <a href="newton/examples/softbody/example_bunny_ears_fba.py">
         <img width="320" src="docs/images/examples/example_bunny_ears_fba.jpg" alt="Bunny Ears FBA">
       </a>
     </td>
+    <td align="center" width="33%">
+    </td>
+    <td align="center" width="33%">
+    </td>
   </tr>
   <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples softbody_franka_fba</code><br>
-      <sub>a Franka arm picks up a soft ball held by friction alone</sub>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples cable_gripper_fba</code><br>
-      <sub>soft fingers curled by embedded cables lift a box</sub>
-    </td>
     <td align="center" width="33%">
       <code>python -m newton.examples bunny_ears_fba</code><br>
       <sub>a soft bunny carried and swung by its ear tips</sub>
     </td>
-  </tr>
-  <tr>
     <td align="center" width="33%">
-      <a href="newton/examples/softbody/example_pneunet_gripper_fba.py">
-        <img width="320" src="docs/images/examples/example_pneunet_gripper_fba.jpg" alt="PneuNet Gripper FBA">
-      </a>
-    </td>
-    <td align="center" width="33%">
-      <a href="newton/examples/softbody/example_claw_machine_fba.py">
-        <img width="320" src="docs/images/examples/example_claw_machine_fba.jpg" alt="Claw Machine FBA">
-      </a>
-    </td>
-    <td align="center" width="33%">
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <code>python -m newton.examples pneunet_gripper_fba</code><br>
-      <sub>a pneumatic three-finger gripper closes around a ball</sub>
-    </td>
-    <td align="center" width="33%">
-      <code>python -m newton.examples claw_machine_fba</code><br>
-      <sub>a claw picks a toy out of a pile of 25 soft toys</sub>
     </td>
     <td align="center" width="33%">
     </td>
@@ -293,20 +293,20 @@ time per wall-clock time. The claw machine is timed over its first 300 frames, w
 
 | Example | Particles | Triangles | Tetrahedra | Frame | ms per frame | Real time |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `stretching_cloth_fba` | 20,201 | 40,000 | 0 | 1/100 s | 6.0 | 1.67x |
-| `shirt_pins_fba` | 7,931 | 15,650 | 0 | 1/60 s | 17.8 | 0.93x |
 | `cloth_dual_franka_fba` | 1,681 | 3,200 | 0 | 1/60 s | 23.0 | 0.73x |
 | `shirt_fold_fba` | 6,480 | 12,748 | 0 | 1/60 s | 17.9 | 0.93x |
+| `softbody_franka_fba` | 2,197 | 1,728 | 10,368 | 1/60 s | 25.7 | 0.65x |
+| `pneunet_gripper_fba` | 7,363 | 9,612 | 27,395 | 1/100 s | 64.6 | 0.15x |
+| `cable_gripper_fba` | 1,050 | 1,408 | 3,200 | 1/100 s | 29.1 | 0.34x |
+| `claw_machine_fba` | 87,982 | 131,566 | 305,339 | 1/30 s | 455.7 | 0.07x |
+| `stretching_cloth_fba` | 20,201 | 40,000 | 0 | 1/100 s | 6.0 | 1.67x |
+| `shirt_pins_fba` | 7,931 | 15,650 | 0 | 1/60 s | 17.8 | 0.93x |
 | `cloth_on_knives_fba` | 5,101 | 10,000 | 0 | 1/100 s | 32.1 | 0.31x |
 | `cloth_on_boxes_fba` | 289 | 512 | 0 | 1/60 s | 28.9 | 0.58x |
 | `twisting_bar_fba` | 11,340 | 5,780 | 58,956 | 1/100 s | 8.6 | 1.16x |
 | `squeezing_ball_fba` | 6,859 | 3,888 | 34,992 | 1/100 s | 15.4 | 0.65x |
 | `softbody_cantilever_fba` | 10,584 | 6,760 | 43,940 | 1/50 s | 13.5 | 1.48x |
-| `softbody_franka_fba` | 2,197 | 1,728 | 10,368 | 1/60 s | 25.7 | 0.65x |
-| `cable_gripper_fba` | 1,050 | 1,408 | 3,200 | 1/100 s | 29.1 | 0.34x |
 | `bunny_ears_fba` | 4,155 | 5,294 | 15,844 | 1/60 s | 5.9 | 2.82x |
-| `pneunet_gripper_fba` | 7,363 | 9,612 | 27,395 | 1/100 s | 64.6 | 0.15x |
-| `claw_machine_fba` | 87,982 | 131,566 | 305,339 | 1/30 s | 455.7 | 0.07x |
 
 ### Example Options
 
