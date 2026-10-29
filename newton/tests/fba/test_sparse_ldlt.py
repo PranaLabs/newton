@@ -4,9 +4,12 @@
 """Tests of SolverFBA's NumPy sparse LDLᵀ factorization."""
 
 import unittest
+from unittest import mock
 
 import numpy as np
 
+from newton._src.solvers.fba import linear_solver
+from newton._src.solvers.fba.linear_solver import factorize_and_sparse_inverse
 from newton._src.solvers.fba.sparse_ldlt import CsrMatrix, factor_ldlt, nested_dissection
 
 
@@ -107,6 +110,164 @@ class TestFactorLdlt(unittest.TestCase):
         """Refuse to factor a matrix with a negative eigenvalue."""
         with self.assertRaises(np.linalg.LinAlgError):
             factor_ldlt(CsrMatrix.from_matrix(np.diag([1.0, -1.0, 2.0])))
+
+
+def _join(blocks, permutation):
+    """The block diagonal matrix of ``blocks`` with its unknowns renumbered by ``permutation``."""
+    rows, cols, values, first = [], [], [], 0
+    for block in blocks:
+        rows.append(block.row_of_entries() + first)
+        cols.append(block.indices + first)
+        values.append(block.data)
+        first += block.shape[0]
+    place = np.argsort(permutation)
+    rows, cols = place[np.concatenate(rows)], place[np.concatenate(cols)]
+    return CsrMatrix.from_triplets((first, first), rows, cols, np.concatenate(values))
+
+
+class TestFactorizeWorlds(unittest.TestCase):
+    def assert_system(self, matrix, positions, worlds=None):
+        """``P A Pᵀ = L D Lᵀ`` with ``S = L⁻¹`` to round-off, and ``A⁻¹ b`` solves ``A x = b``; return the system."""
+        if worlds is None:
+            system = factorize_and_sparse_inverse(matrix, positions)  # the call without world grouping, as before
+        else:
+            system = factorize_and_sparse_inverse(matrix, positions, worlds=worlds)
+        order = system.invperm_r
+        np.testing.assert_array_equal(np.sort(order), np.arange(matrix.shape[0]))
+        np.testing.assert_array_equal(system.perm_r[order], np.arange(matrix.shape[0]))
+        A = matrix.toarray()
+        S = system.S.toarray()
+        L = np.linalg.inv(S)
+        dense = A[np.ix_(order, order)]
+        self.assertLess(np.abs(L / system.Dinv @ L.T - dense).max(), 1e-12 * np.abs(dense).max())
+        b = np.random.default_rng(3).standard_normal(matrix.shape[0])
+        x = np.empty_like(b)
+        x[order] = S.T @ (system.Dinv * (S @ b[order]))
+        self.assertLess(np.abs(A @ x - b).max(), 1e-10 * np.abs(b).max())
+        return system
+
+    def assert_whole(self, matrix, positions, worlds=None):
+        """The system is exactly that of :func:`factor_ldlt` of the whole matrix."""
+        system = self.assert_system(matrix, positions, worlds)
+        order, L, d = factor_ldlt(matrix, positions)
+        np.testing.assert_array_equal(system.invperm_r, order)
+        np.testing.assert_array_equal(system.Dinv, 1.0 / d)
+        S = linear_solver.compute_lower_inverse(L, parent=linear_solver._elimination_tree(L))
+        np.testing.assert_array_equal(system.S.indptr, S.indptr)
+        np.testing.assert_array_equal(system.S.indices, S.indices)
+        np.testing.assert_array_equal(system.S.data, S.data)
+
+    def assert_world_blocks(self, matrix, positions, worlds, system):
+        """Each world takes consecutive places of the order, in ascending world order, with the factor that
+        :func:`factor_ldlt` gives its own matrix, all of its components together."""
+        A, S, first = matrix.toarray(), system.S.toarray(), 0
+        for w in np.unique(worlds):
+            dofs = np.flatnonzero(worlds == w)
+            m = dofs.size
+            block = CsrMatrix.from_matrix(A[np.ix_(dofs, dofs)])
+            order, L, d = factor_ldlt(block, None if positions is None else positions[dofs])
+            np.testing.assert_array_equal(system.invperm_r[first : first + m], dofs[order])
+            np.testing.assert_array_equal(system.Dinv[first : first + m], 1.0 / d)
+            Sw = linear_solver.compute_lower_inverse(L, parent=linear_solver._elimination_tree(L)).toarray()
+            np.testing.assert_allclose(S[first : first + m, first : first + m], Sw, rtol=1e-14, atol=0.0)
+            self.assertFalse(np.any(S[first : first + m, :first]) or np.any(S[first : first + m, first + m :]))
+            first += m
+        self.assertEqual(first, matrix.shape[0])
+
+    def test_components_without_worlds_factor_whole(self):
+        """Without world grouping, or with one world, a matrix of several components, such as isolated unknowns
+        or interleaved bodies, factors as a whole, exactly as :func:`factor_ldlt` does."""
+        blocks = [grid_system(4, 4, 2)[0], grid_system(3, 5, 1)[0], CsrMatrix.from_matrix(np.array([[2.5]]))]
+        points = [grid_system(4, 4, 2)[1], grid_system(3, 5, 1)[1], np.zeros((1, 3))]
+        n = sum(b.shape[0] for b in blocks)
+        permutation = np.random.default_rng(7).permutation(n)
+        matrix = _join(blocks, permutation)
+        for positions in (np.concatenate(points)[permutation], None):
+            for worlds in (None, np.zeros(n, dtype=np.int32), np.full(n, 3, dtype=np.int32)):
+                with self.subTest(positions=positions is not None, worlds=None if worlds is None else worlds[0]):
+                    self.assert_whole(matrix, positions, worlds)
+        isolated = CsrMatrix.from_matrix(np.diag(np.linspace(1.0, 2.0, 64)))
+        self.assert_whole(isolated, np.random.default_rng(1).standard_normal((64, 3)))
+
+    def test_interleaved_heterogeneous_worlds(self):
+        """Interleaved worlds of different sizes, one of two components, with an empty world number between them,
+        factor one world at a time and keep each world's components together."""
+        blocks = [
+            grid_system(4, 4, 2)[0],
+            grid_system(3, 5, 1)[0],
+            CsrMatrix.from_matrix(np.array([[2.5]])),
+            grid_system(2, 3, 2)[0],
+        ]
+        points = [grid_system(4, 4, 2)[1], grid_system(3, 5, 1)[1], np.zeros((1, 3)), grid_system(2, 3, 2)[1]]
+        world_of_block = [3, 0, 3, 1]  # world 2 is empty; world 3 holds two components
+        sizes = [b.shape[0] for b in blocks]
+        n = sum(sizes)
+        permutation = np.random.default_rng(11).permutation(n)
+        matrix = _join(blocks, permutation)
+        worlds = np.repeat(world_of_block, sizes)[permutation].astype(np.int32)
+        for positions in (np.concatenate(points)[permutation], None):
+            with self.subTest(positions=positions is not None):
+                calls = []
+
+                def factor(matrix, positions=None, leaf_size=64, calls=calls):
+                    calls.append(matrix.shape[0])
+                    return factor_ldlt(matrix, positions, leaf_size)
+
+                with mock.patch.object(linear_solver, "factor_ldlt", side_effect=factor):
+                    system = self.assert_system(matrix, positions, worlds)
+                self.assertEqual(calls, [sizes[1], sizes[3], sizes[0] + sizes[2]])
+                self.assert_world_blocks(matrix, positions, worlds, system)
+
+    def test_colocated_worlds_factor_alone(self):
+        """Co-located replica worlds reach the multifrontal factor one at a time, so no front spans two."""
+        block, points = grid_system(5, 5, 2)
+        replicas = 4
+        n = replicas * block.shape[0]
+        permutation = np.arange(n).reshape(replicas, -1).T.ravel()  # interleave the replicas' unknowns
+        matrix = _join([block] * replicas, permutation)
+        positions = np.tile(points, (replicas, 1))[permutation]
+        worlds = (permutation // block.shape[0]).astype(np.int32)
+        sizes = []
+
+        def factor(matrix, positions=None, leaf_size=64):
+            sizes.append(matrix.shape[0])
+            return factor_ldlt(matrix, positions, leaf_size)
+
+        with mock.patch.object(linear_solver, "factor_ldlt", side_effect=factor):
+            system = self.assert_system(matrix, positions, worlds)
+        self.assertEqual(sizes, [block.shape[0]] * replicas)
+        self.assert_world_blocks(matrix, positions, worlds, system)
+        reference = factor_ldlt(block, points)[1]
+        self.assertEqual(system.S.data.size, replicas * linear_solver.compute_lower_inverse(reference).data.size)
+
+    def test_coupled_worlds_factor_whole(self):
+        """Worlds coupled to each other, or to a global unknown of world -1, factor as a whole, exactly as before."""
+        block, points = grid_system(4, 4, 1)
+        replicas, m = 3, block.shape[0]
+        matrix = _join([block] * replicas, np.arange(replicas * m))
+        rows = np.r_[matrix.row_of_entries(), np.arange(0, replicas * m, m), np.full(replicas, replicas * m)]
+        cols = np.r_[matrix.indices, np.full(replicas, replicas * m), np.arange(0, replicas * m, m)]
+        values = np.r_[matrix.data + 0.0, -0.1 * np.ones(2 * replicas)]
+        coupled = CsrMatrix.from_triplets(
+            (replicas * m + 1,) * 2, np.r_[rows, replicas * m], np.r_[cols, replicas * m], np.r_[values, 1.0]
+        )
+        points = np.r_[np.tile(points, (replicas, 1)), np.zeros((1, 3))]
+        worlds = np.r_[np.repeat(np.arange(replicas), m), -1].astype(np.int32)
+        for positions in (points, None):
+            for labels in (None, worlds):
+                with self.subTest(positions=positions is not None, worlds=labels is not None):
+                    self.assert_whole(coupled, positions, labels)
+
+    def test_diagonal_and_empty_matrices(self):
+        """Factor a matrix of singletons, one world each, and the empty matrix."""
+        diagonal = CsrMatrix.from_matrix(np.diag([2.0, 0.5, 4.0]))
+        worlds = np.array([1, 0, 2], dtype=np.int32)
+        system = self.assert_system(diagonal, np.zeros((3, 3)), worlds)
+        np.testing.assert_allclose(system.Dinv[system.perm_r], [0.5, 2.0, 0.25])
+        self.assert_world_blocks(diagonal, np.zeros((3, 3)), worlds, system)
+        empty = factorize_and_sparse_inverse(CsrMatrix.from_matrix(np.zeros((0, 0))))
+        self.assertEqual(empty.S.shape, (0, 0))
+        self.assertEqual(empty.Dinv.size, 0)
 
 
 if __name__ == "__main__":

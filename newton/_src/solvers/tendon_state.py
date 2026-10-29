@@ -13,6 +13,7 @@ from __future__ import annotations
 import numpy as np
 import warp as wp
 
+from ..core.reset import reset_state_array
 from ..sim import Model, State
 from ..sim.tendon import TendonGuideFlags, TendonGuideType
 from .tendon_kernels import (
@@ -21,7 +22,6 @@ from .tendon_kernels import (
     mark_tendon_rebaseline_worlds,
     prepare_tendon_route,
     rebaseline_tendon_attachments,
-    reset_tendon_state_array,
     save_tendon_history,
     snapshot_tendon_guide_active,
     solve_tendon_material,
@@ -846,7 +846,7 @@ class TendonStateMixin:
                     wp.copy(current, initial)
                 else:
                     wp.launch(
-                        kernel=reset_tendon_state_array,
+                        kernel=reset_state_array,
                         dim=current.shape[0],
                         inputs=[entity_world, world_mask, self.model.world_count, initial],
                         outputs=[current],
@@ -871,7 +871,7 @@ class TendonStateMixin:
             else:
                 entity_world = self._tendon_guide_world if name == "tendon_guide_active" else self._tendon_segment_world
                 wp.launch(
-                    reset_tendon_state_array,
+                    reset_state_array,
                     dim=current.size,
                     inputs=[entity_world, world_mask, self.model.world_count, initial],
                     outputs=[current],

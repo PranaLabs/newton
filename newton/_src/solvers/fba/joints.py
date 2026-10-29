@@ -11,6 +11,7 @@ are expressed in the joint frame carried by the parent body.
 
 import itertools
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import warp as wp
@@ -496,6 +497,30 @@ def gather_values_kernel(
     """``dst[offset + k] = src[index[k]]``."""
     k = wp.tid()
     dst[offset + k] = src[index[k]]
+
+
+@wp.kernel
+def gather_rows_kernel(
+    src: wp.array[Any],
+    index: wp.array[wp.int32],
+    # outputs
+    dst: wp.array[Any],
+):
+    """``dst[k] = src[index[k]]``."""
+    k = wp.tid()
+    dst[k] = src[index[k]]
+
+
+@wp.kernel
+def gather_rows_2d_kernel(
+    src: wp.array2d[Any],
+    index: wp.array[wp.int32],
+    # outputs
+    dst: wp.array2d[Any],
+):
+    """``dst[k, j] = src[index[k], j]``."""
+    k, j = wp.tid()
+    dst[k, j] = src[index[k], j]
 
 
 @wp.kernel

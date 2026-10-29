@@ -861,18 +861,74 @@ class FactorizedSystem:
     invperm_r: np.ndarray  # length n, int32
 
 
-def factorize_and_sparse_inverse(A, positions: np.ndarray | None = None) -> FactorizedSystem:
+def _factor_components(
+    matrix: CsrMatrix, positions: np.ndarray | None, component: np.ndarray, counts: np.ndarray
+) -> tuple[np.ndarray, CscMatrix, np.ndarray]:
+    """:func:`~.sparse_ldlt.factor_ldlt` of each block of unknowns of ``matrix`` on its own, as one block diagonal
+    factor: the blocks take consecutive places of the order, each in its own elimination order, so that no front of
+    one holds another's unknowns, such as those of co-located worlds that nested dissection would otherwise group
+    together. No entry may join two blocks.
+
+    Args:
+        matrix: Symmetric positive definite matrix.
+        positions: Point of each unknown [m], shape ``[n, 3]``, or ``None``.
+        component: Block of each unknown, numbered from 0, shape ``[n]``.
+        counts: Unknowns of each block.
+
+    Returns:
+        ``(order, L, d)`` as :func:`~.sparse_ldlt.factor_ldlt` returns them for the whole matrix.
+    """
+    n = matrix.shape[0]
+    start = np.r_[0, np.cumsum(counts)]
+    unknowns = np.argsort(component, kind="stable")  # each block's unknowns, ascending
+    local = np.empty(n, dtype=np.int64)
+    local[unknowns] = np.arange(n) - start[component[unknowns]]
+    # every entry joins two unknowns of one block, so the entries split by their rows' blocks
+    rows = matrix.row_of_entries()
+    entries = np.argsort(component[rows], kind="stable")
+    entry_start = np.searchsorted(component[rows][entries], np.arange(counts.size + 1))
+    order, d = np.empty(n, dtype=np.int64), np.empty(n)
+    indptr, indices, data, stored = [np.zeros(1, dtype=np.int64)], [], [], 0
+    for c, m in enumerate(counts):
+        first, e = start[c], entries[entry_start[c] : entry_start[c + 1]]
+        block = CsrMatrix.from_triplets((m, m), local[rows[e]], local[matrix.indices[e]], matrix.data[e])
+        dofs = unknowns[first : first + m]
+        block_order, L, d[first : first + m] = factor_ldlt(block, None if positions is None else positions[dofs])
+        order[first : first + m] = dofs[block_order]
+        indptr.append(L.indptr[1:] + stored)
+        indices.append(L.indices.astype(np.int64) + first)
+        data.append(L.data)
+        stored += L.data.size
+    L = CscMatrix((n, n), np.concatenate(indptr), np.concatenate(indices).astype(np.int32), np.concatenate(data))
+    return order, L, d
+
+
+def factorize_and_sparse_inverse(
+    A, positions: np.ndarray | None = None, worlds: np.ndarray | None = None
+) -> FactorizedSystem:
     """Factor an SPD matrix as ``P A Pᵀ = L D Lᵀ`` and compute ``S = L⁻¹``.
 
     Args:
         A: Scalar N x N PD matrix: a :class:`~.sparse_ldlt.CsrMatrix`, a dense array, or a matrix with ``tocoo()``.
-        positions: Point of each unknown [m], shape ``[N, 3]``, for the nested dissection ordering; ``None``
-            factors densely in the given order.
+        positions: Point of each unknown [m], shape ``[N, 3]``, for the nested dissection ordering;
+            ``None`` factors densely in the given order of the unknowns.
+        worlds: World of each unknown, shape ``[N]``, or ``None``. The unknowns of several worlds that no entry
+            joins factor one world at a time, each world's as its own matrix with all of its components, and take
+            consecutive places of the order in ascending world order, so the factor is block diagonal. Without
+            them, with one world, or with an entry that joins two worlds, the matrix factors as a whole.
 
     Returns:
         FactorizedSystem with all data needed to construct an FBALinearSolver.
     """
-    order, L, d = factor_ldlt(CsrMatrix.from_matrix(A), positions)
+    matrix = CsrMatrix.from_matrix(A)
+    counts = np.empty(0)
+    if worlds is not None:
+        _, component, counts = np.unique(worlds, return_inverse=True, return_counts=True)
+        component = component.reshape(-1)
+    if counts.size > 1 and np.array_equal(component[matrix.row_of_entries()], component[matrix.indices]):
+        order, L, d = _factor_components(matrix, positions, component, counts)
+    else:
+        order, L, d = factor_ldlt(matrix, positions)
     S = compute_lower_inverse(L, parent=_elimination_tree(L))
     perm_r = np.argsort(order).astype(np.int32)
     return FactorizedSystem(S=S, Dinv=1.0 / d, perm_r=perm_r, invperm_r=order.astype(np.int32))
@@ -943,6 +999,15 @@ class FBALinearSolver:
         self._DSb = wp.empty(n, dtype=wp.float64, device=self.device)
         self._SDSb = wp.empty(n, dtype=wp.float64, device=self.device)
         self._x_scalar = wp.empty(n, dtype=wp.float64, device=self.device)
+        self._factor_keys = tuple(self.__dict__)
+
+    def schur_view(self) -> FBALinearSolver:
+        """A solver of this factor, its options and its solve buffers with Schur rows of its own, for a second set of
+        rows built and applied beside this one's, such as those of other worlds."""
+        view = object.__new__(FBALinearSolver)
+        view.__dict__.update({key: self.__dict__[key] for key in self._factor_keys})
+        view._row_slots = view.W_sparse = view._W_pattern = None
+        return view
 
     def solve(self, b: wp.array[wp.vec3], x: wp.array[wp.vec3]) -> None:
         """Compute ``x[i] = A⁻¹ · b[i]`` component-wise.

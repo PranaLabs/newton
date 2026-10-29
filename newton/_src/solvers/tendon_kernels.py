@@ -3,8 +3,6 @@
 
 """Solver-neutral routed tendon geometry kernels."""
 
-from typing import Any
-
 import warp as wp
 
 from ..core.reset import reset_world_selected
@@ -115,20 +113,6 @@ def snapshot_tendon_guide_active(
     else:
         tendon_guide_active[guide_idx] = True
         tendon_guide_active_step[guide_idx] = True
-
-
-@wp.kernel(module="unique", enable_backward=False)
-def reset_tendon_state_array(
-    entity_world: wp.array[int],
-    world_mask: wp.array[wp.bool],
-    world_count: int,
-    initial: wp.array[Any],
-    current: wp.array[Any],
-):
-    """Restore selected rows of one mutable tendon-state array."""
-    index = wp.tid()
-    if reset_world_selected(entity_world[index], world_mask, world_count):
-        current[index] = initial[index]
 
 
 @wp.kernel

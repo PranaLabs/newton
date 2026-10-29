@@ -16,7 +16,27 @@
 # SolverFBA steps the shirt with the lite contact operator, accumulating its
 # contact forces over each step's iterations, and holds the grasped cloth.
 #
+# With --fully-coupled, an experiment: SolverFBA integrates the arms as
+# well, with their joints as constraints and their contacts with the shirt
+# in the same frictional solve with the full operator, so the shirt acts
+# back on them. Stable PD drives with gravity compensation and force
+# limits follow the IK targets, and the fingers pinch the shirt by friction
+# alone, with no held particles. The arms' shapes still do not collide with
+# the table or each other. The full operator keeps a dense block over the
+# contacted particles: at the default 6480 particles it ran out of memory,
+# dense and sparse, so the experiment runs on a coarser shirt, a resolution
+# tradeoff whose fold is not known to succeed.
+#
+# With --world-count N, N copies of the arms, table and shirt fold in
+# parallel worlds, stepped by one Featherstone and one SolverFBA, each
+# world with its own IK problem, measured heights and grasps; --action-noise
+# biases each world's arm joint targets by a fixed amount, so that the
+# worlds differ.
+#
 # Command: python -m newton.examples shirt_fold_fba
+# Parallel worlds: python -m newton.examples shirt_fold_fba --world-count 4 --action-noise 0.0001
+# Coarser shirt: python -m newton.examples shirt_fold_fba --cloth-edge-length 0.0222
+# Fully coupled: python -m newton.examples shirt_fold_fba --fully-coupled --cloth-edge-length 0.0222
 ###########################################################################
 
 import numpy as np
@@ -28,6 +48,14 @@ import newton.examples
 import newton.ik as ik
 import newton.usd
 import newton.utils
+from newton.examples.cloth.franka_fba_utils import (
+    ArmNoise,
+    JointDrive,
+    add_world_args,
+    joint_residual,
+    view_worlds,
+    world_args,
+)
 from newton.solvers import SolverFBA, SolverFeatherstone
 
 TABLE_TOP = 0.2  # [m]
@@ -69,6 +97,12 @@ SHOULDER, HEM_CORNER, SIDE_LINE = (0.24, -0.70), (0.21, -0.215), 0.12
 HEM_GRIP, HEM_LINE = (0.06, -0.20), -0.48
 # The hem fold's arc height as a share of its radius, and its duration [s].
 HEM_LIFT, HEM_ARC = 1.0, 4.0
+# With --fully-coupled: the rubber finger pads grip the shirt with a friction coefficient over the table's, and the
+# arms press them PRESS [m] into their contact distance; the fingers close to 0 where the plan closes them, and
+# stopped on the shirt over STOP [m], squeeze it with SQUEEZE [N] more as their command closes, within GRIP_FORCE [N].
+# The drives' natural frequencies [rad/s] keep stable at four substeps.
+PAD_MU, PRESS, STOP, SQUEEZE, GRIP_FORCE = 2.0, 0.002, 0.0015, 15.0, 20.0
+ARM_FREQUENCY, FINGER_FREQUENCY = 30.0, 450.0
 
 
 def rotation(axis, theta):
@@ -188,17 +222,30 @@ def shop_fold():
 class Example:
     def __init__(self, viewer, args):
         self.viewer = viewer
+        self.fully_coupled = getattr(args, "fully_coupled", False)
+        edge_length = float(getattr(args, "cloth_edge_length", 0.0111))
+        if not np.isfinite(edge_length) or edge_length <= 0.0:
+            raise ValueError(f"cloth_edge_length must be a positive length [m], got {edge_length}")
+        self.world_count, noise, spacing = world_args(args)
+        if self.fully_coupled and self.world_count > 1:
+            raise ValueError("--fully-coupled runs a single world")
         # Two substeps of 1/120 s: the lite operator takes a particle's mass alone for its response, which overstates
         # it more the longer the step; accumulating the contact forces over a step's iterations keeps the 6 mm layers
         # apart at this step.
-        self.frame_dt, self.sim_substeps = 1.0 / 60.0, 2
+        # The fully coupled drives push the arms with the forces of each step's start, which four substeps keep stable.
+        self.frame_dt, self.sim_substeps = 1.0 / 60.0, 4 if self.fully_coupled else 2
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
         self.plan = shop_fold()
 
-        builder = newton.ModelBuilder()
-        builder.default_shape_cfg.mu = 1.5
-        builder.default_shape_cfg.margin = SHAPE_MARGIN
+        def new_builder():
+            builder = newton.ModelBuilder()
+            builder.default_shape_cfg.mu = 1.5
+            builder.default_shape_cfg.margin = SHAPE_MARGIN
+            return builder
+
+        # One world's arms, table and shirt; parallel worlds replicate it in place and share the ground.
+        builder = template = new_builder()
         urdf = str(newton.utils.download_asset("franka_emika_panda") / "urdf" / "fr3_franka_hand.urdf")
         options = {
             "floating": False,
@@ -209,19 +256,20 @@ class Example:
         self.hands, self.fingers = [], []
         for x, y in BASES:
             face = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), np.pi if x > 0.0 else 0.0)
-            builder.add_urdf(urdf, xform=wp.transform((x, y, 0.0), face), **options)
-            builder.joint_q[-9:] = [*READY, OPEN, OPEN]
-            self.hands.append(builder.body_count - 3)
-            self.fingers.append(builder.joint_coord_count - 2)
+            template.add_urdf(urdf, xform=wp.transform((x, y, 0.0), face), **options)
+            template.joint_q[-9:] = [*READY, OPEN, OPEN]
+            self.hands.append(template.body_count - 3)
+            self.fingers.append(template.joint_coord_count - 2)
         table = wp.transform((0.0, -0.5, 0.5 * TABLE_TOP), wp.quat_identity())
-        builder.add_shape_box(-1, xform=table, hx=0.4, hy=0.4, hz=0.5 * TABLE_TOP, color=(0.5,) * 3, label="table")
-        # The shirt of example_cloth_franka in meters: the asset remeshed to even 1.1 cm edges, dropped from 22 cm
+        template.add_shape_box(-1, xform=table, hx=0.4, hy=0.4, hz=0.5 * TABLE_TOP, color=(0.5,) * 3, label="table")
+        # The shirt of example_cloth_franka in meters: the asset, in centimeters, remeshed to even edges of
+        # edge_length, 1.1 cm by default, dropped from 22 cm
         # over the table. Its rest pose is folded, so its bending holds no rest angle.
         stage = Usd.Stage.Open(newton.examples.get_asset("unisex_shirt.usd"))
         mesh = newton.utils.remesh_mesh(
-            newton.usd.get_mesh(stage.GetPrimAtPath("/root/shirt")), method="isotropic", edge_length=1.11
+            newton.usd.get_mesh(stage.GetPrimAtPath("/root/shirt")), method="isotropic", edge_length=100.0 * edge_length
         )
-        builder.add_cloth_mesh(
+        template.add_cloth_mesh(
             pos=wp.vec3(0.0, 0.70, 0.42),
             rot=wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), np.pi),
             scale=0.01,
@@ -234,6 +282,12 @@ class Example:
             edge_ke=1.5e-3,
             particle_radius=CLOTH_RADIUS,
         )
+        # strides of a world's bodies, joint coordinates and particles
+        self.bodies, self.coords = template.body_count, template.joint_coord_count
+        self.particles = template.particle_count
+        if self.world_count > 1:
+            builder = new_builder()
+            builder.replicate(template, self.world_count)
         builder.add_ground_plane()
         # The arms follow the IK and only the shirt's contacts are read: the shapes do not collide with each other.
         for k in range(builder.shape_count):
@@ -245,30 +299,61 @@ class Example:
             if b >= 0 and "finger" in str(self.model.body_label[b]):
                 margin[s] = 0.0
         self.model.shape_margin.assign(margin)
+        if self.fully_coupled:
+            mu = self.model.shape_material_mu.numpy()
+            mu[margin == 0.0] = PAD_MU
+            self.model.shape_material_mu.assign(mu)
         self.model.edge_rest_angle.zero_()
 
         # IK places the middle of each hand's fingertip pads, pointing down with the fingers closing along y, so that
-        # the hands' long sides face each other when they pass; each hand keeps the yaw it has in the ready pose.
-        self.ik_q = wp.array(self.model.joint_q, shape=(1, self.model.joint_coord_count))
-        self.pads = [ik.IKObjectivePosition(h, wp.vec3(0.0, 0.0, PAD), wp.zeros(1, wp.vec3)) for h in self.hands]
+        # the hands' long sides face each other when they pass; each hand keeps the yaw it has in the ready pose. Each
+        # world is one problem on one world's arms.
+        n = self.world_count
+        ik_model = self.model if n == 1 else template.finalize()
+        self.ik_q = wp.array(np.tile(ik_model.joint_q.numpy(), (n, 1)), dtype=wp.float32)
+        self.pads = [ik.IKObjectivePosition(h, wp.vec3(0.0, 0.0, PAD), wp.zeros(n, wp.vec3)) for h in self.hands]
         objectives = list(self.pads)
         for hand, (x, _) in zip(self.hands, BASES, strict=True):
             yaw = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), (np.pi if x > 0.0 else 0.0) - 0.25 * np.pi)
             down = wp.mul(yaw, wp.quat(1.0, 0.0, 0.0, 0.0))
             objectives.append(
-                ik.IKObjectiveRotation(hand, wp.quat_identity(), wp.array([wp.vec4(*down)], dtype=wp.vec4))
+                ik.IKObjectiveRotation(hand, wp.quat_identity(), wp.array([wp.vec4(*down)] * n, dtype=wp.vec4))
             )
-        objectives.append(ik.IKObjectiveJointLimit(self.model.joint_limit_lower, self.model.joint_limit_upper, 10.0))
-        self.ik = ik.IKSolver(self.model, 1, objectives, lambda_initial=0.1, jacobian_mode=ik.IKJacobianType.ANALYTIC)
-        self.heights, self.landing = {}, {}
-        self.ready_q, self.home_q = self.model.joint_q.numpy().copy(), None
+        objectives.append(ik.IKObjectiveJointLimit(ik_model.joint_limit_lower, ik_model.joint_limit_upper, 10.0))
+        self.ik = ik.IKSolver(ik_model, n, objectives, lambda_initial=0.1, jacobian_mode=ik.IKJacobianType.ANALYTIC)
+        self.noise = ArmNoise(ik_model, self.fingers, n, noise)
+        # per world: the measured heights of the key poses and the landings of the pinches, see height
+        self.heights, self.landing = [{} for _ in range(n)], [{} for _ in range(n)]
+        self.ready_q, self.home_q = ik_model.joint_q.numpy().copy(), None
         self.ik_graph = None  # (iterations, graph) of the IK step
-        self.model.joint_q.assign(self.key_pose(0.0, iterations=100))
+        self.model.joint_q.assign(self.key_pose(0.0, iterations=100, noise=False))
 
         self.state_0, self.state_1 = self.model.state(), self.model.state()
         self.control = self.model.control()
         self.joint_qd = wp.zeros_like(self.state_0.joint_qd)
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+        if self.fully_coupled:
+            self.init_fully_coupled()
+        else:
+            self.init_kinematic_arms()
+        self.pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=RADIUS)  # finds the table 2 RADIUS out
+        self.contacts = self.pipeline.contacts()
+        self.gravity = self.model.gravity.numpy()
+        # Per world and hand: the grasp, dragging the strip under the closing pads or holding the bulge between the
+        # closed ones, with its particles, numbered within the world, and their targets in the pad frame, or None.
+        self.held = [[None, None] for _ in range(n)]
+        self.pinched = []  # particles each pinch took, in any world
+        self.rows = None  # the pinched particles of all worlds and their targets in the last substep
+
+        self.viewer.set_model(self.model)
+        if n == 1:
+            self.viewer.set_camera(pos=wp.vec3(0.0, 0.2, 1.38), pitch=-59.0, yaw=-90.0)
+        else:
+            view_worlds(self.viewer, self.model, spacing, (0.0, -0.4, 0.0), 0.8, pitch=-60.0, yaw=-90.0)
+
+    def init_kinematic_arms(self):
+        """IK poses the arms and Featherstone moves them kinematically; SolverFBA steps the shirt with the lite contact
+        operator and holds the grasped cloth."""
         self.robot_solver = SolverFeatherstone(self.model, update_mass_matrix_interval=self.sim_substeps)
         self.solver = SolverFBA(
             self.model,
@@ -296,67 +381,93 @@ class Example:
             particle_topological_contact_filter_threshold=1,
             particle_rest_shape_contact_exclusion_radius=LAND_MARGIN,
         )
-        self.pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=RADIUS)  # finds the table 2 RADIUS out
-        self.contacts = self.pipeline.contacts()
-        self.gravity = self.model.gravity.numpy()
-        # Per hand: the grasp, dragging the strip under the closing pads or holding the bulge between the closed ones,
-        # with its particles and their targets in the pad frame, or None.
-        self.held = [None, None]
-        self.pinched = []  # particles each pinch took
-        self.rows = None  # the pinched particles and their targets in the last substep
 
-        self.viewer.set_model(self.model)
-        self.viewer.set_camera(pos=wp.vec3(0.0, 0.2, 1.38), pitch=-59.0, yaw=-90.0)
+    def init_fully_coupled(self):
+        """SolverFBA integrates the arms and the shirt; the joint drives follow the IK targets, apart from the measured
+        joints. Contacts on integrated bodies need the full operator, which takes the place of the lite operator's
+        accumulation."""
+        self.target = self.model.joint_q.numpy().astype(float)
+        finger = np.zeros(self.model.joint_dof_count, dtype=bool)
+        finger[[f + k for f in self.fingers for k in (0, 1)]] = True
+        limit = np.where(finger, GRIP_FORCE, self.model.joint_effort_limit.numpy())
+        self.drive = JointDrive(self.model, np.where(finger, FINGER_FREQUENCY, ARM_FREQUENCY), effort_limit=limit)
+        self.solver = SolverFBA(
+            self.model,
+            iterations=5,
+            stretching_model="arap",
+            nsn_schur_mode="full",
+            # the dense operator of the landing shirt's contacts takes several gigabytes
+            nsn_sparse_storage=True,
+            nsn_linear_iterations=10,
+            lambda_cap=200.0,
+            rayleigh_beta=3.0e-3,
+            rayleigh_corotated=True,
+            friction_anchors=True,
+            particle_enable_self_contact=True,
+            particle_self_contact_margin=LAND_MARGIN,
+            particle_self_contact_edge_edge=True,
+            particle_self_contact_edge_edge_ratio=1.0,
+            particle_topological_contact_filter_threshold=1,
+            particle_rest_shape_contact_exclusion_radius=LAND_MARGIN,
+        )
 
-    def top_near(self, xy):
-        """Height of the highest shirt particle within 1.5 cm of ``xy`` [m]."""
-        q = self.state_0.particle_q.numpy()
+    def world_particles(self, world):
+        """Positions of world ``world``'s shirt particles [m]."""
+        return self.state_0.particle_q[world * self.particles : (world + 1) * self.particles].numpy()
+
+    def top_near(self, world, xy):
+        """Height of world ``world``'s highest shirt particle within 1.5 cm of ``xy`` [m]."""
+        q = self.world_particles(world)
         near = np.linalg.norm(q[:, :2] - np.asarray(xy), axis=1) < 0.015
         return q[near, 2].max() if near.any() else TABLE_TOP + RADIUS
 
-    def height(self, ref):
-        """Pad-middle height of a measured key pose [m]."""
+    def height(self, world, ref):
+        """Pad-middle height of a measured key pose in world ``world`` [m]."""
+        landing = self.landing[world]
         if ref[0] == "land":
             _, i, hand = ref
-            if (i, hand) not in self.landing:  # nothing pinched: set the empty pads down as on the grip
-                self.landing[(i, hand)] = (self.top_near(self.plan.folds[i]["laid"][hand]), PAD_HALF_LENGTH + 0.002)
-            top, drop = self.landing[(i, hand)]
+            if (i, hand) not in landing:  # nothing pinched: set the empty pads down as on the grip
+                landing[(i, hand)] = (self.top_near(world, self.plan.folds[i]["laid"][hand]), PAD_HALF_LENGTH + 0.002)
+            top, drop = landing[(i, hand)]
             # the turned pinch's lowest particle a self-contact margin and 3 mm over the shirt there
             return top + FOLD_MARGIN + 0.003 + drop
         i, hand = ref
-        # the pads' lower edges 1 mm over the shirt's contact thickness against them
-        return self.top_near(self.plan.folds[i]["grips"][hand]) + CLOTH_RADIUS + 0.001 + PAD_HALF_LENGTH
+        # the pads' lower edges 1 mm over the shirt's contact thickness against them, or pressed into it when coupled
+        lift = -PRESS if self.fully_coupled else 0.001
+        return self.top_near(world, self.plan.folds[i]["grips"][hand]) + CLOTH_RADIUS + lift + PAD_HALF_LENGTH
 
-    def key_z(self, key):
-        ref = key[3]
+    def key_z(self, world, key):
+        ref, heights = key[3], self.heights[world]
         if ref is None:
             return key[4]
-        if ref not in self.heights:
-            self.heights[ref] = self.height(ref)
-        return self.heights[ref] + key[4]
+        if ref not in heights:
+            heights[ref] = self.height(world, ref)
+        return heights[ref] + key[4]
 
-    def hand_targets(self, t):
-        """Each hand's pad-middle target, finger position and pinch angle at time ``t``."""
+    def hand_targets(self, world, t):
+        """Each hand's pad-middle target, finger position and pinch angle in world ``world`` at time ``t``."""
         out = []
         for hand in range(2):
             a, b, s = self.plan.sample(hand, t)
-            za, zb = self.key_z(a), self.key_z(b)
+            za, zb = self.key_z(world, a), self.key_z(world, b)
             x, y, finger, theta = (a[k] + s * (b[k] - a[k]) for k in (1, 2, 5, 6))
             out.append(((x, y, za + s * (zb - za)), finger, theta))
         return out
 
-    def key_pose(self, t, iterations=8):
-        """Joint positions of both arms at time ``t``."""
-        targets = self.hand_targets(t)
+    def key_pose(self, t, iterations=8, noise=True):
+        """Joint positions of both arms of every world at time ``t``, with the worlds' action noise unless ``noise`` is
+        false, shape [world_count * joint_coord_count of a world]."""
+        targets = [self.hand_targets(w, t) for w in range(self.world_count)]
         if t > self.plan.home[0]:  # back to the ready pose in joint space, easing in and out
             if self.home_q is None:
-                self.home_q = self.ik_q.numpy()[0].copy()
+                self.home_q = self.ik_q.numpy().copy()
             s = min((t - self.plan.home[0]) / (self.plan.home[1] - self.plan.home[0]), 1.0)
             q = self.home_q + (0.5 - 0.5 * np.cos(np.pi * s)) * (self.ready_q - self.home_q)
-            self.ik_q.assign(q[None, :])
-            return q
-        for pads, (p, _, _) in zip(self.pads, targets, strict=True):
-            pads.set_target_position(0, wp.vec3(*p))
+            self.ik_q.assign(q)
+            return (self.noise(q) if noise else q).reshape(-1)
+        for w, world_targets in enumerate(targets):
+            for pads, (p, _, _) in zip(self.pads, world_targets, strict=True):
+                pads.set_target_position(w, wp.vec3(*p))
         if self.ik_q.device.is_cuda:
             if self.ik_graph is None or self.ik_graph[0] != iterations:
                 with wp.ScopedCapture(device=self.ik_q.device) as capture:
@@ -365,20 +476,24 @@ class Example:
             wp.capture_launch(self.ik_graph[1])
         else:
             self.ik.step(self.ik_q, self.ik_q, iterations=iterations)
-        q = self.ik_q.numpy()[0]
-        for f, (_, finger, _) in zip(self.fingers, targets, strict=True):
-            q[f : f + 2] = finger
-        return q
+        # a copy: the noise stays out of the IK's own state
+        q = self.ik_q.numpy().copy()
+        for w, world_targets in enumerate(targets):
+            for f, (_, finger, _) in zip(self.fingers, world_targets, strict=True):
+                # coupled fingers close to 0 where the plan closes them, and stop on the shirt
+                q[w, f : f + 2] = OPEN * (finger - CLOSED) / (OPEN - CLOSED) if self.fully_coupled else finger
+        return (self.noise(q) if noise else q).reshape(-1)
 
-    def pad_frame(self, state, hand):
-        """Middle of a hand's fingertip pads and their axes."""
-        X = wp.transform(*state.body_q.numpy()[self.hands[hand]])
+    def pad_frame(self, body_q, world, hand):
+        """Middle of the fingertip pads of a hand of world ``world`` and their axes, from the body poses ``body_q``."""
+        X = wp.transform(*body_q[self.hands[hand] + world * self.bodies])
         R = np.array(wp.quat_to_matrix(X.q)).reshape(3, 3)
         return np.array(X.p) + R @ np.array([0.0, 0.0, PAD]), R @ PAD_AXES
 
-    def start_drag(self, origin, axes, half_gap):
-        """The strip of the shirt's layers under and between the pads, with its place along the closing axis."""
-        x = self.state_0.particle_q.numpy()
+    def start_drag(self, world, origin, axes, half_gap):
+        """The strip of world ``world``'s shirt layers under and between the pads, with its place along the closing
+        axis."""
+        x = self.world_particles(world)
         local = (x - origin) @ axes
         depth = local[:, 2] - PAD_HALF_LENGTH  # below the pads' lower edges
         strip = (np.abs(local[:, 0]) <= half_gap + PAD_THICKNESS) & (np.abs(local[:, 1]) <= PAD_HALF_WIDTH)
@@ -398,11 +513,11 @@ class Example:
             "layer": layer,
         }
 
-    def start_hold(self, hand, i, origin, axes, half_gap, drag=None):
-        """Hold the bulge that the closed pads squeezed up between them as it stands, with a particle of each layer of
-        the strip that it leaves out, turning it with its fold."""
+    def start_hold(self, world, hand, i, origin, axes, half_gap, drag=None):
+        """Hold the bulge of world ``world``'s shirt that the closed pads squeezed up between them as it stands, with a
+        particle of each layer of the strip that it leaves out, turning it with its fold."""
         fold = self.plan.folds[i]
-        x = self.state_0.particle_q.numpy()
+        x = self.world_particles(world)
         local = (x - origin) @ axes
         between = (np.abs(local[:, 0]) <= half_gap + 0.002) & (np.abs(local[:, 1]) <= PAD_HALF_WIDTH + 0.004)
         between &= (local[:, 2] >= -BULGE_HEIGHT) & (local[:, 2] <= PAD_HALF_LENGTH + HOLD_DEPTH)
@@ -429,7 +544,7 @@ class Example:
         middle = held.mean(axis=0) if len(taken) else np.zeros(3)
         # turned half a circle about its middle, the pinch's lowest particle lies this far under the pads
         drop = 2.0 * middle[2] - held[:, 2].min() if len(taken) else PAD_HALF_LENGTH + 0.002
-        self.landing[(i, hand)] = (self.top_near(fold["laid"][hand]), drop)
+        self.landing[world][(i, hand)] = (self.top_near(world, fold["laid"][hand]), drop)
         self.pinched.append(len(taken))
         return {"phase": "hold", "taken": taken, "local": held, "middle": middle, "axis": axes.T @ fold["axes"][hand]}
 
@@ -437,38 +552,39 @@ class Example:
         """While a hand's fingers close at a grip, its pads drag the layers under them in, so that the cloth between
         them buckles up; once they are closed, hold that bulge at the pads, turning it with the fold, until they
         open."""
-        q, rows, drag_rows = self.state_1.joint_q.numpy(), [], []
+        q, rows, drag_rows, free = self.state_1.joint_q.numpy(), [], [], []
+        body_q, xy = self.state_1.body_q.numpy(), self.state_0.particle_q.numpy()[:, :2]
         i = self.plan.fold_at(self.sim_time)
-        targets = self.hand_targets(self.sim_time)
-        for hand, f in enumerate(self.fingers):
-            origin, axes = self.pad_frame(self.state_1, hand)
-            a, b, _ = self.plan.sample(hand, self.sim_time)
-            closing = b[5] < a[5]
-            held = self.held[hand]
-            if held is not None and held["phase"] == "hold" and q[f] > 0.5 * (OPEN + CLOSED):
-                held = None
-            if held is None and closing and i is not None and q[f] < OPEN - 5.0e-4:
-                held = self.start_drag(origin, axes, q[f])
-            if held is not None and held["phase"] == "drag" and q[f] < CLOSED + 1.0e-3:
-                held = self.start_hold(hand, i, origin, axes, q[f], drag=held)
-            self.held[hand] = held
-            if held is None:
-                continue
-            if held["phase"] == "drag":
-                # under a pad: with it; between the pads: shortened with the gap
-                u, g0, g = held["along"], held["gap"], q[f]
-                along = np.where(np.abs(u) >= g0, np.sign(u) * (np.abs(u) - g0 + g), u * g / g0)
-                drag_rows.append((held["taken"], np.tile(held["axis"], (len(u), 1)), origin @ held["axis"] + along))
-            else:
-                turn = rotation(held["axis"], targets[hand][2])
-                patch = held["middle"] + (held["local"] - held["middle"]) @ turn.T
-                rows.append((held["taken"], origin + patch @ axes.T))
-        free = []
-        for hand, held in enumerate(self.held):
-            if held is not None:
-                origin, _ = self.pad_frame(self.state_1, hand)
-                xy = self.state_0.particle_q.numpy()[:, :2]
-                free.append(np.flatnonzero(np.linalg.norm(xy - origin[:2], axis=1) < ANCHOR_FREE))
+        for w in range(self.world_count):
+            targets = self.hand_targets(w, self.sim_time)
+            first = w * self.particles  # of the world's particles in the model
+            for hand, finger in enumerate(self.fingers):
+                f = finger + w * self.coords
+                origin, axes = self.pad_frame(body_q, w, hand)
+                a, b, _ = self.plan.sample(hand, self.sim_time)
+                closing = b[5] < a[5]
+                held = self.held[w][hand]
+                if held is not None and held["phase"] == "hold" and q[f] > 0.5 * (OPEN + CLOSED):
+                    held = None
+                if held is None and closing and i is not None and q[f] < OPEN - 5.0e-4:
+                    held = self.start_drag(w, origin, axes, q[f])
+                if held is not None and held["phase"] == "drag" and q[f] < CLOSED + 1.0e-3:
+                    held = self.start_hold(w, hand, i, origin, axes, q[f], drag=held)
+                self.held[w][hand] = held
+                if held is None:
+                    continue
+                world_xy = xy[first : first + self.particles]
+                free.append(first + np.flatnonzero(np.linalg.norm(world_xy - origin[:2], axis=1) < ANCHOR_FREE))
+                if held["phase"] == "drag":
+                    # under a pad: with it; between the pads: shortened with the gap
+                    u, g0, g = held["along"], held["gap"], q[f]
+                    along = np.where(np.abs(u) >= g0, np.sign(u) * (np.abs(u) - g0 + g), u * g / g0)
+                    d = np.tile(held["axis"], (len(u), 1))
+                    drag_rows.append((first + held["taken"], d, origin @ held["axis"] + along))
+                else:
+                    turn = rotation(held["axis"], targets[hand][2])
+                    patch = held["middle"] + (held["local"] - held["middle"]) @ turn.T
+                    rows.append((first + held["taken"], origin + patch @ axes.T))
         self.solver.set_friction_anchor_exclusion(np.concatenate(free) if free else None)
         rows = [r for r in rows if len(r[0])]
         drag_rows = [r for r in drag_rows if len(r[0])]
@@ -502,6 +618,9 @@ class Example:
         if -0.5 * self.frame_dt <= thin * THIN_RAMP <= THIN_RAMP + 0.5 * self.frame_dt:
             margin = LAND_MARGIN + min(max(thin, 0.0), 1.0) * (FOLD_MARGIN - LAND_MARGIN)
             self.solver.set_particle_self_contact(margin=margin)
+        if self.fully_coupled:
+            self.step_fully_coupled()
+            return
         target = self.key_pose(self.sim_time + self.frame_dt)
         self.joint_qd.assign((target - self.state_0.joint_q.numpy()) / self.frame_dt)
         for _ in range(self.sim_substeps):
@@ -521,6 +640,27 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
             self.sim_time += self.sim_dt
 
+    def step_fully_coupled(self):
+        """SolverFBA steps the arms and the shirt together; the drives follow the joint targets, interpolated over the
+        frame, and fingers stopped on the shirt squeeze it."""
+        start, target = self.target, self.key_pose(self.sim_time + self.frame_dt)
+        velocity = (target - start) / self.frame_dt
+        closing = [float(np.clip(1.0 - target[f] / OPEN, 0.0, 1.0)) for f in self.fingers]
+        for k in range(self.sim_substeps):
+            self.state_0.clear_forces()
+            self.viewer.apply_forces(self.state_0)
+            q, _ = self.drive.measure(self.state_0)
+            squeeze = np.zeros_like(q)
+            for f, c in zip(self.fingers, closing, strict=True):
+                squeeze[f : f + 2] = np.where(q[f : f + 2] > STOP, -SQUEEZE * c, 0.0)
+            s = (k + 1) / self.sim_substeps
+            self.drive.apply(self.state_0, start + s * (target - start), velocity, self.sim_dt, squeeze)
+            self.pipeline.collide(self.state_0, self.contacts)
+            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+            self.state_0, self.state_1 = self.state_1, self.state_0
+            self.sim_time += self.sim_dt
+        self.target = target
+
     def test_post_step(self):
         x = self.state_0.particle_q.numpy()
         assert np.isfinite(x).all(), f"non-finite shirt positions at t={self.sim_time:.2f} s"
@@ -531,32 +671,58 @@ class Example:
         # every layer, press the lowest one for a few frames up to its radius under the top.
         low = x[:, 2].min() - TABLE_TOP
         assert low > -CLOTH_RADIUS, f"a particle is {-low * 1e3:.1f} mm under the table top at t={self.sim_time:.2f} s"
+        if self.fully_coupled:
+            gap, turn = joint_residual(self.model, self.state_0.body_q.numpy())
+            assert gap < 1.0e-3 and turn < 1.0e-2, (
+                f"joints {gap * 1e3:.2f} mm, {turn:.4f} rad off at t={self.sim_time:.2f} s"
+            )
+            fingers = self.drive.q[[f + k for f in self.fingers for k in (0, 1)]]
+            assert fingers.min() > -2.0e-3, f"fingers closed to {fingers.min() * 1e3:.1f} mm at t={self.sim_time:.2f} s"
         if self.rows is not None:
             off = np.linalg.norm(x[self.rows[0]] - self.rows[1], axis=1).max()
             assert off < 1.0e-3, f"a pinched particle is {off * 1e3:.2f} mm off at t={self.sim_time:.2f} s"
 
     def test_final(self):
-        x = self.state_0.particle_q.numpy()
         assert min(self.pinched, default=6) >= 6, f"the pinches took {self.pinched} particles"
         done = [self.sim_time >= f["t1"] + 1.0 for f in self.plan.folds]
-        if done[0]:
-            side = np.percentile(x[:, 0], 99)
-            assert side < SIDE_LINE + 0.05, f"the +x side reaches x = {side:.3f} m after its fold"
-        if done[1]:
-            side = np.percentile(x[:, 0], 1)
-            assert side > -SIDE_LINE - 0.05, f"the -x side reaches x = {side:.3f} m after its fold"
-        if done[2]:
-            hem = np.percentile(x[:, 1], 99)
-            assert hem < HEM_LINE + 0.05, f"the hem half reaches y = {hem:.3f} m after its fold"
+        for w in range(self.world_count):
+            x = self.world_particles(w)
+            if done[0]:
+                side = np.percentile(x[:, 0], 99)
+                assert side < SIDE_LINE + 0.05, f"the +x side reaches x = {side:.3f} m after its fold in world {w}"
+            if done[1]:
+                side = np.percentile(x[:, 0], 1)
+                assert side > -SIDE_LINE - 0.05, f"the -x side reaches x = {side:.3f} m after its fold in world {w}"
+            if done[2]:
+                hem = np.percentile(x[:, 1], 99)
+                assert hem < HEM_LINE + 0.05, f"the hem half reaches y = {hem:.3f} m after its fold in world {w}"
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
         self.viewer.end_frame()
 
+    @staticmethod
+    def create_parser():
+        parser = newton.examples.create_parser()
+        parser.set_defaults(num_frames=2250)
+        parser.add_argument(
+            "--fully-coupled",
+            action="store_true",
+            help="Integrate the arms in SolverFBA too, driven by force-limited joint drives, with friction-only pinches.",
+        )
+        parser.add_argument(
+            "--cloth-edge-length",
+            type=float,
+            default=0.0111,
+            help="Edge length [m] the shirt is remeshed to, for both modes. The full contact operator of "
+            "--fully-coupled runs out of memory at the default 6480 particles; 0.0222 gives a coarser shirt.",
+        )
+        add_world_args(parser)
+        return parser
+
 
 if __name__ == "__main__":
-    parser = newton.examples.create_parser()
-    parser.set_defaults(num_frames=2250)
+    parser = Example.create_parser()
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

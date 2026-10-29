@@ -38,8 +38,7 @@ held by other objects:
   solve, or rigid bodies come from another solver, such as an arm that
   :class:`~newton.solvers.SolverFeatherstone` integrates.
 
-Choose another solver for models with several worlds, for differentiable
-simulation, and for articulations that need joint limits, drives, or
+Choose another solver for differentiable simulation and for articulations that need joint limits, drives, or
 actuators: FBA treats joints as bilateral constraints only, so integrate such
 an articulation with another solver and pass
 ``integrate_with_external_rigid_solver=True``. See the :ref:`Supported
@@ -57,6 +56,81 @@ quadratic bending energy:
 
 Construction and Stepping
 -------------------------
+
+Parallel worlds
+^^^^^^^^^^^^^^^
+
+Build independent environments with :meth:`ModelBuilder.add_world` or
+:meth:`ModelBuilder.replicate`. Worlds may overlap spatially and have different
+geometry and contact counts. FBA filters self contacts by world and runs the
+contact linear solver with independent reductions, iteration budgets and
+stopping decisions for each world. Gravity uses the model's per-world values.
+For large batches, use ``nsn_sparse_storage=True`` with the full frictional
+operator to avoid storing a dense matrix across all environments. This does
+not share the prefactorization of repeated meshes; each replica retains its
+own system data.
+With several worlds, vertex-face and edge-edge self-contact queries search
+only their own world's triangles and edges, and vertex-vertex queries share one
+spatial hash across worlds. If particles change worlds, the queries search all
+worlds' geometry and filter by world. Contacts between distinct local worlds
+are always excluded.
+With several worlds, the particle system and the system of the integrated
+bodies factor one world at a time, each world's matrix whole with all of its
+components; a model of one world factors each system whole. A world whose
+particles touch an integrated body solves all of its particle contacts and
+particle constraint rows together with the body rows, while the other worlds
+keep the deformable contact solve that they take alone.
+Lite's exact particle constraints take at most 64 rows in each world: the
+rows of each world form their own Cholesky block, since the worlds do not
+couple. A model of one world takes its global and local particles' rows in
+one block, within one limit of 64 rows.
+
+Each world solves the same equations with the same algorithms and iteration
+rules as it would alone. Batching can still change floating-point results:
+the worlds' systems factor separately, reductions sum in a different order,
+and the choice among self-contact triangles at equal distances follows the
+query order. Batched runs therefore do not promise bitwise equality with
+separate runs or with earlier versions, and long nonlinear contact
+trajectories can amplify such differences.
+
+Particles and integrated dynamic bodies must belong to local worlds in a
+multi-world model. Elements, joints and particle constraint rows must not
+connect different worlds. Global static shapes, such as a shared ground
+plane, are supported. These are runtime solver rules on Newton's existing
+world metadata; no additional USD schema is required.
+
+Call ``solver.reset(state, world_mask=mask)`` to restore selected worlds'
+body and particle positions and velocities from the model defaults and clear
+their friction anchors and contact warm start. The boolean mask has
+``model.world_count + 1`` entries; the final entry selects global entities.
+Passing no mask resets all worlds.
+
+Use ``flags`` to select ``StateFlags.BODY_Q``, ``BODY_QD``, ``PARTICLE_Q``
+and ``PARTICLE_QD``. ``None`` restores all supported fields. After writing a
+custom initial state, pass ``flags=0`` to clear only solver history and retain
+that state. Missing state arrays are skipped. When an external solver
+integrates rigid bodies, FBA leaves their state unchanged. Joint-coordinate
+flags are ignored because FBA uses body coordinates; use :func:`eval_fk`
+after reset to initialize bodies from joint coordinates.
+
+Reset preserves external forces, control inputs, pin targets and particle
+constraint targets. Their owner must restore them as needed. Collision
+matching and actuator histories also retain their own reset interfaces:
+
+.. code-block:: python
+
+   solver.reset(state, world_mask=mask)
+   collision_pipeline.reset_contact_matching(world_mask=mask)
+   collision_pipeline.collide(state, contacts)
+
+If actuators are used, reset their :meth:`~newton.actuators.Actuator.State.reset`
+history with the corresponding actuator-entry selection. Its mask selects
+actuator entries, rather than worlds. Regenerate contacts after restoring or
+randomizing state and before the next simulation step. This reset is a
+runtime operation and requires no additional USD schema.
+
+Single step
+^^^^^^^^^^^
 
 Detect contacts with a :class:`~newton.CollisionPipeline` on the input state
 of each step and pass them to :meth:`~newton.solvers.SolverFBA.step`:
@@ -255,6 +329,17 @@ Examples
 - ``cloth_dual_franka_fba``: two Franka arms integrated by
   :class:`~newton.solvers.SolverFeatherstone` pinch the corners of a square
   towel and fold it twice into a square, with light Rayleigh mass damping.
+  With ``--fully-coupled``, an experiment: FBA integrates the arms too, with
+  force-limited joint drives built from body wrenches and friction-only
+  pinches, so the towel acts back on the arms; the pinches do not hold
+  reliably enough to complete the folds.
+  ``--world-count N`` folds N towels in parallel worlds, replicated in place
+  and spread out only in the viewer by ``--world-spacing``, with one
+  Featherstone and one FBA solver over all worlds and each world's own IK
+  problem, fold plan and grasps. ``--action-noise A`` [rad] adds to each
+  world's arm joint targets a fixed bias, drawn once per world and joint from
+  ``U(-A, A)`` with seed 42, clipped to the joint limits; it leaves the
+  fingers, the timing, the initial pose and the IK state unchanged.
 - ``shirt_pins_fba``, ``bunny_ears_fba``: two handles move a T-shirt by its
   shoulders, with self-contact and light Rayleigh stiffness damping, and a
   soft bunny by its ears.
@@ -263,6 +348,14 @@ Examples
   at two steps per frame with the lite operator accumulating its contact
   forces, a self-contact margin that thins after the landing, edge-edge
   contacts, friction anchors and corotated Rayleigh stiffness damping.
+  ``--fully-coupled`` integrates the arms in FBA as well, as for
+  ``cloth_dual_franka_fba``, with the full contact operator, whose dense
+  block over the contacted particles ran out of GPU memory for the default
+  6480-particle shirt, with and without ``nsn_sparse_storage``;
+  ``--cloth-edge-length 0.0222`` remeshes the shirt coarser in both modes for
+  an experimental comparison at matched resolution. ``--world-count``,
+  ``--world-spacing`` and ``--action-noise`` run parallel worlds as for
+  ``cloth_dual_franka_fba``.
 - ``softbody_cantilever_fba``: two soft cantilevers swing under gravity, one
   with Rayleigh damping.
 - ``pneunet_gripper_fba``: a three-finger PneuNet gripper whose chambers,

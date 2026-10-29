@@ -2124,7 +2124,8 @@ def particle_constraint_residual_kernel(
 @wp.kernel
 def held_row_update_kernel(
     rows: wp.array[wp.int32],
-    x: wp.array2d[wp.float64],  # (1, tile) Newton step of the rows, W^-1 r
+    slot: wp.array[wp.int32],  # entry of each row in x
+    x: wp.array[wp.float64],  # (blocks * tile) Newton step of the rows, W^-1 r, per world block
     dt: wp.float64,
     lam: wp.array[wp.float64],  # out, bilateral rows
     omega: wp.array[wp.float64],  # out, bilateral rows
@@ -2133,26 +2134,35 @@ def held_row_update_kernel(
     """Multipliers of the bilateral rows that hold particles at points, from their Newton step ``x``."""
     k = wp.tid()
     r = rows[k]
-    lam_apply[r] = x[0, k]
-    lam[r] = x[0, k] / (dt * dt)
+    lam_apply[r] = x[slot[k]]
+    lam[r] = x[slot[k]] / (dt * dt)
     omega[r] = wp.float64(1.0)
 
 
 @wp.kernel
 def held_row_correction_kernel(
-    rows: wp.array[wp.int32],
-    column: wp.array[wp.int32],  # column of A^-1 at the particle of each row
+    particle_block: wp.array[wp.int32],  # block of each particle, -1 for none
+    particle_local: wp.array[wp.int32],  # place of each particle among its block's
+    row_start: wp.array[wp.int32],  # (blocks + 1) first row of each block
+    column_start: wp.array[wp.int32],  # first entry of each block's columns in response
+    block_particles: wp.array[wp.int32],  # particles of each block, the length of its columns
+    column: wp.array[wp.int32],  # column of each row among its block's held particles
+    response: wp.array[wp.float64],  # columns of A^-1 at each block's held particles, over its particles
     coefficient: wp.array[wp.float64],
     direction: wp.array[wp.vec3d],
-    columns: wp.array2d[wp.float64],  # (U, N) columns of A^-1 at the held particles
-    x: wp.array2d[wp.float64],  # (1, tile) multipliers of the rows
+    slot: wp.array[wp.int32],  # entry of each row in x
+    x: wp.array[wp.float64],  # (blocks * tile) multipliers of the rows, per world block
     q: wp.array[wp.vec3],  # inout
 ):
-    """``q += A^-1 J^T x`` for the rows that hold particles at points, by the columns of ``A^-1``."""
+    """``q += A^-1 J^T x`` for the rows that hold particles at points, by the columns of ``A^-1`` of the rows of
+    each particle's block, in the order of the rows."""
     i = wp.tid()
     dq = wp.vec3d(0.0)
-    for k in range(rows.shape[0]):
-        dq += columns[column[k], i] * coefficient[k] * x[0, k] * direction[k]
+    b = particle_block[i]
+    if b >= 0:
+        base = column_start[b] + particle_local[i]
+        for k in range(row_start[b], row_start[b + 1]):
+            dq += response[base + column[k] * block_particles[b]] * coefficient[k] * x[slot[k]] * direction[k]
     q[i] = q[i] + wp.vec3(dq)
 
 
@@ -3018,15 +3028,20 @@ def held_contact_law_kernel(
 @wp.kernel
 def scale_diagonal_kernel(
     scale: wp.float64,
+    contact_scale: wp.array[wp.float64],
     a: wp.array2d[wp.float64],  # inout
 ):
     """``a[i, i] *= scale`` on the launched rows."""
     i = wp.tid()
-    a[i, i] = a[i, i] * scale
+    gain = scale
+    if contact_scale.shape[0] > 0:
+        gain = contact_scale[i // 3]
+    a[i, i] = a[i, i] * gain
 
 
 @wp.kernel
 def fb_newton_lite_coulomb_kernel(
+    contacts: wp.array[wp.int32],  # optional subset; empty processes every contact
     # ---- contact metadata (M entries each) ----
     contact_particle: wp.array[wp.int32],  # (M,)
     contact_normal: wp.array[wp.vec3],  # (M,)
@@ -3084,6 +3099,8 @@ def fb_newton_lite_coulomb_kernel(
         lam_apply: Output per-row impulse to apply to ``x_cur``, length ``3M``.
     """
     c = wp.tid()
+    if contacts.shape[0]:
+        c = contacts[c]
     p = contact_particle[c]
     inv_m = inv_mass[p]
     dt2 = dt * dt
@@ -3424,6 +3441,7 @@ def build_a_schur_csr_kernel(
     compliance: wp.array[wp.float64],
     regularized: int,
     scale: wp.float64,
+    contact_scale: wp.array[wp.float64],
     # outputs
     a_values: wp.array[wp.float64],
 ):
@@ -3437,7 +3455,10 @@ def build_a_schur_csr_kernel(
     if i == j:
         a = a + compliance[i]
         if i < regularized:
-            a = a * scale
+            gain = scale
+            if contact_scale.shape[0] > 0:
+                gain = contact_scale[i // 3]
+            a = a * gain
     a_values[k] = a
 
 
@@ -3536,6 +3557,26 @@ def compute_omega_times_lam_kernel(
 # ``mat12`` is the largest type we materialise per thread.
 _MAX_KP_PER_PARTICLE = wp.constant(4)
 _MAX_ROWS_PER_PARTICLE = wp.constant(12)  # 3 · _MAX_KP_PER_PARTICLE
+
+
+@wp.kernel
+def restore_lite_direct_rows_kernel(
+    rows: wp.array[wp.int32],
+    initial_lam: wp.array[wp.float64],
+    initial_omega: wp.array[wp.float64],
+    lam: wp.array[wp.float64],
+    omega: wp.array[wp.float64],
+):
+    r = rows[wp.tid()]
+    lam[r] = initial_lam[r]
+    omega[r] = initial_omega[r]
+
+
+@wp.kernel
+def clear_lite_direct_displacement_kernel(particles: wp.array[wp.int32], displacement: wp.array[wp.vec3]):
+    displacement[particles[wp.tid()]] = wp.vec3(0.0)
+
+
 _MAT12_F64 = wp.types.matrix((12, 12), wp.float64)
 _VEC12_F64 = wp.types.vector(12, wp.float64)
 
@@ -3996,6 +4037,8 @@ def friction_anchor_apply_kernel(
     previous_point: wp.array[wp.vec3],  # their anchors
     previous_pressed: wp.array[wp.int32],  # 1 where the contact pressed
     previous_count: wp.int32,
+    particle_world: wp.array[wp.int32],
+    two_way_world: wp.array[wp.int32],
     # outputs
     t1_offset: wp.array[wp.float64],  # (M,) inout
     t2_offset: wp.array[wp.float64],  # (M,) inout
@@ -4024,6 +4067,12 @@ def friction_anchor_apply_kernel(
     first = wp.int32(-1)
     if has_extra != 0:
         first = extra_particle[c, 0]
+    if two_way_world.shape[0] > 0:
+        if two_way_world[particle_world[p]] != 0:
+            # Plain keys precede the face/self-contact sentinels and must stay sorted for binary search.
+            if first < 0:
+                key[c] = wp.int64(p) * (shape_count + wp.int64(1)) + wp.int64(s + 1)
+            return
     offset = wp.vec3(0.0)
     reach = float(0.0)
     found = wp.int32(0)
@@ -4108,6 +4157,8 @@ def friction_anchor_update_kernel(
     anchored: wp.array[wp.int32],  # (M,) from the apply kernel
     key: wp.array[wp.int64],  # (M,)
     point: wp.array[wp.vec3],  # (M,)
+    particle_world: wp.array[wp.int32],
+    two_way_world: wp.array[wp.int32],
     # outputs
     anchor_triangle: wp.array[wp.vec3i],  # (N,)
     anchor_bary: wp.array[wp.vec3],  # (N,)
@@ -4136,6 +4187,9 @@ def friction_anchor_update_kernel(
     next_key[c] = key[c]
     next_point[c] = point[c]
     next_pressed[c] = 0
+    if two_way_world.shape[0] > 0:
+        if two_way_world[particle_world[p]] != 0:
+            return
     first = wp.int32(-1)
     if has_extra != 0:
         first = extra_particle[c, 0]

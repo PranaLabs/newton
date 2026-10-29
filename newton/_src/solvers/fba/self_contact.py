@@ -8,12 +8,14 @@ from __future__ import annotations
 import numpy as np
 import warp as wp
 
+from ...geometry.bvh import compute_bvh_group_roots
 from ...geometry.kernels import compute_tri_aabbs, triangle_closest_point
 from ...sim import Model
 from .kernels import host_head
 
 # Threads that share the candidate triangles of one particle.
 _LANES = wp.constant(32)
+_INF = wp.constant(float("inf"))
 
 
 @wp.func
@@ -34,10 +36,46 @@ def _in_ring(ring_offsets: wp.array[wp.int32], ring: wp.array[wp.int32], v: wp.i
 
 
 @wp.kernel
+def traversal_rank_kernel(bvh: wp.uint64, rank: wp.array[wp.int32]):
+    """The place of each item in a query of the whole of ``bvh``. A query box only prunes the traversal, so these
+    order the items of any query of ``bvh`` as that query does."""
+    query = wp.bvh_query_aabb(bvh, wp.vec3(-_INF), wp.vec3(_INF))
+    t = wp.int32(0)
+    k = wp.int32(0)
+    while wp.bvh_query_next(query, t):
+        rank[t] = k
+        k += 1
+
+
+@wp.kernel
+def world_changed_kernel(world: wp.array[wp.int32], initial: wp.array[wp.int32], changed: wp.array[wp.int32]):
+    """Set ``changed[0]`` where a particle's world differs from its world when the trees were grouped."""
+    i = wp.tid()
+    if world[i] != initial[i]:
+        wp.atomic_max(changed, 0, 1)
+
+
+@wp.func
+def _query_root(roots: wp.array[wp.int32], changed: wp.array[wp.int32], world: wp.int32) -> wp.int32:
+    """The root of the tree of ``world`` in a tree grouped by world, ``-2`` where it has none, or the root of the
+    whole tree, ``-1``, without groups or once a particle changed its world."""
+    if roots.shape[0] == 0 or changed[0] != 0:
+        return -1
+    root = roots[world]
+    if root < 0:
+        return -2
+    return root
+
+
+@wp.kernel
 def triangle_candidates_kernel(
     q: wp.array[wp.vec3],
+    world: wp.array[wp.int32],
+    triangles: wp.array2d[wp.int32],
     query_mask: wp.array[wp.int32],
     bvh: wp.uint64,
+    roots: wp.array[wp.int32],
+    changed: wp.array[wp.int32],
     query_radius: float,
     candidates: wp.array2d[wp.int32],
     candidate_count: wp.array[wp.int32],
@@ -45,17 +83,21 @@ def triangle_candidates_kernel(
 ):
     """The triangles whose bounds come within ``query_radius`` of each particle along every axis, in the order of the
     query, as many as fit; ``count[1]`` takes the most of any particle, and a particle outside ``query_mask`` none.
-    The search runs apart from the tests of :func:`vertex_face_contacts_kernel`, whose registers would otherwise spill
-    in its loop."""
+    With ``roots`` of a tree grouped by world, each particle searches its own world's tree only, while no particle has
+    changed its world. The search runs apart from the tests of :func:`vertex_face_contacts_kernel`, whose registers
+    would otherwise spill in its loop."""
     v = wp.tid()
-    if query_mask[v] == 0:
+    root = _query_root(roots, changed, world[v])
+    if query_mask[v] == 0 or root == -2:
         candidate_count[v] = 0
         return
     p = q[v]
-    query = wp.bvh_query_aabb(bvh, p - wp.vec3(query_radius), p + wp.vec3(query_radius))
+    query = wp.bvh_query_aabb(bvh, p - wp.vec3(query_radius), p + wp.vec3(query_radius), root)
     t = wp.int32(0)
     k = wp.int32(0)
     while wp.bvh_query_next(query, t):
+        if world[v] >= 0 and world[triangles[t, 0]] >= 0 and world[v] != world[triangles[t, 0]]:
+            continue
         if k < candidates.shape[1]:
             candidates[v, k] = t
         k += 1
@@ -69,6 +111,7 @@ def vertex_face_contacts_kernel(
     tri_indices: wp.array2d[wp.int32],
     candidates: wp.array2d[wp.int32],
     candidate_count: wp.array[wp.int32],
+    traversal_rank: wp.array[wp.int32],
     ring_offsets: wp.array[wp.int32],
     ring: wp.array[wp.int32],
     rest: wp.array[wp.vec3],
@@ -87,8 +130,8 @@ def vertex_face_contacts_kernel(
     nearest_distance: wp.array[float],
 ):
     """The nearest triangle of each particle within ``query_radius``, outside its rings and ``rest_radius`` from it
-    at rest, the first of equals among its candidates, in the particle's slot; ``found`` marks the particles
-    that have one. The threads of a block, ``_LANES`` on CUDA and one on the CPU, take the candidates
+    at rest, the first of equals among its candidates, or of least ``traversal_rank`` where given, in the particle's
+    slot; ``found`` marks the particles that have one. The threads of a block, ``_LANES`` on CUDA and one on the CPU, take the candidates
     of one particle in turn, and test the rings and rest distance of only those nearer than their nearest yet.
 
     With ``has_groups``, a particle and a triangle of two groups keep ``margin`` apart, and of one group the group's
@@ -119,7 +162,12 @@ def vertex_face_contacts_kernel(
                 if pair <= 0.0:
                     continue
             key = d - pair
-        if key >= best:
+        # The first of equals: a candidate's place in the query, or its rank in the query of the tree before it was
+        # grouped, which orders the candidates of every query alike. An equal of the threshold never counts.
+        priority = k
+        if traversal_rank.shape[0] > 0:
+            priority = traversal_rank[t]
+        if key > best or (key == best and (best_t < 0 or priority >= best_k)):
             continue
         if (
             _in_ring(ring_offsets, ring, v, a)
@@ -132,7 +180,7 @@ def vertex_face_contacts_kernel(
             if wp.length(rest[v] - rest_point) < rest_radius:
                 continue
         best = key
-        best_k = k
+        best_k = priority
         best_t = t
         best_bary = bary
         best_point = point
@@ -183,6 +231,7 @@ def compact_contacts_kernel(
 @wp.kernel
 def vertex_vertex_contacts_kernel(
     q: wp.array[wp.vec3],
+    world: wp.array[wp.int32],
     grid: wp.uint64,
     ring_offsets: wp.array[wp.int32],
     ring: wp.array[wp.int32],
@@ -201,6 +250,8 @@ def vertex_vertex_contacts_kernel(
     query = wp.hash_grid_query(grid, p, query_radius)
     b = int(0)
     while wp.hash_grid_query_next(query, b):
+        if world[a] >= 0 and world[b] >= 0 and world[a] != world[b]:
+            continue
         if b <= a or _in_ring(ring_offsets, ring, a, b) or wp.length(rest[a] - rest[b]) < rest_radius:
             continue
         d = wp.length(p - q[b])
@@ -238,8 +289,11 @@ def edge_bounds_kernel(
 @wp.kernel
 def edge_edge_contacts_kernel(
     q: wp.array[wp.vec3],
+    world: wp.array[wp.int32],
     edges: wp.array[wp.vec2i],
     bvh: wp.uint64,
+    roots: wp.array[wp.int32],
+    changed: wp.array[wp.int32],
     ring_offsets: wp.array[wp.int32],
     ring: wp.array[wp.int32],
     rest: wp.array[wp.vec3],
@@ -265,7 +319,11 @@ def edge_edge_contacts_kernel(
     reach_a = wp.min(nearest_distance[a0], nearest_distance[a1])
     # Edges shorter than a thousandth of the query radius count as points.
     eps = 1.0e-6 * query_radius * query_radius
-    query = wp.bvh_query_aabb(bvh, wp.min(pa0, pa1) - wp.vec3(query_radius), wp.max(pa0, pa1) + wp.vec3(query_radius))
+    root = _query_root(roots, changed, world[a0])
+    if root == -2:
+        return
+    lower = wp.min(pa0, pa1) - wp.vec3(query_radius)
+    query = wp.bvh_query_aabb(bvh, lower, wp.max(pa0, pa1) + wp.vec3(query_radius), root)
     eb = wp.int32(0)
     # The cheap geometric tests reject most of the candidates first; the ring and rest tests run on the few left.
     while wp.bvh_query_next(query, eb):
@@ -273,6 +331,8 @@ def edge_edge_contacts_kernel(
             continue
         b0 = edges[eb][0]
         b1 = edges[eb][1]
+        if world[a0] >= 0 and world[b0] >= 0 and world[a0] != world[b0]:
+            continue
         pb0 = q[b0]
         pb1 = q[b1]
         st = wp.closest_point_edge_edge(pa0, pa1, pb0, pb1, eps)
@@ -411,6 +471,14 @@ class SelfContact:
         if edge_edge and mode != "vertex_face":
             raise ValueError("edge-edge self contacts need mode='vertex_face'")
         self.mode, self.query_radius, self.device = mode, float(query_radius), model.device
+        self.world = model.particle_world
+        # Several worlds of local particles search their own world's trees, while the particles keep their worlds.
+        self._world_h = self.world.numpy()
+        grouped = mode == "vertex_face" and model.world_count > 1 and model.tri_count > 0
+        grouped = grouped and bool((self._world_h >= 0).all())
+        self.initial_world = wp.clone(self.world) if grouped else None
+        self.world_changed = wp.zeros(1, dtype=wp.int32, device=self.device)
+        self.traversal_rank = self.roots = self.edge_roots = wp.empty(0, dtype=wp.int32, device=self.device)
         self.rest, self.rest_radius = wp.clone(model.particle_q), float(rest_radius)
         triangles = model.tri_indices.numpy()
         tets = model.tet_indices.numpy().reshape(-1, 4) if model.tet_count else None
@@ -428,6 +496,13 @@ class SelfContact:
             self.upper = wp.zeros(model.tri_count, dtype=wp.vec3, device=self.device)
             self._bounds(model.particle_q)
             self.bvh = wp.Bvh(self.lower, self.upper)
+            if grouped:
+                # Rank the triangles in the order of the tree of all of them, then search each world's own tree,
+                # breaking ties in that order, so that every particle takes the triangle it took before.
+                self.traversal_rank = wp.empty(model.tri_count, dtype=wp.int32, device=self.device)
+                wp.launch(traversal_rank_kernel, 1, [self.bvh.id], [self.traversal_rank], device=self.device)
+                wp.synchronize_device(self.device)
+                self.bvh, self.roots = self._grouped_bvh(self.lower, self.upper, triangles[:, 0], model.world_count)
             self.candidates = wp.empty((model.particle_count, 64), dtype=wp.int32, device=self.device)
             self.candidate_count = wp.empty(model.particle_count, dtype=wp.int32, device=self.device)
             # Particles with a contact, their places among the contacts, and the contacts in that order.
@@ -457,9 +532,24 @@ class SelfContact:
             inputs = [model.particle_q, self.edges]
             wp.launch(edge_bounds_kernel, n_edges, inputs, [self.edge_lower, self.edge_upper], device=self.device)
             self.edge_bvh = wp.Bvh(self.edge_lower, self.edge_upper)
+            if grouped:
+                # The edge contacts sort by their edge pairs, so the order of the query does not matter.
+                edges0 = self.edges.numpy()[:, 0]
+                self.edge_bvh, self.edge_roots = self._grouped_bvh(
+                    self.edge_lower, self.edge_upper, edges0, model.world_count
+                )
             self.edge_contact_count = wp.zeros(1, dtype=wp.int32, device=self.device)
             self.edge_edge_ratio = float(edge_edge_ratio)
             self._allocate_edge_contacts(n_edges)
+
+    def _grouped_bvh(self, lower: wp.array, upper: wp.array, particles: np.ndarray, world_count: int) -> tuple:
+        """A tree of the items with ``lower`` and ``upper`` bounds grouped by the world of their ``particles``, and
+        the root of each world's tree, -1 where a world has no items."""
+        groups = wp.array(self._world_h[particles], dtype=wp.int32, device=self.device)
+        bvh = wp.Bvh(lower, upper, groups=groups)
+        roots = wp.empty(world_count, dtype=wp.int32, device=self.device)
+        wp.launch(compute_bvh_group_roots, world_count, [bvh.id], [roots], device=self.device)
+        return bvh, roots
 
     def set_groups(self, groups: np.ndarray, group_margins: np.ndarray | None, margin: float, gap: float) -> None:
         """Keep a particle and a triangle of two groups ``margin`` apart and of one group ``group_margins[group]``,
@@ -521,7 +611,18 @@ class SelfContact:
         self.edge_bvh.refit()
         while True:
             self.edge_contact_count.zero_()
-            inputs = [q, self.edges, self.edge_bvh.id, self.ring_offsets, self.ring, self.rest, self.rest_radius]
+            inputs = [
+                q,
+                self.world,
+                self.edges,
+                self.edge_bvh.id,
+                self.edge_roots,
+                self.world_changed,
+                self.ring_offsets,
+                self.ring,
+                self.rest,
+                self.rest_radius,
+            ]
             inputs += [self.query_radius, self.nearest_distance, self.edge_edge_ratio]
             outputs = [self.edge_contact_count, self.edge_keys, self.edge_particles, self.edge_alpha, self.edge_normal]
             wp.launch(edge_edge_contacts_kernel, n_edges, inputs, outputs, device=self.device)
@@ -563,6 +664,11 @@ class SelfContact:
         if self.mode == "vertex_face":
             self._bounds(q)
             self.bvh.refit()
+            if self.initial_world is not None:
+                # A particle that changed its world searches the whole tree, by the same ranks.
+                self.world_changed.zero_()
+                inputs = [self.world, self.initial_world]
+                wp.launch(world_changed_kernel, self.world.shape[0], inputs, [self.world_changed], device=self.device)
         else:
             self.grid.build(q, self.query_radius)
         while True:
@@ -571,13 +677,14 @@ class SelfContact:
             filters = [self.ring_offsets, self.ring, self.rest, self.rest_radius, self.query_radius]
             if self.mode == "vertex_face":
                 found = [self.candidates, self.candidate_count]
-                inputs = [q, self.query_mask, self.bvh.id, self.query_radius]
+                inputs = [q, self.world, self.tri_indices, self.query_mask, self.bvh.id, self.roots, self.world_changed]
+                inputs.append(self.query_radius)
                 wp.launch(triangle_candidates_kernel, q.shape[0], inputs, [*found, self.count], device=self.device)
                 groups = [self.groups, self.group_margins, self.margin, self.gap, 1]
                 if self.groups is None:
                     empty = (wp.empty(1, dtype=t, device=self.device) for t in (wp.int32, wp.float32))
                     groups = [*empty, 0.0, 0.0, 0]
-                inputs = [q, self.tri_indices, *found, *filters, *groups]
+                inputs = [q, self.tri_indices, *found, self.traversal_rank, *filters, *groups]
                 kernel, outputs = vertex_face_contacts_kernel, [*outputs, self.found, self.nearest_distance]
                 wp.launch_tiled(
                     kernel, dim=[q.shape[0]], inputs=inputs, outputs=outputs, block_dim=_LANES, device=self.device
@@ -587,7 +694,7 @@ class SelfContact:
                 outputs = [self.found_particles, self.found_alpha, self.found_normal]
                 wp.launch(compact_contacts_kernel, q.shape[0], inputs, outputs, device=self.device)
             else:
-                inputs = [q, self.grid.id, *filters]
+                inputs = [q, self.world, self.grid.id, *filters]
                 wp.launch(vertex_vertex_contacts_kernel, q.shape[0], inputs, outputs, device=self.device)
             n, most = (int(x) for x in self.count.numpy())
             if self.mode == "vertex_face" and most > self.candidates.shape[1]:
