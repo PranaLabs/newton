@@ -288,7 +288,7 @@ are still in the package; `python -m newton.examples --list` lists them all.
 ### Performance
 
 Mean time per frame of each example over the frames of its test run, after 10 warm-up frames, without rendering
-(`--viewer null`), on one NVIDIA GeForce RTX 5090, at `ziqiu/fba-solver` `1902ddf0`. Real time is the simulated
+(`--viewer null`), on one NVIDIA GeForce RTX 5090, with the code of `fa512ee5`, which differs from this branch only in the README. Real time is the simulated
 time per wall-clock time. The claw machine is timed over its first 300 frames, while the toys fall and settle.
 
 | Example | Particles | Triangles | Tetrahedra | Frame | ms per frame | Real time |
