@@ -1,53 +1,111 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-![GitHub commit activity](https://img.shields.io/github/commit-activity/m/newton-physics/newton/main)
-[![Downloads](https://api.pepy.tech/badge/newton/month)](https://pepy.tech/projects/newton)
-[![codecov](https://codecov.io/gh/newton-physics/newton/graph/badge.svg?token=V6ZXNPAWVG)](https://codecov.io/gh/newton-physics/newton)
-[![Push - AWS GPU](https://github.com/newton-physics/newton/actions/workflows/push_aws_gpu.yml/badge.svg)](https://github.com/newton-physics/newton/actions/workflows/push_aws_gpu.yml)
 
-# Newton
+# Newton with SolverFBA
 
-Newton is a GPU-accelerated physics simulation engine built upon [NVIDIA Warp](https://github.com/NVIDIA/warp), specifically targeting roboticists and simulation researchers.
+This branch of [Newton](https://github.com/newton-physics/newton) adds `SolverFBA`, a solver for cloth and
+volumetric soft bodies with robust frictional contact, after the paper
+[*Fast But Accurate: A Real-Time Hyperelastic Simulator with Robust Frictional Contact*](https://doi.org/10.1145/3730834)
+(ACM Transactions on Graphics 44(4), 2025). It is based on Newton `main` at
+[`b09a2214`](https://github.com/newton-physics/newton/commit/b09a22143be8015d18491e1df5d3fc147add791d)
+(2026-05-14); everything outside `SolverFBA` and its examples is upstream Newton.
 
-Newton extends and generalizes Warp's ([deprecated](https://github.com/NVIDIA/warp/discussions/735)) `warp.sim` module, and integrates
-[MuJoCo Warp](https://github.com/google-deepmind/mujoco_warp) as its primary backend. Newton emphasizes GPU-based computation, [OpenUSD](https://openusd.org/) support, differentiability, and user-defined extensibility, facilitating rapid iteration and scalable robotics simulation.
+<p align="center">
+  <img width="960" src="https://github.com/PranaLabs/newton/releases/download/fba-media/fba_examples.gif" alt="SolverFBA examples">
+  <br>
+  <sub>Clockwise from top left: <code>cloth_dual_franka_fba</code> (1.65x speed), <code>shirt_fold_fba</code> (3.75x),
+  <code>pneunet_gripper_fba</code> (1.1x), <code>cloth_on_knives_fba</code> (0.5x). Rendered with Newton's OpenGL viewer.</sub>
+</p>
 
-Newton is a [Linux Foundation](https://www.linuxfoundation.org/) project that is community-built and maintained. Code is licensed under [Apache-2.0](https://github.com/newton-physics/newton/blob/main/LICENSE.md). Documentation is licensed under [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/). Additional and third-party license texts are available in [`newton/licenses`](https://github.com/newton-physics/newton/tree/main/newton/licenses).
+## SolverFBA
 
-Newton was initiated by [Disney Research](https://www.disneyresearch.com/), [Google DeepMind](https://deepmind.google/), and [NVIDIA](https://www.nvidia.com/).
+`SolverFBA` steps the elastic bodies with projective dynamics: each step runs a fixed number of local-global
+iterations, the local phase projects every element onto its constraint set, and the global phase solves with a
+system matrix that is factored once. Contacts are complementarity conditions: each iteration takes one semismooth
+Newton step of the contact and constraint multipliers, so contacts do not penetrate and need no contact stiffness.
+
+- **Cloth**: ARAP, corotational, or Neo-Hookean stretching and isometric bending.
+- **Soft bodies**: tetrahedra with the same stretching models; tetrahedron activations grow or shrink them, as the
+  chambers of a pneumatic actuator lengthen.
+- **Frictional contact**: particle and face contacts on shapes, cloth self-contact with vertex-face and edge-edge
+  contacts, friction anchors that keep stacked layers from creeping apart, and a contact warm start.
+- **Damping**: implicit Rayleigh damping, per particle if needed.
+- **Constraints**: pinned particles with moving targets, and rows that hold lengths or linear combinations of
+  particle positions, such as cables through a soft body or the cloth a gripper holds.
+- **Rigid bodies**: rigid bodies with bilateral joints, or bodies that another Newton solver integrates.
+- **Devices**: CUDA and CPU.
+
+`SolverFBA` is experimental: its API and behavior may change. The
+[FBA solver guide](https://pranalabs.github.io/newton/fba/solvers/fba.html) covers its inputs, contact options, and limitations, and the
+[API reference](https://pranalabs.github.io/newton/fba/api/_generated/newton.solvers.SolverFBA.html) its parameters.
 
 ## Requirements
 
 - **Python** 3.10+
 - **OS:** Linux (x86-64, aarch64), Windows (x86-64), or macOS (CPU only)
-- **GPU:** Fresh installs currently select Warp 1.18, which requires an NVIDIA Turing GPU (compute capability 7.5+) and driver R580+ for CUDA acceleration.
-  On an R545–R579 driver or an older supported GPU, install with `warp-lang==1.17.0` (see the installation guide).
-  No local CUDA Toolkit is required; macOS runs on CPU.
+- **GPU:** Warp 1.18, which requires an NVIDIA Turing GPU (compute capability 7.5+) and driver R580+ for CUDA
+  acceleration. No local CUDA Toolkit is required; macOS runs on CPU.
 
-For detailed system requirements, see the [installation guide](https://newton-physics.github.io/newton/latest/guide/installation.html). For tested configurations and Newton's versioning and deprecation policies, see the [compatibility guide](https://newton-physics.github.io/newton/latest/guide/compatibility.html).
+## Installation
+
+`SolverFBA` is not in the `newton` package on PyPI. Install this branch from source:
+
+```bash
+git clone -b ziqiu/fba-solver https://github.com/PranaLabs/newton.git
+cd newton
+uv run --extra examples -m newton.examples cloth_dual_franka_fba
+```
+
+or, without [uv](https://docs.astral.sh/uv/), in a virtual environment:
+
+```bash
+pip install -e ".[examples]"
+python -m newton.examples cloth_dual_franka_fba
+```
 
 ## Quickstart
 
-```bash
-pip install "newton[examples]"
-python -m newton.examples
+A cloth dropped on the ground:
+
+```python
+import warp as wp
+
+import newton
+
+builder = newton.ModelBuilder()
+builder.add_ground_plane()
+builder.add_cloth_grid(
+    pos=wp.vec3(-0.5, -0.5, 0.5),
+    rot=wp.quat_identity(),
+    vel=wp.vec3(0.0),
+    dim_x=20,
+    dim_y=20,
+    cell_x=0.05,
+    cell_y=0.05,
+    mass=0.005,
+    tri_ke=1.0e4,
+    edge_ke=1.0e-4,
+    particle_radius=0.005,
+)
+model = builder.finalize()
+
+solver = newton.solvers.SolverFBA(model, iterations=10)
+pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.01)
+contacts = pipeline.contacts()
+state_0, state_1 = model.state(), model.state()
+
+for _ in range(120):
+    pipeline.collide(state_0, contacts)
+    solver.step(state_0, state_1, None, contacts, 1.0 / 60.0)
+    state_0, state_1 = state_1, state_0
 ```
 
-To install from source with [uv](https://docs.astral.sh/uv/), see the [installation guide](https://newton-physics.github.io/newton/latest/guide/installation.html).
+The first step factors the system matrix on the CPU and takes longer than the others.
 
 ## Examples
 
-The examples below run on `SolverFBA`, which this branch adds. The examples that come with
-upstream Newton are still in the package; `python -m newton.examples --list` lists them all.
-
-Before running the examples below, install Newton with the examples extra:
-
-```bash
-pip install "newton[examples]"
-```
-
-If you run the examples from a source checkout with uv, use
-`uv run --extra examples -m newton.examples <example_name>` instead of the
-`python -m newton.examples <example_name>` commands below.
+Each example below runs with `python -m newton.examples <name>`, or with
+`uv run --extra examples -m newton.examples <name>` from a uv checkout. The examples that come with upstream Newton
+are still in the package; `python -m newton.examples --list` lists them all.
 
 <table>
   <tr>
@@ -72,13 +130,16 @@ If you run the examples from a source checkout with uv, use
   </tr>
   <tr>
     <td align="center" width="33%">
-      <code>python -m newton.examples stretching_cloth_fba</code>
+      <code>python -m newton.examples stretching_cloth_fba</code><br>
+      <sub>Neo-Hookean cloth pulled apart by pins on two opposite edges</sub>
     </td>
     <td align="center" width="33%">
-      <code>python -m newton.examples shirt_pins_fba</code>
+      <code>python -m newton.examples shirt_pins_fba</code><br>
+      <sub>a T-shirt moved by two handles at its shoulders, with self-contact</sub>
     </td>
     <td align="center" width="33%">
-      <code>python -m newton.examples cloth_dual_franka_fba</code>
+      <code>python -m newton.examples cloth_dual_franka_fba</code><br>
+      <sub>two Franka arms fold a towel twice into a square</sub>
     </td>
   </tr>
   <tr>
@@ -94,7 +155,8 @@ If you run the examples from a source checkout with uv, use
   </tr>
   <tr>
     <td align="center" width="33%">
-      <code>python -m newton.examples shirt_fold_fba</code>
+      <code>python -m newton.examples shirt_fold_fba</code><br>
+      <sub>two Franka arms fold a T-shirt dropped on a table</sub>
     </td>
     <td align="center" width="33%">
     </td>
@@ -120,10 +182,12 @@ If you run the examples from a source checkout with uv, use
   </tr>
   <tr>
     <td align="center" width="33%">
-      <code>python -m newton.examples cloth_on_knives_fba</code>
+      <code>python -m newton.examples cloth_on_knives_fba</code><br>
+      <sub>cloth dropped on notched blades, held off their tips by face contacts</sub>
     </td>
     <td align="center" width="33%">
-      <code>python -m newton.examples cloth_on_boxes_fba</code>
+      <code>python -m newton.examples cloth_on_boxes_fba</code><br>
+      <sub>cloth on stacked boxes and a hinged plank that tips onto them</sub>
     </td>
     <td align="center" width="33%">
     </td>
@@ -150,13 +214,16 @@ If you run the examples from a source checkout with uv, use
   </tr>
   <tr>
     <td align="center" width="33%">
-      <code>python -m newton.examples twisting_bar_fba</code>
+      <code>python -m newton.examples twisting_bar_fba</code><br>
+      <sub>a stiff Neo-Hookean bar (E = 1 GPa) twisted by its pinned ends</sub>
     </td>
     <td align="center" width="33%">
-      <code>python -m newton.examples squeezing_ball_fba</code>
+      <code>python -m newton.examples squeezing_ball_fba</code><br>
+      <sub>a soft ball dragged through spinning cylinders by friction</sub>
     </td>
     <td align="center" width="33%">
-      <code>python -m newton.examples softbody_cantilever_fba</code>
+      <code>python -m newton.examples softbody_cantilever_fba</code><br>
+      <sub>two soft beams, one with Rayleigh damping</sub>
     </td>
   </tr>
   <tr>
@@ -178,13 +245,16 @@ If you run the examples from a source checkout with uv, use
   </tr>
   <tr>
     <td align="center" width="33%">
-      <code>python -m newton.examples softbody_franka_fba</code>
+      <code>python -m newton.examples softbody_franka_fba</code><br>
+      <sub>a Franka arm picks up a soft ball held by friction alone</sub>
     </td>
     <td align="center" width="33%">
-      <code>python -m newton.examples cable_gripper_fba</code>
+      <code>python -m newton.examples cable_gripper_fba</code><br>
+      <sub>soft fingers curled by embedded cables lift a box</sub>
     </td>
     <td align="center" width="33%">
-      <code>python -m newton.examples bunny_ears_fba</code>
+      <code>python -m newton.examples bunny_ears_fba</code><br>
+      <sub>a soft bunny carried and swung by its ear tips</sub>
     </td>
   </tr>
   <tr>
@@ -203,15 +273,40 @@ If you run the examples from a source checkout with uv, use
   </tr>
   <tr>
     <td align="center" width="33%">
-      <code>python -m newton.examples pneunet_gripper_fba</code>
+      <code>python -m newton.examples pneunet_gripper_fba</code><br>
+      <sub>a pneumatic three-finger gripper closes around a ball</sub>
     </td>
     <td align="center" width="33%">
-      <code>python -m newton.examples claw_machine_fba</code>
+      <code>python -m newton.examples claw_machine_fba</code><br>
+      <sub>a claw picks a toy out of a pile of 25 soft toys</sub>
     </td>
     <td align="center" width="33%">
     </td>
   </tr>
 </table>
+
+### Performance
+
+Mean time per frame of each example over the frames of its test run, after 10 warm-up frames, without rendering
+(`--viewer null`), on one NVIDIA GeForce RTX 5090, at `ziqiu/fba-solver` `1902ddf0`. Real time is the simulated
+time per wall-clock time. The claw machine is timed over its first 300 frames, while the toys fall and settle.
+
+| Example | Particles | Triangles | Tetrahedra | Frame | ms per frame | Real time |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `stretching_cloth_fba` | 20,201 | 40,000 | 0 | 1/100 s | 6.0 | 1.67x |
+| `shirt_pins_fba` | 7,931 | 15,650 | 0 | 1/60 s | 17.8 | 0.93x |
+| `cloth_dual_franka_fba` | 1,681 | 3,200 | 0 | 1/60 s | 23.0 | 0.73x |
+| `shirt_fold_fba` | 6,480 | 12,748 | 0 | 1/60 s | 17.9 | 0.93x |
+| `cloth_on_knives_fba` | 5,101 | 10,000 | 0 | 1/100 s | 32.1 | 0.31x |
+| `cloth_on_boxes_fba` | 289 | 512 | 0 | 1/60 s | 28.9 | 0.58x |
+| `twisting_bar_fba` | 11,340 | 5,780 | 58,956 | 1/100 s | 8.6 | 1.16x |
+| `squeezing_ball_fba` | 6,859 | 3,888 | 34,992 | 1/100 s | 15.4 | 0.65x |
+| `softbody_cantilever_fba` | 10,584 | 6,760 | 43,940 | 1/50 s | 13.5 | 1.48x |
+| `softbody_franka_fba` | 2,197 | 1,728 | 10,368 | 1/60 s | 25.7 | 0.65x |
+| `cable_gripper_fba` | 1,050 | 1,408 | 3,200 | 1/100 s | 29.1 | 0.34x |
+| `bunny_ears_fba` | 4,155 | 5,294 | 15,844 | 1/60 s | 5.9 | 2.82x |
+| `pneunet_gripper_fba` | 7,363 | 9,612 | 27,395 | 1/100 s | 64.6 | 0.15x |
+| `claw_machine_fba` | 87,982 | 131,566 | 305,339 | 1/30 s | 455.7 | 0.07x |
 
 ### Example Options
 
@@ -246,22 +341,29 @@ python -m newton.examples shirt_fold_fba --device cuda:0
 python -m newton.examples twisting_bar_fba --viewer gl --num-frames 500 --device cpu
 ```
 
-## Research using Newton
+## Citation
 
-See [PUBLICATIONS.md](https://github.com/newton-physics/newton/blob/main/PUBLICATIONS.md) for research using Newton, inclusion criteria, and instructions for adding your publication.
+If you use `SolverFBA` in your research, please cite:
 
-## Contributing and Development
+```bibtex
+@article{Zeng2025FBA,
+  title   = {Fast But Accurate: A Real-Time Hyperelastic Simulator with Robust Frictional Contact},
+  author  = {Zeng, Ziqiu and Luo, Siyuan and Shi, Fan and Zhang, Zhongkai},
+  journal = {ACM Transactions on Graphics},
+  volume  = {44},
+  number  = {4},
+  pages   = {1--19},
+  year    = {2025},
+  doi     = {10.1145/3730834},
+}
+```
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for ways to contribute and the pull-request process. The [governance contribution guidelines](https://github.com/newton-physics/newton-governance/blob/main/CONTRIBUTING.md) cover legal requirements, project roles, and approval authority. Use the [development guide](https://newton-physics.github.io/newton/latest/guide/development.html) for environment setup and development workflows. Code and public API changes must follow the [source code guidelines](CODING_GUIDELINES.rst); reviewers may use the suggested [review guidelines](REVIEW_GUIDELINES.rst).
+## Newton
 
-## Support and Community Discussion
-
-For questions, please consult the [Newton documentation](https://newton-physics.github.io/newton/latest/guide/overview.html) first before creating [a discussion in the main repository](https://github.com/newton-physics/newton/discussions).
-
-## Code of Conduct
-
-By participating in this community, you agree to abide by the Linux Foundation [Code of Conduct](https://lfprojects.org/policies/code-of-conduct/).
-
-## Project Governance, Legal, and Members
-
-Please see the [newton-governance repository](https://github.com/newton-physics/newton-governance) for more information about project governance.
+Newton is a GPU-accelerated physics simulation engine built upon [NVIDIA Warp](https://github.com/NVIDIA/warp) and
+a [Linux Foundation](https://www.linuxfoundation.org/) project; see the
+[Newton repository](https://github.com/newton-physics/newton) and its
+[documentation](https://newton-physics.github.io/newton/latest/guide/overview.html) for everything else. Code is
+licensed under [Apache-2.0](LICENSE.md). Documentation is licensed under
+[CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/). Additional and third-party license texts are available in
+[`newton/licenses`](newton/licenses).
