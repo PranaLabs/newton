@@ -13,6 +13,65 @@ import newton.examples
 import newton.utils
 
 
+def reset_franka_worlds(example, world_mask):
+    """Restore the selected examples' robots, cloth, IK and grasps between frames.
+
+    Use Newton's mask convention: ``model.world_count + 1`` booleans on the model
+    device, with the last entry selecting global entities. The unreplicated
+    single-world examples contain global entities. ``None`` selects everything.
+    Returns the selected episode indices; the example restores its own plan.
+    """
+    model = example.model
+    # The component validates the mask before any state is changed.
+    example.pipeline.reset_contact_matching(world_mask)
+    mask = np.ones(model.world_count + 1, dtype=bool) if world_mask is None else world_mask.numpy()
+    worlds = model.particle_world.numpy()[:: example.particles]
+    selected = np.flatnonzero(mask[worlds])
+    if not len(selected):
+        return selected
+    articulation_mask = wp.array(mask[model.articulation_world.numpy()], dtype=wp.bool, device=model.device)
+    for state in (example.state_0, example.state_1):
+        example.solver.reset(state, world_mask)
+        for w in selected.tolist():
+            joints = slice(w * example.coords, (w + 1) * example.coords)
+            for name in ("joint_q", "joint_qd"):
+                wp.copy(getattr(state, name)[joints], getattr(model, name)[joints])
+            state.body_f[w * example.bodies : (w + 1) * example.bodies].zero_()
+            state.particle_f[w * example.particles : (w + 1) * example.particles].zero_()
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state, mask=articulation_mask)
+    for w in selected.tolist():
+        joints = slice(w * example.coords, (w + 1) * example.coords)
+        wp.copy(example.joint_qd[joints], model.joint_qd[joints])
+        wp.copy(example.ik_q[w : w + 1], example.initial_ik_q[w : w + 1])
+        for name in ("joint_target_q", "joint_target_qd"):
+            wp.copy(getattr(example.control, name)[joints], getattr(model, name)[joints])
+        for name in ("joint_f", "joint_act"):
+            value = getattr(example.control, name)
+            if value is not None:
+                value[joints].zero_()
+        example.held[w] = [None, None]
+    example.episode_time[selected] = 0.0
+    if example.grasp_rows is not None:
+        p, coefficients, targets, directions, exact = example.grasp_rows
+        keep = ~mask[model.particle_world.numpy()[p[:, 0]]]
+        example.grasp_rows = (
+            (p[keep], coefficients[keep], targets[keep], directions[keep], exact) if keep.any() else None
+        )
+    apply_grasp_rows(example)
+    if example.fully_coupled:
+        example.target = model.joint_q.numpy().copy()
+    return selected
+
+
+def apply_grasp_rows(example):
+    """Install the cached grasp rows, including only the retained worlds after reset."""
+    if example.grasp_rows is None:
+        example.solver.set_particle_constraints(None, None, None)
+    else:
+        p, coefficients, targets, directions, exact = example.grasp_rows
+        example.solver.set_particle_constraints(p, coefficients, targets, directions=directions, exact=exact)
+
+
 class JointDrive:
     """Stable PD drives of the revolute and prismatic joints of fixed-base articulations, with gravity and Coriolis
     compensation, clipped at the joints' effort limits and applied to each joint's child body and, as the reaction,

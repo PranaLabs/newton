@@ -2693,6 +2693,17 @@ def soft_contact_keys_kernel(
     values[i] = i
 
 
+@wp.func
+def world_value(world: int, values: wp.array[wp.float32], default: float) -> float:
+    """A per-world parameter, including the final global slot, or its uniform default."""
+    if values.shape[0] == 0:
+        return default
+    index = world
+    if index < 0:
+        index = values.shape[0] - 1
+    return values[index]
+
+
 @wp.kernel
 def assemble_contacts_kernel(
     order: wp.array[wp.int32],  # indices of the particle-shape contacts in their sorted order
@@ -2705,6 +2716,8 @@ def assemble_contacts_kernel(
     self_normal: wp.array[wp.vec3],  # (S,)
     shape_contacts: int,
     self_radius: float,
+    particle_world: wp.array[wp.int32],
+    world_margins: wp.array[wp.float32],
     groups: wp.array[wp.int32],  # (N,) self-contact group of each particle, with has_groups
     group_margins: wp.array[wp.float32],  # self-contact margin within each group
     has_groups: int,
@@ -2738,7 +2751,7 @@ def assemble_contacts_kernel(
         normal[c] = n
         alpha[c] = self_alpha[s, 0]
         shape[c] = -1
-        radius = self_radius
+        radius = world_value(particle_world[particle[c]], world_margins, self_radius)
         if has_groups:
             group = groups[self_particles[s, 0]]
             if group == groups[self_particles[s, 1]]:
@@ -4029,6 +4042,7 @@ def friction_anchor_apply_kernel(
     shape_margin: wp.array[float],
     shape_count: wp.int64,
     self_margin: float,
+    world_margins: wp.array[wp.float32],
     step: wp.int32,
     anchor_triangle: wp.array[wp.vec3i],  # (N,) triangle of each particle's self-contact anchor
     anchor_bary: wp.array[wp.vec3],  # (N,) its barycentric coordinates
@@ -4082,7 +4096,7 @@ def friction_anchor_apply_kernel(
         if extra_alpha[c, 0] > 0.0:
             vertex_face = False
     if vertex_face:
-        reach = 0.25 * self_margin
+        reach = 0.25 * world_value(particle_world[p], world_margins, self_margin)
         # Vertex-vertex self contacts, with one further particle, keep the step's point.
         if anchor_step[p] == step - 1 and extra_particle.shape[1] >= 3:
             a = anchor_triangle[p]

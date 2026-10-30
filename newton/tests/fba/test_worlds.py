@@ -14,6 +14,7 @@ import newton
 from newton._src.solvers.fba.nsn_pcr_solver import NSNPCRSolver, group_world_rows
 from newton._src.solvers.fba.self_contact import SelfContact, traversal_rank_kernel
 from newton.solvers import SolverFBA
+from newton.tests.fba.test_self_contact import _crossing_ribbons
 
 
 def _cloth(height=0.005, mass=0.01):
@@ -50,6 +51,72 @@ class TestFBAWorlds(unittest.TestCase):
     def setUpClass(cls):
         wp.init()
         cls.devices = ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else [])
+
+    def test_self_contact_world_distances(self):
+        """Different episode phases use their own detection, contact and friction-anchor distances."""
+        source = _cloth(0.005)
+        source.add_builder(_cloth(0.02))
+        ribbons = _crossing_ribbons(0.003, "cpu")
+        crossed = newton.ModelBuilder()
+        crossed.add_cloth_mesh(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0),
+            vertices=[wp.vec3(*v) for v in ribbons.particle_q.numpy()],
+            indices=ribbons.tri_indices.numpy().ravel().tolist(),
+            density=0.2,
+            tri_ke=1e4,
+            tri_ka=1e4,
+            edge_ke=1e-3,
+            particle_radius=0.0,
+        )
+        crossed.particle_mass[:20] = [0.0] * 20
+        for device in self.devices:
+            for mode, edges in (("vertex_face", False), ("vertex_face", True), ("vertex_vertex", False)):
+                with self.subTest(device=device, mode=mode, edges=edges):
+                    cloth = crossed if edges else source
+                    models = [_model([cloth, cloth], device)] + [_model([cloth], device) for _ in range(2)]
+                    margins, gaps = ([0.002, 0.006], [0.0005, 0.002]) if edges else ([0.006, 0.012], [0.003, 0.01])
+                    states, edge_counts = [], []
+                    for i, model in enumerate(models):
+                        solver = SolverFBA(
+                            model,
+                            iterations=3,
+                            nsn_schur_mode="lite",
+                            nsn_lite_accumulate=True,
+                            particle_enable_self_contact=True,
+                            particle_self_contact_mode=mode,
+                            particle_self_contact_edge_edge=edges,
+                            particle_topological_contact_filter_threshold=1,
+                            friction_anchors=True,
+                        )
+                        solver.set_particle_self_contact(
+                            margin=[*margins, 0.009] if i == 0 else margins[i - 1],
+                            gap=[*gaps, 0.009] if i == 0 else gaps[i - 1],
+                        )
+                        if edges:
+                            _, alpha, _ = solver._self_contact.detect(model.particle_q)
+                            edge_counts.append(int((alpha[:, 1] > 0).sum()))
+                        with self.assertRaises(ValueError):
+                            solver.set_particle_self_contact(margin=np.zeros(model.world_count + 1))
+                        with self.assertRaises(ValueError):
+                            solver.set_particle_self_contact(margin=float("nan"))
+                        pipeline = newton.CollisionPipeline(model)
+                        contacts = pipeline.contacts()
+                        a, b = model.state(), model.state()
+                        for _ in range(3):
+                            pipeline.collide(a, contacts)
+                            solver.step(a, b, None, contacts, 0.01)
+                            a, b = b, a
+                        states.append(a)
+                    if edges:
+                        self.assertEqual(edge_counts[1], 0)
+                        self.assertGreater(edge_counts[2], 0)
+                        self.assertEqual(edge_counts[0], sum(edge_counts[1:]))
+                    for name in ("particle_q", "particle_qd"):
+                        expected = np.concatenate([getattr(s, name).numpy() for s in states[1:]])
+                        np.testing.assert_allclose(getattr(states[0], name).numpy(), expected, atol=2e-6)
 
     def test_pcr_independent_recurrences(self):
         """One truncated iteration, zero RHS and a refused system cannot change a neighboring world's step."""

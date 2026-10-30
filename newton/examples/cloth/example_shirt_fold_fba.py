@@ -33,6 +33,11 @@
 # biases each world's arm joint targets by a fixed amount, so that the
 # worlds differ.
 #
+# Call example.reset(world_mask) between frames to restart selected episodes.
+# The Warp boolean mask uses model.world_count + 1 entries, with the last
+# selecting global entities (including the unreplicated single-world scene).
+# Each episode keeps its own time; sim_time remains the viewer clock.
+#
 # Command: python -m newton.examples shirt_fold_fba
 # Parallel worlds: python -m newton.examples shirt_fold_fba --world-count 4 --action-noise 0.0001
 # Coarser shirt: python -m newton.examples shirt_fold_fba --cloth-edge-length 0.0222
@@ -52,7 +57,9 @@ from newton.examples.cloth.franka_fba_utils import (
     ArmNoise,
     JointDrive,
     add_world_args,
+    apply_grasp_rows,
     joint_residual,
+    reset_franka_worlds,
     view_worlds,
     world_args,
 )
@@ -236,6 +243,7 @@ class Example:
         self.frame_dt, self.sim_substeps = 1.0 / 60.0, 4 if self.fully_coupled else 2
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
+        self.episode_time = np.zeros(self.world_count)
         self.plan = shop_fold()
 
         def new_builder():
@@ -324,10 +332,12 @@ class Example:
         self.noise = ArmNoise(ik_model, self.fingers, n, noise)
         # per world: the measured heights of the key poses and the landings of the pinches, see height
         self.heights, self.landing = [{} for _ in range(n)], [{} for _ in range(n)]
-        self.ready_q, self.home_q = ik_model.joint_q.numpy().copy(), None
+        self.ready_q = ik_model.joint_q.numpy().copy()
+        self.home_q = [None] * n
         self.ik_graph = None  # (iterations, graph) of the IK step
         self.model.joint_q.assign(self.key_pose(0.0, iterations=100, noise=False))
 
+        self.initial_ik_q = wp.clone(self.ik_q)
         self.state_0, self.state_1 = self.model.state(), self.model.state()
         self.control = self.model.control()
         self.joint_qd = wp.zeros_like(self.state_0.joint_qd)
@@ -338,11 +348,14 @@ class Example:
             self.init_kinematic_arms()
         self.pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=RADIUS)  # finds the table 2 RADIUS out
         self.contacts = self.pipeline.contacts()
-        self.gravity = self.model.gravity.numpy()
+        self.gravity = self.model.gravity.numpy().copy()
         # Per world and hand: the grasp, dragging the strip under the closing pads or holding the bulge between the
         # closed ones, with its particles, numbered within the world, and their targets in the pad frame, or None.
+        self.grasp_rows = None
         self.held = [[None, None] for _ in range(n)]
-        self.pinched = []  # particles each pinch took, in any world
+        self.pinched = [[] for _ in range(n)]  # particles each pinch took, per episode
+        self.anchor_exclusion = np.empty(0, dtype=int)
+        self.contact_margin = np.full(n, LAND_MARGIN)
         self.rows = None  # the pinched particles of all worlds and their targets in the last substep
 
         self.viewer.set_model(self.model)
@@ -457,31 +470,37 @@ class Example:
     def key_pose(self, t, iterations=8, noise=True):
         """Joint positions of both arms of every world at time ``t``, with the worlds' action noise unless ``noise`` is
         false, shape [world_count * joint_coord_count of a world]."""
-        targets = [self.hand_targets(w, t) for w in range(self.world_count)]
-        if t > self.plan.home[0]:  # back to the ready pose in joint space, easing in and out
-            if self.home_q is None:
-                self.home_q = self.ik_q.numpy().copy()
-            s = min((t - self.plan.home[0]) / (self.plan.home[1] - self.plan.home[0]), 1.0)
-            q = self.home_q + (0.5 - 0.5 * np.cos(np.pi * s)) * (self.ready_q - self.home_q)
-            self.ik_q.assign(q)
-            return (self.noise(q) if noise else q).reshape(-1)
+        times = np.broadcast_to(t, (self.world_count,))
+        targets = [self.hand_targets(w, times[w]) for w in range(self.world_count)]
+        homing = np.flatnonzero(times > self.plan.home[0]).tolist()
+        starting_home = [w for w in homing if self.home_q[w] is None]
+        if starting_home:
+            previous = self.ik_q.numpy()
+            for w in starting_home:
+                self.home_q[w] = previous[w].copy()
         for w, world_targets in enumerate(targets):
             for pads, (p, _, _) in zip(self.pads, world_targets, strict=True):
                 pads.set_target_position(w, wp.vec3(*p))
-        if self.ik_q.device.is_cuda:
-            if self.ik_graph is None or self.ik_graph[0] != iterations:
-                with wp.ScopedCapture(device=self.ik_q.device) as capture:
-                    self.ik.step(self.ik_q, self.ik_q, iterations=iterations)
-                self.ik_graph = (iterations, capture.graph)
-            wp.capture_launch(self.ik_graph[1])
-        else:
-            self.ik.step(self.ik_q, self.ik_q, iterations=iterations)
+        if len(homing) < self.world_count:
+            if self.ik_q.device.is_cuda:
+                if self.ik_graph is None or self.ik_graph[0] != iterations:
+                    with wp.ScopedCapture(device=self.ik_q.device) as capture:
+                        self.ik.step(self.ik_q, self.ik_q, iterations=iterations)
+                    self.ik_graph = (iterations, capture.graph)
+                wp.capture_launch(self.ik_graph[1])
+            else:
+                self.ik.step(self.ik_q, self.ik_q, iterations=iterations)
         # a copy: the noise stays out of the IK's own state
         q = self.ik_q.numpy().copy()
         for w, world_targets in enumerate(targets):
             for f, (_, finger, _) in zip(self.fingers, world_targets, strict=True):
                 # coupled fingers close to 0 where the plan closes them, and stop on the shirt
                 q[w, f : f + 2] = OPEN * (finger - CLOSED) / (OPEN - CLOSED) if self.fully_coupled else finger
+        for w in homing:
+            s = min((times[w] - self.plan.home[0]) / (self.plan.home[1] - self.plan.home[0]), 1.0)
+            q[w] = self.home_q[w] + (0.5 - 0.5 * np.cos(np.pi * s)) * (self.ready_q - self.home_q[w])
+            # Keep the arm's return trajectory in IK without feeding action noise back into it.
+            self.ik_q[w : w + 1].assign(q[w : w + 1])
         return (self.noise(q) if noise else q).reshape(-1)
 
     def pad_frame(self, body_q, world, hand):
@@ -545,7 +564,7 @@ class Example:
         # turned half a circle about its middle, the pinch's lowest particle lies this far under the pads
         drop = 2.0 * middle[2] - held[:, 2].min() if len(taken) else PAD_HALF_LENGTH + 0.002
         self.landing[world][(i, hand)] = (self.top_near(world, fold["laid"][hand]), drop)
-        self.pinched.append(len(taken))
+        self.pinched[world].append(len(taken))
         return {"phase": "hold", "taken": taken, "local": held, "middle": middle, "axis": axes.T @ fold["axes"][hand]}
 
     def update_grasp(self):
@@ -554,14 +573,15 @@ class Example:
         open."""
         q, rows, drag_rows, free = self.state_1.joint_q.numpy(), [], [], []
         body_q, xy = self.state_1.body_q.numpy(), self.state_0.particle_q.numpy()[:, :2]
-        i = self.plan.fold_at(self.sim_time)
         for w in range(self.world_count):
-            targets = self.hand_targets(w, self.sim_time)
+            t = self.episode_time[w]
+            i = self.plan.fold_at(t)
+            targets = self.hand_targets(w, t)
             first = w * self.particles  # of the world's particles in the model
             for hand, finger in enumerate(self.fingers):
                 f = finger + w * self.coords
                 origin, axes = self.pad_frame(body_q, w, hand)
-                a, b, _ = self.plan.sample(hand, self.sim_time)
+                a, b, _ = self.plan.sample(hand, t)
                 closing = b[5] < a[5]
                 held = self.held[w][hand]
                 if held is not None and held["phase"] == "hold" and q[f] > 0.5 * (OPEN + CLOSED):
@@ -585,12 +605,14 @@ class Example:
                     turn = rotation(held["axis"], targets[hand][2])
                     patch = held["middle"] + (held["local"] - held["middle"]) @ turn.T
                     rows.append((first + held["taken"], origin + patch @ axes.T))
-        self.solver.set_friction_anchor_exclusion(np.concatenate(free) if free else None)
+        self.anchor_exclusion = np.concatenate(free) if free else np.empty(0, dtype=int)
+        self.solver.set_friction_anchor_exclusion(self.anchor_exclusion)
         rows = [r for r in rows if len(r[0])]
         drag_rows = [r for r in drag_rows if len(r[0])]
         if not rows and not drag_rows:
             self.rows = None
-            self.solver.set_particle_constraints(None, None, None)
+            self.grasp_rows = None
+            apply_grasp_rows(self)
             return
         particles, directions, values = [], [], []
         if rows:
@@ -609,19 +631,46 @@ class Example:
         # Every row takes the exact step, so that the dragged strip follows the pads too.
         directions = np.concatenate(directions)
         coefficients = np.ones((len(particles), 1))
-        self.solver.set_particle_constraints(
-            particles[:, None], coefficients, np.concatenate(values), directions=directions, exact=True
-        )
+        self.grasp_rows = (particles[:, None], coefficients, np.concatenate(values), directions, True)
+        apply_grasp_rows(self)
+
+    def update_contact_margin(self):
+        """Each episode thins its own shirt after landing, independently of reset neighbors."""
+        thin = np.clip((self.episode_time - THIN_TIME) / THIN_RAMP, 0.0, 1.0)
+        margins = LAND_MARGIN + thin * (FOLD_MARGIN - LAND_MARGIN)
+        if np.array_equal(margins, self.contact_margin):
+            return
+        if (margins == margins[0]).all():
+            self.solver.set_particle_self_contact(margin=float(margins[0]))
+        else:
+            self.solver.set_particle_self_contact(margin=np.append(margins, LAND_MARGIN))
+        self.contact_margin = margins
+
+    def reset(self, world_mask=None):
+        """Restart selected episodes between frames; see ``reset_franka_worlds`` for the mask convention."""
+        worlds = reset_franka_worlds(self, world_mask)
+        if not len(worlds):
+            return
+        for w in worlds:
+            self.heights[w].clear()
+            self.landing[w].clear()
+            self.home_q[w] = None
+            self.pinched[w].clear()
+        if self.rows is not None:
+            p, x = self.rows
+            keep = ~np.isin(p // self.particles, worlds)
+            self.rows = (p[keep], x[keep]) if keep.any() else None
+        self.anchor_exclusion = self.anchor_exclusion[~np.isin(self.anchor_exclusion // self.particles, worlds)]
+        if not self.fully_coupled:
+            self.solver.set_friction_anchor_exclusion(self.anchor_exclusion)
+        self.update_contact_margin()
 
     def step(self):
-        thin = (self.sim_time - THIN_TIME) / THIN_RAMP
-        if -0.5 * self.frame_dt <= thin * THIN_RAMP <= THIN_RAMP + 0.5 * self.frame_dt:
-            margin = LAND_MARGIN + min(max(thin, 0.0), 1.0) * (FOLD_MARGIN - LAND_MARGIN)
-            self.solver.set_particle_self_contact(margin=margin)
+        self.update_contact_margin()
         if self.fully_coupled:
             self.step_fully_coupled()
             return
-        target = self.key_pose(self.sim_time + self.frame_dt)
+        target = self.key_pose(self.episode_time + self.frame_dt)
         self.joint_qd.assign((target - self.state_0.joint_q.numpy()) / self.frame_dt)
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
@@ -639,11 +688,12 @@ class Example:
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
             self.sim_time += self.sim_dt
+            self.episode_time += self.sim_dt
 
     def step_fully_coupled(self):
         """SolverFBA steps the arms and the shirt together; the drives follow the joint targets, interpolated over the
         frame, and fingers stopped on the shirt squeeze it."""
-        start, target = self.target, self.key_pose(self.sim_time + self.frame_dt)
+        start, target = self.target, self.key_pose(self.episode_time + self.frame_dt)
         velocity = (target - start) / self.frame_dt
         closing = [float(np.clip(1.0 - target[f] / OPEN, 0.0, 1.0)) for f in self.fingers]
         for k in range(self.sim_substeps):
@@ -659,6 +709,7 @@ class Example:
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
             self.sim_time += self.sim_dt
+            self.episode_time += self.sim_dt
         self.target = target
 
     def test_post_step(self):
@@ -683,9 +734,9 @@ class Example:
             assert off < 1.0e-3, f"a pinched particle is {off * 1e3:.2f} mm off at t={self.sim_time:.2f} s"
 
     def test_final(self):
-        assert min(self.pinched, default=6) >= 6, f"the pinches took {self.pinched} particles"
-        done = [self.sim_time >= f["t1"] + 1.0 for f in self.plan.folds]
         for w in range(self.world_count):
+            assert min(self.pinched[w], default=6) >= 6, f"world {w} pinches took {self.pinched[w]} particles"
+            done = [self.episode_time[w] >= f["t1"] + 1.0 for f in self.plan.folds]
             x = self.world_particles(w)
             if done[0]:
                 side = np.percentile(x[:, 0], 99)

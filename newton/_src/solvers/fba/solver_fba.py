@@ -2778,7 +2778,7 @@ class SolverFBA(SolverBase):
         else:
             self._x_ref.assign(np.asarray(target_positions, dtype=np.float32))
 
-    def set_particle_self_contact(self, *, margin: float, gap: float | None = None) -> None:
+    def set_particle_self_contact(self, *, margin: float | ArrayLike, gap: float | ArrayLike | None = None) -> None:
         """Change the self-contact distance and detection gap for the following steps.
 
         A cloth dropped onto a surface needs a margin and gap that its layers cannot pass in one step; once it lies
@@ -2786,19 +2786,39 @@ class SolverFBA(SolverBase):
         contacts need ``particle_self_contact_edge_edge=True`` to keep crossing edges apart.
 
         Args:
-            margin: Self-contact distance [m], as ``particle_self_contact_margin``.
-            gap: Additional detection distance [m], as ``particle_self_contact_gap``. ``None`` takes the margin.
+            margin: Positive self-contact distance [m]. A scalar applies to all worlds. An array of shape
+                ``(model.world_count + 1,)`` sets each world's distance independently; the last entry is for
+                global particles. Per-world distances require self-contact groups to be disabled.
+            gap: Nonnegative additional detection distance [m], as a scalar or an array of shape
+                ``(model.world_count + 1,)``. ``None`` takes the margin. Scalars broadcast independently
+                for either parameter. Neither parameter is restored by :meth:`reset`.
         """
-        if self._self_contact is None:
+        sc = self._self_contact
+        if sc is None:
             raise ValueError("set_particle_self_contact needs particle_enable_self_contact=True")
-        gap = margin if gap is None else gap
-        if margin <= 0.0 or gap < 0.0:
-            raise ValueError(f"set_particle_self_contact needs margin > 0 and gap >= 0, got {margin} and {gap}")
-        self.particle_self_contact_margin = float(margin)
+        margin = np.asarray(margin, dtype=np.float64)
+        gap = margin if gap is None else np.asarray(gap, dtype=np.float64)
+        shape = (self.model.world_count + 1,)
+        if any(a.shape not in ((), shape) for a in (margin, gap)):
+            raise ValueError(f"margin and gap must be scalars or arrays of shape {shape}")
+        if not np.isfinite(margin).all() or not np.isfinite(gap).all() or (margin <= 0.0).any() or (gap < 0.0).any():
+            raise ValueError("set_particle_self_contact needs finite margin > 0 and gap >= 0")
+        per_world = margin.ndim != 0 or gap.ndim != 0
+        if per_world and self._self_contact_groups:
+            raise ValueError("per-world self-contact distances require self-contact groups to be disabled")
+        self.particle_self_contact_margin = float(margin.max())
+        sc._world_margins_h = np.broadcast_to(margin, shape).astype(np.float32).copy() if per_world else None
+        values = (sc._world_margins_h, np.broadcast_to(margin + gap, shape)) if per_world else ([], [])
+        for name, value in zip(("world_margins", "world_radii"), values, strict=True):
+            current = getattr(sc, name)
+            if current.shape == (len(value),):
+                current.assign(np.asarray(value, dtype=np.float32))
+            else:
+                setattr(sc, name, wp.array(value, dtype=wp.float32, device=self._device))
         if self._self_contact_groups:
-            self._self_contact.set_margin(margin, gap)
+            sc.set_margin(float(margin), float(gap))
         else:
-            self._self_contact.query_radius = float(margin) + float(gap)
+            sc.query_radius = float((margin + gap).max())
 
     def set_particle_constraints(self, particles, coefficients, targets, *, directions=None, exact=False) -> None:
         """Hold lengths or linear combinations of particle positions in the following steps.
@@ -3323,6 +3343,11 @@ class SolverFBA(SolverBase):
         inputs += [self._contact_normal_d, self._contact_tangent1_d, self._contact_tangent2_d]
         inputs += [self._contact_world_anchor_d, state_in.particle_q, self.model.particle_radius]
         inputs += [shape_body, shape_margin, wp.int64(max(self.model.shape_count, 1)), float(margin)]
+        inputs += [
+            self._self_contact.world_margins
+            if self._self_contact is not None
+            else wp.empty(0, dtype=wp.float32, device=self._device)
+        ]
         inputs += [wp.int32(self._anchor_step), self._anchor_triangle_d, self._anchor_bary_d, self._anchor_step_d]
         inputs += [self._anchor_previous_key_d, self._anchor_previous_point_d, self._anchor_previous_pressed_d]
         inputs += [wp.int32(self._anchor_count)]
@@ -3564,6 +3589,9 @@ class SolverFBA(SolverBase):
                     particle_h, alpha_h = np.concatenate([particle_h, sp[:, 0]]), np.concatenate([alpha_h, sa[:, 0]])
                     shape_h, normal_h = np.concatenate([shape_h, np.full(len(sp), -1)]), np.concatenate([normal_h, sn])
                     margin = self.particle_self_contact_margin
+                    if self._self_contact._world_margins_h is not None:
+                        worlds = self.model.particle_world.numpy()[sp[:, 0]]
+                        margin = self._self_contact._world_margins_h[worlds, None]
                     if self._self_contact_groups and self._self_contact.within_groups:
                         margin = self._self_contact.contact_margins(sp)[:, None]
                     body_pos_h = np.concatenate([body_pos_h, margin * sn])
@@ -3795,7 +3823,7 @@ class SolverFBA(SolverBase):
         # Without contacts within groups, every self contact joins two groups and keeps the margin between groups.
         if not self._self_contact_groups or not sc.within_groups:
             groups = [wp.empty(1, dtype=wp.int32, device=device), wp.empty(1, dtype=wp.float32, device=device), 0]
-        inputs += [self.particle_self_contact_margin, *groups]
+        inputs += [self.particle_self_contact_margin, self.model.particle_world, sc.world_margins, *groups]
         outputs = [self._contact_particle_d, self._contact_normal_d, self._contact_alpha_d, self._contact_shape_d]
         outputs += [self._contact_body_pos_d, *extra]
         wp.launch(assemble_contacts_kernel, M, inputs, outputs, device=device)
