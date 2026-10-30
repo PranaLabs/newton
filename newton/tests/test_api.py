@@ -16,6 +16,11 @@ def _param_list(sig: inspect.Signature):
     return list(sig.parameters.values())[1:]
 
 
+def _is_builder_arg_doc_line(line: str) -> bool:
+    """Return True for legacy and type-less Google-style builder arg docs."""
+    return line.startswith("builder (ModelBuilder):") or line.startswith("builder:")
+
+
 def _check_builder_method_matches_importer_function_signature(func, method):
     func_name = func.__name__
     method_name = method.__name__
@@ -75,15 +80,27 @@ def _check_builder_method_matches_importer_function_signature(func, method):
     lines_doc_func = [line.strip() for line in (func.__doc__ or "").splitlines()]
     # Remove line that contains the docstring for the ModelBuilder argument
     # because this argument does not exist in the method
-    doc_func = "\n".join(line for line in lines_doc_func if "builder (ModelBuilder)" not in line).strip()
-    doc_method = "\n".join(line.strip() for line in (method.__doc__ or "").splitlines()).strip()
-    assert "builder (ModelBuilder)" not in doc_method, (
-        f"Docstring for {method_name} must not contain 'builder (ModelBuilder)'"
+    doc_func = "\n".join(line for line in lines_doc_func if not _is_builder_arg_doc_line(line)).strip()
+    lines_doc_method = [line.strip() for line in (method.__doc__ or "").splitlines()]
+    assert not any(_is_builder_arg_doc_line(line) for line in lines_doc_method), (
+        f"Docstring for {method_name} must not document the builder argument"
     )
+    doc_method = "\n".join(lines_doc_method).strip()
     assert doc_func == doc_method, f"Docstring mismatch between {func_name} and {method_name}"
 
 
 class TestApi(unittest.TestCase):
+    def test_collision_pipeline_flattens_speculative_contact_config(self):
+        """Configure speculative contacts without a single-field wrapper."""
+        import newton  # noqa: PLC0415
+
+        parameters = inspect.signature(newton.CollisionPipeline).parameters
+
+        self.assertIn("speculative_contact_gap_max", parameters)
+        self.assertNotIn("max_speculative_extension", parameters)
+        self.assertNotIn("speculative_config", parameters)
+        self.assertFalse(hasattr(newton.CollisionPipeline, "SpeculativeContactConfig"))
+
     def test_builder_urdf_signature_parity(self):
         from newton import ModelBuilder  # noqa: PLC0415
         from newton._src.utils.import_urdf import parse_urdf  # noqa: PLC0415
@@ -109,6 +126,99 @@ class TestApi(unittest.TestCase):
         doc_func = "\n".join(line.strip() for line in (get_tetmesh.__doc__ or "").splitlines()).strip()
         doc_method = "\n".join(line.strip() for line in (TetMesh.create_from_usd.__doc__ or "").splitlines()).strip()
         assert doc_func == doc_method, "Docstring mismatch between get_tetmesh and TetMesh.create_from_usd"
+
+    def test_get_tetmesh_hides_importer_material_control(self):
+        """Keep importer-only material controls out of the public signature."""
+        import newton.usd  # noqa: PLC0415
+
+        parameters = inspect.signature(newton.usd.get_tetmesh).parameters
+
+        self.assertNotIn("_load_material", parameters)
+
+    def test_keyword_only_arguments_reject_positional_use(self):
+        """Reject positional use of mature keyword-only API options."""
+        import warp as wp  # noqa: PLC0415
+
+        import newton  # noqa: PLC0415
+
+        builder = newton.ModelBuilder()
+        model = builder.finalize()
+
+        calls = (
+            lambda: builder.add_shape_box(-1, wp.transform(), 0.1, 0.2, 0.3),
+            lambda: builder.add_body(wp.transform()),
+            lambda: newton.ModelBuilder.ShapeConfig(12.0, 34.0),
+            lambda: newton.ModelBuilder.JointDofConfig(newton.Axis.Y),
+            lambda: newton.solvers.SolverSemiImplicit(model, 0.123),
+        )
+
+        for call in calls:
+            with self.subTest(call=call), self.assertRaises(TypeError):
+                call()
+
+    def test_deprecate_nonkeyword_arguments_rebinds_options(self):
+        """Rebind positional options while a deprecation window is active."""
+        from newton._src.utils.deprecation import deprecate_nonkeyword_arguments  # noqa: PLC0415
+
+        @deprecate_nonkeyword_arguments
+        def func(value, *, option=None):
+            return value, option
+
+        with self.assertWarnsRegex(DeprecationWarning, "Passing 'option' positionally"):
+            result = func(1, 2)
+
+        self.assertEqual(result, (1, 2))
+
+    def test_deprecate_nonkeyword_arguments_rejects_duplicate_keyword(self):
+        """Reject options supplied both positionally and by keyword."""
+        from newton._src.utils.deprecation import deprecate_nonkeyword_arguments  # noqa: PLC0415
+
+        @deprecate_nonkeyword_arguments
+        def func(value, *, option=None):
+            return value, option
+
+        with self.assertRaisesRegex(TypeError, "multiple values for argument 'option'"):
+            func(1, 2, option=3)
+
+    def test_keyword_only_api_signatures(self):
+        """Expose mature optional API arguments as keyword-only."""
+        import newton  # noqa: PLC0415
+
+        body_sig = inspect.signature(newton.ModelBuilder.add_body)
+        link_sig = inspect.signature(newton.ModelBuilder.add_link)
+        solver_sig = inspect.signature(newton.solvers.SolverSemiImplicit.__init__)
+
+        self.assertEqual(body_sig.parameters["xform"].kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertEqual(link_sig.parameters["xform"].kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertEqual(solver_sig.parameters["angular_damping"].kind, inspect.Parameter.KEYWORD_ONLY)
+
+    def test_shape_opacity_follows_color(self):
+        """Keep shape display arguments adjacent and keyword-only."""
+        import newton  # noqa: PLC0415
+
+        method_names = (
+            "add_shape",
+            "add_shape_plane",
+            "add_ground_plane",
+            "add_shape_sphere",
+            "add_shape_ellipsoid",
+            "add_shape_box",
+            "add_shape_capsule",
+            "add_shape_cylinder",
+            "add_shape_cone",
+            "add_shape_mesh",
+            "add_shape_convex_hull",
+            "add_shape_heightfield",
+            "add_shape_gaussian",
+        )
+
+        for method_name in method_names:
+            with self.subTest(method=method_name):
+                parameters = list(inspect.signature(getattr(newton.ModelBuilder, method_name)).parameters.values())
+                color_index = next(i for i, parameter in enumerate(parameters) if parameter.name == "color")
+                opacity = parameters[color_index + 1]
+                self.assertEqual(opacity.name, "opacity")
+                self.assertEqual(opacity.kind, inspect.Parameter.KEYWORD_ONLY)
 
 
 if __name__ == "__main__":

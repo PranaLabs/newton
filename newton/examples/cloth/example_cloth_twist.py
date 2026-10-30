@@ -144,7 +144,7 @@ class Example:
         vertices = [wp.vec3(v) for v in mesh_points]
         self.faces = mesh_indices.reshape(-1, 3)
 
-        scene = newton.ModelBuilder(gravity=0)
+        scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         scene.add_cloth_mesh(
             pos=wp.vec3(0.0, 0.0, 0.0),
             rot=wp.quat_from_axis_angle(wp.vec3(0, 0, 1), np.pi / 2),
@@ -155,14 +155,14 @@ class Example:
             density=0.2,
             tri_ke=1.0e3,
             tri_ka=1.0e3,
-            tri_kd=2.0e-7,
+            tri_kd=2.0e-4,
             edge_ke=1e-3,
-            edge_kd=1e-4,
+            edge_kd=1e-2,
         )
         scene.color()
         self.model = scene.finalize()
         self.model.soft_contact_ke = 1.0e3
-        self.model.soft_contact_kd = 1.0e-4
+        self.model.soft_contact_kd = 1.0e-1
         self.model.soft_contact_mu = 0.2
 
         cloth_size = 50
@@ -179,16 +179,21 @@ class Example:
 
         self.solver = newton.solvers.SolverVBD(
             self.model,
-            self.iterations,
+            iterations=self.iterations,
             particle_enable_self_contact=True,
-            particle_self_contact_radius=0.002,
-            particle_self_contact_margin=0.0035,
+            particle_self_contact_margin=0.002,
+            particle_self_contact_gap=0.0015,
+            # Tight twisting exceeds the default buffer capacities (measured
+            # peak demand: 49 vertex / 104 edge pairs); overflow drops pairs.
+            particle_vertex_contact_buffer_size=64,
+            particle_edge_contact_buffer_size=128,
         )
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
 
-        self.contacts = self.model.contacts()
+        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.contacts = self.collision_pipeline.contacts()
 
         rot_axes = [[0, 1, 0]] * len(right_side) + [[0, -1, 0]] * len(left_side)
 
@@ -224,13 +229,12 @@ class Example:
 
     def capture(self):
         self.graph = None
-        if wp.get_device().is_cuda:
-            with wp.ScopedCapture() as capture:
-                self.simulate()
-            self.graph = capture.graph
+        with wp.ScopedCapture() as capture:
+            self.simulate()
+        self.graph = capture.graph
 
     def simulate(self):
-        self.model.collide(self.state_0, self.contacts)
+        self.collision_pipeline.collide(self.state_0, self.contacts)
         self.solver.rebuild_bvh(self.state_0)
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()

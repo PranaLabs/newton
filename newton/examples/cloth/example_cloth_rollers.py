@@ -222,7 +222,7 @@ class Example:
         target_local_y = target_world_z - cloth_offset_z
 
         # Build model with zero gravity
-        builder = newton.ModelBuilder(gravity=0.0)
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
 
         # Generate cloth mesh with extension going directly to target
         self.cloth_verts, self.cloth_faces, self.spiral_rows, self.ext_rows = rolled_cloth_mesh(
@@ -237,12 +237,25 @@ class Example:
         self.num_cloth_verts = len(self.cloth_verts)
         self.total_rows = self.spiral_rows + self.ext_rows
 
+        # Give both triangles in each quad the same checker color so the
+        # material pattern makes the rolling motion easier to follow.
+        checker_indices = np.indices((self.total_rows - 1, self.nv - 1)).sum(axis=0) % 2
+        checker_palette = np.array(((0.08, 0.24, 0.65), (0.9, 0.9, 0.9)), dtype=np.float32)
+        self.cloth_colors = np.repeat(checker_palette[checker_indices.reshape(-1)], 2, axis=0)
+
         # Generate cylinder meshes
         cylinder_segments = 128
         self.cyl1_verts, self.cyl1_faces = cylinder_mesh(radius=self.cyl1_radius, segments=cylinder_segments)
         self.cyl2_verts, self.cyl2_faces = cylinder_mesh(radius=self.cyl2_radius, segments=cylinder_segments)
         self.num_cyl1_verts = len(self.cyl1_verts)
         self.num_cyl2_verts = len(self.cyl2_verts)
+
+        # Alternate colors around the circumference in broad axial stripes.
+        # Each angular segment contributes two triangles, which share a color.
+        stripe_width = 8
+        stripe_indices = (np.arange(cylinder_segments) // stripe_width) % 2
+        stripe_palette = np.array(((0.55, 0.23, 0.07), (0.9, 0.48, 0.16)), dtype=np.float32)
+        self.roller_colors = np.repeat(stripe_palette[stripe_indices], 2, axis=0)
 
         # Add cloth mesh
         builder.add_cloth_mesh(
@@ -255,10 +268,11 @@ class Example:
             density=0.02,
             tri_ke=1.0e5,
             tri_ka=1.0e5,
-            tri_kd=1.0e-5,
+            tri_kd=1.0e0,
             edge_ke=1e2,
-            edge_kd=0.1,
+            edge_kd=1.0e1,
             particle_radius=0.5,
+            color=self.cloth_colors,
         )
 
         # Add first cylinder
@@ -272,9 +286,10 @@ class Example:
             density=0.02,
             tri_ke=1.0e5,
             tri_ka=1.0e5,
-            tri_kd=1.0e-5,
+            tri_kd=1.0e0,
             edge_ke=1e2,
             edge_kd=0.0,
+            color=self.roller_colors,
         )
 
         # Add second cylinder
@@ -288,13 +303,14 @@ class Example:
             density=0.02,
             tri_ke=1.0e5,
             tri_ka=1.0e5,
-            tri_kd=1.0e-5,
+            tri_kd=1.0e0,
             edge_ke=1,
             edge_kd=0.01,
+            color=self.roller_colors,
         )
 
         # Add ground plane
-        builder.add_ground_plane(-1.0)
+        builder.add_ground_plane(height=-1.0)
 
         # Color for VBD solver
         builder.color(include_bending=False)
@@ -302,7 +318,7 @@ class Example:
         # Finalize model
         self.model = builder.finalize()
         self.model.soft_contact_ke = 5.0e5
-        self.model.soft_contact_kd = 1.0e-6
+        self.model.soft_contact_kd = 5.0
         self.model.soft_contact_mu = 0.1
 
         # Fix outer edge of cloth to cylinder 2 and set up cylinder rotation
@@ -362,11 +378,16 @@ class Example:
             model=self.model,
             iterations=self.iterations,
             particle_enable_self_contact=True,
-            particle_self_contact_radius=0.3,
-            particle_self_contact_margin=0.6,
+            particle_self_contact_margin=0.3,
+            particle_self_contact_gap=0.3,
+            # The 0.6 query radius packs many edge pairs (measured peak demand:
+            # 24 vertex / 146 edge pairs); overflow drops pairs.
             particle_vertex_contact_buffer_size=48,
-            particle_edge_contact_buffer_size=64,
-            particle_collision_detection_interval=5,
+            particle_edge_contact_buffer_size=160,
+            collision_frequency={newton.solvers.SolverBase.CollisionSlot.SOFT_SELF_CONTACT: 5},
+            collision_frequency_type={
+                newton.solvers.SolverBase.CollisionSlot.SOFT_SELF_CONTACT: newton.solvers.SolverBase.CollisionFrequencyType.ITERATIONS,
+            },
             particle_topological_contact_filter_threshold=2,
         )
 
@@ -394,19 +415,16 @@ class Example:
         self.viewer.set_model(self.model)
 
         # Set up camera
-        if hasattr(self.viewer, "camera") and hasattr(self.viewer.camera, "fov"):
+        if hasattr(self.viewer, "camera"):
             self.viewer.set_camera(pos=wp.vec3(-0.02, -2.33, 0.69), pitch=-15.9, yaw=-264.8)
             self.viewer.camera.fov = 67.0
 
         self.capture()
 
     def capture(self):
-        if wp.get_device().is_cuda:
-            with wp.ScopedCapture() as capture:
-                self.simulate()
-            self.graph = capture.graph
-        else:
-            self.graph = None
+        with wp.ScopedCapture() as capture:
+            self.simulate()
+        self.graph = capture.graph
 
     def simulate(self):
         self.solver.rebuild_bvh(self.state_0)

@@ -18,8 +18,7 @@ import warp as wp
 from ......geometry.types import GeoType
 from ...core.data import DataKamino
 from ...core.model import ModelKamino
-from ...core.state import StateKamino
-from ...core.types import float32, int32, vec6f
+from ...core.types import to_warp_int32_array, vec6f
 from ..contacts import DEFAULT_GEOM_PAIR_CONTACT_GAP, ContactsKamino
 from .broadphase import (
     PRIMITIVE_BROADPHASE_SUPPORTED_SHAPES,
@@ -54,15 +53,12 @@ class CollisionPipelinePrimitive:
         Initialize an instance of Kamino's optimized primitive collision detection pipeline.
 
         Args:
-            model (`ModelKamino`, optional):
-                The model container holding the time-invariant data of the system being simulated.\n
-                If provided, the detector will be finalized using the provided model and settings.\n
+            model: The model container holding the time-invariant data of the system being simulated.
+                If provided, the detector will be finalized using the provided model and settings.
                 If `None`, the detector will be created empty without allocating data, and
-                can be finalized later by providing a model to the `finalize` method.\n
-            bvtype (`Literal["aabb", "bs"]`, optional):
-                Type of bounding volume to use in broad-phase.
-            default_gap (`float`, optional):
-                Default detection gap [m] applied as a floor to per-geometry gaps.
+                can be finalized later by providing a model to the `finalize` method.
+            bvtype: Type of bounding volume to use in broad-phase.
+            default_gap: Default detection gap [m] applied as a floor to per-geometry gaps.
         """
         # Cache the model reference, target device and settings
         self._model: ModelKamino | None = model
@@ -76,6 +72,7 @@ class CollisionPipelinePrimitive:
         self._cmodel: CollisionCandidatesModel | None = None
         self._cdata: CollisionCandidatesData | None = None
         self._bvdata: BoundingVolumesData | None = None
+        self._contact_overflow_warning_emitted: wp.array[wp.int32] | None = None
 
         # If a builder is provided, proceed to finalize all data allocations
         if model is not None:
@@ -103,13 +100,11 @@ class CollisionPipelinePrimitive:
         Finalizes the collision detection pipeline by allocating all necessary data structures.
 
         Args:
-            model (`ModelKamino`, optional):
-                The model container holding the time-invariant data of the system being simulated.\n
-                If provided, the detector will be finalized using the provided model and settings.\n
+            model: The model container holding the time-invariant data of the system being simulated.
+                If provided, the detector will be finalized using the provided model and settings.
                 If `None`, the detector will be created empty without allocating data, and
-                can be finalized later by providing a model to the `finalize` method.\n
-            bvtype (`Literal["aabb", "bs"]`, optional):
-                Type of bounding volume to use in broad-phase.
+                can be finalized later by providing a model to the `finalize` method.
+            bvtype: Type of bounding volume to use in broad-phase.
         """
         # Override the model if specified
         if model is not None:
@@ -142,7 +137,7 @@ class CollisionPipelinePrimitive:
                 case BoundingVolumeType.AABB:
                     self._bvdata.aabb = wp.zeros(shape=(num_geoms,), dtype=vec6f)
                 case BoundingVolumeType.BS:
-                    self._bvdata.radius = wp.zeros(shape=(num_geoms,), dtype=float32)
+                    self._bvdata.radius = wp.zeros(shape=(num_geoms,), dtype=wp.float32)
                 case _:
                     raise ValueError(f"Unsupported BoundingVolumeType: {self._bvtype}")
 
@@ -150,32 +145,29 @@ class CollisionPipelinePrimitive:
             self._cmodel = CollisionCandidatesModel(
                 num_model_geom_pairs=self._model.geoms.num_collidable_pairs,
                 num_world_geom_pairs=world_num_geom_pairs,
-                model_num_pairs=wp.array([self._model.geoms.num_collidable_pairs], dtype=int32),
-                world_num_pairs=wp.array(world_num_geom_pairs, dtype=int32),
-                wid=wp.array(geom_pair_wid, dtype=int32),
+                model_num_pairs=to_warp_int32_array([self._model.geoms.num_collidable_pairs]),
+                world_num_pairs=to_warp_int32_array(world_num_geom_pairs),
+                wid=to_warp_int32_array(geom_pair_wid),
                 geom_pair=self._model.geoms.collidable_pairs,
             )
 
             # Allocate the time-varying collision candidates data
             self._cdata = CollisionCandidatesData(
                 num_model_geom_pairs=self._model.geoms.num_collidable_pairs,
-                model_num_collisions=wp.zeros(shape=(1,), dtype=int32),
-                world_num_collisions=wp.zeros(shape=(num_worlds,), dtype=int32),
-                wid=wp.zeros(shape=(self._model.geoms.num_collidable_pairs,), dtype=int32),
+                model_num_collisions=wp.zeros(shape=(1,), dtype=wp.int32),
+                world_num_collisions=wp.zeros(shape=(num_worlds,), dtype=wp.int32),
+                wid=wp.zeros(shape=(self._model.geoms.num_collidable_pairs,), dtype=wp.int32),
                 geom_pair=wp.zeros_like(self._model.geoms.collidable_pairs),
             )
+            self._contact_overflow_warning_emitted = wp.zeros(shape=(1,), dtype=wp.int32)
 
-    def collide(self, data: DataKamino, state: StateKamino, contacts: ContactsKamino):
+    def collide(self, data: DataKamino, contacts: ContactsKamino):
         """
-        Runs the unified collision detection pipeline to generate discrete contacts.
+        Runs the primitive collision detection pipeline to generate discrete contacts.
 
         Args:
-            data (DataKamino):
-                The data container holding internal time-varying state of the solver.
-            state (StateKamino):
-                The state container holding the time-varying state of the simulation.
-            contacts (ContactsKamino):
-                Output contacts container (will be cleared and populated)
+            data: The data container holding internal time-varying state of the solver.
+            contacts: Output contacts container (will be cleared and populated)
         """
         # Ensure that the pipeline has been finalized
         # before proceeding with actual operations
@@ -184,10 +176,11 @@ class CollisionPipelinePrimitive:
         # Clear all active collision candidates and contacts
         self._cdata.clear()
         contacts.clear()
+        self._contact_overflow_warning_emitted.zero_()
 
         # Perform the broad-phase collision detection to generate candidate pairs
         primitive_broadphase_explicit(
-            body_poses=state.q_i,
+            body_poses=data.bodies.q_i,
             geoms_model=self._model.geoms,
             geoms_data=data.geoms,
             bv_type=self._bvtype,
@@ -198,7 +191,14 @@ class CollisionPipelinePrimitive:
         )
 
         # Perform the narrow-phase collision detection to generate active contacts
-        primitive_narrowphase(self._model, data, self._cdata, contacts, default_gap=self._default_gap)
+        primitive_narrowphase(
+            self._model,
+            data,
+            self._cdata,
+            contacts,
+            self._contact_overflow_warning_emitted,
+            default_gap=self._default_gap,
+        )
 
     ###
     # Internals
@@ -211,7 +211,12 @@ class CollisionPipelinePrimitive:
         Raises:
             RuntimeError: If the pipeline has not been finalized.
         """
-        if self._cmodel is None or self._cdata is None or self._bvdata is None:
+        if (
+            self._cmodel is None
+            or self._cdata is None
+            or self._bvdata is None
+            or self._contact_overflow_warning_emitted is None
+        ):
             raise RuntimeError(
                 "CollisionPipelinePrimitive has not been finalized. "
                 "Please call `finalize(builder, device)` before using the pipeline."
@@ -224,8 +229,7 @@ class CollisionPipelinePrimitive:
         model are supported by the primitive narrow-phase collider.
 
         Args:
-            model (ModelKamino):
-                The model container holding the time-invariant parameters of the simulation.
+            model: The model container holding the time-invariant parameters of the simulation.
 
         Raises:
             ValueError: If any unsupported shape type is found.

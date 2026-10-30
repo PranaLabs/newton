@@ -9,11 +9,9 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.kamino._src.core.builder import ModelBuilderKamino
-from newton._src.solvers.kamino._src.core.types import float32
+from newton._src.solvers.kamino._src import ModelKamino
 from newton._src.solvers.kamino._src.utils import logger as msg
 from newton._src.solvers.kamino._src.utils.control import AnimationJointReference
-from newton._src.solvers.kamino._src.utils.io.usd import USDImporter
 from newton._src.solvers.kamino.tests import setup_tests, test_context
 
 ###
@@ -56,9 +54,9 @@ class TestAnimationJointReference(unittest.TestCase):
         animation_asset_file = str(asset_path / "dr_legs" / "animation" / "dr_legs_animation_100fps.npy")
 
         # Import USD model of DR Legs
-        importer = USDImporter()
-        builder: ModelBuilderKamino = importer.import_from(source=model_asset_file)
-        model = builder.finalize(device=self.default_device)
+        builder = newton.ModelBuilder()
+        builder.add_usd(source=model_asset_file)
+        model = ModelKamino.from_newton(builder.finalize(device=self.default_device))
         data = model.data(device=self.default_device)
 
         # Retrieve the number of actuated coordinates and DoFs
@@ -110,8 +108,8 @@ class TestAnimationJointReference(unittest.TestCase):
         np.testing.assert_array_almost_equal(animation.data.dq_j_ref.numpy(), np.zeros_like(animation_np), decimal=6)
 
         # Allocate output arrays for joint references
-        q_j_ref_out = wp.zeros(njad, dtype=float32, device=self.default_device)
-        dq_j_ref_out = wp.zeros(njad, dtype=float32, device=self.default_device)
+        q_j_ref_out = wp.zeros(njad, dtype=wp.float32, device=self.default_device)
+        dq_j_ref_out = wp.zeros(njad, dtype=wp.float32, device=self.default_device)
 
         # Retrieve the reference at the initial step (0)
         animation.reset(q_j_ref_out=q_j_ref_out, dq_j_ref_out=dq_j_ref_out)
@@ -159,9 +157,9 @@ class TestAnimationJointReference(unittest.TestCase):
         animation_asset_file = str(asset_path / "dr_legs" / "animation" / "dr_legs_animation_100fps.npy")
 
         # Import USD model of DR Legs
-        importer = USDImporter()
-        builder: ModelBuilderKamino = importer.import_from(source=model_asset_file)
-        model = builder.finalize(device=self.default_device)
+        builder = newton.ModelBuilder()
+        builder.add_usd(source=model_asset_file)
+        model = ModelKamino.from_newton(builder.finalize(device=self.default_device))
         data = model.data(device=self.default_device)
 
         # Retrieve the number of actuated coordinates and DoFs
@@ -217,8 +215,8 @@ class TestAnimationJointReference(unittest.TestCase):
         np.testing.assert_array_almost_equal(animation.data.dq_j_ref.numpy(), np.zeros_like(animation_np), decimal=6)
 
         # Allocate output arrays for joint references
-        q_j_ref_out = wp.zeros(njad, dtype=float32, device=self.default_device)
-        dq_j_ref_out = wp.zeros(njad, dtype=float32, device=self.default_device)
+        q_j_ref_out = wp.zeros(njad, dtype=wp.float32, device=self.default_device)
+        dq_j_ref_out = wp.zeros(njad, dtype=wp.float32, device=self.default_device)
 
         # Retrieve the reference at the initial step (0)
         animation.reset(q_j_ref_out=q_j_ref_out, dq_j_ref_out=dq_j_ref_out)
@@ -300,9 +298,9 @@ class TestAnimationJointReference(unittest.TestCase):
         animation_asset_file = str(asset_path / "dr_legs" / "animation" / "dr_legs_animation_100fps.npy")
 
         # Import USD model of DR Legs
-        importer = USDImporter()
-        builder: ModelBuilderKamino = importer.import_from(source=model_asset_file)
-        model = builder.finalize(device=self.default_device)
+        builder = newton.ModelBuilder()
+        builder.add_usd(source=model_asset_file)
+        model = ModelKamino.from_newton(builder.finalize(device=self.default_device))
         data = model.data(device=self.default_device)
 
         # Retrieve the number of actuated coordinates and DoFs
@@ -358,8 +356,8 @@ class TestAnimationJointReference(unittest.TestCase):
         np.testing.assert_array_almost_equal(animation.data.dq_j_ref.numpy(), np.zeros_like(animation_np), decimal=6)
 
         # Allocate output arrays for joint references
-        q_j_ref_out = wp.zeros(njad, dtype=float32, device=self.default_device)
-        dq_j_ref_out = wp.zeros(njad, dtype=float32, device=self.default_device)
+        q_j_ref_out = wp.zeros(njad, dtype=wp.float32, device=self.default_device)
+        dq_j_ref_out = wp.zeros(njad, dtype=wp.float32, device=self.default_device)
 
         # Retrieve the reference at the initial step (0)
         animation.reset(q_j_ref_out=q_j_ref_out, dq_j_ref_out=dq_j_ref_out)
@@ -441,9 +439,9 @@ class TestAnimationJointReference(unittest.TestCase):
         animation_asset_file = str(asset_path / "dr_legs" / "animation" / "dr_legs_animation_100fps.npy")
 
         # Import USD model of DR Legs
-        importer = USDImporter()
-        builder: ModelBuilderKamino = importer.import_from(source=model_asset_file)
-        model = builder.finalize(device=self.default_device)
+        builder = newton.ModelBuilder()
+        builder.add_usd(source=model_asset_file)
+        model = ModelKamino.from_newton(builder.finalize(device=self.default_device))
         data = model.data(device=self.default_device)
 
         # Retrieve the number of actuated coordinates and DoFs
@@ -499,8 +497,8 @@ class TestAnimationJointReference(unittest.TestCase):
         np.testing.assert_array_almost_equal(animation.data.dq_j_ref.numpy(), np.zeros_like(animation_np), decimal=6)
 
         # Allocate output arrays for joint references
-        q_j_ref_out = wp.zeros(njad, dtype=float32, device=self.default_device)
-        dq_j_ref_out = wp.zeros(njad, dtype=float32, device=self.default_device)
+        q_j_ref_out = wp.zeros(njad, dtype=wp.float32, device=self.default_device)
+        dq_j_ref_out = wp.zeros(njad, dtype=wp.float32, device=self.default_device)
 
         # Reset the reference at the initial step (0)
         animation.reset(q_j_ref_out=q_j_ref_out, dq_j_ref_out=dq_j_ref_out)

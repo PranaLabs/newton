@@ -3,12 +3,17 @@
 
 # Some ray intersection functions are adapted from https://iquilezles.org/articles/intersectors/
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import warp as wp
 
-from ..utils.heightfield import HeightfieldData, ray_intersect_heightfield_local
-from .types import (
-    GeoType,
-)
+from ..core import MAXVAL
+from .types import GeoType
+
+if TYPE_CHECKING:
+    from ..sim import Model
 
 # A small constant to avoid division by zero and other numerical issues
 MINVAL = 1e-15
@@ -44,13 +49,19 @@ def safe_div_vec3(x: wp.vec3, y: wp.vec3) -> wp.vec3:
 
 
 @wp.func
-def map_ray_to_local(transform: wp.transform, ray_origin: wp.vec3, ray_direction: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
-    """Maps a ray from world space into the local shape frame.
+def map_ray_to_local(
+    transform: wp.transform,
+    ray_origin: wp.vec3,
+    ray_direction: wp.vec3,
+    scale: wp.vec3 = wp.vec3(1.0),  # noqa: B008  # Warp bakes @wp.func defaults at compile time
+) -> tuple[wp.vec3, wp.vec3]:
+    """Maps a ray from world space into the local shape frame, dividing by per-axis scale.
 
     Args:
         transform: World transform of the shape.
         ray_origin: Starting point of the ray in world space.
         ray_direction: Direction of the ray in world space.
+        scale: Per-axis scale of the shape; the local ray is divided by this.
 
     Returns:
         Tuple of (ray_origin_local, ray_direction_local) in the shape's local frame.
@@ -58,47 +69,36 @@ def map_ray_to_local(transform: wp.transform, ray_origin: wp.vec3, ray_direction
     inv_transform = wp.transform_inverse(transform)
     ray_origin_local = wp.transform_point(inv_transform, ray_origin)
     ray_direction_local = wp.transform_vector(inv_transform, ray_direction)
+    if scale[0] != 1.0 or scale[1] != 1.0 or scale[2] != 1.0:
+        inv_size = safe_div_vec3(wp.vec3(1.0), scale)
+        ray_origin_local = wp.cw_mul(ray_origin_local, inv_size)
+        ray_direction_local = wp.cw_mul(ray_direction_local, inv_size)
     return ray_origin_local, ray_direction_local
 
 
 @wp.func
-def map_ray_to_local_scaled(
-    transform: wp.transform, scale: wp.vec3, ray_origin: wp.vec3, ray_direction: wp.vec3
-) -> tuple[wp.vec3, wp.vec3]:
-    """Maps a ray into a shape's local frame and divides by per-axis scale."""
-    ray_origin_local, ray_direction_local = map_ray_to_local(transform, ray_origin, ray_direction)
-    inv_size = safe_div_vec3(wp.vec3(1.0), scale)
-    return wp.cw_mul(ray_origin_local, inv_size), wp.cw_mul(ray_direction_local, inv_size)
-
-
-@wp.func
-def ray_intersect_sphere(
-    geom_to_world: wp.transform, ray_origin: wp.vec3, ray_direction: wp.vec3, r: float
-) -> tuple[float, wp.vec3]:
-    """Computes ray-sphere intersection.
+def ray_intersect_sphere(ray_origin: wp.vec3, ray_direction: wp.vec3, r: float) -> tuple[float, wp.vec3]:
+    """Computes ray-sphere intersection in the sphere's local frame.
 
     Args:
-        geom_to_world: The world transform of the sphere.
-        ray_origin: The origin of the ray in world space.
-        ray_direction: The direction of the ray in world space.
+        ray_origin: The origin of the ray in the sphere's local frame.
+        ray_direction: The direction of the ray in the sphere's local frame.
         r: The radius of the sphere.
 
     Returns:
-        The distance and normal of the intersection point along the ray, or -1.0 and a zero vector if there is no intersection.
+        The distance and local-space normal of the intersection point along the ray, or -1.0 and a zero vector if there is no intersection.
     """
     t_hit = -1.0
     normal = wp.vec3(0.0)
 
-    ray_origin_local, ray_direction_local = map_ray_to_local(geom_to_world, ray_origin, ray_direction)
-
-    d_len_sq = wp.dot(ray_direction_local, ray_direction_local)
+    d_len_sq = wp.dot(ray_direction, ray_direction)
     if d_len_sq < MINVAL:
         return t_hit, normal
 
     inv_d_len = 1.0 / wp.sqrt(d_len_sq)
-    d_local_norm = ray_direction_local * inv_d_len
+    d_local_norm = ray_direction * inv_d_len
 
-    oc = ray_origin_local
+    oc = ray_origin
     b = wp.dot(oc, d_local_norm)
     c = wp.dot(oc, oc) - r * r
 
@@ -114,8 +114,7 @@ def ray_intersect_sphere(
                 t_hit = t2 * inv_d_len
 
     if t_hit >= 0.0:
-        hit_point = ray_origin + t_hit * ray_direction
-        normal = wp.normalize(hit_point - wp.transform_get_translation(geom_to_world))
+        normal = wp.normalize(ray_origin + t_hit * ray_direction)
 
     return t_hit, normal
 
@@ -160,30 +159,25 @@ def ray_intersect_particle_sphere(
 
 
 @wp.func
-def ray_intersect_ellipsoid(
-    geom_to_world: wp.transform, ray_origin: wp.vec3, ray_direction: wp.vec3, semi_axes: wp.vec3
-) -> tuple[float, wp.vec3]:
-    """Computes ray-ellipsoid intersection.
+def ray_intersect_ellipsoid(ray_origin: wp.vec3, ray_direction: wp.vec3, semi_axes: wp.vec3) -> tuple[float, wp.vec3]:
+    """Computes ray-ellipsoid intersection in the ellipsoid's local frame.
 
     The ellipsoid is defined by semi-axes (a, b, c) along the local X, Y, Z axes respectively.
     Based on Inigo Quilez's ellipsoid intersection algorithm.
 
     Args:
-        geom_to_world: The world transform of the ellipsoid.
-        ray_origin: The origin of the ray in world space.
-        ray_direction: The direction of the ray in world space.
+        ray_origin: The origin of the ray in the ellipsoid's local frame.
+        ray_direction: The direction of the ray in the ellipsoid's local frame.
         semi_axes: The semi-axes (a, b, c) of the ellipsoid.
 
     Returns:
-        The distance and normal of the intersection point along the ray, or -1.0 and a zero vector if there is no intersection.
+        The distance and local-space normal of the intersection point along the ray, or -1.0 and a zero vector if there is no intersection.
     """
     t_hit = -1.0
     normal = wp.vec3(0.0)
 
-    ro, rd = map_ray_to_local(geom_to_world, ray_origin, ray_direction)
-
     # Reject degenerate rays (matching sphere/capsule pattern)
-    d_len_sq = wp.dot(rd, rd)
+    d_len_sq = wp.dot(ray_direction, ray_direction)
     if d_len_sq < MINVAL:
         return t_hit, normal
 
@@ -194,8 +188,8 @@ def ray_intersect_ellipsoid(
         return t_hit, normal
 
     # Scale by inverse semi-axes (transforms ellipsoid to unit sphere)
-    ocn = wp.cw_div(ro, ra)
-    rdn = wp.cw_div(rd, ra)
+    ocn = wp.cw_div(ray_origin, ra)
+    rdn = wp.cw_div(ray_direction, ra)
 
     a = wp.dot(rdn, rdn)
     b = wp.dot(ocn, rdn)
@@ -218,11 +212,10 @@ def ray_intersect_ellipsoid(
         t_hit = t2
 
     if t_hit >= 0.0:
-        hit_local = ro + t_hit * rd
+        hit_local = ray_origin + t_hit * ray_direction
         inv_size = safe_div_vec3(wp.vec3(1.0), semi_axes)
         inv_size_sq = wp.cw_mul(inv_size, inv_size)
-        normal_local = wp.cw_mul(hit_local, inv_size_sq)
-        normal = wp.normalize(wp.transform_vector(geom_to_world, normal_local))
+        normal = wp.normalize(wp.cw_mul(hit_local, inv_size_sq))
 
     return t_hit, normal
 
@@ -231,22 +224,17 @@ _IFACE = wp.types.matrix((3, 2), dtype=wp.int32)(1, 2, 0, 2, 0, 1)
 
 
 @wp.func
-def ray_intersect_box(
-    geom_to_world: wp.transform, ray_origin: wp.vec3, ray_direction: wp.vec3, size: wp.vec3
-) -> tuple[float, wp.vec3]:
-    """Computes ray-box intersection.
+def ray_intersect_box(ray_origin: wp.vec3, ray_direction: wp.vec3, size: wp.vec3) -> tuple[float, wp.vec3]:
+    """Computes ray-box intersection in the box's local frame.
 
     Args:
-        geom_to_world: The world transform of the box.
-        ray_origin: The origin of the ray in world space.
-        ray_direction: The direction of the ray in world space.
+        ray_origin: The origin of the ray in the box's local frame.
+        ray_direction: The direction of the ray in the box's local frame.
         size: The half-extents of the box.
 
     Returns:
-        The distance and normal of the intersection point along the ray, or -1.0 and a zero vector if there is no intersection.
+        The distance and local-space normal of the intersection point along the ray, or -1.0 and a zero vector if there is no intersection.
     """
-    ray_origin_local, ray_direction_local = map_ray_to_local(geom_to_world, ray_origin, ray_direction)
-
     t_hit = -1.0
     normal = wp.vec3(0.0)
     t_near = -1.0e10
@@ -254,13 +242,13 @@ def ray_intersect_box(
     hit = 1
 
     for i in range(3):
-        if wp.abs(ray_direction_local[i]) < MINVAL:
-            if ray_origin_local[i] < -size[i] or ray_origin_local[i] > size[i]:
+        if wp.abs(ray_direction[i]) < MINVAL:
+            if ray_origin[i] < -size[i] or ray_origin[i] > size[i]:
                 hit = 0
         else:
-            inv_d_i = 1.0 / ray_direction_local[i]
-            t1 = (-size[i] - ray_origin_local[i]) * inv_d_i
-            t2 = (size[i] - ray_origin_local[i]) * inv_d_i
+            inv_d_i = 1.0 / ray_direction[i]
+            t1 = (-size[i] - ray_origin[i]) * inv_d_i
+            t2 = (size[i] - ray_origin[i]) * inv_d_i
 
             if t1 > t2:
                 temp = t1
@@ -280,75 +268,72 @@ def ray_intersect_box(
         # Identify the hit face by matching the solved face distance to t_hit.
         normal_local = wp.vec3(0.0)
         for i in range(3):
-            if wp.abs(ray_direction_local[i]) > EPSILON:
+            if wp.abs(ray_direction[i]) > EPSILON:
                 for side in range(-1, 2, 2):
-                    sol = (float(side) * size[i] - ray_origin_local[i]) / ray_direction_local[i]
+                    sol = (float(side) * size[i] - ray_origin[i]) / ray_direction[i]
                     if sol >= 0.0:
                         id0 = _IFACE[i][0]
                         id1 = _IFACE[i][1]
-                        p0 = ray_origin_local[id0] + sol * ray_direction_local[id0]
-                        p1 = ray_origin_local[id1] + sol * ray_direction_local[id1]
+                        p0 = ray_origin[id0] + sol * ray_direction[id0]
+                        p1 = ray_origin[id1] + sol * ray_direction[id1]
                         if wp.abs(p0) <= size[id0] and wp.abs(p1) <= size[id1]:
                             if wp.abs(sol - t_hit) < EPSILON:
                                 normal_local[i] = -1.0 if side < 0 else 1.0
-        normal = wp.normalize(wp.transform_vector(geom_to_world, normal_local))
+        normal = wp.normalize(normal_local)
 
     return t_hit, normal
 
 
 @wp.func
-def ray_intersect_capsule(
-    geom_to_world: wp.transform, ray_origin: wp.vec3, ray_direction: wp.vec3, r: float, h: float
-) -> tuple[float, wp.vec3]:
-    """Computes ray-capsule intersection.
+def ray_intersect_capsule(ray_origin: wp.vec3, ray_direction: wp.vec3, r: float, h: float) -> tuple[float, wp.vec3]:
+    """Computes ray-capsule intersection in the capsule's local frame.
+
+    The capsule is centered at the local origin with its cylindrical axis along local Z.
 
     Args:
-        geom_to_world: The world transform of the capsule.
-        ray_origin: The origin of the ray in world space.
-        ray_direction: The direction of the ray in world space.
+        ray_origin: The origin of the ray in the capsule's local frame.
+        ray_direction: The direction of the ray in the capsule's local frame.
         r: The radius of the capsule.
         h: The half-height of the capsule's cylindrical part.
 
     Returns:
-        The distance and normal of the intersection point along the ray, or -1.0 and a zero vector if there is no intersection.
+        The distance and local-space normal of the intersection point along the ray, or -1.0 and a zero vector if there is no intersection.
     """
     t_hit = -1.0
     normal = wp.vec3(0.0)
 
-    ray_origin_local, ray_direction_local = map_ray_to_local(geom_to_world, ray_origin, ray_direction)
-
-    d_len_sq = wp.dot(ray_direction_local, ray_direction_local)
+    d_len_sq = wp.dot(ray_direction, ray_direction)
     if d_len_sq < MINVAL:
         return t_hit, normal
 
     inv_d_len = 1.0 / wp.sqrt(d_len_sq)
-    d_local_norm = ray_direction_local * inv_d_len
+    d_local_norm = ray_direction * inv_d_len
 
     min_t = 1.0e10
 
     # Intersection with cylinder body
     a_cyl = d_local_norm[0] * d_local_norm[0] + d_local_norm[1] * d_local_norm[1]
     if a_cyl > MINVAL:
-        b_cyl = 2.0 * (ray_origin_local[0] * d_local_norm[0] + ray_origin_local[1] * d_local_norm[1])
-        c_cyl = ray_origin_local[0] * ray_origin_local[0] + ray_origin_local[1] * ray_origin_local[1] - r * r
+        b_cyl = 2.0 * (ray_origin[0] * d_local_norm[0] + ray_origin[1] * d_local_norm[1])
+        c_cyl = ray_origin[0] * ray_origin[0] + ray_origin[1] * ray_origin[1] - r * r
         delta_cyl = b_cyl * b_cyl - 4.0 * a_cyl * c_cyl
         if delta_cyl >= 0.0:
             sqrt_delta_cyl = wp.sqrt(delta_cyl)
             t1 = (-b_cyl - sqrt_delta_cyl) / (2.0 * a_cyl)
             if t1 >= 0.0:
-                z = ray_origin_local[2] + t1 * d_local_norm[2]
+                z = ray_origin[2] + t1 * d_local_norm[2]
                 if wp.abs(z) <= h:
                     min_t = wp.min(min_t, t1)
 
             t2 = (-b_cyl + sqrt_delta_cyl) / (2.0 * a_cyl)
             if t2 >= 0.0:
-                z = ray_origin_local[2] + t2 * d_local_norm[2]
+                z = ray_origin[2] + t2 * d_local_norm[2]
                 if wp.abs(z) <= h:
                     min_t = wp.min(min_t, t2)
 
     # Intersection with sphere caps
     # Top cap
-    oc_top = ray_origin_local - wp.vec3(0.0, 0.0, h)
+    oc_top = ray_origin - wp.vec3(0.0, 0.0, h)
     b_top = wp.dot(oc_top, d_local_norm)
     c_top = wp.dot(oc_top, oc_top) - r * r
     delta_top = b_top * b_top - c_top
@@ -356,16 +341,16 @@ def ray_intersect_capsule(
         sqrt_delta_top = wp.sqrt(delta_top)
         t1_top = -b_top - sqrt_delta_top
         if t1_top >= 0.0:
-            if (ray_origin_local[2] + t1_top * d_local_norm[2]) >= h:
+            if (ray_origin[2] + t1_top * d_local_norm[2]) >= h:
                 min_t = wp.min(min_t, t1_top)
 
         t2_top = -b_top + sqrt_delta_top
         if t2_top >= 0.0:
-            if (ray_origin_local[2] + t2_top * d_local_norm[2]) >= h:
+            if (ray_origin[2] + t2_top * d_local_norm[2]) >= h:
                 min_t = wp.min(min_t, t2_top)
 
     # Bottom cap
-    oc_bot = ray_origin_local - wp.vec3(0.0, 0.0, -h)
+    oc_bot = ray_origin - wp.vec3(0.0, 0.0, -h)
     b_bot = wp.dot(oc_bot, d_local_norm)
     c_bot = wp.dot(oc_bot, oc_bot) - r * r
     delta_bot = b_bot * b_bot - c_bot
@@ -373,86 +358,122 @@ def ray_intersect_capsule(
         sqrt_delta_bot = wp.sqrt(delta_bot)
         t1_bot = -b_bot - sqrt_delta_bot
         if t1_bot >= 0.0:
-            if (ray_origin_local[2] + t1_bot * d_local_norm[2]) <= -h:
+            if (ray_origin[2] + t1_bot * d_local_norm[2]) <= -h:
                 min_t = wp.min(min_t, t1_bot)
 
         t2_bot = -b_bot + sqrt_delta_bot
         if t2_bot >= 0.0:
-            if (ray_origin_local[2] + t2_bot * d_local_norm[2]) <= -h:
+            if (ray_origin[2] + t2_bot * d_local_norm[2]) <= -h:
                 min_t = wp.min(min_t, t2_bot)
 
     if min_t < 1.0e9:
         t_hit = min_t * inv_d_len
 
     if t_hit >= 0.0:
-        hit_local = ray_origin_local + t_hit * ray_direction_local
+        hit_local = ray_origin + t_hit * ray_direction
         z_clamped = wp.min(h, wp.max(-h, hit_local[2]))
         axis_point = wp.vec3(0.0, 0.0, z_clamped)
-        normal_local = wp.normalize(hit_local - axis_point)
-        normal = wp.normalize(wp.transform_vector(geom_to_world, normal_local))
+        normal = wp.normalize(hit_local - axis_point)
 
     return t_hit, normal
 
 
 @wp.func
 def ray_intersect_cylinder(
-    geom_to_world: wp.transform, ray_origin: wp.vec3, ray_direction: wp.vec3, r: float, h: float
+    ray_origin: wp.vec3, ray_direction: wp.vec3, r: float, h: float, barrel_radius: float = 0.0
 ) -> tuple[float, wp.vec3]:
-    """Computes ray-cylinder intersection.
+    """Computes ray-cylinder intersection in the cylinder's local frame.
+
+    The cylinder is centered at the local origin with its axis along local Z.
 
     Args:
-        geom_to_world: The world transform of the cylinder.
-        ray_origin: The origin of the ray in world space.
-        ray_direction: The direction of the ray in world space.
+        ray_origin: The origin of the ray in the cylinder's local frame.
+        ray_direction: The direction of the ray in the cylinder's local frame.
         r: The radius of the cylinder.
         h: The half-height of the cylinder.
+        barrel_radius: Radius of the circular side profile. Zero creates straight sides. Ray casting
+            approximates a nonzero circular profile with a truncated ellipsoid that matches its end
+            and equatorial radii.
 
     Returns:
-        The distance and normal of the intersection point along the ray, or -1.0 and a zero vector if there is no intersection.
+        The distance and local-space normal of the intersection point along the ray, or -1.0 and a zero vector if there is no intersection.
     """
-    ray_origin_local, ray_direction_local = map_ray_to_local(geom_to_world, ray_origin, ray_direction)
-
     t_hit = -1.0
     normal = wp.vec3(0.0)
     min_t = 1.0e10
+    axial_scale = 0.0
+    equatorial_radius = r
 
-    # Intersection with cylinder body
-    a_cyl = ray_direction_local[0] * ray_direction_local[0] + ray_direction_local[1] * ray_direction_local[1]
-    if a_cyl > MINVAL:
-        b_cyl = 2.0 * (ray_origin_local[0] * ray_direction_local[0] + ray_origin_local[1] * ray_direction_local[1])
-        c_cyl = ray_origin_local[0] * ray_origin_local[0] + ray_origin_local[1] * ray_origin_local[1] - r * r
-        delta_cyl = b_cyl * b_cyl - 4.0 * a_cyl * c_cyl
-        if delta_cyl >= 0.0:
-            sqrt_delta_cyl = wp.sqrt(delta_cyl)
-            inv_2a = 1.0 / (2.0 * a_cyl)
-            t1 = (-b_cyl - sqrt_delta_cyl) * inv_2a
-            if t1 >= 0.0:
-                z = ray_origin_local[2] + t1 * ray_direction_local[2]
-                if wp.abs(z) <= h:
-                    min_t = wp.min(min_t, t1)
+    if barrel_radius > 0.0 and h > MINVAL:
+        equatorial_radius = r + barrel_radius - wp.sqrt(barrel_radius * barrel_radius - h * h)
+        axial_scale = (equatorial_radius * equatorial_radius - r * r) / (h * h)
 
-            t2 = (-b_cyl + sqrt_delta_cyl) * inv_2a
-            if t2 >= 0.0:
-                z = ray_origin_local[2] + t2 * ray_direction_local[2]
-                if wp.abs(z) <= h:
-                    min_t = wp.min(min_t, t2)
+    # A straight cylinder is the axial_scale=0 case. For barrel cylinders this
+    # is a truncated ellipsoid matching the circular profile at its ends and equator.
+    a_side = (
+        ray_direction[0] * ray_direction[0]
+        + ray_direction[1] * ray_direction[1]
+        + axial_scale * ray_direction[2] * ray_direction[2]
+    )
+    if a_side > MINVAL:
+        b_side = 2.0 * (
+            ray_origin[0] * ray_direction[0]
+            + ray_origin[1] * ray_direction[1]
+            + axial_scale * ray_origin[2] * ray_direction[2]
+        )
+        c_side = (
+            ray_origin[0] * ray_origin[0]
+            + ray_origin[1] * ray_origin[1]
+            + axial_scale * ray_origin[2] * ray_origin[2]
+            - equatorial_radius * equatorial_radius
+        )
+        delta_side = b_side * b_side - 4.0 * a_side * c_side
+        if delta_side >= 0.0:
+            sqrt_delta_side = wp.sqrt(delta_side)
+            inv_2a_side = 1.0 / (2.0 * a_side)
+            t_side = (-b_side - sqrt_delta_side) * inv_2a_side
+            z_side = ray_origin[2] + t_side * ray_direction[2]
+            if t_side < 0.0 or wp.abs(z_side) > h:
+                t_side = (-b_side + sqrt_delta_side) * inv_2a_side
+                z_side = ray_origin[2] + t_side * ray_direction[2]
+            if t_side >= 0.0 and wp.abs(z_side) <= h:
+                min_t = t_side
+
+    # Refine the ellipsoid hit against the circular profile. One Newton step
+    # removes most of the approximation error without a quartic torus solver.
+    if barrel_radius > 0.0 and min_t < 1.0e10:
+        hit_side = ray_origin + min_t * ray_direction
+        radial_side = wp.sqrt(hit_side[0] * hit_side[0] + hit_side[1] * hit_side[1])
+        circle_sq = barrel_radius * barrel_radius - hit_side[2] * hit_side[2]
+        if radial_side > MINVAL and circle_sq > MINVAL:
+            circle_side = wp.sqrt(circle_sq)
+            end_radial_offset = wp.sqrt(barrel_radius * barrel_radius - h * h)
+            residual = radial_side - r - circle_side + end_radial_offset
+            radial_derivative = (hit_side[0] * ray_direction[0] + hit_side[1] * ray_direction[1]) / radial_side
+            axial_derivative = hit_side[2] * ray_direction[2] / circle_side
+            derivative = radial_derivative + axial_derivative
+            if wp.abs(derivative) > MINVAL:
+                refined_t = min_t - residual / derivative
+                refined_z = ray_origin[2] + refined_t * ray_direction[2]
+                if refined_t >= 0.0 and wp.abs(refined_z) <= h:
+                    min_t = refined_t
 
     # Intersection with caps
-    if wp.abs(ray_direction_local[2]) > MINVAL:
-        inv_d_z = 1.0 / ray_direction_local[2]
+    if wp.abs(ray_direction[2]) > MINVAL:
+        inv_d_z = 1.0 / ray_direction[2]
         # Top cap
-        t_top = (h - ray_origin_local[2]) * inv_d_z
+        t_top = (h - ray_origin[2]) * inv_d_z
         if t_top >= 0.0:
-            x = ray_origin_local[0] + t_top * ray_direction_local[0]
-            y = ray_origin_local[1] + t_top * ray_direction_local[1]
+            x = ray_origin[0] + t_top * ray_direction[0]
+            y = ray_origin[1] + t_top * ray_direction[1]
             if x * x + y * y <= r * r:
                 min_t = wp.min(min_t, t_top)
 
         # Bottom cap
-        t_bot = (-h - ray_origin_local[2]) * inv_d_z
+        t_bot = (-h - ray_origin[2]) * inv_d_z
         if t_bot >= 0.0:
-            x = ray_origin_local[0] + t_bot * ray_direction_local[0]
-            y = ray_origin_local[1] + t_bot * ray_direction_local[1]
+            x = ray_origin[0] + t_bot * ray_direction[0]
+            y = ray_origin[1] + t_bot * ray_direction[1]
             if x * x + y * y <= r * r:
                 min_t = wp.min(min_t, t_bot)
 
@@ -460,39 +481,44 @@ def ray_intersect_cylinder(
         t_hit = min_t
 
     if t_hit >= 0.0:
-        hit_local = ray_origin_local + t_hit * ray_direction_local
+        hit_local = ray_origin + t_hit * ray_direction
         z_clamped = wp.min(h, wp.max(-h, hit_local[2]))
         if z_clamped >= (h - EPSILON) or z_clamped <= (-h + EPSILON):
             normal_local = wp.vec3(0.0, 0.0, z_clamped)
+        elif barrel_radius > 0.0:
+            radial_length = wp.sqrt(hit_local[0] * hit_local[0] + hit_local[1] * hit_local[1])
+            circle_height = wp.sqrt(barrel_radius * barrel_radius - hit_local[2] * hit_local[2])
+            normal_local = wp.vec3(
+                hit_local[0] / radial_length,
+                hit_local[1] / radial_length,
+                hit_local[2] / circle_height,
+            )
         else:
-            normal_local = wp.normalize(hit_local - wp.vec3(0.0, 0.0, z_clamped))
-        normal = wp.normalize(wp.transform_vector(geom_to_world, normal_local))
+            normal_local = wp.vec3(hit_local[0], hit_local[1], axial_scale * hit_local[2])
+        normal = wp.normalize(normal_local)
 
     return t_hit, normal
 
 
 @wp.func
 def ray_intersect_cone(
-    geom_to_world: wp.transform, ray_origin: wp.vec3, ray_direction: wp.vec3, radius: float, half_height: float
+    ray_origin: wp.vec3, ray_direction: wp.vec3, radius: float, half_height: float
 ) -> tuple[float, wp.vec3]:
-    """Computes ray-cone intersection.
+    """Computes ray-cone intersection in the cone's local frame.
 
-    The cone is oriented along the Z-axis with the tip at +half_height and base at -half_height.
+    The cone is oriented along the local Z-axis with the tip at +half_height and base at -half_height.
 
     Args:
-        geom_to_world: The world transform of the cone.
-        ray_origin: The origin of the ray in world space.
-        ray_direction: The direction of the ray in world space.
+        ray_origin: The origin of the ray in the cone's local frame.
+        ray_direction: The direction of the ray in the cone's local frame.
         radius: The radius of the cone's base.
         half_height: Half the height of the cone (distance from center to tip/base).
 
     Returns:
-        The distance and normal of the intersection point along the ray, or -1.0 and a zero vector if there is no intersection.
+        The distance and local-space normal of the intersection point along the ray, or -1.0 and a zero vector if there is no intersection.
     """
     t_hit = -1.0
     normal = wp.vec3(0.0)
-
-    ray_origin_local, ray_direction_local = map_ray_to_local(geom_to_world, ray_origin, ray_direction)
 
     if wp.abs(half_height) < MINVAL:
         return t_hit, normal
@@ -501,8 +527,6 @@ def ray_intersect_cone(
         return t_hit, normal
 
     # pa = tip (cone extremes), pb = base center, ra = 0 (tip radius), rb = radius (base radius)
-    ro = ray_origin_local
-    rd = ray_direction_local
     # Check conventions.rst, section "Newton Collision Primitives"
     pa = wp.vec3(0.0, 0.0, half_height)  # tip at +half_height
     pb = wp.vec3(0.0, 0.0, -half_height)  # base center at -half_height
@@ -510,25 +534,25 @@ def ray_intersect_cone(
     rb = radius  # radius at base
 
     ba = pb - pa
-    oa = ro - pa
-    ob = ro - pb
+    oa = ray_origin - pa
+    ob = ray_origin - pb
     m0 = wp.dot(ba, ba)
     m1 = wp.dot(oa, ba)
-    m2 = wp.dot(rd, ba)
-    m3 = wp.dot(rd, oa)
+    m2 = wp.dot(ray_direction, ba)
+    m3 = wp.dot(ray_direction, oa)
     m5 = wp.dot(oa, oa)
     m9 = wp.dot(ob, ba)
 
     # caps
     if m1 < 0.0:
-        temp = oa * m2 - rd * m1
+        temp = oa * m2 - ray_direction * m1
         if wp.dot(temp, temp) < (ra * ra * m2 * m2):
             if wp.abs(m2) > MINVAL:
                 t_hit = -m1 / m2
     elif m9 > 0.0:
         if wp.abs(m2) > MINVAL:
             t = -m9 / m2
-            temp_ob = ob + rd * t
+            temp_ob = ob + ray_direction * t
             if wp.dot(temp_ob, temp_ob) < (rb * rb):
                 t_hit = t
 
@@ -548,7 +572,7 @@ def ray_intersect_cone(
                 t_hit = t
 
     if t_hit >= 0.0:
-        hit_local = ray_origin_local + t_hit * ray_direction_local
+        hit_local = ray_origin + t_hit * ray_direction
         if wp.abs(hit_local[2] - half_height) <= EPSILON:
             normal_local = wp.vec3(0.0, 0.0, 1.0)
         elif wp.abs(hit_local[2] + half_height) <= EPSILON:
@@ -562,46 +586,51 @@ def ray_intersect_cone(
                 denom = wp.max(2.0 * wp.abs(half_height), EPSILON)
                 slope = radius / denom
                 normal_local = wp.normalize(wp.vec3(hit_local[0], hit_local[1], slope * radial))
-        normal = wp.normalize(wp.transform_vector(geom_to_world, normal_local))
+        normal = wp.normalize(normal_local)
 
     return t_hit, normal
 
 
 @wp.func
 def ray_intersect_plane(
-    geom_to_world: wp.transform, ray_origin: wp.vec3, ray_direction: wp.vec3, size: wp.vec3
+    ray_origin: wp.vec3,
+    ray_direction: wp.vec3,
+    size: wp.vec3,
+    enable_backface_culling: bool = False,
 ) -> tuple[float, wp.vec3]:
-    """Computes ray-plane intersection.
+    """Computes ray-plane intersection in the plane's local frame.
 
     The plane lies at z = 0 in local space with normal along +Z.  ``size`` holds ``(width, length, 0)``:
-    the full extents along local X and Y.  A value of ``0`` means infinite in that axis.  The plane is
-    double-sided: rays approaching from either side register intersections. Callers that need
-    back-face culling can check ``wp.dot(ray_direction, normal)`` themselves.
+    the full extents along local X and Y.  A value of ``0`` means infinite in that axis.  By default the
+    plane is double-sided: rays approaching from either side register intersections. Set
+    ``enable_backface_culling`` to reject rays that approach from behind the +Z normal.
 
     Args:
-        geom_to_world: The world transform of the plane.
-        ray_origin: The origin of the ray in world space.
-        ray_direction: The direction of the ray in world space.
+        ray_origin: The origin of the ray in the plane's local frame.
+        ray_direction: The direction of the ray in the plane's local frame.
         size: ``(width, length, 0)`` -- full extents; ``0`` = infinite.
+        enable_backface_culling: When ``True``, reject hits approached from behind the +Z normal.
 
     Returns:
-        The distance and normal of the intersection point along the ray, or -1.0 and a zero vector if there is no intersection.
+        The distance and local-space normal of the intersection point along the ray, or -1.0 and a zero vector if there is no intersection.
     """
     t_hit = -1.0
     normal = wp.vec3(0.0)
 
-    ro, rd = map_ray_to_local(geom_to_world, ray_origin, ray_direction)
-
     # Ray parallel to the plane (or degenerate)
-    if wp.abs(rd[2]) < PARALLEL_TOL:
+    if wp.abs(ray_direction[2]) < PARALLEL_TOL:
         return t_hit, normal
 
-    t = -ro[2] / rd[2]
+    # Cull rays approaching from behind (aligned with the +Z normal)
+    if enable_backface_culling and ray_direction[2] > 0.0:
+        return t_hit, normal
+
+    t = -ray_origin[2] / ray_direction[2]
     if t < 0.0:
         return t_hit, normal
 
-    hit_x = ro[0] + t * rd[0]
-    hit_y = ro[1] + t * rd[1]
+    hit_x = ray_origin[0] + t * ray_direction[0]
+    hit_y = ray_origin[1] + t * ray_direction[1]
 
     half_w = size[0] * 0.5
     half_l = size[1] * 0.5
@@ -612,569 +641,428 @@ def ray_intersect_plane(
         return t_hit, normal
 
     t_hit = t
-    normal = wp.normalize(wp.transform_vector(geom_to_world, wp.vec3(0.0, 0.0, 1.0)))
+    normal = wp.vec3(0.0, 0.0, 1.0)
 
     return t_hit, normal
 
 
-@wp.func
-def ray_intersect_mesh(
-    geom_to_world: wp.transform,
-    ray_origin: wp.vec3,
-    ray_direction: wp.vec3,
-    size: wp.vec3,
-    mesh_id: wp.uint64,
-    enable_backface_culling: bool,
-    max_t: float,
-) -> tuple[float, wp.vec3, float, float, int]:
-    """Computes ray-mesh intersection using Warp's built-in mesh query.
-
-    Args:
-        geom_to_world: The world transform of the mesh.
-        ray_origin: The origin of the ray in world space.
-        ray_direction: The direction of the ray in world space.
-        size: The 3D scale of the mesh.
-        mesh_id: The Warp mesh ID for raycasting.
-        enable_backface_culling: When ``True``, reject hits whose triangle normal
-            is aligned with the ray direction (back faces).
-        max_t: Maximum parameter ``t`` along the (local, scaled) ray to consider.
-
-    Returns:
-        Tuple ``(distance, normal, u, v, face_index)``. The distance and normal of the intersection point along the ray, or -1.0 and a zero vector if there is no intersection; on miss, ``u`` and ``v`` are ``0.0`` and ``face_index`` is -1.
-    """
-    if mesh_id == wp.uint64(0):
-        return -1.0, wp.vec3(0.0), 0.0, 0.0, -1
-
-    ray_origin_local, ray_direction_local = map_ray_to_local_scaled(geom_to_world, size, ray_origin, ray_direction)
-
-    query = wp.mesh_query_ray(mesh_id, ray_origin_local, ray_direction_local, max_t)
-
-    if query.result:
-        if not enable_backface_culling or wp.dot(ray_direction_local, query.normal) < 0.0:
-            normal = wp.normalize(wp.transform_vector(geom_to_world, safe_div_vec3(query.normal, size)))
-            return query.t, normal, query.u, query.v, query.face
-
-    return -1.0, wp.vec3(0.0), 0.0, 0.0, -1
-
-
-@wp.func
-def ray_intersect_mesh_no_transform(
-    mesh_id: wp.uint64,
-    ray_origin: wp.vec3,
-    ray_direction: wp.vec3,
-    enable_backface_culling: bool,
-    max_t: float,
-) -> tuple[float, wp.vec3, float, float, int]:
-    """Ray-mesh intersection when the mesh is already expressed in world space.
-
-    Requires the Warp ``wp.Mesh`` handle be supplied in ``mesh_id``.
-
-    Args:
-        mesh_id: The Warp mesh ID for raycasting.
-        ray_origin: The origin of the ray in world space.
-        ray_direction: The direction of the ray in world space.
-        enable_backface_culling: When ``True``, reject hits whose triangle normal
-            is aligned with the ray direction (back faces).
-        max_t: Maximum parameter ``t`` along the ray to consider.
-
-    Returns:
-        Tuple ``(distance, normal, u, v, face_index)``. The distance and normal of the intersection point along the ray, or -1.0 and a zero vector if there is no intersection; on miss, ``u`` and ``v`` are ``0.0`` and ``face_index`` is -1.
-    """
-    if mesh_id == wp.uint64(0):
-        return -1.0, wp.vec3(0.0), 0.0, 0.0, -1
-
-    query = wp.mesh_query_ray(mesh_id, ray_origin, ray_direction, max_t)
-    if query.result:
-        if not enable_backface_culling or wp.dot(ray_direction, query.normal) < 0.0:
-            return query.t, wp.normalize(query.normal), query.u, query.v, query.face
-
-    return -1.0, wp.vec3(0.0), 0.0, 0.0, -1
-
-
-@wp.func
-def ray_intersect_heightfield(
-    geom_to_world: wp.transform,
-    hfd: HeightfieldData,
-    elevation_data: wp.array[wp.float32],
-    ray_origin: wp.vec3,
-    ray_direction: wp.vec3,
-) -> tuple[float, wp.vec3]:
-    """Ray-heightfield intersection in world space.
-
-    Thin wrapper that maps the ray into the heightfield's local frame, delegates
-    to ``ray_intersect_heightfield_local`` (in ``utils.heightfield``), and rotates
-    the local surface normal back to world space.
-
-    Args:
-        geom_to_world: World transform of the heightfield.
-        hfd: Per-shape heightfield metadata (extents, grid size, z-range, data offset).
-        elevation_data: Concatenated normalized [0, 1] elevation array.
-        ray_origin: Ray origin in world space.
-        ray_direction: Ray direction in world space.
-
-    Returns:
-        The distance along the ray and the world-space surface normal at the
-        intersection, or ``-1.0`` and a zero vector on miss.
-    """
-    ro, rd = map_ray_to_local(geom_to_world, ray_origin, ray_direction)
-    t_hit, normal_local = ray_intersect_heightfield_local(hfd, elevation_data, ro, rd)
-    if t_hit < 0.0:
-        return -1.0, wp.vec3(0.0)
-    normal_world = wp.normalize(wp.transform_vector(geom_to_world, normal_local))
-    return t_hit, normal_world
-
-
-@wp.func
-def ray_for_pixel(
-    camera_position: wp.vec3,
-    camera_direction: wp.vec3,
-    camera_up: wp.vec3,
-    camera_right: wp.vec3,
-    fov_scale: float,
-    camera_aspect_ratio: float,
-    resolution: wp.vec2,
-    pixel_x: int,
-    pixel_y: int,
-):
-    """Generate a ray for a given pixel in a perspective camera.
-
-    Args:
-        camera_position: Camera position in world space
-        camera_direction: Camera forward direction (normalized)
-        camera_up: Camera up direction (normalized)
-        camera_right: Camera right direction (normalized)
-        fov_scale: Scale factor for field of view, ``tan(fov_radians/2)``
-        camera_aspect_ratio: Width/height aspect ratio
-        resolution: Image resolution as (width, height)
-        pixel_x: Pixel x coordinate (0 to width-1)
-        pixel_y: Pixel y coordinate (0 to height-1)
-
-    Returns:
-        Tuple of (ray_origin, ray_direction) in world space, direction normalized.
-    """
-    width = resolution[0]
-    height = resolution[1]
-
-    # Convert to normalized coordinates [-1, 1] with (0,0) at center
-    ndc_x = (2.0 * float(pixel_x) + 1.0) / width - 1.0
-    ndc_y = 1.0 - (2.0 * float(pixel_y) + 1.0) / height  # Flip Y axis
-
-    # Apply field of view and aspect ratio
-    cam_x = ndc_x * fov_scale * camera_aspect_ratio
-    cam_y = ndc_y * fov_scale
-    cam_z = 1.0  # Forward is negative Z in camera space (camera_direction already looks at -Z)
-
-    ray_dir_camera = wp.vec3(cam_x, cam_y, cam_z)
-
-    # Transform ray direction from camera to world space
-    ray_direction_world = (
-        camera_right * ray_dir_camera[0] + camera_up * ray_dir_camera[1] + camera_direction * ray_dir_camera[2]
-    )
-    ray_direction_world = wp.normalize(ray_direction_world)
-
-    return camera_position, ray_direction_world
-
-
-def _make_raycast_funcs(enable_heightfields: bool):
-    """Generate ``ray_intersect_geom`` + raycast kernels with HFIELD support gated.
-
-    When ``enable_heightfields`` is ``False``, ``wp.static`` strips the HFIELD
-    branch, the ``shape_heightfield_index`` / ``heightfield_data`` reads, and the
-    ``ray_intersect_heightfield`` call from the compiled outputs, so scenes
-    without heightfields pay no per-thread HFIELD overhead. Same factory pattern
-    as :func:`~newton._src.geometry.sdf_contact._create_sdf_contact_funcs`.
-
-    The HFIELD lookup lives inside ``ray_intersect_geom`` so kernels just thread
-    the per-Model arrays through without any per-shape setup; only HFIELD shapes
-    actually read from those arrays.
+def _make_ray_intersect_mesh(compute_normal: bool):
+    """Build a ray-mesh intersection ``@wp.func``, specialized at compile time on whether the
+    surface normal is computed. ``wp.static(compute_normal)`` folds away the normal work in the
+    depth-only / shadow variant, so no code is duplicated (see :data:`ray_intersect_mesh` and
+    :data:`ray_intersect_mesh_no_normal`).
     """
 
     @wp.func
-    def ray_intersect_geom(
+    def ray_intersect_mesh(
+        ray_origin: wp.vec3,
+        ray_direction: wp.vec3,
+        size: wp.vec3,
+        mesh_id: wp.uint64,
+        enable_backface_culling: bool,
+        max_t: float,
+        root: int = -1,
+    ) -> tuple[float, wp.vec3, float, float, int]:
+        """Computes ray-mesh intersection in the mesh's local frame using Warp's built-in mesh query.
+
+        Args:
+            ray_origin: The origin of the ray in the mesh's local frame.
+            ray_direction: The direction of the ray in the mesh's local frame.
+            size: The 3D scale of the mesh, used to scale-correct the returned local normal.
+            mesh_id: The Warp mesh ID for raycasting.
+            enable_backface_culling: When ``True``, reject hits whose triangle normal
+                is aligned with the ray direction (back faces).
+            max_t: Maximum parameter ``t`` along the local ray to consider.
+            root: Root node index for grouped mesh traversal, or ``-1`` for the global root.
+
+        Returns:
+            Tuple ``(distance, normal, u, v, face_index)``. The distance along the ray and the local-space normal of the intersection point (a zero vector in the ``no_normal`` variant), or -1.0 and a zero vector if there is no intersection; on miss, ``u`` and ``v`` are ``0.0`` and ``face_index`` is -1.
+        """
+        if mesh_id == wp.uint64(0):
+            return -1.0, wp.vec3(0.0), 0.0, 0.0, -1
+
+        query = wp.mesh_query_ray(mesh_id, ray_origin, ray_direction, max_t, root)
+
+        if query.result:
+            if not enable_backface_culling or wp.dot(ray_direction, query.normal) < 0.0:
+                normal = wp.vec3(0.0)
+                if wp.static(compute_normal):
+                    normal = wp.normalize(safe_div_vec3(query.normal, size))
+                return query.t, normal, query.u, query.v, query.face
+
+        return -1.0, wp.vec3(0.0), 0.0, 0.0, -1
+
+    return ray_intersect_mesh
+
+
+ray_intersect_mesh = _make_ray_intersect_mesh(True)
+ray_intersect_mesh_no_normal = _make_ray_intersect_mesh(False)
+
+
+@wp.func
+def ray_intersect_mesh_anyhit(
+    ray_origin: wp.vec3,
+    ray_direction: wp.vec3,
+    mesh_id: wp.uint64,
+    max_t: float,
+    root: int = -1,
+) -> float:
+    """Tests whether a ray hits a mesh within ``max_t``, in the mesh's local frame.
+
+    Uses Warp's any-hit mesh query, which returns on the first intersection without
+    searching for the closest one -- cheaper than :func:`ray_intersect_mesh` for
+    occlusion/shadow rays that only need existence of a hit.
+
+    Args:
+        ray_origin: The origin of the ray in the mesh's local frame.
+        ray_direction: The direction of the ray in the mesh's local frame.
+        mesh_id: The Warp mesh ID for raycasting.
+        max_t: Maximum parameter ``t`` along the local ray to consider.
+        root: Root node index for grouped mesh traversal, or ``-1`` for the global root.
+
+    Returns:
+        ``0.0`` if the ray hits the mesh within ``max_t``, otherwise ``-1.0``.
+    """
+    if mesh_id == wp.uint64(0):
+        return -1.0
+
+    hit = wp.mesh_query_ray_anyhit(mesh_id, ray_origin, ray_direction, max_t, root)
+
+    if hit:
+        return 0.0
+
+    return -1.0
+
+
+def _make_ray_intersect_shape(compute_normal: bool):
+    """Build the primitive-dispatch ``@wp.func``, specialized at compile time on whether the
+    surface normal is computed. ``wp.static(compute_normal)`` folds away the normal transform in
+    the depth-only / shadow variant (and, being unused, the primitives' local-normal work is then
+    dead-code-eliminated), so no code is duplicated (see :data:`ray_intersect_shape` and
+    :data:`ray_intersect_shape_no_normal`).
+    """
+
+    @wp.func
+    def ray_intersect_shape(
         geom_to_world: wp.transform,
         size: wp.vec3,
         geomtype: int,
         ray_origin: wp.vec3,
         ray_direction: wp.vec3,
-        mesh_id: wp.uint64,
-        shape_idx: int,
-        shape_heightfield_index: wp.array[wp.int32],
-        heightfield_data: wp.array[HeightfieldData],
-        heightfield_elevations: wp.array[wp.float32],
+        enable_backface_culling: bool,
     ) -> tuple[float, wp.vec3]:
-        """Dispatches to the appropriate ray-shape intersection routine.
+        """Maps a world-space ray into the shape's local frame, dispatches to the matching primitive routine, and rotates the normal back to world.
 
-        For non-HFIELD shapes the trailing four arguments are not read; callers
-        may pass ``None`` for the three arrays. The HFIELD branch (and every
-        access to ``shape_heightfield_index`` / ``heightfield_data`` /
-        ``heightfield_elevations``) is stripped from the compile unit when
-        ``enable_heightfields`` is ``False``.
+        Handles primitive shapes only. Mesh-backed shapes (MESH, CONVEX_MESH, HFIELD) are
+        intersected via :func:`ray_intersect_mesh`; callers dispatch on the geometry type and
+        pick the matching routine.
 
         Args:
             geom_to_world: The world transform of the shape.
             size: The size of the geometry.
             geomtype: The type of the geometry.
-            ray_origin: The origin of the ray.
-            ray_direction: The direction of the ray.
-            mesh_id: The Warp mesh ID for mesh geometries.
-            shape_idx: Index of the shape being tested; used only when ``geomtype`` is HFIELD to look up its ``HeightfieldData``.
-            shape_heightfield_index: Per-shape index into ``heightfield_data``.
-            heightfield_data: Compact array of ``HeightfieldData`` structs, one per HFIELD shape.
-            heightfield_elevations: Concatenated normalized [0, 1] elevation array indexed via ``HeightfieldData.data_offset``.
+            ray_origin: The origin of the ray in world space.
+            ray_direction: The direction of the ray in world space.
+            enable_backface_culling: When ``True``, reject plane hits approached from
+                behind (ray direction aligned with the plane normal).
 
         Returns:
-            The distance and normal of the intersection point along the ray, or -1.0 and a zero vector if there is no intersection.
+            The distance and world-space normal of the intersection point along the ray (a zero vector in the ``no_normal`` variant), or -1.0 and a zero vector if there is no intersection.
         """
+        ray_origin_local, ray_direction_local = map_ray_to_local(geom_to_world, ray_origin, ray_direction)
+
         t_hit = -1.0
-        normal = wp.vec3(0.0)
+        normal_local = wp.vec3(0.0)
 
         if geomtype == GeoType.PLANE:
-            t_hit, normal = ray_intersect_plane(geom_to_world, ray_origin, ray_direction, size)
-
-        elif geomtype == GeoType.SPHERE:
-            t_hit, normal = ray_intersect_sphere(geom_to_world, ray_origin, ray_direction, size[0])
-
-        elif geomtype == GeoType.BOX:
-            t_hit, normal = ray_intersect_box(geom_to_world, ray_origin, ray_direction, size)
-
-        elif geomtype == GeoType.CAPSULE:
-            t_hit, normal = ray_intersect_capsule(geom_to_world, ray_origin, ray_direction, size[0], size[1])
-
-        elif geomtype == GeoType.CYLINDER:
-            t_hit, normal = ray_intersect_cylinder(geom_to_world, ray_origin, ray_direction, size[0], size[1])
-
-        elif geomtype == GeoType.CONE:
-            t_hit, normal = ray_intersect_cone(geom_to_world, ray_origin, ray_direction, size[0], size[1])
-
-        elif geomtype == GeoType.ELLIPSOID:
-            t_hit, normal = ray_intersect_ellipsoid(geom_to_world, ray_origin, ray_direction, size)
-
-        elif geomtype == GeoType.MESH or geomtype == GeoType.CONVEX_MESH:
-            t_hit, normal, _u, _v, _face = ray_intersect_mesh(
-                geom_to_world, ray_origin, ray_direction, size, mesh_id, False, _DEFAULT_MESH_MAX_T
+            t_hit, normal_local = ray_intersect_plane(
+                ray_origin_local, ray_direction_local, size, enable_backface_culling
             )
+        elif geomtype == GeoType.SPHERE:
+            t_hit, normal_local = ray_intersect_sphere(ray_origin_local, ray_direction_local, size[0])
+        elif geomtype == GeoType.BOX:
+            t_hit, normal_local = ray_intersect_box(ray_origin_local, ray_direction_local, size)
+        elif geomtype == GeoType.CAPSULE:
+            t_hit, normal_local = ray_intersect_capsule(ray_origin_local, ray_direction_local, size[0], size[1])
+        elif geomtype == GeoType.CYLINDER:
+            t_hit, normal_local = ray_intersect_cylinder(
+                ray_origin_local, ray_direction_local, size[0], size[1], size[2]
+            )
+        elif geomtype == GeoType.CONE:
+            t_hit, normal_local = ray_intersect_cone(ray_origin_local, ray_direction_local, size[0], size[1])
+        elif geomtype == GeoType.ELLIPSOID:
+            t_hit, normal_local = ray_intersect_ellipsoid(ray_origin_local, ray_direction_local, size)
 
-        # HFIELD path: read the per-shape index + ``HeightfieldData`` only after we
-        # know the shape is a heightfield. ``wp.static`` strips this entire block
-        # (including the array reads and the ``ray_intersect_heightfield`` call)
-        # from the no-HFIELD variant.
-        if wp.static(enable_heightfields):
-            if geomtype == GeoType.HFIELD:
-                if shape_heightfield_index:
-                    hf_idx = shape_heightfield_index[shape_idx]
-                    if hf_idx >= 0:
-                        hfd = heightfield_data[hf_idx]
-                        t_hit, normal = ray_intersect_heightfield(
-                            geom_to_world, hfd, heightfield_elevations, ray_origin, ray_direction
-                        )
+        normal = wp.vec3(0.0)
+        if wp.static(compute_normal):
+            if t_hit >= 0.0:
+                normal = wp.normalize(wp.transform_vector(geom_to_world, normal_local))
 
         return t_hit, normal
 
-    @wp.kernel
-    def raycast_kernel(
-        # Model
-        body_q: wp.array[wp.transform],
-        shape_body: wp.array[int],
-        shape_transform: wp.array[wp.transform],
-        geom_type: wp.array[int],
-        geom_size: wp.array[wp.vec3],
-        shape_source_ptr: wp.array[wp.uint64],
-        # Heightfield data (unused when the no-HFIELD variant is selected; ``wp.static``
-        # strips every read of these arrays from that variant's compile unit).
-        shape_heightfield_index: wp.array[wp.int32],
-        heightfield_data: wp.array[HeightfieldData],
-        heightfield_elevations: wp.array[wp.float32],
-        # Ray
-        ray_origin: wp.vec3,
-        ray_direction: wp.vec3,
-        # Lock helper
-        lock: wp.array[wp.int32],
-        # Output
-        min_dist: wp.array[float],
-        min_index: wp.array[int],
-        min_body_index: wp.array[int],
-        # Optional: world offsets for multi-world picking
-        shape_world: wp.array[int],
-        world_offsets: wp.array[wp.vec3],
-        visible_worlds_mask: wp.array[int],
-    ):
-        """Computes the intersection of a ray with all geometries in the scene.
-
-        Args:
-            body_q: Array of body transforms.
-            shape_body: Maps shape index to body index.
-            shape_transform: Array of local shape transforms.
-            geom_type: Array of geometry types for each geometry.
-            geom_size: Array of sizes for each geometry.
-            shape_source_ptr: Array of mesh IDs for mesh geometries (wp.uint64).
-            shape_heightfield_index: Per-shape index into ``heightfield_data``. Unused (and not read) in the no-HFIELD variant.
-            heightfield_data: Compact array of ``HeightfieldData`` structs, one per HFIELD shape. Unused in the no-HFIELD variant.
-            heightfield_elevations: Concatenated normalized [0, 1] elevation array indexed via ``HeightfieldData.data_offset``. Unused in the no-HFIELD variant.
-            ray_origin: The origin of the ray.
-            ray_direction: The direction of the ray.
-            lock: Lock array used for synchronization. Expected to be initialized to 0.
-            min_dist: A single-element array to store the minimum intersection distance. Expected to be initialized to a large value like 1e10.
-            min_index: A single-element array to store the index of the closest geometry. Expected to be initialized to -1.
-            min_body_index: A single-element array to store the body index of the closest geometry. Expected to be initialized to -1.
-            shape_world: Optional array mapping shape index to world index. Can be empty to disable world offsets.
-            world_offsets: Optional array of world offsets. Can be empty to disable world offsets.
-            visible_worlds_mask: Optional mask array (1=visible, 0=hidden per world). Can be empty to disable filtering.
-        """
-        shape_idx = wp.tid()
-
-        # Skip shapes from non-visible worlds
-        if visible_worlds_mask and shape_world.shape[0] > 0:
-            world_idx = shape_world[shape_idx]
-            if world_idx >= 0:
-                if visible_worlds_mask[world_idx] == 0:
-                    return
-
-        # compute shape transform
-        b = shape_body[shape_idx]
-
-        X_wb = wp.transform_identity()
-        if b >= 0:
-            X_wb = body_q[b]
-
-        X_bs = shape_transform[shape_idx]
-
-        geom_to_world = wp.mul(X_wb, X_bs)
-
-        # Apply world offset if available (for multi-world picking)
-        if shape_world.shape[0] > 0 and world_offsets.shape[0] > 0:
-            world_idx = shape_world[shape_idx]
-            if world_idx >= 0 and world_idx < world_offsets.shape[0]:
-                offset = world_offsets[world_idx]
-                geom_to_world = wp.transform(geom_to_world.p + offset, geom_to_world.q)
-
-        geomtype = geom_type[shape_idx]
-
-        # Get mesh ID for mesh-like geometries
-        if geomtype == GeoType.MESH or geomtype == GeoType.CONVEX_MESH:
-            mesh_id = shape_source_ptr[shape_idx]
-        else:
-            mesh_id = wp.uint64(0)
-
-        t, _normal = ray_intersect_geom(
-            geom_to_world,
-            geom_size[shape_idx],
-            geomtype,
-            ray_origin,
-            ray_direction,
-            mesh_id,
-            shape_idx,
-            shape_heightfield_index,
-            heightfield_data,
-            heightfield_elevations,
-        )
-
-        if t >= 0.0 and t < min_dist[0]:
-            _spinlock_acquire(lock)
-            # Still use an atomic inside the spinlock to get a volatile read
-            old_min = wp.atomic_min(min_dist, 0, t)
-            if t <= old_min:
-                min_index[0] = shape_idx
-                min_body_index[0] = b
-            _spinlock_release(lock)
-
-    @wp.kernel
-    def sensor_raycast_kernel(
-        # Model
-        body_q: wp.array[wp.transform],
-        shape_body: wp.array[int],
-        shape_transform: wp.array[wp.transform],
-        geom_type: wp.array[int],
-        geom_size: wp.array[wp.vec3],
-        shape_source_ptr: wp.array[wp.uint64],
-        shape_heightfield_index: wp.array[wp.int32],
-        heightfield_data: wp.array[HeightfieldData],
-        heightfield_elevations: wp.array[wp.float32],
-        # Camera parameters
-        camera_position: wp.vec3,
-        camera_direction: wp.vec3,
-        camera_up: wp.vec3,
-        camera_right: wp.vec3,
-        fov_scale: float,
-        camera_aspect_ratio: float,
-        resolution: wp.vec2,
-        # Output (per-pixel results)
-        hit_distances: wp.array2d[float],
-    ):
-        """Raycast sensor kernel that casts rays for each pixel in an image.
-
-        Each thread processes one pixel, generating a ray and finding the closest intersection.
-        Heightfield setup is stripped from the no-HFIELD variant via ``wp.static``.
-
-        Args:
-            body_q: Array of body transforms
-            shape_body: Maps shape index to body index
-            shape_transform: Array of local shape transforms
-            geom_type: Array of geometry types for each geometry
-            geom_size: Array of sizes for each geometry
-            shape_source_ptr: Array of mesh IDs for mesh geometries
-            shape_heightfield_index: Per-shape index into ``heightfield_data``. Unused (and not read) in the no-HFIELD variant.
-            heightfield_data: Compact array of ``HeightfieldData`` structs, one per HFIELD shape. Unused in the no-HFIELD variant.
-            heightfield_elevations: Concatenated normalized [0, 1] elevation array indexed via ``HeightfieldData.data_offset``. Unused in the no-HFIELD variant.
-            camera_position: Camera position in world space
-            camera_direction: Camera forward direction (normalized)
-            camera_up: Camera up direction (normalized)
-            camera_right: Camera right direction (normalized)
-            fov_scale: Scale factor for field of view, computed as tan(fov_radians/2) where fov_radians is the vertical field of view angle in radians
-            camera_aspect_ratio: Width/height aspect ratio
-            resolution: Image resolution as (width, height)
-            hit_distances: Output array of hit distances per pixel
-        """
-        pixel_x, pixel_y, shape_idx = wp.tid()
-
-        # Skip if out of bounds
-        if pixel_x >= resolution[0] or pixel_y >= resolution[1]:
-            return
-
-        # Generate ray for this pixel
-        ray_origin, ray_direction = ray_for_pixel(
-            camera_position,
-            camera_direction,
-            camera_up,
-            camera_right,
-            fov_scale,
-            camera_aspect_ratio,
-            resolution,
-            pixel_x,
-            pixel_y,
-        )
-
-        # compute shape transform
-        b = shape_body[shape_idx]
-
-        X_wb = wp.transform_identity()
-        if b >= 0:
-            X_wb = body_q[b]
-
-        X_bs = shape_transform[shape_idx]
-
-        geom_to_world = wp.mul(X_wb, X_bs)
-
-        geomtype = geom_type[shape_idx]
-
-        # Get mesh ID for mesh-like geometries
-        if geomtype == GeoType.MESH or geomtype == GeoType.CONVEX_MESH:
-            mesh_id = shape_source_ptr[shape_idx]
-        else:
-            mesh_id = wp.uint64(0)
-
-        t, _normal = ray_intersect_geom(
-            geom_to_world,
-            geom_size[shape_idx],
-            geomtype,
-            ray_origin,
-            ray_direction,
-            mesh_id,
-            shape_idx,
-            shape_heightfield_index,
-            heightfield_data,
-            heightfield_elevations,
-        )
-
-        if t >= 0.0:
-            wp.atomic_min(hit_distances, pixel_y, pixel_x, t)
-
-    return ray_intersect_geom, raycast_kernel, sensor_raycast_kernel
+    return ray_intersect_shape
 
 
-# Two pre-compiled variants. Tests use the public ``ray_intersect_geom`` (HFIELD-aware).
-# Launch sites pick the kernel pair based on ``Model.has_heightfields``.
-ray_intersect_geom, raycast_kernel, sensor_raycast_kernel = _make_raycast_funcs(enable_heightfields=True)
-_, raycast_kernel_no_hfield, sensor_raycast_kernel_no_hfield = _make_raycast_funcs(enable_heightfields=False)
+ray_intersect_shape = _make_ray_intersect_shape(True)
+ray_intersect_shape_no_normal = _make_ray_intersect_shape(False)
 
 
 @wp.kernel
-def sensor_raycast_particles_kernel(
-    grid: wp.uint64,
-    particle_positions: wp.array[wp.vec3],
-    particle_radius: wp.array[float],
-    search_radius: float,
-    march_step: float,
-    max_steps: wp.int32,
-    camera_position: wp.vec3,
-    camera_direction: wp.vec3,
-    camera_up: wp.vec3,
-    camera_right: wp.vec3,
-    fov_scale: float,
-    camera_aspect_ratio: float,
-    resolution: wp.vec2,
-    max_distance: float,
-    hit_distances: wp.array2d[float],
+def raycast_kernel(
+    # Model
+    body_q: wp.array[wp.transform],
+    shape_body: wp.array[int],
+    shape_transform: wp.array[wp.transform],
+    geom_type: wp.array[int],
+    geom_size: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
+    # Ray
+    ray_origin: wp.vec3,
+    ray_direction: wp.vec3,
+    # Lock helper
+    lock: wp.array[wp.int32],
+    # Output
+    min_dist: wp.array[float],
+    min_index: wp.array[int],
+    min_body_index: wp.array[int],
+    # Optional: world offsets for multi-world picking
+    shape_world: wp.array[int],
+    world_offsets: wp.array[wp.vec3],
+    visible_worlds_mask: wp.array[int],
 ):
-    """March rays against particles stored in a hash grid and record the nearest hit if found before max_distance.
+    """Computes the intersection of a ray with all geometries in the scene.
+
+    HFIELD shapes use their ``wp.Mesh`` ID from ``shape_source_ptr``; the mesh is
+    built during :meth:`~newton.ModelBuilder.finalize`.
 
     Args:
-        grid: The hash grid containing the particles.
-        particle_positions: Array of particle positions.
-        particle_radius: Array of particle radii.
-        search_radius: The radius around each sample point to search for nearby particles.
-        march_step: The step size for ray marching.
-        max_steps: Maximum number of ray-march iterations allowed for a pixel.
-        camera_position: Camera position in world space.
-        camera_direction: Camera forward direction (normalized); rays travel along this vector.
-        camera_up: Camera up direction (normalized).
-        camera_right: Camera right direction (normalized).
-        fov_scale: Scale factor for field of view, computed as tan(fov_radians/2) where fov_radians is the vertical field of view angle in radians.
-        camera_aspect_ratio: Width/height aspect ratio.
-        resolution: Image resolution as (width, height).
-        max_distance: Maximum distance to march along the ray.
-        hit_distances: Output array of hit distances per pixel.
+        body_q: Array of body transforms.
+        shape_body: Maps shape index to body index.
+        shape_transform: Array of local shape transforms.
+        geom_type: Array of geometry types for each geometry.
+        geom_size: Array of sizes for each geometry.
+        shape_source_ptr: Array of mesh IDs for MESH, CONVEX_MESH, and HFIELD geometries (wp.uint64).
+        ray_origin: The origin of the ray.
+        ray_direction: The direction of the ray.
+        lock: Lock array used for synchronization. Expected to be initialized to 0.
+        min_dist: A single-element array to store the minimum intersection distance. Expected to be initialized to a large value like 1e10.
+        min_index: A single-element array to store the index of the closest geometry. Expected to be initialized to -1.
+        min_body_index: A single-element array to store the body index of the closest geometry. Expected to be initialized to -1.
+        shape_world: Optional array mapping shape index to world index. Can be empty to disable world offsets.
+        world_offsets: Optional array of world offsets. Can be empty to disable world offsets.
+        visible_worlds_mask: Optional mask array (1=visible, 0=hidden per world). Can be empty to disable filtering.
     """
-    pixel_x, pixel_y = wp.tid()
+    shape_idx = wp.tid()
 
-    if pixel_x >= resolution[0] or pixel_y >= resolution[1]:
-        return
+    # Skip shapes from non-visible worlds
+    if visible_worlds_mask and shape_world.shape[0] > 0:
+        world_idx = shape_world[shape_idx]
+        if world_idx >= 0:
+            if visible_worlds_mask[world_idx] == 0:
+                return
 
-    ray_origin, ray_direction = ray_for_pixel(
-        camera_position,
-        camera_direction,
-        camera_up,
-        camera_right,
-        fov_scale,
-        camera_aspect_ratio,
-        resolution,
-        pixel_x,
-        pixel_y,
+    # compute shape transform
+    b = shape_body[shape_idx]
+
+    X_wb = wp.transform_identity()
+    if b >= 0:
+        X_wb = body_q[b]
+
+    X_bs = shape_transform[shape_idx]
+
+    geom_to_world = wp.mul(X_wb, X_bs)
+
+    # Apply world offset if available (for multi-world picking)
+    if shape_world.shape[0] > 0 and world_offsets.shape[0] > 0:
+        world_idx = shape_world[shape_idx]
+        if world_idx >= 0 and world_idx < world_offsets.shape[0]:
+            offset = world_offsets[world_idx]
+            geom_to_world = wp.transform(geom_to_world.p + offset, geom_to_world.q)
+
+    geomtype = geom_type[shape_idx]
+
+    if geomtype == GeoType.MESH or geomtype == GeoType.CONVEX_MESH or geomtype == GeoType.HFIELD:
+        ray_origin_local, ray_direction_local = map_ray_to_local(
+            geom_to_world, ray_origin, ray_direction, geom_size[shape_idx]
+        )
+        t, _normal, _u, _v, _face = ray_intersect_mesh(
+            ray_origin_local,
+            ray_direction_local,
+            geom_size[shape_idx],
+            shape_source_ptr[shape_idx],
+            False,
+            _DEFAULT_MESH_MAX_T,
+        )
+    else:
+        t, _normal = ray_intersect_shape(
+            geom_to_world,
+            geom_size[shape_idx],
+            geomtype,
+            ray_origin,
+            ray_direction,
+            False,
+        )
+
+    if t >= 0.0 and t < min_dist[0]:
+        _spinlock_acquire(lock)
+        # Still use an atomic inside the spinlock to get a volatile read
+        old_min = wp.atomic_min(min_dist, 0, t)
+        if t <= old_min:
+            min_index[0] = shape_idx
+            min_body_index[0] = b
+        _spinlock_release(lock)
+
+
+def intersect_ray(
+    model: Model,
+    *,
+    ray_origins: wp.array[wp.vec3],
+    ray_directions: wp.array[wp.vec3],
+    ray_worlds: wp.array[wp.int32],
+    enable_global_world: bool = True,
+    out_dist: wp.array[float] | None = None,
+    out_shape_id: wp.array[wp.int32] | None = None,
+    out_normal: wp.array[wp.vec3] | None = None,
+    fast_math: bool = True,
+):
+    """Intersect rays with model shapes.
+
+    :meth:`~newton.ModelBuilder.finalize` builds the model shape BVH for the
+    initial model state. If the queried state changes shape transforms, refit
+    the BVH with :meth:`~newton.Model.bvh_refit_shapes` before raycasting
+    again. Manually populated models must build the BVH with
+    :meth:`~newton.Model.bvh_build_shapes` before first use.
+
+    Each ray is cast against the shapes of its own world (given by
+    ``ray_worlds``) and against the shapes of the global world (index ``-1``),
+    which are accessible from every world. A ray whose world is ``-1`` is cast
+    against the global world only.
+
+    ``out_dist``, ``out_shape_id`` and ``out_normal`` are optional outputs.
+    Pass ``None`` to skip writing a channel.
+
+    Args:
+        model: Model containing the shapes to query.
+        ray_origins: Ray origins in world space [m], shape [ray_count, 3].
+        ray_directions: Ray directions in world space, shape [ray_count, 3].
+            Values must be normalized and nonzero.
+        ray_worlds: Per-ray world index, shape [ray_count]. Use ``-1`` for the
+            global world.
+        enable_global_world: Whether to enable global world raycasting.
+        out_dist: Optional output hit distances [m], shape [ray_count]. ``-1`` on miss.
+        out_shape_id: Optional output hit shape indices, shape [ray_count]. ``-1`` on miss.
+        out_normal: Optional output hit normals, shape [ray_count, 3].
+        fast_math: Whether to compile the intersection kernel with fast math enabled.
+    """
+
+    if model.bvh_shapes is None:
+        raise RuntimeError(
+            "BVH raycasting requires a shape BVH built for the queried state. "
+            "ModelBuilder.finalize() builds one for the initial state; call "
+            "model.bvh_build_shapes(state) for manually populated models and "
+            "model.bvh_refit_shapes(state) after state changes."
+        )
+
+    write_dist = out_dist is not None
+    write_shape_id = out_shape_id is not None
+    write_normal = out_normal is not None
+
+    @wp.kernel(enable_backward=False, module="unique", module_options={"fast_math": fast_math})
+    def _intersect_ray_kernel(
+        bvh_id: wp.uint64,
+        bvh_shapes_group_roots: wp.array[wp.int32],
+        bvh_shape_enabled: wp.array[wp.uint32],
+        shape_transform_world: wp.array[wp.transform],
+        shape_type: wp.array[int],
+        shape_scale: wp.array[wp.vec3],
+        shape_source_ptr: wp.array[wp.uint64],
+        ray_origin: wp.array[wp.vec3],
+        ray_direction: wp.array[wp.vec3],
+        ray_world: wp.array[wp.int32],
+        out_dist: wp.array[float],
+        out_shape_id: wp.array[wp.int32],
+        out_normal: wp.array[wp.vec3],
+    ):
+        rayid = wp.tid()
+
+        origin = ray_origin[rayid]
+        direction = ray_direction[rayid]
+
+        min_dist = float(MAXVAL)
+        min_shape_id = wp.int32(-1)
+        min_normal = wp.vec3(0.0)
+
+        # Pass 0 queries the ray's own world; pass 1 the global world shared by all.
+        for i in range(wp.static(2 if enable_global_world else 1)):
+            groupid = ray_world[rayid] if i == 0 else bvh_shapes_group_roots.shape[0] - 1
+
+            bvh_root = bvh_shapes_group_roots[groupid]
+            if bvh_root < 0:
+                continue
+
+            query = wp.bvh_query_ray(bvh_id, origin, direction, bvh_root)
+            bvh_shape_id = wp.int32(0)
+
+            while wp.bvh_query_next(query, bvh_shape_id, min_dist):
+                shape_id = wp.int32(bvh_shape_enabled[bvh_shape_id])
+                geom_type = shape_type[shape_id]
+
+                if geom_type == GeoType.MESH or geom_type == GeoType.CONVEX_MESH or geom_type == GeoType.HFIELD:
+                    geom_to_world = shape_transform_world[shape_id]
+                    ray_origin_local, ray_direction_local = map_ray_to_local(
+                        geom_to_world, origin, direction, shape_scale[shape_id]
+                    )
+                    hit_dist, hit_normal_local, _u, _v, _face = ray_intersect_mesh(
+                        ray_origin_local,
+                        ray_direction_local,
+                        shape_scale[shape_id],
+                        shape_source_ptr[shape_id],
+                        False,
+                        min_dist,
+                    )
+                    hit_normal = wp.vec3(0.0)
+                    if hit_dist >= 0.0:
+                        hit_normal = wp.normalize(wp.transform_vector(geom_to_world, hit_normal_local))
+                else:
+                    hit_dist, hit_normal = ray_intersect_shape(
+                        shape_transform_world[shape_id],
+                        shape_scale[shape_id],
+                        geom_type,
+                        origin,
+                        direction,
+                        False,
+                    )
+                if hit_dist >= 0.0 and hit_dist < min_dist:
+                    min_dist = hit_dist
+                    min_shape_id = shape_id
+                    min_normal = hit_normal
+
+        if wp.static(write_dist):
+            out_dist[rayid] = wp.where(min_shape_id < 0, -1.0, min_dist)
+        if wp.static(write_shape_id):
+            out_shape_id[rayid] = min_shape_id
+        if wp.static(write_normal):
+            out_normal[rayid] = min_normal
+
+    wp.launch(
+        kernel=_intersect_ray_kernel,
+        dim=ray_origins.shape[0],
+        inputs=[
+            model.bvh_shapes.id,
+            model.bvh_shapes_group_roots,
+            model.bvh_shape_enabled,
+            model.bvh_shape_world_transforms,
+            model.shape_type,
+            model.shape_scale,
+            model.shape_source_ptr,
+            ray_origins,
+            ray_directions,
+            ray_worlds,
+        ],
+        outputs=[
+            out_dist,
+            out_shape_id,
+            out_normal,
+        ],
+        device=model.device,
     )
-
-    best = hit_distances[pixel_y, pixel_x]
-    if best < 0.0:
-        best = max_distance
-
-    search_radius_local = search_radius
-    step = march_step
-
-    s = wp.int32(0)
-    t = float(0.0)
-
-    while s < max_steps and t <= max_distance and t <= best:
-        sample_pos = ray_origin + ray_direction * t
-
-        query = wp.hash_grid_query(grid, sample_pos, search_radius_local)
-        candidate = int(0)
-
-        while wp.hash_grid_query_next(query, candidate):
-            # Intersect ray with particle sphere
-            radius = particle_radius[candidate]
-            if radius <= 0.0:
-                continue
-
-            center = particle_positions[candidate]
-            t_hit, _normal = ray_intersect_particle_sphere(ray_origin, ray_direction, center, radius)
-
-            if t_hit < 0.0:
-                continue
-
-            if t_hit > max_distance:
-                continue
-
-            if t_hit < best:
-                hit_distances[pixel_y, pixel_x] = t_hit
-                best = t_hit
-
-        s += 1
-        t += step

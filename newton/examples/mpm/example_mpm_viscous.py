@@ -15,6 +15,8 @@ import newton
 import newton.examples
 from newton.solvers import SolverImplicitMPM
 
+TUBE_OPACITY = 0.5
+
 
 class Example:
     def __init__(self, viewer, options):
@@ -44,6 +46,7 @@ class Example:
             body=-1,
             mesh=mesh,
             cfg=newton.ModelBuilder.ShapeConfig(mu=options.funnel_friction),
+            opacity=TUBE_OPACITY,
         )
 
         # Fill funnel with particles
@@ -68,7 +71,7 @@ class Example:
         mpm_options.collider_basis = options.collider_basis
         mpm_options.solver = options.solver
 
-        self.solver = SolverImplicitMPM(self.model, mpm_options)
+        self.solver = SolverImplicitMPM(self.model, config=mpm_options)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()

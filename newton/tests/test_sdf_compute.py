@@ -823,8 +823,8 @@ class TestMeshSDFCollisionFlag(unittest.TestCase):
         model = builder.finalize(device="cpu")
 
         # No compact SDF entry should exist for this shape
-        self.assertEqual(int(model.shape_sdf_index.numpy()[0]), -1)
-        self.assertEqual(model.texture_sdf_data.shape[0], 0)
+        self.assertEqual(int(model._shape_sdf_index.numpy()[0]), -1)
+        self.assertEqual(model._texture_sdf_data.shape[0], 0)
 
     @unittest.skipUnless(_cuda_available, "Requires CUDA device")
     def test_mesh_build_sdf_works_on_gpu(self):
@@ -842,9 +842,9 @@ class TestMeshSDFCollisionFlag(unittest.TestCase):
         model = builder.finalize(device="cuda:0")
 
         # Texture SDF data should be populated in compact table
-        sdf_idx = int(model.shape_sdf_index.numpy()[0])
+        sdf_idx = int(model._shape_sdf_index.numpy()[0])
         self.assertGreaterEqual(sdf_idx, 0)
-        self.assertGreater(model.texture_sdf_data.shape[0], sdf_idx)
+        self.assertGreater(model._texture_sdf_data.shape[0], sdf_idx)
 
     @unittest.skipUnless(_cuda_available, "Requires CUDA device")
     def test_mesh_build_sdf_guard_and_clear(self):
@@ -933,9 +933,9 @@ class TestSDFPublicApi(unittest.TestCase):
         builder.add_shape_box(body=body, hx=0.5, hy=0.4, hz=0.3, cfg=cfg)
 
         model = builder.finalize(device="cuda:0")
-        sdf_idx = int(model.shape_sdf_index.numpy()[0])
+        sdf_idx = int(model._shape_sdf_index.numpy()[0])
         self.assertGreaterEqual(sdf_idx, 0)
-        self.assertGreater(model.texture_sdf_data.shape[0], sdf_idx)
+        self.assertGreater(model._texture_sdf_data.shape[0], sdf_idx)
 
 
 @unittest.skipUnless(_cuda_available, "wp.Volume requires CUDA device")
@@ -961,7 +961,24 @@ class TestComputeOffsetMesh(unittest.TestCase):
             pz = max(-hh, min(float(v[2]), hh))
             return np.linalg.norm(v - np.array([0, 0, pz])) - r
         if shape_type == GeoType.CYLINDER:
-            r, hh = shape_scale[0], shape_scale[1]
+            r, hh, barrel_radius = shape_scale
+            if barrel_radius > 0.0:
+                radial = np.linalg.norm(v[:2])
+                z_abs = abs(v[2])
+                end_offset = np.sqrt(barrel_radius**2 - hh**2)
+                center = r - end_offset
+                delta = np.array([radial - center, z_abs])
+                side = np.array([center + barrel_radius, 0.0])
+                if np.linalg.norm(delta) > 0.0:
+                    side = np.array([center, 0.0]) + barrel_radius * delta / np.linalg.norm(delta)
+                if side[0] - center < end_offset:
+                    side = np.array([r, hh])
+                cap = np.array([min(radial, r), hh])
+                distance = min(
+                    np.linalg.norm(np.array([radial, z_abs]) - side), np.linalg.norm(np.array([radial, z_abs]) - cap)
+                )
+                profile = center + np.sqrt(max(barrel_radius**2 - z_abs**2, 0.0))
+                return -distance if z_abs <= hh and radial <= profile else distance
             dxy = np.linalg.norm(v[:2]) - r
             dz = abs(v[2]) - hh
             return float(np.linalg.norm(np.maximum([dxy, dz], 0.0)) + min(max(dxy, dz), 0.0))
@@ -1050,6 +1067,14 @@ class TestComputeOffsetMesh(unittest.TestCase):
         mesh = compute_offset_mesh(GeoType.CYLINDER, shape_scale=(r, hh, 0.0), offset=off, device=self.device)
         self.assertIsNotNone(mesh)
         self._assert_vertices_at_offset(mesh, GeoType.CYLINDER, (r, hh, 0.0), off)
+
+    def test_barrel_cylinder_offset(self):
+        """Offset a barrel cylinder using its bulged analytical SDF."""
+        scale = (0.3, 0.5, 0.8)
+        offset = 0.15
+        mesh = compute_offset_mesh(GeoType.CYLINDER, shape_scale=scale, offset=offset, device=self.device)
+        self.assertIsNotNone(mesh)
+        self._assert_vertices_at_offset(mesh, GeoType.CYLINDER, scale, offset, atol=0.04)
 
     def test_plane_returns_none(self):
         """Plane should return None (not supported)."""
@@ -1343,7 +1368,7 @@ def test_brick_pyramid_stability(test, device):
     builder.rigid_gap = 0.005
 
     # Add ground plane
-    builder.add_shape_plane(-1, wp.transform_identity(), width=0.0, length=0.0)
+    builder.add_shape_plane(xform=wp.transform_identity(), width=0.0, length=0.0)
 
     # Create unit cube mesh (will be scaled non-uniformly)
     cube_mesh = create_box_mesh((0.5, 0.5, 0.5))
@@ -1370,7 +1395,7 @@ def test_brick_pyramid_stability(test, device):
         for i in range(bricks_in_row):
             x_pos = start_x + i * (brick_width + gap)
 
-            body = builder.add_body(xform=wp.transform(wp.vec3(x_pos, 0.0, z_pos), wp.quat_identity()))
+            body = builder.add_link(xform=wp.transform(wp.vec3(x_pos, 0.0, z_pos), wp.quat_identity()))
             builder.add_shape_mesh(
                 body,
                 mesh=cube_mesh,

@@ -88,14 +88,14 @@ class Example:
         self.cloth_particle_radius = 0.8
         self.cloth_body_contact_margin = 0.8
         #       self-contact
-        self.particle_self_contact_radius = 0.2
         self.particle_self_contact_margin = 0.2
+        self.particle_self_contact_gap = 0.0
 
         self.soft_contact_ke = 1e4
-        self.soft_contact_kd = 1e-2
+        self.soft_contact_kd = 1e1
 
         self.robot_contact_ke = 5e4
-        self.robot_contact_kd = 1e-3
+        self.robot_contact_kd = 5e1
         self.robot_contact_mu = 1.5
 
         self.self_contact_friction = 0.25
@@ -103,12 +103,12 @@ class Example:
         #   elasticity
         self.tri_ke = 1e4
         self.tri_ka = 1e4
-        self.tri_kd = 1.5e-6
+        self.tri_kd = 1.5e-2
 
         self.bending_ke = 5
-        self.bending_kd = 1e-2
+        self.bending_kd = 5e-1
 
-        self.scene = ModelBuilder(gravity=-981.0)
+        self.scene = ModelBuilder(gravity=(0.0, 0.0, -981.0))
 
         self.viewer = viewer
 
@@ -129,7 +129,7 @@ class Example:
         self.table_shape_idx = self.scene.shape_count
         self.scene.add_shape_box(
             -1,
-            wp.transform(
+            xform=wp.transform(
                 self.table_pos_cm,
                 wp.quat_identity(),
             ),
@@ -229,7 +229,7 @@ class Example:
         # Explicit collision pipeline for cloth-body contacts with custom margin
         self.collision_pipeline = newton.CollisionPipeline(
             self.model,
-            soft_contact_margin=self.cloth_body_contact_margin,
+            soft_contact_gap=self.cloth_body_contact_margin,
         )
         self.contacts = self.collision_pipeline.contacts()
 
@@ -246,14 +246,16 @@ class Example:
                 self.model,
                 iterations=self.iterations,
                 integrate_with_external_rigid_solver=True,
-                particle_self_contact_radius=self.particle_self_contact_radius,
                 particle_self_contact_margin=self.particle_self_contact_margin,
+                particle_self_contact_gap=self.particle_self_contact_gap,
                 particle_topological_contact_filter_threshold=1,
                 particle_rest_shape_contact_exclusion_radius=0.5,
                 particle_enable_self_contact=True,
                 particle_vertex_contact_buffer_size=16,
                 particle_edge_contact_buffer_size=20,
-                particle_collision_detection_interval=-1,
+                collision_frequency_type={
+                    newton.solvers.SolverBase.CollisionSlot.SOFT_SELF_CONTACT: newton.solvers.SolverBase.CollisionFrequencyType.PRE_INIT,
+                },
             )
 
         self.viewer.set_model(self.model)
@@ -279,6 +281,15 @@ class Example:
         scale_np *= self.viz_scale
         self.viz_shape_scale = wp.array(scale_np, dtype=wp.vec3, device=self.model.device)
 
+        # Scale particle radii from cm to meters for visualization
+        self.sim_particle_radius = self.model.particle_radius
+        if self.model.particle_radius is not None:
+            radius_np = self.model.particle_radius.numpy().copy()
+            radius_np *= self.viz_scale
+            self.viz_particle_radius = wp.array(radius_np, dtype=wp.float32, device=self.model.device)
+        else:
+            self.viz_particle_radius = None
+
         # Scale the viewer's cached shape instance data (base viewer / GL fallback path)
         if hasattr(self.viewer, "_shape_instances"):
             for shapes in self.viewer._shape_instances.values():
@@ -291,9 +302,11 @@ class Example:
                 shapes.scales = wp.array(sc, dtype=wp.vec3, device=shapes.device)
 
         # gravity arrays for swapping during simulation
-        self.gravity_zero = wp.zeros(1, dtype=wp.vec3)
+        self.gravity_zero = wp.zeros(self.model.gravity.shape[0], dtype=wp.vec3, device=self.model.device)
         # gravity in cm/s²
-        self.gravity_earth = wp.array(wp.vec3(0.0, 0.0, -981.0), dtype=wp.vec3)
+        self.gravity_earth = wp.full(
+            self.model.gravity.shape[0], wp.vec3(0.0, 0.0, -981.0), dtype=wp.vec3, device=self.model.device
+        )
 
         # Ensure FK evaluation (for non-MuJoCo solvers):
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
@@ -353,12 +366,9 @@ class Example:
         self.initial_pose = self.model.joint_q.numpy()
 
     def capture(self):
-        if wp.get_device().is_cuda:
-            with wp.ScopedCapture() as capture:
-                self.simulate()
-            self.graph = capture.graph
-        else:
-            self.graph = None
+        with wp.ScopedCapture() as capture:
+            self.simulate()
+        self.graph = capture.graph
 
     def create_articulation(self, builder):
         asset_path = newton.utils.download_asset("franka_emika_panda")
@@ -374,6 +384,7 @@ class Example:
             enable_self_collisions=False,
             collapse_fixed_joints=True,
             force_show_colliders=False,
+            joint_damping_mode="passive",
         )
         builder.joint_q[:6] = [0.0, 0.0, 0.0, -1.59695, 0.0, 2.5307]
 
@@ -600,25 +611,28 @@ class Example:
                 outputs=[self.viz_state.body_q],
             )
 
-        # Swap model shape data to meter-scale for rendering
+        # Swap model shape and particle data to meter-scale for rendering
         self.model.shape_transform = self.viz_shape_transform
         self.model.shape_scale = self.viz_shape_scale
+        self.model.particle_radius = self.viz_particle_radius
 
-        self.viewer.begin_frame(self.sim_time)
-        self.viewer.log_state(self.viz_state)
-        # Render the table box manually at meter scale
-        self.viewer.log_shapes(
-            "/table",
-            newton.GeoType.BOX,
-            self.table_viz_scale,
-            self.table_viz_xform,
-            self.table_viz_color,
-        )
-        self.viewer.end_frame()
-
-        # Restore simulation shape data
-        self.model.shape_transform = self.sim_shape_transform
-        self.model.shape_scale = self.sim_shape_scale
+        try:
+            self.viewer.begin_frame(self.sim_time)
+            self.viewer.log_state(self.viz_state)
+            # Render the table box manually at meter scale
+            self.viewer.log_shapes(
+                "/table",
+                newton.GeoType.BOX,
+                self.table_viz_scale,
+                self.table_viz_xform,
+                self.table_viz_color,
+            )
+            self.viewer.end_frame()
+        finally:
+            # Restore simulation shape and particle data
+            self.model.shape_transform = self.sim_shape_transform
+            self.model.shape_scale = self.sim_shape_scale
+            self.model.particle_radius = self.sim_particle_radius
 
     def test_final(self):
         p_lower = wp.vec3(-36.0, -95.0, -5.0)
