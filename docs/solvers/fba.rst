@@ -129,6 +129,14 @@ actuator entries, rather than worlds. Regenerate contacts after restoring or
 randomizing state and before the next simulation step. This reset is a
 runtime operation and requires no additional USD schema.
 
+The ``cloth_dual_franka_fba`` and ``shirt_fold_fba`` examples compose these
+operations through ``example.reset(world_mask=None)`` between frames. They
+restore both state buffers, robot joint state, controls, IK, grasp constraints
+and the selected episodes' task phases. Unselected episodes continue from
+their current state. Each world has its own ``episode_time``; ``sim_time``
+remains the viewer clock. The unreplicated single-world examples use global
+entities, so select the final mask entry or call ``example.reset()``.
+
 Single step
 ^^^^^^^^^^^
 
@@ -265,7 +273,12 @@ Contacts
   their edges must come compared with their particles' nearest triangles, and
   :meth:`~newton.solvers.SolverFBA.set_particle_self_contact` changes the
   margin between steps, so that a dropped cloth can land with a thick margin
-  and fold with a thin one. ``particle_self_contact_group_ids`` gives each
+  and fold with a thin one. Pass a scalar to set all worlds, or arrays of shape
+  ``(model.world_count + 1,)`` to set ``margin`` and ``gap`` independently per
+  world, with the last entry for global particles. Per-world values require
+  self-contact groups to be disabled and persist across solver resets; the
+  shirt example restores the selected episodes' landing margins itself.
+  ``particle_self_contact_group_ids`` gives each
   particle a group, such as one per body of a pile: the particles and
   triangles of two groups keep the margin apart, and those of one group the
   group's margin from ``particle_self_contact_group_margins``, or do not

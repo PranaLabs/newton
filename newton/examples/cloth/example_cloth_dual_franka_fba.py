@@ -29,6 +29,11 @@
 # biases each world's arm joint targets by a fixed amount, so that the
 # worlds differ.
 #
+# Call example.reset(world_mask) between frames to restart selected episodes.
+# The Warp boolean mask uses model.world_count + 1 entries, with the last
+# selecting global entities (including the unreplicated single-world scene).
+# Each episode keeps its own time; sim_time remains the viewer clock.
+#
 # Command: python -m newton.examples cloth_dual_franka_fba
 # Parallel worlds: python -m newton.examples cloth_dual_franka_fba --world-count 4 --action-noise 0.0001
 # Fully coupled: python -m newton.examples cloth_dual_franka_fba --fully-coupled
@@ -47,7 +52,9 @@ from newton.examples.cloth.franka_fba_utils import (
     ArmNoise,
     JointDrive,
     add_world_args,
+    apply_grasp_rows,
     joint_residual,
+    reset_franka_worlds,
     view_worlds,
     world_args,
 )
@@ -128,6 +135,7 @@ class Example:
         self.inset = (INSET_ALONG, INSET_ACROSS) if self.fully_coupled else (0.0, 0.0)
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
+        self.episode_time = np.zeros(self.world_count)
 
         def new_builder():
             builder = newton.ModelBuilder()
@@ -208,6 +216,7 @@ class Example:
         self.plan_first_fold()
         self.model.joint_q.assign(self.key_pose(0.0, iterations=100, noise=False))
 
+        self.initial_ik_q = wp.clone(self.ik_q)
         self.state_0, self.state_1 = self.model.state(), self.model.state()
         self.control = self.model.control()
         self.joint_qd = wp.zeros_like(self.state_0.joint_qd)
@@ -218,10 +227,11 @@ class Example:
             self.init_kinematic_arms()
         self.pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=THICKNESS)
         self.contacts = self.pipeline.contacts()
-        self.gravity = self.model.gravity.numpy()
+        self.gravity = self.model.gravity.numpy().copy()
         # per world and hand: the squeezed or held towel, see update_grasp
+        self.grasp_rows = None
         self.held = [[None, None] for _ in range(self.world_count)]
-        self.first_fold_checked = False
+        self.first_fold_checked = np.zeros(self.world_count, dtype=bool)
         # The fingers' collision boxes: body, transform in it and half extents.
         m, bodies = self.model, [h + k for h in self.hands for k in (1, 2)]
         boxes = np.isin(m.shape_body.numpy(), bodies) & (m.shape_type.numpy() == newton.GeoType.BOX)
@@ -320,32 +330,30 @@ class Example:
         key(t, sets, lay + 0.1, OPEN)
         return t
 
-    def plan_first_fold(self):
+    def plan_first_fold(self, worlds=None):
         """Fold the far half over the near half: the far corners onto the near ones."""
         along, across = self.inset
         grips = [(FAR - across, y + side * along) for y, side in zip(SIDES, (1.0, -1.0), strict=True)]
         sets = [(NEAR + across, y) for _, y in grips]
-        # per world: the key poses (time, pad middles, finger position, yaw), the half circles' times and the folds'
-        # directions; the fold under way is the same in all worlds
-        n = self.world_count
-        self.keys, self.arcs, self.dirs, self.fold = (
-            [[] for _ in range(n)],
-            [[] for _ in range(n)],
-            [[] for _ in range(n)],
-            0,
-        )
+        if worlds is None:
+            worlds = range(self.world_count)
+            self.keys = [[] for _ in worlds]
+            self.arcs = [[] for _ in worlds]
+            self.dirs = [[] for _ in worlds]
+            self.fold = np.zeros(self.world_count, dtype=int)
         grasp = GRASP - self.press
-        for w in range(n):
+        for w in worlds:
+            self.keys[w], self.arcs[w], self.dirs[w], self.fold[w] = [], [], [], 0
             self.keys[w].append((0.0, [np.array((*g, grasp + 0.1)) for g in grips], FOLDS[0].grip_open, FOLDS[0].yaw))
             self.add_fold(w, 0.0, grips, sets, grasp, 1, axis=0)
 
-    def plan_second_fold(self):
+    def plan_second_fold(self, worlds):
         """Fold the side SIDES[1] of the folded towel over the side SIDES[0], from the corners where the first fold left
         them: hand 0 takes the corner at the near edge, hand 1 the corner at the fold. The arms then draw back over
         the far corners."""
         X0, X = self.model.particle_q.numpy(), self.state_0.particle_q.numpy()
-        self.fold = 1
-        for w in range(self.world_count):
+        for w in worlds:
+            self.fold[w] = 1
             x0, x = (a[w * self.particles : (w + 1) * self.particles] for a in (X0, X))
             side = np.abs(x0[:, 1] - SIDES[1]) < 0.5 * CELL
             near, far = (np.abs(x0[:, 0] - e) < 0.5 * CELL for e in (NEAR, FAR))
@@ -369,8 +377,10 @@ class Example:
     def key_pose(self, t, iterations=24, noise=True):
         """Joint positions of both arms of every world at time ``t`` of their key poses, with the worlds' action
         noise unless ``noise`` is false, shape [world_count * joint_coord_count of a world]."""
+        times_by_world = np.broadcast_to(t, (self.world_count,))
         fingers = []
         for w, keys in enumerate(self.keys):
+            t = times_by_world[w]
             times = [k[0] for k in keys]
             fingers.append(np.interp(t, times, [k[2] for k in keys]))
             yaw = np.radians(np.interp(t, times, [k[3] for k in keys]))
@@ -416,11 +426,11 @@ class Example:
         while they are closed, laid out flat while they open, and let go once they stand open."""
         q, q0, rows = self.state_1.joint_q.numpy(), self.state_0.joint_q.numpy(), []
         body_q, body_q0 = self.state_1.body_q.numpy(), self.state_0.body_q.numpy()
-        t = self.sim_time + self.sim_dt
-        grip_open = FOLDS[self.fold].grip_open
         for w in range(self.world_count):
+            t = self.episode_time[w] + self.sim_dt
+            grip_open = FOLDS[self.fold[w]].grip_open
             # The phase follows the fingers' commanded motion; the squeeze follows their actual gap.
-            q_now, q_next = self.finger_command(w, self.sim_time), self.finger_command(w, t)
+            q_now, q_next = self.finger_command(w, self.episode_time[w]), self.finger_command(w, t)
             closing, opening = q_next < q_now, q_next > q_now
             for hand, finger in enumerate(self.fingers):
                 f = finger + w * self.coords
@@ -447,13 +457,13 @@ class Example:
                 # the world's particles, by their index in the model
                 rows.append((held["taken"] + w * self.particles, origin + local @ axes.T))
         if not rows:
-            self.solver.set_particle_constraints(None, None, None)
+            self.grasp_rows = None
+            apply_grasp_rows(self)
             return
         p, x = (np.concatenate(a) for a in zip(*rows, strict=True))
         eye = np.tile(np.eye(3), (len(p), 1))
-        self.solver.set_particle_constraints(
-            np.repeat(p, 3)[:, None], np.ones((3 * len(p), 1)), x.reshape(-1), directions=eye
-        )
+        self.grasp_rows = (np.repeat(p, 3)[:, None], np.ones((3 * len(p), 1)), x.reshape(-1), eye, False)
+        apply_grasp_rows(self)
 
     def start_squeeze(self, world, origin, axes, gap):
         """The towel of world ``world`` that a hand's pads squeeze, every layer down to the table, in the pads' frame:
@@ -481,7 +491,7 @@ class Example:
             "taken": taken,
             "start": local[taken],
             "gap": gap,
-            "fold": self.fold,
+            "fold": self.fold[world],
             "layer": layer[taken],
         }
 
@@ -568,15 +578,22 @@ class Example:
         local[:, 2] += s * (flat - local[:, 2])
         return local
 
+    def reset(self, world_mask=None):
+        """Restart selected episodes between frames; see ``reset_franka_worlds`` for the mask convention."""
+        worlds = reset_franka_worlds(self, world_mask)
+        self.plan_first_fold(worlds)
+        self.first_fold_checked[worlds] = False
+
     # Step
 
     def step(self):
-        if self.fold == 0 and self.sim_time >= FOLD2 - 1.0e-9:
-            self.plan_second_fold()
+        worlds = np.flatnonzero((self.fold == 0) & (self.episode_time >= FOLD2 - 1.0e-9))
+        if len(worlds):
+            self.plan_second_fold(worlds)
         if self.fully_coupled:
             self.step_fully_coupled()
             return
-        target = self.key_pose(self.sim_time + self.frame_dt)
+        target = self.key_pose(self.episode_time + self.frame_dt)
         self.joint_qd.assign((target - self.state_0.joint_q.numpy()) / self.frame_dt)
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
@@ -594,14 +611,15 @@ class Example:
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
             self.sim_time += self.sim_dt
+            self.episode_time += self.sim_dt
 
     def step_fully_coupled(self):
         """SolverFBA steps the arms and the towel together; the drives follow the joint targets, interpolated over the
         frame, and fingers stopped on the towel squeeze it."""
-        start, target = self.target, self.key_pose(self.sim_time + self.frame_dt)
+        start, target = self.target, self.key_pose(self.episode_time + self.frame_dt)
         velocity = (target - start) / self.frame_dt
-        grip_open = FOLDS[self.fold].grip_open
-        closing = np.clip((grip_open - self.finger_command(0, self.sim_time)) / grip_open, 0.0, 1.0)
+        grip_open = FOLDS[self.fold[0]].grip_open
+        closing = np.clip((grip_open - self.finger_command(0, self.episode_time[0])) / grip_open, 0.0, 1.0)
         for k in range(self.sim_substeps):
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
@@ -615,6 +633,7 @@ class Example:
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
             self.sim_time += self.sim_dt
+            self.episode_time += self.sim_dt
         self.target = target
 
     def test_post_step(self):
@@ -628,7 +647,7 @@ class Example:
             )
             fingers = self.drive.q[[f + k for f in self.fingers for k in (0, 1)]]
             assert fingers.min() > -2.0e-3, f"fingers closed to {fingers.min() * 1e3:.1f} mm at t={self.sim_time:.2f} s"
-        check_fold = not self.first_fold_checked and self.sim_time >= FOLD2 - 0.5 * self.frame_dt
+        check_fold = ~self.first_fold_checked & (self.episode_time >= FOLD2 - 0.5 * self.frame_dt)
         for w in range(self.world_count):
             at = f"in world {w} at t={self.sim_time:.2f} s"
             x = X[w * self.particles : (w + 1) * self.particles]
@@ -638,13 +657,15 @@ class Example:
                     free[held["taken"]] = False
                     if held["phase"] == "hold" and len(held["taken"]):
                         origin, axes = self.pad_frame(body_q, w, hand)
-                        off = np.abs(x[held["taken"]] - origin - self.held_local(held, self.sim_time) @ axes.T).max()
+                        off = np.abs(
+                            x[held["taken"]] - origin - self.held_local(held, self.episode_time[w]) @ axes.T
+                        ).max()
                         assert off < 1.0e-3, f"a held particle is {off:.4f} m off {at}"
             for body, X_bs, half in self.finger_boxes:
                 X_b = wp.transform(*body_q[body + w * self.bodies]) * X_bs
                 inside = np.abs((x[free] - X_b.p) @ np.array(wp.quat_to_matrix(X_b.q)).reshape(3, 3)) - half
                 assert inside.max(axis=1).min() > 0.0, f"a towel particle is inside a finger {at}"
-            if check_fold:
+            if check_fold[w]:
                 # Before the second fold, the far half lies turned over the middle onto the near half.
                 x0 = self.model.particle_q.numpy()[w * self.particles : (w + 1) * self.particles]
                 far = x0[:, 0] > 0.5 * (NEAR + FAR)
@@ -658,6 +679,8 @@ class Example:
         # second fold turned over; nothing lies over the top layer.
         X0, X = self.model.particle_q.numpy(), self.state_0.particle_q.numpy()
         for w in range(self.world_count):
+            if self.fold[w] == 0 or self.episode_time[w] < self.keys[w][-1][0] - 1.0e-9:
+                continue
             x0, x = (a[w * self.particles : (w + 1) * self.particles] for a in (X0, X))
             lo, hi = np.array((NEAR, SIDES[0])), np.array((0.5 * (NEAR + FAR), -0.5))
             out = np.maximum(lo - x[:, :2], x[:, :2] - hi).max()

@@ -1,19 +1,168 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-"""Regression checks for the joint drives of the fully coupled Franka FBA examples."""
+"""Regression checks for episode resets and joint drives in the Franka FBA examples."""
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import warp as wp
 
 import newton
+from newton.examples.cloth import example_cloth_dual_franka_fba as towel
 from newton.examples.cloth.franka_fba_utils import JointDrive, joint_residual
 from newton.solvers import SolverFBA
+from newton.tests.unittest_utils import USD_AVAILABLE
+from newton.viewer import ViewerNull
+
+if USD_AVAILABLE:
+    from newton.examples.cloth import example_shirt_fold_fba as shirt_example
 
 
 def transform(p):
     return wp.transform(wp.vec3(*p), wp.quat_identity())
+
+
+class TestFrankaFBAEpisodes(unittest.TestCase):
+    """Exercise the real examples with coarse cloth to keep episode checks short."""
+
+    @staticmethod
+    def example(shirt, worlds=2, device="cpu"):
+        if shirt and not USD_AVAILABLE:
+            raise unittest.SkipTest("requires usd-core for the shirt asset")
+
+        args = SimpleNamespace(
+            world_count=worlds, fully_coupled=False, action_noise=0.0001, world_spacing=2.0, cloth_edge_length=0.1
+        )
+        with wp.ScopedDevice(device), patch.object(towel, "CELL", 0.1):
+            return (shirt_example if shirt else towel).Example(ViewerNull(), args)
+
+    def test_cpu_gravity_survives_robot_step(self):
+        """Preserve CPU gravity while Featherstone advances the arms with gravity temporarily disabled."""
+        for shirt in (False, True):
+            with self.subTest(shirt=shirt):
+                ex = self.example(shirt)
+                gravity = ex.model.gravity.numpy().copy()
+                ex.step()
+                np.testing.assert_array_equal(ex.model.gravity.numpy(), gravity)
+
+    def test_partial_episode_reset(self):
+        """Match a fresh episode after reset and an uninterrupted reference in the neighboring world."""
+        for shirt in (False, True):
+            with self.subTest(shirt=shirt):
+                ex, control = self.example(shirt), self.example(shirt)
+                initial_ik = ex.ik_q.numpy().copy()
+                for _ in range(2):
+                    ex.step()
+                    control.step()
+                neighbor = {
+                    name: getattr(ex.state_0, name).numpy().copy()
+                    for name in ("particle_q", "particle_qd", "body_q", "body_qd", "joint_q", "joint_qd")
+                }
+                mask = wp.array([True, False, False], dtype=wp.bool, device="cpu")
+                ex.reset(mask)
+                np.testing.assert_array_equal(ex.episode_time, [0.0, control.sim_time])
+                np.testing.assert_array_equal(ex.ik_q.numpy()[0], initial_ik[0])
+                for name, before in neighbor.items():
+                    stride = len(before) // 2
+                    np.testing.assert_array_equal(getattr(ex.state_0, name).numpy()[stride:], before[stride:])
+                fresh = self.example(shirt)
+                for _ in range(3):
+                    ex.step()
+                    control.step()
+                    fresh.step()
+                for name in neighbor:
+                    value = getattr(ex.state_0, name).numpy()
+                    stride = len(value) // 2
+                    np.testing.assert_allclose(value[:stride], getattr(fresh.state_0, name).numpy()[:stride], atol=2e-6)
+                    np.testing.assert_allclose(
+                        value[stride:], getattr(control.state_0, name).numpy()[stride:], atol=2e-6
+                    )
+                # An empty selection is a no-op; a full reset restores both buffers.
+                ex.reset(wp.array([False, False, False], dtype=wp.bool, device="cpu"))
+                ex.reset()
+                for state in (ex.state_0, ex.state_1):
+                    np.testing.assert_array_equal(state.particle_q.numpy(), ex.model.particle_q.numpy())
+                    np.testing.assert_array_equal(state.joint_q.numpy(), ex.model.joint_q.numpy())
+                np.testing.assert_array_equal(ex.episode_time, 0.0)
+                ex.test_final()
+                if not shirt:
+                    # At the completed episode's boundary, an unfolded towel must fail the final check.
+                    ex.plan_second_fold(range(ex.world_count))
+                    end = ex.keys[0][-1][0]
+                    ex.episode_time[:] = np.nextafter(end, -np.inf)
+                    with self.assertRaises(AssertionError):
+                        ex.test_final()
+
+    def test_single_world_global_reset(self):
+        """Reset an unreplicated scene through the global slot and reject malformed masks before mutation."""
+        for shirt in (False, True):
+            with self.subTest(shirt=shirt):
+                ex = self.example(shirt, worlds=1)
+                ex.step()
+                before = ex.state_0.particle_q.numpy().copy()
+                # An unreplicated model's entities are global, not world 0.
+                ex.reset(wp.array([True, False], dtype=wp.bool, device="cpu"))
+                np.testing.assert_array_equal(ex.state_0.particle_q.numpy(), before)
+                with self.assertRaises(ValueError):
+                    ex.reset(wp.array([True], dtype=wp.bool, device="cpu"))
+                np.testing.assert_array_equal(ex.state_0.particle_q.numpy(), before)
+                ex.reset(wp.array([False, True], dtype=wp.bool, device="cpu"))
+                np.testing.assert_array_equal(ex.state_0.particle_q.numpy(), ex.model.particle_q.numpy())
+                np.testing.assert_array_equal(ex.state_0.joint_q.numpy(), ex.model.joint_q.numpy())
+                ex.step()
+                self.assertTrue(np.isfinite(ex.state_0.particle_q.numpy()).all())
+
+    def test_reset_preserves_neighbor_grasp_and_home_phase(self):
+        """Retain the neighboring episode's grasp rows, return trajectory and self-contact margin."""
+        for shirt in (False, True):
+            with self.subTest(shirt=shirt):
+                ex, control = self.example(shirt), self.example(shirt)
+                for e in (ex, control):
+                    if shirt:
+                        e.key_pose(e.plan.home[0] - 0.02, noise=False)
+                        e.episode_time[:] = e.plan.home[0] + 0.4
+                        e.key_pose(e.episode_time, noise=False)
+                        e.update_contact_margin()
+                    else:
+                        q = e.key_pose(2.2, iterations=100, noise=False)
+                        for state in (e.state_0, e.state_1):
+                            state.joint_q.assign(q)
+                            state.joint_qd.zero_()
+                            newton.eval_fk(e.model, state.joint_q, state.joint_qd, state)
+                        e.episode_time[:] = 2.2
+                        e.update_grasp()
+                        self.assertIsNotNone(e.grasp_rows)
+                        e.step()
+                rows = ex.grasp_rows
+                ex.reset(wp.array([True, False, False], dtype=wp.bool, device="cpu"))
+                if shirt:
+                    self.assertIsNone(ex.home_q[0])
+                    np.testing.assert_array_equal(ex.home_q[1], control.home_q[1])
+                    np.testing.assert_array_equal(
+                        ex.contact_margin, [shirt_example.LAND_MARGIN, shirt_example.FOLD_MARGIN]
+                    )
+                else:
+                    keep = rows[0][:, 0] >= ex.particles
+                    self.assertTrue(keep.any())
+                    for actual, before in zip(ex.grasp_rows[:4], rows[:4], strict=True):
+                        np.testing.assert_array_equal(actual, before[keep])
+                for _ in range(3):
+                    if shirt:
+                        ex.episode_time += ex.frame_dt
+                        control.episode_time += control.frame_dt
+                        actual = ex.key_pose(ex.episode_time).reshape(2, -1)
+                        expected = control.key_pose(control.episode_time).reshape(2, -1)
+                        np.testing.assert_array_equal(actual[1], expected[1])
+                    else:
+                        ex.step()
+                        control.step()
+                        for name in ("particle_q", "particle_qd", "body_q", "body_qd", "joint_q", "joint_qd"):
+                            actual, expected = (getattr(e.state_0, name).numpy() for e in (ex, control))
+                            np.testing.assert_allclose(
+                                actual[len(actual) // 2 :], expected[len(actual) // 2 :], atol=2e-6
+                            )
 
 
 class TestJointDrive(unittest.TestCase):
