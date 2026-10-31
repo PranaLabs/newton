@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+import warnings
 
 import numpy as np
 import warp as wp
@@ -10,9 +11,9 @@ import newton
 
 
 def _build_model(*, custom_attrs: tuple[str, ...] = ()):
-    builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=0.0)
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, 0.0, 0.0))
     inertia = wp.mat33((0.1, 0.0, 0.0), (0.0, 0.1, 0.0), (0.0, 0.0, 0.1))
-    body = builder.add_link(armature=0.0, inertia=inertia, mass=1.0)
+    body = builder.add_link(inertia=inertia, mass=1.0)
     joint = builder.add_joint_revolute(
         parent=-1,
         child=body,
@@ -26,7 +27,9 @@ def _build_model(*, custom_attrs: tuple[str, ...] = ()):
         actuator_mode=newton.JointTargetMode.POSITION_VELOCITY,
     )
     builder.add_articulation([joint])
-    builder.request_state_attributes("mujoco:qfrc_actuator")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        builder.request_state_attributes("mujoco:qfrc_actuator")
     for name in custom_attrs:
         builder.add_custom_attribute(
             newton.ModelBuilder.CustomAttribute(

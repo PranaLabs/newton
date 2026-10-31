@@ -13,8 +13,8 @@ newton.sensors
    :toctree: _generated
    :nosignatures:
 
+   SensorCamera
    SensorContact
    SensorFrameTransform
    SensorIMU
-   SensorRaycast
    SensorTiledCamera

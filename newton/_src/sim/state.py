@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import ClassVar
+
 import warp as wp
 
 
@@ -55,20 +58,27 @@ class State:
     store and update the simulation's current configuration and derived data.
     """
 
-    EXTENDED_ATTRIBUTES: frozenset[str] = frozenset(
-        (
-            "body_qdd",
-            "body_parent_f",
-            "mujoco:qfrc_actuator",
-        )
-    )
+    @dataclass(frozen=True)
+    class ExtendedAttributeTemplate:
+        """Allocation metadata for an optional built-in state attribute."""
+
+        frequency: str
+        dtype: type
+
+    EXTENDED_ATTRIBUTE_TEMPLATES: ClassVar[dict[str, ExtendedAttributeTemplate]] = {
+        "body_qdd": ExtendedAttributeTemplate("BODY", wp.spatial_vector),
+        "body_parent_f": ExtendedAttributeTemplate("BODY", wp.spatial_vector),
+        "mujoco:qfrc_actuator": ExtendedAttributeTemplate("JOINT_DOF", wp.float32),
+    }
+    """Optional extended state attributes and their allocation metadata."""
+
+    EXTENDED_ATTRIBUTES: frozenset[str] = frozenset(EXTENDED_ATTRIBUTE_TEMPLATES)
     """
-    Names of optional extended state attributes that are not allocated by default.
+    Deprecated optional solver-produced state attributes.
 
-    These can be requested via :meth:`newton.ModelBuilder.request_state_attributes` or
-    :meth:`newton.Model.request_state_attributes` before calling :meth:`newton.Model.state`.
+    .. deprecated:: 1.7
 
-    See :ref:`extended_state_attributes` for details and usage.
+        Request :class:`newton.solvers.SolverBase.Observables` from the solver instead.
     """
 
     @classmethod
@@ -116,15 +126,14 @@ class State:
         last three: angular velocity [rad/s] in world frame.
         See :ref:`Twist conventions in Newton <Twist conventions>` for more information."""
 
-        self.body_q_prev: wp.array | None = None
-        """Previous rigid body transforms [m, unitless quaternion] for finite-difference velocity computation."""
-
         self.body_qdd: wp.array | None = None
         """Rigid body accelerations (spatial) [m/s², rad/s²], shape (body_count,), dtype :class:`spatial_vector`.
         First three entries: linear acceleration [m/s²] relative to the body's center of mass in world frame;
         last three: angular acceleration [rad/s²] in world frame.
 
-        This is an extended state attribute; see :ref:`extended_state_attributes` for more information.
+        .. deprecated:: 1.7
+            Request :attr:`newton.solvers.SolverBase.ObservableKind.BODY_QDD` from the solver and read
+            :attr:`newton.solvers.SolverBase.Observables.body_qdd` instead.
         """
 
         self.body_f: wp.array | None = None
@@ -140,7 +149,9 @@ class State:
         """Parent interaction forces [N, N·m], shape (body_count,), dtype :class:`spatial_vector`.
         First three entries: linear force [N]; last three: torque [N·m].
 
-        This is an extended state attribute; see :ref:`extended_state_attributes` for more information.
+        .. deprecated:: 1.7
+            Request :attr:`newton.solvers.SolverBase.ObservableKind.BODY_PARENT_F` from the solver and read
+            :attr:`newton.solvers.SolverBase.Observables.body_parent_f` instead.
 
         .. note::
             :attr:`body_parent_f` represents incoming joint wrenches in world frame, referenced to the body's center of mass (COM).

@@ -12,7 +12,9 @@ from ...math import (
     vec_min,
     velocity_at_point,
 )
-from ...sim import BodyFlags, JointType
+from ...sim import BodyFlags, JointType, Model
+from ...sim.contacts import contact_surface_point, contact_surface_separation
+from ...sim.joint_mimic import eval_joint_mimic_coordinate
 
 
 @wp.kernel
@@ -38,14 +40,17 @@ def apply_particle_shape_restitution(
     particle_v_old: wp.array[wp.vec3],
     particle_radius: wp.array[float],
     particle_flags: wp.array[wp.int32],
+    particle_world: wp.array[wp.int32],
     body_q: wp.array[wp.transform],
-    body_q_prev: wp.array[wp.transform],
+    body_q_pre_solve: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
-    body_qd_prev: wp.array[wp.spatial_vector],
+    body_qd_pre_solve: wp.array[wp.spatial_vector],
     body_com: wp.array[wp.vec3],
     shape_body: wp.array[int],
     particle_ka: float,
     restitution: float,
+    gravity: wp.array[wp.vec3],
+    dt: float,
     contact_count: wp.array[int],
     contact_particle: wp.array[int],
     contact_shape: wp.array[int],
@@ -73,12 +78,12 @@ def apply_particle_shape_restitution(
     v_old = particle_v_old[particle_index]
 
     X_wb = wp.transform_identity()
-    X_wb_prev = wp.transform_identity()
+    X_wb_pre_solve = wp.transform_identity()
     X_com = wp.vec3()
 
     if body_index >= 0:
         X_wb = body_q[body_index]
-        X_wb_prev = body_q_prev[body_index]
+        X_wb_pre_solve = body_q_pre_solve[body_index]
         X_com = body_com[body_index]
 
     # body position in world space
@@ -90,22 +95,23 @@ def apply_particle_shape_restitution(
     if c > particle_ka:
         return
 
-    # lever arm from previous pose (consistent with apply_rigid_restitution)
-    bx_prev = wp.transform_point(X_wb_prev, contact_body_pos[tid])
-    r = bx_prev - wp.transform_point(X_wb_prev, X_com)
+    # Use the same pre-solve pose and velocity snapshot as rigid restitution.
+    bx_pre_solve = wp.transform_point(X_wb_pre_solve, contact_body_pos[tid])
+    r = bx_pre_solve - wp.transform_point(X_wb_pre_solve, X_com)
 
     # compute body velocity at the contact point
-    bv_contact = wp.transform_vector(X_wb_prev, contact_body_vel[tid])
+    bv_contact = wp.transform_vector(X_wb_pre_solve, contact_body_vel[tid])
     bv_old = bv_contact
     bv_new = bv_contact
     if body_index >= 0:
-        bv_old = velocity_at_point(body_qd_prev[body_index], r) + bv_contact
+        bv_old = velocity_at_point(body_qd_pre_solve[body_index], r) + bv_contact
         bv_new = velocity_at_point(body_qd[body_index], r) + bv_contact
 
     rel_vel_old = wp.dot(n, v_old - bv_old)
     rel_vel_new = wp.dot(n, v_new - bv_new)
 
-    if rel_vel_old < 0.0:
+    impact_threshold = 2.0 * wp.length(gravity[particle_world[particle_index]]) * dt
+    if rel_vel_old < -impact_threshold:
         dv = n * (-rel_vel_new + wp.max(-restitution * rel_vel_old, 0.0))
 
         wp.atomic_add(particle_v_out, particle_index, dv)
@@ -123,6 +129,7 @@ def solve_particle_shape_contacts(
     body_com: wp.array[wp.vec3],
     body_m_inv: wp.array[float],
     body_I_inv: wp.array[wp.mat33],
+    body_flags: wp.array[wp.int32],
     shape_body: wp.array[int],
     shape_material_mu: wp.array[float],
     particle_mu: float,
@@ -150,8 +157,16 @@ def solve_particle_shape_contacts(
     body_index = shape_body[shape_index]
     particle_index = contact_particle[tid]
 
-    if (particle_flags[particle_index] & ParticleFlags.ACTIVE) == 0:
+    particle_flag = particle_flags[particle_index]
+    if (particle_flag & ParticleFlags.ACTIVE) == 0:
         return
+    if (particle_flag & ParticleFlags.PROXY) != 0:
+        if body_index < 0:
+            return
+        if (body_flags[body_index] & int(BodyFlags.PROXY)) != 0:
+            return
+        if body_m_inv[body_index] == 0.0:
+            return
 
     px = particle_x[particle_index]
     pv = particle_v[particle_index]
@@ -218,8 +233,13 @@ def solve_particle_shape_contacts(
     wp.atomic_add(delta, particle_index, w1 * delta_total)
 
     if body_index >= 0:
-        delta_t = wp.cross(r, delta_total)
-        wp.atomic_sub(body_delta, body_index, wp.spatial_vector(delta_total, delta_t))
+        # apply_body_deltas() treats body_delta as a velocity-like correction:
+        # it multiplies by inverse mass/inertia and dt to update the body pose.
+        # delta_total is a positional contact correction, matching the particle
+        # path above, so convert it to the body-delta convention here.
+        delta_v = delta_total / dt
+        delta_w = wp.cross(r, delta_v)
+        wp.atomic_sub(body_delta, body_index, wp.spatial_vector(delta_v, delta_w))
 
 
 @wp.kernel
@@ -245,8 +265,10 @@ def solve_particle_particle_contacts(
     if i == -1:
         # hash grid has not been built yet
         return
-    if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+    particle_flag = particle_flags[i]
+    if (particle_flag & ParticleFlags.ACTIVE) == 0:
         return
+    is_proxy = particle_flag & ParticleFlags.PROXY
 
     x = particle_x[i]
     v = particle_v[i]
@@ -260,7 +282,12 @@ def solve_particle_particle_contacts(
     delta = wp.vec3(0.0)
 
     while wp.hash_grid_query_next(query, index):
-        if (particle_flags[index] & ParticleFlags.ACTIVE) != 0 and index != i:
+        neighbor_flag = particle_flags[index]
+        if (
+            (neighbor_flag & ParticleFlags.ACTIVE) != 0
+            and (is_proxy == 0 or ((neighbor_flag & ParticleFlags.PROXY) == 0 and particle_invmass[index] > 0.0))
+            and index != i
+        ):
             # compute distance to point
             n = x - particle_x[index]
             d = wp.length(n)
@@ -270,7 +297,7 @@ def solve_particle_particle_contacts(
             w2 = particle_invmass[index]
             denom = w1 + w2
 
-            if err <= k_cohesion and denom > 0.0:
+            if err <= k_cohesion and denom > 0.0 and d > 0.0:
                 n = n / d
                 vrel = v - particle_v[index]
 
@@ -469,6 +496,38 @@ def solve_tetrahedra(
     relaxation: float,
     delta: wp.array[wp.vec3],
 ):
+    # Tetrahedral XPBD constraint solve.
+    #
+    # ModelBuilder stores rest_matrix as inv(Dm), where
+    # Dm = [x1_0 - x0_0, x2_0 - x0_0, x3_0 - x0_0] in the rest pose.  Each
+    # iteration rebuilds Ds from the current particle positions and computes the
+    # deformation gradient
+    #
+    #     F = Ds * inv(Dm).
+    #
+    # The material is the same compressible Neo-Hookean-style split used by the
+    # FEM path: a distortional term controlled by the first Lame parameter
+    # k_mu, and a volume term controlled by the second Lame parameter k_lambda.
+    # In XPBD form these are solved as two scalar constraints:
+    #
+    #     C_dev = trace(F^T F) - 3
+    #     C_vol = det(F) - 1 + activation
+    #
+    # Their gradients are dC/dF = 2F for C_dev and cof(F) for C_vol.  The chain
+    # rule dF/dx contributes inv(Dm)^T, giving the per-particle gradients below.
+    #
+    # A tetrahedron's energy scales with rest volume V0, so the XPBD compliance
+    # for a material stiffness k is 1 / (V0 * k).  Since rest_matrix is inv(Dm),
+    # det(rest_matrix) * 6 = 1 / V0.
+    #
+    # Damping uses XPBD's compliant Rayleigh term:
+    #
+    #     gamma = k_damp / (k * dt)
+    #     dlambda = -(C + gamma * dt * grad(C).dot(v))
+    #               / ((1 + gamma) * sum_i(w_i |grad_i C|^2) + alpha)
+    #
+    # The solver does not persist lambdas for this constraint, so each iteration
+    # computes a local multiplier and accumulates relaxed position corrections.
     tid = wp.tid()
 
     i = indices[tid, 0]
@@ -476,21 +535,21 @@ def solve_tetrahedra(
     k = indices[tid, 2]
     l = indices[tid, 3]
 
-    # act = activation[tid]
+    act = activation[tid]
 
-    # k_mu = materials[tid, 0]
-    # k_lambda = materials[tid, 1]
-    # k_damp = materials[tid, 2]
+    k_mu = materials[tid, 0]
+    k_lambda = materials[tid, 1]
+    k_damp = materials[tid, 2]
 
     x0 = x[i]
     x1 = x[j]
     x2 = x[k]
     x3 = x[l]
 
-    # v0 = v[i]
-    # v1 = v[j]
-    # v2 = v[k]
-    # v3 = v[l]
+    v0 = v[i]
+    v1 = v[j]
+    v2 = v[k]
+    v3 = v[l]
 
     w0 = inv_mass[i]
     w1 = inv_mass[j]
@@ -506,6 +565,8 @@ def solve_tetrahedra(
     inv_QT = wp.transpose(Dm)
 
     inv_rest_volume = wp.determinant(Dm) * 6.0
+    if inv_rest_volume <= 0.0 or k_mu <= 0.0 or k_lambda <= 0.0:
+        return
 
     # F = Xs*Xm^-1
     F = Ds * Dm
@@ -519,9 +580,7 @@ def solve_tetrahedra(
     C = float(0.0)
     dC = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     compliance = float(0.0)
-
-    stretching_compliance = relaxation
-    volume_compliance = relaxation
+    stiffness = float(0.0)
 
     num_terms = 2
     for term in range(0, num_terms):
@@ -529,12 +588,14 @@ def solve_tetrahedra(
             # deviatoric, stable
             C = tr - 3.0
             dC = F * 2.0
-            compliance = stretching_compliance
+            compliance = inv_rest_volume / k_mu
+            stiffness = k_mu
         elif term == 1:
             # volume conservation
-            C = wp.determinant(F) - 1.0
+            C = wp.determinant(F) - 1.0 + act
             dC = wp.matrix_from_cols(wp.cross(f2, f3), wp.cross(f3, f1), wp.cross(f1, f2))
-            compliance = volume_compliance
+            compliance = inv_rest_volume / k_lambda
+            stiffness = k_lambda
 
         if C != 0.0:
             dP = dC * inv_QT
@@ -552,14 +613,17 @@ def solve_tetrahedra(
 
             if w > 0.0:
                 alpha = compliance / dt / dt
-                if inv_rest_volume > 0.0:
-                    alpha *= inv_rest_volume
-                dlambda = -C / (w + alpha)
+                gamma = float(0.0)
+                grad_dot_v = float(0.0)
+                if k_damp > 0.0 and stiffness > 0.0:
+                    gamma = k_damp / (stiffness * dt)
+                    grad_dot_v = dt * (wp.dot(grad0, v0) + wp.dot(grad1, v1) + wp.dot(grad2, v2) + wp.dot(grad3, v3))
+                dlambda = -1.0 * (C + gamma * grad_dot_v) / ((1.0 + gamma) * w + alpha)
 
-                wp.atomic_add(delta, i, w0 * dlambda * grad0)
-                wp.atomic_add(delta, j, w1 * dlambda * grad1)
-                wp.atomic_add(delta, k, w2 * dlambda * grad2)
-                wp.atomic_add(delta, l, w3 * dlambda * grad3)
+                wp.atomic_add(delta, i, w0 * dlambda * grad0 * relaxation)
+                wp.atomic_add(delta, j, w1 * dlambda * grad1 * relaxation)
+                wp.atomic_add(delta, k, w2 * dlambda * grad2 * relaxation)
+                wp.atomic_add(delta, l, w3 * dlambda * grad3 * relaxation)
                 # wp.atomic_add(particle.num_corr, id0, 1)
                 # wp.atomic_add(particle.num_corr, id1, 1)
                 # wp.atomic_add(particle.num_corr, id2, 1)
@@ -657,11 +721,6 @@ def solve_tetrahedra2(
     x1 = x[j]
     x2 = x[k]
     x3 = x[l]
-
-    # v0 = v[i]
-    # v1 = v[j]
-    # v2 = v[k]
-    # v3 = v[l]
 
     w0 = inv_mass[i]
     w1 = inv_mass[j]
@@ -801,6 +860,7 @@ def apply_particle_deltas(
     v_new_mag = wp.length(v_new)
     if v_new_mag > v_max:
         v_new *= v_max / v_new_mag
+        x_new = x0 + v_new * dt
 
     x_out[tid] = x_new
     v_out[tid] = v_new
@@ -879,12 +939,51 @@ def apply_body_deltas(
 
 
 @wp.kernel
+def update_body_velocities(
+    poses: wp.array[wp.transform],
+    poses_prev: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    dt: float,
+    qd_out: wp.array[wp.spatial_vector],
+):
+    """Reconstruct body velocities from a full-step pose change for legacy compatibility."""
+    tid = wp.tid()
+
+    pose = poses[tid]
+    pose_prev = poses_prev[tid]
+
+    x = wp.transform_get_translation(pose)
+    x_prev = wp.transform_get_translation(pose_prev)
+
+    q = wp.transform_get_rotation(pose)
+    q_prev = wp.transform_get_rotation(pose_prev)
+
+    x_com = x + wp.quat_rotate(q, body_com[tid])
+    x_com_prev = x_prev + wp.quat_rotate(q_prev, body_com[tid])
+
+    v = (x_com - x_com_prev) / dt
+    dq = q * wp.quat_inverse(q_prev)
+
+    omega = 2.0 / dt * wp.vec3(dq[0], dq[1], dq[2])
+    if dq[3] < 0.0:
+        omega = -omega
+
+    qd_out[tid] = wp.spatial_vector(v, omega)
+
+
+@wp.kernel
 def apply_body_delta_velocities(
     deltas: wp.array[wp.spatial_vector],
+    constraint_inv_weights: wp.array[float],
     qd_out: wp.array[wp.spatial_vector],
 ):
     tid = wp.tid()
-    wp.atomic_add(qd_out, tid, deltas[tid])
+    weight = 1.0
+    if constraint_inv_weights:
+        inv_weight = constraint_inv_weights[tid]
+        if inv_weight > 0.0:
+            weight = 1.0 / inv_weight
+    wp.atomic_add(qd_out, tid, deltas[tid] * weight)
 
 
 @wp.kernel
@@ -901,13 +1000,15 @@ def apply_joint_forces(
     joint_dof_dim: wp.array2d[int],
     joint_axis: wp.array[wp.vec3],
     joint_f: wp.array[float],
+    dt: float,
     body_f: wp.array[wp.spatial_vector],
+    joint_impulse: wp.array[wp.spatial_vector],
 ):
     tid = wp.tid()
     type = joint_type[tid]
     if not joint_enabled[tid]:
         return
-    if type == JointType.FIXED or type == JointType.CABLE:
+    if type == JointType.FIXED or type == JointType.ROD:
         return
 
     # rigid body indices of the child and parent
@@ -954,6 +1055,12 @@ def apply_joint_forces(
         wp.atomic_add(body_f, id_c, wp.spatial_vector(f_total, t_total))
         if id_p >= 0:
             wp.atomic_sub(body_f, id_p, wp.spatial_vector(f_total, t_total))
+        # Record the contribution to the inbound joint wrench (used to populate
+        # ``SolverBase.Observables.body_parent_f``).  For FREE joints this is a diagnostic only;
+        # for DISTANCE joints the constraint solver adds its own contribution.
+        # Convention: positive = wrench transmitted parent->child at child COM.
+        if joint_impulse:
+            wp.atomic_add(joint_impulse, tid, wp.spatial_vector(f_total, t_total) * dt)
         return
     elif type == JointType.BALL:
         t_total = wp.vec3(joint_f[qd_start + 0], joint_f[qd_start + 1], joint_f[qd_start + 2])
@@ -998,9 +1105,18 @@ def apply_joint_forces(
         print("joint type not handled in apply_joint_forces")
 
     # write forces
+    child_wrench_at_com = wp.spatial_vector(f_total, t_total + wp.cross(r_c, f_total))
     if id_p >= 0:
         wp.atomic_sub(body_f, id_p, wp.spatial_vector(f_total, t_total + wp.cross(r_p, f_total)))
-    wp.atomic_add(body_f, id_c, wp.spatial_vector(f_total, t_total + wp.cross(r_c, f_total)))
+    wp.atomic_add(body_f, id_c, child_wrench_at_com)
+
+    # Record the joint-f contribution to the inbound joint wrench (used to
+    # populate ``SolverBase.Observables.body_parent_f``).  We accumulate the child-side spatial
+    # wrench (linear ``[N]``, torque ``[N·m]`` at the child COM, world frame)
+    # multiplied by ``dt`` so that the same `impulse / dt` conversion applied
+    # in :func:`convert_joint_impulse_to_parent_f` recovers the wrench.
+    if joint_impulse:
+        wp.atomic_add(joint_impulse, tid, child_wrench_at_com * dt)
 
 
 @wp.func
@@ -1454,10 +1570,11 @@ def solve_body_joints(
     joint_limit_lower: wp.array[float],
     joint_limit_upper: wp.array[float],
     joint_qd_start: wp.array[int],
+    joint_target_q_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
     joint_axis: wp.array[wp.vec3],
-    joint_target_pos: wp.array[float],
-    joint_target_vel: wp.array[float],
+    joint_target_q: wp.array[float],
+    joint_target_qd: wp.array[float],
     joint_target_ke: wp.array[float],
     joint_target_kd: wp.array[float],
     joint_linear_compliance: float,
@@ -1531,13 +1648,14 @@ def solve_body_joints(
     rel_p = wp.transform_get_translation(rel_pose)
 
     # joint connection points
-    # x_p = wp.transform_get_translation(X_wp)
+    x_p = wp.transform_get_translation(X_wp)
     x_c = wp.transform_get_translation(X_wc)
 
     linear_compliance = joint_linear_compliance
     angular_compliance = joint_angular_compliance
 
     axis_start = joint_qd_start[tid]
+    target_axis_start = joint_target_q_start[tid]
     lin_axis_count = joint_dof_dim[tid, 0]
     ang_axis_count = joint_dof_dim[tid, 1]
 
@@ -1546,28 +1664,33 @@ def solve_body_joints(
 
     # handle positional constraints
     if type == JointType.DISTANCE:
-        r_p = wp.transform_get_translation(X_wp) - world_com_p
-        r_c = wp.transform_get_translation(X_wc) - world_com_c
+        r_p = x_p - world_com_p
+        r_c = x_c - world_com_c
         lower = joint_limit_lower[axis_start]
         upper = joint_limit_upper[axis_start]
         if lower < 0.0 and upper < 0.0:
             # no limits
             return
-        d = wp.length(rel_p)
+        anchor_delta = x_c - x_p
+        d = wp.length(anchor_delta)
         err = 0.0
         if lower >= 0.0 and d < lower:
             err = d - lower
-            # use a more descriptive direction vector for the constraint
-            # in case the joint parent and child anchors are very close
-            rel_p = err * wp.normalize(world_com_c - world_com_p)
         elif upper >= 0.0 and d > upper:
             err = d - upper
 
         if wp.abs(err) > 1e-9:
             # compute gradients
-            linear_c = rel_p
+            if d > 1e-9:
+                linear_c = anchor_delta / d
+            else:
+                com_delta = world_com_c - world_com_p
+                if wp.length_sq(com_delta) > 1e-18:
+                    linear_c = wp.normalize(com_delta)
+                else:
+                    # The parent joint frame supplies a stable direction when the geometry cannot.
+                    linear_c = wp.transform_vector(X_wp, wp.vec3(1.0, 0.0, 0.0))
             linear_p = -linear_c
-            r_c = x_c - world_com_c
             angular_p = -wp.cross(r_p, linear_c)
             angular_c = wp.cross(r_c, linear_c)
             # constraint time derivative
@@ -1621,36 +1744,38 @@ def solve_body_joints(
             axis_limits = wp.spatial_vector(vec_min(lo_temp, up_temp), vec_max(lo_temp, up_temp))
             ke = joint_target_ke[axis_start]
             kd = joint_target_kd[axis_start]
-            target_pos = joint_target_pos[axis_start]
-            target_vel = joint_target_vel[axis_start]
+            target_pos = joint_target_q[target_axis_start]
+            target_vel = joint_target_qd[axis_start]
             if ke > 0.0:  # has position control
                 axis_target_pos_ke = update_joint_axis_weighted_target(axis, target_pos, ke, axis_target_pos_ke)
             if kd > 0.0:  # has velocity control
                 axis_target_vel_kd = update_joint_axis_weighted_target(axis, target_vel, kd, axis_target_vel_kd)
         if lin_axis_count > 1:
             axis_idx = axis_start + 1
+            target_axis_idx = target_axis_start + 1
             axis = joint_axis[axis_idx]
             lower = joint_limit_lower[axis_idx]
             upper = joint_limit_upper[axis_idx]
             axis_limits = update_joint_axis_limits(axis, lower, upper, axis_limits)
             ke = joint_target_ke[axis_idx]
             kd = joint_target_kd[axis_idx]
-            target_pos = joint_target_pos[axis_idx]
-            target_vel = joint_target_vel[axis_idx]
+            target_pos = joint_target_q[target_axis_idx]
+            target_vel = joint_target_qd[axis_idx]
             if ke > 0.0:  # has position control
                 axis_target_pos_ke = update_joint_axis_weighted_target(axis, target_pos, ke, axis_target_pos_ke)
             if kd > 0.0:  # has velocity control
                 axis_target_vel_kd = update_joint_axis_weighted_target(axis, target_vel, kd, axis_target_vel_kd)
         if lin_axis_count > 2:
             axis_idx = axis_start + 2
+            target_axis_idx = target_axis_start + 2
             axis = joint_axis[axis_idx]
             lower = joint_limit_lower[axis_idx]
             upper = joint_limit_upper[axis_idx]
             axis_limits = update_joint_axis_limits(axis, lower, upper, axis_limits)
             ke = joint_target_ke[axis_idx]
             kd = joint_target_kd[axis_idx]
-            target_pos = joint_target_pos[axis_idx]
-            target_vel = joint_target_vel[axis_idx]
+            target_pos = joint_target_q[target_axis_idx]
+            target_vel = joint_target_qd[axis_idx]
             if ke > 0.0:  # has position control
                 axis_target_pos_ke = update_joint_axis_weighted_target(axis, target_pos, ke, axis_target_pos_ke)
             if kd > 0.0:  # has velocity control
@@ -1669,10 +1794,28 @@ def solve_body_joints(
         axis_limits_lower = wp.spatial_top(axis_limits)
         axis_limits_upper = wp.spatial_bottom(axis_limits)
 
+        # A relative offset can contain both valid joint motion and error. For example,
+        # a prismatic joint may be 0.5 m along its free axis and 1 m off it.
+        # Start from the current offset so unconstrained coordinates keep their extension.
+        projected_rel_p = rel_p
+        for dim in range(3):
+            lower = axis_limits_lower[dim]
+            upper = axis_limits_upper[dim]
+            # Limit violations project to the nearest admissible boundary.
+            if rel_p[dim] < lower:
+                projected_rel_p[dim] = lower
+            elif rel_p[dim] > upper:
+                projected_rel_p[dim] = upper
+            # A position-driven coordinate projects to its target. Locked coordinates
+            # have zero-width limits above and therefore already project to zero.
+            elif axis_stiffness[dim] > 0.0:
+                projected_rel_p[dim] = wp.clamp(axis_target_pos[dim], lower, upper)
+
         frame_p = wp.quat_to_matrix(wp.transform_get_rotation(X_wp))
-        # note that x_c appearing in both is correct
-        r_p = x_c - world_com_p
-        r_c = x_c - wp.transform_point(pose_c, com_c)
+        # Use the admissible point for the parent lever arm: the parent anchor would
+        # discard valid extension, while the child anchor would include separation error.
+        r_p = wp.transform_point(X_wp, projected_rel_p) - world_com_p
+        r_c = x_c - world_com_c
 
         # for loop will be unrolled, so we can modify local variables
         for dim in range(3):
@@ -1816,42 +1959,45 @@ def solve_body_joints(
         # avoid a for loop here since local variables would need to be modified which is not yet differentiable
         if ang_axis_count > 0:
             axis_idx = axis_start + lin_axis_count
+            target_axis_idx = target_axis_start + lin_axis_count
             axis = joint_axis[axis_idx]
             lo_temp = axis * joint_limit_lower[axis_idx]
             up_temp = axis * joint_limit_upper[axis_idx]
             axis_limits = wp.spatial_vector(vec_min(lo_temp, up_temp), vec_max(lo_temp, up_temp))
             ke = joint_target_ke[axis_idx]
             kd = joint_target_kd[axis_idx]
-            target_pos = joint_target_pos[axis_idx]
-            target_vel = joint_target_vel[axis_idx]
+            target_pos = joint_target_q[target_axis_idx]
+            target_vel = joint_target_qd[axis_idx]
             if ke > 0.0:  # has position control
                 axis_target_pos_ke = update_joint_axis_weighted_target(axis, target_pos, ke, axis_target_pos_ke)
             if kd > 0.0:  # has velocity control
                 axis_target_vel_kd = update_joint_axis_weighted_target(axis, target_vel, kd, axis_target_vel_kd)
         if ang_axis_count > 1:
             axis_idx = axis_start + lin_axis_count + 1
+            target_axis_idx = target_axis_start + lin_axis_count + 1
             axis = joint_axis[axis_idx]
             lower = joint_limit_lower[axis_idx]
             upper = joint_limit_upper[axis_idx]
             axis_limits = update_joint_axis_limits(axis, lower, upper, axis_limits)
             ke = joint_target_ke[axis_idx]
             kd = joint_target_kd[axis_idx]
-            target_pos = joint_target_pos[axis_idx]
-            target_vel = joint_target_vel[axis_idx]
+            target_pos = joint_target_q[target_axis_idx]
+            target_vel = joint_target_qd[axis_idx]
             if ke > 0.0:  # has position control
                 axis_target_pos_ke = update_joint_axis_weighted_target(axis, target_pos, ke, axis_target_pos_ke)
             if kd > 0.0:  # has velocity control
                 axis_target_vel_kd = update_joint_axis_weighted_target(axis, target_vel, kd, axis_target_vel_kd)
         if ang_axis_count > 2:
             axis_idx = axis_start + lin_axis_count + 2
+            target_axis_idx = target_axis_start + lin_axis_count + 2
             axis = joint_axis[axis_idx]
             lower = joint_limit_lower[axis_idx]
             upper = joint_limit_upper[axis_idx]
             axis_limits = update_joint_axis_limits(axis, lower, upper, axis_limits)
             ke = joint_target_ke[axis_idx]
             kd = joint_target_kd[axis_idx]
-            target_pos = joint_target_pos[axis_idx]
-            target_vel = joint_target_vel[axis_idx]
+            target_pos = joint_target_q[target_axis_idx]
+            target_vel = joint_target_qd[axis_idx]
             if ke > 0.0:  # has position control
                 axis_target_pos_ke = update_joint_axis_weighted_target(axis, target_pos, ke, axis_target_pos_ke)
             if kd > 0.0:  # has velocity control
@@ -1940,6 +2086,255 @@ def solve_body_joints(
     # measured from the child COM).
     if joint_impulse:
         wp.atomic_add(joint_impulse, tid, wp.spatial_vector(lin_delta_c, ang_delta_c))
+
+
+@wp.func
+def _joint_mimic_effective_mass(
+    body: int,
+    gradient: wp.spatial_vector,
+    body_q: wp.array[wp.transform],
+    body_inv_m: wp.array[float],
+    body_inv_I: wp.array[wp.mat33],
+):
+    """Return the inverse effective mass for one maximal-coordinate gradient."""
+    if body < 0:
+        return float(0.0)
+    linear = wp.spatial_top(gradient)
+    angular = wp.spatial_bottom(gradient)
+    body_rotation = wp.transform_get_rotation(body_q[body])
+    angular_body = wp.quat_rotate_inv(body_rotation, angular)
+    return body_inv_m[body] * wp.length_sq(linear) + wp.dot(angular_body, body_inv_I[body] * angular_body)
+
+
+@wp.kernel(module="unique")
+def solve_joint_mimics(
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    body_inv_m: wp.array[float],
+    body_inv_I: wp.array[wp.mat33],
+    joint_type: wp.array[int],
+    joint_enabled: wp.array[bool],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    joint_qd_start: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    joint_axis: wp.array[wp.vec3],
+    joint_mimic_joint: wp.array[int],
+    joint_mimic_coeffs: wp.array[wp.vec2],
+    angular_relaxation: float,
+    linear_relaxation: float,
+    dt: float,
+    deltas: wp.array[wp.spatial_vector],
+    joint_impulse: wp.array[wp.spatial_vector],
+):
+    """Solve joint-owned mimic relationships as coupled maximal-coordinate constraints."""
+    follower = wp.tid()
+    reference = joint_mimic_joint[follower]
+    if reference < 0 or not joint_enabled[follower] or not joint_enabled[reference]:
+        return
+
+    follower_type = joint_type[follower]
+    reference_type = joint_type[reference]
+    follower_supported = (
+        follower_type == JointType.PRISMATIC or follower_type == JointType.REVOLUTE or follower_type == JointType.D6
+    )
+    reference_supported = (
+        reference_type == JointType.PRISMATIC or reference_type == JointType.REVOLUTE or reference_type == JointType.D6
+    )
+    if not follower_supported or not reference_supported:
+        return
+
+    follower_parent = joint_parent[follower]
+    follower_child = joint_child[follower]
+    reference_parent = joint_parent[reference]
+    reference_child = joint_child[reference]
+    coordinate_count = joint_dof_dim[follower, 0] + joint_dof_dim[follower, 1]
+    follower_linear_count = joint_dof_dim[follower, 0]
+    coeffs = joint_mimic_coeffs[follower]
+    offset = coeffs[0]
+    multiplier = coeffs[1]
+
+    for component in range(6):
+        if component >= coordinate_count:
+            continue
+
+        follower_q, follower_parent_gradient, follower_child_gradient = eval_joint_mimic_coordinate(
+            follower,
+            component,
+            body_q,
+            body_com,
+            joint_type,
+            joint_parent,
+            joint_child,
+            joint_X_p,
+            joint_X_c,
+            joint_qd_start,
+            joint_dof_dim,
+            joint_axis,
+        )
+        reference_q, reference_parent_gradient, reference_child_gradient = eval_joint_mimic_coordinate(
+            reference,
+            component,
+            body_q,
+            body_com,
+            joint_type,
+            joint_parent,
+            joint_child,
+            joint_X_p,
+            joint_X_c,
+            joint_qd_start,
+            joint_dof_dim,
+            joint_axis,
+        )
+
+        error = follower_q - offset - multiplier * reference_q
+        if component >= follower_linear_count:
+            error = wp.atan2(wp.sin(error), wp.cos(error))
+
+        gradient_0 = follower_parent_gradient
+        gradient_1 = follower_child_gradient
+        gradient_2 = reference_parent_gradient * -multiplier
+        gradient_3 = reference_child_gradient * -multiplier
+        impulse_reference_child = gradient_3
+
+        body_0 = follower_parent
+        body_1 = follower_child
+        body_2 = reference_parent
+        body_3 = reference_child
+
+        # A serial pair shares the reference child with the follower parent.
+        # Merge equal body indices before computing effective mass so the cross
+        # terms of the combined maximal-coordinate gradient are retained.
+        if body_1 >= 0 and body_1 == body_0:
+            gradient_0 += gradient_1
+            body_1 = -1
+        if body_2 >= 0:
+            if body_2 == body_0:
+                gradient_0 += gradient_2
+                body_2 = -1
+            elif body_2 == body_1:
+                gradient_1 += gradient_2
+                body_2 = -1
+        if body_3 >= 0:
+            if body_3 == body_0:
+                gradient_0 += gradient_3
+                body_3 = -1
+            elif body_3 == body_1:
+                gradient_1 += gradient_3
+                body_3 = -1
+            elif body_3 == body_2:
+                gradient_2 += gradient_3
+                body_3 = -1
+
+        effective_mass = _joint_mimic_effective_mass(body_0, gradient_0, body_q, body_inv_m, body_inv_I)
+        effective_mass += _joint_mimic_effective_mass(body_1, gradient_1, body_q, body_inv_m, body_inv_I)
+        effective_mass += _joint_mimic_effective_mass(body_2, gradient_2, body_q, body_inv_m, body_inv_I)
+        effective_mass += _joint_mimic_effective_mass(body_3, gradient_3, body_q, body_inv_m, body_inv_I)
+        if effective_mass == 0.0:
+            continue
+
+        relaxation = linear_relaxation
+        if component >= follower_linear_count:
+            relaxation = angular_relaxation
+        delta_lambda = -error / (dt * effective_mass) * relaxation
+
+        if body_0 >= 0:
+            wp.atomic_add(deltas, body_0, gradient_0 * delta_lambda)
+        if body_1 >= 0:
+            wp.atomic_add(deltas, body_1, gradient_1 * delta_lambda)
+        if body_2 >= 0:
+            wp.atomic_add(deltas, body_2, gradient_2 * delta_lambda)
+        if body_3 >= 0:
+            wp.atomic_add(deltas, body_3, gradient_3 * delta_lambda)
+
+        if joint_impulse:
+            wp.atomic_add(joint_impulse, follower, follower_child_gradient * delta_lambda)
+            wp.atomic_add(joint_impulse, reference, impulse_reference_child * delta_lambda)
+
+
+@wp.kernel(module="unique")
+def apply_joint_mimic_deltas(
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    body_inv_m: wp.array[float],
+    body_inv_I: wp.array[wp.mat33],
+    deltas: wp.array[wp.spatial_vector],
+    dt: float,
+):
+    """Apply velocity-like mimic corrections to maximal body state in place."""
+    body = wp.tid()
+    inv_m = body_inv_m[body]
+    if inv_m == 0.0:
+        return
+
+    pose = body_q[body]
+    rotation = wp.transform_get_rotation(pose)
+    delta = deltas[body]
+    linear_delta = wp.spatial_top(delta) * inv_m
+    angular_delta = wp.quat_rotate(
+        rotation,
+        body_inv_I[body] * wp.quat_rotate_inv(rotation, wp.spatial_bottom(delta)),
+    )
+
+    rotation_new = wp.normalize(rotation + 0.5 * wp.quat(angular_delta * dt, 0.0) * rotation)
+    com = body_com[body]
+    com_world = wp.transform_get_translation(pose) + wp.quat_rotate(rotation, com)
+    position_new = com_world + linear_delta * dt - wp.quat_rotate(rotation_new, com)
+
+    velocity = body_qd[body]
+    body_q[body] = wp.transform(position_new, rotation_new)
+    body_qd[body] = wp.spatial_vector(
+        wp.spatial_top(velocity) + linear_delta,
+        wp.spatial_bottom(velocity) + angular_delta,
+    )
+
+
+def project_joint_mimics(
+    model: Model,
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_inv_m: wp.array[float],
+    body_inv_I: wp.array[wp.mat33],
+    deltas: wp.array[wp.spatial_vector],
+    dt: float,
+) -> None:
+    """Perform one maximal-coordinate projection of supported mimic relationships."""
+    deltas.zero_()
+    wp.launch(
+        kernel=solve_joint_mimics,
+        dim=model.joint_count,
+        inputs=[
+            body_q,
+            model.body_com,
+            body_inv_m,
+            body_inv_I,
+            model.joint_type,
+            model.joint_enabled,
+            model.joint_parent,
+            model.joint_child,
+            model.joint_X_p,
+            model.joint_X_c,
+            model.joint_qd_start,
+            model.joint_dof_dim,
+            model.joint_axis,
+            model.joint_mimic_joint,
+            model.joint_mimic_coeffs,
+            1.0,
+            1.0,
+            dt,
+        ],
+        outputs=[deltas, None],
+        device=model.device,
+    )
+    wp.launch(
+        kernel=apply_joint_mimic_deltas,
+        dim=model.body_count,
+        inputs=[body_q, body_qd, model.body_com, body_inv_m, body_inv_I, deltas, dt],
+        device=model.device,
+    )
 
 
 @wp.func
@@ -2059,8 +2454,8 @@ def compute_angular_correction(
     return delta_lambda
 
 
-@wp.kernel
-def solve_body_contact_positions(
+@wp.func
+def _solve_body_contact_positions(
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     body_flags: wp.array[wp.int32],
@@ -2071,6 +2466,7 @@ def solve_body_contact_positions(
     contact_count: wp.array[int],
     contact_point0: wp.array[wp.vec3],
     contact_point1: wp.array[wp.vec3],
+    contact_surface_velocity: wp.vec3,
     contact_offset0: wp.array[wp.vec3],
     contact_offset1: wp.array[wp.vec3],
     contact_normal: wp.array[wp.vec3],
@@ -2083,12 +2479,11 @@ def solve_body_contact_positions(
     shape_material_mu_rolling: wp.array[float],
     relaxation: float,
     dt: float,
-    # outputs
     deltas: wp.array[wp.spatial_vector],
     contact_inv_weight: wp.array[float],
     contact_impulse: wp.array[wp.spatial_vector],
+    tid: int,
 ):
-    tid = wp.tid()
 
     count = contact_count[0]
     if tid >= count:
@@ -2119,9 +2514,8 @@ def solve_body_contact_positions(
     bx_a = wp.transform_point(X_wb_a, contact_point0[tid])
     bx_b = wp.transform_point(X_wb_b, contact_point1[tid])
 
-    thickness = contact_thickness0[tid] + contact_thickness1[tid]
     n = contact_normal[tid]
-    d = wp.dot(n, bx_b - bx_a) - thickness
+    d = contact_surface_separation(bx_a, bx_b, n, contact_thickness0[tid], contact_thickness1[tid])
 
     if d >= 0.0:
         return
@@ -2202,8 +2596,8 @@ def solve_body_contact_positions(
     if mu > 0.0:
         # add on displacement from surface offsets, this ensures we include any rotational effects due to thickness from feature
         # need to use the current rotation to account for friction due to angular effects (e.g.: slipping contact)
-        bx_a += wp.transform_vector(X_wb_a, offset_a)
-        bx_b += wp.transform_vector(X_wb_b, offset_b)
+        bx_a = contact_surface_point(X_wb_a, contact_point0[tid], offset_a)
+        bx_b = contact_surface_point(X_wb_b, contact_point1[tid], offset_b)
 
         # update delta
         delta = bx_b - bx_a
@@ -2223,6 +2617,7 @@ def solve_body_contact_positions(
         if body_b >= 0 and (body_flags[body_b] & int(BodyFlags.KINEMATIC)) != 0:
             v_b = velocity_at_point(body_qd[body_b], r_b)
             rel_v_kin_t = rel_v_kin_t + (v_b - wp.dot(n, v_b) * n)
+        rel_v_kin_t += contact_surface_velocity - wp.dot(n, contact_surface_velocity) * n
         friction_delta += rel_v_kin_t * dt
 
         perp = wp.normalize(friction_delta)
@@ -2299,6 +2694,70 @@ def solve_body_contact_positions(
 
 
 @wp.kernel
+def solve_body_contact_positions(
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_flags: wp.array[wp.int32],
+    body_com: wp.array[wp.vec3],
+    body_m_inv: wp.array[float],
+    body_I_inv: wp.array[wp.mat33],
+    shape_body: wp.array[int],
+    contact_count: wp.array[int],
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_surface_velocity: wp.array[wp.vec3],
+    contact_offset0: wp.array[wp.vec3],
+    contact_offset1: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    contact_thickness0: wp.array[float],
+    contact_thickness1: wp.array[float],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    shape_material_mu: wp.array[float],
+    shape_material_mu_torsional: wp.array[float],
+    shape_material_mu_rolling: wp.array[float],
+    relaxation: float,
+    dt: float,
+    deltas: wp.array[wp.spatial_vector],
+    contact_inv_weight: wp.array[float],
+    contact_impulse: wp.array[wp.spatial_vector],
+):
+    tid = wp.tid()
+    surface_velocity = wp.vec3(0.0)
+    if contact_surface_velocity:
+        surface_velocity = contact_surface_velocity[tid]
+    _solve_body_contact_positions(
+        body_q,
+        body_qd,
+        body_flags,
+        body_com,
+        body_m_inv,
+        body_I_inv,
+        shape_body,
+        contact_count,
+        contact_point0,
+        contact_point1,
+        surface_velocity,
+        contact_offset0,
+        contact_offset1,
+        contact_normal,
+        contact_thickness0,
+        contact_thickness1,
+        contact_shape0,
+        contact_shape1,
+        shape_material_mu,
+        shape_material_mu_torsional,
+        shape_material_mu_rolling,
+        relaxation,
+        dt,
+        deltas,
+        contact_inv_weight,
+        contact_impulse,
+        tid,
+    )
+
+
+@wp.kernel
 def accumulate_weighted_contact_impulse(
     contact_count: wp.array[int],
     contact_impulse_iter: wp.array[wp.spatial_vector],
@@ -2368,7 +2827,7 @@ def convert_contact_impulse_to_force(
     # output
     contact_force: wp.array[wp.spatial_vector],
 ):
-    """Convert accumulated per-contact spatial impulse to ``contacts.force`` spatial vectors.
+    """Convert accumulated per-contact spatial impulse to contact-force output vectors.
 
     The XPBD lambda convention used in this solver already absorbs one power
     of ``dt`` (see ``compute_contact_constraint_delta``), so dividing the
@@ -2403,17 +2862,27 @@ def convert_joint_impulse_to_parent_f(
     # output
     body_parent_f: wp.array[wp.spatial_vector],
 ):
-    """Convert accumulated child-side joint impulse to ``state.body_parent_f``.
+    """Convert accumulated child-side joint impulse to a body-parent-wrench output.
 
-    The XPBD lambda convention used by ``solve_body_joints`` already absorbs
-    one power of ``dt`` (see ``compute_positional_correction`` /
-    ``compute_angular_correction``), so dividing the accumulated spatial
-    impulse by the substep ``dt`` yields the incoming joint wrench in
-    ``[N, N·m]`` in world frame, referenced to the child body's COM --
-    matching the :attr:`State.body_parent_f` convention.
+    The accumulated ``joint_impulse[joint_id]`` contains two contributions:
 
-    Free joints and disabled joints contribute zero (their bodies inherit
-    the zero-init from the caller).
+    * The XPBD constraint correction accumulated by ``solve_body_joints`` over
+      every iteration.  The lambda convention used there already absorbs one
+      power of ``dt`` (see ``compute_positional_correction`` /
+      ``compute_angular_correction``), so dividing by the substep ``dt``
+      yields the constraint reaction wrench.
+    * The body-frame contribution from ``Control.joint_f`` recorded by
+      ``apply_joint_forces``, pre-multiplied by ``dt`` for the same
+      conversion to compose correctly.
+
+    The result is the **total** wrench transmitted from the parent through the
+    inbound joint to the child, expressed in world frame at the child body's
+    COM (linear ``[N]``, torque ``[N·m]``).  This matches the convention used
+    by :class:`SolverFeatherstone` and :class:`SolverMuJoCo`.
+
+    Free joints and disabled joints contribute zero (their bodies inherit the
+    zero-init from the caller).  Multiple joints sharing the same child body
+    accumulate atomically, so loop-closure topologies remain race-free.
     """
     tid = wp.tid()
 
@@ -2430,191 +2899,4 @@ def convert_joint_impulse_to_parent_f(
     impulse = joint_impulse[tid]
     f = wp.spatial_top(impulse) * inv_dt
     tau = wp.spatial_bottom(impulse) * inv_dt
-    body_parent_f[id_c] = wp.spatial_vector(f, tau)
-
-
-@wp.kernel
-def update_body_velocities(
-    poses: wp.array[wp.transform],
-    poses_prev: wp.array[wp.transform],
-    body_com: wp.array[wp.vec3],
-    dt: float,
-    qd_out: wp.array[wp.spatial_vector],
-):
-    tid = wp.tid()
-
-    pose = poses[tid]
-    pose_prev = poses_prev[tid]
-
-    x = wp.transform_get_translation(pose)
-    x_prev = wp.transform_get_translation(pose_prev)
-
-    q = wp.transform_get_rotation(pose)
-    q_prev = wp.transform_get_rotation(pose_prev)
-
-    # Update body velocities according to Alg. 2
-    # XXX we consider the body COM as the origin of the body frame
-    x_com = x + wp.quat_rotate(q, body_com[tid])
-    x_com_prev = x_prev + wp.quat_rotate(q_prev, body_com[tid])
-
-    # XXX consider the velocity of the COM
-    v = (x_com - x_com_prev) / dt
-    dq = q * wp.quat_inverse(q_prev)
-
-    omega = 2.0 / dt * wp.vec3(dq[0], dq[1], dq[2])
-    if dq[3] < 0.0:
-        omega = -omega
-
-    qd_out[tid] = wp.spatial_vector(v, omega)
-
-
-@wp.kernel
-def apply_rigid_restitution(
-    body_q: wp.array[wp.transform],
-    body_qd: wp.array[wp.spatial_vector],
-    body_q_prev: wp.array[wp.transform],
-    body_qd_prev: wp.array[wp.spatial_vector],
-    body_com: wp.array[wp.vec3],
-    body_m_inv: wp.array[float],
-    body_I_inv: wp.array[wp.mat33],
-    body_world: wp.array[wp.int32],
-    shape_body: wp.array[int],
-    contact_count: wp.array[int],
-    contact_normal: wp.array[wp.vec3],
-    contact_shape0: wp.array[int],
-    contact_shape1: wp.array[int],
-    shape_material_restitution: wp.array[float],
-    contact_point0: wp.array[wp.vec3],
-    contact_point1: wp.array[wp.vec3],
-    contact_offset0: wp.array[wp.vec3],
-    contact_offset1: wp.array[wp.vec3],
-    contact_thickness0: wp.array[float],
-    contact_thickness1: wp.array[float],
-    contact_inv_weight: wp.array[float],
-    gravity: wp.array[wp.vec3],
-    dt: float,
-    # outputs
-    deltas: wp.array[wp.spatial_vector],
-):
-    tid = wp.tid()
-
-    count = contact_count[0]
-    if tid >= count:
-        return
-    shape_a = contact_shape0[tid]
-    shape_b = contact_shape1[tid]
-    if shape_a == shape_b:
-        return
-    body_a = -1
-    body_b = -1
-
-    # use average contact material properties
-    mat_nonzero = 0
-    restitution = 0.0
-    if shape_a >= 0:
-        mat_nonzero += 1
-        restitution += shape_material_restitution[shape_a]
-        body_a = shape_body[shape_a]
-    if shape_b >= 0:
-        mat_nonzero += 1
-        restitution += shape_material_restitution[shape_b]
-        body_b = shape_body[shape_b]
-    if mat_nonzero > 0:
-        restitution /= float(mat_nonzero)
-    if body_a == body_b:
-        return
-
-    m_inv_a = 0.0
-    m_inv_b = 0.0
-    I_inv_a = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-    I_inv_b = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-    # body to world transform
-    X_wb_a_prev = wp.transform_identity()
-    X_wb_b_prev = wp.transform_identity()
-    # center of mass in body frame
-    com_a = wp.vec3(0.0)
-    com_b = wp.vec3(0.0)
-    # previous velocity at contact points
-    v_a = wp.vec3(0.0)
-    v_b = wp.vec3(0.0)
-    # new velocity at contact points
-    v_a_new = wp.vec3(0.0)
-    v_b_new = wp.vec3(0.0)
-    # inverse mass used to compute the impulse
-    inv_mass = 0.0
-
-    if body_a >= 0:
-        X_wb_a_prev = body_q_prev[body_a]
-        # X_wb_a = body_q[body_a]
-        m_inv_a = body_m_inv[body_a]
-        I_inv_a = body_I_inv[body_a]
-        com_a = body_com[body_a]
-
-    if body_b >= 0:
-        X_wb_b_prev = body_q_prev[body_b]
-        # X_wb_b = body_q[body_b]
-        m_inv_b = body_m_inv[body_b]
-        I_inv_b = body_I_inv[body_b]
-        com_b = body_com[body_b]
-
-    # compute body position in world space
-    bx_a = wp.transform_point(X_wb_a_prev, contact_point0[tid] + contact_offset0[tid])
-    bx_b = wp.transform_point(X_wb_b_prev, contact_point1[tid] + contact_offset1[tid])
-
-    thickness = contact_thickness0[tid] + contact_thickness1[tid]
-    n = contact_normal[tid]
-    d = wp.dot(n, bx_b - bx_a) - thickness
-    if d >= 0.0:
-        return
-
-    r_a = bx_a - wp.transform_point(X_wb_a_prev, com_a)
-    r_b = bx_b - wp.transform_point(X_wb_b_prev, com_b)
-
-    rxn_a = wp.vec3(0.0)
-    rxn_b = wp.vec3(0.0)
-    if body_a >= 0:
-        world_idx_a = body_world[body_a]
-        world_a_g = gravity[wp.max(world_idx_a, 0)]
-        v_a = velocity_at_point(body_qd_prev[body_a], r_a) + world_a_g * dt
-        v_a_new = velocity_at_point(body_qd[body_a], r_a)
-        q_a = wp.transform_get_rotation(X_wb_a_prev)
-        rxn_a = wp.quat_rotate_inv(q_a, wp.cross(r_a, n))
-        # Eq. 2
-        inv_mass_a = m_inv_a + wp.dot(rxn_a, I_inv_a * rxn_a)
-        inv_mass += inv_mass_a
-    if body_b >= 0:
-        world_idx_b = body_world[body_b]
-        world_b_g = gravity[wp.max(world_idx_b, 0)]
-        v_b = velocity_at_point(body_qd_prev[body_b], r_b) + world_b_g * dt
-        v_b_new = velocity_at_point(body_qd[body_b], r_b)
-        q_b = wp.transform_get_rotation(X_wb_b_prev)
-        rxn_b = wp.quat_rotate_inv(q_b, wp.cross(r_b, n))
-        # Eq. 3
-        inv_mass_b = m_inv_b + wp.dot(rxn_b, I_inv_b * rxn_b)
-        inv_mass += inv_mass_b
-
-    if inv_mass == 0.0:
-        return
-
-    # Eq. 29 — relative velocity of B w.r.t. A along the A-to-B normal
-    rel_vel_old = wp.dot(n, v_b - v_a)
-    rel_vel_new = wp.dot(n, v_b_new - v_a_new)
-
-    if rel_vel_old >= 0.0:
-        return
-
-    # Eq. 34
-    dv = (-rel_vel_new - restitution * rel_vel_old) / inv_mass
-
-    # Eq. 33 — push A in -n direction, B in +n direction
-    if body_a >= 0:
-        dv_a = -dv
-        q_a = wp.transform_get_rotation(X_wb_a_prev)
-        dq = wp.quat_rotate(q_a, I_inv_a * rxn_a * dv_a)
-        wp.atomic_add(deltas, body_a, wp.spatial_vector(n * m_inv_a * dv_a, dq))
-
-    if body_b >= 0:
-        dv_b = dv
-        q_b = wp.transform_get_rotation(X_wb_b_prev)
-        dq = wp.quat_rotate(q_b, I_inv_b * rxn_b * dv_b)
-        wp.atomic_add(deltas, body_b, wp.spatial_vector(n * m_inv_b * dv_b, dq))
+    wp.atomic_add(body_parent_f, id_c, wp.spatial_vector(f, tau))

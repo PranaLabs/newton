@@ -8,11 +8,12 @@
 # from a USD file using newton.ModelBuilder.add_usd().
 # We also apply a sinusoidal trajectory to the joint targets and
 # apply a continuous rotation to the fixed root joint in the form
-# of the joint parent transform. The MuJoCo solver is updated
+# of the joint parent transform. The solver is updated
 # about this change in the joint parent transform by calling
-# self.solver.notify_model_changed(SolverNotifyFlags.JOINT_PROPERTIES).
+# self.solver.notify_model_changed(ModelFlags.JOINT_PROPERTIES).
 #
 # Command: python -m newton.examples robot_allegro_hand --world-count 16
+#          python -m newton.examples robot_allegro_hand --solver kamino
 #
 ###########################################################################
 
@@ -22,33 +23,32 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton import JointTargetMode
-from newton.solvers import SolverNotifyFlags
+from newton import JointTargetMode, ModelFlags
 
 
 @wp.kernel
 def move_hand(
-    joint_qd_start: wp.array[wp.int32],
+    joint_q_start: wp.array[wp.int32],
     joint_limit_lower: wp.array[wp.float32],
     joint_limit_upper: wp.array[wp.float32],
     sim_time: wp.array[wp.float32],
     sim_dt: float,
     hand_rotation: wp.quat,
     # outputs
-    joint_target_pos: wp.array[wp.float32],
+    joint_target_q: wp.array[wp.float32],
     joint_parent_xform: wp.array[wp.transform],
 ):
     world_id = wp.tid()
     root_joint_id = world_id * 22
     t = sim_time[world_id]
 
-    root_dof_start = joint_qd_start[root_joint_id]
+    root_dof_start = joint_q_start[root_joint_id]
 
     # animate the finger joints
     for i in range(20):
         di = root_dof_start + i
         target = wp.sin(t + float(i * 6) * 0.1) * 0.08 + 0.3
-        joint_target_pos[di] = wp.clamp(target, joint_limit_lower[di], joint_limit_upper[di])
+        joint_target_q[di] = wp.clamp(target, joint_limit_lower[di], joint_limit_upper[di])
 
     # animate the root joint transform
     q = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), wp.sin(t) * 0.1)
@@ -61,6 +61,7 @@ def move_hand(
 
 class Example:
     def __init__(self, viewer, args):
+        newton.use_coord_layout_targets = True
         self.fps = 50
         self.frame_dt = 1.0 / self.fps
 
@@ -68,7 +69,10 @@ class Example:
         self.sim_substeps = 8
         self.sim_dt = self.frame_dt / self.sim_substeps
 
+        self.solver_type = args.solver
         self.world_count = args.world_count
+        if self.world_count is None:
+            self.world_count = 100
 
         self.viewer = viewer
 
@@ -78,7 +82,10 @@ class Example:
         max_contacts_per_world = 300
 
         allegro_hand = newton.ModelBuilder()
-        newton.solvers.SolverMuJoCo.register_custom_attributes(allegro_hand)
+        if self.solver_type == "kamino":
+            newton.solvers.SolverKamino.register_custom_attributes(allegro_hand)
+        else:
+            newton.solvers.SolverMuJoCo.register_custom_attributes(allegro_hand)
         allegro_hand.default_shape_cfg.ke = 1.0e3
         allegro_hand.default_shape_cfg.kd = 1.0e2
         allegro_hand.default_shape_cfg.margin = 0.005
@@ -92,6 +99,7 @@ class Example:
             enable_self_collisions=False,
             ignore_paths=[".*Dummy", ".*CollisionPlane"],
             hide_collision_shapes=True,
+            load_static_visual_shapes=False,
         )
 
         # set joint targets and joint drive gains (only on hand, not the floating-body cube)
@@ -99,10 +107,10 @@ class Example:
             allegro_hand.joint_target_ke[i] = 150
             allegro_hand.joint_target_kd[i] = 5
             allegro_hand.joint_q[i] = 0.3
-            allegro_hand.joint_target_pos[i] = 0.3
+            allegro_hand.joint_target_q[i] = 0.3
             if allegro_hand.joint_label[i][-2:] == "_0":
                 allegro_hand.joint_q[i] = 0.6
-                allegro_hand.joint_target_pos[i] = 0.6
+                allegro_hand.joint_target_q[i] = 0.6
             allegro_hand.joint_target_mode[i] = int(JointTargetMode.POSITION)
             if allegro_hand.joint_type[i] == newton.JointType.REVOLUTE:
                 allegro_hand.joint_armature[i] = 1e-2
@@ -130,23 +138,40 @@ class Example:
 
         self.world_time = wp.zeros(self.world_count, dtype=wp.float32)
 
-        self.solver = newton.solvers.SolverMuJoCo(
-            self.model,
-            solver="newton",
-            integrator="implicitfast",
-            njmax=200,
-            nconmax=max_contacts_per_world,
-            impratio=20.0,
-            cone="elliptic",
-            iterations=100,
-            ls_iterations=50,
-            use_mujoco_contacts=False,
-        )
+        if self.solver_type == "kamino":
+            solver_config = newton.solvers.SolverKamino.Config.from_model(
+                self.model, dynamics_solver="dvi", sparse_dynamics=True, sparse_jacobian=True
+            )
+            solver_config.dvi.max_alternating_iterations = 8
+            solver_config.dvi.bilateral_solve_interval = 8
+            solver_config.dvi.bilateral_solver_type = "LLTBRCM"
+            solver_config.dvi.omega = 1.2
+            solver_config.dvi.contact_warmstart_method = (
+                "key_and_position_with_net_force_backup_and_tangential_net_force"
+            )
+            solver_config.dvi.use_schur_complement = True
+            self.solver = newton.solvers.SolverKamino(self.model, config=solver_config)
+        else:
+            self.solver = newton.solvers.SolverMuJoCo(
+                self.model,
+                solver="newton",
+                integrator="implicitfast",
+                njmax=200,
+                nconmax=max_contacts_per_world,
+                impratio=20.0,
+                # Preserve the example's solref-inherited grasp friction; its
+                # purpose is articulation control rather than kf mapping.
+                cone="pyramidal",
+                iterations=100,
+                ls_iterations=50,
+                use_mujoco_contacts=False,
+            )
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.contacts = self.model.contacts()
+        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.contacts = self.collision_pipeline.contacts()
 
         self.viewer.set_model(self.model)
 
@@ -154,13 +179,13 @@ class Example:
 
     def capture(self):
         self.graph = None
-        if wp.get_device().is_cuda:
-            with wp.ScopedCapture() as capture:
-                self.simulate()
-            self.graph = capture.graph
+        with wp.ScopedCapture() as capture:
+            self.simulate()
+        self.graph = capture.graph
 
     def simulate(self):
-        self.model.collide(self.state_0, self.contacts)
+        if self.solver_type != "kamino":
+            self.collision_pipeline.collide(self.state_0, self.contacts)
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
 
@@ -171,18 +196,20 @@ class Example:
                 move_hand,
                 dim=self.world_count,
                 inputs=[
-                    self.model.joint_qd_start,
+                    self.model.joint_q_start,
                     self.model.joint_limit_lower,
                     self.model.joint_limit_upper,
                     self.world_time,
                     self.sim_dt,
                     self.hand_rotation,
                 ],
-                outputs=[self.control.joint_target_pos, self.model.joint_X_p],
+                outputs=[self.control.joint_target_q, self.model.joint_X_p],
             )
 
-            # # update the solver since we have updated the joint parent transforms
-            self.solver.notify_model_changed(SolverNotifyFlags.JOINT_PROPERTIES)
+            # Update the solver since we have updated the joint parent transforms.
+            self.solver.notify_model_changed(ModelFlags.JOINT_PROPERTIES)
+            if self.solver_type == "kamino":
+                self.collision_pipeline.collide(self.state_0, self.contacts)
 
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
 
@@ -204,6 +231,14 @@ class Example:
         self.viewer.end_frame()
 
     def test_final(self):
+        """Check compact viewer layout and stable hand and cube motion."""
+        # Scale the bound with the grid size so larger world counts remain valid.
+        offset_limit = np.ceil(np.sqrt(self.world_count))
+        max_world_offset = float(np.abs(self.viewer.world_offsets.numpy()).max())
+        assert max_world_offset < offset_limit, (
+            f"World offsets reach {max_world_offset:g} m, expected less than {offset_limit:g} m for a compact hand layout"
+        )
+
         num_bodies_per_world = self.model.body_count // self.world_count
         cubes_held = 0
 
@@ -240,7 +275,8 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         newton.examples.add_world_count_arg(parser)
-        parser.set_defaults(world_count=100)
+        parser.add_argument("--solver", choices=["mujoco", "kamino"], default="mujoco")
+        parser.set_defaults(world_count=None)
         return parser
 
 

@@ -1,12 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import warnings
+
 import warp as wp
 
 from ...core.types import override
-from ...sim import Contacts, Control, Model, State
-from ..flags import SolverNotifyFlags
+from ...sim import Contacts, Control, Model, ModelFlags, State
+from ...sim.joint_mimic import has_supported_joint_mimics
+from ..coupled.interface import CouplingInterface
 from ..solver import SolverBase
+from . import kernels, restitution_kernels
 from .kernels import (
     accumulate_weighted_contact_impulse,
     apply_body_delta_velocities,
@@ -14,13 +18,13 @@ from .kernels import (
     apply_joint_forces,
     apply_particle_deltas,
     apply_particle_shape_restitution,
-    apply_rigid_restitution,
     bending_constraint,
     convert_contact_impulse_to_force,
     convert_joint_impulse_to_parent_f,
     copy_kinematic_body_state_kernel,
     solve_body_contact_positions,
     solve_body_joints,
+    solve_joint_mimics,
     solve_particle_particle_contacts,
     solve_particle_shape_contacts,
     # solve_simple_body_joints,
@@ -28,9 +32,23 @@ from .kernels import (
     solve_tetrahedra,
     update_body_velocities,
 )
+from .restitution_kernels import (
+    RESTITUTION_MANIFOLD_MAX_CONTACTS,
+    apply_restitution_deltas,
+    build_restitution_manifolds,
+    mark_restitution_contacts,
+    select_manifold_contacts,
+    solve_manifold_restitution,
+)
+
+_COMPUTE_BODY_VELOCITY_DEPRECATION_MSG = (
+    "SolverXPBD.compute_body_velocity_from_position_delta is deprecated in Newton 1.6 and will be removed in 1.7 "
+    "or later. Leave it at False because XPBD now updates rigid-body velocities incrementally after every position "
+    "correction."
+)
 
 
-class SolverXPBD(SolverBase):
+class SolverXPBD(SolverBase, CouplingInterface):
     """An implicit integrator using eXtended Position-Based Dynamics (XPBD) for rigid and soft body simulation.
 
     References:
@@ -40,33 +58,40 @@ class SolverXPBD(SolverBase):
     After constructing :class:`Model`, :class:`State`, and :class:`Control` (optional) objects, this time-integrator
     may be used to advance the simulation state forward in time.
 
+    Rigid-body velocities use Newton's public ``(v_com_world, omega_world)`` convention throughout integration and
+    constraint projection. Enabling restitution adds velocity-level contact constraints without changing that
+    integration path for other bodies.
+
     Limitations:
         **Momentum conservation** -- When ``rigid_contact_con_weighting`` is
         enabled (the default), each body's positional correction is divided by
         its number of active contacts.  This improves convergence for stacking
         scenarios but means the solver does not conserve momentum at contacts.
-        Reported per-contact forces (see :meth:`update_contacts`) are
+        Reported per-contact forces (request
+        :attr:`~newton.solvers.SolverBase.ObservableKind.CONTACT_F`) are
         approximate: for contacts between two dynamic bodies the force is
         computed using the harmonic mean of the two bodies' contact counts,
         which is symmetric but not exact.
 
-        **Reported parent-joint forces** (see :attr:`~newton.State.body_parent_f`,
-        populated when the extended state attribute is requested) are also
+        **Reported parent-joint forces** (request
+        :attr:`~newton.solvers.SolverBase.ObservableKind.BODY_PARENT_F`) are
         approximate.  XPBD applies relaxation factors
         (``joint_linear_relaxation``, ``joint_angular_relaxation``) to each
         joint constraint correction, and with a finite ``iterations`` count
         residual constraint error remains at end-of-step, so the reported
         wrench is the *applied* constraint reaction rather than the exact
         wrench needed to enforce the joint perfectly.  The convention matches
+        :class:`~newton.solvers.SolverFeatherstone` and
         :class:`~newton.solvers.SolverMuJoCo`: it is the spatial wrench
         transmitted from the parent through the inbound joint, in world frame
-        at the child body's COM. In equilibrium this reaction counters all
-        applied forces (gravity, contacts, ``State.body_f``, and the net
-        effect of :attr:`~newton.Control.joint_f`) by Newton's third law.
+        at the child body's COM, **including** both the constraint reaction
+        and the body-frame contribution of :attr:`~newton.Control.joint_f`.
+        In equilibrium this wrench counters all applied forces (gravity,
+        contacts, ``State.body_f``) by Newton's third law.
 
     Joint limitations:
         - Supported joint types: PRISMATIC, REVOLUTE, BALL, FIXED, FREE, DISTANCE, D6.
-          CABLE joints are not supported.
+          ROD joints are not supported.
         - :attr:`~newton.Model.joint_enabled`,
           :attr:`~newton.Model.joint_target_ke`/:attr:`~newton.Model.joint_target_kd`, and
           :attr:`~newton.Control.joint_f` are supported.
@@ -74,7 +99,8 @@ class SolverXPBD(SolverBase):
         - :attr:`~newton.Model.joint_armature`, :attr:`~newton.Model.joint_friction`,
           :attr:`~newton.Model.joint_effort_limit`, :attr:`~newton.Model.joint_velocity_limit`,
           and :attr:`~newton.Model.joint_target_mode` are not supported.
-        - Equality and mimic constraints are not supported.
+        - Joint-owned mimic relationships are supported for PRISMATIC, REVOLUTE, and D6 joints.
+          Equality constraints and the deprecated sparse mimic constraints are not supported.
 
         See :ref:`Joint feature support` for the full comparison across solvers.
 
@@ -83,7 +109,7 @@ class SolverXPBD(SolverBase):
 
     .. code-block:: python
 
-        solver = newton.solvers.SolverXPBD(model)
+        solver = newton.solvers.SolverXPBD(model, enable_restitution=True)
 
         # simulation loop
         for i in range(100):
@@ -92,9 +118,17 @@ class SolverXPBD(SolverBase):
 
     """
 
+    SUPPORTED_OBSERVABLES = frozenset(
+        {
+            SolverBase.ObservableKind.BODY_PARENT_F,
+            SolverBase.ObservableKind.CONTACT_F,
+        }
+    )
+
     def __init__(
         self,
         model: Model,
+        *,
         iterations: int = 2,
         soft_body_relaxation: float = 0.9,
         soft_contact_relaxation: float = 0.9,
@@ -103,11 +137,54 @@ class SolverXPBD(SolverBase):
         joint_linear_compliance: float = 0.0,
         joint_angular_compliance: float = 0.0,
         rigid_contact_relaxation: float = 0.8,
+        rigid_contact_restitution_iterations: int = 2,
         rigid_contact_con_weighting: bool = True,
         angular_damping: float = 0.0,
         enable_restitution: bool = False,
+        deterministic: wp.DeterministicMode | None = None,
     ):
+        """Initialize the XPBD solver.
+
+        Args:
+            model: Simulation model to integrate.
+            iterations: Number of constraint-solver iterations per time step. Defaults to 2.
+            soft_body_relaxation: Relaxation factor applied to tetrahedral constraint corrections
+                [dimensionless]. Defaults to 0.9.
+            soft_contact_relaxation: Relaxation factor applied to particle-particle and particle-shape contact
+                corrections [dimensionless]. Defaults to 0.9.
+            joint_linear_relaxation: Relaxation factor applied to linear joint constraint corrections
+                [dimensionless]. Defaults to 0.7.
+            joint_angular_relaxation: Relaxation factor applied to angular joint constraint corrections
+                [dimensionless]. Defaults to 0.4.
+            joint_linear_compliance: Compliance shared by linear joint constraints [m/N]. Defaults to 0.0.
+            joint_angular_compliance: Compliance shared by angular joint constraints [rad/(N·m)]. Defaults to 0.0.
+            rigid_contact_relaxation: Relaxation factor applied to rigid contact constraint corrections
+                [dimensionless]. Defaults to 0.8.
+            rigid_contact_restitution_iterations: Number of outer iterations of the rigid-body restitution
+                velocity solve. Each outer iteration solves every contact manifold (body pair) independently
+                with a fixed number of inner Gauss-Seidel sweeps, then couples manifolds by averaging the
+                resulting velocity changes per body, so values above 1 primarily matter when a body
+                participates in several manifolds (or when a large manifold leaves its inner sweeps
+                under-converged). Defaults to 2.
+            rigid_contact_con_weighting: Whether to divide each rigid body's contact correction by its number of
+                active contacts. Defaults to ``True``.
+            angular_damping: Rigid-body angular velocity damping coefficient [1/s]. Defaults to 0.0.
+            enable_restitution: Whether to apply restitution to rigid and particle-shape contacts after the
+                positional solve. Defaults to ``False``.
+            deterministic: Opt-in determinism for this solver's atomic-emitting
+                kernel module. Pass a :class:`warp.DeterministicMode`, or
+                ``None`` (default) to inherit the current
+                ``wp.config.deterministic`` mode.
+        """
         super().__init__(model=model)
+        effective_deterministic = deterministic if deterministic is not None else wp.config.deterministic
+        module_options = {
+            "deterministic": effective_deterministic,
+            "deterministic_max_records": 0,
+        }
+        self._set_module_options(module_options, module=kernels)
+        self._restitution_module_options = module_options
+
         self.iterations = iterations
 
         self.soft_body_relaxation = soft_body_relaxation
@@ -119,13 +196,23 @@ class SolverXPBD(SolverBase):
         self.joint_angular_compliance = joint_angular_compliance
 
         self.rigid_contact_relaxation = rigid_contact_relaxation
+        if rigid_contact_restitution_iterations < 1:
+            raise ValueError("rigid_contact_restitution_iterations must be at least 1")
+        self.rigid_contact_restitution_iterations = rigid_contact_restitution_iterations
+        # Eight local sweeps converge flat manifolds in one pass; outer iterations couple manifolds.
+        self._restitution_manifold_inner_iterations = 8
         self.rigid_contact_con_weighting = rigid_contact_con_weighting
 
         self.angular_damping = angular_damping
 
         self.enable_restitution = enable_restitution
+        self._rigid_restitution_enabled = False
+        self._refresh_rigid_restitution_enabled()
+        self._compute_body_velocity_from_position_delta = False
 
-        self.compute_body_velocity_from_position_delta = False
+        self._has_joint_mimics = has_supported_joint_mimics(model, "SolverXPBD")
+        if self._has_joint_mimics:
+            self._set_module_options(module_options, module=solve_joint_mimics.module)
 
         self._init_kinematic_state()
 
@@ -138,12 +225,69 @@ class SolverXPBD(SolverBase):
             with wp.ScopedDevice(model.device):
                 model.particle_grid.reserve(model.particle_count)
 
+    @property
+    def compute_body_velocity_from_position_delta(self) -> bool:
+        """Whether to reconstruct rigid-body velocities after position projection.
+
+        .. deprecated:: 1.6
+            Leave this setting at ``False`` because XPBD now maintains rigid-body
+            velocities incrementally. ``True`` temporarily retains the legacy
+            full-step velocity reconstruction for compatibility.
+        """
+        warnings.warn(_COMPUTE_BODY_VELOCITY_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
+        return self._compute_body_velocity_from_position_delta
+
+    @compute_body_velocity_from_position_delta.setter
+    def compute_body_velocity_from_position_delta(self, value: bool) -> None:
+        warnings.warn(_COMPUTE_BODY_VELOCITY_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
+        self._compute_body_velocity_from_position_delta = value
+
     @override
-    def notify_model_changed(self, flags: int) -> None:
-        if flags & (SolverNotifyFlags.BODY_PROPERTIES | SolverNotifyFlags.BODY_INERTIAL_PROPERTIES):
+    def notify_model_changed(self, flags: ModelFlags | int) -> None:
+        """Refresh cached body data after model properties change.
+
+        Effective inverse masses and inertia tensors are refreshed for body-property changes. The cached restitution
+        state is refreshed for shape-property changes. Other flags are ignored.
+
+        Args:
+            flags: Bitmask of :class:`~newton.ModelFlags` or custom ``int`` bits indicating which model properties
+                changed.
+        """
+        self._ensure_restitution_module_options()
+        self._apply_module_options()
+        if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.BODY_INERTIAL_PROPERTIES):
             self._refresh_kinematic_state()
+        if self.enable_restitution and flags & ModelFlags.SHAPE_PROPERTIES:
+            self._refresh_rigid_restitution_enabled()
+
+    def _refresh_rigid_restitution_enabled(self) -> None:
+        restitution = self.model.shape_material_restitution
+        self._rigid_restitution_enabled = restitution is not None and restitution.size > 0
+
+    def _ensure_restitution_module_options(self) -> None:
+        if self.enable_restitution and restitution_kernels not in self._module_options:
+            self._set_module_options(self._restitution_module_options, module=restitution_kernels)
+            # Registration may advance the shared revision while this solver's
+            # core module options are stale, so force a complete reapplication.
+            self._applied_module_options_revision = -1
+
+    @override
+    def coupling_supports_inertial_property_refresh(self) -> bool:
+        """Return whether inertial properties can be refreshed during graph capture.
+
+        Returns:
+            ``True`` because :meth:`notify_model_changed` refreshes the derived inertial buffers with device work.
+        """
+        return True
 
     def copy_kinematic_body_state(self, model: Model, state_in: State, state_out: State):
+        """Copy kinematic body poses and velocities from an input state to an output state.
+
+        Args:
+            model: Simulation model that owns the body data.
+            state_in: State containing the source kinematic body poses and velocities.
+            state_out: State that receives the kinematic body poses and velocities.
+        """
         if model.body_count == 0:
             return
         wp.launch(
@@ -257,12 +401,48 @@ class SolverXPBD(SolverBase):
         return new_body_q, new_body_qd
 
     @override
-    def step(self, state_in: State, state_out: State, control: Control, contacts: Contacts, dt: float) -> None:
+    def step(
+        self,
+        state_in: State,
+        state_out: State,
+        control: Control | None,
+        contacts: Contacts | None,
+        dt: float,
+        *,
+        observables: SolverBase.Observables | None = None,
+    ) -> None:
+        """Advance the simulation state by one time step using XPBD.
+
+        Args:
+            state_in: State at the beginning of the time step.
+            state_out: State that receives the simulation result.
+            control: Control inputs. If ``None``, the model's default control values are used.
+            contacts: Contact data populated by :meth:`~newton.CollisionPipeline.collide` and allocated with
+                :meth:`~newton.CollisionPipeline.contacts`. If ``None``, rigid and particle-shape contact handling
+                is skipped; particle-particle contacts and model constraints are still solved.
+            dt: Time step size [s].
+            observables: Optional solver observable arrays allocated by :meth:`observables`.
+        """
+        self._ensure_restitution_module_options()
+        self._apply_module_options()
+        self.validate_observables(observables, contacts)
         requires_grad = state_in.requires_grad
         self._particle_delta_counter = 0
         self._body_delta_counter = 0
 
         model = self.model
+        body_parent_f = (
+            observables.body_parent_f
+            if observables is not None and observables.is_requested(SolverBase.ObservableKind.BODY_PARENT_F)
+            else None
+        )
+        if body_parent_f is None:
+            body_parent_f = state_out.body_parent_f
+        contact_f = (
+            observables.contact_f
+            if observables is not None and observables.is_requested(SolverBase.ObservableKind.CONTACT_F)
+            else None
+        )
 
         particle_q = None
         particle_qd = None
@@ -270,11 +450,25 @@ class SolverXPBD(SolverBase):
 
         body_q = None
         body_qd = None
-        body_q_init = None
-        body_qd_init = None
+        body_q_step_start = None
+        body_q_pre_solve = None
+        body_qd_pre_solve = None
         body_deltas = None
 
         rigid_contact_inv_weight = None
+        restitution_contact_active = None
+        restitution_manifold_key = None
+        restitution_manifold_size = None
+        restitution_manifold_contact = None
+        restitution_manifold_head = None
+        restitution_manifold_total = None
+        restitution_contact_next = None
+        restitution_contact_pos_depth = None
+        restitution_contact_sel_score = None
+        restitution_body_manifold_count = None
+        restitution_contact_n_K = None
+        restitution_contact_axn_lo_target = None
+        restitution_contact_axn_hi_sigma = None
 
         contact_impulse = None
         contact_impulse_iter = None
@@ -282,18 +476,42 @@ class SolverXPBD(SolverBase):
         if contacts:
             if self.rigid_contact_con_weighting:
                 rigid_contact_inv_weight = wp.zeros(model.body_count, dtype=float, device=model.device)
-            rigid_contact_inv_weight_init = None
+            if self.enable_restitution and self._rigid_restitution_enabled and model.body_count:
+                restitution_contact_active = wp.zeros(contacts.rigid_contact_max, dtype=wp.int32, device=model.device)
+                # manifold hash table (one slot may host every contact, so
+                # capacity == contact capacity guarantees insertion succeeds)
+                restitution_manifold_key = wp.zeros(contacts.rigid_contact_max, dtype=wp.int64, device=model.device)
+                restitution_manifold_size = wp.zeros(contacts.rigid_contact_max, dtype=wp.int32, device=model.device)
+                restitution_manifold_contact = wp.empty(
+                    contacts.rigid_contact_max * RESTITUTION_MANIFOLD_MAX_CONTACTS,
+                    dtype=wp.int32,
+                    device=model.device,
+                )
+                restitution_manifold_head = wp.zeros(contacts.rigid_contact_max, dtype=wp.int32, device=model.device)
+                restitution_manifold_total = wp.zeros(contacts.rigid_contact_max, dtype=wp.int32, device=model.device)
+                restitution_contact_next = wp.empty(contacts.rigid_contact_max, dtype=wp.int32, device=model.device)
+                restitution_contact_pos_depth = wp.empty(contacts.rigid_contact_max, dtype=wp.vec4, device=model.device)
+                restitution_contact_sel_score = wp.empty(contacts.rigid_contact_max, dtype=float, device=model.device)
+                restitution_body_manifold_count = wp.zeros(model.body_count, dtype=float, device=model.device)
+                # per-contact solve records cached by build_restitution_manifolds
+                restitution_contact_n_K = wp.empty(contacts.rigid_contact_max, dtype=wp.vec4, device=model.device)
+                restitution_contact_axn_lo_target = wp.empty(
+                    contacts.rigid_contact_max, dtype=wp.vec4, device=model.device
+                )
+                restitution_contact_axn_hi_sigma = wp.empty(
+                    contacts.rigid_contact_max, dtype=wp.vec4, device=model.device
+                )
 
-            if contacts.force is not None:
+            if contacts.force is not None or contact_f is not None:
                 contact_impulse = wp.zeros(contacts.rigid_contact_max, dtype=wp.spatial_vector, device=model.device)
                 contact_impulse_iter = wp.zeros(
                     contacts.rigid_contact_max, dtype=wp.spatial_vector, device=model.device
                 )
 
         # Optional per-joint accumulated child-side spatial impulse, used to
-        # populate ``state_out.body_parent_f`` after the iteration loop.
+        # populate ``body_parent_f`` after the iteration loop.
         joint_impulse = None
-        if state_out.body_parent_f is not None and model.joint_count > 0:
+        if body_parent_f is not None and model.joint_count > 0:
             joint_impulse = wp.zeros(model.joint_count, dtype=wp.spatial_vector, device=model.device)
 
         if control is None:
@@ -305,11 +523,11 @@ class SolverXPBD(SolverBase):
                 particle_qd = state_out.particle_qd
 
                 self.particle_q_init = wp.clone(state_in.particle_q)
-                if self.enable_restitution:
-                    self.particle_qd_init = wp.clone(state_in.particle_qd)
                 particle_deltas = wp.empty_like(state_out.particle_qd)
 
                 self.integrate_particles(model, state_in, state_out, dt)
+                if self.enable_restitution:
+                    self.particle_qd_init = wp.clone(state_out.particle_qd)
 
                 # Build/update the particle hash grid for particle-particle contact queries
                 if model.particle_count > 1 and model.particle_grid is not None:
@@ -322,9 +540,8 @@ class SolverXPBD(SolverBase):
                 body_q = state_out.body_q
                 body_qd = state_out.body_qd
 
-                if self.compute_body_velocity_from_position_delta or self.enable_restitution:
-                    body_q_init = wp.clone(state_in.body_q)
-                    body_qd_init = wp.clone(state_in.body_qd)
+                if self._compute_body_velocity_from_position_delta and not requires_grad:
+                    body_q_step_start = wp.clone(state_in.body_q)
 
                 body_deltas = wp.empty_like(state_out.body_qd)
 
@@ -332,6 +549,13 @@ class SolverXPBD(SolverBase):
                 if model.joint_count:
                     # Avoid accumulating joint_f into the persistent state body_f buffer.
                     body_f_tmp = wp.clone(state_in.body_f)
+                    # ``joint_impulse`` (may be ``None`` when ``body_parent_f``
+                    # was not requested) accumulates both the joint_f wrench
+                    # contribution recorded here and the constraint-correction
+                    # contribution added by :func:`solve_body_joints` inside
+                    # the iteration loop.  Together they recover the total
+                    # wrench transmitted to the child body, matching the
+                    # :attr:`State.body_parent_f` convention.
                     wp.launch(
                         kernel=apply_joint_forces,
                         dim=model.joint_count,
@@ -348,8 +572,9 @@ class SolverXPBD(SolverBase):
                             model.joint_dof_dim,
                             model.joint_axis,
                             control.joint_f,
+                            dt,
                         ],
-                        outputs=[body_f_tmp],
+                        outputs=[body_f_tmp, joint_impulse],
                         device=model.device,
                     )
 
@@ -360,6 +585,10 @@ class SolverXPBD(SolverBase):
                     state_in.body_f = body_f_tmp
                     self.integrate_bodies(model, state_in, state_out, dt, self.angular_damping)
                     state_in.body_f = body_f_prev
+
+                if self.enable_restitution:
+                    body_q_pre_solve = wp.clone(state_out.body_q)
+                    body_qd_pre_solve = wp.clone(state_out.body_qd)
 
             spring_constraint_lambdas = None
             if model.spring_count:
@@ -383,7 +612,8 @@ class SolverXPBD(SolverBase):
                             particle_deltas.zero_()
 
                         # particle-rigid body contacts (besides ground plane)
-                        if model.shape_count:
+                        if model.shape_count and contacts is not None:
+                            contacts._assert_particle_only_soft_contacts("SolverXPBD")
                             wp.launch(
                                 kernel=solve_particle_shape_contacts,
                                 dim=contacts.soft_contact_max,
@@ -398,6 +628,7 @@ class SolverXPBD(SolverBase):
                                     model.body_com,
                                     self.body_inv_mass_effective,
                                     self.body_inv_inertia_effective,
+                                    model.body_flags,
                                     model.shape_body,
                                     model.shape_material_mu,
                                     model.soft_contact_mu,
@@ -492,7 +723,7 @@ class SolverXPBD(SolverBase):
                                     model.particle_inv_mass,
                                     model.tet_indices,
                                     model.tet_poses,
-                                    model.tet_activations,
+                                    control.tet_activations,
                                     model.tet_materials,
                                     dt,
                                     self.soft_body_relaxation,
@@ -516,6 +747,26 @@ class SolverXPBD(SolverBase):
                         if contact_impulse_iter is not None:
                             contact_impulse_iter.zero_()
 
+                        if restitution_contact_active is not None:
+                            wp.launch(
+                                kernel=mark_restitution_contacts,
+                                dim=contacts.rigid_contact_max,
+                                inputs=[
+                                    body_q,
+                                    model.shape_body,
+                                    contacts.rigid_contact_count,
+                                    contacts.rigid_contact_point0,
+                                    contacts.rigid_contact_point1,
+                                    contacts.rigid_contact_normal,
+                                    contacts.rigid_contact_margin0,
+                                    contacts.rigid_contact_margin1,
+                                    contacts.rigid_contact_shape0,
+                                    contacts.rigid_contact_shape1,
+                                ],
+                                outputs=[restitution_contact_active],
+                                device=model.device,
+                            )
+
                         wp.launch(
                             kernel=solve_body_contact_positions,
                             dim=contacts.rigid_contact_max,
@@ -530,6 +781,7 @@ class SolverXPBD(SolverBase):
                                 contacts.rigid_contact_count,
                                 contacts.rigid_contact_point0,
                                 contacts.rigid_contact_point1,
+                                contacts.rigid_contact_surface_velocity,
                                 contacts.rigid_contact_offset0,
                                 contacts.rigid_contact_offset1,
                                 contacts.rigid_contact_normal,
@@ -576,13 +828,6 @@ class SolverXPBD(SolverBase):
 
                         # print(rigid_active_contact_distance.numpy().flatten())
 
-                        if self.enable_restitution and i == 0:
-                            # remember contact constraint weighting from the first iteration
-                            if self.rigid_contact_con_weighting:
-                                rigid_contact_inv_weight_init = wp.clone(rigid_contact_inv_weight)
-                            else:
-                                rigid_contact_inv_weight_init = None
-
                         body_q, body_qd = self._apply_body_deltas(
                             model, state_in, state_out, body_deltas, dt, rigid_contact_inv_weight
                         )
@@ -611,10 +856,11 @@ class SolverXPBD(SolverBase):
                                 model.joint_limit_lower,
                                 model.joint_limit_upper,
                                 model.joint_qd_start,
+                                model.joint_target_q_start,
                                 model.joint_dof_dim,
                                 model.joint_axis,
-                                control.joint_target_pos,
-                                control.joint_target_vel,
+                                control.joint_target_q,
+                                control.joint_target_qd,
                                 model.joint_target_ke,
                                 model.joint_target_kd,
                                 self.joint_linear_compliance,
@@ -627,18 +873,63 @@ class SolverXPBD(SolverBase):
                             device=model.device,
                         )
 
+                        if self._has_joint_mimics:
+                            wp.launch(
+                                kernel=solve_joint_mimics,
+                                dim=model.joint_count,
+                                inputs=[
+                                    body_q,
+                                    model.body_com,
+                                    self.body_inv_mass_effective,
+                                    self.body_inv_inertia_effective,
+                                    model.joint_type,
+                                    model.joint_enabled,
+                                    model.joint_parent,
+                                    model.joint_child,
+                                    model.joint_X_p,
+                                    model.joint_X_c,
+                                    model.joint_qd_start,
+                                    model.joint_dof_dim,
+                                    model.joint_axis,
+                                    model.joint_mimic_joint,
+                                    model.joint_mimic_coeffs,
+                                    self.joint_angular_relaxation,
+                                    self.joint_linear_relaxation,
+                                    dt,
+                                ],
+                                outputs=[body_deltas, joint_impulse],
+                                device=model.device,
+                            )
+
                         body_q, body_qd = self._apply_body_deltas(model, state_in, state_out, body_deltas, dt)
 
             self._contact_impulse = contact_impulse
             self._contact_impulse_capacity = contacts.rigid_contact_max if contacts is not None else 0
             self._last_dt = dt
 
-            # Populate optional ``state_out.body_parent_f`` (incoming joint
+            if contact_f is not None:
+                contact_f.zero_()
+                if contact_impulse is not None and contacts is not None:
+                    wp.launch(
+                        kernel=convert_contact_impulse_to_force,
+                        dim=contacts.rigid_contact_max,
+                        inputs=[
+                            contacts.rigid_contact_count,
+                            contact_impulse,
+                            dt,
+                        ],
+                        outputs=[contact_f],
+                        device=model.device,
+                    )
+                if contacts is not None and contacts.force is not None and contacts.force.ptr != contact_f.ptr:
+                    contacts.force.assign(contact_f)
+
+            # Populate optional ``body_parent_f`` (incoming joint
             # wrench per body) from the per-joint accumulated child-side
             # impulse.  Bodies without an inbound joint (roots / free bodies)
             # remain zero-initialized, matching MuJoCo's behavior.
-            if state_out.body_parent_f is not None:
-                state_out.body_parent_f.zero_()
+            if body_parent_f is not None:
+                body_parent_f.zero_()
                 if joint_impulse is not None:
                     wp.launch(
                         kernel=convert_joint_impulse_to_parent_f,
@@ -650,9 +941,11 @@ class SolverXPBD(SolverBase):
                             model.joint_child,
                             dt,
                         ],
-                        outputs=[state_out.body_parent_f],
+                        outputs=[body_parent_f],
                         device=model.device,
                     )
+                if state_out.body_parent_f is not None and state_out.body_parent_f.ptr != body_parent_f.ptr:
+                    state_out.body_parent_f.assign(body_parent_f)
 
             if model.particle_count:
                 if particle_q.ptr != state_out.particle_q.ptr:
@@ -664,26 +957,28 @@ class SolverXPBD(SolverBase):
                     state_out.body_q.assign(body_q)
                     state_out.body_qd.assign(body_qd)
 
-            # update body velocities from position changes
-            if self.compute_body_velocity_from_position_delta and model.body_count and not requires_grad:
-                # causes gradient issues (probably due to numerical problems
-                # when computing velocities from position changes)
-                if requires_grad:
-                    out_body_qd = wp.clone(state_out.body_qd)
-                else:
-                    out_body_qd = state_out.body_qd
-
-                # update body velocities
+            if self._compute_body_velocity_from_position_delta and model.body_count and not requires_grad:
+                assert body_q_step_start is not None
                 wp.launch(
                     kernel=update_body_velocities,
                     dim=model.body_count,
-                    inputs=[state_out.body_q, body_q_init, model.body_com, dt],
-                    outputs=[out_body_qd],
+                    inputs=[state_out.body_q, body_q_step_start, model.body_com, dt],
+                    outputs=[state_out.body_qd],
                     device=model.device,
                 )
 
+            # Rigid integration and every positional correction update all
+            # bodies' public COM-referenced velocities incrementally. Velocity
+            # constraints consume that same convention without selecting a
+            # different integration path when restitution is enabled.
+            body_qd_for_restitution = state_out.body_qd
+
             if self.enable_restitution and contacts is not None:
                 if model.particle_count:
+                    # Grad-enabled steps write into a cloned buffer to avoid
+                    # mutating a recorded array in place.
+                    assert particle_qd is not None
+                    particle_qd_with_restitution = wp.clone(particle_qd) if requires_grad else state_out.particle_qd
                     wp.launch(
                         kernel=apply_particle_shape_restitution,
                         dim=contacts.soft_contact_max,
@@ -693,14 +988,17 @@ class SolverXPBD(SolverBase):
                             self.particle_qd_init,
                             model.particle_radius,
                             model.particle_flags,
+                            model.particle_world,
                             body_q,
-                            body_q_init,
-                            body_qd,
-                            body_qd_init,
+                            body_q_pre_solve,
+                            body_qd_for_restitution,
+                            body_qd_pre_solve,
                             model.body_com,
                             model.shape_body,
                             model.particle_adhesion,
                             model.soft_contact_restitution,
+                            model.gravity,
+                            dt,
                             contacts.soft_contact_count,
                             contacts.soft_contact_particle,
                             contacts.soft_contact_shape,
@@ -709,27 +1007,32 @@ class SolverXPBD(SolverBase):
                             contacts.soft_contact_normal,
                             contacts.soft_contact_max,
                         ],
-                        outputs=[state_out.particle_qd],
+                        outputs=[particle_qd_with_restitution],
                         device=model.device,
                     )
+                    if requires_grad:
+                        state_out.particle_qd = particle_qd_with_restitution
 
-                if model.body_count:
-                    body_deltas.zero_()
-
+                if model.body_count and self._rigid_restitution_enabled:
+                    # Group contacts that can fire restitution into manifolds
+                    # (canonical body pairs) and cache their solve records.
+                    # The collision pipeline interleaves contacts across
+                    # pairs, so contacts are not pair-contiguous; a fixed-size
+                    # hash table built with atomics keeps this graph-capture
+                    # safe.
                     wp.launch(
-                        kernel=apply_rigid_restitution,
+                        kernel=build_restitution_manifolds,
                         dim=contacts.rigid_contact_max,
                         inputs=[
-                            state_out.body_q,
-                            state_out.body_qd,
-                            body_q_init,
-                            body_qd_init,
+                            body_q_pre_solve,
+                            body_qd_pre_solve,
                             model.body_com,
                             self.body_inv_mass_effective,
                             self.body_inv_inertia_effective,
                             model.body_world,
                             model.shape_body,
                             contacts.rigid_contact_count,
+                            restitution_contact_active,
                             contacts.rigid_contact_normal,
                             contacts.rigid_contact_shape0,
                             contacts.rigid_contact_shape1,
@@ -738,27 +1041,97 @@ class SolverXPBD(SolverBase):
                             contacts.rigid_contact_point1,
                             contacts.rigid_contact_offset0,
                             contacts.rigid_contact_offset1,
-                            contacts.rigid_contact_margin0,
-                            contacts.rigid_contact_margin1,
-                            rigid_contact_inv_weight_init,
                             model.gravity,
                             dt,
+                            model.body_count,
                         ],
                         outputs=[
-                            body_deltas,
+                            restitution_manifold_key,
+                            restitution_manifold_head,
+                            restitution_manifold_total,
+                            restitution_contact_next,
+                            restitution_contact_n_K,
+                            restitution_contact_axn_lo_target,
+                            restitution_contact_axn_hi_sigma,
+                            restitution_contact_pos_depth,
                         ],
                         device=model.device,
                     )
 
+                    # Reduce each manifold chain to its bounded best-K subset
+                    # (deterministic; see restitution_kernels.select_manifold_contacts).
                     wp.launch(
-                        kernel=apply_body_delta_velocities,
-                        dim=model.body_count,
+                        kernel=select_manifold_contacts,
+                        dim=contacts.rigid_contact_max,
                         inputs=[
-                            body_deltas,
+                            restitution_manifold_key,
+                            restitution_manifold_head,
+                            restitution_manifold_total,
+                            restitution_contact_next,
+                            restitution_contact_pos_depth,
+                            restitution_contact_n_K,
                         ],
-                        outputs=[state_out.body_qd],
+                        outputs=[
+                            restitution_manifold_contact,
+                            restitution_manifold_size,
+                            restitution_contact_sel_score,
+                        ],
                         device=model.device,
                     )
+
+                    body_qd_with_restitution = body_qd_for_restitution
+                    if not requires_grad:
+                        # apply_restitution_deltas consumes and clears the
+                        # accumulators, so they only need zeroing once
+                        body_deltas.zero_()
+                        restitution_body_manifold_count.zero_()
+                    for outer_iteration in range(self.rigid_contact_restitution_iterations):
+                        if requires_grad:
+                            body_deltas = wp.zeros_like(body_deltas)
+                            restitution_body_manifold_count = wp.zeros_like(restitution_body_manifold_count)
+
+                        wp.launch(
+                            kernel=solve_manifold_restitution,
+                            dim=contacts.rigid_contact_max,
+                            inputs=[
+                                body_qd_with_restitution,
+                                body_q_pre_solve,
+                                self.body_inv_mass_effective,
+                                self.body_inv_inertia_effective,
+                                restitution_manifold_key,
+                                restitution_manifold_size,
+                                restitution_manifold_contact,
+                                model.body_count,
+                                restitution_contact_n_K,
+                                restitution_contact_axn_lo_target,
+                                restitution_contact_axn_hi_sigma,
+                                self._restitution_manifold_inner_iterations,
+                                outer_iteration,
+                            ],
+                            outputs=[body_deltas, restitution_body_manifold_count],
+                            device=model.device,
+                        )
+
+                        if requires_grad:
+                            next_body_qd = wp.clone(body_qd_with_restitution)
+                            wp.launch(
+                                kernel=apply_body_delta_velocities,
+                                dim=model.body_count,
+                                inputs=[body_deltas, restitution_body_manifold_count],
+                                outputs=[next_body_qd],
+                                device=model.device,
+                            )
+                            body_qd_with_restitution = next_body_qd
+                        else:
+                            wp.launch(
+                                kernel=apply_restitution_deltas,
+                                dim=model.body_count,
+                                inputs=[body_deltas, restitution_body_manifold_count],
+                                outputs=[body_qd_with_restitution],
+                                device=model.device,
+                            )
+                    if requires_grad:
+                        state_out.body_qd = body_qd_with_restitution
 
             if model.body_count:
                 self.copy_kinematic_body_state(model, state_in, state_out)
@@ -766,6 +1139,10 @@ class SolverXPBD(SolverBase):
     @override
     def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
         """Populate ``contacts.force`` from XPBD contact impulses accumulated during the last :meth:`step`.
+
+        .. deprecated:: 1.7
+            Request :attr:`~newton.solvers.SolverBase.ObservableKind.CONTACT_F` and
+            pass the resulting container to :meth:`step` instead.
 
         Both force [N] and torque [N·m] components are written.  The torque
         includes torsional and rolling friction contributions that cannot be
@@ -792,10 +1169,17 @@ class SolverXPBD(SolverBase):
             ValueError: If ``contacts.force`` is ``None`` (not requested), if no step has been run yet,
                 or if the contacts capacity does not match the one used in the last :meth:`step`.
         """
+        warnings.warn(
+            "SolverXPBD.update_contacts() is deprecated in Newton 1.7; request SolverBase.ObservableKind.CONTACT_F and pass "
+            "SolverBase.Observables to step().",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self._apply_module_options()
         if contacts.force is None:
             raise ValueError(
-                "contacts.force is not allocated. Call model.request_contact_attributes('force') "
-                "before creating the Contacts object."
+                "The deprecated contacts.force compatibility buffer is not allocated. "
+                "Prefer SolverBase.ObservableKind.CONTACT_F; legacy callers must request 'force' before creating Contacts."
             )
         if not hasattr(self, "_contact_impulse") or self._contact_impulse is None:
             raise ValueError("No contact impulse data available. Call step() before update_contacts().")

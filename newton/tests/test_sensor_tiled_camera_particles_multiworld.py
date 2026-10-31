@@ -9,7 +9,16 @@ import warp as wp
 
 import newton
 from newton.sensors import SensorTiledCamera
-from newton.tests.unittest_utils import add_function_test, get_test_devices
+from newton.tests.unittest_utils import (
+    add_function_test,
+    get_test_devices,
+    ignore_sensor_tiled_camera_deprecation,
+)
+
+
+def setUpModule():
+    # SensorTiledCamera is deprecated; these tests exercise it intentionally.
+    ignore_sensor_tiled_camera_deprecation()
 
 
 def _build_multiworld_particle_model(*, worlds: int, spacing: float):
@@ -98,9 +107,9 @@ def test_sensor_tiled_camera_multiworld_particles_consistent(test: unittest.Test
 
     sensor = SensorTiledCamera(
         model=model,
-        config=SensorTiledCamera.RenderConfig(max_distance=max_distance),
+        default_render_config=SensorTiledCamera.RenderConfig(max_distance=max_distance),
     )
-    camera_rays = sensor.utils.compute_pinhole_camera_rays(width, height, fov)
+    camera_rays = sensor.utils.compute_camera_rays_pinhole(width, height, camera_fovs=fov)
 
     cam_quat = wp.quat_identity()
     camera_transforms = wp.array(
@@ -118,8 +127,6 @@ def test_sensor_tiled_camera_multiworld_particles_consistent(test: unittest.Test
     )
 
     depth_image = sensor.utils.create_depth_image_output(width, height, camera_count=1)
-    newton.geometry.build_bvh_shape(model, state)
-    newton.geometry.build_bvh_particle(model, state)
     sensor.update(state, camera_transforms, camera_rays, depth_image=depth_image)
 
     depth_np = depth_image.numpy()  # (num_worlds, num_cameras, H, W)

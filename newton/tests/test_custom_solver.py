@@ -1,0 +1,215 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for extending solver change/reset flags with custom integer bits."""
+
+from __future__ import annotations
+
+import unittest
+from dataclasses import dataclass
+
+import numpy as np
+import warp as wp
+
+import newton
+
+
+class DummySolver(newton.solvers.SolverBase):
+    """Minimal solver that consumes extension flags and custom attributes."""
+
+    class ObservableKind(newton.solvers.SolverBase.ObservableKind):
+        """Add a custom kind while inheriting the standard observable names."""
+
+        BODY_TEMPERATURE = "body_temperature"
+
+    @dataclass(eq=False)
+    class Observables(newton.solvers.SolverBase.Observables):
+        """Extend the standard observable container with a custom body array."""
+
+        body_temperature: wp.array[wp.float32] | None = newton.solvers.SolverBase.Observables.field(
+            dtype=wp.float32, frequency=newton.Model.AttributeFrequency.BODY
+        )
+
+    # These bits intentionally live outside Newton's built-in flag range.
+    MODEL_ATTRIBUTE_CHANGED = 1 << 20
+    STATE_ATTRIBUTE_RESET = 1 << 21
+    SUPPORTED_OBSERVABLES = frozenset(
+        {
+            ObservableKind.BODY_QDD,
+            ObservableKind.BODY_TEMPERATURE,
+        }
+    )
+
+    def __init__(self, model: newton.Model):
+        """Initialize bookkeeping used by the tests."""
+        super().__init__(model)
+        self.notify_flags: int | None = None
+        self.reset_flags: int | None = None
+        self.saw_body_properties = False
+        self.saw_body_q = False
+        self.model_epoch: int | None = None
+        self.reset_epoch: int | None = None
+
+    def notify_model_changed(self, flags: newton.ModelFlags | int) -> None:
+        """Consume both built-in model flags and a custom solver flag."""
+        self.notify_flags = flags
+        self.saw_body_properties = bool(flags & newton.ModelFlags.BODY_PROPERTIES)
+        if flags & self.MODEL_ATTRIBUTE_CHANGED:
+            self.model_epoch = int(self.model.custom_solver.model_epoch.numpy()[0])
+
+    def reset(
+        self,
+        state: newton.State,
+        world_mask: wp.array | None = None,
+        flags: newton.StateFlags | int | None = None,
+    ) -> None:
+        """Consume both built-in state flags and a custom solver reset flag."""
+        del world_mask
+        reset_flags = int(newton.StateFlags.ALL if flags is None else flags)
+        self.reset_flags = reset_flags
+        self.saw_body_q = bool(reset_flags & newton.StateFlags.BODY_Q)
+        if reset_flags & self.STATE_ATTRIBUTE_RESET:
+            self.reset_epoch = int(state.custom_solver.reset_epoch.numpy()[0])
+            state.custom_solver.reset_epoch.assign(np.array([self.reset_epoch + 1], dtype=np.int32))
+
+    @staticmethod
+    def register_custom_attributes(builder: newton.ModelBuilder) -> None:
+        """Register custom buffers that the dummy solver owns."""
+        builder.add_custom_attribute(
+            newton.ModelBuilder.CustomAttribute(
+                name="model_epoch",
+                dtype=wp.int32,
+                frequency=newton.Model.AttributeFrequency.BODY,
+                assignment=newton.Model.AttributeAssignment.MODEL,
+                namespace="custom_solver",
+                default=-1,
+            )
+        )
+        builder.add_custom_attribute(
+            newton.ModelBuilder.CustomAttribute(
+                name="reset_epoch",
+                dtype=wp.int32,
+                frequency=newton.Model.AttributeFrequency.BODY,
+                assignment=newton.Model.AttributeAssignment.STATE,
+                namespace="custom_solver",
+                default=-1,
+            )
+        )
+
+
+class TestCustomSolver(unittest.TestCase):
+    """Verify custom solver flags can be regular Python integer bitmasks."""
+
+    def _build_model(self) -> newton.Model:
+        """Build a one-body model with custom solver-owned attributes."""
+        builder = newton.ModelBuilder()
+        DummySolver.register_custom_attributes(builder)
+        builder.add_body(
+            mass=0.0,
+            custom_attributes={
+                "custom_solver:model_epoch": 7,
+                "custom_solver:reset_epoch": 11,
+            },
+        )
+        return builder.finalize()
+
+    def test_notify_model_changed_accepts_custom_int_flag(self):
+        """Model-change notifications preserve custom integer bits."""
+        model = self._build_model()
+        solver = DummySolver(model)
+        flags = newton.ModelFlags.BODY_PROPERTIES | DummySolver.MODEL_ATTRIBUTE_CHANGED
+
+        # IntEnum combinations with unknown bits become plain ints, which is
+        # what lets downstream solvers define their own extension flags.
+        self.assertIs(type(flags), int)
+
+        solver.notify_model_changed(flags)
+
+        self.assertEqual(solver.notify_flags, flags)
+        self.assertTrue(solver.saw_body_properties)
+        self.assertEqual(solver.model_epoch, 7)
+
+    def test_reset_accepts_custom_int_flag(self):
+        """State resets preserve custom integer bits."""
+        model = self._build_model()
+        state = model.state()
+        solver = DummySolver(model)
+        flags = newton.StateFlags.BODY_Q | DummySolver.STATE_ATTRIBUTE_RESET
+
+        # Keep this assertion explicit so a future enum implementation cannot
+        # accidentally reject extension bits by coercing them back to StateFlags.
+        self.assertIs(type(flags), int)
+
+        solver.reset(state, flags=flags)
+
+        self.assertEqual(solver.reset_flags, flags)
+        self.assertTrue(solver.saw_body_q)
+        self.assertEqual(solver.reset_epoch, 11)
+        self.assertEqual(int(state.custom_solver.reset_epoch.numpy()[0]), 12)
+
+    def test_base_reset_validates_global_world_mask_slot(self):
+        """Require a final global slot in reset masks."""
+        builder = newton.ModelBuilder()
+        builder.begin_world()
+        builder.end_world()
+        builder.begin_world()
+        builder.end_world()
+        model = builder.finalize()
+        solver = newton.solvers.SolverBase(model)
+        state = model.state()
+
+        solver.reset(state, world_mask=wp.array((True, False, True), dtype=wp.bool, device=model.device))
+
+        with self.assertRaisesRegex(ValueError, "world_count \\+ 1"):
+            solver.reset(state, world_mask=wp.array((True, False), dtype=wp.bool, device=model.device))
+
+        with self.assertRaisesRegex(ValueError, "world_count \\+ 1"):
+            solver.reset(state, world_mask=wp.array((True,), dtype=wp.bool, device=model.device))
+
+    def test_observables_compose_standard_and_custom_flags(self):
+        """Allocate inherited and solver-specific observables from one set."""
+        model = self._build_model()
+        solver = DummySolver(model)
+        requested = {
+            solver.ObservableKind.BODY_QDD,
+            solver.ObservableKind.BODY_TEMPERATURE,
+        }
+
+        observables = solver.observables(kinds=requested)
+
+        self.assertIsInstance(observables, DummySolver.Observables)
+        self.assertEqual(observables.kinds, frozenset(requested))
+        self.assertEqual(observables.body_qdd.shape, (model.body_count,))
+        self.assertEqual(observables.body_temperature.shape, (model.body_count,))
+        self.assertIsNone(observables.body_parent_f)
+
+    def test_observables_reject_invalid_requests(self):
+        """Reject unsupported names, bare strings, and invalid collection entries."""
+        model = self._build_model()
+        solver = DummySolver(model)
+        for kinds, error, message in (
+            ({solver.ObservableKind.BODY_PARENT_F}, ValueError, "body_parent_f"),
+            ({""}, TypeError, "nonempty strings"),
+            ({0}, TypeError, "nonempty strings"),
+            ("body_qdd", TypeError, "collection of strings"),
+        ):
+            with self.subTest(kinds=kinds), self.assertRaisesRegex(error, message):
+                solver.observables(kinds)
+
+    def test_extended_attribute_requests_are_deprecated(self):
+        """Keep legacy allocation requests while directing callers to solver observables."""
+        builder = newton.ModelBuilder()
+        with self.assertWarnsRegex(DeprecationWarning, "SolverBase.Observables"):
+            builder.request_state_attributes("body_qdd")
+        with self.assertWarnsRegex(DeprecationWarning, "SolverBase.Observables"):
+            builder.request_contact_attributes("force")
+
+        model = builder.finalize()
+        with self.assertWarnsRegex(DeprecationWarning, "SolverBase.Observables"):
+            model.request_state_attributes("body_parent_f")
+        with self.assertWarnsRegex(DeprecationWarning, "SolverBase.Observables"):
+            model.request_contact_attributes("force")
+
+
+if __name__ == "__main__":
+    unittest.main()

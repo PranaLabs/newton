@@ -101,11 +101,9 @@ def _compute_edge_bending_data(
         edge_bending_cot, edge_aniso_values)`` suitable for Style3D edge
         attributes.
     """
-    adjacency = MeshAdjacency(tri_indices.tolist())
-    edge_indices = np.fromiter(
-        (x for e in adjacency.edges.values() for x in (e.o0, e.o1, e.v0, e.v1, e.f0, e.f1)),
-        int,
-    ).reshape(-1, 6)
+    _adjacency = MeshAdjacency(tri_indices)
+    edge_indices, edge_tri_indices = _adjacency.edge_indices, _adjacency.edge_tri_indices
+    edge_indices = np.concatenate((edge_indices, edge_tri_indices), axis=1)
 
     edge_count = edge_indices.shape[0]
     edge_aniso_values = None
@@ -144,15 +142,15 @@ def _compute_edge_bending_data(
         return a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]
 
     if edge_aniso_values is not None:
-        angle_f0 = np.atan2(panel_x43_f0[:, 1], panel_x43_f0[:, 0])
-        angle_f1 = np.atan2(panel_x43_f1[:, 1], panel_x43_f1[:, 0])
+        angle_f0 = np.arctan2(panel_x43_f0[:, 1], panel_x43_f0[:, 0])
+        angle_f1 = np.arctan2(panel_x43_f1[:, 1], panel_x43_f1[:, 0])
         angle = (angle_f0 + angle_f1) * 0.5
         sin = np.sin(angle)
         cos = np.cos(angle)
-        sin2 = np.pow(sin, 2)
-        cos2 = np.pow(cos, 2)
-        sin12 = np.pow(sin, 12)
-        cos12 = np.pow(cos, 12)
+        sin2 = np.power(sin, 2)
+        cos2 = np.power(cos, 2)
+        sin12 = np.power(sin, 12)
+        cos12 = np.power(cos, 12)
         aniso_ke = np.array(edge_aniso_values, dtype=float).reshape(-1, 3)
         edge_ke = aniso_ke[:, 0] * sin12 + aniso_ke[:, 1] * cos12 + aniso_ke[:, 2] * 4.0 * sin2 * cos2
 
@@ -160,7 +158,7 @@ def _compute_edge_bending_data(
         np.abs(cross2d(panel_x43_f0, panel_x1_f0 - panel_x3_f0))
         + np.abs(cross2d(panel_x43_f1, panel_x2_f1 - panel_x3_f1))
         + 1.0e-8
-    ) / 3.0
+    ) / 2.0
 
     def cot2d(a, b, c):
         ba = b - a
@@ -360,15 +358,14 @@ def add_cloth_mesh(
     if edge_aniso_values is not None:
         edge_custom_attrs["style3d:aniso_ke"] = edge_aniso_values
 
-    builder.add_edges(
-        edge_indices_global[:, 0].tolist(),
-        edge_indices_global[:, 1].tolist(),
-        edge_indices_global[:, 2].tolist(),
-        edge_indices_global[:, 3].tolist(),
+    edge_range = builder._add_soft_mesh_edges_from_triangles(
+        tri_start,
+        tri_end,
         edge_ke=edge_ke,
         edge_kd=edge_kd_list,
         custom_attributes=edge_custom_attrs,
     )
+    edge_indices_global = np.asarray(builder.edge_indices[edge_range.start : edge_range.stop], dtype=np.int32)
 
     if add_springs:
         spring_indices = set()

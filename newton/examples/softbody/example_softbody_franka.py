@@ -27,6 +27,8 @@ import newton.utils
 from newton import ModelBuilder, eval_fk
 from newton.solvers import SolverFeatherstone, SolverVBD
 
+DUCK_OPACITY = 0.55
+
 
 @wp.kernel
 def set_gripper_q(joint_q: wp.array2d[float], finger_pos: wp.array[float], idx0: int, idx1: int):
@@ -58,14 +60,14 @@ class Example:
         # contact (meter scale)
         self.particle_radius = 0.005
         self.soft_body_contact_margin = 0.01
-        self.particle_self_contact_radius = 0.003
-        self.particle_self_contact_margin = 0.005
+        self.particle_self_contact_margin = 0.003
+        self.particle_self_contact_gap = 0.002
 
         self.soft_contact_ke = 2e6
-        self.soft_contact_kd = 1e-7
+        self.soft_contact_kd = 2e-1
         self.self_contact_friction = 0.5
 
-        self.scene = ModelBuilder(gravity=-9.81)
+        self.scene = ModelBuilder(gravity=(0.0, 0.0, -9.81))
 
         self.viewer = viewer
 
@@ -81,7 +83,7 @@ class Example:
         table_pos = wp.vec3(0.0, -0.5, 0.1)
         self.scene.add_shape_box(
             -1,
-            wp.transform(table_pos, wp.quat_identity()),
+            xform=wp.transform(table_pos, wp.quat_identity()),
             hx=table_hx,
             hy=table_hy,
             hz=table_hz,
@@ -91,7 +93,9 @@ class Example:
         duck_path = newton.utils.download_asset("manipulation_objects/rubber_duck")
         usd_stage = Usd.Stage.Open(str(duck_path / "model.usda"))
         prim = usd_stage.GetPrimAtPath("/root/Model/TetMesh")
-        tetmesh = newton.TetMesh.create_from_usd(prim)
+        # The duck authors no physics material; canonical-only reads avoid the
+        # legacy-default deprecation window.
+        tetmesh = newton.TetMesh.create_from_usd(prim, compat_namespaces=())
 
         # Duck USDA is in meters (metersPerUnit=1.0).
         # Table top is at z=0.2m. Duck center offset ~0.03m above table.
@@ -104,8 +108,9 @@ class Example:
             density=100.0,
             k_mu=1.0e6,
             k_lambda=1.0e6,
-            k_damp=1e-6,
+            k_damp=1e0,
             particle_radius=self.particle_radius,
+            opacity=DUCK_OPACITY,
         )
 
         self.scene.color()
@@ -131,7 +136,7 @@ class Example:
         # collision pipeline for soft body - robot contacts
         self.collision_pipeline = newton.CollisionPipeline(
             self.model,
-            soft_contact_margin=self.soft_body_contact_margin,
+            soft_contact_gap=self.soft_body_contact_margin,
         )
         self.contacts = self.collision_pipeline.contacts()
 
@@ -148,20 +153,24 @@ class Example:
             self.model,
             iterations=self.iterations,
             integrate_with_external_rigid_solver=True,
-            particle_self_contact_radius=self.particle_self_contact_radius,
             particle_self_contact_margin=self.particle_self_contact_margin,
+            particle_self_contact_gap=self.particle_self_contact_gap,
             particle_enable_self_contact=False,
             particle_vertex_contact_buffer_size=32,
             particle_edge_contact_buffer_size=64,
-            particle_collision_detection_interval=-1,
+            collision_frequency_type={
+                newton.solvers.SolverBase.CollisionSlot.SOFT_SELF_CONTACT: newton.solvers.SolverBase.CollisionFrequencyType.PRE_INIT,
+            },
         )
 
         self.viewer.set_model(self.model)
         self.viewer.set_camera(wp.vec3(-0.6, 0.6, 1.24), -42.0, -58.0)
 
         # gravity arrays for swapping during simulation
-        self.gravity_zero = wp.zeros(1, dtype=wp.vec3)
-        self.gravity_earth = wp.array(wp.vec3(0.0, 0.0, -9.81), dtype=wp.vec3)
+        self.gravity_zero = wp.zeros(self.model.gravity.shape[0], dtype=wp.vec3, device=self.model.device)
+        self.gravity_earth = wp.full(
+            self.model.gravity.shape[0], wp.vec3(0.0, 0.0, -9.81), dtype=wp.vec3, device=self.model.device
+        )
 
         # evaluate FK for initial state
         eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
@@ -226,12 +235,9 @@ class Example:
         self.ik_iters = 24
 
     def capture(self):
-        if wp.get_device().is_cuda:
-            with wp.ScopedCapture() as capture:
-                self.simulate()
-            self.graph = capture.graph
-        else:
-            self.graph = None
+        with wp.ScopedCapture() as capture:
+            self.simulate()
+        self.graph = capture.graph
 
     def create_articulation(self, builder):
         asset_path = newton.utils.download_asset("franka_emika_panda")
@@ -244,6 +250,7 @@ class Example:
             enable_self_collisions=False,
             collapse_fixed_joints=True,
             force_show_colliders=False,
+            joint_damping_mode="passive",
         )
         builder.joint_q[:6] = [0.0, 0.0, 0.0, -1.59695, 0.0, 2.5307]
 

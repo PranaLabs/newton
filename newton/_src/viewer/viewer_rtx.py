@@ -1,0 +1,3251 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import ctypes
+import math
+import os
+import re
+import tempfile
+import warnings
+from collections.abc import Callable, Mapping, Sequence
+from time import perf_counter
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Literal
+
+import numpy as np
+import warp as wp
+
+import newton
+
+from ..core.types import Axis, override
+from ..utils.mesh import compute_vertex_normals
+
+try:
+    from pxr import Gf, UsdGeom
+except ImportError:
+    Gf = UsdGeom = None
+
+if TYPE_CHECKING:
+    import ovstage
+
+from .camera import Camera
+from .gl.frame_cache import FrameCache
+from .gl.icon import set_window_icon
+from .image_logger import ImageLogger, _validate
+from .picking import Picking
+from .plot_logger import PlotLogger
+from .utils import OPAQUE_OPACITY_THRESHOLD
+from .viewer import _DEFAULT_LAYER_ID
+from .viewer_gui import ViewerGui
+from .viewer_usd import ViewerUSD
+from .wind import Wind
+
+PROFILE_ENABLED = os.environ.get("NEWTON_PROFILE", "0") != "0"
+
+
+def _version_prefix(version: str, package: str) -> tuple[int, int]:
+    """Return the ``(major, minor)`` prefix of a package version."""
+    match = re.match(r"^(\d+)\.(\d+)", version)
+    if match is None:
+        raise RuntimeError(f"Unable to determine {package} compatibility from version {version!r}")
+    return int(match.group(1)), int(match.group(2))
+
+
+def _uses_ovstage(ovrtx_version: str) -> bool:
+    """Return whether an OVRTX release uses the OVStage scene interface."""
+    return _version_prefix(ovrtx_version, "OVRTX") >= (0, 4)
+
+
+@wp.kernel(enable_backward=False)
+def write_transforms(xform: wp.array[wp.transform], scale: wp.array[wp.vec3], offset: int, m_out: wp.array[wp.mat44d]):
+    tid = wp.tid()
+    xf32 = xform[tid]
+    sc32 = scale[tid]
+    # convert to float64
+    p64 = wp.vec3d(wp.float64(xf32[0]), wp.float64(xf32[1]), wp.float64(xf32[2]))
+    q64 = wp.quatd(wp.float64(xf32[3]), wp.float64(xf32[4]), wp.float64(xf32[5]), wp.float64(xf32[6]))
+    s64 = wp.vec3d(wp.float64(sc32[0]), wp.float64(sc32[1]), wp.float64(sc32[2]))
+    # NOTE: transpose needed
+    m_out[offset + tid] = wp.transpose(wp.transform_compose(p64, q64, s64))
+
+
+@wp.kernel(enable_backward=False)
+def write_prim_world_matrices(
+    body_q: wp.array[wp.transform],
+    prim_body: wp.array[int],
+    prim_linear: wp.array[wp.mat33],
+    prim_translation: wp.array[wp.vec3],
+    prim_world: wp.array[int],
+    world_offsets: wp.array[wp.vec3],
+    layer_xform: wp.transform,
+    mat44_offset: int,
+    m_out: wp.array[wp.mat44d],
+):
+    """Write ``layer · world offset · body · local`` prim matrices, transposed to USD's row-vector convention."""
+    tid = wp.tid()
+    lin = prim_linear[tid]
+    t = prim_translation[tid]
+    body = prim_body[tid]
+    if body >= 0:
+        xf = body_q[body]
+        rot = wp.quat_to_matrix(wp.transform_get_rotation(xf))
+        lin = rot @ lin
+        t = rot @ t + wp.transform_get_translation(xf)
+    if world_offsets:
+        w = prim_world[tid]
+        if w >= 0 and w < world_offsets.shape[0]:
+            t = t + world_offsets[w]
+    lin = wp.quat_to_matrix(wp.transform_get_rotation(layer_xform)) @ lin
+    t = wp.transform_point(layer_xform, t)
+    # fmt: off
+    m_out[mat44_offset + tid] = wp.mat44d(wp.mat44(
+        lin[0, 0], lin[1, 0], lin[2, 0], 0.0,
+        lin[0, 1], lin[1, 1], lin[2, 1], 0.0,
+        lin[0, 2], lin[1, 2], lin[2, 2], 0.0,
+        t[0], t[1], t[2], 1.0,
+    ))
+    # fmt: on
+
+
+def _transforms_to_usd_matrices(xforms: np.ndarray) -> np.ndarray:
+    """Convert ``[N, 7]`` Newton transforms to ``[N, 4, 4]`` USD row-vector matrices."""
+    x, y, z, w = xforms[:, 3], xforms[:, 4], xforms[:, 5], xforms[:, 6]
+    rot = np.stack(
+        [
+            np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)], axis=-1),
+            np.stack([2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)], axis=-1),
+            np.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], axis=-1),
+        ],
+        axis=-2,
+    )
+    out = np.zeros((len(xforms), 4, 4), dtype=np.float64)
+    out[:, :3, :3] = np.swapaxes(rot, -1, -2)
+    out[:, 3, :3] = xforms[:, :3]
+    out[:, 3, 3] = 1.0
+    return out
+
+
+def _resolve_usd_type(setting: str, type_name: str):
+    """Resolve a USD type name (``"uint"``) or ``Sdf.ValueTypeNames`` attribute (``"UInt"``)."""
+    from pxr import Sdf
+
+    value_type = Sdf.ValueTypeNames.Find(type_name)
+    if not value_type:
+        value_type = getattr(Sdf.ValueTypeNames, type_name, None)
+    if not isinstance(value_type, Sdf.ValueTypeName):
+        raise ValueError(f"render_settings[{setting!r}]: unknown USD type name {type_name!r}")
+    return value_type
+
+
+class ViewerRTX(ViewerUSD):
+    """Real-time ray-traced viewer using NVIDIA OVRTX.
+
+    Builds a USD scene during the first simulation frame using the ViewerUSD
+    base class, serializes it to disk, then creates an OVRTX renderer for
+    real-time path-traced rendering. Subsequent frames update rigid-body
+    transforms (and deforming-mesh vertices) via the OVRTX 0.3 attribute
+    interface or the OVStage interface used by OVRTX 0.4 and newer, and
+    present the rendered image in a pyglet / OpenGL window. Debug markers
+    and custom mesh instances can also be added after rendering starts.
+    """
+
+    _PHASE_BUILD = 0
+    _PHASE_RENDER = 1
+    _PICKING_LINE_NAME = "picking_line"
+    _PICKING_LINE_RADIUS = 0.01
+    _PICKING_LINE_COLOR = (0.0, 1.0, 1.0)
+
+    # Available lighting environment presets.
+    ENVIRONMENTS = ("default", "studio", "none")
+
+    _borrowed_stage = None
+    _borrowed_reference = None
+    _stage_from_model = None
+    _borrowed_reset_pending = False
+    _prim_paths: Sequence[str] = ()
+    _prim_count = 0
+    _rtx_render_settings: Mapping[str, tuple[Any, Any]] = MappingProxyType({})
+    _render_var_path = "/Render/Vars/LdrColor"
+
+    @override
+    def activate(self, layer_id: str):
+        # A borrowed stage binds the bodies of a single model.
+        if self._borrowed_stage is not None and layer_id != _DEFAULT_LAYER_ID:
+            raise ValueError("ViewerRTX(ovstage=...) does not support layers")
+        if (
+            getattr(self, "_phase", self._PHASE_BUILD) == self._PHASE_RENDER
+            and layer_id != _DEFAULT_LAYER_ID
+            and layer_id not in self._layers
+        ):
+            raise RuntimeError("ViewerRTX layers must be activated before the first rendered frame")
+        return super().activate(layer_id)
+
+    def __init__(
+        self,
+        width: int = 1280,
+        height: int = 720,
+        vsync: bool = False,
+        headless: bool = False,
+        paused: bool = False,
+        fps: int = 60,
+        up_axis: Literal["X", "Y", "Z"] = "Z",
+        num_frames: int | None = None,
+        scaling: float = 1.0,
+        environment: Literal["default", "studio", "none"] = "default",
+        async_rendering: bool = True,
+        *,
+        plot_history_size: int = 250,
+        ovstage: ovstage.Stage | None = None,
+        render_settings: dict[str, tuple[str, Any]] | None = None,
+    ):
+        """Initialize the OVRTX-backed real-time ray-tracing viewer.
+
+        Args:
+            width: Window width in pixels.
+            height: Window height in pixels.
+            vsync: Enable vertical sync.
+            headless: Run in headless mode (no window).
+            paused: Start the viewer in paused mode.
+            fps: Stage frames-per-second metadata used by OVRTX.
+            up_axis: Scene up axis (``"X"``, ``"Y"`` or ``"Z"``).
+            num_frames: Number of viewer-loop frames in headless mode before
+                :meth:`is_running` returns ``False``. ``None`` means run
+                indefinitely. Includes rendering-paused frames. Ignored when
+                a window is visible.
+            scaling: Uniform world-scale applied at the ``/root`` xform.
+            environment: Lighting preset; one of :attr:`ENVIRONMENTS`.
+            async_rendering: Submit OVRTX render work asynchronously and
+                present the previous frame while the next one is still in
+                flight.
+            plot_history_size: Maximum number of samples kept per
+                :meth:`log_scalar` signal for the live time-series plots.
+            ovstage: Populated stage to render instead of a scene built from
+                the model; see :ref:`viewer-rtx-existing-stage`. :meth:`log_state`
+                writes each body's world pose to the stage prim whose path is
+                the body's ``body_label``, keeping the prim's authored scale;
+                bodies without such a prim are not rendered. If the import
+                re-oriented the stage (up-axis alignment or ``xform``),
+                :meth:`set_model` infers the model-to-stage transform from the
+                root bodies' poses, which must still be the imported ones, and
+                applies it to bodies, camera, and debug geometry. The caller
+                owns the stage's content, lights, and lifetime; the viewer adds
+                its camera, render product, and debug geometry under
+                ``/__newton_viewer``. The viewer generates no geometry for the
+                model's shapes, cloth, or particles; ``show_triangles`` (off by
+                default here) and ``show_particles`` draw simulated cloth and
+                particles as debug overlays. :meth:`set_visible_worlds`,
+                ``show_collision``, and ``show_visual`` affect only the debug
+                geometry, ``environment`` must stay ``"default"``, and layers
+                are not supported. :meth:`set_model` and :meth:`end_frame`
+                write above the stage's current write floor and then advance
+                it, so finish other writes to the stage first. Bound prims keep their last world
+                pose after the viewer releases the stage. Requires OVRTX 0.4
+                and OVStage 0.2 or newer, and a stage created with GPU
+                hierarchy computation.
+            render_settings: ``omni:rtx:*`` attributes to author on the
+                viewer's render product as ``{name: (usd_type_name, value)}``,
+                e.g. ``{"omni:rtx:pt:samplesPerPixel": ("uint", 4)}``. The type
+                is a USD type name or its ``Sdf.ValueTypeNames`` attribute
+                (``"UInt"``).
+        """
+        # Captured before ``import ovstage`` below rebinds the name.
+        self._borrowed_stage = ovstage
+        self._plot_logger = PlotLogger(plot_history_size, get_window=lambda: self._window)
+
+        # FIXME: Disable USD checks in OVRTX that refuse to load the library if `usd-core` is present.
+        # OVRTX 0.3+ ships with namespaced USD builds that should be safe to use in conjunction with
+        # `usd-core`, but the check wasn't removed yet. Upcoming OVRTX releases should remove the check,
+        # at which point we can remove this hack.
+        os.environ.setdefault("OVRTX_SKIP_USD_CHECK", "1")
+
+        try:
+            import ovrtx
+        except ImportError as e:
+            raise ImportError("ovrtx package is required for ViewerRTX. Install with: pip install ovrtx") from e
+
+        self._use_ovstage = _uses_ovstage(ovrtx.__version__)
+        if self._use_ovstage:
+            try:
+                import ovstage
+            except ImportError as e:
+                raise ImportError(
+                    "ovstage package is required for ViewerRTX with OVRTX 0.4 or newer. "
+                    "Install with: pip install ovstage"
+                ) from e
+
+        if UsdGeom is None:
+            raise ImportError("usd-core package is required for ViewerRTX. Install with: pip install usd-core")
+
+        if self._borrowed_stage is not None:
+            if not self._use_ovstage:
+                raise ValueError("ViewerRTX(ovstage=...) requires OVRTX 0.4 or newer")
+            import ovstage
+
+            # Older OVStage misplaces prims under GPU hierarchy computation.
+            if _version_prefix(ovstage.__version__, "OVStage") < (0, 2):
+                raise ValueError("ViewerRTX(ovstage=...) requires OVStage 0.2 or newer")
+            if scaling != 1.0:
+                raise ValueError("ViewerRTX(ovstage=...) does not support scaling")
+            if environment != "default":
+                raise ValueError("ViewerRTX(ovstage=...) takes its lighting from the stage; leave environment unset")
+            self._root_path = "/__newton_viewer"
+        self._rtx_render_settings = {
+            name: (_resolve_usd_type(name, type_name), value)
+            for name, (type_name, value) in (render_settings or {}).items()
+        }
+        self._borrowed_reference = None
+
+        self._environment = environment.lower()
+        if self._environment not in self.ENVIRONMENTS:
+            raise ValueError(
+                f"Unknown RTX environment {self._environment!r}. Choose from: {', '.join(self.ENVIRONMENTS)}"
+            )
+
+        self._paused = paused
+        self._step_requested = False
+        self._reset_callback: Callable[[], None] | None = None
+
+        # OVRTX
+        self._rtx = None
+        self._async = async_rendering
+        self._render_result = None
+        self._discard_render_result = False
+        self._render_products = None
+        self._displayed_frame = FrameCache()
+        self._displayed_pixels = None
+        self._last_frame_is_fullscreen = False
+        self._uses_fractional_opacity = False
+        self._transform_binding = None
+        self._all_instance_paths = []
+        self._ovstage = None
+        self._ovstage_attached = False
+        self._ovstage_paths = None
+        self._ovstage_queries = {}
+        self._ovstage_ordinal = 0
+        self._ovstage_population_dirty = False
+        self._pending_transform_matrices = {}
+
+        # The renderer output size is fixed even if window is resized
+        self._render_width = width
+        self._render_height = height
+        self._window_width = width
+        self._window_height = height
+        self._headless = headless
+        self._up_axis = up_axis
+
+        # Window creation is deferred until _init_ovrtx() to avoid pyglet/Warp
+        # kernel compilation deadlock on Windows.
+        self._window = None
+        self._pyglet = None
+        self._pyglet_gl = None
+        self._pyglet_app = None
+        self._tex_resource = None
+        self._gl_texture = None
+        self._gl_program = None
+        self._gl_vao = None
+        self._vsync = vsync
+        self._should_close = False
+
+        # Input / timing state
+        self._keys_down: set[int] = set()
+        self._last_perf_time: float | None = None
+        self.gui = None
+
+        # ``gui`` is created lazily in ``_init_window``; any ``register_ui_callback`` /
+        # ``show_loading_splash`` calls that arrive before then are buffered here and
+        # flushed once the GUI exists.
+        self._pending_ui_callbacks: list[tuple] = []
+        self._pending_splash: tuple[bool, str | None] | None = None
+        # ``set_model`` rebinds the device once ``ViewerBase`` has resolved it.
+        self._image_logger = ImageLogger(device=wp.get_device())
+        # ``log_image`` calls that arrive before the GL context exists, keyed by
+        # ``(name, fullscreen)``.
+        self._pending_images: dict[tuple[str, bool], Any] = {}
+
+        # Generate a temporary USD path to share with OVRTX renderer
+        fd, output_path = tempfile.mkstemp(suffix=".usd")
+        os.close(fd)
+
+        # Initializing the base class calls clear_model(), which
+        # is used to initialize/reset model-specific state.
+        super().__init__(
+            output_path=output_path,
+            fps=fps,
+            up_axis=up_axis,
+            num_frames=num_frames,
+            scaling=scaling,
+        )
+
+    # ------------------------------------------------------------------ window
+
+    def _init_window(self):
+        """Create a pyglet window with GL texture + shader for fast framebuffer blitting."""
+        import ctypes  # noqa: PLC0415
+
+        import pyglet
+
+        pyglet.options["debug_gl"] = False
+        from pyglet import gl
+
+        self._window = pyglet.window.Window(
+            width=self._window_width,
+            height=self._window_height,
+            caption="Newton RTX Viewer",
+            resizable=True,
+            visible=not self._headless,
+            vsync=self._vsync,
+        )
+        set_window_icon(self._window)
+
+        # cache the imported pyglet modules to avoid reimporting later
+        self._pyglet = pyglet
+        self._pyglet_gl = pyglet.gl
+        self._pyglet_app = pyglet.app
+
+        # ---- GL texture + shader for zero-copy blit --------------------------
+        self._window.switch_to()
+
+        tex_id = (gl.GLuint * 1)()
+        gl.glGenTextures(1, tex_id)
+        self._gl_texture = tex_id[0]
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self._gl_texture)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+        gl.glTexImage2D(
+            gl.GL_TEXTURE_2D,
+            0,
+            gl.GL_RGBA8,
+            self.camera.width,
+            self.camera.height,
+            0,
+            gl.GL_RGBA,
+            gl.GL_UNSIGNED_BYTE,
+            None,
+        )
+        gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+
+        self._tex_resource = wp.GLTextureResource(
+            self._gl_texture, gl.GL_TEXTURE_2D, flags=wp.TextureResourceFlags.WRITE_DISCARD
+        )
+
+        # Compile fullscreen-triangle shader (linear→sRGB gamma + Y-flip in fragment)
+        _VS = b"""#version 330
+out vec2 uv;
+void main() {
+    uv = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+    gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0);
+}
+\x00"""
+        _FS = b"""#version 330
+uniform sampler2D tex;
+in vec2 uv;
+out vec4 fragColor;
+void main() {
+    vec4 c = texture(tex, vec2(uv.x, 1.0 - uv.y));
+    fragColor = c;
+}
+\x00"""
+
+        def _compile_shader(src, stype):
+            s = gl.glCreateShader(stype)
+            src_p = ctypes.c_char_p(src)
+            src_pp = (ctypes.c_char_p * 1)(src_p)
+            gl.glShaderSource(s, 1, ctypes.cast(src_pp, ctypes.POINTER(ctypes.POINTER(ctypes.c_char))), None)
+            gl.glCompileShader(s)
+            status = (gl.GLint * 1)()
+            gl.glGetShaderiv(s, gl.GL_COMPILE_STATUS, status)
+            if not status[0]:
+                log_len = (gl.GLint * 1)()
+                gl.glGetShaderiv(s, gl.GL_INFO_LOG_LENGTH, log_len)
+                log = (ctypes.c_char * log_len[0])()
+                gl.glGetShaderInfoLog(s, log_len[0], None, log)
+                raise RuntimeError(f"Shader compilation failed:\n{log.value.decode()}")
+            return s
+
+        vs = _compile_shader(_VS, gl.GL_VERTEX_SHADER)
+        fs = _compile_shader(_FS, gl.GL_FRAGMENT_SHADER)
+        self._gl_program = gl.glCreateProgram()
+        gl.glAttachShader(self._gl_program, vs)
+        gl.glAttachShader(self._gl_program, fs)
+        gl.glLinkProgram(self._gl_program)
+        link_status = (gl.GLint * 1)()
+        gl.glGetProgramiv(self._gl_program, gl.GL_LINK_STATUS, link_status)
+        if not link_status[0]:
+            log_len = (gl.GLint * 1)()
+            gl.glGetProgramiv(self._gl_program, gl.GL_INFO_LOG_LENGTH, log_len)
+            log = (ctypes.c_char * log_len[0])()
+            gl.glGetProgramInfoLog(self._gl_program, log_len[0], None, log)
+            raise RuntimeError(f"Shader program linking failed:\n{log.value.decode()}")
+        gl.glDeleteShader(vs)
+        gl.glDeleteShader(fs)
+
+        # Empty VAO required by core profile for the fullscreen triangle
+        vao = (gl.GLuint * 1)()
+        gl.glGenVertexArrays(1, vao)
+        self._gl_vao = vao[0]
+
+        # ---- input callbacks ------------------------------------------------
+        @self._window.event
+        def on_mouse_drag(x, y, dx, dy, buttons, modifiers):
+            if self.gui:
+                self.gui.handle_mouse_drag(x, y, dx, dy, buttons, self._to_framebuffer_coords, modifiers)
+
+        @self._window.event
+        def on_mouse_press(x, y, button, modifiers):
+            if self.gui:
+                self.gui.handle_mouse_press(x, y, button, self._to_framebuffer_coords)
+
+        @self._window.event
+        def on_mouse_release(x, y, button, modifiers):
+            if self.gui:
+                self.gui.handle_mouse_release(x, y, button)
+
+        @self._window.event
+        def on_mouse_scroll(x, y, scroll_x, scroll_y):
+            if self.gui:
+                self.gui.handle_mouse_scroll(scroll_y)
+
+        @self._window.event
+        def on_key_press(symbol, modifiers):
+            if not (self.gui and self.gui.should_ignore_keyboard_input()):
+                self._keys_down.add(symbol)
+            if self.gui:
+                self.gui.handle_key_press(symbol, close_fn=self._window.close)
+
+        @self._window.event
+        def on_key_release(symbol, modifiers):
+            self._keys_down.discard(symbol)
+
+        @self._window.event
+        def on_resize(width, height):
+            self._window_width = width
+            self._window_height = height
+
+        @self._window.event
+        def on_close():
+            self._should_close = True
+
+        self.gui = ViewerGui(self, self._window)
+        self.gui.register_ui_callback(self._ui_populate_rendering_panel, position="rendering")
+        # Drain any registrations that arrived before the GUI was ready.
+        for callback, position in self._pending_ui_callbacks:
+            self.gui.register_ui_callback(callback, position=position)
+        self._pending_ui_callbacks = []
+        if self._pending_splash is not None:
+            active, text = self._pending_splash
+            if active:
+                self.gui.show_loading_splash(text)
+            else:
+                self.gui.hide_loading_splash()
+            self._pending_splash = None
+        for (name, fullscreen), image in self._pending_images.items():
+            self._image_logger.log(name, image, fullscreen=fullscreen)
+        self._pending_images.clear()
+
+    def _discard_partial_window(self) -> None:
+        """Close and clear resources left by failed window initialization."""
+        ui = self.ui
+        if ui is not None:
+            try:
+                ui.shutdown()
+            except Exception:
+                pass
+        self.gui = None
+
+        # Unregister CUDA/GL interop before destroying the GL context.
+        self._tex_resource = None
+        window = self._window
+        self._window = None
+        if window is not None:
+            try:
+                window.close()
+            except Exception:
+                pass
+
+        self._gl_texture = None
+        self._gl_program = None
+        self._gl_vao = None
+        self._pyglet = None
+        self._pyglet_gl = None
+        self._pyglet_app = None
+        self._should_close = False
+
+    @property
+    def ui(self) -> Any | None:
+        """Return the underlying UI object, or ``None`` if the GUI has not been created yet."""
+        if self.gui is None:
+            return None
+        return self.gui.ui
+
+    @property
+    def vsync(self) -> bool:
+        """
+        Get the current vsync state.
+
+        Returns:
+            bool: True if vsync is enabled, False otherwise.
+        """
+        return self._vsync
+
+    @vsync.setter
+    def vsync(self, enabled: bool) -> None:
+        """
+        Set the vsync state.
+
+        Args:
+            enabled: Enable or disable vsync.
+        """
+        if self._window is not None:
+            self._window.set_vsync(enabled)
+        self._vsync = enabled
+
+    # ------------------------------------------------------------------ camera
+
+    def _compute_camera_matrix(self):
+        """Return a 4x4 row-major world-transform for the camera prim (USD convention)."""
+        fwd = np.array(self.camera.get_front(), dtype=np.float64)
+        right = np.array(self.camera.get_right(), dtype=np.float64)
+        up = np.array(self.camera.get_up(), dtype=np.float64)
+
+        mat = np.eye(4, dtype=np.float64)
+        mat[0, :3] = right
+        mat[1, :3] = up
+        mat[2, :3] = -fwd  # USD cameras look along local -Z
+        mat[3, :3] = np.array(self.camera.pos, dtype=np.float64)
+        return mat
+
+    def _to_framebuffer_coords(self, x: float, y: float) -> tuple[float, float]:
+        """Map a window-space mouse point to render-target pixel coordinates.
+
+        Accounts for the letterbox/pillarbox viewport so that picking works
+        correctly after a window resize.
+        """
+        if self._window is None:
+            return float(x), float(y)
+        win_w, win_h = self._window.get_size()
+        if win_w <= 0 or win_h <= 0:
+            return float(x), float(y)
+        render_aspect = self.camera.width / max(self.camera.height, 1)
+        window_aspect = win_w / max(win_h, 1)
+        if window_aspect >= render_aspect:
+            # Pillarbox: black bars left/right
+            vp_h = win_h
+            vp_w = win_h * render_aspect
+            vp_x = (win_w - vp_w) / 2.0
+            vp_y = 0.0
+        else:
+            # Letterbox: black bars top/bottom
+            vp_w = win_w
+            vp_h = win_w / render_aspect
+            vp_x = 0.0
+            vp_y = (win_h - vp_h) / 2.0
+        rx = (x - vp_x) / vp_w * self.camera.width
+        ry = (y - vp_y) / vp_h * self.camera.height
+        return float(rx), float(ry)
+
+    # -------------------------------------------------------- USD scene helpers
+
+    def _add_camera_lights_and_render_product(self):
+        """Insert camera, lights, and RenderProduct into the stage before serialisation."""
+        from pxr import Sdf
+
+        # ---- Camera ----------------------------------------------------------
+        cam = UsdGeom.Camera.Define(self.stage, self._camera_prim_path)
+
+        aspect = self.camera.width / max(self.camera.height, 1)
+        # camera.fov is vertical FOV, so derive focal length from the vertical aperture.
+        v_aperture = 20.955
+        h_aperture = v_aperture * aspect
+        focal_length = v_aperture / (2.0 * math.tan(math.radians(self.camera.fov) / 2.0))
+
+        cam.GetFocalLengthAttr().Set(focal_length)
+        cam.GetHorizontalApertureAttr().Set(h_aperture)
+        cam.GetVerticalApertureAttr().Set(v_aperture)
+        cam.GetClippingRangeAttr().Set(Gf.Vec2f(self.camera.near, self.camera.far))
+
+        xform = UsdGeom.Xform(cam.GetPrim())
+        xform.ClearXformOpOrder()
+        mat_op = xform.AddTransformOp()
+        cam_mat = self._compute_camera_matrix()
+        gf_mat = Gf.Matrix4d(*cam_mat.flatten().tolist())
+        mat_op.Set(gf_mat)
+
+        # ---- Lights ----------------------------------------------------------
+        if self._borrowed_stage is not None:
+            pass  # lighting belongs to the borrowed stage
+        elif self._environment == "studio":
+            self._add_studio_lights()
+        elif self._environment == "default":
+            self._add_default_lights()
+
+        # ---- Render hierarchy (must match Kit convention for OVRTX) ------------
+        # Structure: /Render/OmniverseKit/HydraTextures/<product>
+        #            /Render/Vars/LdrColor
+        #            /Render/OmniverseGlobalRenderSettings
+
+        rp = self.stage.DefinePrim(self._render_product_path, "RenderProduct")
+        rp.SetMetadata(
+            "apiSchemas",
+            Sdf.TokenListOp.Create(
+                prependedItems=[
+                    "OmniRtxSettingsCommonAdvancedAPI_1",
+                    "OmniRtxSettingsRtAdvancedAPI_1",
+                    "OmniRtxSettingsPtAdvancedAPI_1",
+                    "OmniRtxPostColorGradingAPI_1",
+                    "OmniRtxPostChromaticAberrationAPI_1",
+                    "OmniRtxPostBloomPhysicalAPI_1",
+                    "OmniRtxPostMatteObjectAPI_1",
+                    "OmniRtxPostCompositingAPI_1",
+                    "OmniRtxPostDofAPI_1",
+                    "OmniRtxPostMotionBlurAPI_1",
+                    "OmniRtxPostTvNoiseAPI_1",
+                    "OmniRtxPostTonemapIrayReinhardAPI_1",
+                    "OmniRtxPostDebugSettingsAPI_1",
+                    "OmniRtxDebugSettingsAPI_1",
+                ]
+            ),
+        )
+        rp.CreateRelationship("camera").SetTargets([Sdf.Path(self._camera_prim_path)])
+        rp.CreateAttribute("resolution", Sdf.ValueTypeNames.Int2, custom=False).Set(
+            Gf.Vec2i(self.camera.width, self.camera.height)
+        )
+
+        # RenderVar lives at /Render/Vars/LdrColor (NOT nested under the product)
+        rv_path = self._render_var_path
+        rv = self.stage.DefinePrim(rv_path, "RenderVar")
+        rv.CreateAttribute("sourceName", Sdf.ValueTypeNames.String, custom=False).Set("LdrColor")
+        rp.CreateRelationship("orderedVars").SetTargets([Sdf.Path(rv_path)])
+
+        # ---- RTX render settings on the RenderProduct -------------------------
+        rp.CreateAttribute("omni:rtx:rendermode", Sdf.ValueTypeNames.Token).Set("RealTimePathTracing")
+        rp.CreateAttribute("omni:rtx:ambientOcclusion:denoiserMode", Sdf.ValueTypeNames.Token).Set("none")
+        rp.CreateAttribute("omni:rtx:background:source:texture:textureMode", Sdf.ValueTypeNames.Token).Set(
+            "repeatMirrored"
+        )
+        rp.CreateAttribute("omni:rtx:background:source:type", Sdf.ValueTypeNames.Token).Set("domeLight")
+        rp.CreateAttribute("omni:rtx:debug:view:pixelDebug:enableFixedTextPos", Sdf.ValueTypeNames.Bool).Set(True)
+        rp.CreateAttribute("omni:rtx:directLighting:sampledLighting:denoisingTechnique", Sdf.ValueTypeNames.Token).Set(
+            "None"
+        )
+        rp.CreateAttribute("omni:rtx:dlss:frameGeneration", Sdf.ValueTypeNames.Bool).Set(True)
+        rp.CreateAttribute("omni:rtx:indirectDiffuse:denoiser:enabled", Sdf.ValueTypeNames.Bool).Set(False)
+        rp.CreateAttribute("omni:rtx:post:aa:limitedOps", Sdf.ValueTypeNames.Bool).Set(False)
+        rp.CreateAttribute("omni:rtx:post:registeredCompositing:invertColorCorrection", Sdf.ValueTypeNames.Bool).Set(
+            True
+        )
+        rp.CreateAttribute("omni:rtx:post:registeredCompositing:invertToneMap", Sdf.ValueTypeNames.Bool).Set(True)
+        rp.CreateAttribute("omni:rtx:pt:maxSamplesPerLaunch", Sdf.ValueTypeNames.Int).Set(2073600)
+        rp.CreateAttribute("omni:rtx:pt:mgpu:maxPixelsPerRegionExponent", Sdf.ValueTypeNames.Int).Set(12)
+        rp.CreateAttribute("omni:rtx:pt:denoising:enabled", Sdf.ValueTypeNames.Bool).Set(False)
+        rp.CreateAttribute("omni:rtx:pt:samplesPerPixel", Sdf.ValueTypeNames.UInt).Set(1)
+        rp.CreateAttribute("omni:rtx:reflections:denoiser:enabled", Sdf.ValueTypeNames.Bool).Set(False)
+        rp.CreateAttribute("omni:rtx:rt:ambientLight:color", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.1, 0.1, 0.1))
+        rp.CreateAttribute("omni:rtx:rt:demoire", Sdf.ValueTypeNames.Bool).Set(False)
+        if self._uses_fractional_opacity:
+            rp.CreateAttribute("omni:rtx:rt:fractionalOpacity", Sdf.ValueTypeNames.Bool).Set(True)
+        rp.CreateAttribute("omni:rtx:rt:lightcache:spatialCache:dontResolveConflicts", Sdf.ValueTypeNames.Bool).Set(
+            True
+        )
+        rp.CreateAttribute("omni:rtx:rt:sss:samples", Sdf.ValueTypeNames.Int).Set(1)
+        rp.CreateAttribute("omni:rtx:rtpt:maxVolumeBounces", Sdf.ValueTypeNames.Int).Set(15)
+        rp.CreateAttribute("omni:rtx:rtpt:modulatingRoughnessThreshold", Sdf.ValueTypeNames.Float).Set(0.08)
+        rp.CreateAttribute("omni:rtx:scene:hydra:mdlMaterialWarmup", Sdf.ValueTypeNames.Bool).Set(True)
+        rp.CreateAttribute("omni:rtx:viewTile:limit", Sdf.ValueTypeNames.UInt).Set(4294967295)
+
+        # Disable the quality convergence loop to minimize step() latency
+        rp.CreateAttribute("omni:rtx:quality", Sdf.ValueTypeNames.Int, custom=False).Set(0)
+        rp.CreateAttribute("omni:rtx:waitForEvents", Sdf.ValueTypeNames.TokenArray).Set([])
+
+        for name, (value_type, value) in self._rtx_render_settings.items():
+            rp.CreateAttribute(name, value_type).Set(value)
+
+        # Global render settings belong to the owner of a borrowed stage.
+        if self._borrowed_stage is not None:
+            return
+
+        # ---- RenderSettings --------------------------------------------------
+        rs = self.stage.DefinePrim("/Render/OmniverseGlobalRenderSettings", "RenderSettings")
+        rs.SetMetadata(
+            "apiSchemas",
+            Sdf.TokenListOp.Create(
+                prependedItems=[
+                    "OmniRtxSettingsGlobalRtAdvancedAPI_1",
+                    "OmniRtxSettingsGlobalPtAdvancedAPI_1",
+                ]
+            ),
+        )
+        rs.CreateRelationship("products").SetTargets([Sdf.Path(self._render_product_path)])
+
+    def _add_default_lights(self):
+        """Default lighting: dome light + distant directional light."""
+        from pxr import UsdLux
+
+        dome = UsdLux.DomeLight.Define(self.stage, "/root/_RTXDomeLight")
+        dome.GetIntensityAttr().Set(150.0)
+
+        distant = UsdLux.DistantLight.Define(self.stage, "/root/_RTXDistantLight")
+        distant.GetIntensityAttr().Set(900.0)
+        distant.GetAngleAttr().Set(0.53)
+        dx = UsdGeom.Xform(distant.GetPrim())
+        dx.ClearXformOpOrder()
+        rot = dx.AddRotateXYZOp()
+        if self.camera.up_axis == 2:
+            rot.Set(Gf.Vec3f(-45.0, 30.0, 0.0))
+        else:
+            rot.Set(Gf.Vec3f(-45.0, 0.0, 30.0))
+
+    def _add_studio_lights(self):
+        """Studio lighting rig from dome + warm distant + cool fill sphere."""
+        from pxr import Sdf, UsdLux
+
+        # Dome light — cool-tinted low ambient
+        dome_xf = UsdGeom.Xform.Define(self.stage, "/root/_RTXDomeLight")
+        dome_xf.ClearXformOpOrder()
+        dome = UsdLux.DomeLight.Define(self.stage, "/root/_RTXDomeLight/_RTXDomeLight")
+        dome.GetColorAttr().Set(Gf.Vec3f(0.250, 0.319, 0.409))
+        dome.GetIntensityAttr().Set(200.0)
+
+        # Distant light — warm key, angled from above-behind
+        dist_xf = UsdGeom.Xform.Define(self.stage, "/root/_RTXDistantLight")
+        dist_xf.ClearXformOpOrder()
+        dist_xf.AddRotateXYZOp().Set(Gf.Vec3f(41.4, 0.0, -175.7))
+        distant = UsdLux.DistantLight.Define(self.stage, "/root/_RTXDistantLight/_RTXDistantLight")
+        distant.GetColorAttr().Set(Gf.Vec3f(1.0, 0.906, 0.722))
+        distant.GetIntensityAttr().Set(3000.0)
+
+        # Cool fill sphere light (blue-white)
+        fill_xf = UsdGeom.Xform.Define(self.stage, "/root/_RTXFillLight")
+        fill_xf.ClearXformOpOrder()
+        fill_xf.AddTranslateOp().Set(Gf.Vec3d(5.0, 0.0, 5.5))
+        fill = UsdLux.SphereLight.Define(self.stage, "/root/_RTXFillLight/_RTXFillLight")
+        fill.GetPrim().SetMetadata("apiSchemas", Sdf.TokenListOp.Create(prependedItems=["ShapingAPI"]))
+        fill.GetColorAttr().Set(Gf.Vec3f(0.468, 0.684, 1.0))
+        fill.GetIntensityAttr().Set(300000.0)
+        fill.GetRadiusAttr().Set(0.5)
+
+    def _apply_ground_material(self):
+        """Bind a dark, shiny UsdPreviewSurface material to ground-plane meshes."""
+        from pxr import Sdf, UsdShade
+
+        plane_prims = [prim for name, prim in self._meshes.items() if "plane" in name.lower()]
+        if not plane_prims:
+            return
+
+        mat_path = f"{self._root_path}/Materials/mat_ground"
+        self._ensure_scopes_for_path(self.stage, mat_path)
+
+        material = UsdShade.Material.Define(self.stage, mat_path)
+        surface = UsdShade.Shader.Define(self.stage, f"{mat_path}/PreviewSurface")
+        surface.CreateIdAttr("UsdPreviewSurface")
+        surface.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.05, 0.05, 0.06))
+        surface.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.15)
+        surface.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+        material.CreateSurfaceOutput().ConnectToSource(surface.ConnectableAPI(), "surface")
+
+        for prim in plane_prims:
+            UsdShade.MaterialBindingAPI.Apply(prim.GetPrim())
+            UsdShade.MaterialBindingAPI(prim).Bind(material)
+
+    def add_background_usd(self, path: str):
+        """Add a reference to a background USD (e.g. Gaussian splat scan).
+
+        Must be called before the first frame (during the build phase).
+
+        Args:
+            path: Absolute or relative path to a USD file.
+        """
+        if self._borrowed_stage is not None:
+            raise RuntimeError("add_background_usd() is unavailable with a borrowed stage; add the USD to that stage")
+        if self._phase != self._PHASE_BUILD:
+            raise RuntimeError("add_background_usd() must be called before the first simulation frame")
+        path = os.path.abspath(path)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Background USD not found: {path}")
+        bg_prim = self.stage.DefinePrim("/root/background")
+        bg_prim.GetReferences().AddReference(path)
+
+    # ------------------------------------------------------------- OVRTX init
+
+    def _init_ovrtx(self):
+        """Serialise the USD stage, create the OVRTX renderer and load the scene."""
+
+        self._add_camera_lights_and_render_product()
+        self._apply_ground_material()
+        ovrtx_usd_path = None
+        if self._borrowed_stage is None:
+            # HACK? Export to a unique temp path so OVRTX never uses a cached version
+            # of a previous example's file.
+            fd, ovrtx_usd_path = tempfile.mkstemp(suffix=".usd")
+            os.close(fd)
+            self.stage.GetRootLayer().Export(ovrtx_usd_path)
+
+        try:
+            import ovrtx
+
+            config = ovrtx.RendererConfig()
+            config.log_level = "error"
+            self._rtx = ovrtx.Renderer(config=config)
+            if self._borrowed_stage is not None:
+                self._attach_borrowed_stage()
+            elif self._use_ovstage:
+                import ovstage
+
+                self._ovstage = ovstage.Stage("newton.ViewerRTX")
+                self._rtx.attach_ovstage(self._ovstage)
+                self._ovstage_attached = True
+                self._ovstage_paths = ovstage.PathDictionary(self._ovstage)
+                self._ovstage_ordinal = 1
+                ovstage.population.open_usd(
+                    self._ovstage,
+                    ovrtx_usd_path,
+                    ordinal=self._ovstage_ordinal,
+                    time_code=0.0,
+                )
+                self._ovstage.advance_write_floor(self._ovstage_ordinal, ovstage.Scope.ALL).wait()
+            else:
+                self._rtx.open_usd(ovrtx_usd_path)
+            self._runtime_prim_paths = {
+                path: path
+                for path in (
+                    *self._mesh_prim_paths.values(),
+                    *self._point_batch_paths.values(),
+                    *(self._get_path(name) for name in self._instance_prim_paths),
+                )
+            }
+
+            self._bind_ovrtx_transforms()
+        except Exception as e:
+            self._release_runtime_scene()
+            self._destroy_ovrtx()
+            raise RuntimeError(f"Failed to create OVRTX renderer: {e}") from e
+        finally:
+            if ovrtx_usd_path is not None:
+                try:
+                    os.unlink(ovrtx_usd_path)
+                except OSError:
+                    pass
+
+        # Create the presentation window now that all Warp kernels have been
+        # compiled.  Doing this earlier causes a deadlock on Windows because
+        # the Win32 message pump and Warp's JIT compilation fight for the
+        # main thread.  Skip entirely in headless mode — a hidden window still
+        # requires a display server and an OpenGL context.
+        # On example switch the window already exists — reuse it.
+        if not self._headless and self._window is None:
+            try:
+                self._init_window()
+            except Exception as e:
+                # A failed GL/window setup must not leave runtime-scene
+                # resources attached while Python unwinds construction.
+                self._discard_partial_window()
+                self._release_runtime_scene()
+                self._destroy_ovrtx()
+                raise RuntimeError(f"Failed to create window: {e}") from e
+
+        self._use_layered_transform_updates = any(layer_id != _DEFAULT_LAYER_ID for layer_id in self._layers)
+        if self._use_layered_transform_updates:
+            self._prim_count = 0
+        elif self._borrowed_stage is None:
+            self._build_flat_shape_arrays()
+
+        self._phase = self._PHASE_RENDER
+
+    # --------------------------------------------------------- borrowed stage
+
+    def _borrowed_write_floor(self) -> int:
+        """Return the borrowed stage's sealed global write floor."""
+        stage = self._borrowed_stage
+        query = stage.get_attribute_write_floor()
+        try:
+            return int(stage.fetch_ordinal(query))
+        finally:
+            stage.release_ordinal_query(query).wait()
+
+    def _next_ovstage_ordinal(self) -> None:
+        """Move to the ordinal for the next write batch."""
+        # The owner of a borrowed stage may have advanced its floor since our last write.
+        floor = self._ovstage_ordinal if self._borrowed_stage is None else self._borrowed_write_floor()
+        self._ovstage_ordinal = max(self._ovstage_ordinal, floor) + 1
+
+    def _read_borrowed_world_matrices(self, prim_paths: Sequence[str]) -> np.ndarray:
+        """Read ``omni:fabric:worldMatrix`` rows in ``prim_paths`` order; missing prims stay NaN."""
+        import ovstage
+
+        stage = self._borrowed_stage
+        out = np.full((len(prim_paths), 4, 4), np.nan, dtype=np.float64)
+        # World matrices of cloned or moved prims are stale until the hierarchy is recomputed.
+        self._next_ovstage_ordinal()
+        stage.compute_hierarchy(
+            self._ovstage_ordinal - 1, self._ovstage_ordinal, ovstage.HierarchyComputationModel.RUNTIME_DEFAULT
+        )
+        stage.advance_write_floor(self._ovstage_ordinal, ovstage.Scope.ALL).wait()
+        ordinal_range = ovstage.OrdinalRange.latest(self._ovstage_ordinal)
+        with ovstage.PathDictionary(stage) as paths:
+            path_list = paths.create_path_list_from_strings(list(prim_paths))
+            try:
+                token = paths.intern_token("omni:fabric:worldMatrix")
+                with stage.query_from_path_list(path_list) as query:
+                    with stage.read_attributes(query, [token], ordinal_range) as read:
+                        read.wait()
+                        group = read.fetch_next()
+                        while group is not None:
+                            rows = np.from_dlpack(group.dlpack(0)).reshape(-1, 4, 4)
+                            for local in range(group.prim_count):
+                                out[group.prim_index(local)] = rows[local]
+                            stage.release_group(group)
+                            group = read.fetch_next()
+            finally:
+                paths.destroy_path_list(path_list)
+        return out
+
+    def _bind_body_prims(self, model: newton.Model) -> None:
+        """Bind each body to the borrowed-stage prim at its label, keeping the prim's authored world scale."""
+        candidates = [(body, label) for body, label in enumerate(model.body_label) if label.startswith("/")]
+        world = (
+            self._read_borrowed_world_matrices([label for _, label in candidates])
+            if candidates
+            else np.empty((0, 4, 4))
+        )
+        found = [i for i, matrix in enumerate(world) if not np.isnan(matrix[0, 0])]
+        paths = [candidates[i][1] for i in found]
+        if len(set(paths)) != len(paths):
+            raise ValueError("Several bodies share a label; give each body the path of its own stage prim")
+        if len(paths) < model.body_count:
+            bound = set(paths)
+            unbound = [label for label in model.body_label if label not in bound]
+            warnings.warn(
+                f"ViewerRTX: {len(unbound)} of {model.body_count} bodies have no prim at their label in the "
+                f"borrowed stage and are not rendered, e.g. {unbound[:3]}",
+                stacklevel=3,
+            )
+        if not paths:
+            return
+        world = world[found]
+        # Row norms of the row-vector linear part are the axis scales; a reflection flips their sign.
+        scales = np.linalg.norm(world[:, :3, :3], axis=2)
+        scales[np.linalg.det(world[:, :3, :3]) < 0.0] *= -1.0
+        linear = np.zeros((len(paths), 3, 3))
+        linear[:, [0, 1, 2], [0, 1, 2]] = scales
+        bodies = np.array([candidates[i][0] for i in found], dtype=np.int32)
+        stage_from_model = self._infer_stage_from_model(model, bodies, world, scales)
+        if stage_from_model is not None:
+            from pxr import Gf
+
+            # The viewer's camera and debug geometry live in the model frame, under its root.
+            self.root.MakeMatrixXform().Set(Gf.Matrix4d(*stage_from_model.ravel().tolist()))
+            rotation = wp.quat_from_matrix(wp.mat33(stage_from_model[:3, :3].T.astype(np.float32)))
+            self._stage_from_model = wp.transform(wp.vec3(*stage_from_model[3, :3]), rotation)
+        self._set_prim_rows(
+            paths,
+            bodies,
+            linear=linear,
+            translation=np.zeros((len(paths), 3)),
+            worlds=None,
+            device=model.device,
+        )
+
+    @staticmethod
+    def _infer_stage_from_model(
+        model: newton.Model, bodies: np.ndarray, world: np.ndarray, scales: np.ndarray
+    ) -> np.ndarray | None:
+        """Return the row-vector matrix from the model frame to the stage frame, or ``None`` if they coincide.
+
+        Importing a stage can re-orient it (``add_usd`` up-axis alignment or ``xform``). Root bodies
+        still hold their imported pose, so each one yields the import transform's inverse.
+        """
+        children = model.joint_child.numpy()[model.joint_parent.numpy() >= 0]
+        roots = ~np.isin(bodies, children)
+        if not roots.any():
+            return None
+        rigid = world[roots].copy()
+        rigid[:, :3, :3] /= scales[roots][:, :, None]
+        body = _transforms_to_usd_matrices(model.body_q.numpy()[bodies[roots]].astype(np.float64))
+        candidates = np.linalg.solve(body, rigid)
+        if not np.allclose(candidates, candidates[0], atol=1.0e-3):
+            warnings.warn(
+                "ViewerRTX: body poses in the model and the borrowed stage differ by more than one rigid "
+                "transform; rendering bodies at their model poses",
+                stacklevel=4,
+            )
+            return None
+        if np.allclose(candidates[0], np.eye(4), atol=1.0e-5):
+            return None
+        return candidates[0]
+
+    def _attach_borrowed_stage(self) -> None:
+        """Attach the renderer and publish the viewer-owned subtree into the borrowed stage."""
+        import ovstage
+        from pxr import Usd
+
+        stage = Usd.Stage.Open(self.stage.Flatten())
+        self._freeze_time_samples(stage)
+
+        self._ovstage = self._borrowed_stage
+        self._rtx.attach_ovstage(self._ovstage)
+        self._ovstage_attached = True
+        self._ovstage_paths = ovstage.PathDictionary(self._ovstage)
+        self._next_ovstage_ordinal()
+        self._borrowed_reference = ovstage.population.add_usd_reference_from_string(
+            self._ovstage, stage.GetRootLayer().ExportToString(), self._root_path
+        )
+        ovstage.population.apply_usd_changes(self._ovstage, ordinal=self._ovstage_ordinal)
+        self._borrowed_reset_pending = bool(self._prim_paths)
+        self._ovstage.advance_write_floor(self._ovstage_ordinal, ovstage.Scope.ALL).wait()
+
+    def _set_prim_rows(
+        self,
+        paths: Sequence[str],
+        bodies: np.ndarray,
+        linear: np.ndarray,
+        translation: np.ndarray,
+        worlds: np.ndarray | None,
+        device: Any,
+        mat44_offset: int = 0,
+    ) -> None:
+        """Store the static per-prim inputs of :func:`write_prim_world_matrices`."""
+        self._prim_paths = tuple(paths)
+        self._prim_count = len(self._prim_paths)
+        self._prim_body = wp.array(bodies, dtype=int, device=device)
+        self._prim_linear = wp.array(linear.astype(np.float32), dtype=wp.mat33, device=device)
+        self._prim_translation = wp.array(translation.astype(np.float32), dtype=wp.vec3, device=device)
+        self._prim_world = None if worlds is None else wp.array(worlds, dtype=int, device=device)
+        self._prim_mat44_offset = mat44_offset
+        if self._use_ovstage:
+            self._prim_matrices = wp.empty(self._prim_count, dtype=wp.mat44d, device=device)
+
+    def _build_flat_shape_arrays(self):
+        """Concatenate per-batch shape arrays into prim rows matching the mat44d layout.
+
+        Called once at the end of the build phase. The rows are static (topology
+        does not change per-frame) and allow all shape transforms to be updated
+        with a single :func:`write_prim_world_matrices` launch instead of one
+        launch per shape batch.
+        """
+        # _shape_instances is keyed by geometry hash (int), not by name; build a reverse map.
+        name_to_shapes = {s.name: s for s in self._shape_instances.values()}
+
+        chunks_xforms = []
+        chunks_parents = []
+        chunks_worlds = []
+        chunks_scales = []
+        flat_shape_paths = []
+        flat_mat44_offset = 0
+        found_shape = False
+
+        for name, paths in self._instance_prim_paths.items():
+            shapes = name_to_shapes.get(name)
+            if shapes is not None:
+                found_shape = True
+                flat_shape_paths.extend(paths)
+                chunks_xforms.append(shapes.xforms.numpy())
+                chunks_parents.append(shapes.parents.numpy())
+                chunks_worlds.append(shapes.worlds.numpy())
+                chunks_scales.append(shapes.scales.numpy())
+            elif not found_shape:
+                flat_mat44_offset += len(paths)
+
+        if not chunks_xforms:
+            return
+
+        xforms = np.concatenate(chunks_xforms, axis=0).astype(np.float64)
+        scales = np.concatenate(chunks_scales, axis=0)
+        # Column-form rotation with the shape scale folded into its columns.
+        rotation = np.swapaxes(_transforms_to_usd_matrices(xforms)[:, :3, :3], -1, -2)
+        self._set_prim_rows(
+            flat_shape_paths,
+            np.concatenate(chunks_parents, axis=0),
+            linear=rotation * scales[:, None, :],
+            translation=xforms[:, :3],
+            worlds=np.concatenate(chunks_worlds, axis=0),
+            device=self.device,
+            mat44_offset=flat_mat44_offset,
+        )
+
+    def _launch_prim_world_matrices(self, m_out: wp.array, mat44_offset: int = 0) -> None:
+        """Compute all prim world matrices into ``m_out`` with one launch."""
+        body_q = self._last_state.body_q if self._last_state is not None else None
+        # Borrowed prims have no world index; the stage already places their worlds.
+        world_offsets = self.world_offsets if self._prim_world is not None else None
+        layer_xform = self.layer.xform
+        if self._stage_from_model is not None:
+            layer_xform = wp.transform_multiply(self._stage_from_model, layer_xform)
+        wp.launch(
+            write_prim_world_matrices,
+            dim=self._prim_count,
+            inputs=[
+                body_q,
+                self._prim_body,
+                self._prim_linear,
+                self._prim_translation,
+                self._prim_world,
+                world_offsets,
+                layer_xform,
+                mat44_offset,
+            ],
+            outputs=[m_out],
+            device=m_out.device,
+        )
+
+    def _bind_ovrtx_transforms(self):
+        """Bind transforms for the scene assembled before rendering starts."""
+        if self._use_ovstage:
+            self._bound_instance_prim_paths = {name: tuple(paths) for name, paths in self._instance_prim_paths.items()}
+            self._all_instance_paths = [path for paths in self._bound_instance_prim_paths.values() for path in paths]
+            return
+
+        from ovrtx import PrimMode, Semantic
+
+        if self._transform_binding is not None:
+            self._transform_binding.unbind()
+            self._transform_binding = None
+        for binding in getattr(self, "_runtime_transform_bindings", {}).values():
+            binding.unbind()
+        self._runtime_transform_bindings = {}
+        self._bound_instance_prim_paths = {name: tuple(paths) for name, paths in self._instance_prim_paths.items()}
+        self._all_instance_paths = [path for paths in self._bound_instance_prim_paths.values() for path in paths]
+        if self._all_instance_paths:
+            self._transform_binding = self._rtx.bind_attribute(
+                prim_paths=self._all_instance_paths,
+                attribute_name="omni:xform",
+                semantic=Semantic.XFORM_MAT4x4,
+                prim_mode=PrimMode.MUST_EXIST,
+            )
+
+    def _bind_runtime_transforms(self, name: str) -> None:
+        """Bind only one runtime-created or replaced instance batch."""
+        if self._use_ovstage or self._get_path(name) in self._deferred_prims:
+            return
+
+        from ovrtx import PrimMode, Semantic
+
+        binding = self._runtime_transform_bindings.pop(name, None)
+        if binding is not None:
+            binding.unbind()
+        paths = self._instance_prim_paths[name]
+        if paths:
+            self._runtime_transform_bindings[name] = self._rtx.bind_attribute(
+                prim_paths=paths,
+                attribute_name="omni:xform",
+                semantic=Semantic.XFORM_MAT4x4,
+                prim_mode=PrimMode.MUST_EXIST,
+            )
+
+    def _freeze_time_samples(self, stage) -> None:
+        """Replace time samples with their current-frame value; OVRTX consumes the current frame."""
+        for prim in stage.Traverse():
+            for attr in prim.GetAttributes():
+                if attr.GetNumTimeSamples():
+                    value = attr.Get(self._frame_index)
+                    attr.Clear()
+                    attr.Set(value)
+
+    def _replace_runtime_prim(self, path: str) -> str:
+        """Publish a self-contained USD subtree, including its bound materials."""
+        if self.is_rendering_paused() or self._render_result is not None:
+            self._deferred_prims.add(path)
+            return path
+        from pxr import Sdf, Usd, UsdShade
+
+        mask = Usd.StagePopulationMask([path])
+        masked_stage = Usd.Stage.OpenMasked(self.stage.GetRootLayer(), mask)
+        masked_stage.ExpandPopulationMask()
+        flattened = masked_stage.Flatten()
+        stage = Usd.Stage.CreateInMemory()
+        Sdf.CopySpec(flattened, path, stage.GetRootLayer(), "/Marker")
+        stage.SetDefaultPrim(stage.GetPrimAtPath("/Marker"))
+
+        # Material targets outside the copied subtree cannot cross a reference
+        # boundary. Copy those materials inside it and rebind the geometry.
+        materials = {}
+        for prim in list(stage.Traverse()):
+            binding = UsdShade.MaterialBindingAPI(prim).GetDirectBindingRel()
+            if not binding:
+                continue
+            for target in binding.GetTargets():
+                if target.HasPrefix(Sdf.Path("/Marker")):
+                    continue
+                if target not in materials:
+                    material_path = f"/Marker/Materials/material_{len(materials)}"
+                    self._ensure_scopes_for_path(stage, material_path)
+                    Sdf.CopySpec(flattened, target, stage.GetRootLayer(), material_path)
+                    materials[target] = material_path
+                binding.SetTargets([materials[target]])
+
+        self._freeze_time_samples(stage)
+
+        if self._use_ovstage:
+            self._evict_ovstage_queries(self._runtime_prim_paths.get(path, path))
+        handle = self._runtime_prim_handles.pop(path, None)
+        if handle is not None:
+            if self._use_ovstage:
+                import ovstage
+
+                ovstage.population.remove_usd(self._ovstage, handle)
+                self._ovstage_population_dirty = True
+            else:
+                self._rtx.remove_usd(handle)
+        elif path in self._runtime_prim_paths:
+            # Stage writes belong to end_frame(), after any in-flight render.
+            self._pending_hidden_prim_paths.add(path)
+        # OVRTX rejects references at existing prim paths. Keep the original
+        # build-phase batch hidden and publish replacements at fresh sibling paths.
+        self._runtime_prim_serial += 1
+        runtime_path = f"{path}_rtx_{self._runtime_prim_serial}"
+        usd_source = stage.GetRootLayer().ExportToString()
+        if self._use_ovstage:
+            import ovstage
+
+            self._runtime_prim_handles[path] = ovstage.population.add_usd_reference_from_string(
+                self._ovstage, usd_source, runtime_path
+            )
+            self._ovstage_population_dirty = True
+        else:
+            self._runtime_prim_handles[path] = self._rtx.add_usd_reference_from_string(
+                usd_source, prefix_path=runtime_path
+            )
+        self._runtime_prim_paths[path] = runtime_path
+        self._runtime_scene_changed = True
+        return runtime_path
+
+    def _flush_deferred_prims(self) -> None:
+        """Publish the latest runtime geometry after the previous render finishes."""
+        paths, self._deferred_prims = self._deferred_prims, set()
+        for path in paths:
+            runtime_path = self._replace_runtime_prim(path)
+            for name, instances in self._instance_prim_paths.items():
+                if self._get_path(name) == path:
+                    self._instance_prim_paths[name] = [f"{runtime_path}/instance_{i}" for i in range(len(instances))]
+                    self._bind_runtime_transforms(name)
+            for batches in (self._mesh_prim_paths, self._point_batch_paths):
+                for name in batches:
+                    if self._get_path(name) == path:
+                        batches[name] = runtime_path
+
+    # ------------------------------------------------ ViewerUSD overrides
+
+    @override
+    def set_model(self, model: newton.Model | None) -> None:
+        """Set the Newton model to visualize.
+
+        Args:
+            model: The Newton model instance.
+        """
+        super().set_model(model)
+        # ``ViewerBase.set_model`` may have switched ``self.device`` to the model's device.
+        self._image_logger.set_device(self.device)
+        if model is not None and self._borrowed_stage is not None:
+            self._bind_body_prims(model)
+        if model is not None:
+            from pyglet.math import Vec3 as PyVec3
+
+            axis_idx = (
+                model.up_axis
+                if isinstance(model.up_axis, int)
+                else {"X": 0, "Y": 1, "Z": 2}.get(str(model.up_axis).upper(), 2)
+            )
+            self.camera.up_axis = axis_idx
+            if axis_idx == 0:
+                self.camera.pos = PyVec3(2.0, 0.0, 10.0)
+            elif axis_idx == 2:
+                self.camera.pos = PyVec3(10.0, 0.0, 2.0)
+            else:
+                self.camera.pos = PyVec3(0.0, 2.0, 10.0)
+
+        self.picking = Picking(model, world_offsets=self.world_offsets)
+        self.wind = Wind(model)
+
+        if model is not None:
+            try:
+                from ..geometry import raycast as _raycast_module  # noqa: PLC0415
+
+                wp.load_module(module=_raycast_module, device=model.device)
+                wp.load_module(module="newton._src.viewer.kernels", device=model.device)
+            except Exception as exc:
+                warnings.warn(
+                    f"ViewerRTX: Failed to precompile Warp kernels for device {model.device}: {exc}",
+                    category=RuntimeWarning,
+                    stacklevel=2,
+                )
+
+    @override
+    def set_world_offsets(self, spacing: tuple[float, float, float] | list[float] | wp.vec3) -> None:
+        """Set world offsets and update the picking system.
+
+        Args:
+            spacing: Spacing between worlds along each axis [m].
+        """
+        if self._borrowed_stage is not None and any(float(value) != 0.0 for value in spacing):
+            raise ValueError("A borrowed stage places its worlds; world offsets must be zero")
+        super().set_world_offsets(spacing)
+        if self.picking is not None:
+            self.picking.world_offsets = self.world_offsets
+
+    @override
+    def _populate_shapes(self):
+        # A borrowed stage already contains the model's geometry.
+        if self._borrowed_stage is None:
+            super()._populate_shapes()
+
+    @override
+    def _auto_compute_world_offsets(self):
+        if self._borrowed_stage is None:
+            super()._auto_compute_world_offsets()
+
+    @override
+    def set_camera(self, pos: wp.vec3, pitch: float | None = None, yaw: float | None = None) -> None:
+        """Set the camera position, pitch, and yaw.
+
+        Args:
+            pos: Camera position [m].
+            pitch: Camera pitch [deg]. If None, the current pitch is kept.
+            yaw: Camera yaw [deg]. If None, the current yaw is kept.
+        """
+        from pyglet.math import Vec3 as PyVec3
+
+        try:
+            self.camera.pos = PyVec3(float(pos[0]), float(pos[1]), float(pos[2]))
+        except (TypeError, IndexError, KeyError):
+            pass
+        if pitch is not None:
+            self.camera.pitch = pitch
+        if yaw is not None:
+            self.camera.yaw = yaw
+        self._camera_dirty = True
+
+    def _ensure_picking_line_primitive(self):
+        if self._phase != self._PHASE_BUILD or self._PICKING_LINE_NAME in self._instance_prim_paths:
+            return
+
+        if Gf is None or UsdGeom is None:
+            return
+
+        path = self._get_path(self._PICKING_LINE_NAME)
+        self._ensure_scopes_for_path(self.stage, path)
+
+        xform = UsdGeom.Xform.Define(self.stage, path)
+        xform.ClearXformOpOrder()
+        xform.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.0))
+        xform.AddOrientOp().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+        xform.AddScaleOp().Set(Gf.Vec3d(0.0, 0.0, 0.0))
+
+        capsule = UsdGeom.Capsule.Define(self.stage, xform.GetPath().AppendChild("capsule"))
+        capsule.GetAxisAttr().Set(UsdGeom.Tokens.z)
+        capsule.GetRadiusAttr().Set(self._PICKING_LINE_RADIUS)
+        capsule.GetHeightAttr().Set(1.0)
+        capsule.GetDisplayColorAttr().Set([Gf.Vec3f(*self._PICKING_LINE_COLOR)])
+
+        # Use an emissive material so the picking line stays visibly cyan even under scene shadows.
+        from pxr import Sdf, UsdShade
+
+        mat_path = f"{self._root_path}/Materials/mat_picking_line"
+        self._ensure_scopes_for_path(self.stage, mat_path)
+        material = UsdShade.Material.Define(self.stage, mat_path)
+        surface = UsdShade.Shader.Define(self.stage, f"{mat_path}/PreviewSurface")
+        surface.CreateIdAttr("UsdPreviewSurface")
+        surface.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        surface.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*self._PICKING_LINE_COLOR))
+        surface.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(1.0)
+        surface.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+        material.CreateSurfaceOutput().ConnectToSource(surface.ConnectableAPI(), "surface")
+        UsdShade.MaterialBindingAPI.Apply(capsule.GetPrim())
+        UsdShade.MaterialBindingAPI(capsule).Bind(material)
+
+        self._instance_prim_paths[self._PICKING_LINE_NAME] = [path]
+
+    def _ensure_point_batch_primitive(self, name: str):
+        if Gf is None or UsdGeom is None:
+            return None
+
+        path = self._point_batch_paths.get(name, self._get_path(name))
+        instancer = UsdGeom.PointInstancer.Get(self.stage, path)
+        if not instancer:
+            from pxr import Sdf
+
+            self._ensure_scopes_for_path(self.stage, path)
+            instancer = UsdGeom.PointInstancer.Define(self.stage, path)
+            sphere = UsdGeom.Sphere.Define(self.stage, instancer.GetPath().AppendChild("sphere"))
+            sphere.GetRadiusAttr().Set(1.0)
+            instancer.GetPrototypesRel().SetTargets([sphere.GetPath()])
+            primvars = UsdGeom.PrimvarsAPI(instancer)
+            if not primvars.GetPrimvar("displayColor"):
+                primvars.CreatePrimvar("displayColor", Sdf.ValueTypeNames.Color3fArray, UsdGeom.Tokens.vertex, 1)
+
+        self._point_batch_paths[name] = path
+        return instancer
+
+    def _build_point_batch_arrays(
+        self, points, radii, colors
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+        empty_positions = np.zeros((0, 3), dtype=np.float32)
+        empty_scales = np.zeros((0, 3), dtype=np.float32)
+        empty_proto_indices = np.zeros(0, dtype=np.int32)
+        empty_ids = np.zeros(0, dtype=np.int64)
+
+        if points is None:
+            return empty_positions, empty_scales, empty_proto_indices, empty_ids, None, None
+
+        points_np = points.numpy() if isinstance(points, wp.array) else points
+        positions = np.asarray(points_np, dtype=np.float32).reshape((-1, 3))
+        num_points = len(positions)
+        if num_points == 0:
+            return empty_positions, empty_scales, empty_proto_indices, empty_ids, None, None
+
+        if radii is None:
+            radii_np = np.full(num_points, 0.1, dtype=np.float32)
+        elif np.isscalar(radii):
+            radii_np = np.full(num_points, float(radii), dtype=np.float32)
+        else:
+            radii_np = np.asarray(radii.numpy() if isinstance(radii, wp.array) else radii, dtype=np.float32).reshape(-1)
+            if radii_np.shape[0] == 1 and num_points > 1:
+                radii_np = np.full(num_points, float(radii_np[0]), dtype=np.float32)
+            elif radii_np.shape[0] != num_points:
+                raise ValueError("Number of point radii must match the number of points.")
+
+        scales = np.repeat(radii_np[:, None], 3, axis=1)
+        proto_indices = np.zeros(num_points, dtype=np.int32)
+        ids = np.arange(num_points, dtype=np.int64)
+
+        colors_np = None
+        color_indices = None
+        if colors is not None:
+            color_values, _ = self._normalize_point_colors(colors, num_points)
+            colors_np = np.asarray(color_values, dtype=np.float32)
+            if colors_np.ndim == 1:
+                if colors_np.shape[0] != 3:
+                    raise ValueError("Point colors must be an RGB triplet or an array of RGB triplets.")
+                colors_np = colors_np.reshape(1, 3)
+            elif colors_np.ndim != 2 or colors_np.shape[1] != 3:
+                raise ValueError("Point colors must have shape (N, 3).")
+
+            if colors_np.shape[0] == 1:
+                color_indices = np.zeros(num_points, dtype=np.int32)
+            elif colors_np.shape[0] == num_points:
+                color_indices = np.arange(num_points, dtype=np.int32)
+            else:
+                raise ValueError("Number of point colors must match the number of points.")
+
+        return positions, scales, proto_indices, ids, colors_np, color_indices
+
+    @staticmethod
+    def _build_line_instance_buffers(
+        starts_np: np.ndarray, ends_np: np.ndarray, capacity: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        xforms_np = np.zeros((capacity, 7), dtype=np.float32)
+        xforms_np[:, 6] = 1.0
+        scales_np = np.zeros((capacity, 3), dtype=np.float32)
+
+        if capacity <= 0 or Gf is None:
+            return xforms_np, scales_np
+
+        count = min(capacity, len(starts_np), len(ends_np))
+        for i in range(count):
+            pos0 = np.asarray(starts_np[i], dtype=np.float32)
+            pos1 = np.asarray(ends_np[i], dtype=np.float32)
+            delta = pos1 - pos0
+            height = float(np.linalg.norm(delta))
+
+            xforms_np[i, :3] = 0.5 * (pos0 + pos1)
+            if height <= 1.0e-8:
+                continue
+
+            direction = delta / height
+            rot = Gf.Rotation()
+            rot.SetRotateInto(
+                Gf.Vec3d(0.0, 0.0, 1.0),
+                Gf.Vec3d(float(direction[0]), float(direction[1]), float(direction[2])),
+            )
+            quat = rot.GetQuat()
+            imag = quat.GetImaginary()
+            xforms_np[i, 3] = float(imag[0])
+            xforms_np[i, 4] = float(imag[1])
+            xforms_np[i, 5] = float(imag[2])
+            xforms_np[i, 6] = float(quat.GetReal())
+            scales_np[i] = (1.0, 1.0, height)
+
+        return xforms_np, scales_np
+
+    def _queue_picking_line_transform(self, starts_np: np.ndarray, ends_np: np.ndarray):
+        xforms_np, scales_np = self._build_line_instance_buffers(starts_np, ends_np, capacity=1)
+        self._pending_xforms[self._PICKING_LINE_NAME] = (
+            wp.array(xforms_np, dtype=wp.transform, device=self.device),
+            wp.array(scales_np, dtype=wp.vec3, device=self.device),
+        )
+
+    def _hide_picking_line(self):
+        self._queue_picking_line_transform(
+            np.zeros((1, 3), dtype=np.float32),
+            np.zeros((1, 3), dtype=np.float32),
+        )
+
+    @override
+    def is_key_down(self, key: str | int) -> bool:
+        """Check whether a key is currently pressed.
+
+        Args:
+            key: Either a string representing a character/key name, or an int
+                representing a pyglet key constant.
+
+        Returns:
+            bool: True if the key is currently held down.
+        """
+        pyglet = self._pyglet
+        if pyglet is None:
+            return False
+
+        if isinstance(key, str):
+            key = key.lower()
+            if len(key) == 1 and key.isalpha():
+                key_code = getattr(pyglet.window.key, key.upper(), None)
+            elif len(key) == 1 and key.isdigit():
+                key_code = getattr(pyglet.window.key, f"_{key}", None)
+            else:
+                special_keys = {
+                    "space": pyglet.window.key.SPACE,
+                    "escape": pyglet.window.key.ESCAPE,
+                    "esc": pyglet.window.key.ESCAPE,
+                    "enter": pyglet.window.key.ENTER,
+                    "return": pyglet.window.key.ENTER,
+                    "tab": pyglet.window.key.TAB,
+                    "shift": pyglet.window.key.LSHIFT,
+                    "ctrl": pyglet.window.key.LCTRL,
+                    "alt": pyglet.window.key.LALT,
+                    "up": pyglet.window.key.UP,
+                    "down": pyglet.window.key.DOWN,
+                    "left": pyglet.window.key.LEFT,
+                    "right": pyglet.window.key.RIGHT,
+                    "backspace": pyglet.window.key.BACKSPACE,
+                    "delete": pyglet.window.key.DELETE,
+                }
+                key_code = special_keys.get(key, None)
+            if key_code is None:
+                return False
+        else:
+            key_code = key
+
+        return key_code in self._keys_down
+
+    @override
+    def log_gizmo(
+        self,
+        name: str,
+        transform: wp.transform,
+        *,
+        translate: Sequence[Axis] | None = None,
+        rotate: Sequence[Axis] | None = None,
+        snap_to: wp.transform | None = None,
+    ) -> None:
+        """Log a gizmo GUI element for the given name and transform.
+
+        Args:
+            name: The name of the gizmo.
+            transform: The transform of the gizmo.
+            translate: Axes on which the translation handles are shown.
+                Defaults to all axes when ``None``. Pass an empty sequence
+                to hide all translation handles.
+            rotate: Axes on which the rotation rings are shown.
+                Defaults to all axes when ``None``. Pass an empty sequence
+                to hide all rotation rings.
+            snap_to: Optional world transform to snap to when this gizmo is
+                released by the user.
+        """
+        self._gizmo_log[name] = {
+            "transform": transform,
+            "snap_to": snap_to,
+            "translate": (Axis.X, Axis.Y, Axis.Z) if translate is None else tuple(translate),
+            "rotate": (Axis.X, Axis.Y, Axis.Z) if rotate is None else tuple(rotate),
+        }
+
+    @override
+    def log_state(self, state: newton.State) -> None:
+        """Update the viewer with the given state of the simulation.
+
+        Args:
+            state: The current state of the simulation.
+        """
+        self._last_state = state
+        if self.model is None:
+            return
+
+        if self._phase == self._PHASE_BUILD:
+            # Build phase: delegate fully to base so USD prims are set up normally.
+            super().log_state(state)
+        elif self._use_layered_transform_updates:
+            # Multiple layers carry different models and layer transforms.
+            # Queue this active layer's transforms; end_frame() flushes all
+            # queued layer updates through the shared runtime scene.
+            super().log_state(state)
+        else:
+            # Render phase: flat arrays (built at end of build phase) handle all shape
+            # transform updates in a single kernel launch — no per-batch work needed here.
+            show_ground = self.show_ground
+            show_ground_changed = show_ground != self._last_show_ground
+            layer_hidden = self._layer_force_hidden() if show_ground_changed else False
+            for shapes in self._shape_instances.values():
+                shapes.colors_changed = False
+                if show_ground_changed and int(shapes.geo_type) == int(newton.GeoType.PLANE):
+                    qualified = self._qualify(shapes.name)
+                    # Re-derive through the same predicate the build path uses, so
+                    # re-enabling the ground does not override show_visual,
+                    # show_collision, static-shape, or layer rules.
+                    self._pending_instance_visibility[qualified] = (
+                        self._should_show_shape(shapes.flags, shapes.static, shapes.geo_type) and not layer_hidden
+                    )
+            if show_ground_changed:
+                self._last_show_ground = show_ground
+
+            self._log_gaussian_shapes(state)
+            self._log_non_shape_state(state)
+            self.model_changed = False
+
+        self._ensure_picking_line_primitive()
+        self._render_picking_line(state)
+
+    def _render_picking_line(self, state):
+        if not self.picking_enabled or self.picking is None or not self.picking.is_picking():
+            if self._phase == self._PHASE_RENDER:
+                self._hide_picking_line()
+            return
+
+        pick_body_idx = self.picking.pick_body.numpy()[0]
+        if pick_body_idx < 0:
+            if self._phase == self._PHASE_RENDER:
+                self._hide_picking_line()
+            return
+
+        pick_state = self.picking.pick_state.numpy()
+        pick_target = pick_state[0]["picking_target_world"]
+        picked_point = pick_state[0]["picked_point_world"]
+
+        body_world = self.model.body_world if self.model is not None else None
+        if self.world_offsets is not None and self.world_offsets.shape[0] > 0:
+            if body_world is not None:
+                body_world_idx = body_world.numpy()[pick_body_idx]
+                if body_world_idx >= 0 and body_world_idx < self.world_offsets.shape[0]:
+                    world_offset = self.world_offsets.numpy()[body_world_idx]
+                    pick_target = pick_target + world_offset
+                    picked_point = picked_point + world_offset
+
+        self._queue_picking_line_transform(
+            np.asarray([[picked_point[0], picked_point[1], picked_point[2]]], dtype=np.float32),
+            np.asarray([[pick_target[0], pick_target[1], pick_target[2]]], dtype=np.float32),
+        )
+
+    @override
+    def apply_forces(self, state: newton.State) -> None:
+        """Apply viewer-driven forces (picking, wind) to the model.
+
+        Args:
+            state: The current simulation state.
+        """
+        if self.picking_enabled and self.picking is not None:
+            self.picking._apply_picking_force(state)
+
+        if self.wind is not None:
+            self.wind._apply_wind_force(state)
+
+    @override
+    def begin_frame(self, time: float) -> None:
+        """Begin a new frame.
+
+        Args:
+            time: Current simulation time [s].
+        """
+        with wp.ScopedTimer("ViewerRTX::begin_frame", active=PROFILE_ENABLED, use_nvtx=True):
+            super().begin_frame(time)
+            self._point_batch_frame_defaults = self._pending_point_batches.copy()
+            self._gizmo_log = {}
+
+            if self._window and not self._headless:
+                try:
+                    self._window.switch_to()
+                    self._window.dispatch_events()
+                except Exception as exc:
+                    warnings.warn(
+                        f"ViewerRTX: error dispatching window events: {exc}",
+                        category=RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    self._should_close = True
+
+            now = perf_counter()
+            if self._last_perf_time is not None:
+                dt = min(now - self._last_perf_time, 0.1)
+                if self.gui:
+                    self.gui.update_camera_from_keys(dt, lambda k: k in self._keys_down)
+                if self.wind is not None:
+                    self.wind.update(dt)
+            self._last_perf_time = now
+
+    @override
+    def end_frame(self) -> None:
+        """Finish rendering the current frame.
+
+        On the first call, the RTX renderer is initialized from the USD stage
+        built up during the build phase; subsequent calls update transforms
+        and dispatch the next ray-traced render.
+        """
+        if self._should_close:
+            return
+        if self._phase == self._PHASE_BUILD:
+            self._init_ovrtx()
+
+        with wp.ScopedTimer("ViewerRTX::end_frame", active=PROFILE_ENABLED, use_nvtx=True):
+            if self.gui:
+                self.gui.prepare_frame()
+            if self._rtx is not None and not self._should_close and not self.is_rendering_paused():
+                # Preserve the original blocking cadence and simulation/render overlap.
+                products = None
+                if self._render_result is not None:
+                    with wp.ScopedTimer("ViewerRTX::rtx_wait", active=PROFILE_ENABLED, use_nvtx=True):
+                        products = self._render_result.wait().fetch()
+                    self._render_result = None
+                    if self._discard_render_result:
+                        products = None
+                    self._discard_render_result = False
+                self._update_scene()
+                if products is not None:
+                    self._accept_render(products)
+            self._render_and_display()
+
+    def _update_scene(self) -> None:
+        """Apply retained scene updates before submitting the next render."""
+        if self._use_ovstage:
+            self._next_ovstage_ordinal()
+        self._flush_deferred_prims()
+        if self._use_ovstage:
+            self._apply_ovstage_population_changes()
+        self._update_ovrtx_camera()
+        self._update_ovrtx_transforms()
+        self._update_ovrtx_instance_visibility()
+        self._update_ovrtx_point_batches()
+        self._update_ovrtx_mesh_points()
+        if self._use_ovstage:
+            import ovstage
+
+            self._apply_ovstage_population_changes()
+            self._ovstage.advance_write_floor(self._ovstage_ordinal, ovstage.Scope.ALL).wait()
+        if self._runtime_scene_changed:
+            self._rtx.reset(time=self._frame_index / self.fps)
+            self._runtime_scene_changed = False
+        self._pending_xforms.clear()
+        self._pending_instance_visibility.clear()
+        self._pending_mesh_points.clear()
+        self._pending_mesh_normals.clear()
+        self._pending_mesh_topology.clear()
+        self._pending_mesh_visibility.clear()
+        self._pending_point_batches.clear()
+
+    # ViewerUSD authors PreviewSurface materials while ViewerRTX is in the
+    # build phase. RTX fractional opacity is evaluated per ray hit, so the
+    # authored material opacity is lower than the requested object opacity.
+    _PREVIEW_SURFACE_OPACITY_LAYERS = 4.0
+
+    @override
+    def _preview_surface_opacity_value(self, requested_opacity: float) -> float:
+        """Map object opacity to RTX PreviewSurface per-hit opacity."""
+        requested_opacity = float(np.clip(requested_opacity, 0.0, 1.0))
+        if requested_opacity < OPAQUE_OPACITY_THRESHOLD:
+            self._uses_fractional_opacity = True
+        if requested_opacity <= 0.0 or requested_opacity >= OPAQUE_OPACITY_THRESHOLD:
+            return requested_opacity
+        return 1.0 - math.pow(1.0 - requested_opacity, 1.0 / self._PREVIEW_SURFACE_OPACITY_LAYERS)
+
+    @override
+    def _preview_surface_ior_value(self, requested_opacity: float) -> float | None:
+        if requested_opacity < OPAQUE_OPACITY_THRESHOLD:
+            # Avoid the default glass-like IOR so opacity behaves like viewer alpha.
+            return 1.0
+        return None
+
+    @override
+    def log_mesh(
+        self,
+        name: str,
+        points: wp.array[wp.vec3],
+        indices: wp.array[wp.int32] | wp.array[wp.uint32],
+        normals: wp.array[wp.vec3] | None = None,
+        uvs: wp.array[wp.vec2] | None = None,
+        texture: np.ndarray | str | None = None,
+        hidden: bool = False,
+        backface_culling: bool = True,
+        color: tuple[float, float, float] | None = None,
+        roughness: float | None = None,
+        metallic: float | None = None,
+        dynamic: bool = False,
+        opacity: float | None = None,
+    ) -> None:
+        """Log a mesh for rendering.
+
+        Args:
+            name: Unique name for the mesh.
+            points: Vertex positions [m].
+            indices: Triangle indices.
+            normals: Vertex normals. If omitted, generate normals from the current
+                triangle geometry, matching the USD and OpenGL viewers.
+            uvs: Vertex UVs.
+            texture: Texture path/URL or image array (H, W, C).
+            hidden: Whether the mesh is hidden.
+            backface_culling: Enable backface culling.
+            color: Optional base color as an RGB tuple with values in
+                [0, 1]. Used when no texture is provided.
+            roughness: Surface roughness in ``[0, 1]``. ``0`` is perfectly
+                smooth, ``1`` is fully rough.
+            metallic: Metallicity in ``[0, 1]``. ``0`` is dielectric, ``1``
+                is metal.
+            dynamic: Whether mesh topology may change between frames.
+            opacity: Optional display opacity in [0, 1].
+        """
+        name = self._qualify(name)
+
+        if self._phase == self._PHASE_BUILD or name not in self._mesh_prim_paths:
+            super().log_mesh(
+                name,
+                points,
+                indices,
+                normals,
+                uvs,
+                texture,
+                hidden,
+                backface_culling,
+                opacity=opacity,
+                color=color,
+                roughness=roughness,
+                metallic=metallic,
+                dynamic=dynamic,
+            )
+            self._mesh_prim_paths[name] = self._get_path(name)
+            if self._phase == self._PHASE_RENDER:
+                self._mesh_prim_paths[name] = self._replace_runtime_prim(self._get_path(name))
+        elif name in self._mesh_prim_paths:
+            pts = (
+                points.numpy().astype(np.float32)
+                if isinstance(points, wp.array)
+                else np.asarray(points, dtype=np.float32)
+            )
+            self._pending_mesh_points[name] = pts
+            if dynamic or normals is None:
+                indices_np = (
+                    indices.numpy().astype(np.int32)
+                    if isinstance(indices, wp.array)
+                    else np.asarray(indices, dtype=np.int32)
+                )
+            if normals is not None:
+                self._pending_mesh_normals[name] = (
+                    normals.numpy().astype(np.float32)
+                    if isinstance(normals, wp.array)
+                    else np.asarray(normals, dtype=np.float32)
+                )
+            else:
+                self._pending_mesh_normals[name] = compute_vertex_normals(pts, indices_np)
+            if dynamic:
+                face_vertex_counts = np.full(len(indices_np) // 3, 3, dtype=np.int32)
+                self._pending_mesh_topology[name] = (face_vertex_counts, indices_np)
+            self._pending_mesh_visibility[name] = not hidden and len(pts) > 0
+
+    @override
+    def log_instances(
+        self,
+        name: str,
+        mesh: str,
+        xforms: wp.array[wp.transform] | None,
+        scales: wp.array[wp.vec3] | None,
+        colors: wp.array[wp.vec3] | None,
+        materials: wp.array[wp.vec4] | None,
+        hidden: bool = False,
+        opacities: wp.array[wp.float32] | None = None,
+    ) -> None:
+        """Log a batch of mesh instances for rendering.
+
+        Args:
+            name: Unique name for the instancer.
+            mesh: Name of the base mesh previously registered via :meth:`log_mesh`.
+            xforms: Array of transforms.
+            scales: Array of scales.
+            colors: Array of colors.
+            materials: Array of materials.
+            hidden: Whether the instances are hidden.
+            opacities: Optional per-instance opacity values.
+        """
+        name = self._qualify(name)
+        mesh = self._qualify(mesh)
+
+        count = len(xforms) if xforms is not None else 0
+        previous = self._instance_specs.get(name)
+        appearance = tuple(
+            value.numpy().copy() if value is not None else None for value in (colors, materials, opacities)
+        )
+        changed = previous is None or previous[0] != mesh or previous[1] != count
+        if previous is not None:
+            appearance = tuple(old if new is None else new for old, new in zip(previous[2], appearance, strict=True))
+            changed |= any(not np.array_equal(old, new) for old, new in zip(previous[2], appearance, strict=True))
+
+        if self._phase == self._PHASE_BUILD or (xforms is not None and changed):
+            if previous is not None and (previous[0] != mesh or previous[1] != count):
+                self.stage.RemovePrim(self._get_path(name))
+            super().log_instances(
+                name,
+                mesh,
+                xforms,
+                scales,
+                colors,
+                materials,
+                opacities=opacities,
+                hidden=hidden,
+            )
+            if name in self._emissive_instance_groups and appearance[0] is not None:
+                for i, color in enumerate(appearance[0]):
+                    material = self._get_preview_surface_material(
+                        mesh,
+                        color=color,
+                        roughness=1.0,
+                        metallic=0.0,
+                        emissive_color=color,
+                    )
+                    self._bind_material(self.stage.GetPrimAtPath(f"{self._get_path(name)}/instance_{i}"), material)
+            self._instance_specs[name] = (mesh, count, appearance)
+            self._instance_prim_paths[name] = [self._get_path(name) + f"/instance_{i}" for i in range(count)]
+            if self._phase == self._PHASE_RENDER:
+                runtime_path = self._replace_runtime_prim(self._get_path(name))
+                self._instance_prim_paths[name] = [f"{runtime_path}/instance_{i}" for i in range(count)]
+                self._bind_runtime_transforms(name)
+
+        self._pending_instance_visibility[name] = not hidden and (xforms is None or count > 0)
+        if xforms is not None:
+            if scales is None:
+                scales = wp.ones(count, dtype=wp.vec3, device=xforms.device)
+            self._pending_xforms[name] = (xforms, scales)
+
+    @override
+    def log_lines(
+        self,
+        name: str,
+        starts: wp.array[wp.vec3] | None,
+        ends: wp.array[wp.vec3] | None,
+        colors: (wp.array[wp.vec3] | wp.array[wp.float32] | tuple[float, float, float] | list[float] | None),
+        width: float = 0.01,
+        hidden: bool = False,
+    ) -> None:
+        """Log line segments for rendering.
+
+        Args:
+            name: Unique identifier for the line batch.
+            starts: Array of line start positions [m], shape ``[N, 3]``, or ``None`` for empty.
+            ends: Array of line end positions [m], shape ``[N, 3]``, or ``None`` for empty.
+            colors: Array of per-line RGB colors, a single RGB triplet, or ``None`` for empty.
+            width: Line radius [m].
+            hidden: Whether the lines are initially hidden.
+        """
+        self._log_segments(name, starts, ends, colors, width, hidden, arrow=False)
+
+    @override
+    def log_arrows(
+        self,
+        name: str,
+        starts: wp.array[wp.vec3] | None,
+        ends: wp.array[wp.vec3] | None,
+        colors: (wp.array[wp.vec3] | wp.array[wp.float32] | tuple[float, float, float] | list[float] | None),
+        width: float = 0.01,
+        hidden: bool = False,
+    ) -> None:
+        """Log arrows as cylinder shafts with cone heads.
+
+        Args:
+            name: Unique identifier for the arrow batch.
+            starts: Arrow start positions [m], shape ``[N, 3]``, or ``None`` for empty.
+            ends: Arrow tip positions [m], shape ``[N, 3]``, or ``None`` for empty.
+            colors: Per-arrow RGB colors, a single RGB triplet, or ``None`` for empty.
+            width: Shaft radius [m]. The head radius is twice this value.
+            hidden: Whether the arrows are hidden.
+        """
+        self._log_segments(name, starts, ends, colors, width, hidden, arrow=True)
+
+    def _log_segments(self, name, starts, ends, colors, width, hidden, *, arrow: bool):
+        name = self._qualify(name)
+        mesh_name = self._qualify("/geometry/rtx_arrow" if arrow else "/geometry/rtx_line")
+        if hidden or starts is None or ends is None or colors is None or len(starts) == 0 or len(ends) == 0:
+            self._pending_instance_visibility[name] = False
+            return
+
+        if mesh_name not in self._segment_meshes:
+            mesh = (
+                newton.Mesh.create_arrow(
+                    1.0, 0.8, cap_radius=2.0, cap_height=0.2, up_axis=Axis.Z, compute_inertia=False
+                )
+                if arrow
+                else newton.Mesh.create_cylinder(1.0, 0.5, up_axis=Axis.Z, compute_inertia=False)
+            )
+            self.log_mesh(
+                mesh_name,
+                wp.array(mesh.vertices, dtype=wp.vec3, device=self.device),
+                wp.array(mesh.indices, dtype=wp.int32, device=self.device),
+                normals=wp.array(mesh.normals, dtype=wp.vec3, device=self.device),
+                hidden=True,
+            )
+            self._segment_meshes[mesh_name] = float(mesh.vertices[:, 2].max()) if arrow else 1.0
+
+        starts_np = starts.numpy()
+        ends_np = ends.numpy()
+        count = min(len(starts_np), len(ends_np))
+        xforms, scales = self._build_line_instance_buffers(starts_np, ends_np, capacity=count)
+        scales[:, :2] *= float(width)
+        if arrow:
+            xforms[:, :3] = starts_np[:count]
+            scales[:, 2] /= self._segment_meshes[mesh_name]
+        colors_np = np.asarray(self._promote_colors_to_array(colors, count), dtype=np.float32).reshape(-1, 3)
+        if len(colors_np) == 1:
+            colors_np = np.repeat(colors_np, count, axis=0)
+        if len(colors_np) != count:
+            raise ValueError("Number of segment colors must match the number of segments.")
+        if arrow:
+            self._emissive_instance_groups.discard(name)
+        else:
+            self._emissive_instance_groups.add(name)
+        self.log_instances(
+            name,
+            mesh_name,
+            wp.array(xforms, dtype=wp.transform, device=self.device),
+            wp.array(scales, dtype=wp.vec3, device=self.device),
+            wp.array(colors_np, dtype=wp.vec3, device=self.device),
+            None,
+        )
+
+    @override
+    def log_points(
+        self,
+        name: str,
+        points: wp.array[wp.vec3] | None,
+        radii: wp.array[wp.float32] | float | None = None,
+        colors: (wp.array[wp.vec3] | wp.array[wp.float32] | tuple[float, float, float] | list[float] | None) = None,
+        hidden: bool = False,
+    ) -> None:
+        """Log a batch of points for rendering as spheres.
+
+        Args:
+            name: Unique name for the point batch.
+            points: Array of point positions [m].
+            radii: Per-point radii [m] or a single radius value.
+            colors: Array of point colors, a single RGB triplet, or ``None``.
+            hidden: Whether the points are hidden.
+        """
+        name = self._qualify(name)
+
+        if self._phase == self._PHASE_BUILD or name not in self._point_batch_paths:
+            if points is None:
+                return None
+
+            instancer = self._ensure_point_batch_primitive(name)
+            if instancer is None:
+                return None
+
+            positions, scales, proto_indices, ids, colors_np, color_indices = self._build_point_batch_arrays(
+                points, radii, colors
+            )
+
+            instancer.GetPositionsAttr().Set(positions, self._frame_index)
+            instancer.GetScalesAttr().Set(scales, self._frame_index)
+            instancer.GetProtoIndicesAttr().Set(proto_indices, self._frame_index)
+            instancer.CreateIdsAttr().Set(ids, self._frame_index)
+
+            if colors_np is not None and color_indices is not None:
+                from pxr import Vt
+
+                display_color = UsdGeom.PrimvarsAPI(instancer).GetPrimvar("displayColor")
+                display_color.Set(colors_np, self._frame_index)
+                display_color.SetIndices(Vt.IntArray(color_indices.tolist()), self._frame_index)
+                self._point_batch_colors[name] = np.array(colors_np, copy=True)
+
+            self._point_batch_synced_counts[name] = len(positions)
+            instancer.GetVisibilityAttr().Set(
+                "inherited" if not hidden and len(positions) > 0 else "invisible",
+                self._frame_index,
+            )
+            if self._phase == self._PHASE_RENDER:
+                self._point_batch_paths[name] = self._replace_runtime_prim(str(instancer.GetPath()))
+            return self._point_batch_paths[name]
+
+        if name in self._point_batch_paths:
+            # Retain appearance across paused frames, but let the last log in
+            # a single frame win. Per-point arrays must follow the new count.
+            previous = self._point_batch_frame_defaults.get(name)
+            if previous is not None:
+                count = len(points) if points is not None else 0
+                previous_count = len(previous[0]) if previous[0] is not None else 0
+                if radii is None and colors is None and count == previous_count:
+                    radii = previous[1]
+                if colors is None and previous[2] is not None:
+                    values = previous[2]
+                    colors = np.asarray(values.numpy() if isinstance(values, wp.array) else values).reshape(-1, 3)
+                    if count > 0 and len(colors) not in (1, count):
+                        colors = np.concatenate(
+                            (colors[:count], np.repeat(colors[-1:], max(0, count - len(colors)), axis=0))
+                        )
+            self._pending_point_batches[name] = (points, radii, colors, bool(hidden))
+            return self._point_batch_paths[name]
+
+    # --------------------------------------------------------- OVRTX updates
+
+    def _get_ovstage_query(self, prim_paths: Sequence[str]):
+        """Return a reusable ovstage query that preserves prim-path order."""
+        if self._ovstage is None or self._ovstage_paths is None:
+            raise RuntimeError("ViewerRTX runtime stage is not initialized")
+
+        key = tuple(prim_paths)
+        entry = self._ovstage_queries.get(key)
+        if entry is None:
+            path_list = self._ovstage_paths.create_path_list_from_strings(key)
+            query = self._ovstage.query_from_path_list(path_list)
+            entry = (path_list, query)
+            self._ovstage_queries[key] = entry
+        return entry[1]
+
+    def _evict_ovstage_queries(self, root: str) -> None:
+        """Release cached queries that touch ``root`` or its descendants."""
+        prefix = root + "/"
+        for key in [key for key in self._ovstage_queries if any(p == root or p.startswith(prefix) for p in key)]:
+            path_list, query = self._ovstage_queries.pop(key)
+            query.release().wait()
+            self._ovstage_paths.destroy_path_list(path_list)
+
+    def _write_runtime_attribute(
+        self,
+        prim_paths: Sequence[str],
+        attribute_name: str,
+        values: Any,
+        *,
+        is_array: bool = False,
+        is_matrix: bool = False,
+        cuda_stream: int | None = None,
+    ) -> None:
+        """Write one runtime attribute through the active scene interface."""
+        if not self._use_ovstage:
+            if self._rtx is None:
+                return
+            if is_array:
+                self._rtx.write_array_attribute(prim_paths, attribute_name, [values])
+            else:
+                kwargs = {}
+                if is_matrix:
+                    from ovrtx import Semantic
+
+                    kwargs["semantic"] = Semantic.XFORM_MAT4x4
+                self._rtx.write_attribute(
+                    prim_paths=prim_paths,
+                    attribute_name=attribute_name,
+                    tensor=values,
+                    **kwargs,
+                )
+            return
+
+        if self._ovstage is None or self._ovstage_paths is None:
+            return
+
+        import ovstage
+
+        semantic = ovstage.AttributeSemantic.MATRIX if is_matrix else 0
+        if isinstance(values, (list, tuple)) and values and isinstance(values[0], str):
+            values = np.asarray([self._ovstage_paths.intern_token(value) for value in values], dtype=np.uint64)
+            semantic = ovstage.AttributeSemantic.TOKEN_ID
+
+        query = self._get_ovstage_query(prim_paths)
+        self._ovstage.write_attribute(
+            query,
+            attribute_name,
+            ordinal=self._ovstage_ordinal,
+            tensors=values,
+            is_array=is_array,
+            semantic=semantic,
+            cuda_stream=cuda_stream,
+        ).wait()
+
+    def _write_ovstage_matrix_attribute(self, prim_paths: Sequence[str], matrices: wp.array) -> None:
+        """Write Warp ``mat44d`` values as an ovstage matrix attribute."""
+        import ovstage
+
+        matrix_dtype = ovstage.numpy_to_dldatatype(np.dtype(np.float64), lanes=16)
+        tensor = ovstage.make_dltensor(
+            matrices,
+            dtype=matrix_dtype,
+            shape=[len(matrices)],
+            ndim=1,
+        )
+        cuda_stream = matrices.device.stream.cuda_stream if matrices.device.is_cuda else None
+        self._write_runtime_attribute(
+            prim_paths,
+            "omni:xform",
+            tensor,
+            is_matrix=True,
+            cuda_stream=cuda_stream,
+        )
+
+    def _apply_ovstage_population_changes(self) -> None:
+        """Publish pending runtime USD population edits at the current ordinal."""
+        if not self._ovstage_population_dirty or self._ovstage is None:
+            return
+
+        import ovstage
+
+        ovstage.population.apply_usd_changes(self._ovstage, ordinal=self._ovstage_ordinal)
+        self._ovstage_population_dirty = False
+
+    def _release_ovstage(self) -> None:
+        """Release runtime-stage queries and detach the stage from OVRTX."""
+        stage = getattr(self, "_ovstage", None)
+        paths = getattr(self, "_ovstage_paths", None)
+        queries = getattr(self, "_ovstage_queries", {})
+        self._ovstage_population_dirty = False
+
+        if stage is None:
+            return
+
+        if paths is not None:
+            for path_list, query in queries.values():
+                query.release().wait()
+                paths.destroy_path_list(path_list)
+            paths.destroy()
+        queries.clear()
+        self._ovstage_paths = None
+
+        if self._borrowed_stage is not None:
+            self._remove_borrowed_prims()
+
+        if self._rtx is not None and self._ovstage_attached:
+            self._rtx.detach_ovstage()
+            self._ovstage_attached = False
+        if self._borrowed_stage is None:
+            stage.destroy()
+        self._ovstage = None
+
+    def _remove_borrowed_prims(self) -> None:
+        """Remove only the viewer-owned references from the borrowed stage."""
+        import ovstage
+
+        handles = [*self._runtime_prim_handles.values()]
+        if self._borrowed_reference is not None:
+            handles.append(self._borrowed_reference)
+        if not handles:
+            return
+        for handle in handles:
+            ovstage.population.remove_usd(self._ovstage, handle)
+        self._runtime_prim_handles = {}
+        self._borrowed_reference = None
+        self._next_ovstage_ordinal()
+        ovstage.population.apply_usd_changes(self._ovstage, ordinal=self._ovstage_ordinal)
+        self._ovstage.advance_write_floor(self._ovstage_ordinal, ovstage.Scope.ALL).wait()
+
+    def _release_runtime_scene(self) -> None:
+        """Release resources owned by the active scene interface."""
+        if getattr(self, "_use_ovstage", False):
+            self._release_ovstage()
+        else:
+            if (binding := getattr(self, "_transform_binding", None)) is not None:
+                binding.unbind()
+                self._transform_binding = None
+            for binding in getattr(self, "_runtime_transform_bindings", {}).values():
+                binding.unbind()
+        self._runtime_transform_bindings = {}
+
+    def _destroy_ovrtx(self) -> None:
+        """Destroy the renderer when supported and clear its reference."""
+        if self._rtx is None:
+            return
+        destroy = getattr(self._rtx, "destroy", None)
+        if destroy is not None:
+            destroy()
+        self._rtx = None
+
+    def _update_ovrtx_camera(self):
+        if self._rtx is None or not self._camera_dirty:
+            return
+        with wp.ScopedTimer("ViewerRTX::update_camera", active=PROFILE_ENABLED, use_nvtx=True):
+            mat = self._compute_camera_matrix()
+
+            self._write_runtime_attribute(
+                [self._camera_prim_path],
+                "omni:xform",
+                mat[np.newaxis, ...],
+                is_matrix=True,
+            )
+            self._camera_dirty = False
+
+    def _update_ovrtx_transforms(self):
+        # Prims keep their authored transforms until the first logged state.
+        has_prim_rows = self._prim_count > 0 and self._last_state is not None
+        if self._rtx is None or (not has_prim_rows and not self._pending_xforms):
+            return
+        if self._use_ovstage and self._ovstage is None:
+            return
+
+        if self._use_ovstage:
+            with wp.ScopedTimer("ViewerRTX::update_transforms", active=PROFILE_ENABLED, use_nvtx=True):
+                if has_prim_rows:
+                    if self._borrowed_reset_pending:
+                        # Written matrices are world-space, so bound prims must ignore their ancestors.
+                        self._write_runtime_attribute(
+                            self._prim_paths, "omni:resetXformStack", np.ones(self._prim_count, dtype=np.bool_)
+                        )
+                        self._borrowed_reset_pending = False
+                    self._launch_prim_world_matrices(self._prim_matrices)
+                    self._write_ovstage_matrix_attribute(self._prim_paths, self._prim_matrices)
+
+                for name, (xforms, scales) in self._pending_xforms.items():
+                    paths = self._instance_prim_paths.get(name)
+                    if not paths:
+                        continue
+                    count = min(len(paths), len(xforms))
+                    if count == 0:
+                        continue
+                    matrices = self._pending_transform_matrices.get(name)
+                    if matrices is None or len(matrices) != count or matrices.device != xforms.device:
+                        matrices = wp.empty(count, dtype=wp.mat44d, device=xforms.device)
+                        self._pending_transform_matrices[name] = matrices
+                    wp.launch(
+                        write_transforms,
+                        dim=count,
+                        inputs=[xforms, scales, 0, matrices],
+                        device=matrices.device,
+                    )
+                    self._write_ovstage_matrix_attribute(paths[:count], matrices)
+            return
+
+        runtime_updates = {
+            name: binding for name, binding in self._runtime_transform_bindings.items() if name in self._pending_xforms
+        }
+        has_scene_updates = self._transform_binding is not None and (
+            has_prim_rows
+            or any(
+                name in self._pending_xforms and name not in self._runtime_transform_bindings
+                for name in self._bound_instance_prim_paths
+            )
+        )
+        if not has_scene_updates and not runtime_updates:
+            return
+        with wp.ScopedTimer("ViewerRTX::update_transforms", active=PROFILE_ENABLED, use_nvtx=True):
+            from ovrtx import Device
+
+            rtx_device = Device.CUDA if self.device.is_cuda else Device.CPU
+            if has_scene_updates:
+                with self._transform_binding.map(device=rtx_device) as mapping:
+                    matrices = wp.from_dlpack(mapping.tensor, dtype=wp.mat44d)  # (N, 4, 4) float64
+
+                    if has_prim_rows:
+                        # Single kernel launch for all shape batches.
+                        self._launch_prim_world_matrices(matrices, self._prim_mat44_offset)
+
+                    # Handle any remaining build-phase pre-computed transforms.
+                    offset = 0
+                    for name, paths in self._bound_instance_prim_paths.items():
+                        count = len(paths)
+                        if name in self._pending_xforms and name not in self._runtime_transform_bindings:
+                            xf, sc = self._pending_xforms[name]
+                            n = min(count, len(xf))
+                            wp.launch(
+                                write_transforms,
+                                dim=n,
+                                inputs=[xf, sc, offset, matrices],
+                                device=matrices.device,
+                            )
+                        offset += count
+
+                    if matrices.device.is_cuda:
+                        mapping.unmap(stream=matrices.device.stream.cuda_stream)
+
+            for name, binding in runtime_updates.items():
+                xf, sc = self._pending_xforms[name]
+                with binding.map(device=rtx_device) as mapping:
+                    matrices = wp.from_dlpack(mapping.tensor, dtype=wp.mat44d)
+                    wp.launch(
+                        write_transforms,
+                        dim=min(len(self._instance_prim_paths[name]), len(xf)),
+                        inputs=[xf, sc, 0, matrices],
+                        device=matrices.device,
+                    )
+                    if matrices.device.is_cuda:
+                        mapping.unmap(stream=matrices.device.stream.cuda_stream)
+
+    def _update_ovrtx_instance_visibility(self):
+        if self._rtx is None:
+            return
+        if self._pending_hidden_prim_paths:
+            hidden = sorted(self._pending_hidden_prim_paths)
+            self._write_runtime_attribute(hidden, "visibility", ["invisible"] * len(hidden))
+            self._pending_hidden_prim_paths.clear()
+        if not self._pending_instance_visibility:
+            return
+
+        for name, visible in self._pending_instance_visibility.items():
+            paths = self._instance_prim_paths.get(name)
+            if paths is None:
+                continue
+            # The group may have been hidden before its first rendered frame.
+            group_path = self._get_path(name)
+            self._write_runtime_attribute(
+                [self._runtime_prim_paths.get(group_path, group_path)],
+                "visibility",
+                ["inherited" if visible else "invisible"],
+            )
+            if not paths:
+                continue
+            self._write_runtime_attribute(
+                paths,
+                "visibility",
+                ["inherited" if visible else "invisible"] * len(paths),
+            )
+
+    def _make_laned_array_dltensor(self, values_np: np.ndarray, lanes: int):
+        """Create a 1D DLTensor with a fixed lane count per element."""
+        flat = np.ascontiguousarray(values_np).reshape(-1)
+        n = len(flat) // lanes
+        if self._use_ovstage:
+            import ovstage
+
+            dtype = ovstage.numpy_to_dldatatype(flat.dtype, lanes=lanes)
+            return ovstage.make_dltensor(flat, dtype=dtype, shape=[n], ndim=1)
+
+        from ovrtx._src.dlpack import DLTensor
+
+        tensor = DLTensor.from_dlpack(flat)
+        tensor.dtype.lanes = lanes
+        tensor.ndim = 1
+        shape = (ctypes.c_int64 * 1)(n)
+        tensor.shape = ctypes.cast(shape, ctypes.POINTER(ctypes.c_int64))
+        tensor._laned_shape = shape
+        return tensor
+
+    def _write_runtime_array_attribute(self, prim_path: str, attribute_name: str, values: Any):
+        if self._use_ovstage:
+            if self._ovstage is None:
+                return
+        elif self._rtx is None:
+            return
+
+        if isinstance(values, wp.array):
+            # Runtime array attributes are infrequently updated and currently use CPU writes.
+            values = values.numpy()
+
+        values = np.ascontiguousarray(values)
+        if values.ndim > 1:
+            lanes = math.prod(values.shape[1:])
+            values = self._make_laned_array_dltensor(values, lanes=lanes)
+
+        self._write_runtime_attribute(
+            [prim_path],
+            attribute_name,
+            values,
+            is_array=True,
+        )
+
+    def _make_point3f_dltensor(self, points_np):
+        """Create a DLTensor with float3 (lanes=3) dtype from an (N,3) float32 array.
+
+        OVRTX Fabric stores 'points' as point3f[] where each element is 12 bytes
+        (float32 x 3 lanes). A plain DLTensor.from_dlpack on a (N,3) float32 array
+        produces scalar float32 elements (4 bytes), causing an element-size mismatch.
+        """
+        return self._make_laned_array_dltensor(np.asarray(points_np, dtype=np.float32), lanes=3)
+
+    def _update_ovrtx_mesh_points(self):
+        if self._rtx is None or (
+            not self._pending_mesh_points
+            and not self._pending_mesh_normals
+            and not self._pending_mesh_topology
+            and not self._pending_mesh_visibility
+        ):
+            return
+        with wp.ScopedTimer("ViewerRTX::update_mesh_points", active=PROFILE_ENABLED, use_nvtx=True):
+            for mesh_name, points_np in self._pending_mesh_points.items():
+                prim_path = self._mesh_prim_paths.get(mesh_name)
+                if prim_path is None:
+                    continue
+                dl = self._make_point3f_dltensor(points_np)
+                self._write_runtime_attribute([prim_path], "points", dl, is_array=True)
+            for mesh_name, normals_np in self._pending_mesh_normals.items():
+                prim_path = self._mesh_prim_paths.get(mesh_name)
+                if prim_path is None:
+                    continue
+                dl = self._make_point3f_dltensor(normals_np)
+                self._write_runtime_attribute([prim_path], "normals", dl, is_array=True)
+            for mesh_name, (face_vertex_counts, face_vertex_indices) in self._pending_mesh_topology.items():
+                prim_path = self._mesh_prim_paths.get(mesh_name)
+                if prim_path is None:
+                    continue
+                self._write_runtime_array_attribute(prim_path, "faceVertexCounts", face_vertex_counts)
+                self._write_runtime_array_attribute(prim_path, "faceVertexIndices", face_vertex_indices)
+            for mesh_name, visible in self._pending_mesh_visibility.items():
+                prim_path = self._mesh_prim_paths.get(mesh_name)
+                if prim_path is None:
+                    continue
+                self._write_runtime_attribute(
+                    [prim_path],
+                    "visibility",
+                    ["inherited" if visible else "invisible"],
+                )
+
+    def _update_ovrtx_point_batches(self):
+        if self._rtx is None or not self._pending_point_batches:
+            return
+
+        with wp.ScopedTimer("ViewerRTX::update_point_batches", active=PROFILE_ENABLED, use_nvtx=True):
+            for name, (points, radii, colors, hidden) in self._pending_point_batches.items():
+                prim_path = self._point_batch_paths.get(name)
+                if prim_path is None:
+                    continue
+
+                if points is None:
+                    positions = np.zeros((0, 3), dtype=np.float32)
+                else:
+                    positions = np.asarray(
+                        points.numpy() if isinstance(points, wp.array) else points, dtype=np.float32
+                    ).reshape((-1, 3))
+                count = len(positions)
+                self._write_runtime_attribute(
+                    [prim_path],
+                    "visibility",
+                    ["inherited" if not hidden and count > 0 else "invisible"],
+                )
+
+                if count == 0:
+                    continue
+
+                # Sentinel default ensures the first sync for a batch always
+                # falls into the rebuild branch below, which writes all the
+                # supporting attributes (scales, colors, etc.). The fast path
+                # is reserved for same-count updates that pass no new colors
+                # or radii — otherwise we'd skip refreshing them.
+                if count == self._point_batch_synced_counts.get(name, -1) and colors is None and radii is None:
+                    self._write_runtime_array_attribute(prim_path, "positions", positions)
+                    continue
+
+                point_colors = colors
+                if point_colors is None:
+                    point_colors = self._point_batch_colors.get(name)
+                    if point_colors is not None and len(point_colors) not in (1, count):
+                        # Preserve colors for existing points by index. New points
+                        # inherit the final cached color until callers provide an
+                        # updated per-point array.
+                        retained_colors = point_colors[:count]
+                        added_colors = np.repeat(point_colors[-1:], max(0, count - len(point_colors)), axis=0)
+                        point_colors = np.concatenate((retained_colors, added_colors))
+                positions, scales, proto_indices, ids, colors_np, color_indices = self._build_point_batch_arrays(
+                    points, radii, point_colors
+                )
+
+                self._write_runtime_array_attribute(prim_path, "positions", positions)
+                self._write_runtime_array_attribute(prim_path, "scales", scales)
+                self._write_runtime_array_attribute(prim_path, "protoIndices", proto_indices)
+                self._write_runtime_array_attribute(prim_path, "ids", ids)
+
+                if colors_np is not None and color_indices is not None:
+                    self._write_runtime_array_attribute(prim_path, "primvars:displayColor", colors_np)
+                    self._write_runtime_array_attribute(prim_path, "primvars:displayColor:indices", color_indices)
+                    self._point_batch_colors[name] = np.array(colors_np, copy=True)
+
+                self._point_batch_synced_counts[name] = count
+
+    # ------------------------------------------------------- render + display
+
+    def _get_ldr_color_render_var(self, frame):
+        """Return the color output across supported OVRTX versions."""
+        for name in ("LdrColor", self._render_var_path):
+            if name in frame.render_vars:
+                return frame.render_vars[name]
+        return None
+
+    def _accept_render(self, products) -> None:
+        """Retain completed render products and an independently owned image."""
+        self._render_products = products
+        if not self._headless and (self._window is None or self._window.context is None):
+            return
+
+        from ovrtx import Device
+
+        for product in products.values():
+            for frame in product.frames:
+                render_var = self._get_ldr_color_render_var(frame)
+                if render_var is None:
+                    continue
+                with render_var.map(device=Device.CUDA) as mapping:
+                    pixels = wp.from_dlpack(mapping, dtype=wp.vec4ub)
+                    if self._headless:
+                        if self._displayed_pixels is None or self._displayed_pixels.shape != pixels.shape:
+                            self._displayed_pixels = wp.empty_like(pixels)
+                        wp.copy(self._displayed_pixels, pixels)
+                    else:
+                        self._blit_to_window(pixels)
+                    mapping.unmap(stream=pixels.device.stream.cuda_stream)
+                return
+
+    def _render_and_display(self):
+        fullscreen_name = self._image_logger.pop_fullscreen()
+        if self._should_close:
+            return
+
+        # UI changes made while presenting take effect on the next frame.
+        async_rendering = self._async
+        step_kwargs = None
+        if not self.is_rendering_paused():
+            if fullscreen_name is not None and self._window is not None:
+                texture = self._image_logger.get_texture(fullscreen_name, fullscreen=True)
+                if texture is not None:
+                    self._displayed_frame.store(*texture)
+                else:
+                    self._displayed_frame.clear()
+                self._last_frame_is_fullscreen = True
+            elif self._rtx is not None:
+                self._last_frame_is_fullscreen = False
+                step_kwargs = {
+                    "render_products": {self._render_product_path},
+                    "delta_time": 1.0 / self.fps,
+                }
+                if self._use_ovstage:
+                    step_kwargs["ordinal"] = self._ovstage_ordinal
+                if not async_rendering:
+                    with wp.ScopedTimer("ViewerRTX::rtx_step", active=PROFILE_ENABLED, use_nvtx=True):
+                        self._accept_render(self._rtx.step(**step_kwargs))
+
+        if self._window is not None and self._window.context is not None:
+            frame = self._displayed_frame
+            self._present(frame.texture or None, frame.width, frame.height)
+
+        if async_rendering and step_kwargs is not None:
+            with wp.ScopedTimer("ViewerRTX::rtx_step_async", active=PROFILE_ENABLED, use_nvtx=True):
+                self._render_result = self._rtx.step_async(**step_kwargs)
+
+    def _blit_to_window(self, pixels: wp.array | wp.Texture2D):
+        """Copy RTX output into the independently owned presentation cache."""
+        with wp.ScopedTimer("ViewerRTX::gl_tex_copy", active=PROFILE_ENABLED, use_nvtx=True):
+            frame_tex = self._tex_resource.map()
+            frame_tex.copy_from(pixels)
+            self._tex_resource.unmap()
+        self._displayed_frame.store(self._gl_texture, self._render_width, self._render_height)
+
+    def _present(self, texture_id: int | None, width: int, height: int):
+        """Draw a top-row-first RGBA texture letterboxed into the window, then the UI, and swap buffers.
+
+        Args:
+            texture_id: GL texture to draw, or ``None`` to only clear the window.
+            width: Texture width [px].
+            height: Texture height [px].
+        """
+        gl = self._pyglet_gl
+
+        self._window.switch_to()
+        fb_w, fb_h = self._window.get_framebuffer_size()
+
+        # Compute a letterbox viewport that preserves the texture aspect ratio.
+        render_aspect = width / max(height, 1)
+        window_aspect = fb_w / max(fb_h, 1)
+        if window_aspect >= render_aspect:
+            # Window is wider than render — pillarbox (black bars left/right)
+            vp_h = fb_h
+            vp_w = int(fb_h * render_aspect)
+            vp_x = (fb_w - vp_w) // 2
+            vp_y = 0
+        else:
+            # Window is taller than render — letterbox (black bars top/bottom)
+            vp_w = fb_w
+            vp_h = int(fb_w / render_aspect)
+            vp_x = 0
+            vp_y = (fb_h - vp_h) // 2
+
+        with wp.ScopedTimer("ViewerRTX::gl_draw", active=PROFILE_ENABLED, use_nvtx=True):
+            # Clear the full window to black, then draw into the letterbox region
+            gl.glViewport(0, 0, fb_w, fb_h)
+            gl.glClearColor(0.0, 0.0, 0.0, 1.0)
+            gl.glClear(gl.GL_COLOR_BUFFER_BIT)
+            if texture_id:
+                gl.glViewport(vp_x, vp_y, vp_w, vp_h)
+                gl.glBindTexture(gl.GL_TEXTURE_2D, texture_id)
+                gl.glUseProgram(self._gl_program)
+                gl.glBindVertexArray(self._gl_vao)
+                gl.glDrawArrays(gl.GL_TRIANGLES, 0, 3)
+                gl.glBindVertexArray(0)
+                gl.glUseProgram(0)
+                gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+
+            # Restore full viewport for ImGui (which spans the entire window)
+            gl.glViewport(0, 0, fb_w, fb_h)
+
+        if self.gui:
+            with wp.ScopedTimer("ViewerRTX::gui_render", active=PROFILE_ENABLED, use_nvtx=True):
+                self.gui.render_prepared_frame()
+
+        with wp.ScopedTimer("ViewerRTX::swap_buffers", active=PROFILE_ENABLED, use_nvtx=True):
+            self._window.flip()
+
+    @override
+    def get_frame(self, *, output: wp.array3d[wp.uint8] | None = None, render_ui: bool = False) -> wp.array3d[wp.uint8]:
+        """Retrieve the last rendered frame as RGB image data.
+
+        Like :meth:`ViewerGL.get_frame`, this returns a Warp array on the
+        viewer device. Call ``.numpy()`` on the result for a NumPy array.
+        Works in headless mode and reads the RTX render output through CPU
+        memory. Call after :meth:`end_frame`. With asynchronous rendering,
+        capture waits for the render submitted by that call so the image
+        contains the latest logged state. While rendering is paused, capture
+        returns the frozen displayed image without waiting for a pending render.
+        Capturing fullscreen images displayed with
+        ``log_image(..., fullscreen=True)`` is not supported; capture
+        resumes after the next scene render.
+
+        Args:
+            output: Optional pre-allocated Warp array on the viewer
+                device with shape ``(height, width, 3)`` and dtype ``wp.uint8``.
+                If ``None``, a new array is created.
+            render_ui: Whether to include UI overlays. Only ``False`` is
+                supported because RTX capture reads the renderer output.
+
+        Returns:
+            RGB image data on the viewer device with shape
+            ``(height, width, 3)`` and dtype ``wp.uint8``. The origin is
+            top-left and the dimensions are the fixed render resolution.
+            If supplied, returns ``output``.
+
+        Raises:
+            RuntimeError: No rendered frame or color output is available.
+            ValueError: The output shape, dtype, or device is incompatible.
+            NotImplementedError: ``render_ui`` is ``True`` or the last frame
+                displayed a fullscreen logged image.
+        """
+        if render_ui:
+            raise NotImplementedError("ViewerRTX.get_frame() does not support render_ui=True")
+        if self._last_frame_is_fullscreen:
+            raise NotImplementedError("ViewerRTX.get_frame() does not support capturing fullscreen logged images")
+
+        h, w = self._render_height, self._render_width
+        if output is None:
+            output = wp.empty(shape=(h, w, 3), dtype=wp.uint8, device=self.device)
+        else:
+            if output.shape != (h, w, 3):
+                raise ValueError(f"Shape of `output` must be ({h}, {w}, 3), got {output.shape}")
+            if output.dtype != wp.uint8:
+                raise ValueError(f"The dtype of `output` must be wp.uint8, got {output.dtype}")
+            if output.device != self.device:
+                raise ValueError(f"The device of `output` must be {self.device}, got {output.device}")
+
+        # Async presentation retains the previous frame; capture needs the latest.
+        if not self.is_rendering_paused() and self._render_result is not None:
+            self._render_products = self._render_result.wait().fetch()
+
+        pixels = self._capture_screenshot_pixels()
+        output.assign(np.ascontiguousarray(pixels[:, :, :3]))
+        return output
+
+    def _capture_screenshot_pixels(self) -> np.ndarray:
+        if self.is_rendering_paused():
+            if self._headless:
+                if self._displayed_pixels is None:
+                    raise RuntimeError("Frame capture requires at least one displayed frame")
+                return self._displayed_pixels.numpy()
+            if self._window is not None:
+                self._window.switch_to()
+            return self._displayed_frame.pixels()
+        products = self._render_products
+        if products is None and self._render_result is not None:
+            products = self._render_result.wait().fetch()
+        if products is None:
+            raise RuntimeError("Frame capture requires at least one completed render frame")
+
+        from ovrtx import Device
+
+        for _pname, product in products.items():
+            for frame in product.frames:
+                render_var = self._get_ldr_color_render_var(frame)
+                if render_var is not None:
+                    with render_var.map(device=Device.CPU) as mapping:
+                        pixels = np.array(np.from_dlpack(mapping), copy=True)
+                    return pixels
+
+        raise RuntimeError("Frame capture could not find the LdrColor render output")
+
+    def save_screenshot(self, path: str) -> None:
+        """Save the last rendered frame to an image file.
+
+        .. deprecated:: 1.7
+            Use :meth:`get_frame` and an image library instead, for example
+            ``PIL.Image.fromarray(viewer.get_frame().numpy()).save(path)``.
+
+        The file format is inferred from the extension (e.g. ``.png``, ``.jpg``).
+        Call this after at least one completed frame has been rendered (e.g.
+        after the simulation loop). Works in headless mode. While rendering is
+        paused, capture returns the frozen image.
+
+        Args:
+            path: Output image filename.
+
+        Raises:
+            RuntimeError: No completed image exists, or the renderer has no
+                color output.
+        """
+        warnings.warn(
+            "ViewerRTX.save_screenshot() is deprecated in Newton 1.7; "
+            "use get_frame().numpy() and an image library such as Pillow to save the image instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        from PIL import Image
+
+        pixels = self._capture_screenshot_pixels()
+        pil_img = Image.fromarray(pixels)
+        ext = os.path.splitext(path)[1].lower()
+        if ext in {".jpg", ".JPG", ".jpeg", ".JPEG"}:
+            pil_img = pil_img.convert("RGB")
+            pil_img.save(path, quality=92)
+        else:
+            pil_img.save(path)
+
+    # ----------------------------------------------------------- viewer API
+
+    @override
+    def log_array(self, name: str, array: wp.array[Any] | np.ndarray | None):
+        """
+        Log a numeric array as a live heatmap.
+
+        Scalars appear as a single cell, 1-D arrays as a single row, and
+        2-D arrays as a grid. Higher-dimensional arrays are not supported.
+
+        Args:
+            name: Unique path/name for the array signal.
+            array: Array data to visualize, or ``None`` to remove a previously
+                logged array.
+        """
+        self._plot_logger.log_array(self._qualify(name), array)
+
+    @override
+    def log_image(self, name: str, image: wp.array[Any] | np.ndarray, *, fullscreen: bool = False) -> None:
+        """See :meth:`~newton.viewer.ViewerBase.log_image`.
+
+        Ignored in headless mode, which has no window to display images in.
+        """
+        if self._headless:
+            return
+        name = self._qualify(name)
+        if self._window is None:
+            # The GL context only exists after the first end_frame(); upload then.
+            _validate(name, image)
+            key = (name, fullscreen)
+            # Re-insert so the last fullscreen call still wins after the flush.
+            self._pending_images.pop(key, None)
+            self._pending_images[key] = image
+            return
+        self._image_logger.log(name, image, fullscreen=fullscreen)
+
+    @override
+    def log_scalar(
+        self,
+        name: str,
+        value: int | float | bool | np.number,
+        *,
+        clear: bool = False,
+        smoothing: int = 1,
+    ):
+        """
+        Log a scalar value as a live time-series plot.
+
+        Each unique *name* creates a separate line plot displayed in an
+        auto-generated "Plots" window.  Values are stored in a rolling
+        buffer of the last ``plot_history_size`` samples.
+
+        Args:
+            name: Unique path/name for the scalar signal.
+            value: Scalar value to record.
+            clear: If ``True``, discard previously recorded samples for
+                *name* before logging the new value.
+            smoothing: Number of raw samples to average before committing
+                a point to the plot history.  Defaults to ``1`` (no smoothing).
+        """
+        self._plot_logger.log_scalar(self._qualify(name), value, clear=clear, smoothing=smoothing)
+
+    @override
+    def clear_all_layers(self) -> None:
+        """Reset the RTX viewer as one complete layered scene."""
+        for layer_id in [lid for lid in self._layers if lid != _DEFAULT_LAYER_ID]:
+            del self._layers[layer_id]
+        self._active_layer_id = _DEFAULT_LAYER_ID
+        self._load_layer_state(self._layers[_DEFAULT_LAYER_ID])
+        self.clear_model()
+
+    def clear_model(self) -> None:
+        """Reset RTX-specific model-dependent state to defaults.
+
+        Called when the current model is discarded (e.g. before
+        :meth:`set_model`, or when switching examples). Drops example-registered
+        UI callbacks, releases the picking and wind helpers, and drains the
+        async rendering pipeline before releasing the renderer.
+        """
+        if self._has_other_user_layers():
+            raise RuntimeError(
+                "ViewerRTX cannot clear one layer while other user layers are still live; "
+                "create a new ViewerRTX for a different layered scene."
+            )
+
+        if getattr(self, "_plot_logger", None) is not None:
+            self._plot_logger.clear_matching(self._is_layer_owned_path)
+        if getattr(self, "_image_logger", None) is not None:
+            self._image_logger.clear_matching(self._is_layer_owned_path)
+        self._pending_images = {
+            key: image
+            for key, image in getattr(self, "_pending_images", {}).items()
+            if not self._is_layer_owned_path(key[0])
+        }
+
+        # Drop example-registered side/free UI callbacks (panel/stats/rendering persist).
+        if getattr(self, "gui", None) is not None:
+            self.gui.clear_example_callbacks()
+
+        self.picking = None
+        self.wind = None
+
+        if self._render_result is not None:
+            self._render_result.wait().fetch()
+            self._render_result = None
+        self._discard_render_result = False
+        self._render_products = None
+        self._displayed_pixels = None
+        self._last_frame_is_fullscreen = False
+
+        # Release runtime-scene resources before destroying the renderer.
+        self._release_runtime_scene()
+        self._destroy_ovrtx()
+
+        self._displayed_frame.clear()
+
+        # Return to build phase so the next example creates fresh USD prims
+        self._phase = self._PHASE_BUILD
+
+        # Reset build-phase state
+        self._instance_prim_paths = {}
+        self._instance_specs = {}
+        self._runtime_prim_handles = {}
+        self._runtime_prim_paths = {}
+        self._runtime_prim_serial = 0
+        self._runtime_scene_changed = False
+        self._segment_meshes = {}
+        self._emissive_instance_groups = set()
+        self._all_instance_paths = []
+        self._bound_instance_prim_paths = {}
+        self._runtime_transform_bindings = {}
+        self._mesh_prim_paths = {}
+        self._point_batch_paths = {}
+        self._point_batch_colors = {}
+        self._point_batch_synced_counts = {}
+
+        self._pending_xforms = {}
+        self._pending_instance_visibility = {}
+        self._pending_hidden_prim_paths = set()
+        self._pending_mesh_points = {}
+        self._pending_mesh_normals = {}
+        self._pending_mesh_topology = {}
+        self._pending_mesh_visibility = {}
+        self._pending_point_batches = {}
+        self._point_batch_frame_defaults = {}
+        self._deferred_prims = set()
+        self._pending_transform_matrices = {}
+        self._ovstage_population_dirty = False
+
+        self._prim_paths = ()
+        self._prim_count = 0
+        self._stage_from_model = None
+        self._borrowed_reset_pending = False
+        self._prim_body = None
+        self._prim_linear = None
+        self._prim_translation = None
+        self._prim_world = None
+        self._prim_matrices = None
+        self._prim_mat44_offset = 0
+        self._use_layered_transform_updates = False
+
+        self._last_state = None
+        self._last_control = None
+        self._last_show_ground = True
+
+        # reset camera
+        self.camera = Camera(width=self._render_width, height=self._render_height, up_axis=self._up_axis)
+        if self._borrowed_stage is not None:
+            self._camera_prim_path = f"{self._root_path}/Camera"
+            self._render_product_path = f"{self._root_path}/Render/Product"
+            self._render_var_path = f"{self._root_path}/Render/Vars/LdrColor"
+        else:
+            self._camera_prim_path = "/World/Camera"
+            self._render_product_path = "/Render/OmniverseKit/HydraTextures/omni_kit_widget_viewport_ViewportTexture_0"
+            self._render_var_path = "/Render/Vars/LdrColor"
+        self._camera_dirty = True
+
+        super().clear_model()
+        if self._borrowed_stage is not None:
+            # The stage presents the model, so simulated cloth would duplicate its deformables.
+            self.show_triangles = False
+
+    def _has_other_user_layers(self) -> bool:
+        active_layer_id = getattr(self, "_active_layer_id", _DEFAULT_LAYER_ID)
+        layers = getattr(self, "_layers", {})
+        return any(layer_id != _DEFAULT_LAYER_ID and layer_id != active_layer_id for layer_id in layers)
+
+    def _ui_populate_rendering_panel(self, imgui):
+        """Render RTX-specific items inside the Rendering Options panel section."""
+        _changed, self._async = imgui.checkbox("Asynchronous Rendering", self._async)
+
+    def register_ui_callback(
+        self,
+        callback: Callable[[Any], None],
+        position: Literal["side", "stats", "free", "panel", "rendering"] = "side",
+    ):
+        """
+        Register a UI callback to be rendered during the UI phase.
+
+        Args:
+            callback: Function to be called during UI rendering
+            position: Position where the UI should be rendered. One of:
+                     "side" - Side callback (default)
+                     "stats" - Stats/metrics area
+                     "free" - Free-floating UI elements
+                     "panel" - Top-level collapsing headers in left panel
+                     "rendering" - Extra items inside the Rendering Options section
+        """
+        if not callable(callback):
+            raise TypeError("callback must be callable")
+        if self.gui is not None:
+            self.gui.register_ui_callback(callback, position=position)
+        else:
+            # Buffer until the GUI window is created in ``_init_window``.
+            self._pending_ui_callbacks.append((callback, position))
+
+    def show_loading_splash(self, text: str | None = None) -> None:
+        """Display a centered Newton's-cradle loading splash with optional sub-label.
+
+        Args:
+            text: Optional sub-label drawn below the cradle.
+        """
+        if self.gui is not None:
+            self.gui.show_loading_splash(text)
+        else:
+            # Buffer until the GUI window is created in ``_init_window``.
+            self._pending_splash = (True, text)
+
+    def hide_loading_splash(self) -> None:
+        """Remove the splash set by :meth:`show_loading_splash`."""
+        if self.gui is not None:
+            self.gui.hide_loading_splash()
+        else:
+            self._pending_splash = (False, None)
+
+    @override
+    def set_rendering_paused(self, paused: bool) -> None:
+        """See :meth:`newton.viewer.ViewerBase.set_rendering_paused`."""
+        if bool(paused) == self.is_rendering_paused():
+            return
+        self._rendering_paused = bool(paused)
+        if paused:
+            if self._render_result is not None:
+                self._discard_render_result = True
+            if self.picking is not None:
+                self.picking.release()
+            if self.gui is not None:
+                self.gui.on_rendering_paused()
+
+    @override
+    def is_paused(self) -> bool:
+        """Check if the simulation is paused.
+
+        Returns:
+            bool: True if paused, False otherwise.
+        """
+        return self._paused
+
+    @override
+    def should_step(self) -> bool:
+        """Return True if the loop should advance one step.
+
+        Consumes a pending single-step request, so call exactly once per frame.
+        """
+        if not self._paused:
+            self._step_requested = False
+            return True
+        if self._step_requested:
+            self._step_requested = False
+            return True
+        return False
+
+    def set_reset_callback(self, callback: Callable[[], None] | None) -> None:
+        """Register a callback invoked when the user clicks the Reset button.
+
+        Args:
+            callback: Called with no arguments on reset, or ``None`` to remove.
+        """
+        self._reset_callback = callback
+
+    @override
+    def is_running(self) -> bool:
+        """Check if the viewer is still running.
+
+        In headless mode the viewer stops once ``num_frames`` is reached.
+        In windowed mode the viewer keeps running until the user closes the
+        window, ignoring ``num_frames`` so the window does not disappear
+        unexpectedly.
+
+        Returns:
+            bool: True while the viewer should continue rendering.
+        """
+        if self._should_close:
+            return False
+        if self._headless and self.num_frames is not None:
+            return self._frame_count < self.num_frames
+        return True
+
+    @override
+    def close(self) -> None:
+        """Close the viewer and release rendering resources.
+
+        Waits for any in-flight asynchronous render, releases the runtime
+        scene and OVRTX renderer, and closes the underlying pyglet window.
+        """
+        # Drain the one outstanding frame before releasing its renderer.
+        if self._render_result is not None:
+            self._render_result.wait().fetch()
+            self._render_result = None
+        self._render_products = None
+        self._displayed_pixels = None
+        self._displayed_frame.clear()
+        self._last_frame_is_fullscreen = False
+
+        # release runtime-scene resources and renderer
+        self._release_runtime_scene()
+        self._destroy_ovrtx()
+
+        if getattr(self, "_plot_logger", None) is not None:
+            self._plot_logger.clear()
+        if getattr(self, "_image_logger", None) is not None:
+            self._image_logger.clear()
+        self._pending_images = {}
+
+        if self.ui:
+            self.ui.shutdown()
+
+        if self._window is not None:
+            if not self._headless:
+                try:
+                    self._pyglet_app.event_loop.dispatch_event("on_exit")
+                    self._pyglet_app.platform_event_loop.stop()
+                except Exception:
+                    pass
+            self._window.close()
+            self._window = None
+
+        if hasattr(self, "output_path") and self.output_path and os.path.exists(self.output_path):
+            try:
+                os.unlink(self.output_path)
+            except OSError:
+                pass

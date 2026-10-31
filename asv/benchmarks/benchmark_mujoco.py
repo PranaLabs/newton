@@ -23,13 +23,102 @@ import newton.utils
 from newton.sensors import SensorContact
 from newton.utils import EventTracer
 
+if __package__:
+    from .benchmark_metrics import validate_simulation_state
+else:
+    from benchmark_metrics import validate_simulation_state
+
+_NEW_LAYOUT_AVAILABLE = hasattr(newton, "use_coord_layout_targets")
+_MAX_BODY_LINEAR_SPEED = 100.0
+_MAX_BODY_ANGULAR_SPEED = 500.0
+
+
+def _target_q(owner):
+    """Resolve the joint-position-target array across pre/post #2556 layouts.
+
+    On pre-PR Newton (no ``joint_target_q``) falls back to ``joint_target_pos``.
+    Used by the benchmark harness so ``asv compare`` works against both refs.
+    """
+    target = getattr(owner, "joint_target_q", None)
+    if target is None:
+        target = getattr(owner, "joint_target_pos", None)
+    return target
+
+
+# Slew targets toward per-joint random waypoints instead of teleporting them:
+# unbounded setpoint jumps create solves the MuJoCo Newton solver cannot finish
+# within any iteration budget (exposed by mujoco_warp#1374), so the benchmark
+# measured the iteration cap instead of converged stepping.
+TARGET_SLEW_PER_FRAME = 0.01  # fraction of each target's range per frame
+TARGET_WAYPOINT_FRAMES = 50  # frames between waypoint draws
+
+
+@wp.kernel
+def _waypoint_control(
+    seed: int,
+    frame: wp.array[int],
+    lo: wp.array[float],
+    hi: wp.array[float],
+    slew_per_frame: float,
+    waypoint_frames: int,
+    joint_target: wp.array[float],
+):
+    # The waypoint is a pure function of (seed, leg, tid): deterministic, and
+    # no state beyond the frame counter, so the kernel is graph-capturable.
+    tid = wp.tid()
+    leg = frame[0] // waypoint_frames
+    state = wp.rand_init(seed, leg * joint_target.shape[0] + tid)
+    span = hi[tid] - lo[tid]
+    waypoint = lo[tid] + wp.randf(state) * span
+    slew = slew_per_frame * span
+    joint_target[tid] = joint_target[tid] + wp.clamp(waypoint - joint_target[tid], -slew, slew)
+
+
+@wp.kernel
+def _advance_frame(frame: wp.array[int]):
+    frame[0] = frame[0] + 1
+
+
+def _target_bounds(model):
+    """Per-entry bounds for randomized position targets in the ``_target_q``
+    layout. Joints whose coords map 1:1 to dofs get their limits intersected
+    with the historical [-1, 1] command range (sentinel/unlimited sides fall
+    back to +-1); free/ball/distance coordinates keep the initial target.
+    """
+    init = _target_q(model).numpy().astype(np.float32)
+    lo, hi = init.copy(), init.copy()
+    joint_types = model.joint_type.numpy()
+    q_starts = model.joint_q_start.numpy()
+    qd_starts = model.joint_qd_start.numpy()
+    limit_lo = model.joint_limit_lower.numpy()
+    limit_hi = model.joint_limit_upper.numpy()
+    dof_total = limit_lo.shape[0]
+    coord_layout = init.shape[0] == model.joint_coord_count
+    quat_joints = (int(newton.JointType.FREE), int(newton.JointType.BALL), int(newton.JointType.DISTANCE))
+    for j, jt in enumerate(joint_types):
+        if jt in quat_joints:
+            continue
+        d0 = int(qd_starts[j])
+        d1 = int(qd_starts[j + 1]) if j + 1 < len(qd_starts) else dof_total
+        for d in range(d0, d1):
+            i = int(q_starts[j]) + (d - d0) if coord_layout else d
+            lower_raw = float(limit_lo[d])
+            upper_raw = float(limit_hi[d])
+            lower = max(lower_raw, -1.0) if lower_raw > -1.0e6 else -1.0
+            upper = min(upper_raw, 1.0) if upper_raw < 1.0e6 else 1.0
+            if lower >= upper and -1.0e6 < lower_raw < upper_raw < 1.0e6:
+                lower, upper = lower_raw, upper_raw  # bounded range outside [-1, 1]
+            if lower < upper:
+                lo[i], hi[i] = lower, upper
+    return lo, hi
+
+
 ROBOT_CONFIGS = {
     "humanoid": {
         "solver": "newton",
         "integrator": "implicitfast",
         "njmax": 80,
         "nconmax": 25,
-        "ls_parallel": False,
         "cone": "pyramidal",
         "sensing_bodies": ["*thigh*", "*shin*", "*foot*", "*arm*"],
     },
@@ -38,7 +127,6 @@ ROBOT_CONFIGS = {
         "integrator": "implicitfast",
         "njmax": 210,
         "nconmax": 35,
-        "ls_parallel": False,
         "cone": "pyramidal",
     },
     "h1": {
@@ -46,7 +134,6 @@ ROBOT_CONFIGS = {
         "integrator": "implicitfast",
         "njmax": 65,
         "nconmax": 15,
-        "ls_parallel": False,
         "cone": "pyramidal",
     },
     "cartpole": {
@@ -54,7 +141,6 @@ ROBOT_CONFIGS = {
         "integrator": "implicitfast",
         "njmax": 5,
         "nconmax": 0,
-        "ls_parallel": False,
         "cone": "pyramidal",
     },
     "ant": {
@@ -62,7 +148,6 @@ ROBOT_CONFIGS = {
         "integrator": "implicitfast",
         "njmax": 38,
         "nconmax": 15,
-        "ls_parallel": False,
         "cone": "pyramidal",
     },
     "quadruped": {
@@ -70,7 +155,6 @@ ROBOT_CONFIGS = {
         "integrator": "implicitfast",
         "njmax": 75,
         "nconmax": 50,
-        "ls_parallel": False,
         "cone": "pyramidal",
     },
     "allegro": {
@@ -78,7 +162,6 @@ ROBOT_CONFIGS = {
         "integrator": "implicitfast",
         "njmax": 60,
         "nconmax": 40,
-        "ls_parallel": False,
         "cone": "elliptic",
     },
     "kitchen": {
@@ -218,6 +301,7 @@ def _setup_quadruped(articulation_builder):
         xform=wp.transform([0.0, 0.0, 0.7], wp.quat_identity()),
         floating=True,
         enable_self_collisions=False,
+        joint_damping_mode="passive",
     )
     armature_inertia = wp.mat33(np.eye(3, dtype=np.float32)) * 0.01
     for i in range(articulation_builder.body_count):
@@ -230,6 +314,7 @@ def _setup_quadruped(articulation_builder):
 def _setup_allegro(articulation_builder):
     asset_path = newton.utils.download_asset("wonik_allegro")
     asset_file = str(asset_path / "usd" / "allegro_left_hand_with_cube.usda")
+    articulation_builder.rigid_gap = 0.0
     articulation_builder.add_usd(
         asset_file,
         xform=wp.transform(wp.vec3(0, 0, 0.5)),
@@ -240,8 +325,12 @@ def _setup_allegro(articulation_builder):
     # set joint targets and joint drive gains
     for i in range(articulation_builder.joint_dof_count):
         articulation_builder.joint_target_ke[i] = 150
-        articulation_builder.joint_target_kd[i] = 5
-        articulation_builder.joint_target_pos[i] = 0.0
+        articulation_builder.joint_target_kd[i] = 20
+    if _NEW_LAYOUT_AVAILABLE:
+        articulation_builder.joint_target_q[:] = articulation_builder.joint_q
+    else:
+        for i in range(articulation_builder.joint_dof_count):
+            articulation_builder.joint_target_pos[i] = 0.0
     root_dofs = 1
 
     return root_dofs
@@ -286,14 +375,18 @@ class Example:
         njmax=None,
         nconmax=None,
         builder=None,
-        ls_parallel=None,
         cone=None,
+        fps=600,
+        sim_substeps=10,
     ):
-        fps = 600
+        if _NEW_LAYOUT_AVAILABLE:
+            newton.use_coord_layout_targets = True
+        if fps <= 0 or sim_substeps <= 0:
+            raise ValueError("fps and sim_substeps must be positive")
         self.sim_time = 0.0
         self.benchmark_time = 0.0
         self.frame_dt = 1.0 / fps
-        self.sim_substeps = 10
+        self.sim_substeps = sim_substeps
         self.contacts = None
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.world_count = world_count
@@ -301,9 +394,7 @@ class Example:
         self.use_mujoco_cpu = use_mujoco_cpu
         self.actuation = actuation
 
-        # set numpy random seed
         self.seed = 123
-        self.rng = np.random.default_rng(self.seed)
 
         if not stage_path:
             stage_path = "example_" + robot + ".usd"
@@ -325,7 +416,6 @@ class Example:
             ls_iteration=ls_iteration,
             njmax=njmax,
             nconmax=nconmax,
-            ls_parallel=ls_parallel,
             cone=cone,
         )
 
@@ -340,16 +430,27 @@ class Example:
         self.state_0, self.state_1 = self.model.state(), self.model.state()
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
 
+        if self.actuation == "random":
+            self.init_waypoint_control()
+
         self.sensor_contact = None
+        self.solver_observables = None
         sensing_bodies = ROBOT_CONFIGS.get(robot, {}).get("sensing_bodies", None)
         if sensing_bodies is not None:
-            self.sensor_contact = SensorContact(self.model, sensing_obj_bodies=sensing_bodies, counterpart_bodies="*")
-            self.contacts = newton.Contacts(
-                self.solver.get_max_contact_count(),
-                0,
-                device=self.model.device,
-                requested_attributes=self.model.get_requested_contact_attributes(),
+            self.sensor_contact = SensorContact(
+                self.model, request_contact_attributes=False, sensing_bodies=sensing_bodies, counterpart_bodies="*"
             )
+            self.collision_pipeline = newton.CollisionPipeline(
+                self.model, rigid_contact_max=self.solver.get_max_contact_count(), soft_contact_max=0
+            )
+            self.contacts = self.collision_pipeline.contacts()
+            # ASV also runs this benchmark against revisions with the older API.
+            if hasattr(self.sensor_contact, "solver_observable_kinds"):
+                self.solver_observables = self.solver.observables(
+                    contacts=self.contacts, kinds=self.sensor_contact.solver_observable_kinds
+                )
+            else:
+                self.solver_observables = self.solver.observables(self.sensor_contact.solver_observable_flags)
 
         self.graph = None
         if self.use_cuda_graph:
@@ -363,30 +464,70 @@ class Example:
                 self.graph = capture.graph
 
     def simulate(self):
-        for _ in range(self.sim_substeps):
+        for substep in range(self.sim_substeps):
             self.state_0.clear_forces()
-            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+            # The contact sensor consumes only the final substep's forces.
+            if self.solver_observables is not None and substep == self.sim_substeps - 1:
+                self.solver.step(
+                    self.state_0,
+                    self.state_1,
+                    self.control,
+                    self.contacts,
+                    self.sim_dt,
+                    observables=self.solver_observables,
+                )
+            else:
+                self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
         if self.sensor_contact is not None:
-            self.solver.update_contacts(self.contacts, self.state_0)
-            self.sensor_contact.update(self.state_0, self.contacts)
+            self.sensor_contact.update(self.state_0, self.contacts, observables=self.solver_observables)
+
+    def init_waypoint_control(self):
+        lo, hi = _target_bounds(self.model)
+        self._target_lo = wp.array(lo, dtype=wp.float32)
+        self._target_hi = wp.array(hi, dtype=wp.float32)
+        self._target_frame = wp.zeros(1, dtype=int)
+
+    def apply_waypoint_control(self):
+        """Enqueue one frame of waypoint target tracking; safe to graph-capture."""
+        target_q = _target_q(self.control)
+        wp.launch(
+            _waypoint_control,
+            dim=(target_q.shape[0],),
+            inputs=[
+                self.seed,
+                self._target_frame,
+                self._target_lo,
+                self._target_hi,
+                TARGET_SLEW_PER_FRAME,
+                TARGET_WAYPOINT_FRAMES,
+            ],
+            outputs=[target_q],
+        )
+        wp.launch(_advance_frame, dim=1, inputs=[self._target_frame])
 
     def step(self):
         if self.actuation == "random":
-            joint_target = wp.array(self.rng.uniform(-1.0, 1.0, size=self.model.joint_dof_count), dtype=wp.float32)
-            wp.copy(self.control.joint_target_pos, joint_target)
+            self.apply_waypoint_control()
 
         wp.synchronize_device()
-        start_time = time.time()
-        if self.use_cuda_graph:
+        start_time = time.perf_counter()
+        if self.use_cuda_graph and self.graph is not None:
             wp.capture_launch(self.graph)
         else:
             self.simulate()
         wp.synchronize_device()
-        end_time = time.time()
+        end_time = time.perf_counter()
 
         self.benchmark_time += end_time - start_time
         self.sim_time += self.frame_dt
+
+    def test_final(self):
+        validate_simulation_state(
+            self.state_0,
+            max_linear_speed=_MAX_BODY_LINEAR_SPEED,
+            max_angular_speed=_MAX_BODY_ANGULAR_SPEED,
+        )
 
     def render(self):
         if self.renderer is None:
@@ -426,6 +567,7 @@ class Example:
             custom_setup_fn(articulation_builder)
 
         builder = newton.ModelBuilder()
+        builder.rigid_gap = articulation_builder.rigid_gap
         builder.replicate(articulation_builder, world_count)
         if randomize:
             njoint = len(articulation_builder.joint_q)
@@ -454,16 +596,12 @@ class Example:
         ls_iteration=None,
         njmax=None,
         nconmax=None,
-        ls_parallel=None,
         cone=None,
     ):
-        solver_iteration = solver_iteration if solver_iteration is not None else 100
-        ls_iteration = ls_iteration if ls_iteration is not None else 50
         solver = solver if solver is not None else ROBOT_CONFIGS[robot]["solver"]
         integrator = integrator if integrator is not None else ROBOT_CONFIGS[robot]["integrator"]
         njmax = njmax if njmax is not None else ROBOT_CONFIGS[robot]["njmax"]
         nconmax = nconmax if nconmax is not None else ROBOT_CONFIGS[robot]["nconmax"]
-        ls_parallel = ls_parallel if ls_parallel is not None else ROBOT_CONFIGS[robot]["ls_parallel"]
         cone = cone if cone is not None else ROBOT_CONFIGS[robot]["cone"]
 
         njmax += ROBOT_CONFIGS.get(environment, {}).get("njmax", 0)
@@ -478,7 +616,6 @@ class Example:
             ls_iterations=ls_iteration,
             njmax=njmax,
             nconmax=nconmax,
-            ls_parallel=ls_parallel,
             cone=cone,
         )
 
@@ -550,9 +687,6 @@ if __name__ == "__main__":
     parser.add_argument("--ls-iteration", type=int, default=None, help="Number of linesearch iterations.")
     parser.add_argument("--njmax", type=int, default=None, help="Maximum number of constraints per world.")
     parser.add_argument("--nconmax", type=int, default=None, help="Maximum number of collision per world.")
-    parser.add_argument(
-        "--ls-parallel", default=None, action=argparse.BooleanOptionalAction, help="Use parallel line search."
-    )
     parser.add_argument("--cone", type=str, default=None, choices=["pyramidal", "elliptic"], help="Friction cone type.")
 
     args = parser.parse_known_args()[0]
@@ -580,7 +714,6 @@ if __name__ == "__main__":
                 ls_iteration=args.ls_iteration,
                 njmax=args.njmax,
                 nconmax=args.nconmax,
-                ls_parallel=args.ls_parallel,
                 cone=args.cone,
             )
 
@@ -621,7 +754,6 @@ if __name__ == "__main__":
             )
             print(f"{'Solver':<{LABEL_WIDTH}}: {actual_solver}")
             print(f"{'Integrator':<{LABEL_WIDTH}}: {actual_integrator}")
-            # print(f"{'Parallel Line Search':<{LABEL_WIDTH}}: {example.solver.mj_model.opt.ls_parallel}")
             print(f"{'Cone':<{LABEL_WIDTH}}: {actual_cone}")
             print(f"{'Solver Iterations':<{LABEL_WIDTH}}: {example.solver.mj_model.opt.iterations}")
             print(f"{'Line Search Iterations':<{LABEL_WIDTH}}: {example.solver.mj_model.opt.ls_iterations}")
