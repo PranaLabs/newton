@@ -13,6 +13,7 @@ import numpy as np
 import warp as wp
 
 from ..core.types import Vec3
+from ..exceptions import NewtonWarning
 from .inertia import compute_inertia_mesh
 from .types import (
     GeoType,
@@ -403,18 +404,11 @@ def load_mesh(filename: str, method: str | None = None):
 
             m = trimesh.load(filename)
             if hasattr(m, "geometry"):
-                # multiple meshes are contained in a scene; combine to one mesh
-                mesh_points = []
-                mesh_indices = []
-                index_offset = 0
-                for geom in m.geometry.values():
-                    vertices = np.array(geom.vertices, dtype=np.float32)
-                    faces = np.array(geom.faces.flatten(), dtype=np.int32)
-                    mesh_points.append(vertices)
-                    mesh_indices.append(faces + index_offset)
-                    index_offset += len(vertices)
-                mesh_points = np.concatenate(mesh_points, axis=0)
-                mesh_indices = np.concatenate(mesh_indices)
+                # Combine scene parts with their node transforms applied;
+                # raw vertices are in node-local space.
+                combined = m.to_mesh()
+                mesh_points = np.array(combined.vertices, dtype=np.float32)
+                mesh_indices = np.array(combined.faces.flatten(), dtype=np.int32)
             else:
                 # a single mesh
                 mesh_points = np.array(m.vertices, dtype=np.float32)
@@ -575,7 +569,9 @@ def remesh_ftetwild(
 
     if len(new_vertices) == 0 or len(new_faces) == 0:
         warnings.warn(
-            "Remeshing failed, the optimized mesh has no vertices or faces; return previous mesh.", stacklevel=2
+            "Remeshing failed, the optimized mesh has no vertices or faces; return previous mesh.",
+            NewtonWarning,
+            stacklevel=2,
         )
         return vertices, faces
 
@@ -787,7 +783,7 @@ def remesh_convex_hull(vertices: np.ndarray, maxhullvert: int = 0, eps: float = 
             f"remesh_convex_hull: input point cloud is {rank}; returning a "
             "zero-volume fallback mesh. Downstream inertia computations will "
             "produce zero mass / COM / inertia.",
-            UserWarning,
+            NewtonWarning,
             stacklevel=2,
         )
 
@@ -893,7 +889,7 @@ def remesh_convex_hull(vertices: np.ndarray, maxhullvert: int = 0, eps: float = 
     return verts, faces
 
 
-RemeshingMethod = Literal["ftetwild", "alphashape", "quadratic", "convex_hull", "poisson"]
+RemeshingMethod = Literal["ftetwild", "alphashape", "quadratic", "convex_hull", "poisson", "isotropic"]
 
 
 def remesh(
@@ -910,7 +906,9 @@ def remesh(
         vertices: A numpy array of shape (N, 3) containing the vertex positions.
         faces: A numpy array of shape (M, 3) containing the vertex indices of the faces.
         method: The remeshing method to use. One of "ftetwild", "quadratic", "convex_hull",
-            "alphashape", or "poisson".
+            "alphashape", "poisson", or "isotropic", which evens out the edges of open or closed
+            surfaces toward ``edge_length`` [m], the input's mean edge length by default, in
+            ``iterations`` passes, 10 by default.
         visualize: Whether to render the input and output meshes using matplotlib.
         **remeshing_kwargs: Additional keyword arguments passed to the remeshing function.
 
@@ -929,6 +927,10 @@ def remesh(
         from newton._src.geometry.remesh import remesh_poisson  # noqa: PLC0415
 
         new_vertices, new_faces = remesh_poisson(vertices, faces, **remeshing_kwargs)
+    elif method == "isotropic":
+        from newton._src.geometry.remesh_isotropic import remesh_isotropic  # noqa: PLC0415
+
+        new_vertices, new_faces = remesh_isotropic(vertices, faces, **remeshing_kwargs)
     else:
         raise ValueError(f"Unknown remeshing method: {method}")
 
@@ -957,8 +959,10 @@ def remesh_mesh(
     Args:
         mesh: The mesh to be remeshed.
         method: The remeshing method to use.
-            One of "ftetwild", "quadratic", "convex_hull", "alphashape", or "poisson".
-            Defaults to "quadratic".
+            One of "ftetwild", "quadratic", "convex_hull", "alphashape", "poisson", or "isotropic".
+            Defaults to "quadratic". "isotropic" evens out the edges of open or closed surfaces
+            toward the keyword argument ``edge_length`` [m], the input's mean edge length by
+            default, in ``iterations`` passes, 10 by default.
         recompute_inertia: If True, recompute the mass, center of mass,
             and inertia tensor of the mesh after remeshing. Defaults to False.
         inplace: If True, modify the mesh in place. If False,

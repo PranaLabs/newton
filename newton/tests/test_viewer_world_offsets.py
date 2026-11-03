@@ -474,6 +474,56 @@ class TestViewerWorldOffsets(unittest.TestCase):
         for i in range(world_count):
             assert_np_equal(world_xforms[i][:3], expected_offsets[i], tol=1e-5)
 
+    def test_cloth_and_particles_follow_world_offsets(self):
+        """Cloth triangles and particles are drawn at their worlds' offsets, global particles stay, the offsets come
+        before inactive particles are dropped and before a layer transform, and the state keeps its positions."""
+
+        class Recorder(ViewerNull):
+            def log_mesh(self, name, points, indices, *args, **kwargs):
+                self.mesh_points = points.numpy()
+
+            def log_points(self, name, points, *args, **kwargs):
+                self.points = points.numpy()
+
+        world = newton.ModelBuilder()
+        world.add_cloth_grid(
+            pos=wp.vec3(0.0, 0.0, 1.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=1,
+            dim_y=1,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+        )
+        world.particle_flags[0] = 0  # inactive: dropped from the points
+        builder = newton.ModelBuilder()
+        builder.replicate(world, 2)
+        builder.add_particle(wp.vec3(0.0, 0.0, 3.0), wp.vec3(0.0), 0.01)  # global
+        model = builder.finalize(device="cpu")
+        state = model.state()
+        q = state.particle_q.numpy().copy()
+        offsets = np.repeat([[-5.0, 0.0, 0.0], [5.0, 0.0, 0.0], [0.0, 0.0, 0.0]], [4, 4, 1], axis=0)
+        # a quarter turn about z after the offsets
+        turn = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), 0.5 * np.pi)
+        R = np.array(wp.quat_to_matrix(turn)).reshape(3, 3)
+        for layer in (None, "turned"):
+            with self.subTest(layer=layer):
+                viewer = Recorder(num_frames=1)
+                if layer:
+                    viewer.activate(layer)
+                viewer.set_model(model)
+                viewer.set_world_offsets((10.0, 0.0, 0.0))
+                if layer:
+                    viewer.set_layer_transform(layer, wp.transform(wp.vec3(0.0), turn))
+                viewer.begin_frame(0.0)
+                viewer.log_state(state)
+                viewer.end_frame()
+                expected = (q + offsets) @ (R.T if layer else np.eye(3))
+                assert_np_equal(viewer.mesh_points, expected, tol=1e-5)
+                assert_np_equal(viewer.points, np.delete(expected, [0, 4], axis=0), tol=1e-5)
+                assert_np_equal(state.particle_q.numpy(), q, tol=0.0)
+
 
 def test_visual_separation(test: TestViewerWorldOffsets, device):
     """Test that viewer offsets provide visual separation without affecting physics."""

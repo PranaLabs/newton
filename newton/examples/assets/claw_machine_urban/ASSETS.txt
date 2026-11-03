@@ -1,0 +1,24 @@
+Claw machine example assets
+===========================
+
+Cabinet, articulated claw, bear and elephant:
+  Third-party models prepared for this example, with the cabinet's front
+  glass hidden and pastel toy materials. They keep their original license
+  terms, which the repository's source-code license does not change; they
+  came without a separate license document.
+
+Bunny and T2 toy:
+  Prepared from earlier Newton demonstration assets, whose terms apply.
+
+simulation.npz:
+  The tetrahedral rest meshes of the 25 toys, their per-tetrahedron
+  materials, and two states, positions and velocities of particles and
+  bodies: settled at 6 s and with the claw open over the bear at 10.5 s.
+
+Visuals:
+  visuals.usdc: visual surfaces and display colors, source Z-up metres,
+  shifted by the origin in scene.json; rigid mesh points are body-local.
+  visuals.json: body and toy of each surface, material factors and textures.
+  skin_bindings.npz: how each toy's visual surface follows its tetrahedra,
+  for rendering only.
+  PNG files: textures of the materials.

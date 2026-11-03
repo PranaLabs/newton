@@ -20,6 +20,8 @@ repos:
     hooks:
       - id: check-added-large-files
         args: [--maxkb=500]
+        # The meshes, states and textures of the claw machine example.
+        exclude: ^newton/examples/assets/claw_machine_urban/.*\.(npz|usdc|png)$
       - id: check-case-conflict
       - id: check-illegal-windows-names
       - id: check-json
@@ -58,3 +60,10 @@ repos:
         language: python
         types: [python]
         exclude: ^(scripts/check_warp_array_syntax\.py)
+      - id: no-patch-dict-sys-modules
+        name: use patch_sys_module instead of patch.dict(sys.modules)
+        # patch.dict also drops modules first imported inside it (e.g. Warp internals).
+        language: pygrep
+        entry: patch\.dict\s*\((?:\s*|[^()]*\bin_dict\s*=\s*)["']?sys\.modules\b
+        args: [--multiline]
+        files: ^newton/tests/.*\.py$

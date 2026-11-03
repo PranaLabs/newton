@@ -1,0 +1,1 @@
+Add `particle_self_contact_group_ids` and `particle_self_contact_group_margins` to `SolverFBA`: a self-contact margin within each group of particles, such as each body of a pile, and `particle_self_contact_margin` between groups; a group without a margin, or with a 0 margin, collides only with the other groups' triangles.

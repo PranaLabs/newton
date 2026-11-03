@@ -738,7 +738,6 @@ class Example:
     """Conveyor circuit whose static belts carry rigid boxes with contact forces."""
 
     def __init__(self, viewer, args=None):
-        newton.use_coord_layout_targets = True
         self.solver_type = getattr(args, "solver", "xpbd") if args is not None else "xpbd"
 
         self.fps = 60
@@ -802,7 +801,6 @@ class Example:
             self.solver = newton.solvers.SolverVBD(
                 self.model,
                 iterations=VBD_ITERATIONS,
-                rigid_compliant_alm=True,
                 rigid_joint_linear_ke=1.0e2,
                 rigid_joint_angular_ke=1.0e2,
                 rigid_body_contact_buffer_size=64,

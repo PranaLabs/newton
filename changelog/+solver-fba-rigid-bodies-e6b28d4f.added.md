@@ -1,0 +1,1 @@
+Add rigid bodies with fixed, revolute, prismatic, ball and D6 joints and their contacts to `SolverFBA`, or let another solver step them (`integrate_with_external_rigid_solver`), with the `cloth_on_boxes_fba` and `softbody_franka_fba` examples.

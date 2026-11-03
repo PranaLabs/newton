@@ -1,0 +1,1 @@
+Add face contacts to `SolverFBA` (`face_contacts`), which keep shape edges and corners out of cloth triangles and hold particles in concave mesh corners, with the `face_contact_edge_radius` and `face_contact_gap` options, `contact_regularization` for the Newton steps of contact rows on several particles, and the `cloth_on_knives_fba` example.

@@ -1,0 +1,1 @@
+Add tetrahedral activations (`Control.tet_activations`) to `SolverFBA`, which grow or shrink each tetrahedron to `1 - a` times its rest volume, isotropically or along per-tetrahedron directions (`tet_activation_directions`), and the `pneunet_gripper_fba` example.
