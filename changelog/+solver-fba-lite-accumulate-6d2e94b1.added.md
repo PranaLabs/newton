@@ -1,0 +1,1 @@
+Add `nsn_lite_accumulate` to `SolverFBA`: the sparse lite NSN, which steps with self contacts take, keeps the contact forces of a step's earlier iterations and solves for their change, so stacked cloth layers keep their margin at longer time steps.

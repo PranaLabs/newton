@@ -1,0 +1,4834 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+import math
+import unittest
+
+import numpy as np
+import warp as wp
+
+import newton
+from newton import CollisionPipeline
+from newton._src.solvers.fba import SolverFBA
+from newton._src.solvers.fba.linear_solver import (
+    FBALinearSolver,
+    build_particle_element_csr,
+    build_pd_system,
+    build_rigid_system,
+    factorize_and_sparse_inverse,
+)
+
+
+def _projection_rhs(kernel, inputs, arity):
+    """Run a local projection kernel over its elements and sum each element's contributions per particle, as the
+    solver's gather does: the right-hand side the projection adds. ``inputs[0]`` holds the positions and
+    ``inputs[1]`` the element vertex indices, ``arity`` per element."""
+    positions, elements = inputs[0], inputs[1].numpy().reshape(-1, arity)
+    contributions = wp.zeros(elements.shape, dtype=wp.vec3, device=positions.device)
+    wp.launch(kernel, dim=elements.shape[0], inputs=inputs, outputs=[contributions], device=positions.device)
+    rhs = np.zeros((positions.shape[0], 3), dtype=np.float32)
+    np.add.at(rhs, elements, contributions.numpy())
+    return rhs
+
+
+def _no_activation(weight):
+    """Activations and growth directions of the elements that ``weight`` holds, all zero: no growth."""
+    count, device = weight.shape[0], weight.device
+    return wp.zeros(count, dtype=wp.float32, device=device), wp.zeros(count, dtype=wp.vec3, device=device)
+
+
+class TestSolverFBAImport(unittest.TestCase):
+    def test_import_solver_fba(self):
+        """Import SolverFBA from the FBA package."""
+        assert SolverFBA is not None
+
+
+class TestBuildPDSystem(unittest.TestCase):
+    """PD Hessian assembly on a 2-triangle mesh: sanity checks of its entries."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _build_two_triangle_cloth(self):
+        # Two triangles sharing edge (1, 2):
+        #     0 --- 1
+        #     |   / |
+        #     | /   |
+        #     2 --- 3
+        builder = newton.ModelBuilder()
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=[
+                wp.vec3(0.0, 0.0, 0.0),
+                wp.vec3(1.0, 0.0, 0.0),
+                wp.vec3(0.0, 0.0, 1.0),
+                wp.vec3(1.0, 0.0, 1.0),
+            ],
+            indices=[0, 1, 2, 1, 3, 2],
+            density=1.0,
+            tri_ke=50.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0,
+            edge_kd=0.0,
+        )
+        return builder.finalize(device="cpu")
+
+    def test_diagonal_includes_mass_over_dt_squared(self):
+        """Assemble a symmetric PD matrix whose diagonal holds at least ``m / dt²`` for every free particle."""
+        model = self._build_two_triangle_cloth()
+        dt = 1.0 / 60.0
+        A = build_pd_system(model, dt=dt, pin_stiffness=1e12)[0].toarray()
+
+        self.assertEqual(A.shape, (model.particle_count, model.particle_count))
+        # A is symmetric.
+        diff = A - A.T
+        self.assertLess(np.abs(diff).max(), 1e-10)
+
+        # Diagonal of mass contribution: m_i/dt^2 for free particles.
+        masses = model.particle_mass.numpy()
+        inv_masses = model.particle_inv_mass.numpy()
+        diag = A.diagonal()
+        for i in range(model.particle_count):
+            if inv_masses[i] > 0.0:
+                # Contains at least m/dt^2 (other terms add on top).
+                self.assertGreaterEqual(diag[i], masses[i] / (dt * dt) - 1e-9)
+
+    def test_pin_stiffness_on_pinned_diagonal(self):
+        """Add the pin stiffness to the diagonal of a particle pinned by a zero mass."""
+        builder = newton.ModelBuilder()
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=[wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0, 0, 1)],
+            indices=[0, 1, 2],
+            density=1.0,
+            tri_ke=50.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+        )
+        # Manually pin particle 0 by setting mass to 0.
+        builder.particle_mass[0] = 0.0
+        model = builder.finalize(device="cpu")
+
+        A = build_pd_system(model, dt=1.0 / 60.0, pin_stiffness=1e12)[0].toarray()
+        # Pin contributes pin_stiffness to A[0,0].
+        self.assertGreaterEqual(A[0, 0], 1e12 - 1e-3)
+
+
+class TestBendingQMatchesReference(unittest.TestCase):
+    """Verify _compute_isometric_bending_q against a hand-computed reference
+    on an asymmetric quad, whose four cotangent weights all differ.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_bending_q_matches_reference(self):
+        """Match the cotangent weights and the ``3 / (A0 + A1)`` scale of an asymmetric quad's interior edge with a hand
+        computation."""
+        # Asymmetric quad: triangles (0,1,2) and (1,3,2) sharing edge (1,2).
+        builder = newton.ModelBuilder()
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=[
+                wp.vec3(0.0, 0.0, 0.0),  # v0
+                wp.vec3(2.0, 0.0, 0.0),  # v1
+                wp.vec3(0.1, 0.0, 1.0),  # v2 (skewed)
+                wp.vec3(1.9, 0.0, -1.0),  # v3 (different skew)
+            ],
+            indices=[0, 1, 2, 1, 3, 2],
+            density=1.0,
+            tri_ke=50.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0,
+            edge_kd=0.0,
+        )
+        model = builder.finalize(device="cpu")
+
+        # Inspect Newton's edge layout to find the interior edge and its stencil
+        # permutation.  Newton stores [o0, o1, v1, v2]; reordering to
+        # [v1, v2, o0, o1] gives the (v0, v1, v2, v3) stencil used internally.
+        ei = model.edge_indices.numpy().reshape(-1, 4)
+        interior_mask = (ei[:, 0] >= 0) & (ei[:, 1] >= 0)
+        ei_interior = ei[interior_mask]
+        # There must be exactly one interior edge for this two-triangle mesh.
+        self.assertEqual(ei_interior.shape[0], 1)
+        # After reorder: stencil = [v1=1, v2=2, o0=0, o1=3] -> (v0=1,v1=2,v2=0,v3=3)
+        stencil = ei_interior[0, [2, 3, 0, 1]]  # [v1, v2, o0, o1]
+        self.assertListEqual(list(stencil), [1, 2, 0, 3])
+
+        _A, meta = build_pd_system(model, dt=1.0 / 60.0, pin_stiffness=1e12)
+
+        # Hand-computed reference for stencil (v0=1,v1=2,v2=0,v3=3):
+        #   x0=(2,0,0), x1=(0.1,0,1), x2=(0,0,0), x3=(1.9,0,-1)
+        x0 = np.array([2.0, 0.0, 0.0])
+        x1 = np.array([0.1, 0.0, 1.0])
+        x2 = np.array([0.0, 0.0, 0.0])
+        x3 = np.array([1.9, 0.0, -1.0])
+        l01 = np.linalg.norm(x1 - x0)
+        l02 = np.linalg.norm(x2 - x0)
+        l12 = np.linalg.norm(x2 - x1)
+        l03 = np.linalg.norm(x3 - x0)
+        l13 = np.linalg.norm(x3 - x1)
+        r0 = 0.5 * (l01 + l02 + l12)
+        A0 = np.sqrt(max(r0 * (r0 - l01) * (r0 - l02) * (r0 - l12), 0.0))
+        r1 = 0.5 * (l01 + l03 + l13)
+        A1 = np.sqrt(max(r1 * (r1 - l01) * (r1 - l03) * (r1 - l13), 0.0))
+        cot02 = (l01 * l01 - l02 * l02 + l12 * l12) / (4.0 * max(A0, 1e-20))
+        cot12 = (l01 * l01 + l02 * l02 - l12 * l12) / (4.0 * max(A0, 1e-20))
+        cot03 = (l01 * l01 - l03 * l03 + l13 * l13) / (4.0 * max(A1, 1e-20))
+        cot13 = (l01 * l01 + l03 * l03 - l13 * l13) / (4.0 * max(A1, 1e-20))
+        q_ref = np.array([cot02 + cot03, cot12 + cot13, -(cot02 + cot12), -(cot03 + cot13)])
+        scale_ref = 3.0 / max(A0 + A1, 1e-20)
+
+        self.assertTrue(
+            np.allclose(meta["edge_quad_q"][0], q_ref, atol=1e-10),
+            f"q mismatch: got {meta['edge_quad_q'][0]}, expected {q_ref}",
+        )
+        self.assertTrue(
+            np.allclose(meta["edge_quad_scale"][0], scale_ref, atol=1e-10),
+            f"scale mismatch: got {meta['edge_quad_scale'][0]}, expected {scale_ref}",
+        )
+
+    def test_bending_matches_style3d(self):
+        """Assemble the bending matrix SolverStyle3D assembles: each interior edge adds
+        ``edge_ke * 3 / (A0 + A1) * w w^T`` with the cotangent weights ``w`` that Style3D stores for the edge."""
+        builder = newton.ModelBuilder()
+        newton.solvers.SolverStyle3D.register_custom_attributes(builder)
+        # Cells of 10 x 20 cm: legs and diagonals of three lengths, and areas at which Style3D's 1e-8
+        # regularization of areas and cotangents stays below 1e-6.
+        newton.solvers.style3d.add_cloth_grid(
+            builder,
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=5,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.2,
+            mass=0.01,
+        )
+        model = builder.finalize(device="cpu")
+        n = model.particle_count
+        bending = model.edge_bending_properties.numpy().copy()  # a CPU array's numpy() is a view
+        self.assertGreater(bending[:, 0].min(), 0.0)
+
+        # Style3D's Hessian (style3d/builder.py add_bend_constraints); it skips boundary edges.
+        edges = model.edge_indices.numpy()
+        area, cot = model.style3d.edge_rest_area.numpy(), model.style3d.edge_bending_cot.numpy()
+        w = np.stack([-cot[:, 0] - cot[:, 2], -cot[:, 1] - cot[:, 3], cot[:, 2] + cot[:, 3], cot[:, 0] + cot[:, 1]], 1)
+        expected = np.zeros((n, n))
+        for e in np.flatnonzero((edges[:, 0] >= 0) & (edges[:, 1] >= 0)):
+            expected[np.ix_(edges[e], edges[e])] += bending[e, 0] * 3.0 / area[e] * np.outer(w[e], w[e])
+
+        # FBA's bending part: its PD matrix with the model's edge_ke minus the one without bending.
+        with_bending = build_pd_system(model, dt=1.0, pin_stiffness=0.0)[0].toarray()
+        model.edge_bending_properties.assign(bending * np.array([0.0, 1.0], dtype=np.float32))
+        without_bending = build_pd_system(model, dt=1.0, pin_stiffness=0.0)[0].toarray()
+        np.testing.assert_allclose(
+            with_bending - without_bending, expected, rtol=0.0, atol=1e-5 * np.abs(expected).max()
+        )
+
+
+class TestSparseInverse(unittest.TestCase):
+    """compute_lower_inverse matches dense np.linalg.inv on small SPD matrices."""
+
+    def test_random_spd_8x8(self):
+        """Reproduce the permuted inverse of a tridiagonal SPD matrix as ``Sᵀ D⁻¹ S``."""
+        from newton._src.solvers.fba.linear_solver import (  # noqa: PLC0415
+            _elimination_tree,
+            compute_lower_inverse,
+        )
+        from newton._src.solvers.fba.sparse_ldlt import CsrMatrix, factor_ldlt  # noqa: PLC0415
+
+        rng = np.random.default_rng(0)
+        n = 8
+        off = rng.uniform(-1.0, 1.0, n - 1)
+        A = np.diag(rng.uniform(10.0, 20.0, n)) + np.diag(off, 1) + np.diag(off, -1)
+        # Points along a line make the nested dissection reorder the unknowns.
+        points = np.stack([np.arange(n), np.zeros(n), np.zeros(n)], axis=1).astype(np.float64)
+        order, L, d = factor_ldlt(CsrMatrix.from_matrix(A), points, leaf_size=2)
+        S = compute_lower_inverse(L, parent=_elimination_tree(L)).toarray()
+        Ainv = np.linalg.inv(A)[np.ix_(order, order)]
+        self.assertLess(np.abs(S.T @ np.diag(1.0 / d) @ S - Ainv).max(), 1e-12)
+
+
+class TestFBALinearSolver(unittest.TestCase):
+    """End-to-end linear solve and permutation round trip."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_solve_random_spd(self):
+        """Solve a random tridiagonal SPD system for all three components to a relative residual of 1e-6."""
+        import scipy.sparse as sp
+
+        from newton._src.solvers.fba.linear_solver import (  # noqa: PLC0415
+            FBALinearSolver,
+            factorize_and_sparse_inverse,
+        )
+
+        rng = np.random.default_rng(42)
+        n = 64
+        diag = rng.uniform(10.0, 20.0, n)
+        off = rng.uniform(-0.5, 0.5, n - 1)
+        A = sp.diags([off, diag, off], [-1, 0, 1], shape=(n, n), format="csr").astype(np.float64)
+
+        fs = factorize_and_sparse_inverse(A)
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        solver = FBALinearSolver(fs, device=device)
+
+        b_np = rng.standard_normal((n, 3))
+        b = wp.array(b_np, dtype=wp.vec3, device=device)
+        x = wp.empty(n, dtype=wp.vec3, device=device)
+
+        solver.solve(b, x)
+        x_np = x.numpy()
+
+        # Verify A · x ≈ b for each component.
+        for c in range(3):
+            r = A.dot(x_np[:, c]) - b_np[:, c]
+            self.assertLess(np.linalg.norm(r) / max(np.linalg.norm(b_np[:, c]), 1e-12), 1e-6)
+
+    def test_solve_spd_with_dominant_off_diagonal(self):
+        """Solve an SPD system whose off-diagonal entries exceed the diagonal.
+
+        Off-diagonal pivoting would break the symmetric ``A⁻¹ = Pᵀ Sᵀ D⁻¹ S P`` form; bending stencils and rigid inertia
+        produce such matrices.
+        """
+        import scipy.sparse as sp
+
+        from newton._src.solvers.fba.linear_solver import (  # noqa: PLC0415
+            FBALinearSolver,
+            factorize_and_sparse_inverse,
+        )
+
+        A_dense = np.array([[1.0, 2.0, 0.0], [2.0, 5.0, 0.0], [0.0, 0.0, 3.0]])
+        self.assertGreater(np.linalg.eigvalsh(A_dense).min(), 0.0)
+
+        fs = factorize_and_sparse_inverse(sp.csr_matrix(A_dense))
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        solver = FBALinearSolver(fs, device=device)
+
+        b_np = np.eye(3)
+        b = wp.array(b_np, dtype=wp.vec3, device=device)
+        x = wp.empty(3, dtype=wp.vec3, device=device)
+        solver.solve(b, x)
+
+        np.testing.assert_allclose(x.numpy(), np.linalg.solve(A_dense, b_np), rtol=1e-6, atol=1e-6)
+
+    def test_permutation_roundtrip(self):
+        """Permute a vector and permute it back with the inverse, as the linear solve does around the factor."""
+        from newton._src.solvers.fba.kernels import apply_permutation_scalar_kernel  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        n = 32
+        perm = np.random.default_rng(1).permutation(n).astype(np.int32)
+        invperm = np.argsort(perm).astype(np.int32)
+
+        x_np = np.random.default_rng(2).standard_normal(n)
+        x = wp.array(x_np, dtype=wp.float64, device=device)
+        y = wp.empty(n, dtype=wp.float64, device=device)
+        z = wp.empty(n, dtype=wp.float64, device=device)
+        perm_wp = wp.array(perm, dtype=wp.int32, device=device)
+        invperm_wp = wp.array(invperm, dtype=wp.int32, device=device)
+
+        wp.launch(apply_permutation_scalar_kernel, dim=n, inputs=[x, perm_wp], outputs=[y], device=device)
+        wp.launch(apply_permutation_scalar_kernel, dim=n, inputs=[y, invperm_wp], outputs=[z], device=device)
+
+        np.testing.assert_array_equal(y.numpy(), x_np[perm])
+        np.testing.assert_array_equal(z.numpy(), x_np)
+
+
+class TestBuildRigidSystem(unittest.TestCase):
+    """Rigid-body block of the PD system: ``diag(m·I₃, I) / dt²`` per body."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _model(self):
+        builder = newton.ModelBuilder()
+        # Body 0: products of inertia exceed I_xx (needs diagonal pivoting).
+        builder.add_body(mass=2.0, inertia=wp.mat33(0.1, 0.2, 0.0, 0.2, 0.5, 0.0, 0.0, 0.0, 0.3), lock_inertia=True)
+        builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)), is_kinematic=True)
+        builder.add_body(mass=3.0, inertia=wp.mat33(0.4, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.6), lock_inertia=True)
+        return builder.finalize()
+
+    def test_blocks(self):
+        """Assemble ``diag(m I3, I) / dt²`` blocks for the integrated bodies, and an empty matrix for none."""
+        model = self._model()
+        dt = 0.01
+        A = build_rigid_system(model, np.array([0, 2]), dt).toarray()
+
+        inertia = model.body_inertia.numpy().astype(np.float64)
+        expected = np.zeros((12, 12))
+        expected[0:3, 0:3] = 2.0 * np.eye(3)
+        expected[3:6, 3:6] = inertia[0]
+        expected[6:9, 6:9] = 3.0 * np.eye(3)
+        expected[9:12, 9:12] = inertia[2]
+        np.testing.assert_allclose(A, expected / dt**2, rtol=1e-12)
+        self.assertEqual(build_rigid_system(model, np.zeros(0, dtype=np.int32), dt).shape, (0, 0))
+
+    def test_solve_scalar_matches_dense(self):
+        """Solve the rigid system with ``solve_scalar`` as a dense solve does."""
+        A = build_rigid_system(self._model(), np.array([0, 2]), 0.01)
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        solver = FBALinearSolver(factorize_and_sparse_inverse(A), device=device)
+
+        b_np = np.random.default_rng(3).standard_normal(12)
+        b = wp.array(b_np, dtype=wp.float64, device=device)
+        x = wp.empty(12, dtype=wp.float64, device=device)
+        solver.solve_scalar(b, x)
+
+        x_ref = np.linalg.solve(A.toarray(), b_np)
+        np.testing.assert_allclose(x.numpy(), x_ref, rtol=1e-9, atol=1e-12 * np.abs(x_ref).max())
+
+    def test_rejects_massless_body(self):
+        """Refuse a body without mass in the rigid system."""
+        builder = newton.ModelBuilder()
+        builder.add_body(mass=0.0)
+        with self.assertRaises(ValueError):
+            build_rigid_system(builder.finalize(), np.array([0]), 0.01)
+
+
+class TestARAPProjection(unittest.TestCase):
+    """ARAP local projection on triangle stretching."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_projection_of_crushed_triangles(self):
+        """Return the nearest 3x2 matrix with orthonormal columns from svd_3x2, also for crushed triangles.
+
+        With one singular value at 1e-6 of the other, the former division by it turned float32 rounding of F^T F into
+        projections of order 1e3 and blew up a cloth piled on a table.
+        """
+        from newton._src.solvers.fba.kernels import mat32, svd_3x2  # noqa: PLC0415
+
+        @wp.kernel
+        def project(F: wp.array[mat32], P: wp.array[mat32]):
+            i = wp.tid()
+            P[i] = svd_3x2(F[i])
+
+        rng = np.random.default_rng(3)
+        cases = [rng.standard_normal((3, 2)) for _ in range(8)]
+        for s1 in (1.0e-3, 1.0e-6, 0.0):
+            for _ in range(8):
+                U = np.linalg.qr(rng.standard_normal((3, 2)))[0]
+                V = np.linalg.qr(rng.standard_normal((2, 2)))[0]
+                cases.append(U @ np.diag([rng.uniform(0.5, 2.0), s1]) @ V.T)
+        cases.append(np.zeros((3, 2)))
+        F = np.array(cases)
+        out = wp.zeros(len(F), dtype=mat32)
+        wp.launch(project, dim=len(F), inputs=[wp.array(F.astype(np.float32), dtype=mat32)], outputs=[out])
+        P = out.numpy().astype(np.float64)
+        np.testing.assert_allclose(
+            np.einsum("nki,nkj->nij", P, P), np.broadcast_to(np.eye(2), (len(F), 2, 2)), atol=1e-5
+        )
+        U, sigma, Vt = np.linalg.svd(F, full_matrices=False)
+        nearest = np.sum((sigma - 1.0) ** 2, axis=1)
+        np.testing.assert_allclose(np.sum((F - P) ** 2, axis=(1, 2)), nearest, atol=1e-5)
+        np.testing.assert_allclose(P[:8], (U @ Vt)[:8], atol=1e-5)
+
+    def test_corotational_and_neohookean_projections_of_crushed_triangles(self):
+        """Keep the corotational and Neo-Hookean projections of crushed triangles bounded.
+
+        Rebuilding the rotation as ``F v / sigma`` turned float32 rounding of a vanishing singular value into
+        contributions of order 1e7.
+        """
+        from newton._src.solvers.fba.kernels import (  # noqa: PLC0415
+            project_stretching_corotational_kernel,
+            project_stretching_neohookean_kernel,
+        )
+
+        rng = np.random.default_rng(5)
+        q = []
+        for s1 in (1.0e-2, 1.0e-6, 0.0):
+            U = np.linalg.qr(rng.standard_normal((3, 2)))[0]
+            V = np.linalg.qr(rng.standard_normal((2, 2)))[0]
+            F = U @ np.diag([1.3, s1]) @ V.T
+            q += [np.zeros(3), F[:, 0], F[:, 1]]  # a right triangle of unit legs at rest, deformed by F
+        n = len(q) // 3
+        inputs = [
+            wp.array(np.array(q, dtype=np.float32), dtype=wp.vec3),
+            wp.array(np.arange(3 * n, dtype=np.int32), dtype=wp.int32),
+            wp.array(np.tile(np.eye(2, dtype=np.float32), (n, 1, 1)), dtype=wp.mat22),
+            wp.array(np.ones(n, dtype=np.float32), dtype=wp.float32),
+            wp.array(np.ones((n, 2), dtype=np.float32), dtype=wp.vec2),
+        ]
+        for kernel in (project_stretching_corotational_kernel, project_stretching_neohookean_kernel):
+            out = wp.zeros((n, 3), dtype=wp.vec3)
+            wp.launch(kernel, dim=n, inputs=inputs, outputs=[out])
+            contributions = out.numpy()
+            self.assertTrue(np.isfinite(contributions).all(), kernel.key)
+            self.assertLess(np.abs(contributions).max(), 10.0, kernel.key)
+
+    def test_identity_F_zero_after_assembly_bias(self):
+        """Contribute the analytic ``w·Dm_inv·P^T`` at rest, with ``Dm_inv = I₂``.
+
+        For rest=current=(0,0,0),(1,0,0),(0,0,1), P (3x2) maps reference axes to
+        the embedded triangle's axes, so the rows of ``w·Dm_inv·P^T`` are
+            row0 = (1,0,0); row1 = (0,0,1)  (since P = embedding)
+        and the particles receive:
+            rhs[0] = -(row0+row1) = (-1, 0, -1)
+            rhs[1] = (1, 0, 0)
+            rhs[2] = (0, 0, 1)
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_arap_kernel  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0, 0, 1)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tri_indices = wp.array([0, 1, 2], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat22(1.0, 0.0, 0.0, 1.0)], dtype=wp.mat22, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+
+        rhs = _projection_rhs(project_stretching_arap_kernel, [positions, tri_indices, Dm_inv, weight], 3)
+        r = rhs
+        np.testing.assert_allclose(r[1], [1.0, 0.0, 0.0], atol=1e-6)
+        np.testing.assert_allclose(r[2], [0.0, 0.0, 1.0], atol=1e-6)
+        np.testing.assert_allclose(r[0], -(r[1] + r[2]), atol=1e-6)
+
+    def test_non_symmetric_Dm_inv_exposes_transpose_bug(self):
+        """Apply a non-symmetric Dm_inv (a skewed triangle's rest inverse) as Dm_inv, not Dm_inv^T.
+
+        The wrong orientation gave a ~20% error.
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_arap_kernel  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        # Current configuration = rest, so P = embedding and the contributions w·Dm_inv·P^T are exact.
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(2, 0, 0), wp.vec3(1, 0, 1)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tri_indices = wp.array([0, 1, 2], dtype=wp.int32, device=device)
+        # For this triangle: e12=(2,0,0), e13=(1,0,1); the orthonormal basis is
+        # n1=(1,0,0), n2=(0,0,1); Dm = basis^T·edges = [[2,1],[0,1]];
+        # Dm_inv = [[0.5,-0.5],[0,1]].
+        Dm_inv = wp.array(
+            [wp.mat22(0.5, -0.5, 0.0, 1.0)],
+            dtype=wp.mat22,
+            device=device,
+        )
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+        rhs = _projection_rhs(project_stretching_arap_kernel, [positions, tri_indices, Dm_inv, weight], 3)
+        r = rhs
+
+        # Analytical: with current=rest and Dm_inv as above, P = embedding [[1,0],[0,0],[0,1]] (3x2);
+        # P^T = [[1,0,0],[0,0,1]] (2x3). Dm_inv @ P^T = [[0.5, 0, -0.5],[0, 0, 1]].
+        # So row0 (vertex 1's contribution) = (0.5, 0, -0.5), row1 (vertex 2) = (0, 0, 1).
+        # rhs[1] = row0, rhs[2] = row1, rhs[0] = -(row0+row1).
+        np.testing.assert_allclose(r[1], [0.5, 0.0, -0.5], atol=1e-5)
+        np.testing.assert_allclose(r[2], [0.0, 0.0, 1.0], atol=1e-5)
+        np.testing.assert_allclose(r[0], -(r[1] + r[2]), atol=1e-6)
+
+
+class TestBendingProjection(unittest.TestCase):
+    """Isometric bending projection. A flat rest gives zero RHS contribution."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_flat_rest_zero_rhs(self):
+        """Contribute nothing on a flat rest stencil, whose rest curvature is zero."""
+        from newton._src.solvers.fba.kernels import project_bending_kernel  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        # Flat 4-vertex stencil: 2 triangles sharing edge (0,1).
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0.5, 0, 1), wp.vec3(0.5, 0, -1)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        edge_indices = wp.array([[0, 1, 2, 3]], dtype=wp.int32, device=device)
+        # q = [1,1,-1,-1] satisfies sum-to-zero; on the flat positions above
+        # ``q·x_rest = (0,0,0)`` so ``edge_norm = 0`` and the kernel short-circuits.
+        edge_quad_q = wp.array([wp.vec4(1.0, 1.0, -1.0, -1.0)], dtype=wp.vec4, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+        edge_norm = wp.array([0.0], dtype=wp.float32, device=device)
+
+        rhs = _projection_rhs(project_bending_kernel, [positions, edge_indices, edge_quad_q, weight, edge_norm], 4)
+        # Flat-rest ``edge_norm = 0`` ⇒ the contributions are zero.
+        np.testing.assert_allclose(rhs, np.zeros((4, 3)), atol=1e-6)
+
+
+class SolverFBABendingCurvedRestTests(unittest.TestCase):
+    """The bending local step restores the curvature *magnitude*, not its
+    direction, on curved rest cloth.
+
+    Restoring the *rest curvature vector*, ``w · q · (q · x_ref)``, the
+    gradient of ``‖(q·x_cur) - (q·x_ref)‖²``, would penalise any deviation
+    from it, including curvature flips (e.g. cloth bent against its rest
+    direction). The local projection instead contributes
+    ``w · q · ê · ‖q·x_rest‖`` where ``ê = (q·x_cur) / ‖q·x_cur‖``: the
+    direction follows ``x_cur`` and only the magnitude is restored.
+
+    The two formulas agree on flat rest (where ``‖q·x_rest‖ = 0``); they
+    diverge on curved rest and disagree in sign whenever ``q·x_cur`` and
+    ``q·x_rest`` point in opposite directions.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_scatter_follows_x_cur_not_x_rest(self) -> None:
+        """Contribute along the current curvature direction (+z) of a stencil whose rest curvature points along -z.
+
+        The contributions must be ``w · q · (0, 0, +norm_rest)`` (sign of
+        ``q·x_cur``). Restoring the rest curvature vector would contribute
+        ``w · q · (q·x_ref)`` ~ ``w · q · (0, 0, -norm_rest)``, the opposite sign.
+        """
+        from newton._src.solvers.fba.kernels import project_bending_kernel  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        # Stencil chosen so ``q = [1, 1, -1, -1]`` satisfies sum-to-zero.
+        # x_cur has only v1 lifted along +z by 1.0 so ``q · x_cur = (0, 0, +1)``.
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(0, 0, 1), wp.vec3(0, 0, 0), wp.vec3(0, 0, 0)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        edge_indices = wp.array([[0, 1, 2, 3]], dtype=wp.int32, device=device)
+        edge_quad_q = wp.array([wp.vec4(1.0, 1.0, -1.0, -1.0)], dtype=wp.vec4, device=device)
+        weight = wp.array([2.0], dtype=wp.float32, device=device)
+        # Rest curvature magnitude = 0.5; the rest direction is irrelevant:
+        # the kernel only uses the magnitude.
+        edge_norm = wp.array([0.5], dtype=wp.float32, device=device)
+
+        rhs = _projection_rhs(project_bending_kernel, [positions, edge_indices, edge_quad_q, weight, edge_norm], 4)
+
+        # Expected: ``w · q[a] · ê · norm_rest`` with
+        # ``ê = q·x_cur / ‖q·x_cur‖ = (0, 0, 1)``.
+        # rhs[0] = 2 * 1 * (0, 0, 1) * 0.5 = (0, 0, 1)
+        # rhs[1] = 2 * 1 * (0, 0, 1) * 0.5 = (0, 0, 1)
+        # rhs[2] = 2 * -1 * (0, 0, 1) * 0.5 = (0, 0, -1)
+        # rhs[3] = 2 * -1 * (0, 0, 1) * 0.5 = (0, 0, -1)
+        expected = np.array(
+            [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, -1.0], [0.0, 0.0, -1.0]],
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(rhs, expected, atol=1e-6)
+
+        # Restoring the rest curvature vector would contribute
+        # ``w · q · (q · x_ref)`` with ``q · x_ref = (0, 0, -0.5)``, along -z;
+        # the kernel restores only the magnitude, along +z.
+        self.assertGreater(rhs[0, 2], 0.0)
+        self.assertLess(rhs[2, 2], 0.0)
+
+    def test_zero_curvature_x_cur_skips_scatter(self) -> None:
+        """Contribute nothing when ``‖q·x_cur‖ ≈ 0``, without dividing by zero, whatever ``edge_norm`` is."""
+        from newton._src.solvers.fba.kernels import project_bending_kernel  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        # All positions zero ⇒ ``q · x_cur = 0``.
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(0, 0, 0), wp.vec3(0, 0, 0), wp.vec3(0, 0, 0)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        edge_indices = wp.array([[0, 1, 2, 3]], dtype=wp.int32, device=device)
+        edge_quad_q = wp.array([wp.vec4(1.0, 1.0, -1.0, -1.0)], dtype=wp.vec4, device=device)
+        weight = wp.array([2.0], dtype=wp.float32, device=device)
+        edge_norm = wp.array([0.5], dtype=wp.float32, device=device)
+
+        rhs = _projection_rhs(project_bending_kernel, [positions, edge_indices, edge_quad_q, weight, edge_norm], 4)
+        np.testing.assert_allclose(rhs, np.zeros((4, 3)), atol=0.0)
+
+    def test_pre_bent_strip_preserves_curvature_magnitude(self) -> None:
+        """Keep a 3x3 cloth strip with a curved rest shape near its rest shape under bending alone, without gravity.
+
+        The local projection pulls only the curvature magnitude back. The rest configuration is an equilibrium, so the
+        test mainly checks that the bending path runs end to end without NaN or runaway growth.
+        """
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        grid = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        grid.add_cloth_grid(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=2,
+            dim_y=2,
+            cell_x=0.5,
+            cell_y=0.5,
+            mass=1.0,
+            tri_ke=50.0,
+        )
+        # Curve the rest: lift the centre vertex out of the plane, so the rest
+        # angles make ``‖q·x_rest‖ > 0`` on every interior edge. The (2, 2)
+        # grid has 9 particles; the centre vertex is at index 4.
+        vertices = np.array(grid.particle_q)
+        vertices[4, 2] += 0.2
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, 0.0))
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=[wp.vec3(v) for v in vertices],
+            indices=np.array(grid.tri_indices).reshape(-1),
+            density=1.0,
+            tri_ke=50.0,
+            tri_ka=1.0e2,
+            tri_kd=0.0,
+            edge_ke=10.0,
+            edge_kd=0.0,
+        )
+        model = builder.finalize(device="cpu")
+
+        # Pin all four corners so the strip is anchored but the interior
+        # vertices stay free.
+        inv_mass = model.particle_inv_mass.numpy().copy()
+        for corner in (0, 2, 6, 8):
+            inv_mass[corner] = 0.0
+        model.particle_inv_mass = wp.array(inv_mass, dtype=wp.float32, device=model.device)
+        mass = np.where(inv_mass > 0.0, 1.0 / np.maximum(inv_mass, 1.0e-30), 0.0).astype(np.float32)
+        model.particle_mass = wp.array(mass, dtype=wp.float32, device=model.device)
+
+        solver = SolverFBA(model, iterations=8, pin_stiffness=1e10)
+
+        state_in = model.state()
+        state_out = model.state()
+        dt = 1.0 / 60.0
+        for _ in range(20):
+            solver.step(state_in, state_out, control=None, contacts=None, dt=dt)
+            state_in, state_out = state_out, state_in
+
+        pos_final = state_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(pos_final)), "positions diverged to non-finite values")
+        # Centre vertex should remain lifted by roughly the rest curvature.
+        # Restoring the rest curvature vector would satisfy this too (rest is
+        # an equilibrium of both), but together with the unit tests above this
+        # guards the integration.
+        self.assertGreater(pos_final[4, 2], 0.1, "centre vertex collapsed below rest curvature")
+        self.assertLess(pos_final[4, 2], 0.3, "centre vertex blew up past rest curvature")
+
+    def test_rest_angle_sets_the_rest_curvature(self) -> None:
+        """Keep a free hinge folded 60 deg at its rest angle, and unfold it once the rest angle is zeroed.
+
+        Zeroing the rest angles is how a cloth modeled folded in its rest pose is made to rest flat.
+        """
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        def angle_after(zero_rest: bool, steps: int) -> float:
+            h, fold = np.sqrt(3.0) / 2.0, np.radians(60.0)
+            builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+            builder.add_cloth_mesh(
+                pos=wp.vec3(0.0),
+                rot=wp.quat_identity(),
+                scale=1.0,
+                vel=wp.vec3(0.0),
+                vertices=[
+                    wp.vec3(0.0, 0.0, 0.0),
+                    wp.vec3(1.0, 0.0, 0.0),
+                    wp.vec3(0.5, h, 0.0),
+                    wp.vec3(0.5, -h * np.cos(fold), -h * np.sin(fold)),
+                ],
+                indices=[0, 1, 2, 1, 0, 3],
+                density=1.0,
+                tri_ke=500.0,
+                tri_ka=1.0e3,
+                edge_ke=1.0,
+            )
+            model = builder.finalize()
+            if zero_rest:
+                model.edge_rest_angle.zero_()
+            solver = SolverFBA(model, iterations=10)
+            s0, s1 = model.state(), model.state()
+            for _ in range(steps):
+                solver.step(s0, s1, None, None, 1.0 / 60.0)
+                s0, s1 = s1, s0
+            x = s0.particle_q.numpy()
+            n0 = np.cross(x[1] - x[0], x[2] - x[0])
+            n1 = np.cross(x[3] - x[0], x[1] - x[0])
+            return float(np.degrees(np.arccos(np.dot(n0, n1) / np.linalg.norm(n0) / np.linalg.norm(n1))))
+
+        self.assertAlmostEqual(angle_after(False, 0), 60.0, places=4)
+        self.assertAlmostEqual(angle_after(False, 60), 60.0, delta=0.01)
+        self.assertLess(angle_after(True, 10), 15.0)
+
+
+class TestPublicAPI(unittest.TestCase):
+    def test_solver_fba_in_newton_solvers(self):
+        """Export SolverFBA from ``newton.solvers``."""
+        from newton import solvers  # noqa: PLC0415
+
+        self.assertTrue(hasattr(solvers, "SolverFBA"))
+        self.assertIn("SolverFBA", solvers.__all__)
+
+
+class TestSolverFBAIntegration(unittest.TestCase):
+    """Integration tests of SolverFBA stepping cloth."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _build_hanging_cloth(self, dim: int = 32):
+        # Y-up world: cloth grid spans y from 2.0 (bottom row, index 0..dim)
+        # to 2+dim*cell_y (top row, index dim*(dim+1)..dim*(dim+1)+dim).
+        # Pin the two TOP corners so the cloth hangs under gravity (-Y).
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 2, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=dim,
+            dim_y=dim,
+            cell_x=0.05,
+            cell_y=0.05,
+            mass=0.1,
+            tri_ke=5000.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
+            fix_left=False,
+        )
+        # Top-row corners in the (dim+1)x(dim+1) grid: y-index=dim.
+        top_left = dim * (dim + 1)
+        top_right = dim * (dim + 1) + dim
+        builder.particle_mass[top_left] = 0.0
+        builder.particle_mass[top_right] = 0.0
+        return builder.finalize()
+
+    def test_hanging_cloth_stays_finite(self):
+        """Step a 16x16 hanging cloth 50 times without non-finite positions."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._build_hanging_cloth(dim=16)
+        solver = SolverFBA(model, iterations=8)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+        for _ in range(50):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite values appeared")
+
+    def test_hanging_cloth_settles(self):
+        """Settle a 16x16 hanging cloth over 500 steps with its center between 1.9 m and 2.8 m high."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._build_hanging_cloth(dim=16)
+        solver = SolverFBA(model, iterations=10)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+        for _ in range(500):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        # With realistic tri_ke=1e4, the cloth is stiff and drapes relatively
+        # little. The center vertex (grid row dim//2, col dim//2) sits near
+        # the midpoint of the hung cloth: observed center_y ≈ 2.35 after 500
+        # steps. Bounds are deliberately loose to tolerate minor solver tweaks
+        # while still verifying the cloth moved under gravity and stayed finite.
+        center_idx = (16 // 2) * (16 + 1) + (16 // 2)
+        self.assertLess(q[center_idx, 1], 2.8, "cloth did not fall under gravity")
+        self.assertGreater(q[center_idx, 1], 1.9, "cloth fell past plausible drape")
+
+
+class TestSolverFBAExtremeConfigs(unittest.TestCase):
+    """Robustness tests covering extreme configurations: fully-free cloth,
+    all-pinned cloth, single triangle, and zero edge stiffness."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_no_pin_free_cloth_remains_finite(self):
+        """Keep an unpinned, freely falling cloth finite over 100 steps."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 2, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=8,
+            dim_y=8,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.1,
+            tri_ke=50.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
+            fix_left=False,
+        )
+        # NO pinning.
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=10)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+        for _ in range(100):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite values appeared in free-cloth simulation")
+
+    def test_all_pinned_cloth_stays_put(self):
+        """Keep a cloth whose particles are all pinned within 0.1 mm of its start over 50 steps."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=50.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
+            fix_left=False,
+        )
+        for i in range(len(builder.particle_mass)):
+            builder.particle_mass[i] = 0.0
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=10)
+        s_in, s_out = model.state(), model.state()
+        x_initial = s_in.particle_q.numpy().copy()
+        dt = 1.0 / 60.0
+        for _ in range(50):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        x_final = s_in.particle_q.numpy()
+        drift = np.abs(x_final - x_initial).max()
+        self.assertLess(drift, 1e-4, f"all-pinned cloth drifted {drift:.3e} m")
+
+    def test_single_triangle_runs(self):
+        """Step a single triangle with one pinned vertex, which stays at its pin."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0, 0, 0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0, 0, 0),
+            vertices=[wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0, 0, 1)],
+            indices=[0, 1, 2],
+            density=1.0,
+            tri_ke=50.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+        )
+        builder.particle_mass[0] = 0.0  # pin vertex 0
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=10)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+        for _ in range(50):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)))
+        np.testing.assert_allclose(q[0], [0, 0, 0], atol=1e-4)
+
+    def test_zero_edge_stiffness_still_works(self):
+        """Step a pinned cloth without bending stiffness to finite positions."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=50.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,  # no bending
+            fix_left=True,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=10)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+        for _ in range(50):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)))
+
+
+class TestSolverFBAExternalForces(unittest.TestCase):
+    """Robustness tests covering external force application and state buffer
+    ping-pong behaviour."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _build_4x4_cloth(self):
+        """Return a 4x4 cloth model with the top-left corner pinned."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=50.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
+            fix_left=True,
+        )
+        return builder.finalize()
+
+    def test_external_force_displaces_particle(self):
+        """Move a free particle differently after one step under a strong external force than without it.
+
+        With ``fix_left=True`` on a 4x4 cloth, the left column (indices 0, 5, 10, 15, 20) is pinned and particle 7 is a
+        free interior particle. The test catches ``state_in.particle_f`` not reaching the inertial prediction.
+        """
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._build_4x4_cloth()
+        solver = SolverFBA(model, iterations=5)
+        dt = 1.0 / 60.0
+
+        # Verify particle 7 is free (not pinned).
+        self.assertGreater(model.particle_inv_mass.numpy()[7], 0.0, "particle 7 should be free")
+
+        # --- No-force baseline ---
+        s_in = model.state()
+        s_out = model.state()
+        s_in.clear_forces()
+        solver.step(s_in, s_out, None, None, dt)
+        q_no_force = s_out.particle_q.numpy().copy()
+
+        # --- With external force on particle 7 (push in +z) ---
+        s_in2 = model.state()
+        s_out2 = model.state()
+        forces_np = np.zeros((model.particle_count, 3), dtype=np.float32)
+        forces_np[7] = [0.0, 0.0, 100.0]
+        s_in2.particle_f.assign(forces_np)
+        solver.step(s_in2, s_out2, None, None, dt)
+        q_with_force = s_out2.particle_q.numpy().copy()
+
+        displacement = np.linalg.norm(q_with_force[7] - q_no_force[7])
+        self.assertGreater(
+            displacement,
+            1e-3,
+            f"Force on particle 7 produced no measurable displacement: {displacement:.2e} m",
+        )
+
+    def test_state_ping_pong_no_leak(self):
+        """Produce finite, changed positions over 100 steps that swap the input and output states.
+
+        The test catches in-place changes of ``state_in`` and buffer aliasing.
+        """
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._build_4x4_cloth()
+        solver = SolverFBA(model, iterations=5)
+        dt = 1.0 / 60.0
+
+        s_in, s_out = model.state(), model.state()
+        initial_q = s_in.particle_q.numpy().copy()
+
+        for _ in range(100):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+
+        q_final = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q_final)), "non-finite positions after 100-step ping-pong")
+        # Cloth should have fallen (gravity), so at least one particle moved.
+        self.assertFalse(
+            np.allclose(q_final, initial_q, atol=1e-6),
+            "Positions unchanged after 100 steps: cloth did not move",
+        )
+
+    def test_clear_forces_resets_between_steps(self):
+        """Stop accelerating a particle once a one-time force is cleared, its elastic forces braking it.
+
+        The test catches forces that accumulate across steps.
+        """
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._build_4x4_cloth()
+        solver = SolverFBA(model, iterations=5)
+        dt = 1.0 / 60.0
+
+        s_in, s_out = model.state(), model.state()
+
+        # Step 0: apply impulse force on particle 3.
+        forces_np = np.zeros((model.particle_count, 3), dtype=np.float32)
+        forces_np[3] = [5.0, 0.0, 0.0]
+        s_in.particle_f.assign(forces_np)
+        solver.step(s_in, s_out, None, None, dt)
+        s_in, s_out = s_out, s_in
+        v_after_impulse = np.linalg.norm(s_in.particle_qd.numpy()[3])
+
+        # Steps 1..50: clear forces, let cloth relax.
+        for _ in range(50):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+
+        q_final = s_in.particle_q.numpy()
+        v_final = np.linalg.norm(s_in.particle_qd.numpy()[3])
+
+        self.assertTrue(np.all(np.isfinite(q_final)), "non-finite positions after impulse + relaxation")
+        self.assertLess(
+            v_final,
+            v_after_impulse,
+            f"Particle 3 did not decelerate: v_final={v_final:.4f} >= v_after_impulse={v_after_impulse:.4f}",
+        )
+
+    def test_alternating_ping_pong_buffer_ids(self):
+        """Leave ``state_in`` unchanged and write only ``state_out`` in ``step()``."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=50.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
+            fix_left=True,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=5)
+        s_a = model.state()
+        s_b = model.state()
+        initial_q = s_a.particle_q.numpy().copy()
+        s_a.clear_forces()
+        solver.step(s_a, s_b, None, None, 1.0 / 60.0)
+        # state_in (s_a) should be unchanged.
+        np.testing.assert_array_equal(s_a.particle_q.numpy(), initial_q)
+        # state_out (s_b) should differ from initial.
+        self.assertFalse(
+            np.array_equal(s_b.particle_q.numpy(), initial_q),
+            "state_out (s_b) was not updated after step()",
+        )
+
+
+class TestSolverFBAReconfigure(unittest.TestCase):
+    """Robustness tests covering dt-change re-setup and notify_model_changed."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _build_4x4_cloth(self):
+        """Return a 4x4 cloth model with the left column pinned."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=50.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
+            fix_left=True,
+        )
+        return builder.finalize()
+
+    def test_dt_change_triggers_resetup(self):
+        """Rebuild the linear solver when the time step changes."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=50.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
+            fix_left=True,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=5)
+        s_in, s_out = model.state(), model.state()
+
+        s_in.clear_forces()
+        solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+        self.assertAlmostEqual(solver._dt_setup, 1.0 / 60.0, places=10)
+        linsolver_a = solver._linear_solver
+
+        s_in, s_out = s_out, s_in
+        s_in.clear_forces()
+        solver.step(s_in, s_out, None, None, 1.0 / 120.0)
+        self.assertAlmostEqual(solver._dt_setup, 1.0 / 120.0, places=10)
+        linsolver_b = solver._linear_solver
+        self.assertIsNot(linsolver_a, linsolver_b, "linear solver should have been rebuilt on dt change")
+
+        q = s_out.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)))
+
+    def test_same_dt_no_resetup(self):
+        """Keep the linear solver across steps with the same time step."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=50.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
+            fix_left=True,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=5)
+        s_in, s_out = model.state(), model.state()
+        s_in.clear_forces()
+        solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+        linsolver_a = solver._linear_solver
+        s_in, s_out = s_out, s_in
+        s_in.clear_forces()
+        solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+        linsolver_b = solver._linear_solver
+        self.assertIs(linsolver_a, linsolver_b, "linear solver should not rebuild when dt unchanged")
+
+    def test_notify_shape_properties_forces_resetup(self):
+        """Rebuild the linear solver at the next step after ``notify_model_changed(SHAPE_PROPERTIES)``."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=50.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
+            fix_left=True,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=5)
+        s_in, s_out = model.state(), model.state()
+        s_in.clear_forces()
+        solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+        linsolver_a = solver._linear_solver
+        self.assertIsNotNone(linsolver_a)
+
+        solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+        self.assertIsNone(solver._linear_solver, "notify_model_changed should clear _linear_solver")
+        self.assertIsNone(solver._dt_setup, "notify_model_changed should clear _dt_setup")
+
+        s_in, s_out = s_out, s_in
+        s_in.clear_forces()
+        solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+        self.assertIsNotNone(solver._linear_solver)
+        self.assertIsNot(solver._linear_solver, linsolver_a)
+        q = s_out.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)))
+
+    def test_schur_invalidation_preserves_lambda_buffer_refs(self):
+        """Leave the persistent multiplier and weight buffers alone when the Schur cache is invalidated.
+
+        The step resets or resizes the persistent warm-start buffers (``_lam_unilateral_persistent``,
+        ``_lam_coulomb_persistent``, ``_omega_unilateral_persistent``, ``_omega_coulomb_persistent``) at its start, so
+        every step starts from zero multipliers. Invalidating the Schur factor, after a change of the contact set or a
+        model notification, is a separate concern.
+        """
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._build_4x4_cloth()
+        solver = SolverFBA(model, iterations=5)
+
+        # Seed all four persistent buffers with distinguishable sentinel data.
+        solver._lam_unilateral_persistent = np.full(5, 0.123, dtype=np.float64)
+        solver._lam_coulomb_persistent = np.full(15, 0.456, dtype=np.float64)
+        solver._omega_unilateral_persistent = np.full(5, 0.789, dtype=np.float64)
+        solver._omega_coulomb_persistent = np.full(15, 0.321, dtype=np.float64)
+
+        # Also mark the Schur cache current so we can confirm it gets cleared.
+        solver._cached_W = True
+
+        solver._invalidate_schur_cache()
+
+        # Schur cache must be dropped.
+        self.assertFalse(solver._cached_W, "Schur W cache must be invalidated")
+
+        # Persistent λ/ω buffers must survive unchanged (identity + contents).
+        self.assertIsNotNone(
+            solver._lam_unilateral_persistent,
+            "_lam_unilateral_persistent must be preserved",
+        )
+        self.assertEqual(solver._lam_unilateral_persistent.shape, (5,))
+        np.testing.assert_allclose(solver._lam_unilateral_persistent, 0.123)
+
+        self.assertIsNotNone(
+            solver._lam_coulomb_persistent,
+            "_lam_coulomb_persistent must be preserved",
+        )
+        self.assertEqual(solver._lam_coulomb_persistent.shape, (15,))
+        np.testing.assert_allclose(solver._lam_coulomb_persistent, 0.456)
+
+        self.assertIsNotNone(
+            solver._omega_unilateral_persistent,
+            "_omega_unilateral_persistent must be preserved",
+        )
+        self.assertEqual(solver._omega_unilateral_persistent.shape, (5,))
+        np.testing.assert_allclose(solver._omega_unilateral_persistent, 0.789)
+
+        self.assertIsNotNone(
+            solver._omega_coulomb_persistent,
+            "_omega_coulomb_persistent must be preserved",
+        )
+        self.assertEqual(solver._omega_coulomb_persistent.shape, (15,))
+        np.testing.assert_allclose(solver._omega_coulomb_persistent, 0.321)
+
+    def test_notify_unrelated_flag_no_resetup(self):
+        """Keep the linear solver after ``notify_model_changed(JOINT_PROPERTIES)``, which does not affect cloth."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=50.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
+            fix_left=True,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=5)
+        s_in, s_out = model.state(), model.state()
+        s_in.clear_forces()
+        solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+        linsolver_a = solver._linear_solver
+
+        # JOINT_PROPERTIES shouldn't affect FBA cloth.
+        solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
+        self.assertIs(solver._linear_solver, linsolver_a, "FBA should ignore JOINT_PROPERTIES")
+
+
+class TestSolverFBAStability(unittest.TestCase):
+    """Long-run stability of a cloth pinned at two corners."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_pinned_cloth_stays_finite_for_500_steps(self):
+        """Keep a 16x16 cloth pinned at two corners finite over 500 steps of 1/60 s with 10 iterations."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 2, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=16,
+            dim_y=16,
+            cell_x=0.05,
+            cell_y=0.05,
+            mass=0.005,
+            tri_ke=5000.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
+            fix_left=False,
+        )
+        builder.particle_mass[0] = 0.0
+        builder.particle_mass[16] = 0.0
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=10)
+        s_in, s_out = model.state(), model.state()
+        for _ in range(500):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "documented-safe configuration went NaN")
+
+    def test_large_cloth_dim64_realistic_stiffness_finite(self):
+        """Keep a 64x64 hanging cloth with a realistic tri_ke of 1e4 finite over 500 steps with 5 iterations."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 2, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=64,
+            dim_y=64,
+            cell_x=0.05,
+            cell_y=0.05,
+            mass=0.005,
+            tri_ke=5000.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
+            fix_left=False,
+        )
+        builder.particle_mass[0] = 0.0
+        builder.particle_mass[64] = 0.0
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=5)
+        s_in, s_out = model.state(), model.state()
+        for _ in range(500):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "64x64 cloth went NaN at realistic tri_ke=1e4")
+
+
+class TestCorotationalProjection(unittest.TestCase):
+    """Tests for the corotational stretching local projection kernel."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _make_unit_triangle(self):
+        """Return positions, Dm_inv=I₂, weight=1 for an axis-aligned triangle at rest."""
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0, 0, 1)],
+            dtype=wp.vec3,
+            device="cuda:0" if wp.is_cuda_available() else "cpu",
+        )
+        tri_indices = wp.array([0, 1, 2], dtype=wp.int32, device=positions.device)
+        Dm_inv = wp.array([wp.mat22(1.0, 0.0, 0.0, 1.0)], dtype=wp.mat22, device=positions.device)
+        weight = wp.array([1.0], dtype=wp.float32, device=positions.device)
+        return positions, tri_indices, Dm_inv, weight
+
+    def test_rest_configuration_F_equals_I_projects_to_I(self):
+        """Project to sigma_proj=1 at rest (F~=I in the local frame), where the corotational energy has zero gradient.
+
+        The contributions match the ARAP-at-identity case:
+            rhs[1] == (1, 0, 0); rhs[2] == (0, 0, 1); rhs[0] == -(rhs[1]+rhs[2]).
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_corotational_kernel  # noqa: PLC0415
+
+        positions, tri_indices, Dm_inv, weight = self._make_unit_triangle()
+        device = positions.device
+
+        mu, lam = 1.0, 0.5
+        rhs = _projection_rhs(
+            project_stretching_corotational_kernel,
+            [positions, tri_indices, Dm_inv, weight, wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device)],
+            3,
+        )
+        r = rhs
+        # At rest sigma=1: corot energy has zero gradient, projection maps to 1.
+        # P = U*diag(1,1)*Vt = I (embedding), identical to ARAP at rest.
+        np.testing.assert_allclose(r[1], [1.0, 0.0, 0.0], atol=1e-5)
+        np.testing.assert_allclose(r[2], [0.0, 0.0, 1.0], atol=1e-5)
+        np.testing.assert_allclose(r[0], -(r[1] + r[2]), atol=1e-5)
+
+    def test_isotropic_stretch_pulls_sigma_back(self):
+        """Pull an isotropic stretch s0 = (1.5, 1.5) back to the closed-form sigma_proj = (1.2, 1.2) (mu=1, lam=0.5).
+
+        Analytical derivation:
+            k = 2*mu = 2, M = 4*mu+lam = 4.5, det = M^2-lam^2 = 20.
+            b = 2*(mu+lam) + k*s0 = 3 + 3 = 6 (same for both).
+            sigma_proj = (M*b - lam*b)/det = (4.5*6 - 0.5*6)/20 = 24/20 = 1.2.
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_corotational_kernel  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        # Scale current positions by 1.5 to get isotropic stretch F = 1.5·I.
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1.5, 0, 0), wp.vec3(0, 0, 1.5)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tri_indices = wp.array([0, 1, 2], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat22(1.0, 0.0, 0.0, 1.0)], dtype=wp.mat22, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+
+        mu, lam = 1.0, 0.5
+        rhs = _projection_rhs(
+            project_stretching_corotational_kernel,
+            [positions, tri_indices, Dm_inv, weight, wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device)],
+            3,
+        )
+        r = rhs
+
+        # For isotropic stretch by 1.5 with Dm_inv=I: F=1.5*I, U=V=I.
+        # P = U*diag(1.2,1.2)*Vt = 1.2*I (the 3x2 embedding scaled by 1.2).
+        # Contributions: row0 = Dm_inv[0,:]*Pt*w = (1.2, 0, 0); row1 = (0, 0, 1.2).
+        np.testing.assert_allclose(r[1], [1.2, 0.0, 0.0], atol=1e-5)
+        np.testing.assert_allclose(r[2], [0.0, 0.0, 1.2], atol=1e-5)
+        np.testing.assert_allclose(r[0], -(r[1] + r[2]), atol=1e-5)
+
+    def test_solver_corotational_runs_no_nan(self):
+        """Step a small cloth 50 times with ``stretching_model='corotational'`` to finite positions."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 2, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=8,
+            dim_y=8,
+            cell_x=0.05,
+            cell_y=0.05,
+            mass=0.1,
+            tri_ke=3571.0,
+            tri_ka=4286.0,
+            tri_kd=0.0,
+            edge_ke=0.1,
+            edge_kd=0.0,
+            fix_left=False,
+        )
+        # Pin top-left and top-right corners.
+        top_left = 8 * (8 + 1)
+        top_right = 8 * (8 + 1) + 8
+        builder.particle_mass[top_left] = 0.0
+        builder.particle_mass[top_right] = 0.0
+        model = builder.finalize()
+
+        solver = SolverFBA(model, iterations=8, stretching_model="corotational")
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+        for _ in range(50):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite values in corotational simulation")
+
+    def test_solver_init_requires_lame_for_corot(self):
+        """Refuse triangles without a positive k_lambda with ``stretching_model='corotational'``."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=50.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+            fix_left=True,
+        )
+        model = builder.finalize()
+
+        with self.assertRaises(ValueError):
+            SolverFBA(model, stretching_model="corotational")  # k_lambda = tri_ka = 0
+
+    def test_lame_parameters_come_from_each_element(self):
+        """Project each triangle with its own k_mu and k_lambda, scaled by its own gauge."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder()
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            **{"dim_x": 2, "dim_y": 1, "cell_x": 0.1, "cell_y": 0.1, "mass": 0.01, "tri_ke": 1.0e3, "tri_ka": 2.0e3},
+        )
+        model = builder.finalize()
+        materials = model.tri_materials.numpy()
+        materials[1, :2] = (3.0e3, 5.0e2)
+        model.tri_materials.assign(materials)
+        lame = SolverFBA(model, stretching_model="corotational")._tri_lame_d.numpy()
+        mu, lam = materials[:, 0].astype(np.float64), materials[:, 1].astype(np.float64)
+        gauge = (4.0 * mu + 3.0 * lam) / (2.0 * mu + lam)
+        np.testing.assert_allclose(lame, np.stack([mu * gauge, lam * gauge], axis=1), rtol=1e-6)
+
+
+class TestNeoHookeanProjection(unittest.TestCase):
+    """Unit tests for the Neo-Hookean triangle projection kernel."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _device(self):
+        return "cuda:0" if wp.is_cuda_available() else "cpu"
+
+    def test_rest_configuration_projects_to_identity(self):
+        """Leave sigma=(1,1) unchanged at rest, where J=1, log_J=0 and the gradient vanishes.
+
+        With sigma_sq=(1,1): sigma0=(1,1), k=2*mu, J=1, log_J=0, inv=(1,1).
+        grad_0 = mu*(1-1) + lam*0*1 + k*(1-1) = 0.
+        grad_1 = 0 similarly, so the projection keeps sigma at (1,1).
+        The contributions match ARAP-at-rest: rhs[1]=(1,0,0), rhs[2]=(0,0,1).
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_neohookean_kernel  # noqa: PLC0415
+
+        device = self._device()
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0, 0, 1)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tri_indices = wp.array([0, 1, 2], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat22(1.0, 0.0, 0.0, 1.0)], dtype=wp.mat22, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+
+        mu, lam = 1.0, 0.5
+        rhs = _projection_rhs(
+            project_stretching_neohookean_kernel,
+            [positions, tri_indices, Dm_inv, weight, wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device)],
+            3,
+        )
+        r = rhs
+        # At rest: sigma=(1,1), P = U*I*Vt = embedding I (3x2). Contributions as for ARAP.
+        np.testing.assert_allclose(r[1], [1.0, 0.0, 0.0], atol=1e-5)
+        np.testing.assert_allclose(r[2], [0.0, 0.0, 1.0], atol=1e-5)
+        np.testing.assert_allclose(r[0], -(r[1] + r[2]), atol=1e-5)
+
+    def test_isotropic_stretch_NH_returns_finite_sigma(self):
+        """Pull sigma_0=(1.5,1.5) (mu=1, lam=0.5) back to a finite, positive sigma below 1.5, with a gradient norm
+        below 1e-3.
+
+        NH energy pulls sigma back toward 1 (incompressibility); the result should
+        lie strictly between 0 and 1.5.  We also verify the gradient at the final
+        sigma is small: the L-BFGS projection converges.
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_neohookean_kernel  # noqa: PLC0415
+
+        device = self._device()
+        # Scale current positions by 1.5: sigma_sq = (1.5^2, 1.5^2) = (2.25, 2.25)
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1.5, 0, 0), wp.vec3(0, 0, 1.5)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tri_indices = wp.array([0, 1, 2], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat22(1.0, 0.0, 0.0, 1.0)], dtype=wp.mat22, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+
+        mu, lam = 1.0, 0.5
+        rhs = _projection_rhs(
+            project_stretching_neohookean_kernel,
+            [positions, tri_indices, Dm_inv, weight, wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device)],
+            3,
+        )
+        r = rhs
+        # With Dm_inv=I and isotropic stretch, u0=(1,0,0), u1=(0,0,1), V=I.
+        # P = diag(sigma_proj, sigma_proj) (embedded). Row0=(sigma_proj,0,0), row1=(0,0,sigma_proj).
+        # rhs[1] = (sigma_proj, 0, 0), rhs[2] = (0, 0, sigma_proj).
+        sigma_proj = r[1][0]
+        self.assertTrue(np.isfinite(sigma_proj), "sigma_proj is not finite")
+        self.assertGreater(sigma_proj, 0.0, "sigma_proj must be positive")
+        self.assertLess(sigma_proj, 1.5, "NH should pull sigma back from 1.5 toward 1")
+
+        # Verify gradient is small at the converged sigma.
+        k = 2.0 * mu
+        sigma0 = 1.5
+        J = sigma_proj * sigma_proj
+        log_J = np.log(J)
+        inv_s = 1.0 / sigma_proj
+        grad = mu * (sigma_proj - inv_s) + lam * log_J * inv_s + k * (sigma_proj - sigma0)
+        self.assertLess(abs(grad), 1e-3, f"Gradient at converged sigma too large: {abs(grad):.2e}")
+
+    def test_solver_neohookean_runs_no_nan(self):
+        """Step a small cloth 50 times with ``stretching_model='neohookean'`` to finite positions."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 2, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=8,
+            dim_y=8,
+            cell_x=0.05,
+            cell_y=0.05,
+            mass=0.1,
+            tri_ke=3571.4285714285716,
+            tri_ka=14285.71428571429,
+            tri_kd=0.0,
+            edge_ke=0.1,
+            edge_kd=0.0,
+            fix_left=False,
+        )
+        # Pin top-left and top-right corners.
+        top_left = 8 * (8 + 1)
+        top_right = 8 * (8 + 1) + 8
+        builder.particle_mass[top_left] = 0.0
+        builder.particle_mass[top_right] = 0.0
+        model = builder.finalize()
+
+        solver = SolverFBA(model, iterations=5, stretching_model="neohookean")
+        s_in, s_out = model.state(), model.state()
+        dt = 0.01
+        for _ in range(50):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite values in neohookean simulation")
+
+    def test_solver_init_requires_lame_for_neohookean(self):
+        """Refuse triangles without a positive k_lambda with ``stretching_model='neohookean'``."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=50.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+            fix_left=True,
+        )
+        model = builder.finalize()
+
+        with self.assertRaises(ValueError):
+            SolverFBA(model, stretching_model="neohookean")  # k_lambda = tri_ka = 0
+
+
+class TestDynamicPin(unittest.TestCase):
+    """Verify SolverFBA.set_pin_targets moves pinned particle to new targets."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_pin_follows_target(self):
+        """Move a pinned particle with its target, 5 cm per step over 10 steps, to within 1 mm of it."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0, 1, 0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0, 0, 0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=5000.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-1,
+            edge_kd=0.0,
+            fix_left=True,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=5)
+
+        # Move pin 0 by 0.5 m in X over 10 steps.
+        s_in, s_out = model.state(), model.state()
+        x_ref = s_in.particle_q.numpy().copy()
+        for _step in range(10):
+            x_ref[0, 0] += 0.05  # 5 cm per step
+            solver.set_pin_targets(x_ref)
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+
+        # Pinned particle 0 should be close to its target.
+        final = s_in.particle_q.numpy()[0]
+        target = x_ref[0]
+        self.assertLess(
+            np.linalg.norm(final - target),
+            1e-3,
+            f"Pin should follow target; final={final}, target={target}",
+        )
+
+    def test_pinned_particles_with_mass_hold_their_targets(self):
+        """Hold particles with zero inverse mass at their pin targets when they keep a mass."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0, 1.0, 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=1,
+            dim_y=1,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=1.0,
+            tri_ke=5000.0,
+        )
+        model = builder.finalize()
+        model.particle_inv_mass.zero_()  # every particle pinned, with its mass kept
+        solver = SolverFBA(model, iterations=5, pin_stiffness=1.0e6)
+        s0, s1 = model.state(), model.state()
+        x0 = s0.particle_q.numpy().copy()
+        for _ in range(10):
+            solver.step(s0, s1, None, None, 1.0 / 60.0)
+            s0, s1 = s1, s0
+        np.testing.assert_allclose(s0.particle_q.numpy(), x0, atol=1.0e-6)
+
+    def test_inactive_particles_hold_their_state(self):
+        """Hold particles with mass but without the ACTIVE flag where the input state has them, as Newton's
+        integrators do; particles with zero mass keep following their pin targets (see test_pin_follows_target)."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0, 1.0, 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=5000.0,
+            edge_ke=0.1,
+        )
+        model = builder.finalize()
+        top = [20, 24]  # the corners of the top row
+        flags = model.particle_flags.numpy()
+        flags[top] &= ~int(newton.ParticleFlags.ACTIVE)
+        model.particle_flags.assign(flags)
+        solver = SolverFBA(model, iterations=5)
+        s0, s1 = model.state(), model.state()
+        x0 = s0.particle_q.numpy().copy()
+        for step in range(30):
+            if step == 15:  # move a held corner by writing the state
+                q = s0.particle_q.numpy()
+                self.assertLess(q[12, 1], x0[12, 1] - 1.0e-4, "the cloth does not hang from its corners")
+                q[24, 2] += 0.1
+                s0.particle_q.assign(q)
+                moved = q[24].copy()
+            solver.step(s0, s1, None, None, 1.0 / 60.0)
+            s0, s1 = s1, s0
+        q = s0.particle_q.numpy()
+        np.testing.assert_array_equal(q[20], x0[20])
+        np.testing.assert_array_equal(q[24], moved)
+        np.testing.assert_array_equal(s0.particle_qd.numpy()[top], 0.0)
+
+
+class TestTetHessianAssembly(unittest.TestCase):
+    """Verify tet Hessian block assembly in build_pd_system."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _build_single_tet_model(self):
+        """Single tetrahedron: (0,0,0),(1,0,0),(0,1,0),(0,0,1). Pin vertex 0."""
+        builder = newton.ModelBuilder()
+        p0 = builder.add_particle(pos=wp.vec3(0.0, 0.0, 0.0), vel=wp.vec3(0.0, 0.0, 0.0), mass=1.0)
+        p1 = builder.add_particle(pos=wp.vec3(1.0, 0.0, 0.0), vel=wp.vec3(0.0, 0.0, 0.0), mass=1.0)
+        p2 = builder.add_particle(pos=wp.vec3(0.0, 1.0, 0.0), vel=wp.vec3(0.0, 0.0, 0.0), mass=1.0)
+        p3 = builder.add_particle(pos=wp.vec3(0.0, 0.0, 1.0), vel=wp.vec3(0.0, 0.0, 0.0), mass=1.0)
+        builder.add_tetrahedron(p0, p1, p2, p3, k_mu=1.0e3, k_lambda=1.0e3)
+        builder.particle_mass[p0] = 0.0
+        return builder.finalize(device="cpu")
+
+    def test_tet_meta_populated(self):
+        """Record a tetrahedron's indices, rest inverse, weight and volume in the PD system's metadata."""
+        model = self._build_single_tet_model()
+        _A, meta = build_pd_system(model, dt=1.0 / 60.0, pin_stiffness=1e12)
+        self.assertEqual(meta["tet_indices"].shape, (1, 4))
+        self.assertEqual(meta["tet_rest_inv"].shape, (1, 3, 3))
+        self.assertEqual(meta["tet_weight"].shape, (1,))
+        # volume of canonical tet = 1/6
+        np.testing.assert_allclose(meta["tet_volume"][0], 1.0 / 6.0, rtol=1e-5)
+
+    def test_tet_hessian_symmetric(self):
+        """Assemble a symmetric PD matrix for a single tetrahedron."""
+        model = self._build_single_tet_model()
+        A = build_pd_system(model, dt=1.0 / 60.0, pin_stiffness=1e12)[0].toarray()
+        diff = A - A.T
+        self.assertLess(np.abs(diff).max(), 1e-10, "tet Hessian is not symmetric")
+
+    def test_tet_hessian_psd(self):
+        """Assemble a positive semi-definite PD matrix for a single tetrahedron."""
+        model = self._build_single_tet_model()
+        A, _meta = build_pd_system(model, dt=1.0 / 60.0, pin_stiffness=1e12)
+        eigenvalues = np.linalg.eigvalsh(A.toarray())
+        self.assertGreater(eigenvalues.min(), -1e-8, "tet Hessian has negative eigenvalue")
+
+
+class TestTetARAP(unittest.TestCase):
+    """Tests for the tet ARAP projection kernel, project_stretching_arap_tet_kernel."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_rest_tet_projects_to_identity(self):
+        """Contribute w times the identity rows at rest (F=I).
+
+        For canonical tet (0,0,0),(1,0,0),(0,1,0),(0,0,1):
+        Ds = I, Dm_inv = I (since Dm = I), F = I, R = I.
+        proj = w * I * I^T = w * I.
+        row0=(1,0,0)*w, row1=(0,1,0)*w, row2=(0,0,1)*w
+        rhs[0] = -(row0+row1+row2) = -(1,1,1)*w
+        rhs[1] = (1,0,0)*w; rhs[2] = (0,1,0)*w; rhs[3] = (0,0,1)*w
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_arap_tet_kernel  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0, 1, 0), wp.vec3(0, 0, 1)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tet_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
+        # Dm_inv = I for canonical tet
+        Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+
+        rhs = _projection_rhs(
+            project_stretching_arap_tet_kernel, [positions, tet_indices, Dm_inv, weight, *_no_activation(weight)], 4
+        )
+        r = rhs
+        np.testing.assert_allclose(r[1], [1.0, 0.0, 0.0], atol=1e-6)
+        np.testing.assert_allclose(r[2], [0.0, 1.0, 0.0], atol=1e-6)
+        np.testing.assert_allclose(r[3], [0.0, 0.0, 1.0], atol=1e-6)
+        np.testing.assert_allclose(r[0], -(r[1] + r[2] + r[3]), atol=1e-6)
+
+    def test_rotation_invariance(self):
+        """Sum the contributions of a pure rotation F = R0 to zero."""
+        from newton._src.solvers.fba.kernels import project_stretching_arap_tet_kernel  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        # 30-degree rotation about z-axis
+        angle = np.pi / 6.0
+        c, s = np.cos(angle), np.sin(angle)
+        R0 = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float32)
+        # Rotated tet: apply R0 to canonical vertices
+        verts = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
+        verts_rot = verts @ R0.T  # (4,3)
+
+        positions = wp.array([wp.vec3(*v) for v in verts_rot], dtype=wp.vec3, device=device)
+        tet_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
+        # Dm_inv = I for canonical tet
+        Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+
+        rhs = _projection_rhs(
+            project_stretching_arap_tet_kernel, [positions, tet_indices, Dm_inv, weight, *_no_activation(weight)], 4
+        )
+        r = rhs
+        # Momentum conservation: rhs[0] + rhs[1] + rhs[2] + rhs[3] = 0
+        total = r[0] + r[1] + r[2] + r[3]
+        np.testing.assert_allclose(total, [0.0, 0.0, 0.0], atol=1e-5)
+
+    def test_momentum_conservation_arbitrary_deformation(self):
+        """Sum the contributions to zero under an arbitrary deformation (momentum conservation)."""
+        from newton._src.solvers.fba.kernels import project_stretching_arap_tet_kernel  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        # Arbitrary (non-rest, non-rotated) positions
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1.3, 0.1, 0), wp.vec3(0.2, 1.2, 0.1), wp.vec3(0.1, 0.2, 1.1)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tet_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
+        weight = wp.array([2.0], dtype=wp.float32, device=device)
+
+        rhs = _projection_rhs(
+            project_stretching_arap_tet_kernel, [positions, tet_indices, Dm_inv, weight, *_no_activation(weight)], 4
+        )
+        r = rhs
+        total = r[0] + r[1] + r[2] + r[3]
+        np.testing.assert_allclose(total, [0.0, 0.0, 0.0], atol=1e-5)
+
+
+class TestTetARAPIntegration(unittest.TestCase):
+    """Smoke and integration tests for SolverFBA with tet softbody."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _build_tet_grid(self, dim: int = 4):
+        """Build a dim x dim x dim tet grid, pinning the left face via fix_left=True."""
+        builder = newton.ModelBuilder()
+        builder.add_soft_grid(
+            pos=wp.vec3(0.0, 0.0, 0.1),  # lift off ground
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=dim,
+            dim_y=dim,
+            dim_z=dim,
+            cell_x=0.1,
+            cell_y=0.1,
+            cell_z=0.1,
+            density=1.0e3,
+            k_mu=1.0e4,
+            k_lambda=1.0e4,
+            k_damp=0.0,
+            fix_left=True,
+        )
+        return builder.finalize()
+
+    def test_softbody_cube_smoke_no_nan(self):
+        """Run 100 steps on a 4x4x4 tet grid; verify no NaN."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._build_tet_grid(dim=4)
+        self.assertGreater(model.tet_count, 0, "model should have tets")
+        solver = SolverFBA(model, iterations=10)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+        for _ in range(100):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite positions after 100 tet steps")
+
+    def test_softbody_gravity_sag(self):
+        """Deform a tet grid pinned on its left face under gravity."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._build_tet_grid(dim=4)
+        solver = SolverFBA(model, iterations=10)
+        s_in, s_out = model.state(), model.state()
+        q_initial = s_in.particle_q.numpy().copy()
+        dt = 1.0 / 60.0
+        for _ in range(200):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q_final = s_in.particle_q.numpy()
+        # At least some free particles should have moved under gravity.
+        max_displacement = np.abs(q_final - q_initial).max()
+        self.assertGreater(max_displacement, 1e-3, "tet softbody did not deform under gravity")
+
+
+class TestTetCorotational(unittest.TestCase):
+    """Tests for 3D corotational tet projection kernel."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _device(self):
+        return "cuda:0" if wp.is_cuda_available() else "cpu"
+
+    def test_rest_tet_corot_projects_to_identity(self):
+        """Project to sigma_proj=(1,1,1) at rest (F=I), where the corotational gradient vanishes.
+
+        For canonical tet with Dm_inv=I: F=I, sigma=(1,1,1).
+        At rest, energy gradient is zero, so sigma_proj = (1,1,1).
+        The contributions match ARAP-at-rest:
+            rhs[1]=(1,0,0), rhs[2]=(0,1,0), rhs[3]=(0,0,1), rhs[0]=-(sum).
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_corotational_tet_kernel  # noqa: PLC0415
+
+        device = self._device()
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0, 1, 0), wp.vec3(0, 0, 1)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tet_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+
+        mu, lam = 1.0, 0.5
+        rhs = _projection_rhs(
+            project_stretching_corotational_tet_kernel,
+            [
+                positions,
+                tet_indices,
+                Dm_inv,
+                weight,
+                *_no_activation(weight),
+                wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device),
+            ],
+            4,
+        )
+        r = rhs
+        # At rest: sigma=(1,1,1), corot energy gradient=0, sigma_proj=(1,1,1).
+        # P = U*diag(1,1,1)*Vt = I. proj = w*Dm_inv*I = I. Contributions as ARAP-at-rest.
+        np.testing.assert_allclose(r[1], [1.0, 0.0, 0.0], atol=1e-5)
+        np.testing.assert_allclose(r[2], [0.0, 1.0, 0.0], atol=1e-5)
+        np.testing.assert_allclose(r[3], [0.0, 0.0, 1.0], atol=1e-5)
+        np.testing.assert_allclose(r[0], -(r[1] + r[2] + r[3]), atol=1e-5)
+
+    def test_isotropic_stretch_corot_3d(self):
+        """Pull sigma_0=(1.5,1.5,1.5) (mu=1, lam=0.5) back to the closed-form sigma_proj≈1.18182 in all three.
+
+        Closed-form derivation:
+            sum_b = 6*mu + 9*lam + 2*mu*(sigma_0_0+sigma_0_1+sigma_0_2)
+                  = 6 + 4.5 + 2*(3*1.5) = 6 + 4.5 + 9 = 19.5
+            alpha = 4*mu = 4
+            alpha + 3*lam = 4 + 1.5 = 5.5
+            sigma_proj_i = (2*mu + 3*lam + 2*mu*sigma_0_i)/(4*mu) - lam*sum_b/(4*mu*(4*mu+3*lam))
+                         = (2 + 1.5 + 3)/4 - 0.5*19.5/(4*5.5)
+                         = 6.5/4 - 9.75/22
+                         = 1.625 - 0.443182...
+                         = 1.18182...
+        """
+        from newton._src.solvers.fba.kernels import project_stretching_corotational_tet_kernel  # noqa: PLC0415
+
+        device = self._device()
+        # Isotropic 1.5x stretch: move vertices to make F = 1.5*I.
+        # Ds = 1.5*I (edge vectors scaled by 1.5), Dm_inv = I -> F = 1.5*I.
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1.5, 0, 0), wp.vec3(0, 1.5, 0), wp.vec3(0, 0, 1.5)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tet_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+
+        mu, lam = 1.0, 0.5
+        rhs = _projection_rhs(
+            project_stretching_corotational_tet_kernel,
+            [
+                positions,
+                tet_indices,
+                Dm_inv,
+                weight,
+                *_no_activation(weight),
+                wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device),
+            ],
+            4,
+        )
+        r = rhs
+
+        # F = 1.5*I -> U=V=I, sigma=(1.5,1.5,1.5).
+        # sigma_proj ~= 1.18182 for all three.
+        # P = I*diag(sigma_proj)*I = sigma_proj*I.
+        # proj = w*Dm_inv*P^T = sigma_proj*I.
+        # row0=(sigma_proj,0,0), row1=(0,sigma_proj,0), row2=(0,0,sigma_proj)
+        expected = 1.625 - 0.5 * 19.5 / (4.0 * 5.5)  # ~1.18182
+        np.testing.assert_allclose(r[1], [expected, 0.0, 0.0], atol=1e-5)
+        np.testing.assert_allclose(r[2], [0.0, expected, 0.0], atol=1e-5)
+        np.testing.assert_allclose(r[3], [0.0, 0.0, expected], atol=1e-5)
+        np.testing.assert_allclose(r[0], -(r[1] + r[2] + r[3]), atol=1e-5)
+
+    def test_momentum_conservation_corot_3d(self):
+        """Sum the contributions to zero under an arbitrary deformation (momentum conservation)."""
+        from newton._src.solvers.fba.kernels import project_stretching_corotational_tet_kernel  # noqa: PLC0415
+
+        device = self._device()
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1.3, 0.1, 0), wp.vec3(0.2, 1.2, 0.1), wp.vec3(0.1, 0.2, 1.1)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tet_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
+        weight = wp.array([2.0], dtype=wp.float32, device=device)
+
+        mu, lam = 1.0e3, 5.0e2
+        rhs = _projection_rhs(
+            project_stretching_corotational_tet_kernel,
+            [
+                positions,
+                tet_indices,
+                Dm_inv,
+                weight,
+                *_no_activation(weight),
+                wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device),
+            ],
+            4,
+        )
+        r = rhs
+        total = r[0] + r[1] + r[2] + r[3]
+        np.testing.assert_allclose(total, [0.0, 0.0, 0.0], atol=1e-4)
+
+    def test_solver_corot_tet_softbody_runs(self):
+        """Step a 4x4x4 tet grid 50 times with ``stretching_model='corotational'`` to finite positions."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder()
+        builder.add_soft_grid(
+            pos=wp.vec3(0.0, 0.0, 0.1),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=4,
+            dim_y=4,
+            dim_z=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            cell_z=0.1,
+            density=1.0e3,
+            k_mu=1.0e4,
+            k_lambda=1.0e4,
+            k_damp=0.0,
+            fix_left=True,
+        )
+        model = builder.finalize()
+
+        solver = SolverFBA(model, iterations=10, stretching_model="corotational")
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+        for _ in range(50):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite positions after 50 tet Corot steps")
+
+
+class TestTetNeoHookean(unittest.TestCase):
+    """Tests for 3D Neo-Hookean tet projection kernel."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _device(self):
+        return "cuda:0" if wp.is_cuda_available() else "cpu"
+
+    def test_rest_tet_nh_projects_to_identity(self):
+        """Leave sigma=(1,1,1) unchanged at rest, where J=1, log_J=0 and the gradient vanishes.
+
+        With sigma=(1,1,1): J=1, log_J=0, inv_i=1.
+        grad_i = mu*(1-1) + lam*0*1 + k*(1-1) = 0 for all i,
+        so the projection keeps sigma at (1,1,1).
+        The contributions match ARAP-at-rest.
+        """
+        from newton._src.solvers.fba.kernels import (  # noqa: PLC0415
+            project_stretching_neohookean_tet_kernel,
+        )
+
+        device = self._device()
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1, 0, 0), wp.vec3(0, 1, 0), wp.vec3(0, 0, 1)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tet_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+
+        mu, lam = 1.0, 0.5
+        rhs = _projection_rhs(
+            project_stretching_neohookean_tet_kernel,
+            [
+                positions,
+                tet_indices,
+                Dm_inv,
+                weight,
+                *_no_activation(weight),
+                wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device),
+            ],
+            4,
+        )
+        r = rhs
+        # At rest: sigma=(1,1,1), NH gradient=0, sigma_proj=(1,1,1). Contributions as ARAP-at-rest.
+        np.testing.assert_allclose(r[1], [1.0, 0.0, 0.0], atol=1e-5)
+        np.testing.assert_allclose(r[2], [0.0, 1.0, 0.0], atol=1e-5)
+        np.testing.assert_allclose(r[3], [0.0, 0.0, 1.0], atol=1e-5)
+        np.testing.assert_allclose(r[0], -(r[1] + r[2] + r[3]), atol=1e-5)
+
+    def test_isotropic_stretch_nh_3d(self):
+        """Pull sigma_0=(1.5,1.5,1.5) (mu=1, lam=0.5, k=2) back toward 1.
+
+        sigma_proj must be:
+          - all three equal (by symmetry)
+          - positive
+          - less than 1.5 (NH pulls toward incompressibility)
+          - gradient magnitude < 1e-4 at convergence
+        """
+        from newton._src.solvers.fba.kernels import (  # noqa: PLC0415
+            project_stretching_neohookean_tet_kernel,
+        )
+
+        device = self._device()
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1.5, 0, 0), wp.vec3(0, 1.5, 0), wp.vec3(0, 0, 1.5)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tet_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
+        weight = wp.array([1.0], dtype=wp.float32, device=device)
+
+        mu, lam = 1.0, 0.5
+        rhs = _projection_rhs(
+            project_stretching_neohookean_tet_kernel,
+            [
+                positions,
+                tet_indices,
+                Dm_inv,
+                weight,
+                *_no_activation(weight),
+                wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device),
+            ],
+            4,
+        )
+        r = rhs
+        # F=1.5*I -> U=V=I, sigma_0=(1.5,1.5,1.5).
+        # rhs[1]=(sigma_proj,0,0), rhs[2]=(0,sigma_proj,0), rhs[3]=(0,0,sigma_proj).
+        sigma_proj = float(r[1][0])
+        self.assertTrue(np.isfinite(sigma_proj), "sigma_proj is not finite")
+        self.assertGreater(sigma_proj, 0.0, "sigma_proj must be positive")
+        self.assertLess(sigma_proj, 1.5, "NH should pull sigma back from 1.5 toward 1")
+
+        # All three should be equal by symmetry.
+        np.testing.assert_allclose(r[2][1], sigma_proj, atol=1e-5)
+        np.testing.assert_allclose(r[3][2], sigma_proj, atol=1e-5)
+
+        # Verify gradient is small at the converged sigma (3D NH: J = sigma_proj^3).
+        k = 2.0 * mu
+        sigma0 = 1.5
+        J3 = sigma_proj**3
+        log_J3 = np.log(J3)
+        inv_s = 1.0 / sigma_proj
+        grad = mu * (sigma_proj - inv_s) + lam * log_J3 * inv_s + k * (sigma_proj - sigma0)
+        self.assertLess(abs(grad), 1e-4, f"Gradient at converged sigma too large: {abs(grad):.2e}")
+
+    def test_momentum_conservation_nh_3d(self):
+        """Sum the contributions to zero under an arbitrary deformation (momentum conservation)."""
+        from newton._src.solvers.fba.kernels import (  # noqa: PLC0415
+            project_stretching_neohookean_tet_kernel,
+        )
+
+        device = self._device()
+        positions = wp.array(
+            [wp.vec3(0, 0, 0), wp.vec3(1.3, 0.1, 0), wp.vec3(0.2, 1.2, 0.1), wp.vec3(0.1, 0.2, 1.1)],
+            dtype=wp.vec3,
+            device=device,
+        )
+        tet_indices = wp.array([0, 1, 2, 3], dtype=wp.int32, device=device)
+        Dm_inv = wp.array([wp.mat33(1, 0, 0, 0, 1, 0, 0, 0, 1)], dtype=wp.mat33, device=device)
+        weight = wp.array([2.0], dtype=wp.float32, device=device)
+
+        mu, lam = 1.0e3, 5.0e2
+        rhs = _projection_rhs(
+            project_stretching_neohookean_tet_kernel,
+            [
+                positions,
+                tet_indices,
+                Dm_inv,
+                weight,
+                *_no_activation(weight),
+                wp.array([wp.vec2(mu, lam)], dtype=wp.vec2, device=device),
+            ],
+            4,
+        )
+        r = rhs
+        total = r[0] + r[1] + r[2] + r[3]
+        np.testing.assert_allclose(total, [0.0, 0.0, 0.0], atol=1e-4)
+
+    def test_solver_nh_tet_softbody_runs(self):
+        """Step a 4x4x4 tet grid 50 times with ``stretching_model='neohookean'`` to finite positions."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder()
+        builder.add_soft_grid(
+            pos=wp.vec3(0.0, 0.0, 0.1),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=4,
+            dim_y=4,
+            dim_z=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            cell_z=0.1,
+            density=1.0e3,
+            k_mu=1.0e4,
+            k_lambda=1.0e4,
+            k_damp=0.0,
+            fix_left=True,
+        )
+        model = builder.finalize()
+
+        solver = SolverFBA(model, iterations=10, stretching_model="neohookean")
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+        for _ in range(50):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, dt)
+            s_in, s_out = s_out, s_in
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite positions after 50 tet NH steps")
+
+
+class TestUnilateralContact(unittest.TestCase):
+    """Unilateral (frictionless) plane contact via the Schur complement.
+
+    Tests the hard-constraint contact path in SolverFBA: no friction,
+    λ ≥ 0 only.  Each test constructs a :class:`~newton.Contacts` object
+    manually (bypassing the broad/narrow phase pipeline) to isolate the
+    Schur-complement solver.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    # ------------------------------------------------------------------ helpers
+
+    def _build_single_particle_model(self, y: float = -0.5):
+        """Return a one-triangle cloth model with one free particle.
+
+        The cloth is a single equilateral triangle; particle 0 is placed at
+        ``(0, y, 0)`` so it is below the y=0 plane when ``y < 0``.
+        Particle 1 and 2 are placed at their usual rest positions but pinned
+        so only particle 0 is free.
+        """
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=[
+                wp.vec3(0.0, y, 0.0),  # particle 0: free, below plane
+                wp.vec3(1.0, 0.0, 0.0),  # particle 1: pinned
+                wp.vec3(0.0, 0.0, 1.0),  # particle 2: pinned
+            ],
+            indices=[0, 1, 2],
+            density=1.0,
+            tri_ke=5000.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+            particle_radius=0.0,
+        )
+        builder.particle_mass[1] = 0.0  # pin
+        builder.particle_mass[2] = 0.0  # pin
+        return builder.finalize()
+
+    def _make_contacts(self, device, count: int, particle_indices, normals, body_pos_world):
+        """Manually populate a :class:`~newton.Contacts` object.
+
+        Args:
+            device: Warp device.
+            count: Number of contacts ``M``.
+            particle_indices (list[int]): Particle index per contact.
+            normals (list[tuple]): World-frame contact normal per contact.
+            body_pos_world (list[tuple]): World anchor point per contact
+                (stored as-is in ``soft_contact_body_pos``; for the frictionless
+                tests with static shapes this equals the world-frame anchor).
+
+        Returns:
+            :class:`~newton.Contacts` with ``soft_contact_count`` = ``count``.
+        """
+        contacts = newton.Contacts(rigid_contact_max=0, soft_contact_max=max(count, 1), device=device)
+        # Set count via the counter slice.
+        contacts.soft_contact_count.assign(np.array([count], dtype=np.int32))
+        if count > 0:
+            p_arr = np.array(particle_indices, dtype=np.int32)
+            n_arr = np.array(normals, dtype=np.float32)
+            bp_arr = np.array(body_pos_world, dtype=np.float32)
+            contacts.soft_contact_particle.assign(p_arr)
+            contacts.soft_contact_normal.assign(n_arr)
+            contacts.soft_contact_body_pos.assign(bp_arr)
+            # shape indices (-1 = static/no-body shape)
+            s_arr = np.full(count, -1, dtype=np.int32)
+            contacts.soft_contact_shape.assign(s_arr)
+        return contacts
+
+    # ------------------------------------------------------------------ tests
+
+    def test_no_contact_passes_through(self):
+        """Step with an empty contacts object as with ``contacts=None``."""
+        model = self._build_single_particle_model(y=0.5)
+        device = model.device
+        solver = SolverFBA(model, iterations=5)
+        s_in_a, s_out_a = model.state(), model.state()
+        s_in_b, s_out_b = model.state(), model.state()
+        dt = 1.0 / 60.0
+
+        # Baseline: no contacts.
+        s_in_a.clear_forces()
+        solver.step(s_in_a, s_out_a, None, None, dt)
+        q_no_contact = s_out_a.particle_q.numpy().copy()
+
+        # With empty contacts object (count == 0).
+        empty_contacts = self._make_contacts(device, 0, [], [], [])
+        s_in_b.clear_forces()
+        solver.step(s_in_b, s_out_b, None, empty_contacts, dt)
+        q_empty_contact = s_out_b.particle_q.numpy().copy()
+
+        np.testing.assert_allclose(
+            q_empty_contact, q_no_contact, atol=1e-6, err_msg="Empty contacts path diverged from contacts=None path"
+        )
+
+    def test_single_plane_contact_pushes_particle_away(self):
+        """Push a single particle below the plane y = 0 to y >= -1e-4 m in one step.
+
+        The constraint has the normal (0, 1, 0) and the anchor (0, 0, 0), so its offset ``dot(n, anchor)`` is 0.
+        """
+        model = self._build_single_particle_model(y=-0.5)
+        device = model.device
+        # One NSN step per local-global iteration: 20 of them take 0.5 m of penetration under 1e-4 m (10 leave 0.4 mm).
+        solver = SolverFBA(model, iterations=20)
+
+        contacts = self._make_contacts(
+            device,
+            count=1,
+            particle_indices=[0],
+            normals=[(0.0, 1.0, 0.0)],  # outward normal pointing +y
+            body_pos_world=[(0.0, 0.0, 0.0)],  # anchor on the y=0 plane
+        )
+
+        s_in, s_out = model.state(), model.state()
+        s_in.clear_forces()
+        dt = 1.0 / 60.0
+        solver.step(s_in, s_out, None, contacts, dt)
+
+        q = s_out.particle_q.numpy()
+        particle_y = float(q[0, 1])
+        self.assertGreaterEqual(
+            particle_y, -1e-4, f"Particle y={particle_y:.6f} should be >= 0 after plane contact correction"
+        )
+
+    def test_multiple_plane_contacts_no_interpenetration(self):
+        """Push four particles below the plane y = 0, each with its own contact, to y >= -1e-4 m in one step."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        # Build a 2x2 grid so we get 4 free particles in a row below y=0.
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0, -0.5, 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=2,
+            dim_y=2,
+            cell_x=0.5,
+            cell_y=0.5,
+            mass=0.1,
+            tri_ke=5000.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-2,
+            edge_kd=0.0,
+            fix_left=False,
+            particle_radius=0.0,
+        )
+        # Pin one corner so the model is determinate.
+        builder.particle_mass[0] = 0.0
+        model = builder.finalize()
+        device = model.device
+        N = model.particle_count
+
+        # One NSN step per local-global iteration: 20 of them take 0.5 m of penetration under 1e-4 m (10 leave 0.4 mm).
+        solver = SolverFBA(model, iterations=20)
+
+        # All particles start at y = -0.5; identify the free ones.
+        inv_mass = model.particle_inv_mass.numpy()
+        free_indices = [i for i in range(N) if inv_mass[i] > 0]
+
+        # Create one contact per free particle, all on y=0 plane.
+        M = len(free_indices)
+        normals = [(0.0, 1.0, 0.0)] * M
+        anchors = [(0.0, 0.0, 0.0)] * M
+
+        contacts = self._make_contacts(device, M, free_indices, normals, anchors)
+
+        s_in, s_out = model.state(), model.state()
+        s_in.clear_forces()
+        dt = 1.0 / 60.0
+        solver.step(s_in, s_out, None, contacts, dt)
+
+        q = s_out.particle_q.numpy()
+        for fi in free_indices:
+            y = float(q[fi, 1])
+            self.assertGreaterEqual(y, -1e-4, f"Particle {fi} y={y:.6f} should be >= 0 after plane contact correction")
+
+    def test_schur_W_is_positive_definite_for_active_contacts(self):
+        """Build a symmetric positive definite ``W = J A⁻¹ Jᵀ`` for active contacts.
+
+        The test uses FBALinearSolver directly on a known SPD system and checks that all eigenvalues of W are positive,
+        that W is symmetric to float64 precision, and that a single contact's ``W[0, 0]`` equals ``dot(n, A⁻¹ n)`` at
+        its particle.
+        """
+        import scipy.sparse as sp
+
+        from newton._src.solvers.fba.linear_solver import (  # noqa: PLC0415
+            FBALinearSolver,
+            factorize_and_sparse_inverse,
+        )
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        rng = np.random.default_rng(7)
+        n = 32
+
+        # Build a small SPD A.
+        diag = rng.uniform(5.0, 15.0, n)
+        off = rng.uniform(-0.5, 0.5, n - 1)
+        A = sp.diags([off, diag, off], [-1, 0, 1], shape=(n, n), format="csr").astype(np.float64)
+
+        fs = factorize_and_sparse_inverse(A)
+        solver = FBALinearSolver(fs, device=device)
+
+        # 5 contacts: different particles, different normals.
+        M = 5
+        # Pick 5 distinct particle indices.
+        particles = np.array([0, 5, 10, 15, 20], dtype=np.int32)
+        normals_np = np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [0.707, 0.707, 0.0],
+                [0.0, 0.577, 0.816],
+            ],
+            dtype=np.float32,
+        )
+        # Normalise.
+        for i in range(M):
+            normals_np[i] /= np.linalg.norm(normals_np[i])
+        alpha_np = np.ones(M, dtype=np.float32)
+
+        j_indices = wp.array(particles, dtype=wp.int32, device=device)
+        j_normals = wp.array(normals_np, dtype=wp.vec3, device=device)
+        j_alpha = wp.array(alpha_np, dtype=wp.float32, device=device)
+
+        W = solver.build_schur_complement(M, j_indices, j_normals, j_alpha)
+
+        # 1. Symmetry.
+        np.testing.assert_allclose(W, W.T, atol=1e-12, err_msg="W is not symmetric")
+
+        # 2. All eigenvalues positive.
+        eigvals = np.linalg.eigvalsh(W)
+        min_eig = float(eigvals.min())
+        self.assertGreater(min_eig, 0.0, f"W has non-positive eigenvalue: {min_eig:.3e}. eigvals={eigvals}")
+
+        # 3. Scalar check for first contact: W[0,0] = n^T A^{-1}_{pp} n
+        #    where A^{-1}_{pp} is the 1x1 scalar block at particle 0.
+        #    Since A is scalar (not vec3), A^{-1}_{pp} = Ainv[p0, p0].
+        Ainv_dense = np.linalg.inv(A.toarray())
+        p0 = int(particles[0])
+        n0 = normals_np[0].astype(np.float64)
+        # For a scalar A and a scalar n (1D per component), W[0,0] = sum_i n[i]^2 * Ainv[p0,p0]
+        # because the FBA solve does each component independently.
+        W00_expected = float(np.dot(n0, n0)) * float(Ainv_dense[p0, p0])
+        # Tolerance accounts for float32 → float64 round-trip in solve().
+        self.assertAlmostEqual(
+            W[0, 0], W00_expected, delta=1e-7, msg=f"W[0,0]={W[0, 0]:.8f} != expected {W00_expected:.8f}"
+        )
+
+    def test_schur_W_matches_analytical_reference(self):
+        """Build a Schur complement W within 1e-7 of its analytical reference."""
+        import scipy.sparse as _sp
+
+        from newton._src.solvers.fba.linear_solver import (  # noqa: PLC0415
+            FBALinearSolver,
+            factorize_and_sparse_inverse,
+        )
+
+        rng = np.random.default_rng(7)
+        N = 20
+        M = 5  # contacts
+
+        A_dense = rng.standard_normal((N, N))
+        A_dense = A_dense @ A_dense.T + N * np.eye(N)
+        A = _sp.csr_matrix(A_dense)
+        fs = factorize_and_sparse_inverse(A)
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+
+        # Build random contact arrays.
+        rng2 = np.random.default_rng(13)
+        j_indices = rng2.integers(0, N, size=M, dtype=np.int32)
+        j_normals = rng2.standard_normal((M, 3)).astype(np.float32)
+        j_normals /= np.linalg.norm(j_normals, axis=1, keepdims=True) + 1e-8
+        j_alpha = np.ones(M, dtype=np.float32)
+
+        j_indices_d = wp.array(j_indices, dtype=wp.int32, device=device)
+        j_normals_d = wp.array(j_normals, dtype=wp.vec3, device=device)
+        j_alpha_d = wp.array(j_alpha, dtype=wp.float32, device=device)
+
+        solver = FBALinearSolver(fs, device=device)
+        W_b = solver.build_schur_complement(M, j_indices_d, j_normals_d, j_alpha_d)
+
+        # Reference: compute W analytically via numpy.
+        # W[cp, c] = alpha[cp] * sum_ax n_cp[ax] * A_inv[p_cp, p_c] * alpha[c] * n_c[ax]
+        A_inv = np.linalg.inv(A_dense)
+        W_ref = np.zeros((M, M), dtype=np.float64)
+        for cp in range(M):
+            p_cp = j_indices[cp]
+            a_cp = float(j_alpha[cp])
+            n_cp = j_normals[cp].astype(np.float64)
+            for c in range(M):
+                p_c = j_indices[c]
+                a_c = float(j_alpha[c])
+                n_c = j_normals[c].astype(np.float64)
+                # A^{-1} applied component-wise: contribution per axis sums independently.
+                W_ref[cp, c] = a_cp * a_c * float(np.dot(n_cp, n_c)) * float(A_inv[p_cp, p_c])
+
+        np.testing.assert_allclose(
+            W_b,
+            W_ref,
+            rtol=1e-5,
+            atol=1e-7,
+            err_msg="W diverges from analytical reference",
+        )
+
+    def test_isodof_W_matches_dense_path(self):
+        """Build ``W = J A^{-1} J^T`` from the sparse-inverse entries of the contacted particles.
+
+        :meth:`build_schur_complement` computes only the entries ``A^{-1}[i, j]``
+        of the unique contacted particles and assembles ``W`` from a
+        per-particle rank table. It must match ``J A^{-1} J^T`` computed from the
+        dense inverse of ``A`` up to float64 round-off.
+
+        The ordering of ``A`` is a non-trivial permutation, so reading the
+        sparse inverse at ``invperm[isodofs]`` in place of ``perm[isodofs]``
+        would build a wrong ``W``, silently, and NaN would follow as soon as
+        contacts engage.
+        """
+        import scipy.sparse as _sp
+
+        from newton._src.solvers.fba.linear_solver import (  # noqa: PLC0415
+            FBALinearSolver,
+            factorize_and_sparse_inverse,
+        )
+
+        # Build a sparse SPD matrix whose ordering produces a non-trivial ``perm_r`` (``perm_r != invperm_r``):
+        # the identity permutation would mask any bug that swaps ``perm[isodofs]`` for ``invperm[isodofs]``.
+        rng = np.random.default_rng(11)
+        N = 200
+        M = 7
+
+        A_lil = _sp.lil_matrix((N, N))
+        for i in range(N):
+            A_lil[i, i] = 4.0 + rng.random()
+            if i > 0:
+                v = float(rng.standard_normal())
+                A_lil[i, i - 1] = v
+                A_lil[i - 1, i] = v
+            if i > 4:
+                v = 0.1 * float(rng.standard_normal())
+                A_lil[i, i - 5] = v
+                A_lil[i - 5, i] = v
+        for j in (10, 30, 50, 100, 150):
+            A_lil[0, j] = 0.5
+            A_lil[j, 0] = 0.5
+        A = A_lil.tocsc()
+        fs = factorize_and_sparse_inverse(A, rng.random((N, 3)))
+        # Sanity: this is the regime where perm != invperm.
+        assert not np.array_equal(fs.perm_r, fs.invperm_r), (
+            "Test setup invalid: identity ordering; the W test would be vacuous."
+        )
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+
+        rng2 = np.random.default_rng(17)
+        # Allow duplicate particles in contact rows.
+        j_indices = rng2.integers(0, N, size=M, dtype=np.int32)
+        j_normals = rng2.standard_normal((M, 3)).astype(np.float32)
+        j_normals /= np.linalg.norm(j_normals, axis=1, keepdims=True) + 1e-8
+        j_alpha = rng2.uniform(0.5, 2.0, size=M).astype(np.float32)
+
+        j_indices_d = wp.array(j_indices, dtype=wp.int32, device=device)
+        j_normals_d = wp.array(j_normals, dtype=wp.vec3, device=device)
+        j_alpha_d = wp.array(j_alpha, dtype=wp.float32, device=device)
+
+        solver = FBALinearSolver(fs, device=device)
+        W_iso = solver.build_schur_complement(M, j_indices_d, j_normals_d, j_alpha_d)
+
+        # Row m of J is alpha[m] * normal[m] on the three coordinates of particle j_indices[m], so
+        # W[a, b] = alpha[a] * alpha[b] * dot(normal[a], normal[b]) * A^{-1}[p_a, p_b].
+        A_inv = np.linalg.inv(A.toarray())
+        n64, a64 = j_normals.astype(np.float64), j_alpha.astype(np.float64)
+        W_ref = np.outer(a64, a64) * (n64 @ n64.T) * A_inv[np.ix_(j_indices, j_indices)]
+
+        np.testing.assert_allclose(
+            W_iso,
+            W_ref,
+            rtol=1e-6,
+            atol=1e-8,
+            err_msg="Isodof W diverges from the dense J A^-1 J^T",
+        )
+
+    def test_contact_offset_per_shape_type(self):
+        """Give sphere, plane and cylinder contacts the plane through their anchor, at offset ``n·anchor``.
+
+        The anchor is the closest shape point; every contact then stops the particle radius plus its shape's margin
+        outside the shape surface.
+        """
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        # One free particle (needed so the solver has at least one DOF).
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=[
+                wp.vec3(0.0, -0.5, 0.0),
+                wp.vec3(1.0, 0.0, 0.0),
+                wp.vec3(0.0, 0.0, 1.0),
+            ],
+            indices=[0, 1, 2],
+            density=1.0,
+            tri_ke=5000.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+            particle_radius=0.01,
+        )
+        builder.particle_mass[1] = 0.0
+        builder.particle_mass[2] = 0.0
+        # Three static shapes covering the three relevant geometry types.
+        margin = {"sphere": 0.002, "plane": 0.0, "cylinder": 0.005}
+        cfg = {name: newton.ModelBuilder.ShapeConfig(margin=m) for name, m in margin.items()}
+        sphere_shape = builder.add_shape_sphere(body=-1, radius=0.5, cfg=cfg["sphere"])
+        plane_shape = builder.add_shape_plane(cfg=cfg["plane"])
+        cylinder_shape = builder.add_shape_cylinder(body=-1, radius=0.3, half_height=0.4, cfg=cfg["cylinder"])
+        model = builder.finalize()
+        device = model.device
+
+        # Sanity-check the shape-type enum values land where we expect.
+        shape_types = model.shape_type.numpy()
+        from newton._src.geometry.types import GeoType  # noqa: PLC0415
+
+        self.assertEqual(int(shape_types[sphere_shape]), int(GeoType.SPHERE))
+        self.assertEqual(int(shape_types[plane_shape]), int(GeoType.PLANE))
+        self.assertEqual(int(shape_types[cylinder_shape]), int(GeoType.CYLINDER))
+
+        # Three contacts with identical anchor and normal: only the shape
+        # type differs.  Anchor (0.2, 0.3, 0.4), normal (0, 1, 0) ->
+        # dot(n, anchor) = 0.3.
+        anchor = (0.2, 0.3, 0.4)
+        normal = (0.0, 1.0, 0.0)
+        contacts = newton.Contacts(rigid_contact_max=0, soft_contact_max=3, device=device)
+        contacts.soft_contact_count.assign(np.array([3], dtype=np.int32))
+        contacts.soft_contact_particle.assign(np.array([0, 0, 0], dtype=np.int32))
+        contacts.soft_contact_normal.assign(np.array([normal, normal, normal], dtype=np.float32))
+        contacts.soft_contact_body_pos.assign(np.array([anchor, anchor, anchor], dtype=np.float32))
+        contacts.soft_contact_shape.assign(np.array([sphere_shape, plane_shape, cylinder_shape], dtype=np.int32))
+
+        solver = SolverFBA(model, iterations=1, friction=False)
+        solver._ingest_contacts(contacts)
+
+        # Map our shape index back to the (post-sort) contact slot by reading
+        # the per-contact offsets off the device.  ``_ingest_contacts``
+        # lexsorts by ``(normal_z, normal_y, normal_x, shape, particle)``, so
+        # with identical normals the sort is by shape index ascending.
+        offsets = solver._contact_offset_d.numpy()[: solver._contact_count]
+        self.assertEqual(offsets.shape[0], 3)
+
+        # Solve the post-sort ordering: shapes are sorted ascending.
+        sorted_shapes = sorted([sphere_shape, plane_shape, cylinder_shape])
+        slot_of = {s: sorted_shapes.index(s) for s in (sphere_shape, plane_shape, cylinder_shape)}
+
+        # ``soft_contact_body_pos`` is stored float32: the dot product round-trips with ~1e-7 precision.
+        base = float(np.dot(np.asarray(normal, dtype=np.float64), np.asarray(anchor, dtype=np.float64)))
+        shapes = {"sphere": sphere_shape, "plane": plane_shape, "cylinder": cylinder_shape}
+        for name, shape in shapes.items():
+            self.assertAlmostEqual(float(offsets[slot_of[shape]]), base + 0.01 + margin[name], delta=1e-6)
+
+
+class TestFrictionalContact(unittest.TestCase):
+    """Coulomb friction via the semismooth Newton contact solve."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def test_friction_disabled_solvers_agree(self):
+        """Step two ``friction=False`` solvers to bit-identical states, with the particle pushed out of the plane."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=[
+                wp.vec3(0.0, -0.5, 0.0),  # particle 0: free, below plane
+                wp.vec3(1.0, 0.0, 0.0),  # pinned
+                wp.vec3(0.0, 0.0, 1.0),  # pinned
+            ],
+            indices=[0, 1, 2],
+            density=1.0,
+            tri_ke=5000.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+            particle_radius=0.0,
+        )
+        builder.particle_mass[1] = 0.0
+        builder.particle_mass[2] = 0.0
+        model = builder.finalize()
+        device = model.device
+
+        contacts = newton.Contacts(rigid_contact_max=0, soft_contact_max=1, device=device)
+        contacts.soft_contact_count.assign(np.array([1], dtype=np.int32))
+        contacts.soft_contact_particle.assign(np.array([0], dtype=np.int32))
+        contacts.soft_contact_normal.assign(np.array([[0.0, 1.0, 0.0]], dtype=np.float32))
+        contacts.soft_contact_body_pos.assign(np.array([[0.0, 0.0, 0.0]], dtype=np.float32))
+        contacts.soft_contact_shape.assign(np.array([-1], dtype=np.int32))
+
+        dt = 1.0 / 60.0
+
+        # Two identical friction=False solvers must agree exactly.
+        # One NSN step per local-global iteration: 20 of them take the penetration under 1e-4 m (10 leave 0.2 mm).
+        solver_a = SolverFBA(model, iterations=20, friction=False)
+        solver_b = SolverFBA(model, iterations=20, friction=False)
+
+        s_in_a, s_out_a = model.state(), model.state()
+        s_in_b, s_out_b = model.state(), model.state()
+        s_in_a.clear_forces()
+        s_in_b.clear_forces()
+
+        solver_a.step(s_in_a, s_out_a, None, contacts, dt)
+        solver_b.step(s_in_b, s_out_b, None, contacts, dt)
+
+        qa = s_out_a.particle_q.numpy()
+        qb = s_out_b.particle_q.numpy()
+        # Two identical solvers must agree exactly.
+        np.testing.assert_array_equal(qa, qb, err_msg="Two friction=False solvers diverged from each other")
+        # Particle 0 should be above the plane.
+        self.assertGreaterEqual(float(qa[0, 1]), -1e-4, f"Particle still below plane: y={float(qa[0, 1]):.6f}")
+
+    def test_friction_W_block_structure(self):
+        """Build a symmetric 6 x 6 W for two contacts with tangents."""
+        import scipy.sparse as sp
+
+        from newton._src.solvers.fba.linear_solver import (  # noqa: PLC0415
+            FBALinearSolver,
+            factorize_and_sparse_inverse,
+        )
+        from newton.tests.fba._reference import compute_tangent_basis  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        rng = np.random.default_rng(42)
+        n = 20
+
+        # Small SPD A.
+        diag = rng.uniform(5.0, 15.0, n)
+        off = rng.uniform(-0.3, 0.3, n - 1)
+        A = sp.diags([off, diag, off], [-1, 0, 1], shape=(n, n), format="csr").astype(np.float64)
+        fs = factorize_and_sparse_inverse(A)
+        solver = FBALinearSolver(fs, device=device)
+
+        # 2 contacts.
+        M = 2
+        particles = np.array([2, 7], dtype=np.int32)
+        normals = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+        alpha = np.ones(M, dtype=np.float32)
+
+        # Compute tangent bases.
+        t1_arr = np.zeros((M, 3), dtype=np.float32)
+        t2_arr = np.zeros((M, 3), dtype=np.float32)
+        for i in range(M):
+            t1, t2 = compute_tangent_basis(normals[i])
+            t1_arr[i] = t1.astype(np.float32)
+            t2_arr[i] = t2.astype(np.float32)
+
+        j_indices = wp.array(particles, dtype=wp.int32, device=device)
+        j_normals = wp.array(normals, dtype=wp.vec3, device=device)
+        j_alpha = wp.array(alpha, dtype=wp.float32, device=device)
+        j_t1 = wp.array(t1_arr, dtype=wp.vec3, device=device)
+        j_t2 = wp.array(t2_arr, dtype=wp.vec3, device=device)
+
+        W = solver.build_schur_complement(M, j_indices, j_normals, j_alpha, j_t1, j_t2)
+
+        # Shape must be 6x6 (3 rows per contact x 2 contacts).
+        self.assertEqual(W.shape, (6, 6), f"Expected (6,6), got {W.shape}")
+
+        # Symmetry.
+        np.testing.assert_allclose(W, W.T, atol=1e-10, err_msg="Friction W is not symmetric")
+
+        # All eigenvalues positive (SPD since the contacts are at distinct particles
+        # and the directions are orthonormal).
+        eigvals = np.linalg.eigvalsh(W)
+        self.assertGreater(float(eigvals.min()), 0.0, f"W has non-positive eigenvalue: {eigvals.min():.3e}")
+
+    def test_static_friction_holds_particle_on_plane(self):
+        """Hold a particle on a horizontal plane against lateral gravity with sufficient static friction.
+
+        A single free particle at (0, 0, 0) lies on the plane y = 0 under the gravity (0.1, -1.0, 0.0) m/s^2: a normal
+        load of m · 1.0 and a tangent force of m · 0.1. With mu = 0.5, mu F_n exceeds F_t, and after 50 steps the
+        tangent displacement stays below 1e-3 m.
+        """
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=[
+                wp.vec3(0.0, 0.0, 0.0),  # particle 0: free, exactly on plane
+                wp.vec3(1.0, 0.0, 0.0),  # pinned
+                wp.vec3(0.0, 0.0, 1.0),  # pinned
+            ],
+            indices=[0, 1, 2],
+            density=1.0,
+            tri_ke=5000.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+            particle_radius=0.0,
+        )
+        builder.particle_mass[1] = 0.0
+        builder.particle_mass[2] = 0.0
+        model = builder.finalize()
+        # Set lateral gravity (horizontal component pushes particle tangentially).
+        _g = wp.zeros(1, dtype=wp.vec3)
+        _g.fill_(wp.vec3(0.1, -1.0, 0.0))
+        model.gravity.assign(_g)
+        device = model.device
+
+        # The contact has no shape, so it takes the particles' friction coefficient.
+        model.particle_mu = 0.5
+        solver = SolverFBA(model, iterations=5, friction=True)
+
+        contacts = newton.Contacts(rigid_contact_max=0, soft_contact_max=1, device=device)
+        contacts.soft_contact_count.assign(np.array([1], dtype=np.int32))
+        contacts.soft_contact_particle.assign(np.array([0], dtype=np.int32))
+        contacts.soft_contact_normal.assign(np.array([[0.0, 1.0, 0.0]], dtype=np.float32))
+        contacts.soft_contact_body_pos.assign(np.array([[0.0, 0.0, 0.0]], dtype=np.float32))
+        contacts.soft_contact_shape.assign(np.array([-1], dtype=np.int32))
+
+        dt = 1.0 / 60.0
+        state = model.state()
+        state_out = model.state()
+
+        for _ in range(50):
+            state.clear_forces()
+            solver.step(state, state_out, None, contacts, dt)
+            state, state_out = state_out, state
+
+        q = state.particle_q.numpy()
+        # Measure tangential displacement (x and z components of particle 0).
+        tangent_drift = float(np.sqrt(q[0, 0] ** 2 + q[0, 2] ** 2))
+        self.assertLessEqual(
+            tangent_drift, 1e-3, f"Static friction failed: tangent drift = {tangent_drift:.6f} m (target <= 1e-3 m)"
+        )
+        # Particle should stay on or above the plane.
+        self.assertGreaterEqual(float(q[0, 1]), -1e-4, f"Particle fell through plane: y = {float(q[0, 1]):.6f}")
+
+    def test_kinetic_friction_slows_sliding(self):
+        """Slow a particle sliding on a plane more with friction than without.
+
+        The particle starts at (0, 0, 0) with the velocity (1, 0, 0) m/s under the gravity (0, -1, 0) on the plane with
+        the normal (0, 1, 0). The test compares the tangent positions after the first step, while the particle slides
+        (1.4 mm against 1.5 mm): its stiff triangle stops it within a few steps, after which both positions are at
+        rounding level (1e-8 m).
+        """
+
+        def run_sliding(mu_val: float) -> float:
+            builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+            builder.add_cloth_mesh(
+                pos=wp.vec3(0.0, 0.0, 0.0),
+                rot=wp.quat_identity(),
+                scale=1.0,
+                vel=wp.vec3(0.0, 0.0, 0.0),
+                vertices=[
+                    wp.vec3(0.0, 0.0, 0.0),
+                    wp.vec3(1.0, 0.0, 0.0),
+                    wp.vec3(0.0, 0.0, 1.0),
+                ],
+                indices=[0, 1, 2],
+                density=1.0,
+                tri_ke=5000.0,
+                tri_ka=0.0,
+                tri_kd=0.0,
+                edge_ke=0.0,
+                edge_kd=0.0,
+                particle_radius=0.0,
+            )
+            builder.particle_mass[1] = 0.0
+            builder.particle_mass[2] = 0.0
+            model = builder.finalize()
+            device = model.device
+
+            # Give particle 0 an initial tangential velocity.
+            state = model.state()
+            vel = state.particle_qd.numpy()
+            vel[0] = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+            state.particle_qd.assign(vel)
+            state_out = model.state()
+
+            model.particle_mu = mu_val  # the contact has no shape, so it takes the particles' coefficient
+            solver = SolverFBA(model, iterations=5, friction=True)
+
+            contacts = newton.Contacts(rigid_contact_max=0, soft_contact_max=1, device=device)
+            contacts.soft_contact_count.assign(np.array([1], dtype=np.int32))
+            contacts.soft_contact_particle.assign(np.array([0], dtype=np.int32))
+            contacts.soft_contact_normal.assign(np.array([[0.0, 1.0, 0.0]], dtype=np.float32))
+            contacts.soft_contact_body_pos.assign(np.array([[0.0, 0.0, 0.0]], dtype=np.float32))
+            contacts.soft_contact_shape.assign(np.array([-1], dtype=np.int32))
+
+            dt = 1.0 / 60.0
+            state.clear_forces()
+            solver.step(state, state_out, None, contacts, dt)
+            return float(state_out.particle_q.numpy()[0, 0])
+
+        x_frictionless = run_sliding(0.0)
+        x_friction = run_sliding(0.5)
+
+        self.assertLess(
+            x_friction,
+            x_frictionless,
+            f"Friction should decelerate particle: x(mu=0.5)={x_friction:.4f} should be < x(mu=0)={x_frictionless:.4f}",
+        )
+
+    def test_friction_multi_shape_scene_runs(self):
+        """Drop a cloth on a tilted cylinder off the origin with friction, without spurious impulses or free fall.
+
+        A tangent residual measured from the world origin instead of the contact anchor would inflate the residuals
+        of contacts off the origin about tenfold, and the runaway friction would launch the cloth off its contacts
+        into free fall. After 50 steps of a 6x6 cloth over the static cylinder (mu = 0.4), the positions are
+        finite and within 5 m vertically.
+        """
+        DIM = 6
+        CELL_SIZE = 0.08
+        CYLINDER_RADIUS = 0.3
+        CYLINDER_HALF_HEIGHT = 0.6
+        CYLINDER_TILT_DEG = 30.0
+        DT = 1.0 / 60.0
+
+        angle_rad = np.deg2rad(CYLINDER_TILT_DEG)
+        qx = float(np.sin(angle_rad / 2.0))
+        qw = float(np.cos(angle_rad / 2.0))
+        tilt_quat = wp.quat(qx, 0.0, 0.0, qw)
+        cylinder_center_z = 0.5
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
+        builder.add_shape_cylinder(
+            body=-1,
+            xform=wp.transform(wp.vec3(0.0, 0.0, cylinder_center_z), tilt_quat),
+            radius=CYLINDER_RADIUS,
+            half_height=CYLINDER_HALF_HEIGHT,
+            cfg=newton.ModelBuilder.ShapeConfig(mu=0.4),
+        )
+        cloth_start_x = -DIM * CELL_SIZE / 2.0
+        cloth_start_y = -DIM * CELL_SIZE / 2.0
+        cloth_start_z = cylinder_center_z + CYLINDER_HALF_HEIGHT + 0.5
+        builder.add_cloth_grid(
+            pos=wp.vec3(cloth_start_x, cloth_start_y, cloth_start_z),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=DIM,
+            dim_y=DIM,
+            cell_x=CELL_SIZE,
+            cell_y=CELL_SIZE,
+            mass=0.02,
+            tri_ke=4000.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=5.0e-3,
+            edge_kd=0.0,
+            particle_radius=0.0,
+        )
+        model = builder.finalize()
+
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.18)
+        contacts = pipeline.contacts()
+
+        solver = SolverFBA(model, iterations=5, friction=True)
+
+        s_in = model.state()
+        s_out = model.state()
+
+        for _ in range(50):
+            s_in.clear_forces()
+            pipeline.collide(s_in, contacts)
+            solver.step(s_in, s_out, None, contacts, DT)
+            s_in, s_out = s_out, s_in
+
+        q = s_in.particle_q.numpy()
+        self.assertTrue(
+            np.all(np.isfinite(q)),
+            "NaN/Inf positions after 50 friction steps on cloth-cylinder scene",
+        )
+        min_z = float(q[:, 2].min())
+        max_z = float(q[:, 2].max())
+        self.assertGreater(
+            min_z,
+            -5.0,
+            f"Cloth fell too far (min_z={min_z:.2f} m); friction impulses may be spurious",
+        )
+        self.assertLess(
+            max_z,
+            5.0,
+            f"Cloth launched upward (max_z={max_z:.2f} m); friction impulses may be spurious",
+        )
+
+
+class TestContactShapePrimitives(unittest.TestCase):
+    """Verify the Schur-complement pipeline works for non-plane shape
+    primitives (sphere, box) using Newton's real collision detection.
+
+    All tests drive the FULL pipeline:  collide -> _ingest_contacts -> step.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    # ------------------------------------------------------------------ helpers
+
+    def _make_pipeline(self, model, soft_contact_gap=0.3):
+        """Create a CollisionPipeline with an explicit soft contact gap."""
+        return newton.CollisionPipeline(model, soft_contact_gap=soft_contact_gap)
+
+    # ------------------------------------------------------------------ test 1
+
+    def test_particle_vs_sphere_pushes_out(self):
+        """Push a particle from inside a static sphere to its surface within 50 steps.
+
+        The sphere of radius 0.5 at the origin holds particle 0 at (0, 0, 0.2), 0.3 m deep, without friction and with
+        gravity along -z. After 50 steps the particle is at z >= 0.49.
+        """
+        builder = newton.ModelBuilder()
+        builder.add_shape_sphere(body=-1, radius=0.5)
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=[
+                wp.vec3(0.0, 0.0, 0.2),  # particle 0: free, inside sphere
+                wp.vec3(2.0, 0.0, 0.0),  # particle 1: pinned, well outside
+                wp.vec3(0.0, 2.0, 0.0),  # particle 2: pinned, well outside
+            ],
+            indices=[0, 1, 2],
+            density=1.0,
+            tri_ke=5000.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+            particle_radius=0.0,
+        )
+        builder.particle_mass[1] = 0.0
+        builder.particle_mass[2] = 0.0
+        model = builder.finalize()
+
+        pipeline = self._make_pipeline(model)
+        contacts = pipeline.contacts()
+        solver = SolverFBA(model, iterations=15, friction=False)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+
+        for _ in range(50):
+            s_in.clear_forces()
+            pipeline.collide(s_in, contacts)
+            solver.step(s_in, s_out, None, contacts, dt)
+            s_in, s_out = s_out, s_in
+
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite positions after sphere contact test")
+        dist = float(np.linalg.norm(q[0]))
+        self.assertGreaterEqual(
+            dist,
+            0.49,
+            f"Particle distance from origin {dist:.4f} should be >= 0.49 (sphere radius 0.5) after 50 steps",
+        )
+
+    # ------------------------------------------------------------------ test 2
+
+    def test_particle_vs_box_no_interpenetration(self):
+        """Push a particle from just inside a static box out within 50 steps.
+
+        The box at the origin has the half extents (1, 1, 1), and particle 0 starts at (0.9, 0, 0), 0.1 m inside the +x
+        face, without friction and with gravity along -z. After 50 steps the particle is at x >= 0.99 or outside the box
+        to within 1e-2.
+        """
+        builder = newton.ModelBuilder()
+        builder.add_shape_box(body=-1, hx=1.0, hy=1.0, hz=1.0)
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=[
+                wp.vec3(0.9, 0.0, 0.0),  # particle 0: free, inside box (0.1 m from +x)
+                wp.vec3(0.9, 2.0, 0.0),  # particle 1: pinned, outside box
+                wp.vec3(0.9, 0.0, 2.0),  # particle 2: pinned, outside box
+            ],
+            indices=[0, 1, 2],
+            density=1.0,
+            tri_ke=5000.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+            particle_radius=0.0,
+        )
+        builder.particle_mass[1] = 0.0
+        builder.particle_mass[2] = 0.0
+        model = builder.finalize()
+
+        pipeline = self._make_pipeline(model)
+        contacts = pipeline.contacts()
+        solver = SolverFBA(model, iterations=15, friction=False)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+
+        for _ in range(50):
+            s_in.clear_forces()
+            pipeline.collide(s_in, contacts)
+            solver.step(s_in, s_out, None, contacts, dt)
+            s_in, s_out = s_out, s_in
+
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite positions after box contact test")
+        # Particle should be at or outside one of the box faces (|coord| >= 0.99).
+        p0 = q[0]
+        outside_or_on_surface = (abs(p0[0]) >= 0.99) or (abs(p0[1]) >= 0.99) or (abs(p0[2]) >= 0.99)
+        self.assertTrue(
+            outside_or_on_surface,
+            f"Particle {p0} should be at or outside box surface (half-extents=1) after 50 steps",
+        )
+
+    # ------------------------------------------------------------------ test 3
+
+    def test_cloth_drapes_on_sphere(self):
+        """Drape a 4x4 cloth over a sphere for 200 steps without NaN or deep penetration.
+
+        The sphere of radius 0.4 sits at the origin, and the cloth starts at (-0.3, -0.3, 0.6) with its top row pinned,
+        gravity along -z and no friction. No particle comes within 0.1 m of the center, which allows for the soft pins.
+        """
+        builder = newton.ModelBuilder()
+        builder.add_shape_sphere(body=-1, radius=0.4)
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.3, -0.3, 0.6),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.15,
+            cell_y=0.15,
+            mass=0.05,
+            tri_ke=500.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-2,
+            edge_kd=0.0,
+            fix_top=True,
+            particle_radius=0.0,
+        )
+        model = builder.finalize()
+
+        pipeline = self._make_pipeline(model, soft_contact_gap=0.25)
+        contacts = pipeline.contacts()
+        solver = SolverFBA(model, iterations=10, friction=False)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+
+        for _ in range(200):
+            s_in.clear_forces()
+            pipeline.collide(s_in, contacts)
+            solver.step(s_in, s_out, None, contacts, dt)
+            s_in, s_out = s_out, s_in
+
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite positions after cloth-drapes-on-sphere test")
+
+        # No particle should be more than 0.3 m deep inside the sphere.
+        dists = np.linalg.norm(q, axis=1)  # distance from sphere centre (origin)
+        min_dist = float(dists.min())
+        self.assertGreaterEqual(
+            min_dist,
+            0.1,
+            f"Deepest particle is {0.4 - min_dist:.3f} m inside the sphere (min dist={min_dist:.3f}), "
+            "expected < 0.3 m penetration",
+        )
+
+    # ------------------------------------------------------------------ test 4
+
+    def test_softbody_falls_on_box(self):
+        """Drop a 3x3x3 soft cube on a static box for 100 steps without NaN or falling through it.
+
+        The box at the origin has the half extents (0.5, 0.5, 0.1), and the cube of 0.07 m cells starts at z = 0.3,
+        without friction and with gravity along -z. The cube stays above z = -0.2.
+        """
+        builder = newton.ModelBuilder()
+        # Flat platform: half-extents in XY are generous, thin in Z.
+        builder.add_shape_box(body=-1, hx=0.5, hy=0.5, hz=0.1)
+        builder.add_soft_grid(
+            pos=wp.vec3(-0.1, -0.1, 0.3),  # above box top face (z=0.1)
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=3,
+            dim_y=3,
+            dim_z=3,
+            cell_x=0.07,
+            cell_y=0.07,
+            cell_z=0.07,
+            density=5.0e2,
+            k_mu=1.0e3,
+            k_lambda=1.0e3,
+            k_damp=0.0,
+            particle_radius=0.0,
+        )
+        model = builder.finalize()
+
+        pipeline = self._make_pipeline(model, soft_contact_gap=0.25)
+        contacts = pipeline.contacts()
+        solver = SolverFBA(model, iterations=10, friction=False)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+
+        for _ in range(100):
+            s_in.clear_forces()
+            pipeline.collide(s_in, contacts)
+            solver.step(s_in, s_out, None, contacts, dt)
+            s_in, s_out = s_out, s_in
+
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite positions after softbody-on-box test")
+
+        # No particle should be deeply below the box top face (z = 0.1).
+        # Allow 0.2 m tolerance for soft contact residual.
+        min_z = float(q[:, 2].min())
+        self.assertGreaterEqual(
+            min_z,
+            -0.2,
+            f"Soft-body min z={min_z:.3f} is below the box + tolerance threshold -0.2 m",
+        )
+
+    # ------------------------------------------------------------------ test 5
+
+    def test_mixed_shape_collision(self):
+        """Keep a cloth that falls on a ground plane and a sphere out of both.
+
+        A 4x4 cloth starting at (-0.3, -0.3, 0.5), its top row pinned, falls on the plane z = 0 and a sphere of radius
+        0.3 at the origin, with gravity along -z and no friction. After 150 steps the positions are finite, above z =
+        -0.05 and at least 0.25 m from the sphere's center.
+        """
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()  # plane at z=0
+        builder.add_shape_sphere(body=-1, radius=0.3)  # sphere at origin
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.3, -0.3, 0.5),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.15,
+            cell_y=0.15,
+            mass=0.05,
+            tri_ke=500.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-2,
+            edge_kd=0.0,
+            fix_top=True,
+            particle_radius=0.0,
+        )
+        model = builder.finalize()
+
+        pipeline = self._make_pipeline(model, soft_contact_gap=0.25)
+        contacts = pipeline.contacts()
+        solver = SolverFBA(model, iterations=10, friction=False)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+
+        for _ in range(150):
+            s_in.clear_forces()
+            pipeline.collide(s_in, contacts)
+            solver.step(s_in, s_out, None, contacts, dt)
+            s_in, s_out = s_out, s_in
+
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite positions after mixed-shape collision test")
+
+        # No particle below ground plane (z < -0.05 with soft tolerance).
+        min_z = float(q[:, 2].min())
+        self.assertGreaterEqual(min_z, -0.05, f"Particle below ground plane: min z={min_z:.4f}")
+
+        # No particle more than 0.05 m inside sphere.
+        dists = np.linalg.norm(q, axis=1)
+        min_dist = float(dists.min())
+        self.assertGreaterEqual(
+            min_dist,
+            0.25,
+            f"Particle too deep inside sphere: min dist={min_dist:.4f} m (sphere radius=0.3)",
+        )
+
+    # ------------------------------------------------------------------ test 6
+
+    def test_non_origin_sphere_contact_no_double_transform(self):
+        """Push a particle out of a sphere centered off the origin, whose contact anchors take the shape transform once.
+
+        Applying the shape transform twice to the contact anchor would place the contact plane far from the surface. A
+        free particle at (5, 0, 0.2) inside a static sphere of radius 0.5 centered at (5, 0, 0), without gravity or
+        friction, ends at least 0.48 from the center after 80 steps.
+        """
+        builder = newton.ModelBuilder()
+        # Sphere at (5, 0, 0): off the origin, so applying the shape
+        # transform twice in the static-shape path of _ingest_contacts would
+        # move the contact plane.
+        builder.add_shape_sphere(
+            body=-1,
+            xform=wp.transform(wp.vec3(5.0, 0.0, 0.0), wp.quat_identity()),
+            radius=0.5,
+        )
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            vertices=[
+                wp.vec3(5.0, 0.0, 0.2),  # particle 0: free, inside sphere
+                wp.vec3(10.0, 0.0, 0.0),  # particle 1: pinned, well outside
+                wp.vec3(5.0, 10.0, 0.0),  # particle 2: pinned, well outside
+            ],
+            indices=[0, 1, 2],
+            density=1.0,
+            tri_ke=5000.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=0.0,
+            edge_kd=0.0,
+            particle_radius=0.0,
+        )
+        builder.particle_mass[1] = 0.0
+        builder.particle_mass[2] = 0.0
+        model = builder.finalize()
+        # Override gravity to zero so the particle does not drift downward under
+        # gravity while being pushed out of the sphere.
+        model.gravity.assign(wp.zeros(1, dtype=wp.vec3))
+
+        pipeline = self._make_pipeline(model, soft_contact_gap=0.3)
+        contacts = pipeline.contacts()
+        solver = SolverFBA(model, iterations=15, friction=False)
+        s_in, s_out = model.state(), model.state()
+        dt = 1.0 / 60.0
+
+        for _ in range(80):
+            s_in.clear_forces()
+            pipeline.collide(s_in, contacts)
+            solver.step(s_in, s_out, None, contacts, dt)
+            s_in, s_out = s_out, s_in
+
+        q = s_in.particle_q.numpy()
+        self.assertTrue(np.all(np.isfinite(q)), "non-finite positions in non-origin sphere test")
+
+        sphere_centre = np.array([5.0, 0.0, 0.0], dtype=np.float64)
+        dist = float(np.linalg.norm(q[0].astype(np.float64) - sphere_centre))
+        self.assertGreaterEqual(
+            dist,
+            0.48,
+            f"Particle distance from sphere centre {dist:.4f} m should be >= 0.48 "
+            "(sphere radius=0.5). If the double-transform bug is present the "
+            "contact anchor is miscomputed and the particle stays inside.",
+        )
+
+
+class SolverFBAConstructorOptionsTests(unittest.TestCase):
+    """Constructor options, and the models and contacts SolverFBA refuses."""
+
+    def _tiny_cloth_model(self):
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.1, -0.1, 0.2),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=3,
+            dim_y=3,
+            cell_x=0.05,
+            cell_y=0.05,
+            mass=0.05,
+            tri_ke=5000.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+        )
+        return builder.finalize()
+
+    def test_solver_init_rejects_no_geometry(self):
+        """Refuse a model without triangles or tetrahedra."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder()
+        builder.add_particle(pos=wp.vec3(0.0, 0.0, 0.0), vel=wp.vec3(0.0, 0.0, 0.0), mass=1.0)
+        model = builder.finalize()
+        with self.assertRaises(ValueError):
+            SolverFBA(model, iterations=1)
+
+    def test_several_worlds_are_supported(self) -> None:
+        """Accept overlapping replicated worlds."""
+        cloth = newton.ModelBuilder()
+        cloth.add_cloth_grid(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=2,
+            dim_y=2,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.1,
+            tri_ke=50.0,
+        )
+        builder = newton.ModelBuilder()
+        builder.replicate(cloth, 2)
+        model = builder.finalize()
+        solver = SolverFBA(model)
+        state = model.state()
+        solver.step(state, model.state(), None, None, 0.01)
+
+    def test_full_surface_contacts_are_refused(self) -> None:
+        """Refuse contacts from a pipeline that reports edge and face soft contacts, as other particle solvers do."""
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0, 0.0, 0.05),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=2,
+            dim_y=2,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.1,
+            tri_ke=50.0,
+        )
+        model = builder.finalize()
+        pipeline = newton.CollisionPipeline(model, enable_rigid_soft_full_surface_contact=True)
+        contacts = pipeline.contacts()
+        solver = SolverFBA(model)
+        s0, s1 = model.state(), model.state()
+        pipeline.collide(s0, contacts)
+        with self.assertRaisesRegex(NotImplementedError, "SolverFBA does not support full-surface"):
+            solver.step(s0, s1, None, contacts, 1.0 / 60.0)
+
+    def test_lambda_cap_default_is_none(self) -> None:
+        """Default ``lambda_cap`` to ``None``, no clamp."""
+        model = self._tiny_cloth_model()
+        solver = SolverFBA(model)
+        self.assertIsNone(solver.lambda_cap)
+
+    def test_lambda_cap_settable(self) -> None:
+        """Keep the ``lambda_cap`` the constructor is given."""
+        model = self._tiny_cloth_model()
+        solver = SolverFBA(model, lambda_cap=100.0)
+        self.assertEqual(solver.lambda_cap, 100.0)
+
+
+class TestContactForceObservable(unittest.TestCase):
+    """CONTACT_F rows of a cloth resting on the ground."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not wp.is_cuda_available():
+            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
+
+    def test_resting_cloth_weighs_on_the_ground(self):
+        """Report the cloth's weight on the ground, with torques about the origin, in the full and the lite solve."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
+        builder.add_ground_plane()
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.2, -0.2, 0.01),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.05,
+            tri_ke=5000.0,
+            particle_radius=0.0,
+        )
+        model = builder.finalize()
+        weight = float(model.particle_mass.numpy().sum()) * 9.81
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.05)
+        contacts = pipeline.contacts()
+        for mode in ("full", "lite"):
+            solver, s0, s1 = SolverFBA(model, nsn_schur_mode=mode), model.state(), model.state()
+            observables = solver.observables({solver.ObservableKind.CONTACT_F}, contacts=contacts)
+            for _ in range(120):
+                pipeline.collide(s0, contacts)
+                solver.step(s0, s1, None, contacts, 1.0 / 60.0, observables=observables)
+                s0, s1 = s1, s0
+            count, rigid = int(contacts.soft_contact_count.numpy()[0]), contacts.rigid_contact_max
+            wrench = observables.contact_f.numpy()
+            soft = wrench[rigid : rigid + count]
+            # Friction holds the settling cloth with up to 2e-5 of its weight.
+            np.testing.assert_allclose(soft[:, :3].sum(axis=0), [0.0, 0.0, -weight], atol=2e-5 * weight, err_msg=mode)
+            anchor = contacts.soft_contact_body_pos.numpy()[:count]  # in world frame on the static ground
+            np.testing.assert_allclose(soft[:, 3:], np.cross(anchor, soft[:, :3]), atol=1e-6 * weight, err_msg=mode)
+            self.assertFalse(wrench[:rigid].any() or wrench[rigid + count :].any(), mode)
+
+
+class SolverFBALambdaWarmStartTests(unittest.TestCase):
+    """λ warm-starts across the PD outer iterations of a step and resets at every step.
+
+    Verifies:
+    1. A step depends only on its input state: an existing solver and a new
+       one take the same step.
+    2. A new solver holds no persistent multipliers.
+    3. A step with contacts leaves nonzero persistent multipliers.
+    """
+
+    def _cloth_on_plane_model(self):
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
+        builder.add_ground_plane()
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.2, -0.2, 0.15),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.05,
+            tri_ke=5000.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            particle_radius=0.0,
+        )
+        return builder.finalize()
+
+    def test_step_carries_no_history(self) -> None:
+        """Step a state as a new solver steps it: the solver keeps no history for reset to discard.
+
+        The cloth rests on the plane after 14 steps; the contact multipliers and weights start at zero in every
+        step, in the full and the lite contact solve."""
+        from newton import CollisionPipeline  # noqa: PLC0415
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._cloth_on_plane_model()
+        pipeline = CollisionPipeline(model, soft_contact_gap=0.15)
+        contacts = pipeline.contacts()
+        for mode in ("full", "lite"):
+            solver, s0, s1 = SolverFBA(model, nsn_schur_mode=mode), model.state(), model.state()
+            for _ in range(14):
+                pipeline.collide(s0, contacts)
+                solver.step(s0, s1, None, contacts, 1.0 / 60.0)
+                s0, s1 = s1, s0
+            steps = []
+            for stepper in (solver, SolverFBA(model, nsn_schur_mode=mode)):
+                pipeline.collide(s0, contacts)
+                stepper.step(s0, s1, None, contacts, 1.0 / 60.0)
+                steps.append(s1.particle_q.numpy())
+            self.assertGreater(solver._contact_count, 0)
+            np.testing.assert_array_equal(steps[0], steps[1], err_msg=mode)
+
+    def test_lam_persistent_initially_none(self) -> None:
+        """Start a new solver without persistent multipliers."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._cloth_on_plane_model()
+        solver = SolverFBA(model)
+        self.assertIsNone(solver._lam_unilateral_persistent)
+        self.assertIsNone(solver._lam_coulomb_persistent)
+
+    def test_lam_persistent_accumulates_within_step(self) -> None:
+        """Leave nonzero persistent multipliers after a step with contacts."""
+        from newton import CollisionPipeline  # noqa: PLC0415
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._cloth_on_plane_model()
+        solver = SolverFBA(model, friction=False)
+        s_in, s_out = model.state(), model.state()
+        pipeline = CollisionPipeline(model, soft_contact_gap=0.15)
+        contacts = pipeline.contacts()
+
+        # The flat cloth falls 0.15 m and lands on the plane at step 11; step
+        # past that so the contact is sustained.
+        for _ in range(14):
+            s_in.clear_forces()
+            pipeline.collide(s_in, contacts)
+            solver.step(s_in, s_out, None, contacts, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+
+        self.assertTrue(np.all(np.isfinite(s_in.particle_q.numpy())))
+        self.assertGreater(solver._contact_count, 0)
+        self.assertIsNotNone(solver._lam_unilateral_persistent)
+        self.assertGreater(
+            float(np.abs(solver._lam_unilateral_persistent).max()),
+            0.0,
+            "λ should be non-zero after sustained contact",
+        )
+
+
+class SolverFBAKinematicCylinderTests(unittest.TestCase):
+    """Per-shape angular velocity surfaces in the tangent offsets of the friction rows."""
+
+    def _ball_and_cylinder(self):
+        """Tiny tet ball + 1 cylinder (axis +X world). Returns (model, pipeline, contacts)."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, -10.0, 0.0))
+        builder.add_soft_grid(
+            pos=wp.vec3(0.0, 0.5, 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=2,
+            dim_y=2,
+            dim_z=2,
+            cell_x=0.2,
+            cell_y=0.2,
+            cell_z=0.2,
+            density=500.0,
+            k_mu=5.0e3,
+            k_lambda=5.0e3,
+            k_damp=0.0,
+            particle_radius=0.0,
+        )
+        # Z-aligned cylinder primitive → rotate to +X via 90° about -Y.
+        half = math.pi / 4.0
+        qy = -math.sin(half)
+        qw = math.cos(half)
+        q = wp.quat(0.0, qy, 0.0, qw)
+        builder.add_shape_cylinder(
+            body=-1,
+            xform=wp.transform(wp.vec3(0.0, -0.2, 0.0), q),
+            radius=0.3,
+            half_height=2.0,
+            cfg=newton.ModelBuilder.ShapeConfig(mu=0.5),
+        )
+        model = builder.finalize()
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.2)
+        contacts = pipeline.contacts()
+        return model, pipeline, contacts
+
+    def test_default_no_kinematic_motion(self) -> None:
+        """Spin no shape by default."""
+        model, _, _ = self._ball_and_cylinder()
+        solver = SolverFBA(model, friction=True)
+        self.assertTrue(np.all(solver._shape_omega_h == 0.0))
+
+    def test_kinematic_motion_stored_per_shape(self) -> None:
+        """Store the angular velocity given for a spinning shape with that shape."""
+        model, _, _ = self._ball_and_cylinder()
+        solver = SolverFBA(
+            model,
+            friction=True,
+            shape_angular_velocity={0: -3.0},
+        )
+        self.assertEqual(float(solver._shape_omega_h[0]), -3.0)
+
+    def test_kinematic_anchor_velocity_shifts_offsets(self) -> None:
+        """Give contacts on a spinning shape a nonzero anchor velocity, and contacts on a shape that does not spin a
+        zero one."""
+        model, pipeline, contacts = self._ball_and_cylinder()
+        s_in = model.state()
+        s_out = model.state()
+
+        # Drop the ball onto the cylinder to land contacts.
+        solver_static = SolverFBA(
+            model,
+            friction=True,
+        )
+        for _ in range(20):
+            s_in.clear_forces()
+            pipeline.collide(s_in, contacts)
+            solver_static.step(s_in, s_out, None, contacts, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+            if solver_static._contact_count > 0:
+                break
+        self.assertGreater(solver_static._contact_count, 0, "Need at least one contact for the kinematic path.")
+
+        solver_spin = SolverFBA(
+            model,
+            friction=True,
+            shape_angular_velocity={0: -3.0},
+        )
+        # Drive one step on both so _ingest_contacts ran on each.
+        s2 = model.state()
+        solver_static.step(s_in, s_out, None, contacts, 1.0 / 60.0)
+        solver_spin.step(s_in, s2, None, contacts, 1.0 / 60.0)
+
+        # static path: v_anchor must be exactly zero.
+        np.testing.assert_allclose(
+            solver_static._contact_v_anchor_h[: solver_static._contact_count],
+            0.0,
+        )
+        # spin path: v_anchor must be nonzero for at least one contact.
+        self.assertGreater(
+            float(np.linalg.norm(solver_spin._contact_v_anchor_h[: solver_spin._contact_count])),
+            1e-6,
+            "Expected ω ≠ 0 to produce nonzero v_anchor.",
+        )
+
+    def test_cylinder_aligned_basis_for_spinning_shape(self) -> None:
+        """Align the tangent basis of contacts on a spinning shape with the rolling direction and the axis.
+
+        The basis is ``(cross(normal, axis), normalize(cross(normal, t1)))``: the anchor velocity lies almost entirely
+        along t1, and its projection onto t2, the axial direction, is about zero.
+        """
+        model, pipeline, contacts = self._ball_and_cylinder()
+        s_in = model.state()
+        s_out = model.state()
+        solver_spin = SolverFBA(
+            model,
+            friction=True,
+            shape_angular_velocity={0: -3.0},
+        )
+        for _ in range(20):
+            s_in.clear_forces()
+            pipeline.collide(s_in, contacts)
+            solver_spin.step(s_in, s_out, None, contacts, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+            if solver_spin._contact_count > 0:
+                break
+        self.assertGreater(solver_spin._contact_count, 0)
+
+        M = solver_spin._contact_count
+        v = solver_spin._contact_v_anchor_h[:M]
+        t1 = solver_spin._contact_tangent1_d.numpy()[:M].astype(np.float64)
+        t2 = solver_spin._contact_tangent2_d.numpy()[:M].astype(np.float64)
+        proj_t1 = np.einsum("ij,ij->i", t1, v)
+        proj_t2 = np.einsum("ij,ij->i", t2, v)
+        # The v_anchor projection onto the axial t2 must be ≈ 0.
+        # Allow small slack for numerical SVD / float32 round-trip on tangent arrays.
+        self.assertLess(float(np.max(np.abs(proj_t2))), 1e-4)
+        # And t1 must carry most of the v_anchor norm.
+        v_norm = np.linalg.norm(v, axis=1)
+        self.assertGreater(
+            float(np.min(np.abs(proj_t1) / np.maximum(v_norm, 1e-12))),
+            0.95,
+            "v_anchor should lie almost entirely along the rolling tangent t1.",
+        )
+
+
+class ParticleElementCsrTests(unittest.TestCase):
+    """Adjacency CSR builder produces correct (offsets, element_idx, local_vertex_idx)."""
+
+    def test_basic_four_vertex_adjacency(self) -> None:
+        """Map each particle to its elements and local vertex indices for two four-vertex elements sharing three
+        vertices."""
+        quads = np.array([[0, 1, 2, 3], [1, 2, 3, 4]], dtype=np.int32)
+        offsets, elem_idx, local_v = build_particle_element_csr(quads, n_particles=5, n_verts_per_element=4)
+
+        self.assertEqual(offsets.tolist(), [0, 1, 3, 5, 7, 8])
+        # Vertex 1's entries: (element=0, local=1) and (element=1, local=0).
+        v1_slice = slice(offsets[1], offsets[2])
+        elem_v1 = sorted(zip(elem_idx[v1_slice].tolist(), local_v[v1_slice].tolist(), strict=True))
+        self.assertEqual(elem_v1, [(0, 1), (1, 0)])
+
+    def test_tri_adjacency(self) -> None:
+        """Map each particle to its triangles and local vertex indices for two triangles sharing an edge."""
+        tris = np.array([[0, 1, 2], [1, 2, 3]], dtype=np.int32)
+        offsets, elem_idx, local_v = build_particle_element_csr(tris, n_particles=4, n_verts_per_element=3)
+        self.assertEqual(offsets.tolist(), [0, 1, 3, 5, 6])
+        v1_slice = slice(offsets[1], offsets[2])
+        elem_v1 = sorted(zip(elem_idx[v1_slice].tolist(), local_v[v1_slice].tolist(), strict=True))
+        self.assertEqual(elem_v1, [(0, 1), (1, 0)])
+
+    def test_empty_adjacency(self) -> None:
+        """Build an empty adjacency for no elements, with zero offsets for every particle."""
+        empty = np.zeros((0, 4), dtype=np.int32)
+        offsets, elem_idx, local_v = build_particle_element_csr(empty, n_particles=3, n_verts_per_element=4)
+        self.assertEqual(offsets.tolist(), [0, 0, 0, 0])
+        self.assertEqual(elem_idx.shape, (0,))
+        self.assertEqual(local_v.shape, (0,))
+
+
+class SolverFBATetArapDeterminismTests(unittest.TestCase):
+    """The tetrahedral ARAP projection gives bit-identical positions in two runs."""
+
+    def _run_once(self) -> np.ndarray:
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, -10.0, 0.0))
+        builder.add_soft_grid(
+            pos=wp.vec3(0.0, 1.0, 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=3,
+            dim_y=3,
+            dim_z=3,
+            cell_x=0.1,
+            cell_y=0.1,
+            cell_z=0.1,
+            density=500.0,
+            k_mu=5.0e3,
+            k_lambda=5.0e3,
+            k_damp=0.0,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=1)
+        s_in = model.state()
+        s_out = model.state()
+        for _ in range(3):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+        return s_in.particle_q.numpy().copy()
+
+    def test_two_runs_identical(self) -> None:
+        """Produce bit-identical tetrahedral ARAP positions in two runs."""
+        q1 = self._run_once()
+        q2 = self._run_once()
+        np.testing.assert_array_equal(q1, q2, err_msg="tet ARAP projection produced non-deterministic output")
+
+
+class SolverFBATetCorotDeterminismTests(unittest.TestCase):
+    """The tetrahedral corotational projection gives bit-identical positions in two runs."""
+
+    def _run_once(self) -> np.ndarray:
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, -10.0, 0.0))
+        builder.add_soft_grid(
+            pos=wp.vec3(0.0, 1.0, 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=3,
+            dim_y=3,
+            dim_z=3,
+            cell_x=0.1,
+            cell_y=0.1,
+            cell_z=0.1,
+            density=500.0,
+            k_mu=5.0e3,
+            k_lambda=5.0e3,
+            k_damp=0.0,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(
+            model,
+            iterations=1,
+            stretching_model="corotational",
+        )
+        s_in = model.state()
+        s_out = model.state()
+        for _ in range(3):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+        return s_in.particle_q.numpy().copy()
+
+    def test_two_runs_identical(self) -> None:
+        """Produce bit-identical tetrahedral corotational positions in two runs."""
+        q1 = self._run_once()
+        q2 = self._run_once()
+        np.testing.assert_array_equal(q1, q2, err_msg="tet Corot projection produced non-deterministic output")
+
+
+class SolverFBATetNHDeterminismTests(unittest.TestCase):
+    """The tetrahedral Neo-Hookean projection gives bit-identical positions in two runs."""
+
+    def _run_once(self) -> np.ndarray:
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, -10.0, 0.0))
+        builder.add_soft_grid(
+            pos=wp.vec3(0.0, 1.0, 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=3,
+            dim_y=3,
+            dim_z=3,
+            cell_x=0.1,
+            cell_y=0.1,
+            cell_z=0.1,
+            density=500.0,
+            k_mu=5.0e3,
+            k_lambda=5.0e3,
+            k_damp=0.0,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(
+            model,
+            iterations=1,
+            stretching_model="neohookean",
+        )
+        s_in = model.state()
+        s_out = model.state()
+        for _ in range(3):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+        return s_in.particle_q.numpy().copy()
+
+    def test_two_runs_identical(self) -> None:
+        """Produce bit-identical tetrahedral Neo-Hookean positions in two runs."""
+        q1 = self._run_once()
+        q2 = self._run_once()
+        np.testing.assert_array_equal(q1, q2, err_msg="tet NH projection produced non-deterministic output")
+
+
+class SolverFBATriDeterminismTests(unittest.TestCase):
+    """The triangle stretching projections give bit-identical positions in two runs."""
+
+    def _run_once(self, stretching_model: str, mu_val: float = 0.0, lam_val: float = 0.0) -> np.ndarray:
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.2, -0.2, 0.5),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=5,
+            dim_y=5,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.05,
+            tri_ke=5000.0 if stretching_model == "arap" else mu_val,
+            tri_ka=lam_val,
+            tri_kd=0.0,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=1, stretching_model=stretching_model)
+        s_in = model.state()
+        s_out = model.state()
+        for _ in range(3):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+        return s_in.particle_q.numpy().copy()
+
+    def test_arap_two_runs_identical(self) -> None:
+        """Produce bit-identical triangle ARAP positions in two runs."""
+        q1 = self._run_once("arap")
+        q2 = self._run_once("arap")
+        np.testing.assert_array_equal(q1, q2, err_msg="tri ARAP projection non-deterministic")
+
+    def test_corot_two_runs_identical(self) -> None:
+        """Produce bit-identical triangle corotational positions in two runs."""
+        q1 = self._run_once("corotational", mu_val=1.0e3, lam_val=1.0e3)
+        q2 = self._run_once("corotational", mu_val=1.0e3, lam_val=1.0e3)
+        np.testing.assert_array_equal(q1, q2, err_msg="tri Corot projection non-deterministic")
+
+    def test_nh_two_runs_identical(self) -> None:
+        """Produce bit-identical triangle Neo-Hookean positions in two runs."""
+        q1 = self._run_once("neohookean", mu_val=1.0e3, lam_val=1.0e3)
+        q2 = self._run_once("neohookean", mu_val=1.0e3, lam_val=1.0e3)
+        np.testing.assert_array_equal(q1, q2, err_msg="tri NH projection non-deterministic")
+
+
+class SolverFBABendingDeterminismTests(unittest.TestCase):
+    """The bending projection gives bit-identical positions in two runs."""
+
+    def _run_once(self) -> np.ndarray:
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
+        # Cloth with bending edges enabled.
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.2, -0.2, 0.5),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=5,
+            dim_y=5,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.05,
+            tri_ke=5000.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            edge_ke=1.0e-2,  # bending stiffness > 0
+            edge_kd=0.0,
+        )
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=1)
+        s_in = model.state()
+        s_out = model.state()
+        for _ in range(3):
+            s_in.clear_forces()
+            solver.step(s_in, s_out, None, None, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+        return s_in.particle_q.numpy().copy()
+
+    def test_two_runs_identical(self) -> None:
+        """Produce bit-identical bent cloth positions in two runs."""
+        q1 = self._run_once()
+        q2 = self._run_once()
+        np.testing.assert_array_equal(q1, q2, err_msg="bending projection non-deterministic")
+
+
+class SolverFBAIsodofJtLambdaDeterminismTests(unittest.TestCase):
+    """The per-particle gather of ``Jᵀ λ`` gives bit-identical positions in two runs."""
+
+    def _run_once(self) -> np.ndarray:
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
+        builder.add_ground_plane()
+        # Cloth that develops frictional contacts on the plane.
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.2, -0.2, 0.15),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=5,
+            dim_y=5,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.05,
+            tri_ke=5000.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            particle_radius=0.0,
+        )
+        model = builder.finalize()
+        if hasattr(model, "shape_material_mu") and model.shape_material_mu is not None:
+            mu_arr = model.shape_material_mu.numpy()
+            mu_arr[0] = 0.3
+            model.shape_material_mu.assign(mu_arr.astype(np.float32))
+        pipeline = CollisionPipeline(model, soft_contact_gap=0.2)
+        contacts = pipeline.contacts()
+        solver = SolverFBA(
+            model,
+            friction=True,
+        )
+        s_in = model.state()
+        s_out = model.state()
+        for _ in range(10):
+            s_in.clear_forces()
+            pipeline.collide(s_in, contacts)
+            solver.step(s_in, s_out, None, contacts, 1.0 / 60.0)
+            s_in, s_out = s_out, s_in
+        return s_in.particle_q.numpy().copy()
+
+    def test_two_runs_identical(self) -> None:
+        """Produce bit-identical positions of a cloth in contact, whose ``Jᵀ λ`` is gathered per particle, in two
+        runs."""
+        q1 = self._run_once()
+        q2 = self._run_once()
+        np.testing.assert_array_equal(q1, q2, err_msg="isodof J^T·lambda gather non-deterministic")
+
+
+class SolverFBAInIterReDeriveTests(unittest.TestCase):
+    """In-iteration combined-form correction ``b += dt²·Jᵀ·(ω·λ)``.
+
+    The combined form increments the right-hand side and solves once,
+    ``b += dt²·Jᵀ·(ω·λ); x = A⁻¹·b``, in place of the split form
+    ``x_cur += A⁻¹·Jᵀ·lam_apply``. The two are algebraically equivalent by
+    linearity of ``A⁻¹``; this test class verifies their numerical
+    equivalence, the in-place update of the right-hand side, the pure solve
+    at ``lam = 0``, and that a solve keeps nothing from the previous one: the
+    warm start flows through the caller's persistent multipliers.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+
+    def _make_linear_solver(self, N=16):
+        """Build a small SPD linear solver and run build_schur_complement.
+
+        Returns (solver, A_csr_dense, particles, normals, alpha,
+        contact_dev_arrays).
+        """
+        import scipy.sparse as sp
+
+        from newton._src.solvers.fba.linear_solver import (  # noqa: PLC0415
+            FBALinearSolver,
+            factorize_and_sparse_inverse,
+        )
+
+        rng = np.random.default_rng(12345)
+        diag = rng.uniform(5.0, 15.0, N)
+        off = rng.uniform(-0.3, 0.3, N - 1)
+        A = sp.diags([off, diag, off], [-1, 0, 1], shape=(N, N), format="csr").astype(np.float64)
+        fs = factorize_and_sparse_inverse(A)
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        solver = FBALinearSolver(fs, device=device)
+
+        # 3 distinct-particle contacts with random normalized directions.
+        M = 3
+        particles = np.array([1, 5, 10], dtype=np.int32)
+        normals_np = np.array(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.5, 0.5, 0.707]],
+            dtype=np.float32,
+        )
+        normals_np /= np.linalg.norm(normals_np, axis=1, keepdims=True)
+        alpha_np = np.ones(M, dtype=np.float32)
+
+        p_d = wp.array(particles, dtype=wp.int32, device=device)
+        n_d = wp.array(normals_np, dtype=wp.vec3, device=device)
+        a_d = wp.array(alpha_np, dtype=wp.float32, device=device)
+
+        # Build the Schur complement, which populates the ``_row_*_d`` /
+        # ``_isodof_row_*_d`` arrays that ``apply_lambda_correction_combined``
+        # reads.
+        solver.build_schur_complement(M, p_d, n_d, a_d)
+
+        return (
+            solver,
+            A.toarray(),
+            particles,
+            normals_np,
+            alpha_np,
+            (p_d, n_d, a_d),
+        )
+
+    def test_combined_form_matches_split_form(self):
+        """Match the combined-form correction ``A⁻¹·(rhs + Jᵀ·lam)`` with the split form ``A⁻¹·rhs + A⁻¹·Jᵀ·lam`` to
+        float32 rounding.
+
+        The split form is computed with dense solves of A.
+        """
+        N = 16
+        solver, A_dense, particles, normals, alpha, _ = self._make_linear_solver(N=N)
+        device = solver.device
+
+        rng = np.random.default_rng(98765)
+        rhs_np = rng.standard_normal((N, 3)).astype(np.float32)
+        M = len(particles)
+        lam_np = rng.standard_normal(M).astype(np.float64)
+
+        # --- Reference: split form A⁻¹·rhs + A⁻¹·Jᵀ·lam with the dense A ---
+        jt_lam = np.zeros((N, 3))
+        np.add.at(jt_lam, particles, (alpha[:, None] * normals) * lam_np[:, None])
+        x_split = np.linalg.solve(A_dense, rhs_np.astype(np.float64)) + np.linalg.solve(A_dense, jt_lam)
+
+        # --- Combined-form ---
+        rhs_comb = wp.array(rhs_np.copy(), dtype=wp.vec3, device=device)
+        x_comb = wp.empty(N, dtype=wp.vec3, device=device)
+        solver.apply_lambda_correction_combined(lam_np, rhs_comb, x_comb)
+        x_combined = x_comb.numpy().astype(np.float64)
+
+        # Float32 round-trip noise is ~1e-6 relative; allow a generous bound.
+        np.testing.assert_allclose(
+            x_combined,
+            x_split,
+            rtol=1e-4,
+            atol=1e-5,
+            err_msg=(
+                "apply_lambda_correction_combined (in-iter b += Jᵀ·lam, then "
+                "A⁻¹·b) disagrees with the split-form "
+                "(x_unc = A⁻¹·rhs, correction = A⁻¹·Jᵀ·lam, x = x_unc + "
+                "correction)."
+            ),
+        )
+
+    def test_combined_form_mutates_rhs_in_place(self):
+        """Increment ``rhs_inout`` in place by ``Jᵀ·lam``, the ``b += dt²·Jᵀ·(ω·λ)`` of the combined form."""
+        N = 16
+        solver, _A_dense, particles, normals, alpha, _ = self._make_linear_solver(N=N)
+        device = solver.device
+
+        rng = np.random.default_rng(11111)
+        rhs_init = rng.standard_normal((N, 3)).astype(np.float32)
+        M = len(particles)
+        lam_np = rng.standard_normal(M).astype(np.float64)
+
+        # Compute Jᵀ·lam analytically: for each contact r, particle p[r] gets
+        # ``alpha[r] * lam[r] * normal[r]`` added.
+        jt_lam_ref = np.zeros((N, 3), dtype=np.float64)
+        for c in range(M):
+            jt_lam_ref[int(particles[c])] += float(alpha[c]) * float(lam_np[c]) * normals[c].astype(np.float64)
+
+        rhs_d = wp.array(rhs_init.copy(), dtype=wp.vec3, device=device)
+        x_d = wp.empty(N, dtype=wp.vec3, device=device)
+        solver.apply_lambda_correction_combined(lam_np, rhs_d, x_d)
+
+        rhs_after = rhs_d.numpy().astype(np.float64)
+        expected_rhs = rhs_init.astype(np.float64) + jt_lam_ref
+        np.testing.assert_allclose(
+            rhs_after,
+            expected_rhs,
+            rtol=1e-5,
+            atol=1e-6,
+            err_msg=(
+                "apply_lambda_correction_combined did not mutate rhs_inout "
+                "to rhs_inout + Jᵀ·lam; warm-start preservation across PD "
+                "outer iters depends on this in-place update."
+            ),
+        )
+
+    def test_combined_form_zero_lam_is_pure_solve(self):
+        """Reduce the combined form to the plain solve ``x = A⁻¹·rhs`` when ``lam == 0``."""
+        N = 16
+        solver, _A_dense, particles, _normals, _alpha, _ = self._make_linear_solver(N=N)
+        device = solver.device
+
+        rng = np.random.default_rng(22222)
+        rhs_np = rng.standard_normal((N, 3)).astype(np.float32)
+        M = len(particles)
+        lam_zero = np.zeros(M, dtype=np.float64)
+
+        # Reference: pure solve.
+        rhs_ref = wp.array(rhs_np.copy(), dtype=wp.vec3, device=device)
+        x_ref = wp.empty(N, dtype=wp.vec3, device=device)
+        solver.solve(rhs_ref, x_ref)
+
+        rhs_comb = wp.array(rhs_np.copy(), dtype=wp.vec3, device=device)
+        x_comb = wp.empty(N, dtype=wp.vec3, device=device)
+        solver.apply_lambda_correction_combined(lam_zero, rhs_comb, x_comb)
+
+        # Both rhs buffers must end identical (no Jᵀ·0 added) and x must match.
+        np.testing.assert_allclose(rhs_comb.numpy(), rhs_ref.numpy(), atol=0.0)
+        np.testing.assert_allclose(
+            x_comb.numpy().astype(np.float64),
+            x_ref.numpy().astype(np.float64),
+            rtol=1e-6,
+            atol=1e-7,
+            err_msg="lam = 0 must produce x == A⁻¹·rhs (no contact contribution).",
+        )
+
+    def test_two_pd_outer_iters_preserve_warm_start_via_rhs(self):
+        """Simulate two PD outer iters, each with a fresh ``rhs``: the second solve is
+        ``A⁻¹·(rhs1 + Jᵀ·lam1)`` and keeps nothing from the first.
+
+        The solver rebuilds ``_rhs`` in every outer iteration, so the warm
+        start of λ flows through the caller's persistent multipliers, not
+        through buffers of the linear solver.
+        """
+        N = 16
+        solver, A_dense, particles, normals, alpha, _ = self._make_linear_solver(N=N)
+        device = solver.device
+        M = len(particles)
+
+        rng = np.random.default_rng(33333)
+        # Fresh rhs each PD outer iter (this is what solver_fba does: it
+        # zeros _rhs at the start of each outer iter and rebuilds it).
+        rhs_iter0 = rng.standard_normal((N, 3)).astype(np.float32)
+        lam_iter0 = rng.standard_normal(M).astype(np.float64)
+
+        rhs_iter1 = rng.standard_normal((N, 3)).astype(np.float32)  # different rhs after re-projection
+        lam_iter1 = rng.standard_normal(M).astype(np.float64)
+
+        # Iter 0: rhs0 → x0 = A⁻¹·(rhs0 + Jᵀ·lam0).
+        rhs0_d = wp.array(rhs_iter0.copy(), dtype=wp.vec3, device=device)
+        x0_d = wp.empty(N, dtype=wp.vec3, device=device)
+        solver.apply_lambda_correction_combined(lam_iter0, rhs0_d, x0_d)
+
+        # Iter 1: independent rhs1 → x1 = A⁻¹·(rhs1 + Jᵀ·lam1).
+        rhs1_d = wp.array(rhs_iter1.copy(), dtype=wp.vec3, device=device)
+        x1_d = wp.empty(N, dtype=wp.vec3, device=device)
+        solver.apply_lambda_correction_combined(lam_iter1, rhs1_d, x1_d)
+
+        # Compare against analytic reference for iter 1: must depend only on
+        # (rhs1, lam1), not on (rhs0, lam0), i.e., no carryover of warm-start
+        # via state inside the linear solver.
+        Ainv = np.linalg.inv(A_dense)
+        jt_lam1 = np.zeros((N, 3), dtype=np.float64)
+        for c in range(M):
+            jt_lam1[int(particles[c])] += float(alpha[c]) * float(lam_iter1[c]) * normals[c].astype(np.float64)
+        ref_b1 = rhs_iter1.astype(np.float64) + jt_lam1
+        ref_x1 = (Ainv @ ref_b1).astype(np.float64)
+
+        np.testing.assert_allclose(
+            x1_d.numpy().astype(np.float64),
+            ref_x1,
+            rtol=1e-4,
+            atol=1e-5,
+            err_msg=(
+                "Second PD outer iter's combined-form solve must match "
+                "A⁻¹·(rhs1 + Jᵀ·lam1) without leaking iter-0 state. The "
+                "warm-start carryover is intended to flow through "
+                "``λ_persistent`` (caller-side), not through linear-solver "
+                "internal buffers."
+            ),
+        )
+
+
+class TestNeoHookeanLBFGS(unittest.TestCase):
+    """Unit tests for the L-BFGS local projection of the Tri/Tet Neo-Hookean models.
+
+    Validates :func:`project_neohookean_sigma2d_lbfgs` and
+    :func:`project_neohookean_sigma3d_lbfgs` against ``scipy.optimize.minimize``
+    (L-BFGS-B reference) on the same objective ``Psi(sigma) + (k/2)*||sigma-sigma_0||^2``.
+    Also cross-validates the analytic gradient via finite differences.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        wp.init()
+
+    def _device(self) -> str:
+        return "cuda:0" if wp.is_cuda_available() else "cpu"
+
+    @staticmethod
+    def _nh_obj_2d(sigma, sigma0, mu, lam):
+        k = 2.0 * mu
+        s0, s1 = sigma
+        if s0 <= 0.0 or s1 <= 0.0:
+            return np.inf
+        j = s0 * s1
+        log_i3 = 2.0 * np.log(j)
+        i1 = s0 * s0 + s1 * s1
+        psi = 0.5 * mu * (i1 - log_i3 - 3.0) + 0.125 * lam * log_i3 * log_i3
+        return psi + 0.5 * k * np.sum((np.asarray(sigma) - np.asarray(sigma0)) ** 2)
+
+    @staticmethod
+    def _nh_obj_3d(sigma, sigma0, mu, lam):
+        k = 2.0 * mu
+        s0, s1, s2 = sigma
+        if s0 <= 0.0 or s1 <= 0.0 or s2 <= 0.0:
+            return np.inf
+        j = s0 * s1 * s2
+        log_i3 = 2.0 * np.log(j)
+        i1 = s0 * s0 + s1 * s1 + s2 * s2
+        psi = 0.5 * mu * (i1 - log_i3 - 3.0) + 0.125 * lam * log_i3 * log_i3
+        return psi + 0.5 * k * np.sum((np.asarray(sigma) - np.asarray(sigma0)) ** 2)
+
+    @staticmethod
+    def _build_drivers():
+        # Local kernels that drive the @wp.func directly so we can test the
+        # math in isolation (same pattern as the existing SVD/projection tests).
+        from newton._src.solvers.fba.kernels import (  # noqa: PLC0415
+            nh_gradient_2d,
+            nh_gradient_3d,
+            project_neohookean_sigma2d_lbfgs,
+            project_neohookean_sigma3d_lbfgs,
+        )
+
+        @wp.kernel
+        def drive_lbfgs2d(
+            sigma_init: wp.array[wp.vec2d],
+            mu: wp.array[wp.float64],
+            lam: wp.array[wp.float64],
+            out: wp.array[wp.vec2d],
+        ):
+            tid = wp.tid()
+            out[tid] = project_neohookean_sigma2d_lbfgs(sigma_init[tid], mu[tid], lam[tid])
+
+        @wp.kernel
+        def drive_lbfgs3d(
+            sigma_init: wp.array[wp.vec3d],
+            mu: wp.array[wp.float64],
+            lam: wp.array[wp.float64],
+            out: wp.array[wp.vec3d],
+        ):
+            tid = wp.tid()
+            out[tid] = project_neohookean_sigma3d_lbfgs(sigma_init[tid], mu[tid], lam[tid])
+
+        @wp.kernel
+        def drive_grad2d(
+            sigma: wp.array[wp.vec2d],
+            sigma_init: wp.array[wp.vec2d],
+            mu: wp.array[wp.float64],
+            lam: wp.array[wp.float64],
+            out: wp.array[wp.vec2d],
+        ):
+            tid = wp.tid()
+            k = wp.float64(2.0) * mu[tid]
+            out[tid] = nh_gradient_2d(sigma[tid], sigma_init[tid], mu[tid], lam[tid], k)
+
+        @wp.kernel
+        def drive_grad3d(
+            sigma: wp.array[wp.vec3d],
+            sigma_init: wp.array[wp.vec3d],
+            mu: wp.array[wp.float64],
+            lam: wp.array[wp.float64],
+            out: wp.array[wp.vec3d],
+        ):
+            tid = wp.tid()
+            k = wp.float64(2.0) * mu[tid]
+            out[tid] = nh_gradient_3d(sigma[tid], sigma_init[tid], mu[tid], lam[tid], k)
+
+        return drive_lbfgs2d, drive_lbfgs3d, drive_grad2d, drive_grad3d
+
+    def test_lbfgs_2d_matches_scipy_lbfgsb(self):
+        """Match SciPy's L-BFGS-B to 1e-6 with the triangle Neo-Hookean L-BFGS projection on five anchors."""
+        try:
+            import scipy.optimize as opt
+        except ImportError:
+            self.skipTest("scipy required for LBFGS reference")
+
+        device = self._device()
+        drive2, _, _, _ = self._build_drivers()
+        anchors = np.array(
+            [
+                [1.0, 1.0],  # rest
+                [1.5, 0.7],  # mild stretch + compression
+                [0.1, 0.1],  # extreme compression
+                [3.0, 1.0],  # extreme stretch
+                [0.05, 2.0],  # mixed extreme
+            ]
+        )
+        mu = 3571.43
+        lam = 14285.71
+        sigma_d = wp.array(anchors.astype(np.float64), dtype=wp.vec2d, device=device)
+        mu_d = wp.array([mu] * len(anchors), dtype=wp.float64, device=device)
+        lam_d = wp.array([lam] * len(anchors), dtype=wp.float64, device=device)
+        out = wp.zeros(len(anchors), dtype=wp.vec2d, device=device)
+        wp.launch(drive2, dim=len(anchors), inputs=[sigma_d, mu_d, lam_d], outputs=[out], device=device)
+        res = out.numpy()
+        for anchor, r in zip(anchors, res, strict=True):
+            sc = opt.minimize(
+                self._nh_obj_2d,
+                anchor,
+                args=(anchor, mu, lam),
+                method="L-BFGS-B",
+                bounds=[(1e-6, None), (1e-6, None)],
+                options={"maxiter": 50, "ftol": 1e-12, "gtol": 1e-9, "maxcor": 8},
+            )
+            np.testing.assert_allclose(r, sc.x, atol=1e-6, err_msg=f"anchor={anchor}, warp={r}, scipy={sc.x}")
+            # Objective at warp output should match scipy's at <= 1e-10 (both are
+            # near-stationary points).
+            f_warp = self._nh_obj_2d(r, anchor, mu, lam)
+            f_scipy = self._nh_obj_2d(sc.x, anchor, mu, lam)
+            self.assertLess(
+                abs(f_warp - f_scipy),
+                1e-8,
+                f"anchor={anchor}: |Δf|={abs(f_warp - f_scipy):.2e}",
+            )
+
+    def test_lbfgs_3d_matches_scipy_lbfgsb(self):
+        """Match SciPy's L-BFGS-B to 1e-6 with the tetrahedral Neo-Hookean L-BFGS projection on five anchors."""
+        try:
+            import scipy.optimize as opt
+        except ImportError:
+            self.skipTest("scipy required for LBFGS reference")
+
+        device = self._device()
+        _, drive3, _, _ = self._build_drivers()
+        anchors = np.array(
+            [
+                [1.0, 1.0, 1.0],
+                [1.5, 0.7, 0.9],
+                [0.1, 0.1, 0.1],
+                [3.0, 1.0, 1.0],
+                [1.0, 1.0, 0.05],
+            ]
+        )
+        mu = 3571.43
+        lam = 14285.71
+        sigma_d = wp.array(anchors.astype(np.float64), dtype=wp.vec3d, device=device)
+        mu_d = wp.array([mu] * len(anchors), dtype=wp.float64, device=device)
+        lam_d = wp.array([lam] * len(anchors), dtype=wp.float64, device=device)
+        out = wp.zeros(len(anchors), dtype=wp.vec3d, device=device)
+        wp.launch(drive3, dim=len(anchors), inputs=[sigma_d, mu_d, lam_d], outputs=[out], device=device)
+        res = out.numpy()
+        for anchor, r in zip(anchors, res, strict=True):
+            sc = opt.minimize(
+                self._nh_obj_3d,
+                anchor,
+                args=(anchor, mu, lam),
+                method="L-BFGS-B",
+                bounds=[(1e-6, None)] * 3,
+                options={"maxiter": 50, "ftol": 1e-12, "gtol": 1e-9, "maxcor": 8},
+            )
+            np.testing.assert_allclose(r, sc.x, atol=1e-6, err_msg=f"anchor={anchor}, warp={r}, scipy={sc.x}")
+            f_warp = self._nh_obj_3d(r, anchor, mu, lam)
+            f_scipy = self._nh_obj_3d(sc.x, anchor, mu, lam)
+            self.assertLess(abs(f_warp - f_scipy), 1e-7)
+
+    def test_nh_gradient_2d_matches_finite_difference(self):
+        """Match ``nh_gradient_2d`` with SciPy's ``approx_fprime`` finite differences."""
+        try:
+            import scipy.optimize as opt
+        except ImportError:
+            self.skipTest("scipy required for FD reference")
+
+        device = self._device()
+        _, _, drive_g2, _ = self._build_drivers()
+        sigma = np.array([[1.3, 0.8], [0.4, 1.7]])
+        sigma0 = np.array([[1.0, 1.0], [0.5, 1.5]])
+        mu = 100.0
+        lam = 200.0
+        sd = wp.array(sigma.astype(np.float64), dtype=wp.vec2d, device=device)
+        s0d = wp.array(sigma0.astype(np.float64), dtype=wp.vec2d, device=device)
+        mu_d = wp.array([mu] * len(sigma), dtype=wp.float64, device=device)
+        lam_d = wp.array([lam] * len(sigma), dtype=wp.float64, device=device)
+        out = wp.zeros(len(sigma), dtype=wp.vec2d, device=device)
+        wp.launch(drive_g2, dim=len(sigma), inputs=[sd, s0d, mu_d, lam_d], outputs=[out], device=device)
+        g_warp = out.numpy()
+        for i, (s, s0) in enumerate(zip(sigma, sigma0, strict=True)):
+            g_fd = opt.approx_fprime(s, self._nh_obj_2d, 1e-7, s0, mu, lam)
+            np.testing.assert_allclose(g_warp[i], g_fd, rtol=1e-4, atol=1e-3)
+
+    def test_nh_gradient_3d_matches_finite_difference(self):
+        """Match ``nh_gradient_3d`` with SciPy's ``approx_fprime`` finite differences."""
+        try:
+            import scipy.optimize as opt
+        except ImportError:
+            self.skipTest("scipy required for FD reference")
+
+        device = self._device()
+        _, _, _, drive_g3 = self._build_drivers()
+        sigma = np.array([[1.3, 0.8, 0.9], [0.6, 1.5, 1.1]])
+        sigma0 = np.array([[1.0, 1.0, 1.0], [0.8, 1.2, 1.0]])
+        mu = 100.0
+        lam = 200.0
+        sd = wp.array(sigma.astype(np.float64), dtype=wp.vec3d, device=device)
+        s0d = wp.array(sigma0.astype(np.float64), dtype=wp.vec3d, device=device)
+        mu_d = wp.array([mu] * len(sigma), dtype=wp.float64, device=device)
+        lam_d = wp.array([lam] * len(sigma), dtype=wp.float64, device=device)
+        out = wp.zeros(len(sigma), dtype=wp.vec3d, device=device)
+        wp.launch(drive_g3, dim=len(sigma), inputs=[sd, s0d, mu_d, lam_d], outputs=[out], device=device)
+        g_warp = out.numpy()
+        for i, (s, s0) in enumerate(zip(sigma, sigma0, strict=True)):
+            g_fd = opt.approx_fprime(s, self._nh_obj_3d, 1e-7, s0, mu, lam)
+            np.testing.assert_allclose(g_warp[i], g_fd, rtol=1e-4, atol=1e-3)
+
+
+class TestDroppedDualGauge(unittest.TestCase):
+    """A bar of tetrahedra and a strip of triangles hang 10 N; their extension gives the small-strain modulus."""
+
+    def _modulus_ratio(self, tetrahedra, stretching_model, young=1.0e6, poisson=0.4):
+        mu, lam = young / (2 * (1 + poisson)), young * poisson / ((1 + poisson) * (1 - 2 * poisson))
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -10.0))
+        if tetrahedra:  # 0.1 x 0.1 x 0.8 m
+            builder.add_soft_grid(
+                pos=wp.vec3(0.0),
+                rot=wp.quat_identity(),
+                vel=wp.vec3(0.0),
+                dim_x=2,
+                dim_y=2,
+                dim_z=16,
+                cell_x=0.05,
+                cell_y=0.05,
+                cell_z=0.05,
+                density=1.0,
+                k_mu=mu,
+                k_lambda=lam,
+                k_damp=0.0,
+            )
+            modulus, width = young, 0.01
+        else:  # 0.1 x 0.8 m, plane-stress membrane modulus [N/m]
+            rot = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.5 * np.pi)
+            builder.add_cloth_grid(
+                pos=wp.vec3(0.0),
+                rot=rot,
+                vel=wp.vec3(0.0),
+                dim_x=4,
+                dim_y=32,
+                cell_x=0.025,
+                cell_y=0.025,
+                mass=1.0e-4,
+                tri_ke=mu,
+                tri_ka=lam,
+            )
+            modulus, width = 4 * mu * (mu + lam) / (2 * mu + lam), 0.1
+        model = builder.finalize()
+        z = model.particle_q.numpy()[:, 2]
+        top, bottom = np.isclose(z, z.max()), np.isclose(z, z.min())
+        mass = np.where(top, 0.0, np.where(bottom, 1.0 / bottom.sum(), model.particle_mass.numpy()))
+        model.particle_mass.assign(mass)
+        model.particle_inv_mass.assign(np.divide(1.0, mass, out=np.zeros_like(mass), where=mass > 0))
+        solver = SolverFBA(model, iterations=50, stretching_model=stretching_model)
+        s0, s1 = model.state(), model.state()
+        for _ in range(30):  # implicit steps much longer than the 56 ms period settle the load
+            solver.step(s0, s1, None, None, 0.1)
+            s0, s1 = s1, s0
+        extension = z[bottom].mean() - s0.particle_q.numpy()[bottom, 2].mean()
+        return 10.0 * 0.8 / (width * extension) / modulus
+
+    def test_small_strain_modulus_is_the_material_modulus(self):
+        """Recover the material's small-strain modulus to 3% with the corotational and Neo-Hookean models on tetrahedra
+        and triangles.
+
+        Without the gauge the moduli come out 1 / (2 + nu) and (2 mu + lam) / (4 mu + 3 lam) as large.
+        """
+        for tetrahedra in (True, False):
+            for stretching_model in ("corotational", "neohookean"):
+                with self.subTest(tetrahedra=tetrahedra, stretching_model=stretching_model):
+                    self.assertAlmostEqual(self._modulus_ratio(tetrahedra, stretching_model), 1.0, delta=0.03)
+
+
+class TestLiteContactsOnBoxes(unittest.TestCase):
+    """A cloth resting on identical boxes in the lite NSN."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not wp.is_cuda_available():
+            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
+
+    @staticmethod
+    def _drop_on_boxes(boxes: int, mode: str, friction: bool = True) -> tuple[np.ndarray, int]:
+        """Drop a cloth on ``boxes`` identical boxes for 0.5 s; return its particle heights and contact count."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
+        for _ in range(boxes):
+            builder.add_shape_box(body=-1, hx=0.5, hy=0.5, hz=0.05)
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.1, -0.1, 0.07),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=4,
+            dim_y=4,
+            cell_x=0.05,
+            cell_y=0.05,
+            mass=0.01,
+            tri_ke=1.0e3,
+            tri_ka=1.0e3,
+            tri_kd=0.0,
+            edge_ke=1.0e-3,
+            particle_radius=0.005,
+        )
+        model = builder.finalize()
+        pipeline = CollisionPipeline(model, soft_contact_gap=0.02)
+        contacts = pipeline.contacts()
+        solver = SolverFBA(model, nsn_schur_mode=mode, friction=friction)
+        s0, s1 = model.state(), model.state()
+        for _ in range(30):
+            pipeline.collide(s0, contacts)
+            solver.step(s0, s1, None, contacts, 1.0 / 60.0)
+            s0, s1 = s1, s0
+        return s0.particle_q.numpy()[:, 2], int(contacts.soft_contact_count.numpy()[0])
+
+    def test_rests_at_the_contact_distance(self):
+        """Rest a cloth on a box its particle radius above the top face, as the full NSN does, with and without
+        friction."""
+        for friction in (True, False):
+            with self.subTest(friction=friction):
+                heights, _ = self._drop_on_boxes(1, "lite", friction)
+                np.testing.assert_allclose(heights, 0.055, rtol=0.0, atol=1.0e-5)
+
+    def test_five_contacts_on_a_particle_hold(self):
+        """Rest a cloth on five identical boxes in the lite NSN, five contacts on each particle, as on one box."""
+        heights, count = self._drop_on_boxes(5, "lite")
+        self.assertEqual(count, 5 * 25)
+        np.testing.assert_allclose(heights, self._drop_on_boxes(1, "lite")[0], rtol=0.0, atol=1.0e-4)
+
+
+if __name__ == "__main__":
+    unittest.main()

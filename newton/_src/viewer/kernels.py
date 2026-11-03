@@ -1123,3 +1123,19 @@ def transform_points(
 ):
     i = wp.tid()
     transformed_points[i] = wp.transform_point(xform, points[i])
+
+
+@wp.kernel
+def offset_world_points(
+    points: wp.array[wp.vec3],
+    point_world: wp.array[wp.int32],
+    world_offsets: wp.array[wp.vec3],
+    offset_points: wp.array[wp.vec3],
+):
+    """Shift each point by its world's offset; global points (world -1) keep their place."""
+    i = wp.tid()
+    p = points[i]
+    w = point_world[i]
+    if w >= 0 and w < world_offsets.shape[0]:
+        p = p + world_offsets[w]
+    offset_points[i] = p

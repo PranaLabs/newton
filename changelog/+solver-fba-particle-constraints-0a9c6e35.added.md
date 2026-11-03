@@ -1,0 +1,1 @@
+Add particle position and length constraints to `SolverFBA` (`SolverFBA.set_particle_constraints()`, `SolverFBA.Cable`), with the `cable_gripper_fba`, `cloth_dual_franka_fba`, `shirt_pins_fba` and `bunny_ears_fba` examples.

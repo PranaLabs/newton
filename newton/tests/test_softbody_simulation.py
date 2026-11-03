@@ -56,6 +56,9 @@ def _make_solver(model, solver_name):
             particle_enable_tile_solve=False,
         )
 
+    if solver_name == "fba":
+        return newton.solvers.SolverFBA(model, iterations=10)
+
     raise ValueError(f"Unsupported solver: {solver_name}")
 
 
@@ -160,7 +163,7 @@ class TestSoftBodySimulation(unittest.TestCase):
 
 
 devices = get_test_devices(mode="basic")
-for solver in ("semi_implicit", "xpbd", "vbd"):
+for solver in ("semi_implicit", "xpbd", "vbd", "fba"):
     add_function_test(
         TestSoftBodySimulation,
         f"test_soft_grid_free_fall_{solver}",

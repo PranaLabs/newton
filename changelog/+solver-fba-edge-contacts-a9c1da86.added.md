@@ -1,0 +1,1 @@
+Add edge-edge self contacts to `SolverFBA` (`particle_self_contact_edge_edge=True`), which keep crossing edges apart at creases when the self-contact margin is thinner than half of the longest edge, with `particle_self_contact_edge_edge_ratio` for how near the edges come before they collide, and the `shirt_fold_fba` example, in which two Franka arms fold a dropped T-shirt.

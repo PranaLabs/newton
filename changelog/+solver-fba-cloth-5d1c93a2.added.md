@@ -1,0 +1,1 @@
+Add experimental `SolverFBA`, a projective-dynamics cloth solver with ARAP stretching, isometric bending and pins that follow `SolverFBA.set_pin_targets()`, over a prefactored sparse LDLT factorization whose sparse inverse runs the linear solve on the GPU.

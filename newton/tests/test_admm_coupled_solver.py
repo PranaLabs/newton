@@ -17,6 +17,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.sim.collide import _TRIANGLE_PAIRS_MIN_CAPACITY
 from newton._src.solvers.coupled.interface import CouplingInterface
 from newton.solvers import (
     SolverBase,
@@ -1102,9 +1103,12 @@ class TestAdmmBodyParticleAttachment(unittest.TestCase):
         self.assertTrue(any("only SolverVBD" in message for message in logs.output))
 
     def test_single_vbd_entry_attachment_is_left_to_vbd(self):
-        """Leave a same-entry model attachment to SolverVBD without warning."""
+        """Leave a same-entry model attachment to SolverVBD without an attachment warning."""
         model = _build_body_particle_attachment_scene()
-        with self.assertNoLogs("newton._src.solvers.coupled.solver_coupled_admm", level="WARNING"):
+        with (
+            self.assertNoLogs("newton._src.solvers.coupled.solver_coupled_admm", level="WARNING"),
+            self.assertWarns(DeprecationWarning),
+        ):
             solver = SolverCoupledADMM(
                 model,
                 [
@@ -1278,7 +1282,7 @@ class TestAdmmCollisionDetection(unittest.TestCase):
                     ),
                 )
                 pipeline = solver._admm_collision_pipeline
-                expected_capacity = capacity if capacity is not None else defaults["max_triangle_pairs"].default
+                expected_capacity = capacity if capacity is not None else _TRIANGLE_PAIRS_MIN_CAPACITY
                 expected_factor = (
                     factor if factor is not None else defaults["contact_reduction_hashtable_size_factor"].default
                 )
@@ -1367,7 +1371,6 @@ class TestAdmmCollisionDetection(unittest.TestCase):
         model.shape_contact_pairs = wp.array(
             np.asarray([(shape_a, shape_b)], dtype=np.int32), dtype=wp.vec2i, device=model.device
         )
-        model.shape_contact_pair_count = 1
 
         with self.assertRaisesRegex(ValueError, "same world"):
             SolverCoupledADMM(
