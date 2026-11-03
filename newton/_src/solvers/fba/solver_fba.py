@@ -202,7 +202,7 @@ class SolverFBA(SolverBase):
         face_contacts: bool = False,
         face_contact_edge_radius: float = 3.0e-3,
         nsn_linear_iterations: int | None = None,
-        nsn_lite_accumulate: bool = False,
+        nsn_lite_accumulate: bool | ArrayLike = False,
         face_contact_gap: float | None = None,
         particle_enable_self_contact: bool = False,
         particle_self_contact_mode: Literal["vertex_face", "vertex_vertex"] = "vertex_face",
@@ -362,6 +362,8 @@ class SolverFBA(SolverBase):
                 where the material spreads the force. Rows that hold particles
                 at points take their own step as before. Needs
                 ``nsn_schur_mode="lite"`` and ``friction=True``.
+                A boolean array of shape ``(model.world_count + 1,)`` selects
+                worlds independently; the final entry selects global particles.
             face_contact_gap: Distance [m] within which every triangle is
                 also tested for face contacts.
                 ``None`` tests only the triangles next to particle contacts,
@@ -459,8 +461,8 @@ class SolverFBA(SolverBase):
                 same rows rather than from zero: particle contacts matched by
                 particle and shape, rigid contacts by shape pair and rank,
                 joint rows by index, and the particle constraint rows while
-                their count stays, with friction forces re-expressed in the
-                new tangents. A resting or held object then starts each step
+                their world's rows stay unchanged, with friction forces
+                re-expressed in the new tangents. A resting or held object then starts each step
                 at the contact forces that carry it, which a few iterations
                 cannot build up from zero. Face and self contacts start from
                 zero. Needs ``friction=True`` and ``nsn_schur_mode="full"``.
@@ -574,9 +576,17 @@ class SolverFBA(SolverBase):
         if nsn_linear_iterations is not None and nsn_linear_iterations < 1:
             raise ValueError(f"nsn_linear_iterations must be >= 1 or None, got {nsn_linear_iterations}")
         self.nsn_linear_iterations = None if nsn_linear_iterations is None else int(nsn_linear_iterations)
-        if nsn_lite_accumulate and (nsn_schur_mode != "lite" or not friction):
+        accumulation = np.asarray(nsn_lite_accumulate, dtype=bool)
+        if accumulation.ndim and accumulation.shape != (model.world_count + 1,):
+            raise ValueError("nsn_lite_accumulate needs a scalar or one boolean per world plus global entities")
+        self.nsn_lite_accumulate = bool(accumulation.any())
+        if self.nsn_lite_accumulate and (nsn_schur_mode != "lite" or not friction):
             raise ValueError("nsn_lite_accumulate needs nsn_schur_mode='lite' and friction=True")
-        self.nsn_lite_accumulate = bool(nsn_lite_accumulate)
+        self._accumulate_worlds = accumulation.copy() if accumulation.ndim else None
+        disabled = [] if self._accumulate_worlds is None else np.flatnonzero(~accumulation[self._particle_world_h])
+        self._accumulate_disabled_particles = wp.array(disabled, dtype=wp.int32, device=model.device)
+        self._accumulate_disabled_rows = self._empty_indices
+        self._accumulate_disabled_zeros = self._empty_contact_scale
         # nsn_lite_accumulate: the displacement of the contact forces applied so far, the contact-free iterate, and
         # the weighted multipliers with their lite motion, allocated at the first step that needs them.
         self._acc_d = self._acc_free = self._acc_omega_lam = self._acc_w = None
@@ -2044,6 +2054,12 @@ class SolverFBA(SolverBase):
         # its PD outer iterations below.
         M = self._contact_count
         n_b = 0 if self._constraint_rows is None else self._constraint_rows[0].shape[0]
+        if self.nsn_lite_accumulate and self._accumulate_worlds is not None:
+            particles = host_head(self._contact_particle_d, M) if M else np.empty(0, dtype=np.int32)
+            worlds = np.r_[np.repeat(self._particle_world_h[particles], 3), self._constraint_world_h]
+            disabled = np.flatnonzero(~self._accumulate_worlds[worlds])
+            self._accumulate_disabled_rows = wp.array(disabled, dtype=wp.int32, device=self._device)
+            self._accumulate_disabled_zeros = wp.zeros(len(disabled), dtype=wp.float64, device=self._device)
         if M > 0 or n_b:
             self._persistent_rows = None
             if self._lam_unilateral_persistent is None or self._lam_unilateral_persistent.shape != (M,):
@@ -2874,19 +2890,35 @@ class SolverFBA(SolverBase):
             raise ValueError("the lite NSN holds only rows with a direction on one particle")
         if self.nsn_schur_mode == "lite":
             self._hold_at_points(p[:, 0], np.asarray(coefficients)[:, 0], np.asarray(directions), exact)
-        if self._warm_start is not None:
-            # The rows' multipliers carry over to the next step while the rows keep their particles, coefficients
-            # and directions.
-            key = [np.asarray(a) for a in (particles, coefficients, () if directions is None else directions)]
-            if self._constraint_key is None or not all(map(np.array_equal, key, self._constraint_key)):
-                self._warm_start.bilateral_count = 0
-            self._constraint_key = key
-        self._constraint_lengths = directions is None
+        lengths = directions is None
         if directions is None:
             directions = np.zeros((len(targets), 3))
         arrays = [(particles, np.int32, wp.int32), (coefficients, np.float32, wp.float32)]
         arrays += [(directions, np.float32, wp.vec3), (targets, np.float64, wp.float64)]
-        self._constraint_rows = [wp.array(np.asarray(a, dtype=n), dtype=t, device=self._device) for a, n, t in arrays]
+        constraint_rows = [wp.array(np.asarray(a, dtype=n), dtype=t, device=self._device) for a, n, t in arrays]
+        if self._warm_start is not None:
+            key = [np.array(a, copy=True) for a in (particles, coefficients, () if lengths else directions)]
+            previous = self._constraint_key
+            if self._warm_start.bilateral_count and not all(map(np.array_equal, key, previous)):
+
+                def by_world(world, values):
+                    order = np.argsort(world, kind="stable")
+                    for rows in np.split(order, np.flatnonzero(np.diff(world[order])) + 1):
+                        columns = (values[0][rows] >= 0).any(axis=0)
+                        data = [a[np.ix_(rows, columns)] for a in values[:2]]
+                        data.append(values[2][rows] if values[2].size else values[2])
+                        yield int(world[rows[0]]), (rows, data)
+
+                old = dict(by_world(self._constraint_world_h, previous))
+                retained = np.full(R, -1, dtype=np.int32)
+                for world, (rows, data) in by_world(worlds[:, 0], key):
+                    before = old.get(world)
+                    if before is not None and all(map(np.array_equal, data, before[1])):
+                        retained[rows] = before[0]
+                self._warm_start.remap_bilateral(retained)
+            self._constraint_key = key
+        self._constraint_lengths = lengths
+        self._constraint_rows = constraint_rows
         self._constraint_world_h = worlds[:, 0]
         if self.nsn_schur_mode == "lite":
             # The lite rows' particles, directions and coefficients, which hold until the rows change.
@@ -4127,6 +4159,13 @@ class SolverFBA(SolverBase):
         omega_lam, w = self._acc_omega_lam[:n_rows], self._acc_w[:n_rows]
         inputs = [self._omega_coulomb_persistent_d, self._lam_coulomb_persistent_d]
         wp.launch(compute_omega_times_lam_kernel, n_rows, inputs, [omega_lam], device=device)
+        if self._accumulate_disabled_rows.size:
+            from .joints import scatter_values_kernel  # noqa: PLC0415
+
+            rows = self._accumulate_disabled_rows
+            wp.launch(
+                scatter_values_kernel, rows.size, [self._accumulate_disabled_zeros, 0, rows], [omega_lam], device=device
+            )
         if self._lite_direct is not None:
             from .joints import scatter_values_kernel  # noqa: PLC0415
 
@@ -4149,6 +4188,13 @@ class SolverFBA(SolverBase):
 
         inputs = [self._x_cur, self._acc_free]
         wp.launch(sub_vec3_kernel, self.model.particle_count, inputs, [self._acc_d], device=self._device)
+        if self._accumulate_disabled_particles.size:
+            from .kernels import clear_lite_direct_displacement_kernel  # noqa: PLC0415
+
+            particles = self._accumulate_disabled_particles
+            wp.launch(
+                clear_lite_direct_displacement_kernel, particles.size, [particles], [self._acc_d], device=self._device
+            )
         if self._lite_direct is not None:
             from .kernels import clear_lite_direct_displacement_kernel  # noqa: PLC0415
 
