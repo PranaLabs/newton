@@ -7,7 +7,7 @@ Each step's NSN starts from the multipliers ``lambda`` and the weights
 ``omega`` that the previous step ended with on the same rows. Rows are matched
 by identity: a particle contact by its particle and shape, a rigid contact by
 its shape pair and its rank among that pair's contacts, and a joint row by its
-index; the particle constraint rows carry over while their count stays. A
+index; particle constraint rows carry over while their world's rows stay unchanged. A
 matched contact keeps its normal multiplier, its friction force re-expressed in
 its new tangents, and the weights of its three rows. Contacts without such an
 identity start from zero: face and self contacts, and particle contacts that
@@ -67,6 +67,22 @@ def clear_bilateral_worlds_kernel(
     if reset_world_selected(world[i], mask, mask.shape[0] - 1):
         lam[i] = wp.float64(0.0)
         omega[i] = wp.float64(0.0)
+
+
+@wp.kernel
+def remap_bilateral_kernel(
+    previous_lam: wp.array[wp.float64],
+    previous_omega: wp.array[wp.float64],
+    rows: wp.array[wp.int32],
+    lam: wp.array[wp.float64],
+    omega: wp.array[wp.float64],
+):
+    i = wp.tid()
+    lam[i] = wp.float64(0.0)
+    omega[i] = wp.float64(0.0)
+    if rows[i] >= 0:
+        lam[i] = previous_lam[rows[i]]
+        omega[i] = previous_omega[rows[i]]
 
 
 @wp.kernel
@@ -334,6 +350,25 @@ class ContactWarmStart:
         if count and count == self.bilateral_count:
             wp.copy(lam, self.bilateral_lam, dest_offset=row_offset, count=count)
             wp.copy(omega, self.bilateral_omega, dest_offset=row_offset, count=count)
+
+    def remap_bilateral(self, rows: np.ndarray) -> None:
+        """Move retained worlds' cached rows to their new indices; ``-1`` starts a row from zero."""
+        if not np.any(rows >= 0):
+            self.bilateral_count = 0
+            return
+        if np.array_equal(rows, np.arange(self.bilateral_count)):
+            return
+        lam = wp.empty(len(rows), dtype=wp.float64, device=self.device)
+        omega = wp.empty_like(lam)
+        wp.launch(
+            remap_bilateral_kernel,
+            len(rows),
+            [self.bilateral_lam, self.bilateral_omega, wp.array(rows, dtype=wp.int32, device=self.device)],
+            [lam, omega],
+            device=self.device,
+        )
+        self.bilateral_lam, self.bilateral_omega = lam, omega
+        self.bilateral_count = len(rows)
 
     def store_bilateral(self, lam: wp.array, omega: wp.array, row_offset: int, count: int) -> None:
         """Keep the particle constraint rows of this step."""

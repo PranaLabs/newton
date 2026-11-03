@@ -65,6 +65,12 @@ Build independent environments with :meth:`ModelBuilder.add_world` or
 geometry and contact counts. FBA filters self contacts by world and runs the
 contact linear solver with independent reductions, iteration budgets and
 stopping decisions for each world. Gravity uses the model's per-world values.
+Changing one world's particle constraint rows clears only that world's
+constraint warm start; unchanged worlds retain theirs even when their row
+indices shift.
+``nsn_lite_accumulate`` also accepts one boolean per world plus a final global
+entry, so cloths that need accumulated contact forces can share a solver with
+cloths that use the original lite correction.
 For large batches, use ``nsn_sparse_storage=True`` with the full frictional
 operator to avoid storing a dense matrix across all environments. This does
 not share the prefactorization of repeated meshes; each replica retains its

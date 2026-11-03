@@ -760,6 +760,81 @@ class TestFBAWorlds(unittest.TestCase):
                         results.append(a.particle_q.numpy())
                     np.testing.assert_allclose(results[0], np.concatenate(results[1:]), atol=2e-6, rtol=0.0)
 
+    def test_constraint_updates_preserve_other_world_warm_start(self):
+        """Adding or removing one world's rows must not change another world's warm-started trajectory."""
+        sources = [_cloth(), _cloth(0.009, 0.03)]
+        sources[1].add_builder(_cloth(2.0, 0.02))
+        for device in self.devices:
+            for sparse in (False, True):
+                with self.subTest(device=device, sparse=sparse):
+                    results = []
+                    for ids in ((0, 1), (1,)):
+                        model = _model([sources[i] for i in ids], device)
+                        solver = SolverFBA(
+                            model,
+                            iterations=2,
+                            nsn_linear_iterations=4,
+                            nsn_sparse_storage=sparse,
+                            contact_warmstart=True,
+                        )
+                        a, b = model.state(), model.state()
+                        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.03)
+                        contacts = pipeline.contacts()
+                        initial = model.particle_q.numpy().copy()
+                        starts = model.particle_world_start.numpy()
+                        trajectory = []
+                        for step in range(10):
+                            particles = []
+                            for world, source in enumerate(ids):
+                                if source == 0 and step == 4:
+                                    continue
+                                local = (0, step - 1) if source == 0 and step in (2, 3) else (0,)
+                                particles.extend(starts[world] + np.asarray(local))
+                            particles = np.asarray(particles, dtype=np.int32)
+                            targets = initial[particles] + [0.05, 0.0, 0.0]
+                            p = np.repeat(particles, 3)[:, None]
+                            c = np.ones((3 * len(particles), 1))
+                            d = np.tile(np.eye(3), (len(particles), 1))
+                            targets = targets.reshape(-1)
+                            own = model.particle_world.numpy()[p[:, 0]]
+                            changed = own == ids.index(0) if 0 in ids else np.zeros(len(p), dtype=bool)
+                            if step == 6:
+                                c[changed] = 2.0
+                                targets[changed] *= 2.0
+                            if step == 7:
+                                d[changed] *= -1.0
+                                targets[changed] *= -1.0
+                            if step == 8:
+                                # A two-particle row widens the other world's unchanged point rows with padding.
+                                keep = ~changed
+                                p = np.column_stack((p[keep, 0], np.full(keep.sum(), -1, dtype=np.int32)))
+                                c, d, targets = c[keep], d[keep], targets[keep]
+                                c = np.column_stack((c[:, 0], np.zeros(len(c))))
+                                if 0 in ids:
+                                    first = starts[ids.index(0)]
+                                    p = np.vstack(([first, first + 1], p))
+                                    c = np.vstack(([1.0, -1.0], c))
+                                    d = np.vstack(([1.0, 0.0, 0.0], d))
+                                    targets = np.r_[-0.1, targets]
+                            solver.set_particle_constraints(p, c, targets, directions=d)
+                            pipeline.collide(a, contacts)
+                            solver.step(a, b, None, contacts, 0.01)
+                            a, b = b, a
+                            first = starts[ids.index(1)]
+                            trajectory.append(
+                                (a.particle_q.numpy()[first:].copy(), a.particle_qd.numpy()[first:].copy())
+                            )
+                        results.append(trajectory)
+                    for step in range(10):
+                        for field in range(2):
+                            np.testing.assert_allclose(
+                                results[0][step][field],
+                                results[1][step][field],
+                                atol=2e-6,
+                                rtol=0.0,
+                                err_msg=f"{device=}, {sparse=}, {step=}, {field=}",
+                            )
+
     def test_exact_rows_per_world_blocks(self):
         """Lite exact rows take one Cholesky block per world, of at most 64 rows each: 126 rows interleaved over two
         worlds, point rows and partial rows along one direction, and a third world without rows step as the worlds
@@ -991,14 +1066,33 @@ class TestFBAWorlds(unittest.TestCase):
                     )
 
     def test_failed_constraint_update_keeps_ownership(self):
-        """Keep the previous constraint rows and their worlds after a refused update."""
+        """Refused and in-place edits preserve other worlds' rows and warm start."""
         model = _model([_cloth(), _cloth()], "cpu")
-        solver = SolverFBA(model, iterations=1)
-        solver.set_particle_constraints([[0]], [[1.0]], [0.005], directions=[[0.0, 0.0, 1.0]])
+        solver = SolverFBA(model, iterations=1, contact_warmstart=True)
+        particles = np.array([[0], [4]])
+        targets, directions = [0.005, 0.005], [[0.0, 0.0, 1.0]] * 2
+        solver.set_particle_constraints(particles, [[1.0]] * 2, targets, directions=directions)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.03)
+        contacts = pipeline.contacts()
+        a, b = model.state(), model.state()
+        pipeline.collide(a, contacts)
+        solver.step(a, b, None, contacts, 0.01)
+        warm = solver._warm_start
+        before = [a.numpy()[:2].copy() for a in (warm.bilateral_lam, warm.bilateral_omega)]
+        self.assertGreater(abs(before[0][1]), 0.0)
+        particles[0, 0] = 1
+        solver.set_particle_constraints(particles, [[1.0]] * 2, targets, directions=directions)
+        self.assertEqual(warm.bilateral_count, 2)
+        for values, old in zip((warm.bilateral_lam, warm.bilateral_omega), before, strict=True):
+            np.testing.assert_array_equal(values.numpy()[:2], [0.0, old[1]])
         with self.assertRaises(ValueError):
             solver.set_particle_constraints([[4], [5]], [["bad"], ["bad"]], [0.005, 0.005])
-        solver.step(model.state(), model.state(), None, None, 0.01)
-        np.testing.assert_array_equal(solver._constraint_world_h, [0])
+        self.assertEqual(warm.bilateral_count, 2)
+        for values, old in zip((warm.bilateral_lam, warm.bilateral_omega), before, strict=True):
+            np.testing.assert_array_equal(values.numpy()[:2], [0.0, old[1]])
+        pipeline.collide(b, contacts)
+        solver.step(b, a, None, contacts, 0.01)
+        np.testing.assert_array_equal(solver._constraint_world_h, [0, 1])
 
     def test_global_contacts_and_shape_ownership(self):
         """Let global particles contact and constrain a world's, and reject a shape outside its body's world."""
@@ -1061,28 +1155,30 @@ class TestFBAWorlds(unittest.TestCase):
         layered.add_builder(_cloth(0.02))
         sources = [_cloth(), layered]
         for device in self.devices:
-            with self.subTest(device=device):
-                results = []
-                for builders in (sources, *([s] for s in sources)):
-                    model = _model(builders, device)
-                    solver = SolverFBA(
-                        model,
-                        iterations=2,
-                        nsn_linear_iterations=2,
-                        nsn_schur_mode="lite",
-                        particle_enable_self_contact=True,
-                        particle_self_contact_margin=0.02,
-                    )
-                    pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.03)
-                    contacts = pipeline.contacts()
-                    a, b = model.state(), model.state()
-                    for _ in range(2):
-                        pipeline.collide(a, contacts)
-                        solver.step(a, b, None, contacts, 0.01)
-                        a, b = b, a
-                    results.append(a.particle_q.numpy())
-                self.assertIsNotNone(solver._contact_extra)
-                np.testing.assert_allclose(results[0], np.concatenate(results[1:]), atol=2e-6, rtol=0.0)
+            for accumulate in ((False, False), (True, False), (False, True), (True, True)):
+                with self.subTest(device=device, accumulate=accumulate):
+                    results = []
+                    for run, builders in enumerate((sources, *([s] for s in sources))):
+                        model = _model(builders, device)
+                        solver = SolverFBA(
+                            model,
+                            iterations=2,
+                            nsn_linear_iterations=2,
+                            nsn_schur_mode="lite",
+                            nsn_lite_accumulate=[*accumulate, False] if run == 0 else accumulate[run - 1],
+                            particle_enable_self_contact=True,
+                            particle_self_contact_margin=0.02,
+                        )
+                        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.03)
+                        contacts = pipeline.contacts()
+                        a, b = model.state(), model.state()
+                        for _ in range(2):
+                            pipeline.collide(a, contacts)
+                            solver.step(a, b, None, contacts, 0.01)
+                            a, b = b, a
+                        results.append(a.particle_q.numpy())
+                    self.assertIsNotNone(solver._contact_extra)
+                    np.testing.assert_allclose(results[0], np.concatenate(results[1:]), atol=2e-6, rtol=0.0)
 
     def test_factor_splits_only_worlds(self):
         """The particle and body systems of one world factor whole, also of disconnected cloths and bodies; those of
