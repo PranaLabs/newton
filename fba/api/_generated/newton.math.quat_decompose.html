@@ -1066,7 +1066,7 @@
 <dt class="sig sig-object py" id="newton.math.quat_decompose">
 <span class="sig-prename descclassname"><span class="pre">newton.math.</span></span><span class="sig-name descname"><span class="pre">quat_decompose</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">q</span></span></em><span class="sig-paren">)</span><a class="reference external" href="https://github.com/newton-physics/newton/blob/main/newton/_src/math/spatial.py#L150"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#newton.math.quat_decompose" title="Link to this definition">#</a></dt>
 <dd><p>Decompose a quaternion into wrapped XYZ Euler coordinates.</p>
-<p>This wrapper calls <a class="reference external" href="https://nvidia.github.io/warp/stable/language_reference/_generated/warp.quat_to_euler.html#warp._src.lang.quat_to_euler" title="(in Warp v1.18.0)"><code class="xref py py-func docutils literal notranslate"><span class="pre">warp.quat_to_euler()</span></code></a> with the Newton convention
+<p>This wrapper calls <a class="reference external" href="https://nvidia.github.io/warp/stable/language_reference/_generated/warp.quat_to_euler.html#warp._src.lang.quat_to_euler" title="(in Warp v1.19.0)"><code class="xref py py-func docutils literal notranslate"><span class="pre">warp.quat_to_euler()</span></code></a> with the Newton convention
 <span class="math notranslate nohighlight">\((i, j, k) = (2, 1, 0)\)</span>, then wraps each angle to the principal
 branch. Wrapping avoids equivalent representations that differ by
 <span class="math notranslate nohighlight">\(2\pi\)</span>,
@@ -1076,7 +1076,7 @@ which improves stability when reconstructing joint coordinates.</p>
 e_i \leftarrow \operatorname{wrap}_{[-\pi,\pi)}(e_i)\]</div>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>q</strong> (<a class="reference external" href="https://nvidia.github.io/warp/stable/api_reference/_generated/warp.quatf.html#warp.quatf" title="(in Warp v1.18.0)"><em>quatf</em></a>) – Input quaternion in Warp layout <code class="docutils literal notranslate"><span class="pre">(x,</span> <span class="pre">y,</span> <span class="pre">z,</span> <span class="pre">w)</span></code>.</p>
+<dd class="field-odd"><p><strong>q</strong> (<a class="reference external" href="https://nvidia.github.io/warp/stable/api_reference/_generated/warp.quatf.html#warp.quatf" title="(in Warp v1.19.0)"><em>quatf</em></a>) – Input quaternion in Warp layout <code class="docutils literal notranslate"><span class="pre">(x,</span> <span class="pre">y,</span> <span class="pre">z,</span> <span class="pre">w)</span></code>.</p>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
 <dd class="field-even"><p>Wrapped Euler coordinates <code class="docutils literal notranslate"><span class="pre">(x,</span> <span class="pre">y,</span> <span class="pre">z)</span></code> [rad].</p>

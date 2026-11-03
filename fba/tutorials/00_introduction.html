@@ -1136,18 +1136,25 @@
 </pre></div>
 </div>
 </div>
-<div class="nboutput nblast docutils container">
+<div class="nboutput docutils container">
 <div class="prompt empty docutils container">
 </div>
 <div class="output_area docutils container">
 <div class="highlight"><pre>
 Warp 1.18.0 initialized:
-   CUDA Toolkit 13.4, Driver 13.2
+   CUDA Toolkit 13.4, CUDA driver not available (NVRTC compilation available)
    Devices:
      &#34;cpu&#34;      : &#34;x86_64&#34;
-     &#34;cuda:0&#34;   : &#34;NVIDIA GeForce RTX 5090&#34; (31 GiB, sm_120, mempool enabled)
    Kernel cache:
      /home/ziqiu/.cache/warp/1.18.0
+</pre></div></div>
+</div>
+<div class="nboutput nblast docutils container">
+<div class="prompt empty docutils container">
+</div>
+<div class="output_area stderr docutils container">
+<div class="highlight"><pre>
+Warp CUDA error 100: no CUDA-capable device is detected (in function init_cuda_driver, /builds/omniverse/warp/warp/native/cuda_util.cpp:333)
 </pre></div></div>
 </div>
 </section>
@@ -1239,7 +1246,7 @@ Added 4 bodies with collision shapes
 </div>
 <div class="output_area docutils container">
 <div class="highlight"><pre>
-Module newton._src.geometry.inertia 060c986 load on device &#39;cuda:0&#39; took 0.39 ms  (cached)
+Module newton._src.geometry.inertia f6b4bd8 load on device &#39;cpu&#39; took 8.38 ms  (cached)
 Added mesh body with 6102 vertices
 </pre></div></div>
 </div>
@@ -1272,9 +1279,9 @@ Added mesh body with 6102 vertices
 </div>
 <div class="output_area docutils container">
 <div class="highlight"><pre>
-Module validate_and_correct_inertia_kernel_1ff2ac62 1ff2ac6 load on device &#39;cuda:0&#39; took 1.44 ms  (cached)
-Module newton._src.geometry.bvh 0003cad load on device &#39;cuda:0&#39; took 0.51 ms  (cached)
-Model finalized for device cuda:0:
+Module validate_and_correct_inertia_kernel_1ff2ac62 6ad45b8 load on device &#39;cpu&#39; took 0.44 ms  (cached)
+Module newton._src.geometry.bvh f9dede2 load on device &#39;cpu&#39; took 0.59 ms  (cached)
+Model finalized for device cpu:
   Bodies: 5
   Shapes: 7
   Joints: 5
@@ -1340,7 +1347,7 @@ State, Contacts and Control objects created
 </div>
 <div class="output_area docutils container">
 <div class="highlight"><pre>
-Module newton._src.solvers.solver d7b7ff4 load on device &#39;cuda:0&#39; took 1.38 ms  (cached)
+Module newton._src.solvers.solver 5e8bff5 load on device &#39;cpu&#39; took 1.22 ms  (cached)
 Solver created: SolverXPBD
 </pre></div></div>
 </div>
@@ -1437,18 +1444,17 @@ Simulation configured:
 </div>
 <div class="output_area docutils container">
 <div class="highlight"><pre>
-Module newton._src.sim.collide 058d18f load on device &#39;cuda:0&#39; took 2.14 ms  (cached)
-Module newton._src.geometry.broad_phase_nxn 0c4afcd load on device &#39;cuda:0&#39; took 1.15 ms  (cached)
-Module narrow_phase_primitive_write_contact_False_False_False 08da2b3 load on device &#39;cuda:0&#39; took 3.77 ms  (cached)
-Module narrow_phase_gjk_mpr_True_False_write_contact_support_map_default 76bbf0a load on device &#39;cuda:0&#39; took 5.75 ms  (cached)
-Module newton._src.geometry.narrow_phase df346e0 load on device &#39;cuda:0&#39; took 0.28 ms  (cached)
-Module newton._src.geometry.contact_reduction_global 604e7d2 load on device &#39;cuda:0&#39; took 2.88 ms  (cached)
-Module newton._src.geometry.sdf_contact 7e51c88 load on device &#39;cuda:0&#39; took 0.56 ms  (cached)
-Module narrow_phase_mesh_plane_write_contact_to_reducer_True d0011e4 load on device &#39;cuda:0&#39; took 0.48 ms  (cached)
-Module mesh_triangle_contacts_to_reducer_kernel_00644a25 600892e load on device &#39;cuda:0&#39; took 3.15 ms  (cached)
-Module newton._src.geometry.contact_reduction_global c917dbd load on device &#39;cuda:0&#39; took 2.54 ms  (cached)
-Module export_reduced_contacts_write_contact c09a53f load on device &#39;cuda:0&#39; took 0.53 ms  (cached)
-Module newton._src.solvers.xpbd.kernels 49a0574 load on device &#39;cuda:0&#39; took 2.38 ms  (cached)
+Module newton._src.sim.collide 1216036 load on device &#39;cpu&#39; took 0.48 ms  (cached)
+Module newton._src.geometry.broad_phase_nxn fb0ade4 load on device &#39;cpu&#39; took 0.47 ms  (cached)
+Module narrow_phase_primitive_write_contact_False_False_False 5109e14 load on device &#39;cpu&#39; took 0.47 ms  (cached)
+Module narrow_phase_gjk_mpr_True_False_write_contact_support_map_default 08b34ac load on device &#39;cpu&#39; took 1.26 ms  (cached)
+Module newton._src.geometry.narrow_phase f61f953 load on device &#39;cpu&#39; took 0.43 ms  (cached)
+Module newton._src.geometry.contact_reduction_global 36dd1d5 load on device &#39;cpu&#39; took 0.46 ms  (cached)
+Module newton._src.geometry.sdf_contact 310792f load on device &#39;cpu&#39; took 0.35 ms  (cached)
+Module narrow_phase_mesh_plane_write_contact_to_reducer_True d27dd4c load on device &#39;cpu&#39; took 0.34 ms  (cached)
+Module mesh_triangle_contacts_to_reducer_kernel_00644a25 7ebdbe1 load on device &#39;cpu&#39; took 1.07 ms  (cached)
+Module export_reduced_contacts_write_contact 2049828 load on device &#39;cpu&#39; took 0.38 ms  (cached)
+Module newton._src.solvers.xpbd.kernels 12b5d7c load on device &#39;cpu&#39; took 0.64 ms  (cached)
 Graph captured for optimized execution
 </pre></div></div>
 </div>
@@ -1488,8 +1494,8 @@ Graph captured for optimized execution
 </div>
 <div class="output_area docutils container">
 <div class="highlight"><pre>
-Module newton._src.viewer.kernels 50484b9 load on device &#39;cuda:0&#39; took 0.78 ms  (cached)
-Module newton._src.geometry.raycast 50212d9 load on device &#39;cuda:0&#39; took 3.48 ms  (cached)
+Module newton._src.viewer.kernels ed7e7f3 load on device &#39;cpu&#39; took 2184.91 ms  (compiled)
+Module newton._src.geometry.raycast bea63c2 load on device &#39;cpu&#39; took 0.59 ms  (cached)
 </pre></div></div>
 </div>
 </section>
@@ -1532,7 +1538,7 @@ Module newton._src.geometry.raycast 50212d9 load on device &#39;cuda:0&#39; took
 </div>
 <div class="output_area docutils container">
 <div class="highlight"><pre>
-Module newton._src.viewer.viewer_viser_kernels 6ebffef load on device &#39;cuda:0&#39; took 2.13 ms  (cached)
+Module newton._src.viewer.viewer_viser_kernels 0bebe93 load on device &#39;cpu&#39; took 0.92 ms  (cached)
 
 Simulation complete! Total time: 8.33 seconds
 </pre></div></div>

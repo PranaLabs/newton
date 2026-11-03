@@ -1087,8 +1087,7 @@ friction alone.</p></li>
 solve, or rigid bodies come from another solver, such as an arm that
 <a class="reference internal" href="../api/_generated/newton.solvers.SolverFeatherstone.html#newton.solvers.SolverFeatherstone" title="newton.solvers.SolverFeatherstone"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverFeatherstone</span></code></a> integrates.</p></li>
 </ul>
-<p>Choose another solver for models with several worlds, for differentiable
-simulation, and for articulations that need joint limits, drives, or
+<p>Choose another solver for differentiable simulation and for articulations that need joint limits, drives, or
 actuators: FBA treats joints as bilateral constraints only, so integrate such
 an articulation with another solver and pass
 <code class="docutils literal notranslate"><span class="pre">integrate_with_external_rigid_solver=True</span></code>. See the <a class="reference internal" href="index.html#supported-features"><span class="std std-ref">Supported Features</span></a> matrix and the <a class="reference internal" href="index.html#joint-feature-support"><span class="std std-ref">Joint Feature Support</span></a> tables for a comparison
@@ -1106,6 +1105,85 @@ Grinspun. 2006. A Quadratic Bending Model for Inextensible Surfaces.
 </section>
 <section id="construction-and-stepping">
 <h2>Construction and Stepping<a class="headerlink" href="#construction-and-stepping" title="Link to this heading">#</a></h2>
+<section id="parallel-worlds">
+<h3>Parallel worlds<a class="headerlink" href="#parallel-worlds" title="Link to this heading">#</a></h3>
+<p>Build independent environments with <a class="reference internal" href="../api/_generated/newton.ModelBuilder.html#newton.ModelBuilder.add_world" title="newton.ModelBuilder.add_world"><code class="xref py py-meth docutils literal notranslate"><span class="pre">ModelBuilder.add_world()</span></code></a> or
+<a class="reference internal" href="../api/_generated/newton.ModelBuilder.html#newton.ModelBuilder.replicate" title="newton.ModelBuilder.replicate"><code class="xref py py-meth docutils literal notranslate"><span class="pre">ModelBuilder.replicate()</span></code></a>. Worlds may overlap spatially and have different
+geometry and contact counts. FBA filters self contacts by world and runs the
+contact linear solver with independent reductions, iteration budgets and
+stopping decisions for each world. Gravity uses the model’s per-world values.
+Changing one world’s particle constraint rows clears only that world’s
+constraint warm start; unchanged worlds retain theirs even when their row
+indices shift.
+<code class="docutils literal notranslate"><span class="pre">nsn_lite_accumulate</span></code> also accepts one boolean per world plus a final global
+entry, so cloths that need accumulated contact forces can share a solver with
+cloths that use the original lite correction.
+For large batches, use <code class="docutils literal notranslate"><span class="pre">nsn_sparse_storage=True</span></code> with the full frictional
+operator to avoid storing a dense matrix across all environments. This does
+not share the prefactorization of repeated meshes; each replica retains its
+own system data.
+With several worlds, vertex-face and edge-edge self-contact queries search
+only their own world’s triangles and edges, and vertex-vertex queries share one
+spatial hash across worlds. If particles change worlds, the queries search all
+worlds’ geometry and filter by world. Contacts between distinct local worlds
+are always excluded.
+With several worlds, the particle system and the system of the integrated
+bodies factor one world at a time, each world’s matrix whole with all of its
+components; a model of one world factors each system whole. A world whose
+particles touch an integrated body solves all of its particle contacts and
+particle constraint rows together with the body rows, while the other worlds
+keep the deformable contact solve that they take alone.
+Lite’s exact particle constraints take at most 64 rows in each world: the
+rows of each world form their own Cholesky block, since the worlds do not
+couple. A model of one world takes its global and local particles’ rows in
+one block, within one limit of 64 rows.</p>
+<p>Each world solves the same equations with the same algorithms and iteration
+rules as it would alone. Batching can still change floating-point results:
+the worlds’ systems factor separately, reductions sum in a different order,
+and the choice among self-contact triangles at equal distances follows the
+query order. Batched runs therefore do not promise bitwise equality with
+separate runs or with earlier versions, and long nonlinear contact
+trajectories can amplify such differences.</p>
+<p>Particles and integrated dynamic bodies must belong to local worlds in a
+multi-world model. Elements, joints and particle constraint rows must not
+connect different worlds. Global static shapes, such as a shared ground
+plane, are supported. These are runtime solver rules on Newton’s existing
+world metadata; no additional USD schema is required.</p>
+<p>Call <code class="docutils literal notranslate"><span class="pre">solver.reset(state,</span> <span class="pre">world_mask=mask)</span></code> to restore selected worlds’
+body and particle positions and velocities from the model defaults and clear
+their friction anchors and contact warm start. The boolean mask has
+<code class="docutils literal notranslate"><span class="pre">model.world_count</span> <span class="pre">+</span> <span class="pre">1</span></code> entries; the final entry selects global entities.
+Passing no mask resets all worlds.</p>
+<p>Use <code class="docutils literal notranslate"><span class="pre">flags</span></code> to select <code class="docutils literal notranslate"><span class="pre">StateFlags.BODY_Q</span></code>, <code class="docutils literal notranslate"><span class="pre">BODY_QD</span></code>, <code class="docutils literal notranslate"><span class="pre">PARTICLE_Q</span></code>
+and <code class="docutils literal notranslate"><span class="pre">PARTICLE_QD</span></code>. <code class="docutils literal notranslate"><span class="pre">None</span></code> restores all supported fields. After writing a
+custom initial state, pass <code class="docutils literal notranslate"><span class="pre">flags=0</span></code> to clear only solver history and retain
+that state. Missing state arrays are skipped. When an external solver
+integrates rigid bodies, FBA leaves their state unchanged. Joint-coordinate
+flags are ignored because FBA uses body coordinates; use <a class="reference internal" href="../api/_generated/newton.eval_fk.html#newton.eval_fk" title="newton.eval_fk"><code class="xref py py-func docutils literal notranslate"><span class="pre">eval_fk()</span></code></a>
+after reset to initialize bodies from joint coordinates.</p>
+<p>Reset preserves external forces, control inputs, pin targets and particle
+constraint targets. Their owner must restore them as needed. Collision
+matching and actuator histories also retain their own reset interfaces:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">solver</span><span class="o">.</span><span class="n">reset</span><span class="p">(</span><span class="n">state</span><span class="p">,</span> <span class="n">world_mask</span><span class="o">=</span><span class="n">mask</span><span class="p">)</span>
+<span class="n">collision_pipeline</span><span class="o">.</span><span class="n">reset_contact_matching</span><span class="p">(</span><span class="n">world_mask</span><span class="o">=</span><span class="n">mask</span><span class="p">)</span>
+<span class="n">collision_pipeline</span><span class="o">.</span><span class="n">collide</span><span class="p">(</span><span class="n">state</span><span class="p">,</span> <span class="n">contacts</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>If actuators are used, reset their <code class="xref py py-meth docutils literal notranslate"><span class="pre">reset()</span></code>
+history with the corresponding actuator-entry selection. Its mask selects
+actuator entries, rather than worlds. Regenerate contacts after restoring or
+randomizing state and before the next simulation step. This reset is a
+runtime operation and requires no additional USD schema.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">cloth_dual_franka_fba</span></code> and <code class="docutils literal notranslate"><span class="pre">shirt_fold_fba</span></code> examples compose these
+operations through <code class="docutils literal notranslate"><span class="pre">example.reset(world_mask=None)</span></code> between frames. They
+restore both state buffers, robot joint state, controls, IK, grasp constraints
+and the selected episodes’ task phases. Unselected episodes continue from
+their current state. Each world has its own <code class="docutils literal notranslate"><span class="pre">episode_time</span></code>; <code class="docutils literal notranslate"><span class="pre">sim_time</span></code>
+remains the viewer clock. The unreplicated single-world examples use global
+entities, so select the final mask entry or call <code class="docutils literal notranslate"><span class="pre">example.reset()</span></code>.</p>
+</section>
+<section id="single-step">
+<h3>Single step<a class="headerlink" href="#single-step" title="Link to this heading">#</a></h3>
 <p>Detect contacts with a <a class="reference internal" href="../api/_generated/newton.CollisionPipeline.html#newton.CollisionPipeline" title="newton.CollisionPipeline"><code class="xref py py-class docutils literal notranslate"><span class="pre">CollisionPipeline</span></code></a> on the input state
 of each step and pass them to <a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.step" title="newton.solvers.SolverFBA.step"><code class="xref py py-meth docutils literal notranslate"><span class="pre">step()</span></code></a>:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">warp</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">wp</span>
@@ -1152,6 +1230,7 @@ when the time step changes or after
 those arrays take effect only then. A step reads its contacts back to
 the host, so it cannot be captured in a CUDA graph; it captures and replays
 its own local-global iterations. FBA runs on the CPU and on CUDA devices.</p>
+</section>
 </section>
 <section id="model-inputs">
 <h2>Model Inputs<a class="headerlink" href="#model-inputs" title="Link to this heading">#</a></h2>
@@ -1237,7 +1316,12 @@ for thinner margins, <code class="docutils literal notranslate"><span class="pre
 their edges must come compared with their particles’ nearest triangles, and
 <a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.set_particle_self_contact" title="newton.solvers.SolverFBA.set_particle_self_contact"><code class="xref py py-meth docutils literal notranslate"><span class="pre">set_particle_self_contact()</span></code></a> changes the
 margin between steps, so that a dropped cloth can land with a thick margin
-and fold with a thin one. <code class="docutils literal notranslate"><span class="pre">particle_self_contact_group_ids</span></code> gives each
+and fold with a thin one. Pass a scalar to set all worlds, or arrays of shape
+<code class="docutils literal notranslate"><span class="pre">(model.world_count</span> <span class="pre">+</span> <span class="pre">1,)</span></code> to set <code class="docutils literal notranslate"><span class="pre">margin</span></code> and <code class="docutils literal notranslate"><span class="pre">gap</span></code> independently per
+world, with the last entry for global particles. Per-world values require
+self-contact groups to be disabled and persist across solver resets; the
+shirt example restores the selected episodes’ landing margins itself.
+<code class="docutils literal notranslate"><span class="pre">particle_self_contact_group_ids</span></code> gives each
 particle a group, such as one per body of a pile: the particles and
 triangles of two groups keep the margin apart, and those of one group the
 group’s margin from <code class="docutils literal notranslate"><span class="pre">particle_self_contact_group_margins</span></code>, or do not
@@ -1299,7 +1383,18 @@ pinned ends and a soft ball dragged by spinning cylinders.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">cable_gripper_fba</span></code>: soft fingers curled by cables lift a box.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">cloth_dual_franka_fba</span></code>: two Franka arms integrated by
 <a class="reference internal" href="../api/_generated/newton.solvers.SolverFeatherstone.html#newton.solvers.SolverFeatherstone" title="newton.solvers.SolverFeatherstone"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverFeatherstone</span></code></a> pinch the corners of a square
-towel and fold it twice into a square, with light Rayleigh mass damping.</p></li>
+towel and fold it twice into a square, with light Rayleigh mass damping.
+With <code class="docutils literal notranslate"><span class="pre">--fully-coupled</span></code>, an experiment: FBA integrates the arms too, with
+force-limited joint drives built from body wrenches and friction-only
+pinches, so the towel acts back on the arms; the pinches do not hold
+reliably enough to complete the folds.
+<code class="docutils literal notranslate"><span class="pre">--world-count</span> <span class="pre">N</span></code> folds N towels in parallel worlds, replicated in place
+and spread out only in the viewer by <code class="docutils literal notranslate"><span class="pre">--world-spacing</span></code>, with one
+Featherstone and one FBA solver over all worlds and each world’s own IK
+problem, fold plan and grasps. <code class="docutils literal notranslate"><span class="pre">--action-noise</span> <span class="pre">A</span></code> [rad] adds to each
+world’s arm joint targets a fixed bias, drawn once per world and joint from
+<code class="docutils literal notranslate"><span class="pre">U(-A,</span> <span class="pre">A)</span></code> with seed 42, clipped to the joint limits; it leaves the
+fingers, the timing, the initial pose and the IK state unchanged.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">shirt_pins_fba</span></code>, <code class="docutils literal notranslate"><span class="pre">bunny_ears_fba</span></code>: two handles move a T-shirt by its
 shoulders, with self-contact and light Rayleigh stiffness damping, and a
 soft bunny by its ears.</p></li>
@@ -1307,7 +1402,15 @@ soft bunny by its ears.</p></li>
 its hem up, their fingers squeezing the cloth into a bulge that they hold,
 at two steps per frame with the lite operator accumulating its contact
 forces, a self-contact margin that thins after the landing, edge-edge
-contacts, friction anchors and corotated Rayleigh stiffness damping.</p></li>
+contacts, friction anchors and corotated Rayleigh stiffness damping.
+<code class="docutils literal notranslate"><span class="pre">--fully-coupled</span></code> integrates the arms in FBA as well, as for
+<code class="docutils literal notranslate"><span class="pre">cloth_dual_franka_fba</span></code>, with the full contact operator, whose dense
+block over the contacted particles ran out of GPU memory for the default
+6480-particle shirt, with and without <code class="docutils literal notranslate"><span class="pre">nsn_sparse_storage</span></code>;
+<code class="docutils literal notranslate"><span class="pre">--cloth-edge-length</span> <span class="pre">0.0222</span></code> remeshes the shirt coarser in both modes for
+an experimental comparison at matched resolution. <code class="docutils literal notranslate"><span class="pre">--world-count</span></code>,
+<code class="docutils literal notranslate"><span class="pre">--world-spacing</span></code> and <code class="docutils literal notranslate"><span class="pre">--action-noise</span></code> run parallel worlds as for
+<code class="docutils literal notranslate"><span class="pre">cloth_dual_franka_fba</span></code>.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">softbody_cantilever_fba</span></code>: two soft cantilevers swing under gravity, one
 with Rayleigh damping.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">pneunet_gripper_fba</span></code>: a three-finger PneuNet gripper whose chambers,
@@ -1345,7 +1448,11 @@ fingers and the sparse Schur storage.</p></li>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#when-to-choose-fba">When to Choose FBA</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#construction-and-stepping">Construction and Stepping</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#construction-and-stepping">Construction and Stepping</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#parallel-worlds">Parallel worlds</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#single-step">Single step</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-inputs">Model Inputs</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#contacts">Contacts</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#accuracy">Accuracy</a></li>

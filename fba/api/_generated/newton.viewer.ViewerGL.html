@@ -1385,7 +1385,7 @@ prototype meshes (unit cylinder + unit sphere) and applying per-instance transfo
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.15)"><em>str</em></a>) – Unique path/name for the Gaussian point cloud.</p></li>
 <li><p><strong>gaussian</strong> (<a class="reference internal" href="newton.Gaussian.html#newton.Gaussian" title="newton._src.geometry.types.Gaussian"><em>Gaussian</em></a>) – The <a class="reference internal" href="newton.Gaussian.html#newton.Gaussian" title="newton.Gaussian"><code class="xref py py-class docutils literal notranslate"><span class="pre">newton.Gaussian</span></code></a> asset to visualize.</p></li>
-<li><p><strong>xform</strong> (<a class="reference external" href="https://nvidia.github.io/warp/stable/api_reference/_generated/warp.transformf.html#warp.transformf" title="(in Warp v1.18.0)"><em>transformf</em></a><em> | </em><em>None</em>) – Optional world-space transform applied to all splat centers.</p></li>
+<li><p><strong>xform</strong> (<a class="reference external" href="https://nvidia.github.io/warp/stable/api_reference/_generated/warp.transformf.html#warp.transformf" title="(in Warp v1.19.0)"><em>transformf</em></a><em> | </em><em>None</em>) – Optional world-space transform applied to all splat centers.</p></li>
 <li><p><strong>hidden</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><em>bool</em></a>) – Whether the point cloud should be hidden.</p></li>
 </ul>
 </dd>
@@ -1400,7 +1400,7 @@ prototype meshes (unit cylinder + unit sphere) and applying per-instance transfo
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.15)"><em>str</em></a>) – Unique gizmo path/name.</p></li>
-<li><p><strong>transform</strong> (<a class="reference external" href="https://nvidia.github.io/warp/stable/api_reference/_generated/warp.transformf.html#warp.transformf" title="(in Warp v1.18.0)"><em>transformf</em></a>) – Gizmo world transform with translation [m] and a
+<li><p><strong>transform</strong> (<a class="reference external" href="https://nvidia.github.io/warp/stable/api_reference/_generated/warp.transformf.html#warp.transformf" title="(in Warp v1.19.0)"><em>transformf</em></a>) – Gizmo world transform with translation [m] and a
 unitless rotation quaternion.</p></li>
 <li><p><strong>translate</strong> (<a class="reference external" href="https://docs.python.org/3/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.15)"><em>Sequence</em></a><em>[</em><a class="reference internal" href="newton.Axis.html#newton.Axis" title="newton._src.core.types.Axis"><em>Axis</em></a><em>] </em><em>| </em><em>None</em>) – Axes on which the translation handles are shown.
 Defaults to all axes when <code class="docutils literal notranslate"><span class="pre">None</span></code>. Pass an empty sequence
@@ -1408,7 +1408,7 @@ to hide all translation handles.</p></li>
 <li><p><strong>rotate</strong> (<a class="reference external" href="https://docs.python.org/3/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.15)"><em>Sequence</em></a><em>[</em><a class="reference internal" href="newton.Axis.html#newton.Axis" title="newton._src.core.types.Axis"><em>Axis</em></a><em>] </em><em>| </em><em>None</em>) – Axes on which the rotation rings are shown.
 Defaults to all axes when <code class="docutils literal notranslate"><span class="pre">None</span></code>. Pass an empty sequence
 to hide all rotation rings.</p></li>
-<li><p><strong>snap_to</strong> (<a class="reference external" href="https://nvidia.github.io/warp/stable/api_reference/_generated/warp.transformf.html#warp.transformf" title="(in Warp v1.18.0)"><em>transformf</em></a><em> | </em><em>None</em>) – Optional world transform with translation [m] and a
+<li><p><strong>snap_to</strong> (<a class="reference external" href="https://nvidia.github.io/warp/stable/api_reference/_generated/warp.transformf.html#warp.transformf" title="(in Warp v1.19.0)"><em>transformf</em></a><em> | </em><em>None</em>) – Optional world transform with translation [m] and a
 unitless rotation quaternion to apply when this gizmo is
 released by the user.</p></li>
 </ul>
@@ -1715,7 +1715,7 @@ to keep existing geometry.</p></li>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>pos</strong> (<a class="reference external" href="https://nvidia.github.io/warp/stable/api_reference/_generated/warp.vec3f.html#warp.vec3f" title="(in Warp v1.18.0)"><em>vec3f</em></a>) – The camera position [m].</p></li>
+<li><p><strong>pos</strong> (<a class="reference external" href="https://nvidia.github.io/warp/stable/api_reference/_generated/warp.vec3f.html#warp.vec3f" title="(in Warp v1.19.0)"><em>vec3f</em></a>) – The camera position [m].</p></li>
 <li><p><strong>pitch</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a><em> | </em><em>None</em>) – The camera pitch [deg]. If None, the current pitch is kept.</p></li>
 <li><p><strong>yaw</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a><em> | </em><em>None</em>) – The camera yaw [deg]. If None, the current yaw is kept.</p></li>
 </ul>
@@ -1773,7 +1773,7 @@ model up-axis.</p>
 <dd><p>Set world offsets and update the picking system.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>spacing</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#tuple" title="(in Python v3.15)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a><em>] </em><em>| </em><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#list" title="(in Python v3.15)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a><em>] </em><em>| </em><a class="reference external" href="https://nvidia.github.io/warp/stable/api_reference/_generated/warp.vec3f.html#warp.vec3f" title="(in Warp v1.18.0)"><em>vec3f</em></a>) – Spacing between worlds along each axis.</p>
+<dd class="field-odd"><p><strong>spacing</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#tuple" title="(in Python v3.15)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a><em>] </em><em>| </em><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#list" title="(in Python v3.15)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a><em>] </em><em>| </em><a class="reference external" href="https://nvidia.github.io/warp/stable/api_reference/_generated/warp.vec3f.html#warp.vec3f" title="(in Warp v1.19.0)"><em>vec3f</em></a>) – Spacing between worlds along each axis.</p>
 </dd>
 </dl>
 </dd></dl>
