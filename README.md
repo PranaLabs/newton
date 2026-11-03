@@ -50,7 +50,7 @@ Newton step of the contact and constraint multipliers, so contacts do not penetr
 `SolverFBA` is not in the `newton` package on PyPI. Install this branch from source:
 
 ```bash
-git clone -b ziqiu/fba-solver https://github.com/PranaLabs/newton.git
+git clone https://github.com/PranaLabs/newton.git
 cd newton
 uv run --extra examples -m newton.examples cloth_dual_franka_fba
 ```
