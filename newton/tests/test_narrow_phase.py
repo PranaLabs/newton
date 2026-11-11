@@ -2123,6 +2123,124 @@ class TestNarrowPhase(_NarrowPhaseSetupMixin, unittest.TestCase):
         self.assertAlmostEqual(normals[0][0], 1.0, places=1, msg="Normal should point along +X")
 
 
+class TestPlaneConvexHull(_NarrowPhaseSetupMixin, unittest.TestCase):
+    """Infinite plane against a convex hull, through its analytic path."""
+
+    PLANE: typing.ClassVar = {
+        "type": GeoType.PLANE,
+        "transform": ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]),
+        "data": ([0.0, 0.0, 0.0], 0.0),
+    }
+
+    def _hull(self, points, pos, quat=(0.0, 0.0, 0.0, 1.0), scale=(1.0, 1.0, 1.0), cutoff=0.0):
+        """A CONVEX_MESH geometry over ``points``, kept alive by the test."""
+        mesh = wp.Mesh(
+            points=wp.array(np.asarray(points, dtype=np.float32), dtype=wp.vec3), indices=wp.zeros(3, dtype=int)
+        )
+        self.addCleanup(lambda m=mesh: m)
+        return {
+            "type": GeoType.CONVEX_MESH,
+            "transform": (list(pos), list(quat)),
+            "data": (list(scale), 0.0),
+            "source": mesh.id,
+            "cutoff": cutoff,
+        }
+
+    @staticmethod
+    def _cube(h):
+        return [[sx * h, sy * h, sz * h] for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)]
+
+    def _lowest_corners(self, points, pos, quat, scale=(1.0, 1.0, 1.0)):
+        rot = np.array(wp.quat_to_matrix(wp.quat(*quat)), dtype=np.float64).reshape(3, 3)
+        world = np.asarray(pos, dtype=np.float64) + (np.asarray(points) * scale) @ rot.T
+        return np.sort(world[:, 2])
+
+    def test_tilted_cube_depths_match_its_corners(self):
+        """Report each penetrating corner of a tilted cube at its exact depth, with an upward unit normal."""
+        quat = wp.quat_rpy(0.2, -0.1, 0.3)
+        quat = [quat[0], quat[1], quat[2], quat[3]]
+        pos = (0.3, -0.2, 0.47)
+        points = self._cube(0.5)
+        count, pairs, positions, normals, depths, _ = self._run_narrow_phase(
+            [self.PLANE, self._hull(points, pos, quat)], [(0, 1)]
+        )
+        exact = self._lowest_corners(points, pos, quat)
+        below = exact[exact < 0.0]
+        self.assertEqual(count, len(below))
+        np.testing.assert_allclose(np.sort(depths), below, atol=1e-6)
+        np.testing.assert_allclose(normals, np.tile([0.0, 0.0, 1.0], (count, 1)), atol=1e-6)
+        # Each position is midway between the corner and its projection on the plane.
+        np.testing.assert_allclose(positions[:, 2], 0.5 * depths, atol=1e-6)
+        np.testing.assert_array_equal(pairs, np.tile([0, 1], (count, 1)))
+
+    def test_resting_depth_is_exact_far_from_the_origin(self):
+        """Keep a resting cube's depth exact far from the plane's origin, where a support search would round."""
+        points = self._cube(0.05)
+        for x, y in ((0.0, 0.0), (97.3, -41.9), (-713.0, 288.5)):
+            count, _, _, _, depths, _ = self._run_narrow_phase(
+                [self.PLANE, self._hull(points, (x, y, 0.05 - 1.0e-6))], [(0, 1)]
+            )
+            self.assertEqual(count, 4)
+            np.testing.assert_allclose(depths, -1.0e-6, atol=1e-8)
+
+    def test_flat_face_contacts_span_the_face(self):
+        """Spread four contacts over a 32-gon prism's flat face: two across its diameter, two on either side."""
+        radius, n = 0.2, 32
+        angle = 2.0 * np.pi * np.arange(n) / n
+        ring = np.stack([radius * np.cos(angle), radius * np.sin(angle)], axis=1)
+        points = [[x, y, z] for z in (-0.05, 0.05) for x, y in ring]
+        count, _, positions, _, depths, _ = self._run_narrow_phase(
+            [self.PLANE, self._hull(points, (0.0, 0.0, 0.049))], [(0, 1)]
+        )
+        self.assertEqual(count, 4)
+        np.testing.assert_allclose(depths, -1.0e-3, atol=1e-6)
+        xy = positions[:, :2]
+        span = max(np.linalg.norm(a - b) for a in xy for b in xy)
+        self.assertAlmostEqual(span, 2.0 * radius, delta=1e-5)
+        # The four corners enclose most of the inscribed square's area, 2 r^2.
+        hull = xy[np.argsort(np.arctan2(xy[:, 1], xy[:, 0]))]
+        area = 0.5 * abs(np.dot(hull[:, 0], np.roll(hull[:, 1], -1)) - np.dot(hull[:, 1], np.roll(hull[:, 0], -1)))
+        self.assertGreater(area, 0.9 * 2.0 * radius**2)
+
+    def test_single_vertex_and_scale(self):
+        """Touch the plane with one vertex of a scaled tetrahedron, at its scaled depth."""
+        points = [[0.0, 0.0, -1.0], [1.0, 0.0, 1.0], [-0.5, 0.8, 1.0], [-0.5, -0.8, 1.0]]
+        count, _, positions, _, depths, _ = self._run_narrow_phase(
+            [self.PLANE, self._hull(points, (0.1, 0.2, 0.19), scale=(0.2, 0.2, 0.2))], [(0, 1)]
+        )
+        self.assertEqual(count, 1)
+        self.assertAlmostEqual(depths[0], -0.01, delta=1e-6)
+        np.testing.assert_allclose(positions[0], [0.1, 0.2, -0.005], atol=1e-6)
+
+    def test_curved_side_touches_at_its_lowest_point(self):
+        """Touch the plane with a resting sphere's lowest point alone, not with the ring of vertices 3 mm above it
+        within the 1 cm contact gap."""
+        radius = 0.1
+        latitudes = np.linspace(0.0, np.pi, 13)[1:-1]
+        longitudes = 2.0 * np.pi * np.arange(24) / 24
+        points = [[0.0, 0.0, -radius], [0.0, 0.0, radius]]
+        points += [
+            [radius * np.sin(a) * np.cos(b), radius * np.sin(a) * np.sin(b), -radius * np.cos(a)]
+            for a in latitudes
+            for b in longitudes
+        ]
+        geom = [self.PLANE, self._hull(points, (0.0, 0.0, radius - 1.0e-4), cutoff=0.01)]
+        count, _, positions, _, depths, _ = self._run_narrow_phase(geom, [(0, 1)])
+        self.assertEqual(count, 1)
+        self.assertAlmostEqual(depths[0], -1.0e-4, delta=1e-7)
+        np.testing.assert_allclose(positions[0, :2], 0.0, atol=1e-6)
+
+    def test_margin(self):
+        """Report a separated hull only within the shapes' contact gap, at its positive distance."""
+        points = self._cube(0.1)
+        geom = [self.PLANE, self._hull(points, (0.0, 0.0, 0.12), cutoff=0.01)]
+        self.assertEqual(self._run_narrow_phase(geom, [(0, 1)])[0], 0)
+        geom = [self.PLANE, self._hull(points, (0.0, 0.0, 0.105), cutoff=0.01)]
+        count, _, _, _, depths, _ = self._run_narrow_phase(geom, [(0, 1)])
+        self.assertEqual(count, 4)
+        np.testing.assert_allclose(depths, 0.005, atol=1e-6)
+
+
 class TestBufferOverflowWarnings(unittest.TestCase):
     """Test that buffer overflow produces warnings and does not crash."""
 
