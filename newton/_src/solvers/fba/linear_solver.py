@@ -365,6 +365,18 @@ def spring_chains(
     return offsets, order, link, sign, scale
 
 
+def rod_bending_elements(model: Model) -> tuple[np.ndarray, np.ndarray]:
+    """The bending elements of the model's particle rods, from the custom attributes that
+    :meth:`~newton.solvers.SolverFBA.register_custom_attributes` registers: each element's particles before, at and
+    after its bend, shape (B, 3), and its bending stiffness EI [N m^2], shape (B,)."""
+    fba = getattr(model, "fba", None)
+    particles = getattr(fba, "rod_bend_particles", None)
+    if particles is None or particles.shape[0] == 0:
+        return np.zeros((0, 3), dtype=np.int32), np.zeros(0, dtype=np.float64)
+    stiffness = fba.rod_bend_stiffness.numpy().astype(np.float64)
+    return particles.numpy().astype(np.int32).reshape(-1, 3), stiffness
+
+
 def build_pd_system(
     model: Model,
     dt: float,
@@ -416,6 +428,8 @@ def build_pd_system(
           ``np.ndarray[float64]`` shape (S,)
         - ``meta["spring_beta"]`` : ``np.ndarray[float64]`` shape (S,), the stiffness damping coefficient [s] that
           the springs' local steps apply to their length rate, zero unless ``spring_corotated``
+        - ``meta["rod_bend_indices"]`` : ``np.ndarray[int32]`` shape (B, 3), the bending elements of particle rods
+        - ``meta["rod_bend_weight"]`` : ``np.ndarray[float64]`` shape (B,), their weights ``EI / v``
         - ``meta["damping"]`` : :class:`CsrMatrix` of ``C``, or ``None`` without damping
 
     A spring is the ADMM stretch element of :func:`~newton._src.solvers.fba.kernels.project_spring_admm_kernel`:
@@ -623,6 +637,28 @@ def build_pd_system(
             beta_k = element_beta(spring_indices) * spring_k
             damping_parts.append((rows_s, cols_s, np.concatenate([beta_k, beta_k, -beta_k, -beta_k])))
 
+    # ---- Particle rod bending: the 3-particle stencil (x_+ - x) / l_+ - (x - x_-) / l_- ----
+    # With the rest lengths l_- and l_+ of the bend's two segments, the stencil measures the turn 2 sin(phi / 2) of an
+    # unstretched rod, and the weight EI / v, v = (l_- + l_+) / 2, makes the bend's energy (EI / 2) kappa^2 v for small
+    # turns. The target is zero, a straight rod: the element adds to A alone.
+    rod_bend, rod_ei = rod_bending_elements(model)
+    rod_weight = np.zeros(0, dtype=np.float64)
+    if rod_bend.shape[0] > 0:
+        x_rest = model.particle_q.numpy().astype(np.float64)
+        l_minus = np.linalg.norm(x_rest[rod_bend[:, 1]] - x_rest[rod_bend[:, 0]], axis=1)
+        l_plus = np.linalg.norm(x_rest[rod_bend[:, 2]] - x_rest[rod_bend[:, 1]], axis=1)
+        if (l_minus <= 0.0).any() or (l_plus <= 0.0).any():
+            raise ValueError("particle rod segments must have a positive rest length")
+        stencil = np.stack([1.0 / l_minus, -(1.0 / l_minus + 1.0 / l_plus), 1.0 / l_plus], axis=1)
+        rod_weight = rod_ei / (0.5 * (l_minus + l_plus))
+        block = rod_weight[:, None, None] * stencil[:, :, None] * stencil[:, None, :]
+        rows_b = np.repeat(rod_bend, 3, axis=1).reshape(-1)
+        cols_b = np.tile(rod_bend, (1, 3)).reshape(-1)
+        coo_parts.append((rows_b, cols_b, block.reshape(-1)))
+        if rayleigh_beta is not None:
+            beta_vals = (element_beta(rod_bend)[:, None, None] * block).reshape(-1)
+            damping_parts.append((rows_b, cols_b, beta_vals))
+
     # ---- Implicit Rayleigh damping: C / dt ----
     damping = None
     if damping_parts:
@@ -655,6 +691,8 @@ def build_pd_system(
         "spring_stiffness": spring_k,
         "spring_penalty": spring_rho,
         "spring_beta": spring_beta,
+        "rod_bend_indices": rod_bend,
+        "rod_bend_weight": rod_weight,
         "tet_indices": tet_indices,
         "tet_rest_inv": tet_rest_inv,
         "tet_volume": tet_volume,

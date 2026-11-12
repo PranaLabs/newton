@@ -231,6 +231,24 @@ Model Inputs
   a chain meets more springs, the particle's inverse mass counts once for
   each of them, which keeps the solve below the exact one.
   ``spring_damping`` and ``spring_control`` are not read.
+- **Particle rods**: :meth:`~newton.solvers.SolverFBA.add_particle_rod`
+  lays an elastic rod of circular cross-section along a polyline: a particle
+  per vertex, its mass lumped by length and the rod's radius as its contact
+  radius, a spring per segment of stiffness ``E pi r^2 / l``, and a bending
+  element per interior vertex. A bending element is an entry of the custom
+  frequency ``fba:rod_bend`` (see
+  :meth:`~newton.solvers.SolverFBA.register_custom_attributes`) of energy
+  ``EI / (2 v) |(x_+ - x) / l_+ - (x - x_-) / l_-|^2``, with ``l_-`` and
+  ``l_+`` the rest lengths of the vertex's two segments and
+  ``v = (l_- + l_+) / 2``: ``EI / 2 kappa^2 v`` for small turns, straight at
+  rest. It adds to the constant system matrix alone, and raises the penalty
+  of the rod's springs by ``0.1 EI / l^3``. A 0.3 m rod of radius 5 mm
+  clamped at one end sags under its weight to within 0.2% of the
+  small-deflection sag of its discrete bending energy at ``E = 1e8`` Pa.
+  Rods carry no twist, and contacts act at their particles, so segments
+  longer than about twice the radius can pass thin shapes. These rods are
+  particles, unlike the rigid capsule chains of
+  :meth:`~newton.ModelBuilder.add_rod`.
 - **Activations**: the control's ``tet_activations`` grow each tetrahedron
   to ``1 - a`` times its rest volume, so a negative activation inflates it
   and a positive one contracts it: isotropically, or along a direction per

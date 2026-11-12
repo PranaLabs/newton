@@ -13,7 +13,7 @@ import warp as wp
 
 from ...core.reset import reset_state_array
 from ...geometry import ParticleFlags
-from ...sim import BodyFlags, Contacts, Control, Model, ModelFlags, State, StateFlags
+from ...sim import BodyFlags, Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
 from ..solver import SolverBase
 from .kernels import host_head, stored_contact_count
 
@@ -504,7 +504,8 @@ class SolverFBA(SolverBase):
                 if (self._shape_world_h[moving] != self._body_world_h[attached[moving]]).any():
                     raise ValueError("shapes on integrated bodies must belong to the body's world")
             springs = None if model.spring_indices is None else model.spring_indices.reshape((-1, 2))
-            for indices in (model.tri_indices, model.tet_indices, model.edge_indices, springs):
+            rod_bends = getattr(getattr(model, "fba", None), "rod_bend_particles", None)
+            for indices in (model.tri_indices, model.tet_indices, model.edge_indices, springs, rod_bends):
                 if indices is not None and indices.size:
                     ids = indices.numpy()
                     worlds = self._particle_world_h[np.maximum(ids, 0)]
@@ -1805,8 +1806,28 @@ class SolverFBA(SolverBase):
 
     def _spring_bending_stiffness(self) -> np.ndarray | None:
         """Bending stiffness [N m^2] of the rod each of the model's springs belongs to, for the springs' ADMM
-        penalties, or ``None`` when no spring belongs to a rod."""
-        return None
+        penalties: the largest of the bending elements that share the spring's segment, zero for a spring outside
+        rods, or ``None`` when the model has no rod bending elements."""
+        from .linear_solver import rod_bending_elements  # noqa: PLC0415
+
+        model = self.model
+        bends, stiffness = rod_bending_elements(model)
+        if bends.shape[0] == 0 or not model.spring_count:
+            return None
+        n = np.int64(max(model.particle_count, 1))
+
+        def segment_key(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+            return np.minimum(a, b).astype(np.int64) * n + np.maximum(a, b)
+
+        keys = np.concatenate([segment_key(bends[:, 0], bends[:, 1]), segment_key(bends[:, 1], bends[:, 2])])
+        values = np.concatenate([stiffness, stiffness])
+        order = np.argsort(keys, kind="stable")
+        unique, first = np.unique(keys[order], return_index=True)
+        largest = np.maximum.reduceat(values[order], first)
+        springs = model.spring_indices.numpy().reshape(-1, 2)
+        spring_keys = segment_key(springs[:, 0], springs[:, 1])
+        at = np.minimum(np.searchsorted(unique, spring_keys), unique.size - 1)
+        return np.where(unique[at] == spring_keys, largest[at], 0.0)
 
     def _setup_springs(self, meta: dict, dt: float) -> None:
         """Upload the springs of :func:`~newton._src.solvers.fba.linear_solver.build_pd_system`'s ``meta`` and
@@ -2972,6 +2993,116 @@ class SolverFBA(SolverBase):
         inputs += [self._contact_world_anchor_d, self._contact_shape_d, model.shape_body, body_q, body_com]
         inputs += [contacts.rigid_contact_max]
         wp.launch(soft_contact_force_kernel, M, inputs, [contact_f], device=device)
+
+    @classmethod
+    def register_custom_attributes(cls, builder: ModelBuilder) -> None:
+        """Register the custom attributes of SolverFBA: the bending elements of particle rods.
+
+        Registers the custom frequency ``fba:rod_bend``, one entry per bending element, with the attributes
+        ``fba:rod_bend_particles`` (``vec3i``), the rod's particles before, at and after the bend, and
+        ``fba:rod_bend_stiffness`` (``float32``), the rod's bending stiffness ``EI`` [N·m²]. The model holds them
+        as ``model.fba.rod_bend_particles`` and ``model.fba.rod_bend_stiffness``. :meth:`add_particle_rod`
+        registers them itself.
+
+        Args:
+            builder: Model builder to register the attributes on.
+        """
+        builder.add_custom_frequency(ModelBuilder.CustomFrequency(name="rod_bend", namespace="fba"))
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="rod_bend_particles",
+                frequency="fba:rod_bend",
+                dtype=wp.vec3i,
+                namespace="fba",
+                references="particle",
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="rod_bend_stiffness",
+                frequency="fba:rod_bend",
+                dtype=wp.float32,
+                namespace="fba",
+            )
+        )
+
+    @staticmethod
+    def add_particle_rod(
+        builder: ModelBuilder,
+        points: np.ndarray | list,
+        radius: float,
+        youngs_modulus: float,
+        density: float | None = None,
+        mass: float | None = None,
+        bending_stiffness: float | None = None,
+    ) -> list[int]:
+        """Add an elastic rod of circular cross-section along a polyline, as particles that SolverFBA simulates.
+
+        Each vertex becomes a particle of radius ``radius`` whose mass is the rod's line density times half the
+        length of its segments; each segment, a spring of stiffness ``E pi r^2 / l``, the rod's axial stiffness
+        over the segment's rest length ``l``; and each interior vertex, a bending element, an entry of
+        ``fba:rod_bend`` (see :meth:`register_custom_attributes`), of energy
+
+            EI / (2 v) |(x_+ - x) / l_+ - (x - x_-) / l_-|^2,
+
+        with ``x_-``, ``x`` and ``x_+`` the vertex and its neighbors, ``l_-`` and ``l_+`` the rest lengths of its
+        two segments and ``v = (l_- + l_+) / 2``: for small turns ``phi`` of the rod at the vertex,
+        ``EI / 2 kappa^2 v`` with the curvature ``kappa = phi / v``. The rod is straight at rest, whatever the
+        polyline, and has no twist. Rest lengths come from ``points``. Contacts act at the particles, so a rod
+        whose segments are longer than about twice its radius can pass thin shapes between its particles.
+
+        A particle rod is not the rod of :meth:`~newton.ModelBuilder.add_rod`, a chain of rigid capsules joined
+        by rod joints. To hold an end, set its particles' mass to zero, which pins them.
+
+        Args:
+            builder: Model builder to add the rod to.
+            points: Vertices of the polyline [m], shape ``(N, 3)``, ``N >= 2``.
+            radius: Radius of the cross-section [m], also the particles' contact radius.
+            youngs_modulus: Young's modulus ``E`` [Pa].
+            density: Density [kg/m³] of the rod's material, for the line density ``density pi r^2``. Give
+                exactly one of ``density`` and ``mass``.
+            mass: Total mass [kg] of the rod, spread evenly over its length.
+            bending_stiffness: Bending stiffness ``EI`` [N·m²]; ``E pi r^4 / 4``, that of a solid circular
+                section, if ``None``. A rope takes one far below that.
+
+        Returns:
+            The indices of the rod's particles, in the order of ``points``.
+        """
+        points = np.asarray(points, dtype=np.float64)
+        if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] < 2:
+            raise ValueError("points must have shape (N, 3) with N >= 2")
+        segment = np.linalg.norm(np.diff(points, axis=0), axis=1)
+        if not (segment > 0.0).all():
+            raise ValueError("the rod's consecutive points must be distinct")
+        if not radius > 0.0 or not youngs_modulus > 0.0:
+            raise ValueError("radius and youngs_modulus must be positive")
+        if (density is None) == (mass is None):
+            raise ValueError("give exactly one of density and mass")
+        area = np.pi * radius * radius
+        line_density = density * area if density is not None else mass / segment.sum()
+        if not line_density > 0.0:
+            raise ValueError("the rod's density or mass must be positive")
+        if bending_stiffness is None:
+            bending_stiffness = youngs_modulus * np.pi * radius**4 / 4.0
+        if bending_stiffness < 0.0:
+            raise ValueError("bending_stiffness must not be negative")
+        masses = 0.5 * line_density * (np.r_[segment, 0.0] + np.r_[0.0, segment])
+        SolverFBA.register_custom_attributes(builder)
+        particles = [
+            builder.add_particle(pos=tuple(p), vel=(0.0, 0.0, 0.0), mass=float(m), radius=radius)
+            for p, m in zip(points, masses, strict=True)
+        ]
+        for k, length in enumerate(segment):
+            stiffness = youngs_modulus * area / length
+            builder.add_spring(particles[k], particles[k + 1], ke=float(stiffness), kd=0.0, control=0.0)
+        for k in range(1, len(particles) - 1):
+            builder.add_custom_values(
+                **{
+                    "fba:rod_bend_particles": tuple(particles[k - 1 : k + 2]),
+                    "fba:rod_bend_stiffness": float(bending_stiffness),
+                }
+            )
+        return particles
 
     def set_pin_targets(self, target_positions: wp.array | np.ndarray) -> None:
         """Update reference positions for pinned particles (dynamic pin).
