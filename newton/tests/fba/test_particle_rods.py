@@ -176,6 +176,25 @@ class TestSolverFBAParticleRods(unittest.TestCase):
             expected = _discrete_tip_sag(20, 0.3, 0.005, young, 1000.0)
             np.testing.assert_allclose(self._cantilever_sag(young), expected, rtol=rtol)
 
+    def test_rod_follows_its_pin_through_its_bending(self):
+        """Move the pin of a hanging rod, stiff in bending, down by 4.2 mm in one step: the whole rod follows it, as
+        its implicit Euler step does, in 10 iterations, where the bends near the pin would hold the next particles
+        back and compress the top segment by a third."""
+        n, length = 40, 0.48
+        z = np.linspace(1.0, 1.0 - length, n + 1)
+        builder = newton.ModelBuilder()
+        points = np.c_[np.zeros(n + 1), np.zeros(n + 1), z]
+        rod = SolverFBA.add_particle_rod(builder, points, 0.006, 1.0e9, density=884.0, bending_stiffness=5.0e-3)
+        builder.particle_mass[rod[0]] = 0.0
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=10)
+        s0, s1 = model.state(), model.state()
+        targets = model.particle_q.numpy()
+        targets[rod[0], 2] -= 4.2e-3
+        solver.set_pin_targets(targets)
+        solver.step(s0, s1, None, None, 0.01)
+        np.testing.assert_allclose(s1.particle_q.numpy()[:, 2] - z, -4.2e-3, atol=2.0e-5)
+
     def test_hanging_rod_stays_straight_and_holds_its_weight(self):
         """Hang a rod from its pinned top particle: it stays straight down, each segment stretched by the weight
         below it over the segment's stiffness."""

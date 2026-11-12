@@ -1875,6 +1875,32 @@ class SolverFBA(SolverBase):
         self._spring_chain_order_d = wp.array(order, dtype=wp.int32, device=device)
         self._spring_chain_diagonal_d = wp.array(diagonal[order].astype(np.float32), dtype=wp.float32, device=device)
         self._spring_chain_link_d = wp.array(coupling.astype(np.float32), dtype=wp.float32, device=device)
+        # The rods' bends between consecutive springs of a chain: kappa = EI / (v l_- l_+), with the coupling's signs.
+        bend = np.zeros(springs.shape[0], dtype=np.float64)
+        rod_bend, rod_weight = meta.get("rod_bend_indices"), meta.get("rod_bend_weight")
+        if rod_bend is not None and rod_bend.shape[0] > 0:
+            x_rest = self.model.particle_q.numpy().astype(np.float64)
+            l_minus = np.linalg.norm(x_rest[rod_bend[:, 1]] - x_rest[rod_bend[:, 0]], axis=1)
+            l_plus = np.linalg.norm(x_rest[rod_bend[:, 2]] - x_rest[rod_bend[:, 1]], axis=1)
+            kappa = {
+                (min(a, c), b, max(a, c)): w / (lm * lp)
+                for (a, b, c), w, lm, lp in zip(rod_bend.tolist(), rod_weight, l_minus, l_plus, strict=True)
+            }
+            # A spring between held particles has no stretch to solve for: its bends couple nothing.
+            held_spring = (inv_mass[springs] == 0.0).all(axis=1)
+            for place in np.flatnonzero(link >= 0):
+                e, f, p = int(order[place]), int(order[place + 1]), int(link[place])
+                if held_spring[e] or held_spring[f]:
+                    continue
+                a = int(springs[e, 0] if springs[e, 1] == p else springs[e, 1])
+                c = int(springs[f, 0] if springs[f, 1] == p else springs[f, 1])
+                bend[place] = kappa.get((min(a, c), p, max(a, c)), 0.0) * sign[place]
+        # A spring held by its bends as firmly as by its own stiffness takes their stiffness in series with its
+        # compliance: each place's row of the bends' term scales by 1 / (1 + L_ii C).
+        diagonal_bend = np.abs(bend) + np.abs(np.r_[0.0, bend[:-1]] * (np.r_[-1, link[:-1]] >= 0))
+        bend_scale = 1.0 / (1.0 + diagonal_bend * compliance[order])
+        self._spring_chain_bend_d = wp.array(bend.astype(np.float32), dtype=wp.float32, device=device)
+        self._spring_chain_bend_scale_d = wp.array(bend_scale.astype(np.float32), dtype=wp.float32, device=device)
         self._spring_residual_d = wp.zeros(springs.shape[0], dtype=wp.float32, device=device)
         self._spring_sweep_d = (
             wp.zeros(springs.shape[0], dtype=wp.float32, device=device),
@@ -2855,7 +2881,9 @@ class SolverFBA(SolverBase):
             outputs = [self._spring_dual_d, self._spring_dir_d, self._spring_residual_d]
             wp.launch(self._k_spring_dual, S, [*inputs, self._spring_first_d], outputs, device=device)
             inputs = [self._spring_chain_offsets_d, self._spring_chain_order_d, self._spring_chain_diagonal_d]
-            inputs += [self._spring_chain_link_d, self._spring_residual_d, self._spring_dir_d, self._spring_rho_d]
+            inputs += [self._spring_chain_link_d, self._spring_chain_bend_d, self._spring_chain_bend_scale_d]
+            inputs += [self._spring_residual_d]
+            inputs += [self._spring_dir_d, self._spring_rho_d]
             inputs += [self._spring_first_d, *self._spring_sweep_d]
             C = self._spring_chain_offsets_d.shape[0] - 1
             wp.launch(self._k_spring_chain, C, inputs, [self._spring_dual_d], device=device)

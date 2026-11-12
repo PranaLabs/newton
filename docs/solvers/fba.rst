@@ -242,7 +242,11 @@ Model Inputs
   ``l_+`` the rest lengths of the vertex's two segments and
   ``v = (l_- + l_+) / 2``: ``EI / 2 kappa^2 v`` for small turns, straight at
   rest. It adds to the constant system matrix alone, and raises the penalty
-  of the rod's springs by ``0.1 EI / l^3``. A 0.3 m rod of radius 5 mm
+  of the rod's springs by ``0.1 EI / l^3``. In the matrix it also resists a
+  difference of the stretches of its two springs with ``EI / (v l_- l_+)``,
+  far more than the penalty of a stiff rod's short segments, so the tension
+  solve of the rod's springs counts it too: a pin moved through a stiff rod
+  drags the rod along within 10 iterations. A 0.3 m rod of radius 5 mm
   clamped at one end sags under its weight to within 0.2% of the
   small-deflection sag of its discrete bending energy at ``E = 1e8`` Pa.
   Rods carry no twist, and contacts act at their particles, so segments

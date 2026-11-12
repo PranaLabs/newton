@@ -1779,6 +1779,8 @@ def spring_chain_tension_kernel(
     chain_springs: wp.array[wp.int32],
     chain_diagonal: wp.array[wp.float32],
     chain_link: wp.array[wp.float32],
+    chain_bend: wp.array[wp.float32],
+    chain_bend_scale: wp.array[wp.float32],
     residual: wp.array[wp.float32],
     direction: wp.array[wp.vec3],
     penalty: wp.array[wp.float32],
@@ -1799,8 +1801,13 @@ def spring_chain_tension_kernel(
     ``B = h^2 D_t W D_t^T`` of each chain, ``D_t`` the springs' stretch along ``t``; adding ``T = (B + C)^-1 r`` to
     the tensions, with ``C = 1 / (k - rho)`` the compliance that the dual step leaves out, completes the Newton step
     of the tensions of a chain whose particles nothing else holds, and stays below it where more holds them: the
-    system matrix holds the particles at least by their masses and the penalties. The fixed point is unchanged, as
-    ``r`` vanishes there.
+    system matrix holds the particles at least by their masses and the penalties. A rod's bending element, in the
+    system matrix, also resists a difference of the stretches of its two springs with ``kappa = EI / (v l_- l_+)``:
+    the solve adds ``L r`` for the chain's ``L`` of these, ``kappa`` on the diagonal from each bend at a spring's
+    ends and the bend's ``kappa`` times the cosine of its angle, with the signs of the springs' ends, between its
+    two springs. Each spring's row of ``L r`` takes the factor ``1 / (1 + L_ii C)``: where the bends hold a
+    spring's stretch as firmly as its own stiffness, as in a plug, the spring's compliance ``C`` in series bounds
+    the step. The fixed point is unchanged, as ``r`` vanishes there.
 
     Args:
         chain_offsets: Start of each chain in ``chain_springs``, shape ``[C + 1]``.
@@ -1808,6 +1815,9 @@ def spring_chain_tension_kernel(
         chain_diagonal: ``B + C`` on the diagonal at each place of ``chain_springs``.
         chain_link: ``h^2 w`` of the particle that a place's spring shares with the next, times the signs with which
             it enters the two, zero at a chain's end; ``B`` couples the two by it times the cosine of their angle.
+        chain_bend: ``kappa`` [N/m] of the bend at the particle that a place's spring shares with the next, times
+            the same signs, zero without one.
+        chain_bend_scale: ``1 / (1 + L_ii C)`` of each place's spring.
         residual: Stretch ``r`` [m] of each spring from :func:`update_spring_dual_kernel`.
         direction: Direction ``t`` of each spring.
         penalty: ADMM penalty ``rho`` [N/m] of each spring.
@@ -1841,7 +1851,16 @@ def spring_chain_tension_kernel(
         i = end - 1 - j
         tension = sweep_d[i] - sweep_c[i] * tension
         e = chain_springs[i]
-        dual[e] = dual[e] + tension / penalty[e] * direction[e]
+        bend = wp.float32(0.0)
+        if i > start:
+            k = chain_bend[i - 1]
+            f = chain_springs[i - 1]
+            bend += wp.abs(k) * residual[e] + k * wp.dot(direction[f], direction[e]) * residual[f]
+        if i + 1 < end:
+            k = chain_bend[i]
+            f = chain_springs[i + 1]
+            bend += wp.abs(k) * residual[e] + k * wp.dot(direction[e], direction[f]) * residual[f]
+        dual[e] = dual[e] + (tension + chain_bend_scale[i] * bend) / penalty[e] * direction[e]
 
 
 @wp.kernel
