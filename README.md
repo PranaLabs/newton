@@ -229,6 +229,40 @@ are still in the package; `python -m newton.examples --list` lists them all.
     </td>
   </tr>
   <tr>
+    <td colspan="3"><h3>Rigid Bodies</h3></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="newton/examples/contacts/example_convex_pile_fba.py">
+        <img width="320" src="docs/images/examples/example_convex_pile_fba.jpg" alt="Convex Pile FBA">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="newton/examples/contacts/example_convex_hulls_fba.py">
+        <img width="320" src="docs/images/examples/example_convex_hulls_fba.jpg" alt="Convex Hulls FBA">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="newton/examples/contacts/example_nonconvex_pile_fba.py">
+        <img width="320" src="docs/images/examples/example_nonconvex_pile_fba.jpg" alt="Nonconvex Pile FBA">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples convex_pile_fba</code><br>
+      <sub>a thousand convex bodies drop into a box and settle in a pile</sub>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples convex_hulls_fba</code><br>
+      <sub>a cube stack and cubes dropped into a compound U and a CoACD-decomposed U</sub>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples nonconvex_pile_fba</code><br>
+      <sub>a thousand non-convex bodies, as convex parts, settle in a box</sub>
+    </td>
+  </tr>
+  <tr>
     <td colspan="3"><h3>Soft Bodies</h3></td>
   </tr>
   <tr>
@@ -307,6 +341,11 @@ time per wall-clock time. The claw machine is timed over its first 300 frames, w
 | `squeezing_ball_fba` | 6,859 | 3,888 | 34,992 | 1/100 s | 15.4 | 0.65x |
 | `softbody_cantilever_fba` | 10,584 | 6,760 | 43,940 | 1/50 s | 13.5 | 1.48x |
 | `bunny_ears_fba` | 4,155 | 5,294 | 15,844 | 1/60 s | 5.9 | 2.82x |
+
+The rigid examples, timed the same way with this branch's code as of 2026-11-12: `convex_pile_fba`, 1,000 bodies and
+about 6,800 contacts, 6.3 ms per 1/50 s frame (3.2x real time); `convex_hulls_fba`, 9 bodies, 3.5 ms per 1/50 s frame
+(5.7x); `nonconvex_pile_fba`, 1,000 bodies of 5,130 convex parts and about 20,000 contacts, 15.8 ms per 1/50 s frame
+(1.3x).
 
 ### Example Options
 

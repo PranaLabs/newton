@@ -340,6 +340,14 @@ Examples
 - ``cloth_on_knives_fba``: cloth on notched blades with face contacts and light
   Rayleigh stiffness damping.
 - ``cloth_on_boxes_fba``: cloth on rigid bodies with joints.
+- ``convex_pile_fba``: a thousand rigid bodies of eight convex shapes drop
+  into an open box and settle in a pile.
+- ``convex_hulls_fba``: convex hull colliders: a stack of five cubes, and cubes
+  dropped into a U of three hulls on one body and into a concave U decomposed
+  into convex hulls by CoACD.
+- ``nonconvex_pile_fba``: a thousand rigid bodies of eight non-convex shapes,
+  CoACD-decomposed meshes and compounds of boxes, drop into an open box and
+  settle in a pile.
 - ``twisting_bar_fba``, ``squeezing_ball_fba``: a soft bar twisted by its
   pinned ends and a soft ball dragged by spinning cylinders.
 - ``softbody_franka_fba``: a Franka arm integrated by
