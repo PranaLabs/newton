@@ -198,6 +198,8 @@ _PCR_BLOCK_DIM = 128
 # partial sums each block reduces in one tile: up to 262144 rows.
 _FUSED_BLOCK = wp.constant(256)
 _FUSED_MAX_BLOCKS = wp.constant(1024)
+# Threads per row of the tiled sparse product that the fused iteration takes for long rows.
+_TILED_MV = 64
 
 
 # ---------------------------------------------------------------------------
@@ -423,12 +425,21 @@ def csr_diag_kernel(
     values: wp.array[wp.float64],
     diag: wp.array[wp.float64],
 ):
-    """The diagonal of a scalar CSR matrix, zero where a row stores none."""
+    """The diagonal of a scalar CSR matrix with its columns in order in each row, zero where a row stores none."""
     i = wp.tid()
+    lo = offsets[i]
+    hi = offsets[i + 1]
+    end = hi
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if columns[mid] < i:
+            lo = mid + 1
+        else:
+            hi = mid
     d = wp.float64(0.0)
-    for k in range(offsets[i], offsets[i + 1]):
-        if columns[k] == i:
-            d = values[k]
+    if lo < end:
+        if columns[lo] == i:
+            d = values[lo]
     diag[i] = d
 
 
@@ -518,6 +529,16 @@ def _fused_pcr_mv_kernel(
         h[i] = y
         si = s[i]
     wp.tile_store(partial_rho, wp.tile_sum(wp.tile(y * si)), offset=(b,))
+
+
+@wp.kernel
+def _fused_pcr_rho_kernel(s: wp.array[wp.float64], h: wp.array[wp.float64], partial_rho: wp.array[wp.float64]):
+    """The block sums of ``s . h``, for an ``h = W s`` that :func:`warp.sparse.bsr_mv` multiplied."""
+    b = wp.tid()
+    off = b * _FUSED_BLOCK
+    s_t = wp.tile_load(s, shape=(_FUSED_BLOCK,), offset=(off,))
+    h_t = wp.tile_load(h, shape=(_FUSED_BLOCK,), offset=(off,))
+    wp.tile_store(partial_rho, wp.tile_sum(wp.tile_map(wp.mul, s_t, h_t)), offset=(b,))
 
 
 @wp.kernel
@@ -1195,11 +1216,12 @@ class NSNPCRSolver:
         return nb_iter
 
     def solve_sparse_fused(self, W_bsr, b: wp.array[wp.float64], x_out: wp.array[wp.float64]) -> int:
-        """:meth:`solve_sparse` for a fixed iteration count, in four launches per iteration that read nothing from
-        the device.
+        """:meth:`solve_sparse` for a fixed iteration count, in four or five launches per iteration that read nothing
+        from the device.
 
         The scalars of an iteration reduce in blocks of rows, and every block sums the blocks' partial sums
-        alike, so that the run is deterministic; the matrix products run one thread per row in column order. Sums
+        alike, so that the run is deterministic; the matrix products run one thread per row in column order, or,
+        for rows of more than 128 entries on average, as :func:`warp.sparse.bsr_mv`'s tiled product. Sums
         run in another order than :meth:`solve_sparse`'s, so results differ by rounding. With :attr:`world_rows`,
         each world reduces its own chunks of rows and keeps its own scalars, row budget and stop flag, as in
         :meth:`solve_sparse`. Runs that :meth:`solve_sparse` checks for convergence, single systems of more than
@@ -1225,6 +1247,8 @@ class NSNPCRSolver:
             ):
                 return self.solve_sparse(W_bsr, b, x_out)
             return self._solve_worlds_fused(W_bsr, b, x_out)
+        import warp.sparse as wps  # noqa: PLC0415
+
         n = int(b.shape[0])
         nb = (n + _FUSED_BLOCK - 1) // _FUSED_BLOCK
         max_iter = min(self.max_iter, n)
@@ -1237,13 +1261,19 @@ class NSNPCRSolver:
         x, r, s, d, q, h = (a[:n] for a in (self._x, self._r, self._s, self._d, self._q, self._h))
         precond, diag = self._precond[:n], self._diag[:n]
         matrix = [W_bsr.offsets, W_bsr.columns, W_bsr.values]
+        # Rows of more than 128 entries on average, as warp.sparse counts them, take its tiled product: one block of
+        # threads per row reads the row's entries together, where one thread per row reads them one by one.
+        long_rows = int(W_bsr.nnz) > 2 * _TILED_MV * n
         x.zero_()
         wp.launch(csr_diag_kernel, n, matrix, [diag], device=device)
         wp.launch(_precond_from_bsr_diag_kernel, n, [diag], [precond], device=device)
         wp.copy(r, b, count=n)
         wp.launch(_apply_precond_kernel, n, [r, precond], [s], device=device)
         wp.copy(d, s, count=n)
-        wp.launch(csr_mv_kernel, n, [*matrix, d], [q], device=device)
+        if long_rows:
+            wps.bsr_mv(W_bsr, d, q, tile_size=_TILED_MV)
+        else:
+            wp.launch(csr_mv_kernel, n, [*matrix, d], [q], device=device)
         wp.utils.array_inner(s, q, out=self._fused_rho[0:1], count=n)
         self._stopped_d.zero_()
         for k in range(max_iter):
@@ -1252,8 +1282,13 @@ class NSNPCRSolver:
             wp.launch_tiled(_fused_pcr_dots_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
             inputs = [pden, pcurv, pchart, self._fused_rho, slot, self._eta, n, d, q, h, self._stopped_d, x, r, s]
             wp.launch_tiled(_fused_pcr_step_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
-            inputs = [*matrix, s, n, h, prho]
-            wp.launch_tiled(_fused_pcr_mv_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
+            if long_rows:
+                wps.bsr_mv(W_bsr, s, h, tile_size=_TILED_MV)
+                inputs = [s, h, prho]
+                wp.launch_tiled(_fused_pcr_rho_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
+            else:
+                inputs = [*matrix, s, n, h, prho]
+                wp.launch_tiled(_fused_pcr_mv_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
             inputs = [prho, self._fused_rho, slot, n, s, h, d, q]
             wp.launch_tiled(_fused_pcr_direction_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
         wp.copy(x_out, x, count=n)
