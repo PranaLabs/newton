@@ -1181,8 +1181,8 @@ class TestFBAWorlds(unittest.TestCase):
                     np.testing.assert_allclose(results[0], np.concatenate(results[1:]), atol=2e-6, rtol=0.0)
 
     def test_factor_splits_only_worlds(self):
-        """The particle and body systems of one world factor whole, also of disconnected cloths and bodies; those of
-        several worlds factor one world at a time."""
+        """The particle system of one world factors whole, also of disconnected cloths; those of several worlds factor
+        one world at a time. The bodies' system, block diagonal, factors nothing."""
         from newton._src.solvers.fba import linear_solver  # noqa: PLC0415
         from newton._src.solvers.fba.sparse_ldlt import factor_ldlt  # noqa: PLC0415
 
@@ -1191,7 +1191,7 @@ class TestFBAWorlds(unittest.TestCase):
         for x in (1.0, 2.0):
             body = source.add_body(xform=wp.transform((x, 0.0, 0.5), wp.quat_identity()))
             source.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
-        for worlds, expected in ((1, [8, 12]), (3, [8, 8, 8, 12, 12, 12])):
+        for worlds, expected in ((1, [8]), (3, [8, 8, 8])):
             with self.subTest(worlds=worlds):
                 model = _model([source] * worlds, "cpu")
                 solver = SolverFBA(model, iterations=1)
