@@ -208,7 +208,7 @@ class TestFBARigidRows(unittest.TestCase):
         force, b_const = rng.standard_normal(n), rng.standard_normal(6 * m)
         incidence = [wp.array(a, dtype=wp.int32, device=device) for a in rigid.row_incidence(row_slot, m)]
         b = wp.empty(6 * m, dtype=wp.float64, device=device)
-        wp.launch(
+        wp.launch_tiled(
             rigid.row_force_rhs_kernel,
             dim=m,
             inputs=[
@@ -218,6 +218,7 @@ class TestFBARigidRows(unittest.TestCase):
                 wp.array(b_const, dtype=wp.float64, device=device),
             ],
             outputs=[b],
+            block_dim=rigid.ROW_FORCE_LANES,
             device=device,
         )
         np.testing.assert_allclose(b.numpy(), b_const + J.T @ force, rtol=1e-12)

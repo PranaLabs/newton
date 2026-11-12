@@ -271,6 +271,10 @@ def slot_entries(
     return start, entry_row, entry_side
 
 
+# Lanes of :func:`row_force_rhs_kernel` per body slot.
+ROW_FORCE_LANES = 32
+
+
 @wp.kernel
 def row_force_rhs_kernel(
     slot_entry_start: wp.array[wp.int32],
@@ -282,13 +286,17 @@ def row_force_rhs_kernel(
     # outputs
     b: wp.array[wp.float64],
 ):
-    """``b = b_const + Jᵀ f`` per body slot, gathered over the rows touching it."""
-    k = wp.tid()
+    """``b = b_const + Jᵀ f`` per body slot, gathered over the rows touching it, launched tiled with a block of lanes
+    per slot, :data:`ROW_FORCE_LANES` on CUDA: lane ``l`` sums the slot's entries ``l``, ``l + block_dim`` and so on,
+    and the lanes' sums add up in a fixed order."""
+    k, lane = wp.tid()
     acc = wp.spatial_vectord()
-    for e in range(slot_entry_start[k], slot_entry_start[k + 1]):
+    for e in range(slot_entry_start[k] + lane, slot_entry_start[k + 1], wp.block_dim()):
         acc += force[entry_row[e]] * row_jac[entry_row[e], entry_side[e]]
-    for c in range(6):
-        b[6 * k + c] = b_const[6 * k + c] + acc[c]
+    total = wp.tile_extract(wp.tile_sum(wp.tile(acc, preserve_type=True)), 0)
+    if lane == 0:
+        for c in range(6):
+            b[6 * k + c] = b_const[6 * k + c] + total[c]
 
 
 @wp.kernel

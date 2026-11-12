@@ -1605,7 +1605,7 @@ class SolverFBA(SolverBase):
         with all row forces ``f`` and retracts.
         """
         from .joints import joint_residual_kernel  # noqa: PLC0415
-        from .rigid import row_force_rhs_kernel  # noqa: PLC0415
+        from .rigid import ROW_FORCE_LANES, row_force_rhs_kernel  # noqa: PLC0415
 
         b = self._rigid_b_d
         if self._joint_rows is not None:
@@ -1625,11 +1625,12 @@ class SolverFBA(SolverBase):
             self._joint_system.apply_force(self._joint_row_jac_d, self._joint_force_d, b, self._rigid_b_iter_d)
             b = self._rigid_b_iter_d
         if force is not None:
-            wp.launch(
+            wp.launch_tiled(
                 row_force_rhs_kernel,
                 dim=self._rigid_bodies_d.shape[0],
                 inputs=[*self._rc_incidence, self._rc_row_jac_d, force, b],
                 outputs=[self._rigid_b_iter_d],
+                block_dim=ROW_FORCE_LANES,
                 device=self._device,
             )
             b = self._rigid_b_iter_d

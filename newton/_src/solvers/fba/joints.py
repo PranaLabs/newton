@@ -17,7 +17,7 @@ import numpy as np
 import warp as wp
 
 from ...sim import JointType, Model
-from .rigid import row_force_rhs_kernel, row_incidence, slot_coefficients
+from .rigid import ROW_FORCE_LANES, row_force_rhs_kernel, row_incidence, slot_coefficients
 
 _CONSTRAINT_JOINTS = (JointType.PRISMATIC, JointType.REVOLUTE, JointType.BALL, JointType.FIXED, JointType.D6)
 
@@ -465,11 +465,12 @@ class BilateralSystem:
 
     def apply_force(self, row_jac, force, b_const, b) -> None:
         """``b = b_const + Jᵀ force``."""
-        wp.launch(
+        wp.launch_tiled(
             row_force_rhs_kernel,
             dim=self.slot_entry_start.shape[0] - 1,
             inputs=[self.slot_entry_start, self.entry_row, self.entry_side, row_jac, force, b_const],
             outputs=[b],
+            block_dim=ROW_FORCE_LANES,
             device=self.device,
         )
 
