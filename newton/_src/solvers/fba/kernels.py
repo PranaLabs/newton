@@ -3457,13 +3457,17 @@ def build_a_schur_csr_kernel(
     regularized: int,
     scale: wp.float64,
     contact_scale: wp.array[wp.float64],
+    rows: int,
     # outputs
     a_values: wp.array[wp.float64],
 ):
     """``A_schur = ωωᵀ ⊙ W + diag(c)`` at the pattern of ``W`` in CSR form, one thread per entry, as
     :func:`build_a_schur_lite_bsr_kernel` computes it, with the diagonal of the first ``regularized`` rows scaled by
-    ``scale`` after."""
+    ``scale`` after. Threads past the ``offsets[rows]`` entries of the ``rows`` rows return, so a launch can cover
+    the capacity of a matrix whose entries vary."""
     k = wp.tid()
+    if k >= offsets[rows]:
+        return
     i = csr_row_of(offsets, k)
     j = columns[k]
     a = omega[i] * omega[j] * w_values[k]

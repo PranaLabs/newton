@@ -191,6 +191,47 @@ class RigidContactGather:
         self.capacity = cap
 
 
+class RigidRowStorage:
+    """The NSN rows of the rigid contacts kept across steps, for a capacity of contacts that changes only when the
+    step's contacts outgrow it or would take less than half of it afresh.
+
+    The rows past the step's contacts stay inert: no body slot, no entries of ``W``, and zero residual, anchor
+    projection, multipliers and friction, so that the NSN step of the capacity solves the step's rows alone and its
+    graph can replay from step to step.
+    """
+
+    def __init__(self, device):
+        self.device = device
+        self.contacts = 0
+
+    def reserve(self, m: int) -> None:
+        """Hold the rows of ``m`` contacts."""
+        from .linear_solver import CsrStorage  # noqa: PLC0415
+
+        # A tenth more than the contacts, in steps of 64 contacts.
+        contacts = 64 * ((m + m // 10 + 63) // 64)
+        if m <= self.contacts and 2 * contacts >= self.contacts:
+            return
+        n, d = 3 * contacts, self.device
+        self.row_slot = wp.empty((n, 2), dtype=wp.int32, device=d)
+        self.row_jac = wp.empty((n, 2), dtype=wp.spatial_vectord, device=d)
+        self.pene0 = wp.zeros(n, dtype=wp.float64, device=d)
+        self.mu = wp.empty(contacts, dtype=wp.float64, device=d)
+        self.value = wp.empty(n, dtype=wp.float64, device=d)
+        self.r = wp.empty(n, dtype=wp.float64, device=d)
+        self.lam = wp.empty(n, dtype=wp.float64, device=d)
+        self.omega = wp.empty(n, dtype=wp.float64, device=d)
+        self.csr = CsrStorage(n, d)
+        self.contacts = contacts
+
+    def begin(self) -> None:
+        """Clear the rows for a step; the rows of its contacts are written after."""
+        self.row_slot.fill_(-1)
+        self.row_jac.zero_()
+        for a in (self.mu, self.r, self.lam, self.omega):
+            a.zero_()
+
+
 def gather_rigid_contacts(
     model: Model,
     contacts: Contacts,
