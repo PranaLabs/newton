@@ -322,6 +322,58 @@ class TestPCRFusedSparse(_PCRTestCase):
             out.append(x.numpy())
         np.testing.assert_allclose(out[1], out[0], rtol=1.0e-12, atol=1.0e-14 * np.abs(out[0]).max())
 
+    def test_factored_iterations_match_the_formed_matrix(self):
+        """Take the ten iterations of ``diag(c) W diag(c) + diag(e)`` by its factors as of the matrix formed, to
+        rounding, some scalings zero as weights of contact rows are: for short rows, for long rows that take the
+        tiled product, and with a block preconditioner on trailing rows."""
+        import warp.sparse as wps  # noqa: PLC0415
+
+        @wp.kernel
+        def apply_block(inv: wp.array2d[wp.float64], v: wp.array[wp.float64], o: int, out: wp.array[wp.float64]):
+            i = wp.tid()
+            acc = wp.float64(0.0)
+            for j in range(inv.shape[1]):
+                acc += inv[i, j] * v[o + j]
+            out[o + i] = acc
+
+        rng = np.random.default_rng(10)
+        for n, density in ((600, 0.01), (400, 0.5)):
+            S = np.where(rng.random((n, n)) < density, rng.standard_normal((n, n)), 0.0)
+            S = S + S.T
+            np.fill_diagonal(S, 0.0)
+            W = S + np.diag(np.abs(S).sum(axis=1) + rng.uniform(0.5, 2.0, n))
+            c = rng.uniform(0.2, 1.5, n)
+            c[::7] = 0.0
+            e = rng.uniform(0.0, 2.0, n) + (c == 0.0)
+            A = c[:, None] * W * c[None, :] + np.diag(e)
+            b = rng.standard_normal(n)
+            rows, cols = np.nonzero(W)
+            index = [wp.array(a, dtype=wp.int32, device=self.device) for a in (rows, cols)]
+            matrices = [
+                wps.bsr_from_triplets(n, n, *index, wp.array(M[rows, cols], dtype=wp.float64, device=self.device))
+                for M in (W, A)
+            ]
+            block_inv = wp.array(np.linalg.inv(A[n - 20 :, n - 20 :]), dtype=wp.float64, device=self.device)
+
+            def block_precond(v, out, n=n, block_inv=block_inv):
+                wp.launch(apply_block, 20, inputs=[block_inv, v, n - 20], outputs=[out], device=self.device)
+
+            for precond in (None, block_precond):
+                with self.subTest(n=n, block=precond is not None):
+                    out = []
+                    for factored in (False, True):
+                        solver = NSNPCRSolver(max_n=n, device=self.device, tol=1.0e-10, max_iter=10)
+                        self.assertTrue(solver.fuses_alone(n))
+                        x = wp.zeros(n, dtype=wp.float64, device=self.device)
+                        rhs = wp.array(b, dtype=wp.float64, device=self.device)
+                        if factored:
+                            factors = [wp.array(a, dtype=wp.float64, device=self.device) for a in (c, e, np.diag(A))]
+                            solver.solve_sparse_scaled(matrices[0], *factors, rhs, x, block_precond=precond)
+                        else:
+                            solver.solve_sparse_fused(matrices[1], rhs, x, block_precond=precond)
+                        out.append(x.numpy())
+                    np.testing.assert_allclose(out[1], out[0], rtol=1.0e-10, atol=1.0e-12 * np.abs(out[0]).max())
+
     def test_checked_runs_take_solve_sparse(self):
         """Run ``solve_sparse`` itself when the iteration cap exceeds its convergence check interval."""
         A = self._sparse_spd(300, seed=6)

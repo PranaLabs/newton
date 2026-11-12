@@ -4616,7 +4616,7 @@ class SolverFBA(SolverBase):
         """Allocate the vectors of the sparse NSN steps for ``n_rows`` rows."""
         if getattr(self, "_nsn_sparse_scratch", None) is None or self._nsn_sparse_scratch[0].shape[0] < n_rows:
             cap = max(self._nsn_inner_n, n_rows)
-            self._nsn_sparse_scratch = [wp.empty(cap, dtype=wp.float64, device=self._device) for _ in range(3)]
+            self._nsn_sparse_scratch = [wp.empty(cap, dtype=wp.float64, device=self._device) for _ in range(5)]
 
     def _nsn_sparse_graph_step(
         self, name: str, W_sparse: tuple, inputs: tuple, sizes: tuple, block_precond, tail: tuple
@@ -4723,7 +4723,8 @@ class SolverFBA(SolverBase):
         device, dt_w = self._device, wp.float64(dt)
         W_sp, A_sp = W_sparse
         self._ensure_nsn_sparse_scratch(n_rows)
-        ol, wol, diag = (a[:n_rows] for a in self._nsn_sparse_scratch)
+        ol, wol, diag, shift, a_diag = (a[:n_rows] for a in self._nsn_sparse_scratch)
+        pcr = self._pcr_solver
         lam, omega = self._nsn_lam_d[:n_rows], self._nsn_omega_d[:n_rows]
         # Frictional precond: dt²·W_ii for normal rows; dt·W_ii for tangents.
         wps.bsr_get_diag(W_sp, out=diag)
@@ -4748,12 +4749,19 @@ class SolverFBA(SolverBase):
                     outputs=[self._nsn_omega_d, self._nsn_compliance_d, self._nsn_h_d],
                     device=device,
                 )
-            # The Newton matrix, with the diagonal of the contact rows regularized.
+            # The Newton matrix, with the diagonal of the contact rows regularized. A fused PCR applies it as its
+            # factors Ω W Ω + diag(shift), Ω = diag(ω); the other runs take it formed.
             regularized = 3 * M if contact_regularization > 0.0 else 0
-            inputs = [W_sp.offsets, W_sp.columns, W_sp.values, self._nsn_omega_d, self._nsn_compliance_d, regularized]
-            inputs.append(wp.float64(1.0 + contact_regularization))
-            inputs += [self._nsn_contact_scale, int(W_sp.nrow)]
-            wp.launch(K.build_a_schur_csr_kernel, int(W_sp.nnz), inputs, [A_sp.values], device=device)
+            factored = pcr.fuses_alone(n_rows)
+            if factored:
+                inputs = [diag, self._nsn_omega_d, self._nsn_compliance_d, regularized]
+                inputs += [wp.float64(1.0 + contact_regularization), self._nsn_contact_scale]
+                wp.launch(K.newton_matrix_diagonal_kernel, n_rows, inputs, [shift, a_diag], device=device)
+            else:
+                inputs = [W_sp.offsets, W_sp.columns, W_sp.values, self._nsn_omega_d, self._nsn_compliance_d]
+                inputs += [regularized, wp.float64(1.0 + contact_regularization)]
+                inputs += [self._nsn_contact_scale, int(W_sp.nrow)]
+                wp.launch(K.build_a_schur_csr_kernel, int(W_sp.nnz), inputs, [A_sp.values], device=device)
             wp.launch(K.compute_omega_times_lam_kernel, n_rows, [omega, lam], [ol], device=device)
             wps.bsr_mv(W_sp, ol, wol)
             wp.launch(
@@ -4765,7 +4773,10 @@ class SolverFBA(SolverBase):
             )
             rhs, dlam = self._nsn_rhs_d[:n_rows], self._nsn_dlam_d[:n_rows]
             # Fixed-count runs take the fused iteration: four launches per iteration instead of a dozen.
-            self._pcr_solver.solve_sparse_fused(A_sp, rhs, dlam, block_precond=block_precond)
+            if factored:
+                pcr.solve_sparse_scaled(W_sp, omega, shift, a_diag, rhs, dlam, block_precond=block_precond)
+            else:
+                pcr.solve_sparse_fused(A_sp, rhs, dlam, block_precond=block_precond)
             wp.launch(K.axpy_lambda_kernel, n_rows, inputs=[self._nsn_dlam_d], outputs=[self._nsn_lam_d], device=device)
             # Per-contact box clamp of the tangent multipliers; no friction without a positive normal multiplier.
             wp.launch(K.coulomb_box_clamp_kernel, M, inputs=[mu_d], outputs=[self._nsn_lam_d], device=device)

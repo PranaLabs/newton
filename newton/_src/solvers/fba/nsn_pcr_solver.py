@@ -508,9 +508,12 @@ def _fused_pcr_step_kernel(
     x: wp.array[wp.float64],
     r: wp.array[wp.float64],
     s: wp.array[wp.float64],
+    scaled: int,
+    scale: wp.array[wp.float64],
+    sw: wp.array[wp.float64],
 ):
     """The protected step length from the summed blocks, which every block forms alike, and ``x += alpha d``,
-    ``r -= alpha q``, ``s -= alpha h``."""
+    ``r -= alpha q``, ``s -= alpha h``; with ``scaled``, also ``sw = scale s`` for a factored matrix."""
     b, lane = wp.tid()
     den = wp.tile_extract(wp.tile_sum(wp.tile_load(partial_den, shape=(_FUSED_MAX_BLOCKS,))), 0)
     curvature = wp.tile_extract(wp.tile_sum(wp.tile_load(partial_curvature, shape=(_FUSED_MAX_BLOCKS,))), 0)
@@ -528,7 +531,79 @@ def _fused_pcr_step_kernel(
     if i < n:
         x[i] = x[i] + alpha * d[i]
         r[i] = r[i] - alpha * q[i]
-        s[i] = s[i] - alpha * h[i]
+        s_i = s[i] - alpha * h[i]
+        s[i] = s_i
+        if scaled != 0:
+            sw[i] = scale[i] * s_i
+
+
+@wp.kernel
+def _fused_pcr_mv_scaled_kernel(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    sw: wp.array[wp.float64],
+    scale: wp.array[wp.float64],
+    shift: wp.array[wp.float64],
+    s: wp.array[wp.float64],
+    n: int,
+    h: wp.array[wp.float64],
+    partial_rho: wp.array[wp.float64],
+):
+    """:func:`_fused_pcr_mv_kernel` for the factored ``A = diag(scale) W diag(scale) + diag(shift)``:
+    ``h = scale (W sw) + shift s`` from ``sw = scale s``, and the block sums of ``s . h``."""
+    b, lane = wp.tid()
+    i = b * _FUSED_BLOCK + lane
+    y = wp.float64(0.0)
+    si = wp.float64(0.0)
+    if i < n:
+        for k in range(offsets[i], offsets[i + 1]):
+            y += values[k] * sw[columns[k]]
+        si = s[i]
+        y = scale[i] * y + shift[i] * si
+        h[i] = y
+    wp.tile_store(partial_rho, wp.tile_sum(wp.tile(y * si)), offset=(b,))
+
+
+@wp.kernel
+def _fused_pcr_rho_scaled_kernel(
+    s: wp.array[wp.float64],
+    scale: wp.array[wp.float64],
+    shift: wp.array[wp.float64],
+    n: int,
+    h: wp.array[wp.float64],
+    partial_rho: wp.array[wp.float64],
+):
+    """:func:`_fused_pcr_rho_kernel` for the factored matrix: ``h = scale h + shift s`` on an ``h = W sw`` that
+    :func:`warp.sparse.bsr_mv` multiplied, and the block sums of ``s . h``."""
+    b, lane = wp.tid()
+    i = b * _FUSED_BLOCK + lane
+    y = wp.float64(0.0)
+    si = wp.float64(0.0)
+    if i < n:
+        si = s[i]
+        y = scale[i] * h[i] + shift[i] * si
+        h[i] = y
+    wp.tile_store(partial_rho, wp.tile_sum(wp.tile(y * si)), offset=(b,))
+
+
+@wp.kernel
+def _scale_shift_kernel(
+    scale: wp.array[wp.float64],
+    shift: wp.array[wp.float64],
+    v: wp.array[wp.float64],
+    out: wp.array[wp.float64],
+):
+    """``out = scale out + shift v``, which completes the product of the factored matrix by ``v``."""
+    i = wp.tid()
+    out[i] = scale[i] * out[i] + shift[i] * v[i]
+
+
+@wp.kernel
+def _scale_kernel(scale: wp.array[wp.float64], v: wp.array[wp.float64], out: wp.array[wp.float64]):
+    """``out = scale v``."""
+    i = wp.tid()
+    out[i] = scale[i] * v[i]
 
 
 @wp.kernel
@@ -868,6 +943,8 @@ class NSNPCRSolver:
         self._q = wp.zeros(self.max_n, dtype=wp.float64, device=device)
         self._h = wp.zeros(self.max_n, dtype=wp.float64, device=device)
         self._s = wp.zeros(self.max_n, dtype=wp.float64, device=device)
+        # ``scale s`` of :meth:`solve_sparse_scaled`'s factored matrix.
+        self._sw = wp.zeros(self.max_n, dtype=wp.float64, device=device)
         self._precond = wp.zeros(self.max_n, dtype=wp.float64, device=device)
         # Diagonal of the sparse matrix of :meth:`solve_sparse`.
         self._diag = wp.zeros(self.max_n, dtype=wp.float64, device=device)
@@ -1281,35 +1358,88 @@ class NSNPCRSolver:
             ):
                 return self.solve_sparse(W_bsr, b, x_out)
             return self._solve_worlds_fused(W_bsr, b, x_out)
+        if not self.fuses_alone(int(b.shape[0])):
+            return self.solve_sparse(W_bsr, b, x_out, block_precond=block_precond)
+        return self._fused_single(W_bsr, b, x_out, block_precond)
+
+    def fuses_alone(self, n: int) -> bool:
+        """Whether :meth:`solve_sparse_fused` runs a single system of ``n`` rows fused: without :attr:`world_rows`,
+        a run it does not check, and on CUDA."""
+        nb = (n + _FUSED_BLOCK - 1) // _FUSED_BLOCK
+        unchecked = min(self.max_iter, n) <= self.check_every
+        return self.world_rows is None and unchecked and nb <= _FUSED_MAX_BLOCKS and wp.get_device(self.device).is_cuda
+
+    def solve_sparse_scaled(
+        self,
+        W_bsr,
+        scale: wp.array[wp.float64],
+        shift: wp.array[wp.float64],
+        diag: wp.array[wp.float64],
+        b: wp.array[wp.float64],
+        x_out: wp.array[wp.float64],
+        block_precond: Callable[[wp.array, wp.array], None] | None = None,
+    ) -> int:
+        """:meth:`solve_sparse_fused` for ``A = diag(scale) W diag(scale) + diag(shift)``, whose diagonal is ``diag``,
+        without forming ``A``: each product by ``A`` multiplies by ``W`` between the scalings, which the step and the
+        reductions of the iteration apply. Only for systems that :meth:`fuses_alone` fuses.
+
+        Args:
+            W_bsr: Scalar ``BsrMatrix`` with its columns in order in each row.
+            scale: ``(n,)`` row and column scaling, fp64.
+            shift: ``(n,)`` diagonal added after the scaling, fp64.
+            diag: ``(n,)`` diagonal of ``A``, fp64, for the Jacobi preconditioner.
+            b: ``(n,)`` RHS, fp64.
+            x_out: ``(n,)`` output, fp64.
+            block_precond: Optional exact block solve over the Jacobi product, as in :meth:`solve_sparse_fused`.
+
+        Returns:
+            The iterations taken.
+        """
+        if not self.fuses_alone(int(b.shape[0])):
+            raise ValueError("solve_sparse_scaled takes systems that solve_sparse_fused fuses alone")
+        return self._fused_single(W_bsr, b, x_out, block_precond, (scale, shift, diag))
+
+    def _fused_single(self, W_bsr, b: wp.array[wp.float64], x_out: wp.array[wp.float64], block_precond, factors=None):
+        """The fused iterations of a single system, of ``W_bsr`` or, with ``factors = (scale, shift, diag)``, of
+        ``diag(scale) W_bsr diag(scale) + diag(shift)``."""
         import warp.sparse as wps  # noqa: PLC0415
 
         n = int(b.shape[0])
         nb = (n + _FUSED_BLOCK - 1) // _FUSED_BLOCK
         max_iter = min(self.max_iter, n)
         device = self.device
-        if max_iter > self.check_every or nb > _FUSED_MAX_BLOCKS or not wp.get_device(device).is_cuda:
-            return self.solve_sparse(W_bsr, b, x_out, block_precond=block_precond)
         if n <= 0 or n > self.max_n:
             raise ValueError(f"system size n={n} outside 1..{self.max_n}")
         pden, pcurv, pchart, prho = (self._fused_partials[k][:nb] for k in range(4))
-        x, r, s, d, q, h = (a[:n] for a in (self._x, self._r, self._s, self._d, self._q, self._h))
+        x, r, s, d, q, h, sw = (a[:n] for a in (self._x, self._r, self._s, self._d, self._q, self._h, self._sw))
         precond, diag = self._precond[:n], self._diag[:n]
         matrix = [W_bsr.offsets, W_bsr.columns, W_bsr.values]
+        scaled = factors is not None
+        scale, shift = (factors[0], factors[1]) if scaled else (s, s)
         # Rows of more than 128 entries on average, as warp.sparse counts them, take its tiled product: one block of
         # threads per row reads the row's entries together, where one thread per row reads them one by one.
         long_rows = int(W_bsr.nnz) > 2 * _TILED_MV * n
         x.zero_()
-        wp.launch(csr_diag_kernel, n, matrix, [diag], device=device)
+        if scaled:
+            wp.copy(diag, factors[2], count=n)
+        else:
+            wp.launch(csr_diag_kernel, n, matrix, [diag], device=device)
         wp.launch(_precond_from_bsr_diag_kernel, n, [diag], [precond], device=device)
         wp.copy(r, b, count=n)
         wp.launch(_apply_precond_kernel, n, [r, precond], [s], device=device)
         if block_precond is not None:
             block_precond(r, s)
         wp.copy(d, s, count=n)
+        product_in = d
+        if scaled:
+            wp.launch(_scale_kernel, n, [scale, d], [sw], device=device)
+            product_in = sw
         if long_rows:
-            wps.bsr_mv(W_bsr, d, q, tile_size=_TILED_MV)
+            wps.bsr_mv(W_bsr, product_in, q, tile_size=_TILED_MV)
         else:
-            wp.launch(csr_mv_kernel, n, [*matrix, d], [q], device=device)
+            wp.launch(csr_mv_kernel, n, [*matrix, product_in], [q], device=device)
+        if scaled:
+            wp.launch(_scale_shift_kernel, n, [scale, shift, d], [q], device=device)
         wp.utils.array_inner(s, q, out=self._fused_rho[0:1], count=n)
         self._stopped_d.zero_()
         for k in range(max_iter):
@@ -1325,11 +1455,18 @@ class NSNPCRSolver:
                     _fused_pcr_dots_given_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device
                 )
             inputs = [pden, pcurv, pchart, self._fused_rho, slot, self._eta, n, d, q, h, self._stopped_d, x, r, s]
+            inputs += [int(scaled), scale, sw]
             wp.launch_tiled(_fused_pcr_step_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
             if long_rows:
-                wps.bsr_mv(W_bsr, s, h, tile_size=_TILED_MV)
-                inputs = [s, h, prho]
-                wp.launch_tiled(_fused_pcr_rho_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
+                wps.bsr_mv(W_bsr, sw if scaled else s, h, tile_size=_TILED_MV)
+                kernel = _fused_pcr_rho_scaled_kernel if scaled else _fused_pcr_rho_kernel
+                inputs = [s, scale, shift, n, h, prho] if scaled else [s, h, prho]
+                wp.launch_tiled(kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
+            elif scaled:
+                inputs = [*matrix, sw, scale, shift, s, n, h, prho]
+                wp.launch_tiled(
+                    _fused_pcr_mv_scaled_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device
+                )
             else:
                 inputs = [*matrix, s, n, h, prho]
                 wp.launch_tiled(_fused_pcr_mv_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)

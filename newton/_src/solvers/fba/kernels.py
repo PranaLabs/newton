@@ -3482,6 +3482,31 @@ def build_a_schur_csr_kernel(
 
 
 @wp.kernel
+def newton_matrix_diagonal_kernel(
+    w_diag: wp.array[wp.float64],
+    omega: wp.array[wp.float64],
+    compliance: wp.array[wp.float64],
+    regularized: int,
+    scale: wp.float64,
+    contact_scale: wp.array[wp.float64],
+    # outputs
+    shift: wp.array[wp.float64],
+    diagonal: wp.array[wp.float64],
+):
+    """The diagonal of :func:`build_a_schur_csr_kernel`'s ``A_schur``, the first ``regularized`` rows scaled alike,
+    and ``shift = diag(A_schur) - ω² diag(W)``, so that ``A_schur = Ω W Ω + diag(shift)`` with ``Ω = diag(ω)``."""
+    i = wp.tid()
+    ww = omega[i] * omega[i] * w_diag[i]
+    gain = wp.float64(1.0)
+    if i < regularized:
+        gain = scale
+        if contact_scale.shape[0] > 0:
+            gain = contact_scale[i // 3]
+    diagonal[i] = (ww + compliance[i]) * gain
+    shift[i] = ww * (gain - wp.float64(1.0)) + compliance[i] * gain
+
+
+@wp.kernel
 def compute_penetration_sparse_kernel(
     r: wp.array[wp.float64],
     w_omega_lam: wp.array[wp.float64],
