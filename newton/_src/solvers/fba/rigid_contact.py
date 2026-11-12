@@ -55,18 +55,164 @@ class RigidContacts:
         return self.slot.shape[0]
 
 
-def gather_rigid_contacts(model: Model, contacts: Contacts, body_slot: np.ndarray, device) -> RigidContacts | None:
+_DROPPED_PAIR = wp.constant(wp.int64(0x7FFFFFFFFFFFFFFF))
+
+
+@wp.func
+def _lookup(table: wp.array[wp.int32], i: wp.int32) -> wp.int32:
+    """``table[i]``, or -1 for a negative ``i``."""
+    if i < 0:
+        return -1
+    return table[i]
+
+
+@wp.kernel
+def _rigid_contact_keys_kernel(
+    shape0: wp.array[wp.int32],
+    shape1: wp.array[wp.int32],
+    point0: wp.array[wp.vec3],
+    offset0: wp.array[wp.vec3],
+    shape_body: wp.array[wp.int32],
+    body_slot: wp.array[wp.int32],
+    body_com: wp.array[wp.vec3],
+    shape_count: wp.int64,
+    # outputs
+    pair_key: wp.array[wp.int64],
+    anchor_key: wp.array2d[wp.float64],
+    order: wp.array[wp.int32],
+    table: wp.array[wp.int32],
+):
+    """The sort keys of each emitted contact: its shape pair, or a key past every pair for a contact the solver
+    drops, and the side-0 anchor relative to the COM; counts the kept contacts in ``table[0]``."""
+    c = wp.tid()
+    order[c] = c
+    s0, s1 = shape0[c], shape1[c]
+    b0, b1 = _lookup(shape_body, s0), _lookup(shape_body, s1)
+    slot0, slot1 = _lookup(body_slot, b0), _lookup(body_slot, b1)
+    keep = s0 >= 0 and s1 >= 0 and b0 != b1 and (slot0 >= 0 or slot1 >= 0)
+    a = wp.vec3d(point0[c]) + wp.vec3d(offset0[c])
+    if b0 >= 0:
+        a -= wp.vec3d(body_com[b0])
+    for k in range(3):
+        # -0 and +0 compare equal in the order; the radix sort keys alone would split them.
+        v = a[k]
+        if v == wp.float64(0.0):
+            v = wp.float64(0.0)
+        anchor_key[k, c] = v
+    if keep:
+        pair_key[c] = wp.int64(s0) * shape_count + wp.int64(s1)
+        wp.atomic_add(table, 0, 1)
+    else:
+        pair_key[c] = _DROPPED_PAIR
+
+
+@wp.kernel
+def _gather_int64_kernel(src: wp.array[wp.int64], order: wp.array[wp.int32], dst: wp.array[wp.int64]):
+    i = wp.tid()
+    dst[i] = src[order[i]]
+
+
+@wp.kernel
+def _gather_float64_kernel(src: wp.array[wp.float64], order: wp.array[wp.int32], dst: wp.array[wp.float64]):
+    i = wp.tid()
+    dst[i] = src[order[i]]
+
+
+@wp.kernel
+def _rigid_contact_gather_kernel(
+    order: wp.array[wp.int32],
+    shape0: wp.array[wp.int32],
+    shape1: wp.array[wp.int32],
+    point0: wp.array[wp.vec3],
+    point1: wp.array[wp.vec3],
+    offset0: wp.array[wp.vec3],
+    offset1: wp.array[wp.vec3],
+    normal_in: wp.array[wp.vec3],
+    shape_body: wp.array[wp.int32],
+    body_slot: wp.array[wp.int32],
+    body_com: wp.array[wp.vec3],
+    shape_mu: wp.array[wp.float32],
+    # outputs
+    body: wp.array2d[wp.int32],
+    anchor: wp.array2d[wp.vec3],
+    normal: wp.array[wp.vec3],
+    mu: wp.array[wp.float64],
+    table: wp.array[wp.int32],
+):
+    """Contact ``i`` of the sorted order: its bodies, anchors, normal and friction, and its slots and shapes in row
+    ``i`` of ``table[1:]``."""
+    i = wp.tid()
+    c = order[i]
+    s = wp.vec2i(shape0[c], shape1[c])
+    p = wp.vec3d(point0[c]) + wp.vec3d(offset0[c])
+    q = wp.vec3d(point1[c]) + wp.vec3d(offset1[c])
+    for k in range(2):
+        b = _lookup(shape_body, s[k])
+        slot = _lookup(body_slot, b)
+        a = p
+        if k == 1:
+            a = q
+        if b >= 0:
+            a -= wp.vec3d(body_com[b])
+        body[i, k] = b
+        anchor[i, k] = wp.vec3(a)
+        table[1 + 4 * i + k] = slot
+        table[3 + 4 * i + k] = s[k]
+    normal[i] = normal_in[c]
+    mu_sum = wp.float64(0.0)
+    if s[0] >= 0 and s[1] >= 0:
+        mu_sum = wp.float64(shape_mu[s[0]]) + wp.float64(shape_mu[s[1]])
+    mu[i] = mu_sum * wp.float64(0.5)
+
+
+class RigidContactGather:
+    """Device buffers of :func:`gather_rigid_contacts`, kept across steps and grown with the contact count."""
+
+    def __init__(self, device):
+        self.device = device
+        self.capacity = 0
+
+    def reserve(self, n: int) -> None:
+        if n <= self.capacity:
+            return
+        cap = max(n, int(1.5 * self.capacity), 64)
+        d = self.device
+        # radix_sort_pairs works in place on arrays twice the sorted length.
+        self.pair_key = wp.empty(2 * cap, dtype=wp.int64, device=d)
+        self.anchor_key = wp.empty((3, cap), dtype=wp.float64, device=d)
+        self.key64 = wp.empty(2 * cap, dtype=wp.int64, device=d)
+        self.keyf = wp.empty(2 * cap, dtype=wp.float64, device=d)
+        self.order = wp.empty(2 * cap, dtype=wp.int32, device=d)
+        self.table = wp.empty(1 + 4 * cap, dtype=wp.int32, device=d)
+        self.body = wp.empty((cap, 2), dtype=wp.int32, device=d)
+        self.anchor = wp.empty((cap, 2), dtype=wp.vec3, device=d)
+        self.normal = wp.empty(cap, dtype=wp.vec3, device=d)
+        self.mu = wp.empty(cap, dtype=wp.float64, device=d)
+        self.capacity = cap
+
+
+def gather_rigid_contacts(
+    model: Model,
+    contacts: Contacts,
+    body_slot: np.ndarray | wp.array,
+    device,
+    buffers: RigidContactGather | None = None,
+) -> RigidContacts | None:
     """Collect the rigid contacts that touch a body the solver integrates.
 
     Contacts within one body or between bodies the solver does not integrate
     are dropped. The rest are sorted by shape pair and anchor so the rows do not
-    depend on the order the collision pipeline emitted them in.
+    depend on the order the collision pipeline emitted them in. The selection
+    and the sort run on the device; the host reads the contact count and the
+    kept contacts' slots and shapes.
 
     Args:
         model: The Newton model.
         contacts: Contacts populated by :meth:`~newton.Model.collide`.
         body_slot: Rigid DOF slot per model body, -1 if not integrated.
         device: Warp device for the contact arrays.
+        buffers: Device buffers to reuse across calls. The arrays of the
+            returned contacts are views into them, valid until the next call.
 
     Returns:
         The contacts, or ``None`` if no contact touches an integrated body.
@@ -74,28 +220,68 @@ def gather_rigid_contacts(model: Model, contacts: Contacts, body_slot: np.ndarra
     n = stored_contact_count(contacts.rigid_contact_count, contacts.rigid_contact_shape0.shape[0], "rigid")
     if n == 0:
         return None
-    shape = np.stack([host_head(contacts.rigid_contact_shape0, n), host_head(contacts.rigid_contact_shape1, n)], axis=1)
-    body = np.where(shape >= 0, model.shape_body.numpy()[np.maximum(shape, 0)], -1)
-    slot = np.where(body >= 0, body_slot[np.maximum(body, 0)], -1)
-    keep = np.flatnonzero((shape >= 0).all(axis=1) & (body[:, 0] != body[:, 1]) & (slot >= 0).any(axis=1))
-    if keep.size == 0:
+    if buffers is None:
+        buffers = RigidContactGather(device)
+    buffers.reserve(n)
+    B = buffers
+    if not isinstance(body_slot, wp.array):
+        body_slot = wp.array(np.asarray(body_slot, dtype=np.int32), dtype=wp.int32, device=device)
+    c = contacts
+    B.table.zero_()
+    wp.launch(
+        _rigid_contact_keys_kernel,
+        n,
+        inputs=[
+            c.rigid_contact_shape0,
+            c.rigid_contact_shape1,
+            c.rigid_contact_point0,
+            c.rigid_contact_offset0,
+            model.shape_body,
+            body_slot,
+            model.body_com,
+            wp.int64(max(model.shape_count, 1)),
+        ],
+        outputs=[B.pair_key, B.anchor_key, B.order, B.table],
+        device=device,
+    )
+    # Stable least-significant-key-first passes: anchor z, y, x, then the shape pair, as ``np.lexsort`` orders them.
+    for k in (2, 1, 0):
+        wp.launch(_gather_float64_kernel, n, inputs=[B.anchor_key[k], B.order], outputs=[B.keyf], device=device)
+        wp.utils.radix_sort_pairs(B.keyf, B.order, n)
+    wp.launch(_gather_int64_kernel, n, inputs=[B.pair_key, B.order], outputs=[B.key64], device=device)
+    wp.utils.radix_sort_pairs(B.key64, B.order, n)
+    wp.launch(
+        _rigid_contact_gather_kernel,
+        n,
+        inputs=[
+            B.order,
+            c.rigid_contact_shape0,
+            c.rigid_contact_shape1,
+            c.rigid_contact_point0,
+            c.rigid_contact_point1,
+            c.rigid_contact_offset0,
+            c.rigid_contact_offset1,
+            c.rigid_contact_normal,
+            model.shape_body,
+            body_slot,
+            model.body_com,
+            model.shape_material_mu,
+        ],
+        outputs=[B.body, B.anchor, B.normal, B.mu, B.table],
+        device=device,
+    )
+    table = host_head(B.table, 1 + 4 * n)
+    m = int(table[0])
+    if m == 0:
         return None
-    point = np.stack([contacts.rigid_contact_point0.numpy(), contacts.rigid_contact_point1.numpy()], axis=1)[keep]
-    offset = np.stack([contacts.rigid_contact_offset0.numpy(), contacts.rigid_contact_offset1.numpy()], axis=1)[keep]
-    shape, body, slot = shape[keep], body[keep], slot[keep]
-    com = np.where(body[..., None] >= 0, model.body_com.numpy()[np.maximum(body, 0)], 0.0)
-    anchor = point.astype(np.float64) + offset - com
-    normal = contacts.rigid_contact_normal.numpy()[keep]
-
-    order = np.lexsort((anchor[:, 0, 2], anchor[:, 0, 1], anchor[:, 0, 0], shape[:, 1], shape[:, 0]))
-    mu = model.shape_material_mu.numpy().astype(np.float64)[shape[order]].mean(axis=1)
+    rows = table[1:].reshape(n, 4)[:m]
     return RigidContacts(
-        slot=slot[order],
-        shape=shape[order],
-        body=wp.array(body[order], dtype=wp.int32, device=device),
-        anchor=wp.array(anchor[order], dtype=wp.vec3, device=device),
-        normal=wp.array(normal[order], dtype=wp.vec3, device=device),
-        mu=wp.array(mu, dtype=wp.float64, device=device),
+        slot=np.ascontiguousarray(rows[:, :2]),
+        shape=np.ascontiguousarray(rows[:, 2:]),
+        body=B.body[:m],
+        anchor=B.anchor[:m],
+        normal=B.normal[:m],
+        mu=B.mu[:m],
     )
 
 
