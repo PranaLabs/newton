@@ -69,6 +69,16 @@ class TestAddParticleRod(unittest.TestCase):
         np.testing.assert_allclose(model.particle_mass.numpy(), [0.025, 0.05, 0.05, 0.05, 0.025], rtol=1e-6)
         np.testing.assert_allclose(model.fba.rod_bend_stiffness.numpy(), 1.0e-5, rtol=1e-6)
 
+    def test_bending_stiffness_varies_along_the_rod(self):
+        """Give each interior vertex its own bending stiffness, and reject one of another count."""
+        builder = newton.ModelBuilder()
+        stiffness = [1.0e-4, 2.0e-4, 3.0e-2]
+        SolverFBA.add_particle_rod(builder, _line(4), 0.005, 1.0e8, density=1000.0, bending_stiffness=stiffness)
+        model = builder.finalize(device="cpu")
+        np.testing.assert_allclose(model.fba.rod_bend_stiffness.numpy(), stiffness, rtol=1e-6)
+        with self.assertRaisesRegex(ValueError, "one value per interior vertex"):
+            SolverFBA.add_particle_rod(builder, _line(4), 0.005, 1.0e8, density=1000.0, bending_stiffness=[1.0, 2.0])
+
     def test_invalid_rods_are_rejected(self):
         """Reject a rod of fewer than two points, repeated points, no or two mass inputs, or a bad radius."""
         builder = newton.ModelBuilder()
@@ -194,6 +204,26 @@ class TestSolverFBAParticleRods(unittest.TestCase):
         solver.set_pin_targets(targets)
         solver.step(s0, s1, None, None, 0.01)
         np.testing.assert_allclose(s1.particle_q.numpy()[:, 2] - z, -4.2e-3, atol=2.0e-5)
+
+    def test_rod_held_at_a_stiff_end_hangs_still(self):
+        """Hold a rod by the first six particles of a stiff end, a plug two hundred times as stiff in bending: it
+        hangs still, the held end's bends coupling nothing into the free springs' tensions."""
+        n = 30
+        builder = newton.ModelBuilder()
+        points = np.c_[np.zeros(n + 1), np.zeros(n + 1), np.linspace(1.0, 1.0 - 0.0073 * n, n + 1)]
+        bending = np.full(n - 1, 6.0e-3)
+        bending[:6] *= 200.0
+        rod = SolverFBA.add_particle_rod(builder, points, 0.00365, 1.5e8, density=1433.0, bending_stiffness=bending)
+        for i in rod[:6]:
+            builder.particle_mass[i] = 0.0
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=10)
+        s0, s1 = model.state(), model.state()
+        for _ in range(20):
+            solver.step(s0, s1, None, None, 0.01)
+            s0, s1 = s1, s0
+        np.testing.assert_allclose(s0.particle_q.numpy(), points, atol=1.0e-4)
+        self.assertLess(np.abs(s0.particle_qd.numpy()).max(), 1.0e-2)
 
     def test_hanging_rod_stays_straight_and_holds_its_weight(self):
         """Hang a rod from its pinned top particle: it stays straight down, each segment stretched by the weight

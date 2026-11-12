@@ -3062,7 +3062,7 @@ class SolverFBA(SolverBase):
         youngs_modulus: float,
         density: float | None = None,
         mass: float | None = None,
-        bending_stiffness: float | None = None,
+        bending_stiffness: float | ArrayLike | None = None,
     ) -> list[int]:
         """Add an elastic rod of circular cross-section along a polyline, as particles that SolverFBA simulates.
 
@@ -3090,7 +3090,8 @@ class SolverFBA(SolverBase):
             density: Density [kg/m³] of the rod's material, for the line density ``density pi r^2``. Give
                 exactly one of ``density`` and ``mass``.
             mass: Total mass [kg] of the rod, spread evenly over its length.
-            bending_stiffness: Bending stiffness ``EI`` [N·m²]; ``E pi r^4 / 4``, that of a solid circular
+            bending_stiffness: Bending stiffness ``EI`` [N·m²], for the whole rod or one per interior vertex,
+                shape ``(N - 2,)``, as a cable stiffens toward a plug; ``E pi r^4 / 4``, that of a solid circular
                 section, if ``None``. A rope takes one far below that.
 
         Returns:
@@ -3112,8 +3113,12 @@ class SolverFBA(SolverBase):
             raise ValueError("the rod's density or mass must be positive")
         if bending_stiffness is None:
             bending_stiffness = youngs_modulus * np.pi * radius**4 / 4.0
-        if bending_stiffness < 0.0:
+        bending = np.asarray(bending_stiffness, dtype=np.float64)
+        if bending.ndim not in (0, 1) or (bending.ndim == 1 and bending.shape != (points.shape[0] - 2,)):
+            raise ValueError("bending_stiffness must be a scalar or one value per interior vertex, shape (N - 2,)")
+        if (bending < 0.0).any():
             raise ValueError("bending_stiffness must not be negative")
+        bending = np.broadcast_to(bending, (max(points.shape[0] - 2, 0),))
         masses = 0.5 * line_density * (np.r_[segment, 0.0] + np.r_[0.0, segment])
         SolverFBA.register_custom_attributes(builder)
         particles = [
@@ -3127,7 +3132,7 @@ class SolverFBA(SolverBase):
             builder.add_custom_values(
                 **{
                     "fba:rod_bend_particles": tuple(particles[k - 1 : k + 2]),
-                    "fba:rod_bend_stiffness": float(bending_stiffness),
+                    "fba:rod_bend_stiffness": float(bending[k - 1]),
                 }
             )
         return particles
