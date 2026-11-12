@@ -74,6 +74,60 @@ class TestRowGroup(unittest.TestCase):
         np.testing.assert_array_equal(lam.numpy(), [2.0, 0.0, 3.0])
         np.testing.assert_array_equal(omega.numpy(), [0.6, 0.0, 0.7])
 
+    def test_rigid_contacts_continue_the_nearest(self):
+        """Start each rigid contact from the previous contact of its shape pair whose anchors lie nearest to its own,
+        whatever the contacts' ranks: two contacts that share an anchor on one side keep their own rows, a pair that
+        loses a contact keeps its other contacts' rows, and a contact that slides keeps its rows. A pair's contact
+        that finds its nearest previous contact taken takes the pair's previous contact that no contact continues;
+        a contact left over after that starts from zero."""
+        e = np.eye(3)
+
+        def contacts(side0, side1):
+            anchor = np.stack([side0, side1], axis=1).astype(np.float32)
+            normal = np.tile([0.0, 0.0, 1.0], (len(side0), 1)).astype(np.float32)
+            return wp.array(anchor, dtype=wp.vec3), wp.array(normal, dtype=wp.vec3)
+
+        def pair_01(flip):
+            # Two contacts of pair (0, 1) at the same point of shape 0, 10 cm apart on shape 1.
+            y = np.array([0.05, -0.05])[::flip]
+            return np.tile([0.3, 0.0, 0.0], (2, 1)), np.stack([np.full(2, 0.3), y, np.zeros(2)], axis=1)
+
+        group = WS.RigidContactGroup("cpu")
+        # Pair (0, 1) as above, pair (0, 2) at x = 0, 0.1 and 0.2, pair (1, 2) once at x = 0.
+        shape = np.array([[0, 1], [0, 1], [0, 2], [0, 2], [0, 2], [1, 2]])
+        _begin(group, WS.rigid_contact_keys(shape, 3))
+        lam, omega = np.arange(1.0, 19.0), np.linspace(0.1, 1.8, 18)
+        x = np.array([0.0, 0.1, 0.2, 0.0])
+        a01, b01 = pair_01(1)
+        side0, side1 = np.r_[a01, np.outer(x, e[0])], np.r_[b01, np.outer(x + 5.0, e[0])]
+        tangents = _frames(np.tile(e[0], (6, 1)), np.tile(e[1], (6, 1)))
+        group.store(wp.array(lam), wp.array(omega), 0, tangents, *contacts(side0, side1))
+
+        # Pair (0, 1) lists its contacts the other way round. Pair (0, 2) loses its contact at x = 0, its contact at
+        # 0.2 turns into two, 3 and 6 mm away, and it gains one at 0.5. The contact of pair (1, 2) slides 2 cm along
+        # shape 2.
+        shape = np.array([[0, 1], [0, 1], [0, 2], [0, 2], [0, 2], [0, 2], [1, 2]])
+        _begin(group, WS.rigid_contact_keys(shape, 3))
+        x = np.array([0.1001, 0.197, 0.206, 0.5, 0.0])
+        a01, b01 = pair_01(-1)
+        side0, side1 = np.r_[a01, np.outer(x, e[0])], np.r_[b01, np.outer(x + 5.0, e[0])]
+        side1[6, 0] += 0.02
+        out_lam, out_omega = wp.zeros(24, dtype=wp.float64), wp.zeros(24, dtype=wp.float64)
+        tangents = _frames(np.tile(e[0], (7, 1)), np.tile(e[1], (7, 1)))
+        group.restore(out_lam, out_omega, 3, tangents, *contacts(side0, side1))
+
+        got, prev = out_lam.numpy()[3:].reshape(7, 3), lam.reshape(6, 3)
+        np.testing.assert_allclose(got[0], prev[1], rtol=1e-6)
+        np.testing.assert_allclose(got[1], prev[0], rtol=1e-6)
+        np.testing.assert_allclose(got[2], prev[3], rtol=1e-6)
+        np.testing.assert_allclose(got[3], prev[4], rtol=1e-6)
+        # The farther of the two contacts near 0.2 takes the rows of the contact the pair lost; the new one has none.
+        np.testing.assert_allclose(got[4], prev[2], rtol=1e-6)
+        np.testing.assert_allclose(got[5], 0.0)
+        np.testing.assert_allclose(got[6], prev[5], rtol=1e-6)
+        np.testing.assert_allclose(out_lam.numpy()[:3], 0.0)
+        np.testing.assert_allclose(out_omega.numpy()[3:].reshape(7, 3)[3], omega[12:15])
+
     def test_particle_contact_keys(self):
         """Key particle contacts by particle and shape; self contacts and contacts on several particles get none."""
         particle = wp.array([3, 3, 5, 7], dtype=wp.int32)
