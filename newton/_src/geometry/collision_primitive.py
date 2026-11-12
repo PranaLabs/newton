@@ -459,6 +459,125 @@ def collide_plane_box(
 
 
 @wp.func
+def collide_plane_convex(
+    # In:
+    plane_normal: wp.vec3,
+    plane_pos: wp.vec3,
+    mesh_id: wp.uint64,
+    convex_pos: wp.vec3,
+    convex_rot: wp.mat33,
+    convex_scale: wp.vec3,
+    margin: float = 0.0,
+) -> tuple[wp.vec4, wp.types.matrix((4, 3), wp.float32), wp.vec3]:
+    """Core contact geometry calculation for plane-convex-hull collision.
+
+    The deepest hull vertex within ``margin`` of the plane is a contact. The
+    other candidates are the vertices that penetrate the plane and those within
+    a hundredth of the hull's extent above the deepest one, so that a flat face
+    gives its corners and a curved side its lowest point, as a support face
+    would. Up to four candidates span the contact patch: the deepest, the
+    candidate farthest from it along the plane, and the two candidates farthest
+    on either side of the line through those two.
+
+    Args:
+      plane_normal: Normal vector of the plane
+      plane_pos: Position point on the plane
+      mesh_id: Warp mesh holding the hull vertices in the hull's frame
+      convex_pos: Origin of the hull's frame
+      convex_rot: Rotation matrix of the hull's frame
+      convex_scale: Scale applied to the hull vertices
+      margin: Contact margin for early contact generation (default: 0.0)
+
+    Returns:
+      Tuple containing:
+        contact_dist: Vector of contact distances (MAXVAL for unpopulated contacts)
+        contact_pos: Matrix of contact positions (one per row)
+        contact_normal: contact normal vector
+    """
+    points = wp.mesh_get(mesh_id).points
+    count = points.shape[0]
+    center_dist = wp.dot(convex_pos - plane_pos, plane_normal)
+
+    dist = wp.vec4(MAXVAL)
+    pos = _mat43f()
+
+    # The deepest vertex; ties keep the lowest index.
+    found = bool(False)
+    d0 = float(MAXVAL)
+    r0 = wp.vec3()
+    extent = float(0.0)
+    for i in range(count):
+        r = convex_rot @ wp.cw_mul(points[i], convex_scale)
+        extent = wp.max(extent, wp.length(r))
+        d = center_dist + wp.dot(plane_normal, r)
+        if d <= margin and d < d0:
+            found = True
+            d0 = d
+            r0 = r
+    if not found:
+        return dist, pos, plane_normal
+    dist[0] = d0
+    pos[0] = r0 + convex_pos - 0.5 * plane_normal * d0
+
+    # Separations below this length are rounding, not geometry.
+    eps = 1.0e-5 * extent
+    # The candidates: the penetrating vertices and those nearly as deep as the deepest.
+    limit = wp.min(margin, wp.max(d0 + 1.0e-2 * extent, 0.0))
+
+    # The candidate farthest from the deepest one along the plane.
+    found = bool(False)
+    d1 = float(0.0)
+    r1 = wp.vec3()
+    best = float(eps * eps)
+    for i in range(count):
+        r = convex_rot @ wp.cw_mul(points[i], convex_scale)
+        d = center_dist + wp.dot(plane_normal, r)
+        if d <= limit:
+            t = r - r0
+            t = t - wp.dot(t, plane_normal) * plane_normal
+            l2 = wp.dot(t, t)
+            if l2 > best:
+                found = True
+                d1 = d
+                r1 = r
+                best = l2
+    if not found:
+        return dist, pos, plane_normal
+    dist[1] = d1
+    pos[1] = r1 + convex_pos - 0.5 * plane_normal * d1
+
+    # The candidates farthest on either side of the line through both.
+    axis = wp.normalize(wp.cross(plane_normal, r1 - r0))
+    d2 = float(MAXVAL)
+    d3 = float(MAXVAL)
+    s2 = float(eps)
+    s3 = float(-eps)
+    r2 = wp.vec3()
+    r3 = wp.vec3()
+    for i in range(count):
+        r = convex_rot @ wp.cw_mul(points[i], convex_scale)
+        d = center_dist + wp.dot(plane_normal, r)
+        if d <= limit:
+            s = wp.dot(r - r0, axis)
+            if s > s2:
+                s2 = s
+                d2 = d
+                r2 = r
+            if s < s3:
+                s3 = s
+                d3 = d
+                r3 = r
+    if d2 < MAXVAL:
+        dist[2] = d2
+        pos[2] = r2 + convex_pos - 0.5 * plane_normal * d2
+    if d3 < MAXVAL:
+        dist[3] = d3
+        pos[3] = r3 + convex_pos - 0.5 * plane_normal * d3
+
+    return dist, pos, plane_normal
+
+
+@wp.func
 def collide_sphere_cylinder(
     # In:
     sphere_pos: wp.vec3,

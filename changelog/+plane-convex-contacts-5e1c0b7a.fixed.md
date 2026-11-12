@@ -1,0 +1,1 @@
+Fix float32 rounding of up to several micrometers in the contact depth of a convex hull (`GeoType.CONVEX_MESH`) on an infinite plane: the pair now uses an analytic vertex test, reporting up to four contacts that span the support patch, instead of GJK/MPR.

@@ -28,6 +28,7 @@ from ..geometry.collision_primitive import (
     _collide_plane_capsule_contacts,
     collide_capsule_capsule,
     collide_plane_box,
+    collide_plane_convex,
     collide_plane_cylinder,
     collide_plane_ellipsoid,
     collide_plane_sphere,
@@ -747,6 +748,9 @@ def create_narrow_phase_primitive_kernel(
             is_ellipsoid_b = type_b == GeoType.ELLIPSOID
             is_cylinder_b = type_b == GeoType.CYLINDER
             is_box_b = type_b == GeoType.BOX
+            use_plane_convex = (
+                is_infinite_plane_a and type_b == GeoType.CONVEX_MESH and shape_source[shape_b] != wp.uint64(0)
+            )
 
             use_plane_cylinder = is_plane_a and is_cylinder_b
             if use_plane_cylinder and scale_b[2] > 0.0:
@@ -823,6 +827,31 @@ def create_narrow_phase_primitive_kernel(
                 contact_pos_1 = wp.vec3(positions4_box[1, 0], positions4_box[1, 1], positions4_box[1, 2])
                 contact_pos_2 = wp.vec3(positions4_box[2, 0], positions4_box[2, 1], positions4_box[2, 2])
                 contact_pos_3 = wp.vec3(positions4_box[3, 0], positions4_box[3, 1], positions4_box[3, 2])
+
+            # -----------------------------------------------------------------
+            # Infinite-Plane-Convex-Hull collision (type_a=PLANE, type_b=CONVEX_MESH)
+            # Produces up to 4 contacts
+            # -----------------------------------------------------------------
+            elif use_plane_convex:
+                plane_normal = wp.quat_rotate(quat_a, wp.vec3(0.0, 0.0, 1.0))
+                dists4_cvx, positions4_cvx, contact_normal = collide_plane_convex(
+                    plane_normal,
+                    pos_a,
+                    shape_source[shape_b],
+                    pos_b,
+                    wp.quat_to_matrix(quat_b),
+                    scale_b,
+                    gap_sum + margin_offset_a + margin_offset_b,
+                )
+
+                contact_dist_0 = dists4_cvx[0]
+                contact_dist_1 = dists4_cvx[1]
+                contact_dist_2 = dists4_cvx[2]
+                contact_dist_3 = dists4_cvx[3]
+                contact_pos_0 = wp.vec3(positions4_cvx[0, 0], positions4_cvx[0, 1], positions4_cvx[0, 2])
+                contact_pos_1 = wp.vec3(positions4_cvx[1, 0], positions4_cvx[1, 1], positions4_cvx[1, 2])
+                contact_pos_2 = wp.vec3(positions4_cvx[2, 0], positions4_cvx[2, 1], positions4_cvx[2, 2])
+                contact_pos_3 = wp.vec3(positions4_cvx[3, 0], positions4_cvx[3, 1], positions4_cvx[3, 2])
 
             # -----------------------------------------------------------------
             # Sphere-Sphere collision (type_a=SPHERE=2, type_b=SPHERE=2)
@@ -1065,6 +1094,7 @@ def create_narrow_phase_primitive_kernel(
 
             if (
                 (is_plane_a and (is_sphere_b or is_capsule_b or is_ellipsoid_b or use_plane_cylinder or is_box_b))
+                or use_plane_convex
                 or (is_sphere_a and (is_sphere_b or is_capsule_b or (is_cylinder_b and scale_b[2] == 0.0) or is_box_b))
                 or (is_capsule_a and is_capsule_b)
             ):
