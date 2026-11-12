@@ -23,7 +23,7 @@ import numpy as np
 import warp as wp
 
 from ...sim import Contacts, Model
-from .kernels import host_head
+from .kernels import host_head, stored_contact_count
 from .rigid import slot_coefficients
 
 
@@ -71,7 +71,7 @@ def gather_rigid_contacts(model: Model, contacts: Contacts, body_slot: np.ndarra
     Returns:
         The contacts, or ``None`` if no contact touches an integrated body.
     """
-    n = int(contacts.rigid_contact_count.numpy()[0])
+    n = stored_contact_count(contacts.rigid_contact_count, contacts.rigid_contact_shape0.shape[0], "rigid")
     if n == 0:
         return None
     shape = np.stack([host_head(contacts.rigid_contact_shape0, n), host_head(contacts.rigid_contact_shape1, n)], axis=1)

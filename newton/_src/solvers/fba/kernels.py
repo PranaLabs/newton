@@ -3,6 +3,8 @@
 
 """Warp kernels for SolverFBA (projective-dynamics solver for cloth and tetrahedral soft bodies)."""
 
+import warnings
+
 import warp as wp
 
 # 3x2 matrix type: Warp has no ``wp.mat32``.
@@ -4461,6 +4463,29 @@ def compute_tangent_basis_kernel(
     t1_out[c] = t1
     t2_out[c] = t2
     is_spinning_out[c] = is_spin
+
+
+def stored_contact_count(count: wp.array, capacity: int, kind: str) -> int:
+    """The contacts that a collision pipeline stored in its buffers of ``capacity`` contacts.
+
+    The pipeline counts every contact it finds, also those its full buffers drop, so ``count`` can exceed
+    ``capacity``; a warning then reports the dropped contacts.
+
+    Args:
+        count: The pipeline's contact count, shape ``(1,)``.
+        capacity: The length of the pipeline's contact buffers.
+        kind: ``"rigid"`` or ``"soft"``, the contacts' kind.
+    """
+    n = int(count.numpy()[0])
+    if n > capacity:
+        warnings.warn(
+            f"SolverFBA: the collision pipeline found more {kind} contacts than its buffers hold and dropped the "
+            f"others; construct the CollisionPipeline with a larger {kind}_contact_max.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return capacity
+    return n
 
 
 def host_head(a: wp.array, n: int):

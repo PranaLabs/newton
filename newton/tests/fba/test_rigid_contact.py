@@ -90,6 +90,25 @@ class TestGatherRigidContacts(unittest.TestCase):
         model, _, contacts = _box_scene(self.device)
         self.assertIsNone(gather_rigid_contacts(model, contacts, np.full(model.body_count, -1), self.device))
 
+    def test_overflow_keeps_the_stored_contacts(self):
+        """Gather the contacts that a full contact buffer stored, warning that the collision pipeline dropped the
+        others it found: of two boxes on the ground, the four contacts of one fit."""
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        for x in (0.0, 3.0):
+            builder.add_shape_box(builder.add_body(xform=wp.transform((x, 0.0, 0.5), wp.quat_identity())))
+        model = builder.finalize(device=self.device)
+        state = model.state()
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=4, verify_buffers=False)
+        contacts = pipeline.contacts()
+        pipeline.collide(state, contacts)
+        self.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 8)
+        with self.assertWarns(RuntimeWarning):
+            rc = gather_rigid_contacts(model, contacts, _slots(model), self.device)
+        self.assertEqual(rc.count, 4)
+        body = rc.body.numpy()
+        self.assertEqual(np.unique(body[body >= 0]).size, 1)
+
 
 class TestRigidContactRows(unittest.TestCase):
     """Rows of a static-dynamic, a dynamic-dynamic and a dynamic-kinematic contact."""
