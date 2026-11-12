@@ -977,7 +977,13 @@ class SolverFBA(SolverBase):
         from .rigid_contact import gather_rigid_contacts, rigid_contact_jacobian_kernel  # noqa: PLC0415
 
         model, device = self.model, self._device
-        rc = None if contacts is None else gather_rigid_contacts(model, contacts, self._body_slot_h, device)
+        if getattr(self, "_rc_gather", None) is None:
+            from .rigid_contact import RigidContactGather  # noqa: PLC0415
+
+            self._rc_gather = RigidContactGather(device)
+        rc = None
+        if contacts is not None:
+            rc = gather_rigid_contacts(model, contacts, self._body_slot_d, device, self._rc_gather)
         self._rigid_contacts = rc
         m_s, m_r = 0, 0 if rc is None else rc.count
         slots = np.empty((0, 2), dtype=np.int32) if rc is None else rc.slot
