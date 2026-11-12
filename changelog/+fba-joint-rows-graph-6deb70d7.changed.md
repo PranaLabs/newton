@@ -1,0 +1,1 @@
+Speed up `SolverFBA` steps whose contacts touch articulations by keeping their joint rows in the padded rigid row storage, so that the CUDA graph of the NSN step replays from step to step, and by taking the joint rows' block preconditioner in the fused conjugate residual iterations.

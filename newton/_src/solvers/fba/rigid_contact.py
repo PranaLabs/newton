@@ -193,16 +193,26 @@ class RigidContactGather:
 
 class RigidRowStorage:
     """The NSN rows of the rigid contacts kept across steps, for a capacity of contacts that changes only when the
-    step's contacts outgrow it or would take less than half of it afresh.
+    step's contacts outgrow it or would take less than half of it afresh, followed by ``joint_rows`` rows for the
+    joint rows that join the contacts.
 
-    The rows past the step's contacts stay inert: no body slot, no entries of ``W``, and zero residual, anchor
-    projection, multipliers and friction, so that the NSN step of the capacity solves the step's rows alone and its
-    graph can replay from step to step.
+    The rows past the step's contacts, and past its joint rows, stay inert: no body slot, no entries of ``W``, and
+    zero residual, anchor projection, multipliers and friction, so that the NSN step of the capacity solves the
+    step's rows alone and its graph can replay from step to step. :attr:`joint_select` holds the step's joint rows in
+    the order of their NSN rows, -1 past them.
     """
 
-    def __init__(self, device):
+    def __init__(self, device, joint_rows: int = 0):
         self.device = device
         self.contacts = 0
+        self.joint_rows = joint_rows
+        self.joint_select = wp.full(max(joint_rows, 1), -1, dtype=wp.int32, device=device)
+
+    def select_joint_rows(self, rows: np.ndarray) -> None:
+        """Take the joint rows ``rows`` for the step's NSN rows that follow the contacts' capacity."""
+        select = np.full(self.joint_select.shape[0], -1, dtype=np.int32)
+        select[: len(rows)] = rows
+        self.joint_select.assign(select)
 
     def reserve(self, m: int) -> None:
         """Hold the rows of ``m`` contacts."""
@@ -212,7 +222,7 @@ class RigidRowStorage:
         contacts = 64 * ((m + m // 10 + 63) // 64)
         if m <= self.contacts and 2 * contacts >= self.contacts:
             return
-        n, d = 3 * contacts, self.device
+        n, d = 3 * contacts + self.joint_rows, self.device
         self.row_slot = wp.empty((n, 2), dtype=wp.int32, device=d)
         self.row_jac = wp.empty((n, 2), dtype=wp.spatial_vectord, device=d)
         self.pene0 = wp.zeros(n, dtype=wp.float64, device=d)
