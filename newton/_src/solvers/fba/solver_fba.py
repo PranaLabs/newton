@@ -2830,8 +2830,8 @@ class SolverFBA(SolverBase):
         # the duals from taking the previous step's splits.
         if self._spring_indices_d is not None:
             S = self._spring_indices_d.shape[0]
-            inputs = [self._x_cur, self._spring_indices_d, self._spring_split_d, self._spring_dir_d]
-            outputs = [self._spring_dual_d, self._spring_residual_d]
+            inputs = [self._x_cur, self._spring_indices_d, self._spring_rest_d, self._spring_split_d]
+            outputs = [self._spring_dual_d, self._spring_dir_d, self._spring_residual_d]
             wp.launch(self._k_spring_dual, S, [*inputs, self._spring_first_d], outputs, device=device)
             inputs = [self._spring_chain_offsets_d, self._spring_chain_order_d, self._spring_chain_diagonal_d]
             inputs += [self._spring_chain_link_d, self._spring_residual_d, self._spring_dir_d, self._spring_rho_d]
@@ -2839,8 +2839,8 @@ class SolverFBA(SolverBase):
             C = self._spring_chain_offsets_d.shape[0] - 1
             wp.launch(self._k_spring_chain, C, inputs, [self._spring_dual_d], device=device)
             inputs = [self._x_cur, self._spring_indices_d, self._spring_rest_d, self._spring_k_d, self._spring_rho_d]
-            inputs += [self._spring_c_d, self._spring_len0_d, self._spring_dual_d]
-            outputs = [self._spring_split_d, self._spring_dir_d, self._spring_contrib_d]
+            inputs += [self._spring_c_d, self._spring_len0_d, self._spring_dual_d, self._spring_dir_d]
+            outputs = [self._spring_split_d, self._spring_contrib_d]
             wp.launch(self._k_spring, S, inputs, outputs, device=device)
             wp.launch(self._k_clear_flag, 1, [self._spring_first_d], device=device)
             inputs = [self._spring_contrib_d, *self._particle_spring_csr_d]

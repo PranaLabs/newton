@@ -164,6 +164,26 @@ class TestSolverFBASprings(unittest.TestCase):
         np.testing.assert_allclose(s1.particle_q.numpy(), expected, atol=1.0e-6)
         self.assertGreater(np.abs(expected - x0).max(), 1.0e-3)
 
+    def test_compressed_chain_keeps_its_springs_upright(self):
+        """Throw a chain of 40 stiff springs up toward its pin at 4 m/s: holding it back takes duals that push harder
+        than the penalty times the springs' lengths, and each split stays along its spring, so 10 iterations reach
+        the implicit Euler step, where splits taken along the dual's side would turn springs over."""
+        n, seg, mass, ke, dt = 40, 0.05, 1.0e-3, 1.0e5, 0.01
+        model = _chain(n=n, seg=seg, mass=mass, ke=ke).finalize()
+        solver = SolverFBA(model, iterations=10)
+        s0, s1 = model.state(), model.state()
+        x0 = s0.particle_q.numpy().astype(np.float64)
+        v0 = np.zeros_like(x0)
+        v0[1:, 2] = 4.0
+        s0.particle_qd.assign(v0.astype(np.float32))
+        solver.step(s0, s1, None, None, dt)
+        masses = np.r_[0.0, np.full(n, mass)]
+        springs = np.stack([np.arange(n), np.arange(1, n + 1)], axis=1)
+        expected = _implicit_euler(
+            x0, v0, masses, springs, np.full(n, seg), np.full(n, ke), dt, solver.pin_stiffness, masses == 0.0
+        )
+        np.testing.assert_allclose(s1.particle_q.numpy(), expected, atol=1.0e-6)
+
     def test_sagging_rope_settles_without_jitter(self):
         """Hang a rope of 80 stiff springs between two pins, every spring at rest length on an arc that sags 13 cm:
         at 10 iterations per step it swings out and settles, with its springs stretched by the weight they hold,

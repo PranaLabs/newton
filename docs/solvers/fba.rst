@@ -211,7 +211,11 @@ Model Inputs
   ``spring_stiffness / 2 (|x_b - x_a| - spring_rest_length)^2``. Its local
   step is an ADMM step: a scaled dual, kept from step to step, corrects the
   prox of the energy, so the iterations converge to the implicit Euler step
-  of the springs and not to a softened one. The element weighs
+  of the springs and not to a softened one. The dual keeps its part along
+  the spring, a tension, and the prox acts along the spring at its signed
+  length with the dual, so a dual that pushes the particles apart harder
+  than the penalty times the spring's length shortens the target instead of
+  turning the spring over. The element weighs
   ``60 m / dt^2`` in the system matrix, ``m`` the mean mass of its two
   particles, which sets how fast the iterations converge, not where: springs
   far softer than it, whose oscillation the step resolves, converge slowly.

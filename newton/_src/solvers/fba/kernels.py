@@ -1730,34 +1730,47 @@ def project_pin_kernel(
 def update_spring_dual_kernel(
     x: wp.array[wp.vec3],
     springs: wp.array2d[wp.int32],
+    rest_length: wp.array[wp.float32],
     split: wp.array[wp.vec3],
-    direction: wp.array[wp.vec3],
     first: wp.array[wp.int32],
     # in-out state
     dual: wp.array[wp.vec3],
+    direction: wp.array[wp.vec3],
     # outputs
     residual: wp.array[wp.float32],
 ):
-    """Dual step of each spring ``(a, b)`` of :func:`project_spring_admm_kernel`, except in a step's first local
-    step (``first[0] != 0``): its scaled dual ``u`` takes the gap ``r = (x_b - x_a) - z`` of the latest global
-    solution to the previous split ``z``, and ``residual`` keeps the gap along the spring's last direction, the
-    stretch that :func:`spring_chain_tension_kernel` corrects the tensions for.
+    """Dual step of each spring ``(a, b)`` of :func:`project_spring_admm_kernel`: except in a step's first local
+    step (``first[0] != 0``), its scaled dual ``u`` takes the gap ``(x_b - x_a) - z`` of the latest global solution
+    to the previous split ``z``, and ``residual`` keeps the gap along the spring, the stretch that
+    :func:`spring_chain_tension_kernel` corrects the tensions for. The dual then keeps its part along the spring
+    alone, a tension, as a spring's force acts along it; in a step's first local step this turns the previous step's
+    tension to the spring's new direction. ``direction`` takes the spring's direction ``(x_b - x_a) / |x_b - x_a|``,
+    and keeps its last one where the spring is shorter than ``1e-9 l``.
 
     Args:
         x: Current positions [m] of the particles.
         springs: Particle pair ``(a, b)`` of each spring, shape ``[S, 2]``.
+        rest_length: Rest length ``l`` [m] of each spring.
         split: Split ``z`` [m] of each spring.
-        direction: Last direction of each spring's split.
         first: ``first[0]`` is nonzero in the first local step of a time step.
         dual: Scaled dual ``u`` [m] of each spring, kept across steps.
-        residual: Gap [m] along each spring's direction.
+        direction: Direction of each spring.
+        residual: Gap [m] along each spring.
     """
     e = wp.tid()
-    if first[0] != 0:
-        return
-    gap = x[springs[e, 1]] - x[springs[e, 0]] - split[e]
-    dual[e] = dual[e] + gap
-    residual[e] = wp.dot(gap, direction[e])
+    g = x[springs[e, 1]] - x[springs[e, 0]]
+    n = wp.length(g)
+    if wp.isfinite(n) and n > 1.0e-9 * rest_length[e]:
+        direction[e] = g / n
+    d = direction[e]
+    u = dual[e]
+    r = wp.float32(0.0)
+    if first[0] == 0:
+        gap = g - split[e]
+        u = u + gap
+        r = wp.dot(gap, d)
+    dual[e] = wp.dot(u, d) * d
+    residual[e] = r
 
 
 @wp.kernel
@@ -1796,7 +1809,7 @@ def spring_chain_tension_kernel(
         chain_link: ``h^2 w`` of the particle that a place's spring shares with the next, times the signs with which
             it enters the two, zero at a chain's end; ``B`` couples the two by it times the cosine of their angle.
         residual: Stretch ``r`` [m] of each spring from :func:`update_spring_dual_kernel`.
-        direction: Last direction ``t`` of each spring's split.
+        direction: Direction ``t`` of each spring.
         penalty: ADMM penalty ``rho`` [N/m] of each spring.
         first: ``first[0]`` is nonzero in the first local step of a time step.
         sweep_c: Scratch of the forward sweep, shape ``[S]``.
@@ -1841,25 +1854,24 @@ def project_spring_admm_kernel(
     damping: wp.array[wp.float32],
     start_length: wp.array[wp.float32],
     dual: wp.array[wp.vec3],
-    # in-out state
-    split: wp.array[wp.vec3],
     direction: wp.array[wp.vec3],
     # outputs
+    split: wp.array[wp.vec3],
     contrib: wp.array2d[wp.vec3],
 ):
     """ADMM local step of each spring ``(a, b)``, a stretch element of energy ``k/2 (|x_b - x_a| - l)^2``.
 
     The element enters the system matrix with its penalty ``rho`` as PD weight. After the dual steps of
     :func:`update_spring_dual_kernel` and :func:`spring_chain_tension_kernel`, its split is the prox of the spring's
-    energy at ``y = x_b - x_a + u``, with the viscous term ``c / 2 (|z| - r_0)^2`` of a damping ``c`` [N/m] on its
-    length ``r_0`` at the step's start,
+    energy along the spring's direction ``d`` at the signed length ``s = (x_b - x_a + u) . d``, with the viscous term
+    ``c / 2 (|z| - r_0)^2`` of a damping ``c`` [N/m] on its length ``r_0`` at the step's start,
 
-        z = (rho |y| + k l + c r_0) / (rho + k + c) y / |y|,
+        z = (rho s + k l + c r_0) / (rho + k + c) d,
 
     and the element's target ``z - u`` adds ``rho (z - u)`` to the right-hand side of ``b`` and its negative to
     ``a``'s. At a fixed point ``z = x_b - x_a`` and ``rho u`` is the spring force, so the iterations converge to the
-    implicit Euler step of the spring for any ``rho > 0``. A ``y`` of length at most ``1e-9 l`` keeps the
-    spring's last direction.
+    implicit Euler step of the spring for any ``rho > 0``. Along ``d``, a dual that pushes the particles apart harder
+    than ``rho |x_b - x_a|`` leaves a positive split, where the prox at ``x_b - x_a + u`` would turn the spring over.
 
     Args:
         x: Current positions [m] of the particles.
@@ -1870,25 +1882,22 @@ def project_spring_admm_kernel(
         damping: Damping ``c = beta k / dt`` [N/m] of each spring's length rate, zero for none.
         start_length: Length ``r_0`` [m] of each spring at the step's start.
         dual: Scaled dual ``u`` [m] of each spring.
+        direction: Direction ``d`` of each spring, from :func:`update_spring_dual_kernel`.
         split: Split ``z`` [m] of each spring.
-        direction: Last direction of ``y`` of each spring.
         contrib: Right-hand-side contribution to ``a`` and ``b`` of each spring, shape ``[S, 2]``.
     """
     e = wp.tid()
     a = springs[e, 0]
     b = springs[e, 1]
     u = dual[e]
-    y = x[b] - x[a] + u
-    n = wp.length(y)
-    l0 = rest_length[e]
-    if not wp.isfinite(n):
-        n = 0.0
-    elif n > 1.0e-9 * l0 and n > 0.0:
-        direction[e] = y / n
+    d = direction[e]
+    s = wp.dot(x[b] - x[a] + u, d)
+    if not wp.isfinite(s):
+        s = 0.0
     k = stiffness[e]
     rho = penalty[e]
     c = damping[e]
-    z = (rho * n + k * l0 + c * start_length[e]) / (rho + k + c) * direction[e]
+    z = (rho * s + k * rest_length[e] + c * start_length[e]) / (rho + k + c) * d
     split[e] = z
     p = rho * (z - u)
     contrib[e, 0] = -p
