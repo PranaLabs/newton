@@ -688,6 +688,14 @@ class TestCableExamples(NewtonTestCase):
 
 add_example_test(
     TestCableExamples,
+    name="cable.example_particle_rods_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 150},
+    use_viewer=True,
+)
+
+add_example_test(
+    TestCableExamples,
     name="cable.example_cable_twist",
     devices=test_devices,
     use_viewer=True,

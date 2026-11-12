@@ -303,6 +303,9 @@ are still in the package; `python -m newton.examples --list` lists them all.
       </a>
     </td>
     <td align="center" width="33%">
+      <a href="newton/examples/cable/example_particle_rods_fba.py">
+        <img width="320" src="docs/images/examples/example_particle_rods_fba.jpg" alt="Particle Rods FBA">
+      </a>
     </td>
     <td align="center" width="33%">
     </td>
@@ -313,6 +316,8 @@ are still in the package; `python -m newton.examples --list` lists them all.
       <sub>a soft bunny carried and swung by its ear tips</sub>
     </td>
     <td align="center" width="33%">
+      <code>python -m newton.examples particle_rods_fba</code><br>
+      <sub>ropes and a rod made of particles swing over a bar, sag and coil</sub>
     </td>
     <td align="center" width="33%">
     </td>

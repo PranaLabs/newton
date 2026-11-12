@@ -418,6 +418,9 @@ Examples
 - ``softbody_franka_fba``: a Franka arm integrated by
   :class:`~newton.solvers.SolverFeatherstone` picks up a soft ball.
 - ``cable_gripper_fba``: soft fingers curled by cables lift a box.
+- ``particle_rods_fba``: particle rods: three ropes of rising bending stiffness
+  swing down over a bar from a pinned end, a rod clamped in a block sags and
+  swings, and a coil of rope drops onto the ground.
 - ``cloth_dual_franka_fba``: two Franka arms integrated by
   :class:`~newton.solvers.SolverFeatherstone` pinch the corners of a square
   towel and fold it twice into a square, with light Rayleigh mass damping.
