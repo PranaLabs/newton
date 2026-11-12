@@ -165,6 +165,83 @@ def row_incidence(row_slot: np.ndarray, slot_count: int) -> tuple[np.ndarray, np
 
 
 @wp.kernel
+def _slot_entries_kernel(
+    row_slot: wp.array2d[wp.int32],
+    slot_count: int,
+    distinct: int,
+    # outputs
+    keys: wp.array[wp.int32],
+    values: wp.array[wp.int32],
+):
+    """Entry ``2 r + side`` of each row side keyed by its body slot, or by ``slot_count`` for a side without a slot
+    and, with ``distinct``, for a second side on the first side's slot."""
+    i = wp.tid()
+    r = i // 2
+    side = i - 2 * r
+    s = row_slot[r, side]
+    if s < 0 or (distinct != 0 and side == 1 and s == row_slot[r, 0]):
+        s = slot_count
+    keys[i] = s
+    values[i] = i
+
+
+@wp.kernel
+def _slot_starts_kernel(keys: wp.array[wp.int32], count: int, starts: wp.array[wp.int32]):
+    """The first of the ``count`` sorted entries whose slot is at least ``k``."""
+    k = wp.tid()
+    lo = int(0)
+    hi = count
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if keys[mid] < k:
+            lo = mid + 1
+        else:
+            hi = mid
+    starts[k] = lo
+
+
+@wp.kernel
+def _split_entries_kernel(
+    values: wp.array[wp.int32],
+    # outputs
+    entry_row: wp.array[wp.int32],
+    entry_side: wp.array[wp.int32],
+):
+    i = wp.tid()
+    row = values[i] // 2
+    entry_row[i] = row
+    entry_side[i] = values[i] - 2 * row
+
+
+def slot_entries(
+    row_slot: wp.array2d[wp.int32], rows: int, slot_count: int, distinct: bool = False
+) -> tuple[wp.array, wp.array, wp.array]:
+    """:func:`row_incidence` of the first ``rows`` rows of a device ``row_slot``, computed on its device.
+
+    The entries of slot ``k`` are ``start[k]:start[k + 1]``, ascending by row and then side, as
+    :func:`row_incidence` orders them; ``entry_row`` and ``entry_side`` hold ``2 * rows`` entries, of which those from
+    ``start[slot_count]`` on belong to no slot. With ``distinct``, a row enters each slot's entries once, as the
+    rows of a group do.
+    """
+    device = row_slot.device
+    start = wp.zeros(slot_count + 1, dtype=wp.int32, device=device)
+    count = 2 * rows
+    entry_row = wp.empty(max(count, 1), dtype=wp.int32, device=device)
+    entry_side = wp.empty(max(count, 1), dtype=wp.int32, device=device)
+    if count == 0:
+        return start, entry_row, entry_side
+    # radix_sort_pairs sorts in place in arrays twice the sorted length.
+    keys = wp.empty(2 * count, dtype=wp.int32, device=device)
+    values = wp.empty(2 * count, dtype=wp.int32, device=device)
+    inputs = [row_slot, slot_count, int(distinct)]
+    wp.launch(_slot_entries_kernel, count, inputs=inputs, outputs=[keys, values], device=device)
+    wp.utils.radix_sort_pairs(keys, values, count)
+    wp.launch(_slot_starts_kernel, slot_count + 1, inputs=[keys, count], outputs=[start], device=device)
+    wp.launch(_split_entries_kernel, count, inputs=[values], outputs=[entry_row, entry_side], device=device)
+    return start, entry_row, entry_side
+
+
+@wp.kernel
 def row_force_rhs_kernel(
     slot_entry_start: wp.array[wp.int32],
     entry_row: wp.array[wp.int32],

@@ -222,6 +222,34 @@ class TestFBARigidRows(unittest.TestCase):
         )
         np.testing.assert_allclose(b.numpy(), b_const + J.T @ force, rtol=1e-12)
 
+    def test_slot_entries_match_row_incidence(self):
+        """Index the rows of each body slot on the device as :func:`row_incidence` does on the host, and build the
+        pattern of rows that share a slot as :func:`group_pattern` does."""
+        from newton._src.solvers.fba.linear_solver import group_pattern, pattern_from_groups  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        rng = np.random.default_rng(7)
+        m = 9
+        row_slot = rng.integers(-1, m, size=(60, 2)).astype(np.int32)
+        row_slot[5] = (3, 3)
+        row_slot[6] = (-1, -1)
+        row_slot_d = wp.array(row_slot, dtype=wp.int32, device=device)
+        for rows in (0, 1, 37, 60):
+            start, entry_row, entry_side = (a.numpy() for a in rigid.slot_entries(row_slot_d, rows, m))
+            ref = rigid.row_incidence(row_slot[:rows], m)
+            entries = ref[1].shape[0]
+            np.testing.assert_array_equal(start, ref[0])
+            np.testing.assert_array_equal(entry_row[:entries], ref[1])
+            np.testing.assert_array_equal(entry_side[:entries], ref[2])
+
+        # A row on one slot from both sides enters the slot's group once.
+        start, rows, _ = rigid.slot_entries(row_slot_d, row_slot.shape[0], m, distinct=True)
+        offsets, columns, nnz = pattern_from_groups(row_slot_d, start, rows)
+        ref_offsets, ref_columns, ref_nnz = group_pattern(row_slot.astype(np.int64), device)
+        self.assertEqual(nnz, ref_nnz)
+        np.testing.assert_array_equal(offsets.numpy(), ref_offsets.numpy())
+        np.testing.assert_array_equal(columns.numpy()[:nnz], ref_columns.numpy()[:nnz])
+
     def test_row_residual_shifts_to_free_dofs(self):
         """Shift the rigid row residuals to the free-flight DOFs, ``r = -value + J (u - u_free)``."""
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
