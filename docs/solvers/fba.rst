@@ -421,6 +421,14 @@ Examples
 - ``particle_rods_fba``: particle rods: three ropes of rising bending stiffness
   swing down over a bar from a pinned end, a rod clamped in a block sags and
   swings, and a coil of rope drops onto the ground.
+- ``hemp_rope_fba``: a 3 m, 12 mm hemp rope lowered by a circling hand coils
+  onto the floor, its segments colliding as capsules.
+- ``desk_cables_fba``: an HDMI cable, a USB-C cable and a power cord at a
+  laptop, with stiff, heavier plugs; a hand carries the HDMI cable across the
+  desk over the USB-C cable.
+- ``elastic_cords_fba``: a bungee cord and an elastic cord stretch by a fifth
+  as their balls swing down from the level, beside a polyester rope that holds
+  its length.
 - ``cloth_dual_franka_fba``: two Franka arms integrated by
   :class:`~newton.solvers.SolverFeatherstone` pinch the corners of a square
   towel and fold it twice into a square, with light Rayleigh mass damping.

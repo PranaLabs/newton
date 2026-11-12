@@ -696,6 +696,31 @@ add_example_test(
 
 add_example_test(
     TestCableExamples,
+    name="cable.example_hemp_rope_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 360},
+    use_viewer=True,
+)
+
+add_example_test(
+    TestCableExamples,
+    name="cable.example_desk_cables_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 360},
+    use_viewer=True,
+)
+
+add_example_test(
+    TestCableExamples,
+    name="cable.example_elastic_cords_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 100},
+    use_viewer=True,
+)
+
+
+add_example_test(
+    TestCableExamples,
     name="cable.example_cable_twist",
     devices=test_devices,
     use_viewer=True,
