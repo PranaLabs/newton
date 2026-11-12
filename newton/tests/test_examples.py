@@ -1649,6 +1649,12 @@ add_contact_example_test(
     test_options={"num-frames": 150},
     use_viewer=True,
 )
+add_contact_example_test(
+    name="contacts.example_nonconvex_pile_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 150},
+    use_viewer=True,
+)
 
 
 class TestMultiphysicsExamples(NewtonTestCase):
