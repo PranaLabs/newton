@@ -1637,6 +1637,18 @@ add_contact_example_test(
     test_suffix="kamino",
     expect_output_regexes=[(_PYRAMID_BUILD_OUTPUT_RE, "stdout")],
 )
+add_contact_example_test(
+    name="contacts.example_convex_pile_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 150},
+    use_viewer=True,
+)
+add_contact_example_test(
+    name="contacts.example_convex_hulls_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 150},
+    use_viewer=True,
+)
 
 
 class TestMultiphysicsExamples(NewtonTestCase):
