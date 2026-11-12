@@ -105,7 +105,10 @@ def group_pattern(groups: np.ndarray, device) -> tuple[wp.array, wp.array, int]:
 
 
 def pattern_from_groups(
-    row_groups: wp.array2d[wp.int32], group_offsets: wp.array[wp.int32], group_rows: wp.array[wp.int32]
+    row_groups: wp.array2d[wp.int32],
+    group_offsets: wp.array[wp.int32],
+    group_rows: wp.array[wp.int32],
+    storage: CsrStorage | None = None,
 ) -> tuple[wp.array, wp.array, int]:
     """:func:`group_pattern` from device groups.
 
@@ -113,21 +116,31 @@ def pattern_from_groups(
         row_groups: Groups of each row, shape ``(n, G)``, ``-1`` where unused.
         group_offsets: Where each group's rows start in ``group_rows``, shape ``(groups + 1,)``.
         group_rows: The rows of each group, ascending and once each.
+        storage: A :class:`CsrStorage` of ``n`` rows to hold the pattern, whose matrices then take it.
 
     Returns:
-        ``(offsets, columns, nnz)`` as :func:`group_pattern` returns them.
+        ``(offsets, columns, nnz)`` as :func:`group_pattern` returns them, the storage's arrays with ``storage``.
     """
     from .kernels import group_pattern_kernel  # noqa: PLC0415
 
     n, device = row_groups.shape[0], row_groups.device
     inputs = [row_groups, group_offsets, group_rows]
     counts = wp.empty(n, dtype=wp.int32, device=device)
-    offsets = wp.zeros(n + 1, dtype=wp.int32, device=device)
+    if storage is None:
+        offsets = wp.zeros(n + 1, dtype=wp.int32, device=device)
+    else:
+        if storage.n != n:
+            raise ValueError(f"a storage of {storage.n} rows cannot hold a pattern of {n} rows")
+        offsets = storage.offsets
     columns = wp.empty(1, dtype=wp.int32, device=device)
     wp.launch(group_pattern_kernel, n, inputs=[*inputs, offsets, 0], outputs=[counts, columns], device=device)
     wp.utils.array_scan(counts, offsets[1:], inclusive=True)
     nnz = int(offsets[n : n + 1].numpy()[0])
-    columns = wp.empty(max(nnz, 1), dtype=wp.int32, device=device)
+    if storage is None:
+        columns = wp.empty(max(nnz, 1), dtype=wp.int32, device=device)
+    else:
+        storage.reserve(nnz)
+        columns = storage.columns
     wp.launch(group_pattern_kernel, n, inputs=[*inputs, offsets, 1], outputs=[counts, columns], device=device)
     return offsets, columns, nnz
 

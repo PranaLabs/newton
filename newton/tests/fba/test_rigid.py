@@ -223,6 +223,57 @@ class TestFBARigidRows(unittest.TestCase):
         )
         np.testing.assert_allclose(b.numpy(), b_const + J.T @ force, rtol=1e-12)
 
+    def test_sparse_delassus_matches_dense_algebra(self):
+        """Fill ``J M⁻¹ Jᵀ`` at the pattern of rows that share a body slot, built into a kept storage, a block of lanes
+        per row, as dense algebra has it; the pattern holds every entry that dense algebra does not find zero."""
+        from scipy.linalg import block_diag
+
+        from newton._src.solvers.fba.linear_solver import CsrStorage, pattern_from_groups  # noqa: PLC0415
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        rng = np.random.default_rng(5)
+        m, n = 9, 70
+        row_slot = rng.integers(-1, m, size=(n, 2)).astype(np.int32)
+        row_slot[row_slot[:, 0] == row_slot[:, 1], 1] = -1
+        row_slot[7] = (-1, -1)
+        row_jac = rng.standard_normal((n, 2, 6))
+        inv_mass = rng.standard_normal((m, 6, 6))
+        inv_mass = inv_mass @ inv_mass.transpose(0, 2, 1) + np.eye(6)
+        expected = (
+            _dense_jacobian(row_slot, row_jac, m) @ block_diag(*inv_mass) @ _dense_jacobian(row_slot, row_jac, m).T
+        )
+
+        row_slot_d = wp.array(row_slot, dtype=wp.int32, device=device)
+        row_jac_d = wp.array(row_jac, dtype=wp.spatial_vectord, device=device)
+        start, rows, _ = rigid.slot_entries(row_slot_d, n, m, distinct=True)
+        storage = CsrStorage(n, device)
+        offsets, columns, nnz = pattern_from_groups(row_slot_d, start, rows, storage)
+        self.assertIs(offsets, storage.offsets)
+        self.assertIs(columns, storage.columns)
+        minv_jac = wp.empty_like(row_jac_d)
+        inv_mass_d = wp.array(inv_mass, dtype=wp.spatial_matrixd, device=device)
+        wp.launch(
+            rigid.rigid_row_minv_jac_kernel, (n, 2), [row_slot_d, row_jac_d, inv_mass_d], [minv_jac], device=device
+        )
+        none = [wp.zeros(1, dtype=wp.int32, device=device)] * 2 + [wp.zeros(1, dtype=wp.float64, device=device)]
+        values = storage.matrices[0].values
+        wp.launch_tiled(
+            rigid.rigid_delassus_rows_kernel,
+            dim=n,
+            inputs=[offsets, columns, *none, 0, n, row_slot_d, row_jac_d, minv_jac],
+            outputs=[values],
+            block_dim=rigid.DELASSUS_LANES,
+            device=device,
+        )
+        offsets_h, columns_h, values_h = offsets.numpy(), columns.numpy()[:nnz], values.numpy()[:nnz]
+        W = np.zeros((n, n))
+        for i in range(n):
+            entries = slice(offsets_h[i], offsets_h[i + 1])
+            W[i, columns_h[entries]] = values_h[entries]
+        np.testing.assert_allclose(W, expected, rtol=1e-12, atol=1e-12)
+        self.assertEqual(int(offsets_h[n]), nnz)
+        self.assertFalse(np.any(W[7]) or np.any(W[:, 7]))
+
     def test_slot_entries_match_row_incidence(self):
         """Index the rows of each body slot on the device as :func:`row_incidence` does on the host, and build the
         pattern of rows that share a slot as :func:`group_pattern` does."""

@@ -1361,9 +1361,11 @@ class SolverFBA(SolverBase):
         from .rigid import slot_entries  # noqa: PLC0415
 
         if not n_s:
-            # Rows on bodies alone: the body slots are the groups, sorted on the device.
+            # Rows on bodies alone: the body slots are the groups, sorted on the device. Padded rows keep the pattern
+            # in their storage.
             start, rows, _ = slot_entries(self._rc_row_slot_d, n, self._rigid_bodies_d.shape[0], distinct=True)
-            return pattern_from_groups(self._rc_row_slot_d, start, rows)
+            storage = None if self._rc_padded is None else self._rc_padded.csr
+            return pattern_from_groups(self._rc_row_slot_d, start, rows, storage)
         slots = self._rc_row_slot_d.numpy()
         width = 0 if not n_s else self._linear_solver._row_groups.shape[1]
         groups = np.full((n, width + 2), -1, dtype=np.int64)
@@ -1382,21 +1384,39 @@ class SolverFBA(SolverBase):
         n, n_s, device = self._rc_n_pad, 3 * self._rc_counts[0], self._device
         if self.nsn_sparse_storage:
             from .linear_solver import csr_without_zeros  # noqa: PLC0415
-            from .rigid import rigid_delassus_csr_kernel  # noqa: PLC0415
+            from .rigid import DELASSUS_LANES, rigid_delassus_rows_kernel, rigid_row_minv_jac_kernel  # noqa: PLC0415
 
             offsets, columns, nnz = self._rc_W_pattern
-            values = wp.empty(max(nnz, 1), dtype=wp.float64, device=device)
+            # Padded rows, on bodies alone, take W at their pattern in their storage, its few zero entries
+            # included; the other rows drop the zero entries of their pattern.
+            padded = self._rc_padded
+            values = (
+                padded.csr.matrices[0].values
+                if padded is not None
+                else wp.empty(max(nnz, 1), dtype=wp.float64, device=device)
+            )
             soft = self._linear_solver.W_sparse[0] if n_s else None
             soft = (
                 [soft.offsets, soft.columns, soft.values] if n_s else [wp.zeros(1, dtype=wp.int32, device=device)] * 2
             )
             if not n_s:
                 soft.append(wp.empty(1, dtype=wp.float64, device=device))
-            inputs = [offsets, columns, *soft, n_s, n - self._rc_n_b]
-            inputs += [self._rc_row_slot_d, self._rc_row_jac_d, self._slot_inv_mass_d]
-            wp.launch(rigid_delassus_csr_kernel, nnz, inputs=inputs, outputs=[values], device=device)
-            storage = None if self._rc_padded is None else self._rc_padded.csr
-            self._rc_W_sparse = csr_without_zeros(offsets, columns, values, n, nnz, storage)
+            # Each row side's A⁻¹ Jᵀ once, then each row's entries by a block of lanes.
+            minv_jac = wp.empty_like(self._rc_row_jac_d)
+            inputs = [self._rc_row_slot_d, self._rc_row_jac_d, self._slot_inv_mass_d]
+            wp.launch(rigid_row_minv_jac_kernel, (n, 2), inputs=inputs, outputs=[minv_jac], device=device)
+            inputs = [offsets, columns, *soft, n_s, n - self._rc_n_b, self._rc_row_slot_d, self._rc_row_jac_d, minv_jac]
+            wp.launch_tiled(
+                rigid_delassus_rows_kernel,
+                dim=n,
+                inputs=inputs,
+                outputs=[values],
+                block_dim=DELASSUS_LANES,
+                device=device,
+            )
+            self._rc_W_sparse = (
+                padded.csr.matrices if padded is not None else csr_without_zeros(offsets, columns, values, n, nnz)
+            )
             return
         W_soft = self._linear_solver.W_device_view() if n_s else wp.empty((0, 0), dtype=wp.float64, device=device)
         wp.launch(
