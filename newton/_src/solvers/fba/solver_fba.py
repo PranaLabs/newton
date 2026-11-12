@@ -833,12 +833,8 @@ class SolverFBA(SolverBase):
 
     def _setup_rigid_system(self, dt: float) -> None:
         """Factor the rigid block for the dynamic bodies this solver integrates."""
-        from .linear_solver import (  # noqa: PLC0415
-            FBALinearSolver,
-            build_rigid_system,
-            factorize_and_sparse_inverse,
-            rigid_block_inverses,
-        )
+        from .linear_solver import build_rigid_system, rigid_block_inverses  # noqa: PLC0415
+        from .rigid import RigidBlockSolver  # noqa: PLC0415
 
         self._rigid_dt = dt
         if self._warm_start is not None:
@@ -853,18 +849,12 @@ class SolverFBA(SolverBase):
         if bodies.size == 0:
             return
         A = build_rigid_system(model, bodies, dt)
-        # The blocks do not couple: placing each body's DOFs at its slot along a line makes the dissection
-        # split between bodies with empty separators.
-        slots = np.stack([np.repeat(np.arange(bodies.size), 6), np.zeros(6 * bodies.size), np.zeros(6 * bodies.size)])
-        # Several worlds factor one world at a time.
-        worlds = np.repeat(self._body_world_h[bodies], 6) if model.world_count > 1 else None
-        self._rigid_linear_solver = FBALinearSolver(
-            factorize_and_sparse_inverse(A, slots.T, worlds), device=self._device
-        )
         m = bodies.size
         device = self._device
         self._rigid_bodies_d = wp.array(bodies, dtype=wp.int32, device=device)
         self._slot_inv_mass_d = wp.array(rigid_block_inverses(A), dtype=wp.spatial_matrixd, device=device)
+        # The blocks do not couple: each body's block inverse solves its DOFs.
+        self._rigid_linear_solver = RigidBlockSolver(self._slot_inv_mass_d)
         self._rigid_q_pin_d = wp.empty(m, dtype=wp.quatd, device=device)
         self._rigid_x_prev_d = wp.empty(m, dtype=wp.vec3d, device=device)
         self._rigid_b_d = wp.empty(6 * m, dtype=wp.float64, device=device)

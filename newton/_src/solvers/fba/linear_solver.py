@@ -431,8 +431,8 @@ def build_rigid_system(model: Model, bodies: np.ndarray, dt: float) -> CsrMatrix
     Body ``bodies[k]`` owns DOFs ``6k .. 6k+5``: the translation ``chi`` and the
     rotation vector ``rho``, both expressed in the body's pinned frame. Its block
     is ``diag(m·I₃, I) / dt²`` with ``I`` the inertia about the COM in the body
-    frame, so the matrix stays constant while the body rotates and is factored
-    once like the deformable block.
+    frame, so the matrix stays constant while the body rotates and is inverted
+    once, block by block.
 
     Args:
         model: The Newton model providing ``body_mass`` and ``body_inertia``.

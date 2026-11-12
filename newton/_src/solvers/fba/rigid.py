@@ -165,6 +165,36 @@ def row_incidence(row_slot: np.ndarray, slot_count: int) -> tuple[np.ndarray, np
 
 
 @wp.kernel
+def solve_rigid_blocks_kernel(
+    slot_inv_mass: wp.array[wp.spatial_matrixd],
+    b: wp.array[wp.float64],
+    # outputs
+    x: wp.array[wp.float64],
+):
+    """``x = A⁻¹ b`` for the block diagonal rigid system, one body slot per thread."""
+    k = wp.tid()
+    rhs = wp.spatial_vectord()
+    for c in range(6):
+        rhs[c] = b[6 * k + c]
+    out = slot_inv_mass[k] * rhs
+    for c in range(6):
+        x[6 * k + c] = out[c]
+
+
+class RigidBlockSolver:
+    """Solves the rigid system of :func:`~.linear_solver.build_rigid_system`, whose bodies do not couple, with the
+    inverse of each body's 6x6 block."""
+
+    def __init__(self, slot_inv_mass: wp.array[wp.spatial_matrixd]):
+        self.slot_inv_mass = slot_inv_mass
+
+    def solve_scalar(self, b: wp.array[wp.float64], x: wp.array[wp.float64]) -> None:
+        """Compute ``x = A⁻¹ b``; ``x`` must not alias ``b``."""
+        inv = self.slot_inv_mass
+        wp.launch(solve_rigid_blocks_kernel, inv.shape[0], inputs=[inv, b], outputs=[x], device=inv.device)
+
+
+@wp.kernel
 def _slot_entries_kernel(
     row_slot: wp.array2d[wp.int32],
     slot_count: int,
