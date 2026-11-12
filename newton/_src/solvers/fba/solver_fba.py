@@ -973,7 +973,7 @@ class SolverFBA(SolverBase):
         other worlds keep the deformable NSN passes the rows of the touching worlds alone.
         """
         from .joints import select_rows_kernel  # noqa: PLC0415
-        from .rigid import row_incidence  # noqa: PLC0415
+        from .rigid import row_incidence, slot_entries  # noqa: PLC0415
         from .rigid_contact import gather_rigid_contacts, rigid_contact_jacobian_kernel  # noqa: PLC0415
 
         model, device = self.model, self._device
@@ -1065,8 +1065,11 @@ class SolverFBA(SolverBase):
         else:
             self._rc_W_d = wp.empty((n, n), dtype=wp.float64, device=device)
         self._compose_rigid_delassus()
-        incidence = row_incidence(np.repeat(slots, 3, axis=0), self._rigid_bodies_d.shape[0])
-        self._rc_incidence = [wp.array(a, dtype=wp.int32, device=device) for a in incidence]
+        if m_s:
+            incidence = row_incidence(np.repeat(slots, 3, axis=0), self._rigid_bodies_d.shape[0])
+            self._rc_incidence = [wp.array(a, dtype=wp.int32, device=device) for a in incidence]
+        else:
+            self._rc_incidence = list(slot_entries(self._rc_row_slot_d, n_c, self._rigid_bodies_d.shape[0]))
         self._rc_value_d = wp.empty(n, dtype=wp.float64, device=device)
         self._rc_r_d = wp.empty(n, dtype=wp.float64, device=device)
         self._rc_lam_d = wp.zeros(n, dtype=wp.float64, device=device)
@@ -1331,8 +1334,13 @@ class SolverFBA(SolverBase):
     def _two_way_pattern(self, n: int, n_s: int, soft_tail: int) -> tuple:
         """CSR pattern of the two-way ``W`` of ``nsn_sparse_storage``: rows couple where their deformable rows'
         particles share a component of the system, or where they share a body slot."""
-        from .linear_solver import group_pattern  # noqa: PLC0415
+        from .linear_solver import group_pattern, pattern_from_groups  # noqa: PLC0415
+        from .rigid import slot_entries  # noqa: PLC0415
 
+        if not n_s:
+            # Rows on bodies alone: the body slots are the groups, sorted on the device.
+            start, rows, _ = slot_entries(self._rc_row_slot_d, n, self._rigid_bodies_d.shape[0], distinct=True)
+            return pattern_from_groups(self._rc_row_slot_d, start, rows)
         slots = self._rc_row_slot_d.numpy()
         width = 0 if not n_s else self._linear_solver._row_groups.shape[1]
         groups = np.full((n, width + 2), -1, dtype=np.int64)

@@ -79,7 +79,7 @@ def group_pattern(groups: np.ndarray, device) -> tuple[wp.array, wp.array, int]:
     Returns:
         ``(offsets, columns, nnz)``: the row offsets, shape ``(n + 1,)``, and the columns, ascending in each row.
     """
-    from .kernels import _MAX_ROW_GROUPS, group_pattern_kernel  # noqa: PLC0415
+    from .kernels import _MAX_ROW_GROUPS  # noqa: PLC0415
 
     n = groups.shape[0]
     # Each row takes each of its groups once, so that no row repeats in a group's rows.
@@ -97,11 +97,30 @@ def group_pattern(groups: np.ndarray, device) -> tuple[wp.array, wp.array, int]:
     rows = np.broadcast_to(np.arange(n, dtype=np.int32)[:, None], groups.shape)[valid]
     order = np.lexsort((rows, dense))
     group_offsets = np.concatenate([[0], np.cumsum(np.bincount(dense, minlength=len(ids)))]).astype(np.int32)
-    inputs = [
+    return pattern_from_groups(
         wp.array(row_groups, dtype=wp.int32, device=device),
         wp.array(group_offsets, dtype=wp.int32, device=device),
-    ]
-    inputs.append(wp.array(rows[order], dtype=wp.int32, device=device))
+        wp.array(rows[order], dtype=wp.int32, device=device),
+    )
+
+
+def pattern_from_groups(
+    row_groups: wp.array2d[wp.int32], group_offsets: wp.array[wp.int32], group_rows: wp.array[wp.int32]
+) -> tuple[wp.array, wp.array, int]:
+    """:func:`group_pattern` from device groups.
+
+    Args:
+        row_groups: Groups of each row, shape ``(n, G)``, ``-1`` where unused.
+        group_offsets: Where each group's rows start in ``group_rows``, shape ``(groups + 1,)``.
+        group_rows: The rows of each group, ascending and once each.
+
+    Returns:
+        ``(offsets, columns, nnz)`` as :func:`group_pattern` returns them.
+    """
+    from .kernels import group_pattern_kernel  # noqa: PLC0415
+
+    n, device = row_groups.shape[0], row_groups.device
+    inputs = [row_groups, group_offsets, group_rows]
     counts = wp.empty(n, dtype=wp.int32, device=device)
     offsets = wp.zeros(n + 1, dtype=wp.int32, device=device)
     columns = wp.empty(1, dtype=wp.int32, device=device)
