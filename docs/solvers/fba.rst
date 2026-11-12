@@ -249,8 +249,10 @@ Model Inputs
   drags the rod along within 10 iterations. A 0.3 m rod of radius 5 mm
   clamped at one end sags under its weight to within 0.2% of the
   small-deflection sag of its discrete bending energy at ``E = 1e8`` Pa.
-  Rods carry no twist, and contacts act at their particles, so segments
-  longer than about twice the radius can pass thin shapes. These rods are
+  Rods carry no twist, and their contacts with shapes act at their
+  particles, so segments longer than about twice the radius can pass thin
+  shapes. With ``rod_contact=True`` the rods collide with each other and
+  with themselves as chains of capsules (see below). These rods are
   particles, unlike the rigid capsule chains of
   :meth:`~newton.ModelBuilder.add_rod`.
 - **Activations**: the control's ``tet_activations`` grow each tetrahedron
@@ -338,6 +340,20 @@ Contacts
   triangles of two groups keep the margin apart, and those of one group the
   group's margin from ``particle_self_contact_group_margins``, or do not
   collide.
+- ``rod_contact=True`` makes the model's springs, such as the segments of
+  particle rods, collide with each other as capsules whose radius runs
+  between their particles' radii. A particle takes a contact with each
+  segment whose capsule its sphere comes within ``rod_contact_gap`` of, two
+  particles take one where each is the closest point of every segment at the
+  other, and two segments take one on their four particles where their
+  closest points lie inside both and they are not nearly parallel. Each
+  contact keeps the sum of the radii at its points and acts along the
+  direction between them at the step's start, so a rod draped over another
+  sits a little higher at a vertex, where its capsules meet at an angle.
+  Particles within as many segments of each other along the springs as the
+  largest sum of two radii plus the gap spans at the shortest spring do not
+  collide, so that a straight rod never touches itself. The contacts are found
+  on the host each step and take ``model.particle_mu`` as friction.
 - ``friction_anchors=True`` keeps the point a contact presses on across steps,
   on the other layer for a self contact or on a static shape, so its friction
   rows pull back the slip that a step's solve leaves instead of letting it add
