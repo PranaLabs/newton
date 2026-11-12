@@ -429,6 +429,10 @@ Examples
 - ``elastic_cords_fba``: a bungee cord and an elastic cord stretch by a fifth
   as their balls swing down from the level, beside a polyester rope that holds
   its length.
+- ``rod_gripper_fba``: a rigid gripper picks up a rope by its middle and lays
+  it down elsewhere, holding it by the friction of its pads
+  (``--grasp friction``) or by particle constraint rows at the particles
+  between them (``--grasp pins``).
 - ``cloth_dual_franka_fba``: two Franka arms integrated by
   :class:`~newton.solvers.SolverFeatherstone` pinch the corners of a square
   towel and fold it twice into a square, with light Rayleigh mass damping.

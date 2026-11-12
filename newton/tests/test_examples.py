@@ -718,6 +718,22 @@ add_example_test(
     use_viewer=True,
 )
 
+add_example_test(
+    TestCableExamples,
+    name="cable.example_rod_gripper_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 350, "grasp": "friction"},
+    use_viewer=True,
+)
+
+add_example_test(
+    TestCableExamples,
+    name="cable.example_rod_gripper_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 350, "grasp": "pins"},
+    use_viewer=True,
+    test_suffix="pins",
+)
 
 add_example_test(
     TestCableExamples,
