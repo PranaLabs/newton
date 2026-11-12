@@ -213,9 +213,19 @@ Model Inputs
   prox of the energy, so the iterations converge to the implicit Euler step
   of the springs and not to a softened one. The element weighs
   ``60 m / dt^2`` in the system matrix, ``m`` the mean mass of its two
-  particles, which sets how fast the iterations converge, not where: the
-  fewer, the nearer the stiffness is to the penalty, so springs far softer
-  than it, whose oscillation the step resolves, converge slowly.
+  particles, which sets how fast the iterations converge, not where: springs
+  far softer than it, whose oscillation the step resolves, converge slowly.
+  Stiffer springs converge their own stretch at that rate, but a long chain
+  of them carries stretch waves that span many particles, and a dual that
+  lags its chain's swing makes a taut rope shake. After the dual steps, each
+  chain of springs, a path through particles of two springs, therefore
+  solves its tensions with the tridiagonal response of its stretches through
+  the particles' inverse masses, and the compliance that the dual steps
+  leave out: a rope of 80 springs between two pins settles at 10 iterations
+  as at 100, and one step of a chain of 40 springs a hundred times stiffer
+  than their penalty reaches the implicit Euler step in 10 iterations. Where
+  a chain meets more springs, the particle's inverse mass counts once for
+  each of them, which keeps the solve below the exact one.
   ``spring_damping`` and ``spring_control`` are not read.
 - **Activations**: the control's ``tet_activations`` grow each tetrahedron
   to ``1 - a`` times its rest volume, so a negative activation inflates it

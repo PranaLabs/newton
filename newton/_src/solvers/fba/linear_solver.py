@@ -15,6 +15,7 @@ Runtime (on the device):
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
 from typing import Any
 
@@ -265,7 +266,8 @@ def particle_masses(model: Model) -> tuple[np.ndarray, np.ndarray]:
 # iterations converge, not where they converge. The element's target also holds the spring's direction within an
 # iteration, so a penalty near the stiffness converges a chain's stretch fast but its swing slowly: half the stiffness
 # left a 1 m rope of 80 springs 25-50% of its length off its implicit Euler trajectory after 10 iterations, this
-# penalty 2-11%, at the price of up to 3% stretch at its release.
+# penalty 2-3%. It leaves the chain's stretch waves to the tension solve of the spring chains: released from the
+# horizontal, the rope stretches by 0.13% at 10 iterations as at 300, where the dual steps alone left 4.3%.
 SPRING_INERTIA_FACTOR = 60.0
 SPRING_BENDING_FACTOR = 0.1
 
@@ -287,6 +289,76 @@ def spring_penalties(
         with np.errstate(divide="ignore", invalid="ignore"):
             rho = rho + np.where(rest_length > 0.0, SPRING_BENDING_FACTOR * bending_stiffness / rest_length**3, 0.0)
     return np.where(rho > 0.0, rho, stiffness)
+
+
+def spring_chains(
+    indices: np.ndarray, particle_count: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """The springs as chains for their tension solve: paths whose inner particles join exactly two springs, cut at
+    particles that join one or more than two, and closed loops cut at one of their particles.
+
+    Args:
+        indices: Particle pair ``(a, b)`` of each spring, shape ``(S, 2)``.
+        particle_count: Number of particles.
+
+    Returns:
+        A tuple ``(offsets, order, link, sign, scale)``: the chains' starts in ``order``, shape ``(C + 1,)``; the
+        springs of each chain in their order along it, shape ``(S,)``; for each place in ``order``, the particle its
+        spring shares with the next spring of the chain, ``-1`` at a chain's end, shape ``(S,)``, and the product of
+        the signs with which that particle enters the two springs, ``+1`` as ``b`` and ``-1`` as ``a``, shape
+        ``(S,)``; and the factor of the inverse mass of each spring's particles ``a`` and ``b`` on the spring's
+        diagonal, shape ``(S, 2)``: 1 where the chain keeps the particle's couplings, the particle's number of
+        springs where it drops them, which bounds the dropped couplings.
+    """
+    indices = np.asarray(indices, dtype=np.int64).reshape(-1, 2)
+    S = indices.shape[0]
+    incident = [[] for _ in range(particle_count)]
+    for e, (a, b) in enumerate(indices.tolist()):
+        incident[a].append(e)
+        incident[b].append(e)
+    degree = np.array([len(i) for i in incident], dtype=np.int64)
+    visited = np.zeros(S, dtype=bool)
+    chains = []
+
+    def walk(e: int, p: int) -> list[int]:
+        """The chain from spring ``e``, entered at particle ``p``, through particles of two springs."""
+        chain = [e]
+        visited[e] = True
+        q = int(indices[e, 1] if indices[e, 0] == p else indices[e, 0])
+        while degree[q] == 2:
+            nxt = incident[q][0] if incident[q][0] != chain[-1] else incident[q][1]
+            if visited[nxt]:
+                break
+            chain.append(nxt)
+            visited[nxt] = True
+            q = int(indices[nxt, 1] if indices[nxt, 0] == q else indices[nxt, 0])
+        return chain
+
+    for p in range(particle_count):
+        if degree[p] != 2:
+            for e in incident[p]:
+                if not visited[e]:
+                    chains.append(walk(e, p))
+    for e in range(S):
+        if not visited[e]:
+            chains.append(walk(e, int(indices[e, 0])))
+    order = np.array([e for chain in chains for e in chain], dtype=np.int32).reshape(-1)
+    offsets = np.concatenate([[0], np.cumsum([len(c) for c in chains])]).astype(np.int32)
+    link = np.full(S, -1, dtype=np.int32)
+    sign = np.zeros(S, dtype=np.float64)
+    scale = degree[indices].astype(np.float64).reshape(-1, 2)
+    position = 0
+    for chain in chains:
+        for e, f in itertools.pairwise(chain):
+            shared = int(np.intersect1d(indices[e], indices[f])[0])
+            link[position] = shared
+            sign[position] = (1.0 if indices[e, 1] == shared else -1.0) * (1.0 if indices[f, 1] == shared else -1.0)
+            # The chain keeps the shared particle's coupling: its inverse mass counts once on both springs.
+            scale[e, 0 if indices[e, 0] == shared else 1] = 1.0
+            scale[f, 0 if indices[f, 0] == shared else 1] = 1.0
+            position += 1
+        position += 1
+    return offsets, order, link, sign, scale
 
 
 def build_pd_system(

@@ -817,6 +817,8 @@ class SolverFBA(SolverBase):
         self._k_gather = _K.gather_per_particle_kernel
         self._k_pin = _K.project_pin_kernel
         self._k_spring = _K.project_spring_admm_kernel
+        self._k_spring_dual = _K.update_spring_dual_kernel
+        self._k_spring_chain = _K.spring_chain_tension_kernel
         self._k_clear_flag = _K.clear_flag_kernel
         self._k_bending = _K.project_bending_kernel
         self._k_tri_arap = _K.project_stretching_arap_kernel
@@ -1809,8 +1811,9 @@ class SolverFBA(SolverBase):
     def _setup_springs(self, meta: dict, dt: float) -> None:
         """Upload the springs of :func:`~newton._src.solvers.fba.linear_solver.build_pd_system`'s ``meta`` and
         start their ADMM state: zero duals and splits, and the rest directions; with corotated damping, also each
-        spring's damping ``beta k / dt`` of its length rate."""
-        from .linear_solver import build_particle_element_csr  # noqa: PLC0415
+        spring's damping ``beta k / dt`` of its length rate; and the chains of the tension solve,
+        :func:`~newton._src.solvers.fba.kernels.spring_chain_tension_kernel`."""
+        from .linear_solver import build_particle_element_csr, particle_masses, spring_chains  # noqa: PLC0415
 
         springs = meta["spring_indices"]
         if springs.shape[0] == 0:
@@ -1837,6 +1840,25 @@ class SolverFBA(SolverBase):
         self._spring_contrib_d = wp.zeros((springs.shape[0], 2), dtype=wp.vec3, device=device)
         csr = build_particle_element_csr(springs, int(self.model.particle_count), 2)
         self._particle_spring_csr_d = tuple(wp.array(a, dtype=wp.int32, device=device) for a in csr)
+        # The tension solve: per place along each chain, the diagonal h^2 (w_a + w_b) + 1 / (k + c - rho) and the
+        # coupling h^2 w sign to the next spring; springs no stiffer than their penalty take no correction.
+        offsets, order, link, sign, scale = spring_chains(springs, int(self.model.particle_count))
+        _, inv_mass = particle_masses(self.model)
+        stiffness = meta["spring_stiffness"] + damping
+        excess = stiffness - meta["spring_penalty"]
+        compliance = np.where(excess > 1.0e-6 * stiffness, 1.0 / np.maximum(excess, 1.0e-30), 1.0e30)
+        h2 = dt * dt
+        diagonal = h2 * (inv_mass[springs] * scale).sum(axis=1) + compliance
+        coupling = np.where(link >= 0, h2 * inv_mass[np.maximum(link, 0)] * sign, 0.0)
+        self._spring_chain_offsets_d = wp.array(offsets, dtype=wp.int32, device=device)
+        self._spring_chain_order_d = wp.array(order, dtype=wp.int32, device=device)
+        self._spring_chain_diagonal_d = wp.array(diagonal[order].astype(np.float32), dtype=wp.float32, device=device)
+        self._spring_chain_link_d = wp.array(coupling.astype(np.float32), dtype=wp.float32, device=device)
+        self._spring_residual_d = wp.zeros(springs.shape[0], dtype=wp.float32, device=device)
+        self._spring_sweep_d = (
+            wp.zeros(springs.shape[0], dtype=wp.float32, device=device),
+            wp.zeros(springs.shape[0], dtype=wp.float32, device=device),
+        )
 
     def _setup_pd_system(self, dt: float) -> None:
         """Build / rebuild the PD Hessian, factor it, and upload device data."""
@@ -2803,13 +2825,22 @@ class SolverFBA(SolverBase):
                 outputs=[self._rhs],
                 device=device,
             )
-        # Spring stretching projection, ADMM: deterministic (compute -> gather) scatter. The first local step of a
-        # time step clears the flag that keeps the duals from taking the previous step's splits.
+        # Spring stretching projection, ADMM: the dual steps, the chains' tension solve, then the prox, a
+        # deterministic (compute -> gather) scatter. The first local step of a time step clears the flag that keeps
+        # the duals from taking the previous step's splits.
         if self._spring_indices_d is not None:
             S = self._spring_indices_d.shape[0]
+            inputs = [self._x_cur, self._spring_indices_d, self._spring_split_d, self._spring_dir_d]
+            outputs = [self._spring_dual_d, self._spring_residual_d]
+            wp.launch(self._k_spring_dual, S, [*inputs, self._spring_first_d], outputs, device=device)
+            inputs = [self._spring_chain_offsets_d, self._spring_chain_order_d, self._spring_chain_diagonal_d]
+            inputs += [self._spring_chain_link_d, self._spring_residual_d, self._spring_dir_d, self._spring_rho_d]
+            inputs += [self._spring_first_d, *self._spring_sweep_d]
+            C = self._spring_chain_offsets_d.shape[0] - 1
+            wp.launch(self._k_spring_chain, C, inputs, [self._spring_dual_d], device=device)
             inputs = [self._x_cur, self._spring_indices_d, self._spring_rest_d, self._spring_k_d, self._spring_rho_d]
-            inputs += [self._spring_c_d, self._spring_len0_d, self._spring_first_d]
-            outputs = [self._spring_dual_d, self._spring_split_d, self._spring_dir_d, self._spring_contrib_d]
+            inputs += [self._spring_c_d, self._spring_len0_d, self._spring_dual_d]
+            outputs = [self._spring_split_d, self._spring_dir_d, self._spring_contrib_d]
             wp.launch(self._k_spring, S, inputs, outputs, device=device)
             wp.launch(self._k_clear_flag, 1, [self._spring_first_d], device=device)
             inputs = [self._spring_contrib_d, *self._particle_spring_csr_d]

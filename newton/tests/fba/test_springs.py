@@ -3,6 +3,7 @@
 
 """Tests for the springs of SolverFBA, ADMM stretch elements of the PD system."""
 
+import itertools
 import unittest
 
 import numpy as np
@@ -142,6 +143,63 @@ class TestSolverFBASprings(unittest.TestCase):
         np.testing.assert_allclose(s1.particle_q.numpy(), expected, atol=1.0e-6)
         self.assertGreater(np.abs(expected - x0).max(), 5.0e-3)
 
+    def test_stiff_chain_converges_in_few_iterations(self):
+        """Step a chain of 40 springs, a hundred times stiffer than their penalty, thrown down faster toward its free
+        end: the chains' tension solve takes the step to the implicit Euler step in 10 iterations, where the dual
+        steps alone leave stretch waves of several times the step."""
+        n, seg, mass, ke, dt = 40, 0.025, 1.0e-3, 1.0e5, 0.01
+        model = _chain(n=n, seg=seg, mass=mass, ke=ke).finalize()
+        solver = SolverFBA(model, iterations=10)
+        s0, s1 = model.state(), model.state()
+        x0 = s0.particle_q.numpy().astype(np.float64)
+        v0 = np.zeros_like(x0)
+        v0[1:, 2] = np.linspace(0.0, -3.0, n)
+        s0.particle_qd.assign(v0.astype(np.float32))
+        solver.step(s0, s1, None, None, dt)
+        masses = np.r_[0.0, np.full(n, mass)]
+        springs = np.stack([np.arange(n), np.arange(1, n + 1)], axis=1)
+        expected = _implicit_euler(
+            x0, v0, masses, springs, np.full(n, seg), np.full(n, ke), dt, solver.pin_stiffness, masses == 0.0
+        )
+        np.testing.assert_allclose(s1.particle_q.numpy(), expected, atol=1.0e-6)
+        self.assertGreater(np.abs(expected - x0).max(), 1.0e-3)
+
+    def test_sagging_rope_settles_without_jitter(self):
+        """Hang a rope of 80 stiff springs between two pins, every spring at rest length on an arc that sags 13 cm:
+        at 10 iterations per step it swings out and settles, with its springs stretched by the weight they hold,
+        as at 100 iterations; without the chains' tension solve its tension lags its swing and keeps it shaking at
+        0.7 m/s with ten times the stretch."""
+        n, length, span = 80, 1.0, 0.95
+        half = 0.55191  # sin(half) / half = span / length
+        radius = length / (2.0 * half)
+        angle = np.linspace(-half, half, n + 1)
+        sag = radius * (np.cos(angle) - np.cos(half))
+        points = np.c_[0.5 * span + radius * np.sin(angle), 0.1 * sag, 1.0 - sag]
+        seg = np.linalg.norm(np.diff(points, axis=0), axis=1)
+        mass = 0.5 * 5.5e-2 * (np.r_[seg, 0.0] + np.r_[0.0, seg])
+        mass[[0, -1]] = 0.0
+        results = []
+        for iterations in (10, 100):
+            builder = newton.ModelBuilder()
+            for p, m in zip(points, mass, strict=True):
+                builder.add_particle(pos=tuple(p), vel=(0.0, 0.0, 0.0), mass=float(m), radius=0.0)
+            for i, length_i in enumerate(seg):
+                builder.add_spring(i, i + 1, ke=float(1.0e3 / length_i), kd=0.0, control=0.0)
+            model = builder.finalize()
+            solver = SolverFBA(model, iterations=iterations, rayleigh_alpha=2.0)
+            s0, s1 = model.state(), model.state()
+            speeds = []
+            for _ in range(300):
+                solver.step(s0, s1, None, None, 0.01)
+                s0, s1 = s1, s0
+                speeds.append(np.linalg.norm(s0.particle_qd.numpy(), axis=1).max())
+            x = s0.particle_q.numpy().astype(np.float64)
+            results.append((np.max(speeds[-50:]), np.linalg.norm(np.diff(x, axis=0), axis=1) / seg - 1.0))
+        (speed, strain), (converged_speed, converged) = results
+        self.assertLess(speed, 0.01)
+        np.testing.assert_allclose(speed, converged_speed, rtol=0.1)
+        np.testing.assert_allclose(strain, converged, atol=2.0e-5)
+
     def test_reset_clears_the_selected_worlds_duals(self):
         """Keep the springs' duals across steps, clear them in the worlds a reset selects, and in all with none."""
         builder = newton.ModelBuilder()
@@ -229,6 +287,23 @@ class TestSolverFBASprings(unittest.TestCase):
             damping=np.full(n, beta * ke / dt),
         )
         np.testing.assert_allclose(s1.particle_q.numpy(), expected, atol=1.0e-6)
+
+    def test_spring_chains_follow_paths_and_bound_junctions(self):
+        """Split the springs into chains along paths of particles with two springs: a rod, a Y junction cut into its
+        three springs, a loop cut at one particle, two springs that meet head to head; a chain keeps the couplings
+        of its inner particles, with the signs of the two springs' ends, and a particle whose couplings it drops
+        weighs its inverse mass by its number of springs."""
+        from newton._src.solvers.fba.linear_solver import spring_chains  # noqa: PLC0415
+
+        indices = [[0, 1], [1, 2], [2, 3], [4, 5], [5, 6], [7, 5], [8, 9], [9, 10], [10, 8], [11, 12], [13, 12]]
+        offsets, order, link, sign, scale = spring_chains(np.array(indices), 14)
+        chains = [order[a:b].tolist() for a, b in itertools.pairwise(offsets)]
+        self.assertEqual(chains, [[0, 1, 2], [3], [4], [5], [9, 10], [6, 7, 8]])
+        np.testing.assert_array_equal(link, [1, 2, -1, -1, -1, -1, 12, -1, 9, 10, -1])
+        np.testing.assert_array_equal(sign, [-1, -1, 0, 0, 0, 0, 1, 0, -1, -1, 0])
+        np.testing.assert_array_equal(scale[[3, 4, 5]], [[1, 3], [3, 1], [1, 3]])
+        np.testing.assert_array_equal(scale[[6, 8]], [[2, 1], [1, 2]])
+        np.testing.assert_array_equal(scale[[0, 1, 2, 7, 9, 10]], 1.0)
 
     def test_springs_across_worlds_are_rejected(self):
         """Reject a spring that joins particles of different worlds."""
