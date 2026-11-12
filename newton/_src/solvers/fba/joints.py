@@ -315,9 +315,11 @@ def block_gather_kernel(
     # outputs
     rhs: wp.array2d[wp.float64],
 ):
-    """``rhs[block, local] = v[offset + k]`` for joint row ``rows[k]``."""
+    """``rhs[block, local] = v[offset + k]`` for joint row ``rows[k]``, none where ``rows[k]`` is -1."""
     k = wp.tid()
-    rhs[row_block[rows[k]], row_local[rows[k]]] = v[offset + k]
+    row = rows[k]
+    if row >= 0:
+        rhs[row_block[row], row_local[row]] = v[offset + k]
 
 
 @wp.kernel
@@ -330,9 +332,11 @@ def block_scatter_kernel(
     # outputs
     out: wp.array[wp.float64],
 ):
-    """``out[offset + k] = x[block, local]`` for joint row ``rows[k]``."""
+    """``out[offset + k] = x[block, local]`` for joint row ``rows[k]``, none where ``rows[k]`` is -1."""
     k = wp.tid()
-    out[offset + k] = x[row_block[rows[k]], row_local[rows[k]]]
+    row = rows[k]
+    if row >= 0:
+        out[offset + k] = x[row_block[row], row_local[row]]
 
 
 _TILE_KERNELS = {}
@@ -434,7 +438,8 @@ class BilateralSystem:
     def solve_rows(self, rows: wp.array[wp.int32], offset: int, v: wp.array, out: wp.array) -> None:
         """Block solve ``out = W⁻¹ v`` on joint rows ``rows`` placed at ``offset + k`` in both vectors.
 
-        ``rows`` must cover whole blocks; the factor comes from :meth:`factor`.
+        ``rows`` must cover whole blocks; entries of -1 take no part, and their rows of ``out`` stay as they were.
+        The factor comes from :meth:`factor`.
         """
         wp.launch(
             block_gather_kernel,
@@ -494,9 +499,12 @@ def gather_values_kernel(
     # outputs
     dst: wp.array[wp.float64],
 ):
-    """``dst[offset + k] = src[index[k]]``."""
+    """``dst[offset + k] = src[index[k]]``, zero where ``index[k]`` is -1."""
     k = wp.tid()
-    dst[offset + k] = src[index[k]]
+    value = wp.float64(0.0)
+    if index[k] >= 0:
+        value = src[index[k]]
+    dst[offset + k] = value
 
 
 @wp.kernel
@@ -531,6 +539,7 @@ def scatter_values_kernel(
     # outputs
     dst: wp.array[wp.float64],
 ):
-    """``dst[index[k]] = src[offset + k]``."""
+    """``dst[index[k]] = src[offset + k]``, none where ``index[k]`` is -1."""
     k = wp.tid()
-    dst[index[k]] = src[offset + k]
+    if index[k] >= 0:
+        dst[index[k]] = src[offset + k]

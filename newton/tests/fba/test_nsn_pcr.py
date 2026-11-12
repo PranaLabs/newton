@@ -289,6 +289,39 @@ class TestPCRFusedSparse(_PCRTestCase):
         (_, _), (x, _) = self._both(A, np.zeros(600), max_iter=10)
         np.testing.assert_array_equal(x, 0.0)
 
+    def test_fused_iterations_take_the_block_preconditioner(self):
+        """Take the ten iterations with an exact block preconditioner on the trailing rows, as joint rows have, as
+        ``solve_sparse`` does, to rounding."""
+        import warp.sparse as wps  # noqa: PLC0415
+
+        n, m = 600, 30
+        A = self._sparse_spd(n, seed=8)
+        b = np.random.default_rng(9).standard_normal(n)
+        block_inv = wp.array(np.linalg.inv(A[n - m :, n - m :]), dtype=wp.float64, device=self.device)
+
+        @wp.kernel
+        def apply_block(inv: wp.array2d[wp.float64], v: wp.array[wp.float64], offset: int, out: wp.array[wp.float64]):
+            i = wp.tid()
+            acc = wp.float64(0.0)
+            for j in range(inv.shape[1]):
+                acc += inv[i, j] * v[offset + j]
+            out[offset + i] = acc
+
+        def block_precond(v, out):
+            wp.launch(apply_block, m, inputs=[block_inv, v, n - m], outputs=[out], device=self.device)
+
+        rows, cols = np.nonzero(A)
+        arrays = [wp.array(a, dtype=wp.int32, device=self.device) for a in (rows, cols)]
+        W = wps.bsr_from_triplets(n, n, *arrays, wp.array(A[rows, cols], dtype=wp.float64, device=self.device))
+        out = []
+        for name in ("solve_sparse", "solve_sparse_fused"):
+            solver = NSNPCRSolver(max_n=n, device=self.device, tol=1.0e-10, max_iter=10)
+            x = wp.zeros(n, dtype=wp.float64, device=self.device)
+            rhs = wp.array(b, dtype=wp.float64, device=self.device)
+            self.assertEqual(getattr(solver, name)(W, rhs, x, block_precond=block_precond), 10)
+            out.append(x.numpy())
+        np.testing.assert_allclose(out[1], out[0], rtol=1.0e-12, atol=1.0e-14 * np.abs(out[0]).max())
+
     def test_checked_runs_take_solve_sparse(self):
         """Run ``solve_sparse`` itself when the iteration cap exceeds its convergence check interval."""
         A = self._sparse_spd(300, seed=6)

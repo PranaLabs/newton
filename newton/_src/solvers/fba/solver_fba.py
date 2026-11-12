@@ -999,26 +999,35 @@ class SolverFBA(SolverBase):
         if self._joint_rows is not None:
             blocks = self._slot_block[slots[slots >= 0]]
             joint_rows = np.flatnonzero(np.isin(self._joint_row_block, blocks[blocks >= 0])).astype(np.int32)
-        self._rc_joint_rows_d = wp.array(joint_rows, dtype=wp.int32, device=device)
         self._rc_joint_rows_h = joint_rows
         # Particle constraint rows follow the joint rows when the deformable rows join this solve.
         n_b = self._rc_n_b = 0 if self._constraint_rows is None or not m_s else self._constraint_rows[0].shape[0]
         n_s, n_c = 3 * m_s, 3 * m_r
         n = self._rc_n = n_s + n_c + joint_rows.size + n_b
-        # Rows of rigid contacts alone keep their storage across steps, padded to its capacity with inert rows, so
-        # that the NSN step's graph replays from step to step.
+        # Rows of rigid contacts and joint rows keep their storage across steps, the contacts padded to their
+        # capacity with inert rows and the joint rows to all joint rows, so that the NSN step's graph replays from
+        # step to step.
         storage = None
-        if self.nsn_sparse_storage and not m_s and not joint_rows.size and model.world_count == 1:
+        if self.nsn_sparse_storage and not m_s and model.world_count == 1:
             if wp.get_device(device).is_cuda:
                 from .rigid_contact import RigidRowStorage  # noqa: PLC0415
 
-                if getattr(self, "_rc_storage", None) is None:
-                    self._rc_storage = RigidRowStorage(device)
+                R = 0 if self._joint_rows is None else int(self._joint_rows.block_start[-1])
+                if getattr(self, "_rc_storage", None) is None or self._rc_storage.joint_rows != R:
+                    self._rc_storage = RigidRowStorage(device, R)
                 storage = self._rc_storage
                 storage.reserve(m_r)
                 storage.begin()
+                if R:
+                    storage.select_joint_rows(joint_rows)
         self._rc_padded = storage
-        self._rc_n_pad = n if storage is None else 3 * storage.contacts
+        if storage is None:
+            self._rc_joint_rows_d = wp.array(joint_rows, dtype=wp.int32, device=device)
+            self._rc_joint_offset, self._rc_n_pad = n_s + n_c, n
+        else:
+            self._rc_joint_rows_d = storage.joint_select
+            self._rc_joint_offset = 3 * storage.contacts
+            self._rc_n_pad = 3 * storage.contacts + storage.joint_rows
         if storage is None:
             self._rc_row_slot_d = wp.full((n, 2), -1, dtype=wp.int32, device=device)
             self._rc_row_jac_d = wp.zeros((n, 2), dtype=wp.spatial_vectord, device=device)
@@ -1065,7 +1074,7 @@ class SolverFBA(SolverBase):
             wp.launch(
                 select_rows_kernel,
                 dim=joint_rows.size,
-                inputs=[self._rc_joint_rows_d, self._joint_row_slot_d, self._joint_row_jac_d, n_s + n_c],
+                inputs=[self._rc_joint_rows_d, self._joint_row_slot_d, self._joint_row_jac_d, self._rc_joint_offset],
                 outputs=[self._rc_row_slot_d, self._rc_row_jac_d],
                 device=device,
             )
@@ -1265,7 +1274,7 @@ class SolverFBA(SolverBase):
         if self._two_way and self._mixed is None:
             (m_s, m_r), rows = self._rc_counts, (self._rc_lam_d, self._rc_omega_d)
             particle, rigid = (*rows, 0, m_s), (*rows, 3 * m_s, m_r)
-            joint = (*rows, 3 * (m_s + m_r), len(self._rc_joint_rows_h))
+            joint = (*rows, self._rc_joint_offset, len(self._rc_joint_rows_h))
             bilateral = (*rows, self._rc_n - self._rc_n_b, self._rc_n_b)
             return particle, rigid, joint, bilateral
         M = self._contact_count
@@ -1276,7 +1285,7 @@ class SolverFBA(SolverBase):
         if self._rc_n:
             # Beside the deformable rows, the two-way particle contact rows lead the rigid rows.
             (m_s, m_r), rows = self._rc_counts, (self._rc_lam_d, self._rc_omega_d)
-            rigid, joint = (*rows, 3 * m_s, m_r), (*rows, 3 * (m_s + m_r), len(self._rc_joint_rows_h))
+            rigid, joint = (*rows, 3 * m_s, m_r), (*rows, self._rc_joint_offset, len(self._rc_joint_rows_h))
         return particle, rigid, joint, bilateral
 
     def _restore_warm_start(self) -> None:
@@ -1427,7 +1436,7 @@ class SolverFBA(SolverBase):
 
         rc, device, n, n_pad = self._rigid_contacts, self._device, self._rc_n, self._rc_n_pad
         (m_s, m_r), joint_rows, n_b = self._rc_counts, self._rc_joint_rows_d, self._rc_n_b
-        n_s, n_c, n_j = 3 * m_s, 3 * m_s + 3 * m_r, joint_rows.shape[0]
+        n_s, n_c, n_j, j0 = 3 * m_s, 3 * m_s + 3 * m_r, len(self._rc_joint_rows_h), self._rc_joint_offset
         if n_b and self._constraint_lengths:
             self._point_length_rows(self._x_cur)
             self._linear_solver.update_row_directions(self._constraint_rows[2], n_s)
@@ -1464,21 +1473,24 @@ class SolverFBA(SolverBase):
             wp.launch(
                 gather_values_kernel,
                 dim=n_j,
-                inputs=[self._joint_residual_d, joint_rows, n_c],
+                inputs=[self._joint_residual_d, joint_rows, j0],
                 outputs=[self._rc_value_d],
                 device=device,
             )
-        if n - n_b > n_s:
-            wp.launch(
-                rigid_row_residual_kernel,
-                dim=n - n_b - n_s,
-                inputs=[
-                    *(self._rc_value_d[n_s:], self._rc_row_slot_d[n_s:], self._rc_row_jac_d[n_s:]),
-                    *(self._rigid_u_d, self._rigid_u_free_d),
-                ],
-                outputs=[self._rc_r_d[n_s:]],
-                device=device,
-            )
+        # The rigid contact rows and the joint rows, which follow the contacts' capacity in padded storage.
+        spans = [(n_s, n_c + n_j)] if j0 == n_c else [(n_s, n_c), (j0, j0 + n_j)]
+        for lo, hi in spans:
+            if hi > lo:
+                wp.launch(
+                    rigid_row_residual_kernel,
+                    dim=hi - lo,
+                    inputs=[
+                        *(self._rc_value_d[lo:], self._rc_row_slot_d[lo:], self._rc_row_jac_d[lo:]),
+                        *(self._rigid_u_d, self._rigid_u_free_d),
+                    ],
+                    outputs=[self._rc_r_d[lo:]],
+                    device=device,
+                )
         if n_b:
             wp.launch(
                 particle_constraint_residual_kernel,
@@ -1506,7 +1518,9 @@ class SolverFBA(SolverBase):
             graph="two-way",
             world_rows=self._rigid_world_rows,
             contact_scale=self._rigid_contact_scale,
-            graph_tail=functools.partial(self._two_way_contact_tail, m_s, n_pad, n_s, n_b, n_c, joint_rows),
+            graph_tail=functools.partial(
+                self._two_way_contact_tail, m_s, n_pad, n_s, n_b, j0, joint_rows if n_j else None
+            ),
             graph_tail_objects=tail_objects,
             r_device=self._rc_r_d,
             pene0_device=self._rc_pene0_d,
@@ -1514,17 +1528,20 @@ class SolverFBA(SolverBase):
             lam_init_device=self._rc_lam_d,
             omega_init_device=self._rc_omega_d,
             skip_download=True,
-            # Padding rows of the storage follow the contact rows as contacts.
-            m_contacts=m_s + m_r + (n_pad - n) // 3,
-            n_bilateral=n - n_c,
+            # Padding rows of the storage follow the contact rows as contacts, and the joint rows as joint rows.
+            m_contacts=j0 // 3,
+            n_bilateral=n_pad - j0,
             # The joint rows' block of A_schur is their W: Cholesky-factored per articulation.
-            block_precond=functools.partial(self._joint_system.solve_rows, joint_rows, n_c) if n_j else None,
+            block_precond=functools.partial(self._joint_system.solve_rows, joint_rows, j0) if n_j else None,
             contact_regularization=self.contact_regularization,
         )
         return self._nsn_lam_apply_d
 
-    def _two_way_contact_tail(self, m_s: int, n: int, n_s: int, n_b: int, n_c: int, joint_rows: wp.array) -> None:
-        """Keep the two-way NSN step's multipliers, correct the particle positions and write the joint forces."""
+    def _two_way_contact_tail(
+        self, m_s: int, n: int, n_s: int, n_b: int, joint_offset: int, joint_rows: wp.array | None
+    ) -> None:
+        """Keep the two-way NSN step's multipliers, correct the particle positions and write the forces of the joint
+        rows ``joint_rows``, which start at row ``joint_offset``."""
         from .joints import scatter_values_kernel  # noqa: PLC0415
 
         wp.copy(self._rc_lam_d, self._nsn_lam_d, count=n)
@@ -1539,11 +1556,11 @@ class SolverFBA(SolverBase):
             self._linear_solver.apply_lambda_correction_combined(lam_soft, self._rhs, self._x_cur)
             wp.copy(self._lam_coulomb_persistent_d, self._rc_lam_d, count=n_s)
             wp.copy(self._omega_coulomb_persistent_d, self._rc_omega_d, count=n_s)
-        if joint_rows.shape[0]:
+        if joint_rows is not None:
             wp.launch(
                 scatter_values_kernel,
                 dim=joint_rows.shape[0],
-                inputs=[self._nsn_lam_apply_d, n_c, joint_rows],
+                inputs=[self._nsn_lam_apply_d, joint_offset, joint_rows],
                 outputs=[self._joint_force_d],
                 device=self._device,
             )
@@ -4746,11 +4763,8 @@ class SolverFBA(SolverBase):
                 device=device,
             )
             rhs, dlam = self._nsn_rhs_d[:n_rows], self._nsn_dlam_d[:n_rows]
-            if block_precond is None:
-                # Fixed-count runs take the fused iteration: four launches per iteration instead of a dozen.
-                self._pcr_solver.solve_sparse_fused(A_sp, rhs, dlam)
-            else:
-                self._pcr_solver.solve_sparse(A_sp, rhs, dlam, block_precond=block_precond)
+            # Fixed-count runs take the fused iteration: four launches per iteration instead of a dozen.
+            self._pcr_solver.solve_sparse_fused(A_sp, rhs, dlam, block_precond=block_precond)
             wp.launch(K.axpy_lambda_kernel, n_rows, inputs=[self._nsn_dlam_d], outputs=[self._nsn_lam_d], device=device)
             # Per-contact box clamp of the tangent multipliers; no friction without a positive normal multiplier.
             wp.launch(K.coulomb_box_clamp_kernel, M, inputs=[mu_d], outputs=[self._nsn_lam_d], device=device)
