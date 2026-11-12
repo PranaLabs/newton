@@ -193,20 +193,22 @@ class RigidContactGather:
 
 class RigidRowStorage:
     """The NSN rows of the rigid contacts kept across steps, for a capacity of contacts that changes only when the
-    step's contacts outgrow it or would take less than half of it afresh, followed by ``joint_rows`` rows for the
-    joint rows that join the contacts.
+    step's contacts outgrow it or would take less than half of it afresh, followed by a section for the
+    ``joint_rows`` joint rows that join the contacts, rounded up to whole blocks of three rows.
 
     The rows past the step's contacts, and past its joint rows, stay inert: no body slot, no entries of ``W``, and
     zero residual, anchor projection, multipliers and friction, so that the NSN step of the capacity solves the
     step's rows alone and its graph can replay from step to step. :attr:`joint_select` holds the step's joint rows in
-    the order of their NSN rows, -1 past them.
+    the order of their NSN rows, -1 past them. ``W`` of the rows lives in :attr:`csr`, scalar, or in :attr:`blocks`,
+    in 3x3 blocks of three rows.
     """
 
     def __init__(self, device, joint_rows: int = 0):
         self.device = device
         self.contacts = 0
         self.joint_rows = joint_rows
-        self.joint_select = wp.full(max(joint_rows, 1), -1, dtype=wp.int32, device=device)
+        self.joint_section = 3 * ((joint_rows + 2) // 3)
+        self.joint_select = wp.full(max(self.joint_section, 1), -1, dtype=wp.int32, device=device)
 
     def select_joint_rows(self, rows: np.ndarray) -> None:
         """Take the joint rows ``rows`` for the step's NSN rows that follow the contacts' capacity."""
@@ -216,13 +218,13 @@ class RigidRowStorage:
 
     def reserve(self, m: int) -> None:
         """Hold the rows of ``m`` contacts."""
-        from .linear_solver import CsrStorage  # noqa: PLC0415
+        from .linear_solver import Block3Storage, CsrStorage  # noqa: PLC0415
 
         # A tenth more than the contacts, in steps of 64 contacts.
         contacts = 64 * ((m + m // 10 + 63) // 64)
         if m <= self.contacts and 2 * contacts >= self.contacts:
             return
-        n, d = 3 * contacts + self.joint_rows, self.device
+        n, d = 3 * contacts + self.joint_section, self.device
         self.row_slot = wp.empty((n, 2), dtype=wp.int32, device=d)
         self.row_jac = wp.empty((n, 2), dtype=wp.spatial_vectord, device=d)
         self.pene0 = wp.zeros(n, dtype=wp.float64, device=d)
@@ -232,6 +234,7 @@ class RigidRowStorage:
         self.lam = wp.empty(n, dtype=wp.float64, device=d)
         self.omega = wp.empty(n, dtype=wp.float64, device=d)
         self.csr = CsrStorage(n, d)
+        self.blocks = Block3Storage(n // 3, d)
         self.contacts = contacts
 
     def begin(self) -> None:

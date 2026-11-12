@@ -374,6 +374,62 @@ class TestPCRFusedSparse(_PCRTestCase):
                         out.append(x.numpy())
                     np.testing.assert_allclose(out[1], out[0], rtol=1.0e-10, atol=1.0e-12 * np.abs(out[0]).max())
 
+    def test_block_matrix_iterations_match_the_scalar_matrix(self):
+        """Multiply a matrix of 3x3 blocks, take its diagonal, and take the ten factored iterations with it as with
+        the same matrix in scalar entries, to rounding."""
+        import warp.sparse as wps  # noqa: PLC0415
+
+        from newton._src.solvers.fba.linear_solver import Block3Matrix  # noqa: PLC0415
+        from newton._src.solvers.fba.nsn_pcr_solver import block3_diag, block3_mv  # noqa: PLC0415
+
+        rng = np.random.default_rng(12)
+        nb = 150
+        coupled = rng.random((nb, nb)) < 0.06
+        coupled = coupled | coupled.T | np.eye(nb, dtype=bool)
+        W = np.kron(coupled, np.ones((3, 3))) * rng.standard_normal((3 * nb, 3 * nb))
+        W = W + W.T
+        W += np.diag(np.abs(W).sum(axis=1) + 1.0)
+        n = 3 * nb
+        rows, cols = np.nonzero(coupled)
+        values = np.stack([W[3 * i : 3 * i + 3, 3 * j : 3 * j + 3] for i, j in zip(rows, cols, strict=True)])
+        offsets = np.r_[0, np.cumsum(np.bincount(rows, minlength=nb))].astype(np.int32)
+        B = Block3Matrix(
+            wp.array(offsets, dtype=wp.int32, device=self.device),
+            wp.array(cols.astype(np.int32), dtype=wp.int32, device=self.device),
+            wp.array(values, dtype=wp.mat33d, device=self.device),
+            nb,
+            len(rows),
+        )
+        x = rng.standard_normal(n)
+        y = wp.zeros(n, dtype=wp.float64, device=self.device)
+        block3_mv(B, wp.array(x, dtype=wp.float64, device=self.device), y)
+        np.testing.assert_allclose(y.numpy(), W @ x, rtol=1e-12, atol=1e-12)
+        diag = wp.zeros(n, dtype=wp.float64, device=self.device)
+        block3_diag(B, diag)
+        np.testing.assert_array_equal(diag.numpy(), np.diag(W))
+
+        c = rng.uniform(0.2, 1.5, n)
+        c[::5] = 0.0
+        e = rng.uniform(0.0, 2.0, n) + (c == 0.0)
+        a_diag = c * c * np.diag(W) + e
+        r, s = np.nonzero(W)
+        S = wps.bsr_from_triplets(
+            n,
+            n,
+            wp.array(r.astype(np.int32), dtype=wp.int32, device=self.device),
+            wp.array(s.astype(np.int32), dtype=wp.int32, device=self.device),
+            wp.array(W[r, s], dtype=wp.float64, device=self.device),
+        )
+        b = wp.array(rng.standard_normal(n), dtype=wp.float64, device=self.device)
+        out = []
+        for matrix in (S, B):
+            solver = NSNPCRSolver(max_n=n, device=self.device, tol=1.0e-10, max_iter=10)
+            x = wp.zeros(n, dtype=wp.float64, device=self.device)
+            factors = [wp.array(a, dtype=wp.float64, device=self.device) for a in (c, e, a_diag)]
+            solver.solve_sparse_scaled(matrix, *factors, b, x)
+            out.append(x.numpy())
+        np.testing.assert_allclose(out[1], out[0], rtol=1.0e-10, atol=1.0e-12 * np.abs(out[0]).max())
+
     def test_checked_runs_take_solve_sparse(self):
         """Run ``solve_sparse`` itself when the iteration cap exceeds its convergence check interval."""
         A = self._sparse_spd(300, seed=6)

@@ -418,6 +418,71 @@ def csr_mv_kernel(
     y[i] = acc
 
 
+# Lanes of :func:`block3_mv_kernel` per block row.
+BLOCK3_LANES = 32
+
+
+@wp.kernel
+def block3_mv_kernel(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.mat33d],
+    x: wp.array[wp.float64],
+    y: wp.array[wp.float64],
+):
+    """``y = W x`` for a matrix of 3x3 blocks in block CSR form, launched tiled with a block of lanes per block row,
+    :data:`BLOCK3_LANES` on CUDA: lane ``l`` takes the block row's blocks ``l``, ``l + block_dim`` and so on, and the
+    lanes' sums add up in a fixed order."""
+    i, lane = wp.tid()
+    acc = wp.vec3d()
+    for k in range(offsets[i] + lane, offsets[i + 1], wp.block_dim()):
+        j = 3 * columns[k]
+        acc += values[k] * wp.vec3d(x[j], x[j + 1], x[j + 2])
+    total = wp.tile_extract(wp.tile_sum(wp.tile(acc, preserve_type=True)), 0)
+    if lane == 0:
+        y[3 * i] = total[0]
+        y[3 * i + 1] = total[1]
+        y[3 * i + 2] = total[2]
+
+
+@wp.kernel
+def block3_diag_kernel(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.mat33d],
+    diag: wp.array[wp.float64],
+):
+    """The diagonal of a matrix of 3x3 blocks with its block columns in order in each block row, zero where a block
+    row stores no diagonal block."""
+    i = wp.tid()
+    lo = offsets[i]
+    hi = offsets[i + 1]
+    end = hi
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if columns[mid] < i:
+            lo = mid + 1
+        else:
+            hi = mid
+    block = wp.mat33d()
+    if lo < end:
+        if columns[lo] == i:
+            block = values[lo]
+    for a in range(3):
+        diag[3 * i + a] = block[a, a]
+
+
+def block3_mv(W, x: wp.array[wp.float64], y: wp.array[wp.float64]) -> None:
+    """``y = W x`` for a :class:`~newton._src.solvers.fba.linear_solver.Block3Matrix`."""
+    inputs = [W.offsets, W.columns, W.values, x]
+    wp.launch_tiled(block3_mv_kernel, dim=W.nrow, inputs=inputs, outputs=[y], block_dim=BLOCK3_LANES, device=x.device)
+
+
+def block3_diag(W, diag: wp.array[wp.float64]) -> None:
+    """The diagonal of a :class:`~newton._src.solvers.fba.linear_solver.Block3Matrix`."""
+    wp.launch(block3_diag_kernel, W.nrow, inputs=[W.offsets, W.columns, W.values], outputs=[diag], device=diag.device)
+
+
 @wp.kernel
 def csr_diag_kernel(
     offsets: wp.array[wp.int32],
@@ -1365,9 +1430,13 @@ class NSNPCRSolver:
     def fuses_alone(self, n: int) -> bool:
         """Whether :meth:`solve_sparse_fused` runs a single system of ``n`` rows fused: without :attr:`world_rows`,
         a run it does not check, and on CUDA."""
+        return self.world_rows is None and self.fuses_single(n)
+
+    def fuses_single(self, n: int) -> bool:
+        """Whether :meth:`solve_sparse_fused` runs a system of ``n`` rows of one world fused."""
         nb = (n + _FUSED_BLOCK - 1) // _FUSED_BLOCK
         unchecked = min(self.max_iter, n) <= self.check_every
-        return self.world_rows is None and unchecked and nb <= _FUSED_MAX_BLOCKS and wp.get_device(self.device).is_cuda
+        return unchecked and nb <= _FUSED_MAX_BLOCKS and wp.get_device(self.device).is_cuda
 
     def solve_sparse_scaled(
         self,
@@ -1384,7 +1453,8 @@ class NSNPCRSolver:
         reductions of the iteration apply. Only for systems that :meth:`fuses_alone` fuses.
 
         Args:
-            W_bsr: Scalar ``BsrMatrix`` with its columns in order in each row.
+            W_bsr: Scalar ``BsrMatrix`` with its columns in order in each row, or a ``Block3Matrix`` of 3x3 blocks
+                with its block columns in order.
             scale: ``(n,)`` row and column scaling, fp64.
             shift: ``(n,)`` diagonal added after the scaling, fp64.
             diag: ``(n,)`` diagonal of ``A``, fp64, for the Jacobi preconditioner.
@@ -1416,6 +1486,10 @@ class NSNPCRSolver:
         matrix = [W_bsr.offsets, W_bsr.columns, W_bsr.values]
         scaled = factors is not None
         scale, shift = (factors[0], factors[1]) if scaled else (s, s)
+        # A matrix of 3x3 blocks comes factored only: its diagonal is given and its product is block3_mv's.
+        blocked = getattr(W_bsr, "block3", False)
+        if blocked and not scaled:
+            raise ValueError("a matrix of 3x3 blocks takes solve_sparse_scaled")
         # Rows of more than 128 entries on average, as warp.sparse counts them, take its tiled product: one block of
         # threads per row reads the row's entries together, where one thread per row reads them one by one.
         long_rows = int(W_bsr.nnz) > 2 * _TILED_MV * n
@@ -1434,7 +1508,9 @@ class NSNPCRSolver:
         if scaled:
             wp.launch(_scale_kernel, n, [scale, d], [sw], device=device)
             product_in = sw
-        if long_rows:
+        if blocked:
+            block3_mv(W_bsr, product_in, q)
+        elif long_rows:
             wps.bsr_mv(W_bsr, product_in, q, tile_size=_TILED_MV)
         else:
             wp.launch(csr_mv_kernel, n, [*matrix, product_in], [q], device=device)
@@ -1457,8 +1533,11 @@ class NSNPCRSolver:
             inputs = [pden, pcurv, pchart, self._fused_rho, slot, self._eta, n, d, q, h, self._stopped_d, x, r, s]
             inputs += [int(scaled), scale, sw]
             wp.launch_tiled(_fused_pcr_step_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
-            if long_rows:
-                wps.bsr_mv(W_bsr, sw if scaled else s, h, tile_size=_TILED_MV)
+            if blocked or long_rows:
+                if blocked:
+                    block3_mv(W_bsr, sw, h)
+                else:
+                    wps.bsr_mv(W_bsr, sw if scaled else s, h, tile_size=_TILED_MV)
                 kernel = _fused_pcr_rho_scaled_kernel if scaled else _fused_pcr_rho_kernel
                 inputs = [s, scale, shift, n, h, prho] if scaled else [s, h, prho]
                 wp.launch_tiled(kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)

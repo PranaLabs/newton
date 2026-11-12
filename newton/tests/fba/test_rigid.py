@@ -274,6 +274,76 @@ class TestFBARigidRows(unittest.TestCase):
         self.assertEqual(int(offsets_h[n]), nnz)
         self.assertFalse(np.any(W[7]) or np.any(W[:, 7]))
 
+    def test_block_delassus_matches_the_scalar_entries(self):
+        """Fill ``W`` in 3x3 blocks of three rows at the pattern of blocks whose rows share a body slot, also blocks of
+        rows on different bodies, with the entries the scalar assembly gives, and nothing outside its pattern."""
+        from newton._src.solvers.fba.linear_solver import (  # noqa: PLC0415
+            Block3Storage,
+            CsrStorage,
+            pattern_from_groups,
+        )
+
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        rng = np.random.default_rng(6)
+        m, n = 9, 72
+        row_slot = rng.integers(-1, m, size=(n, 2)).astype(np.int32)
+        row_slot[row_slot[:, 0] == row_slot[:, 1], 1] = -1
+        row_slot[:36] = np.repeat(row_slot[:36:3], 3, axis=0)  # contacts: the rows of a block share their bodies
+        row_slot[60:63] = -1
+        row_jac = rng.standard_normal((n, 2, 6))
+        inv_mass = rng.standard_normal((m, 6, 6))
+        inv_mass = inv_mass @ inv_mass.transpose(0, 2, 1) + np.eye(6)
+        row_slot_d = wp.array(row_slot, dtype=wp.int32, device=device)
+        row_jac_d = wp.array(row_jac, dtype=wp.spatial_vectord, device=device)
+        inv_mass_d = wp.array(inv_mass, dtype=wp.spatial_matrixd, device=device)
+        minv_jac = wp.empty_like(row_jac_d)
+        wp.launch(
+            rigid.rigid_row_minv_jac_kernel, (n, 2), [row_slot_d, row_jac_d, inv_mass_d], [minv_jac], device=device
+        )
+
+        start, rows, _ = rigid.slot_entries(row_slot_d, n, m, distinct=True)
+        scalar = CsrStorage(n, device)
+        offsets, columns, nnz = pattern_from_groups(row_slot_d, start, rows, scalar)
+        none = [wp.zeros(1, dtype=wp.int32, device=device)] * 2 + [wp.zeros(1, dtype=wp.float64, device=device)]
+        wp.launch_tiled(
+            rigid.rigid_delassus_rows_kernel,
+            dim=n,
+            inputs=[offsets, columns, *none, 0, n, row_slot_d, row_jac_d, minv_jac],
+            outputs=[scalar.matrices[0].values],
+            block_dim=rigid.DELASSUS_LANES,
+            device=device,
+        )
+        W_scalar = np.zeros((n, n))
+        o, c, v = offsets.numpy(), columns.numpy()[:nnz], scalar.matrices[0].values.numpy()[:nnz]
+        for i in range(n):
+            W_scalar[i, c[o[i] : o[i + 1]]] = v[o[i] : o[i + 1]]
+
+        groups = wp.empty((n // 3, rigid.BLOCK_GROUPS), dtype=wp.int32, device=device)
+        wp.launch(rigid.block_slot_groups_kernel, n // 3, [row_slot_d], [groups], device=device)
+        start, rows = rigid.group_entries(groups, m)
+        blocks = Block3Storage(n // 3, device)
+        b_offsets, b_columns, b_nnz = pattern_from_groups(groups, start, rows, blocks)
+        wp.launch_tiled(
+            rigid.rigid_delassus_blocks_kernel,
+            dim=n // 3,
+            inputs=[b_offsets, b_columns, row_slot_d, row_jac_d, minv_jac],
+            outputs=[blocks.matrix.values],
+            block_dim=rigid.DELASSUS_LANES,
+            device=device,
+        )
+        W_blocks = np.zeros((n, n))
+        o, c, v = b_offsets.numpy(), b_columns.numpy()[:b_nnz], blocks.matrix.values.numpy()[:b_nnz]
+        for i in range(n // 3):
+            for k in range(o[i], o[i + 1]):
+                W_blocks[3 * i : 3 * i + 3, 3 * c[k] : 3 * c[k] + 3] = v[k]
+        np.testing.assert_array_equal(W_blocks, W_scalar)
+        # Every block row's blocks are the blocks its rows' entries fall in, the inert block row has none.
+        covered = np.zeros((n // 3, n // 3), dtype=bool)
+        covered[np.repeat(np.arange(n // 3), np.diff(o)), c] = True
+        touched = np.abs(W_scalar).reshape(n // 3, 3, n // 3, 3).sum(axis=(1, 3)) > 0
+        self.assertTrue(np.all(covered[touched]))
+        self.assertEqual(o[21] - o[20], 0)
+
     def test_slot_entries_match_row_incidence(self):
         """Index the rows of each body slot on the device as :func:`row_incidence` does on the host, and build the
         pattern of rows that share a slot as :func:`group_pattern` does."""

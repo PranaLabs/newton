@@ -108,7 +108,7 @@ def pattern_from_groups(
     row_groups: wp.array2d[wp.int32],
     group_offsets: wp.array[wp.int32],
     group_rows: wp.array[wp.int32],
-    storage: CsrStorage | None = None,
+    storage: CsrStorage | Block3Storage | None = None,
 ) -> tuple[wp.array, wp.array, int]:
     """:func:`group_pattern` from device groups.
 
@@ -116,7 +116,8 @@ def pattern_from_groups(
         row_groups: Groups of each row, shape ``(n, G)``, ``-1`` where unused.
         group_offsets: Where each group's rows start in ``group_rows``, shape ``(groups + 1,)``.
         group_rows: The rows of each group, ascending and once each.
-        storage: A :class:`CsrStorage` of ``n`` rows to hold the pattern, whose matrices then take it.
+        storage: A :class:`CsrStorage` or :class:`Block3Storage` of ``n`` rows to hold the pattern, whose matrices
+            then take it.
 
     Returns:
         ``(offsets, columns, nnz)`` as :func:`group_pattern` returns them, the storage's arrays with ``storage``.
@@ -173,6 +174,42 @@ class CsrStorage:
             m.offsets, m.columns, m.values, m.nnz = self.offsets, self.columns, values, capacity
             matrices.append(m)
         self.matrices, self.capacity = tuple(matrices), capacity
+
+
+class Block3Matrix:
+    """A square matrix of 3x3 blocks in block CSR form: block row ``i`` holds the blocks ``offsets[i]:offsets[i + 1]``
+    at block columns ``columns``, with their ``values``. ``nnz`` is the capacity of its storage, an upper bound of its
+    blocks; the offsets delimit them."""
+
+    block3 = True
+
+    def __init__(self, offsets: wp.array, columns: wp.array, values: wp.array, nrow: int, nnz: int):
+        self.offsets, self.columns, self.values, self.nrow, self.nnz = offsets, columns, values, nrow, nnz
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (3 * self.nrow, 3 * self.nrow)
+
+
+class Block3Storage:
+    """Storage of a :class:`Block3Matrix` of ``n`` block rows, kept across calls and grown with its blocks, as
+    :class:`CsrStorage` keeps a scalar matrix, so that a CUDA graph captured with it stays valid."""
+
+    def __init__(self, n: int, device):
+        self.n, self.device = n, device
+        self.offsets = wp.zeros(n + 1, dtype=wp.int32, device=device)
+        self.capacity = 0
+        self.matrix = None
+
+    def reserve(self, nnz: int) -> None:
+        """Hold at least ``nnz`` blocks; growing replaces the matrix."""
+        if self.matrix is not None and nnz <= self.capacity:
+            return
+        capacity = max(nnz + nnz // 4, 1024)
+        self.columns = wp.zeros(capacity, dtype=wp.int32, device=self.device)
+        values = wp.zeros(capacity, dtype=wp.mat33d, device=self.device)
+        self.matrix = Block3Matrix(self.offsets, self.columns, values, self.n, capacity)
+        self.capacity = capacity
 
 
 def csr_without_zeros(

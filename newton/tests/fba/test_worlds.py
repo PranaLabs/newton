@@ -1305,9 +1305,10 @@ class TestFBAWorlds(unittest.TestCase):
                 if padded is None:
                     calls.append(("two-way", m_s + m_r, n_j + b_s, 3 * (m_s + m_r) + n_j + b_s))
                 else:
-                    # Rows on bodies alone in one world: the storage's capacity of contacts, then all joint rows.
-                    rows = 3 * padded.contacts + padded.joint_rows
-                    calls.append(("two-way", padded.contacts, padded.joint_rows, rows))
+                    # Rows on bodies alone in one world: the storage's capacity of contacts, then all joint rows in
+                    # whole blocks of three rows.
+                    rows = 3 * padded.contacts + padded.joint_section
+                    calls.append(("two-way", padded.contacts, padded.joint_section, rows))
             return calls * iterations
 
         for device in self.devices:
@@ -1329,7 +1330,7 @@ class TestFBAWorlds(unittest.TestCase):
 
                         def record(*args, calls=calls, solve=solve, **kwargs):
                             W = kwargs["W_sparse"]
-                            rows = W[0].nrow if W is not None else kwargs["W_device"].shape[0]
+                            rows = W[0].shape[0] if W is not None else kwargs["W_device"].shape[0]
                             calls.append((kwargs["graph"], kwargs["m_contacts"], kwargs["n_bilateral"], rows))
                             return solve(*args, **kwargs)
 
