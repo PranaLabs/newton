@@ -298,6 +298,7 @@ def build_pd_system(
     rayleigh_alpha: np.ndarray | None = None,
     rayleigh_beta: np.ndarray | None = None,
     spring_bending_stiffness: np.ndarray | None = None,
+    spring_corotated: bool = False,
 ) -> tuple[CsrMatrix, dict[str, Any]]:
     """Assemble the constant scalar PD Hessian ``A`` for cloth.
 
@@ -318,6 +319,8 @@ def build_pd_system(
             element takes the mean of its particles' coefficients.
         spring_bending_stiffness: Bending stiffness [N m^2] of the rod each spring belongs to, which the spring's
             ADMM penalty grows with (see :func:`spring_penalties`), or ``None`` for springs outside rods.
+        spring_corotated: Damp the springs' length rate in their local steps, ``meta["spring_beta"]``, rather than
+            through ``C``, which damps every relative motion of their particles, rotations included.
 
     Returns:
         A tuple ``(A, meta)`` where ``A`` is an ``N x N`` symmetric PSD CSR
@@ -335,6 +338,8 @@ def build_pd_system(
         - ``meta["spring_indices"]`` : ``np.ndarray[int32]`` shape (S, 2), the springs with positive stiffness
         - ``meta["spring_rest_length"]``, ``meta["spring_stiffness"]``, ``meta["spring_penalty"]`` :
           ``np.ndarray[float64]`` shape (S,)
+        - ``meta["spring_beta"]`` : ``np.ndarray[float64]`` shape (S,), the stiffness damping coefficient [s] that
+          the springs' local steps apply to their length rate, zero unless ``spring_corotated``
         - ``meta["damping"]`` : :class:`CsrMatrix` of ``C``, or ``None`` without damping
 
     A spring is the ADMM stretch element of :func:`~newton._src.solvers.fba.kernels.project_spring_admm_kernel`:
@@ -522,6 +527,7 @@ def build_pd_system(
     spring_rest = np.zeros(0, dtype=np.float64)
     spring_k = np.zeros(0, dtype=np.float64)
     spring_rho = np.zeros(0, dtype=np.float64)
+    spring_beta = np.zeros(0, dtype=np.float64)
     if model.spring_count > 0:
         indices = model.spring_indices.numpy().astype(np.int32).reshape(-1, 2)
         rest = model.spring_rest_length.numpy().astype(np.float64)
@@ -534,7 +540,10 @@ def build_pd_system(
         rows_s = np.concatenate([a, b, a, b])
         cols_s = np.concatenate([a, b, b, a])
         coo_parts.append((rows_s, cols_s, np.concatenate([spring_rho, spring_rho, -spring_rho, -spring_rho])))
-        if rayleigh_beta is not None:
+        spring_beta = np.zeros(spring_indices.shape[0], dtype=np.float64)
+        if rayleigh_beta is not None and spring_corotated:
+            spring_beta = element_beta(spring_indices)
+        elif rayleigh_beta is not None:
             beta_k = element_beta(spring_indices) * spring_k
             damping_parts.append((rows_s, cols_s, np.concatenate([beta_k, beta_k, -beta_k, -beta_k])))
 
@@ -569,6 +578,7 @@ def build_pd_system(
         "spring_rest_length": spring_rest,
         "spring_stiffness": spring_k,
         "spring_penalty": spring_rho,
+        "spring_beta": spring_beta,
         "tet_indices": tet_indices,
         "tet_rest_inv": tet_rest_inv,
         "tet_volume": tet_volume,

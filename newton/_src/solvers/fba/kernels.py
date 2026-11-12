@@ -1733,6 +1733,8 @@ def project_spring_admm_kernel(
     rest_length: wp.array[wp.float32],
     stiffness: wp.array[wp.float32],
     penalty: wp.array[wp.float32],
+    damping: wp.array[wp.float32],
+    start_length: wp.array[wp.float32],
     first: wp.array[wp.int32],
     # in-out state
     dual: wp.array[wp.vec3],
@@ -1746,8 +1748,9 @@ def project_spring_admm_kernel(
     The element enters the system matrix with its penalty ``rho`` as PD weight. Its scaled dual ``u`` first takes
     the gap ``(x_b - x_a) - z`` of the latest global solution to the previous split ``z``, except in a step's first
     local step (``first[0] != 0``); the split is then the prox of the spring's energy at ``y = x_b - x_a + u``,
+    with the viscous term ``c / 2 (|z| - r_0)^2`` of a damping ``c`` [N/m] on its length ``r_0`` at the step's start,
 
-        z = (rho |y| + k l) / (rho + k) y / |y|,
+        z = (rho |y| + k l + c r_0) / (rho + k + c) y / |y|,
 
     and the element's target ``z - u`` adds ``rho (z - u)`` to the right-hand side of ``b`` and its negative to
     ``a``'s. At a fixed point ``z = x_b - x_a`` and ``rho u`` is the spring force, so the iterations converge to the
@@ -1760,6 +1763,8 @@ def project_spring_admm_kernel(
         rest_length: Rest length ``l`` [m] of each spring.
         stiffness: Stiffness ``k`` [N/m] of each spring.
         penalty: ADMM penalty ``rho`` [N/m] of each spring.
+        damping: Damping ``c = beta k / dt`` [N/m] of each spring's length rate, zero for none.
+        start_length: Length ``r_0`` [m] of each spring at the step's start.
         first: ``first[0]`` is nonzero in the first local step of a time step.
         dual: Scaled dual ``u`` [m] of each spring, kept across steps.
         split: Split ``z`` [m] of each spring.
@@ -1782,12 +1787,20 @@ def project_spring_admm_kernel(
         direction[e] = y / n
     k = stiffness[e]
     rho = penalty[e]
-    z = (rho * n + k * l0) / (rho + k) * direction[e]
+    c = damping[e]
+    z = (rho * n + k * l0 + c * start_length[e]) / (rho + k + c) * direction[e]
     dual[e] = u
     split[e] = z
     p = rho * (z - u)
     contrib[e, 0] = -p
     contrib[e, 1] = p
+
+
+@wp.kernel
+def spring_length_kernel(x: wp.array[wp.vec3], springs: wp.array2d[wp.int32], length: wp.array[wp.float32]):
+    """The length of each spring."""
+    e = wp.tid()
+    length[e] = wp.length(x[springs[e, 1]] - x[springs[e, 0]])
 
 
 @wp.kernel

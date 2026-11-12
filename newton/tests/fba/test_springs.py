@@ -26,10 +26,11 @@ def _chain(builder=None, n=6, seg=0.05, mass=0.01, ke=1.0e3, x=0.0):
     return builder
 
 
-def _implicit_euler(x0, v0, mass, springs, rest, ke, dt, pin_weight, pinned):
+def _implicit_euler(x0, v0, mass, springs, rest, ke, dt, pin_weight, pinned, damping=None):
     """One implicit Euler step of particles joined by springs, solved by Newton's method:
     ``M (x - x~) / dt^2 + grad U(x) + w (x_p - x0_p) = 0`` with ``x~ = x0 + dt v0 + dt^2 g`` for the free particles,
-    ``U`` the springs' energy ``k/2 (|x_b - x_a| - l)^2`` and ``w`` the pins' weight."""
+    ``U`` the springs' energy ``k/2 (|x_b - x_a| - l)^2`` and ``w`` the pins' weight. With ``damping`` ``c`` [N/m]
+    per spring, each spring also pulls with ``c (|x_b - x_a| - r_0)`` along itself, ``r_0`` its length in ``x0``."""
     n = len(x0)
     free = mass > 0.0
     target = np.where(free[:, None], x0 + dt * v0 + dt * dt * _GRAVITY, x0)
@@ -40,14 +41,18 @@ def _implicit_euler(x0, v0, mass, springs, rest, ke, dt, pin_weight, pinned):
         K = np.zeros((3 * n, 3 * n))
         diag = mass / dt**2 + np.where(pinned, pin_weight, 0.0)
         K[np.arange(3 * n), np.arange(3 * n)] = np.repeat(diag, 3)
-        for (a, b), l0, k in zip(springs, rest, ke, strict=True):
+        c_all = np.zeros(len(springs)) if damping is None else damping
+        for (a, b), l0, k, c in zip(springs, rest, ke, c_all, strict=True):
             d = x[b] - x[a]
             length = np.linalg.norm(d)
             u = d / length
-            f = k * (length - l0) * u
+            r0 = np.linalg.norm(x0[b] - x0[a])
+            f = (k * (length - l0) + c * (length - r0)) * u
             F[a] -= f
             F[b] += f
-            Ke = k * ((1.0 - l0 / length) * np.eye(3) + (l0 / length) * np.outer(u, u))
+            # The force (k + c) (length - l*) u with l* = (k l0 + c r0) / (k + c).
+            rest_eff = (k * l0 + c * r0) / (k + c)
+            Ke = (k + c) * ((1.0 - rest_eff / length) * np.eye(3) + (rest_eff / length) * np.outer(u, u))
             for i, j, sign in ((a, a, 1.0), (b, b, 1.0), (a, b, -1.0), (b, a, -1.0)):
                 K[3 * i : 3 * i + 3, 3 * j : 3 * j + 3] += sign * Ke
         dx = np.linalg.solve(K, -F.reshape(-1)).reshape(n, 3)
@@ -158,6 +163,72 @@ class TestSolverFBASprings(unittest.TestCase):
         solver.reset(s0, flags=0)
         np.testing.assert_array_equal(solver._spring_dual_d.numpy(), 0.0)
         np.testing.assert_array_equal(solver._spring_split_d.numpy(), 0.0)
+
+    @staticmethod
+    def _dumbbell(stretch=0.0, spin=0.0, ke=100.0):
+        """Two particles of 0.1 kg joined by a spring of rest length 0.2 m, without gravity: stretched by ``stretch``
+        and spinning at ``spin`` [rad/s] about their center."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        half = 0.1 * (1.0 + stretch)
+        for sign in (-1.0, 1.0):
+            builder.add_particle(pos=(sign * half, 0.0, 0.0), vel=(0.0, sign * spin * half, 0.0), mass=0.1, radius=0.0)
+        builder.add_spring(0, 1, ke=ke, kd=0.0, control=0.0)
+        builder.spring_rest_length[0] = 0.2
+        return builder.finalize()
+
+    @staticmethod
+    def _run(model, steps, **kwargs):
+        solver = SolverFBA(model, iterations=50, **kwargs)
+        s0, s1 = model.state(), model.state()
+        history = []
+        for _ in range(steps):
+            solver.step(s0, s1, None, None, 0.01)
+            s0, s1 = s1, s0
+            history.append((s0.particle_q.numpy().astype(np.float64), s0.particle_qd.numpy().astype(np.float64)))
+        return history
+
+    def test_corotated_damping_spares_a_spinning_dumbbell(self):
+        """Keep the spin of a dumbbell with ``rayleigh_corotated``, which damps the spring's length rate alone, where
+        the isotropic stiffness damping brakes it."""
+        model = self._dumbbell(spin=5.0)
+
+        def spin(state):
+            x, v = state
+            return np.cross(x, v)[:, 2].sum() / np.sum(x[:, :2] ** 2)
+
+        free = spin(self._run(model, 100)[-1])
+        corotated = spin(self._run(model, 100, rayleigh_beta=0.05, rayleigh_corotated=True)[-1])
+        isotropic = spin(self._run(model, 100, rayleigh_beta=0.05)[-1])
+        np.testing.assert_allclose(corotated, free, rtol=1.0e-2)
+        self.assertLess(isotropic, 0.2 * free)
+
+    def test_damped_step_converges_to_implicit_euler(self):
+        """Step a chain thrown with random velocities and damped along its springs: the step reaches the implicit
+        Euler step with the springs' viscous force ``beta k (r - r_0) / dt`` along them."""
+        n, seg, mass, ke, dt, beta = 6, 0.05, 0.01, 1.0e3, 0.01, 2.0e-3
+        model = _chain(n=n, seg=seg, mass=mass, ke=ke).finalize()
+        solver = SolverFBA(model, iterations=1600, rayleigh_beta=beta, rayleigh_corotated=True)
+        s0, s1 = model.state(), model.state()
+        x0 = s0.particle_q.numpy().astype(np.float64)
+        v0 = np.random.default_rng(1).normal(scale=0.3, size=x0.shape)
+        v0[0] = 0.0
+        s0.particle_qd.assign(v0.astype(np.float32))
+        solver.step(s0, s1, None, None, dt)
+        masses = np.r_[0.0, np.full(n, mass)]
+        springs = np.stack([np.arange(n), np.arange(1, n + 1)], axis=1)
+        expected = _implicit_euler(
+            x0,
+            v0,
+            masses,
+            springs,
+            np.full(n, seg),
+            np.full(n, ke),
+            dt,
+            solver.pin_stiffness,
+            masses == 0.0,
+            damping=np.full(n, beta * ke / dt),
+        )
+        np.testing.assert_allclose(s1.particle_q.numpy(), expected, atol=1.0e-6)
 
     def test_springs_across_worlds_are_rejected(self):
         """Reject a spring that joins particles of different worlds."""

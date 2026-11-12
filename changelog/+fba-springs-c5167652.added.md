@@ -1,1 +1,1 @@
-Add springs to `SolverFBA`: each spring of the model is a stretch element whose ADMM local steps converge to the implicit Euler step of the springs.
+Add springs to `SolverFBA`: each spring of the model is a stretch element whose ADMM local steps converge to the implicit Euler step of the springs. With `rayleigh_corotated=True`, `rayleigh_beta` damps their length rate alone and spares their rotation.

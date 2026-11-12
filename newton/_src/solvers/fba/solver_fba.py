@@ -448,9 +448,13 @@ class SolverFBA(SolverBase):
                 bulge flattens as fast as without damping, while stretch
                 waves stay damped. The system matrix is unchanged; each
                 iteration's right-hand side turns the triangle's stretch at
-                the step's start with its current rotation. Bending and
-                tetrahedra keep the constant damping. Needs
-                ``stretching_model="arap"`` and a nonzero ``rayleigh_beta``.
+                the step's start with its current rotation. Springs, in the
+                same way, damp their length rate alone, with ``beta`` times
+                their stiffness, in their local steps, and leave the system
+                matrix's damping: a swinging chain of springs swings on,
+                while its stretch waves die out. Bending and tetrahedra keep
+                the constant damping. Needs ``stretching_model="arap"`` and a
+                nonzero ``rayleigh_beta``.
             tet_activation_directions: Direction of each tetrahedron's growth
                 in the rest frame, shape ``(tet_count, 3)``: an activation
                 ``a`` stretches it by ``1 - a`` along its direction alone,
@@ -1802,9 +1806,10 @@ class SolverFBA(SolverBase):
         penalties, or ``None`` when no spring belongs to a rod."""
         return None
 
-    def _setup_springs(self, meta: dict) -> None:
+    def _setup_springs(self, meta: dict, dt: float) -> None:
         """Upload the springs of :func:`~newton._src.solvers.fba.linear_solver.build_pd_system`'s ``meta`` and
-        start their ADMM state: zero duals and splits, and the rest directions."""
+        start their ADMM state: zero duals and splits, and the rest directions; with corotated damping, also each
+        spring's damping ``beta k / dt`` of its length rate."""
         from .linear_solver import build_particle_element_csr  # noqa: PLC0415
 
         springs = meta["spring_indices"]
@@ -1821,6 +1826,10 @@ class SolverFBA(SolverBase):
         self._spring_rest_d, self._spring_k_d, self._spring_rho_d = (
             wp.array(a.astype(np.float32), dtype=wp.float32, device=device) for a in f32
         )
+        damping = meta["spring_beta"] * meta["spring_stiffness"] / dt
+        self._spring_damped = bool((damping > 0.0).any())
+        self._spring_c_d = wp.array(damping.astype(np.float32), dtype=wp.float32, device=device)
+        self._spring_len0_d = wp.zeros(springs.shape[0], dtype=wp.float32, device=device)
         self._spring_dual_d = wp.zeros(springs.shape[0], dtype=wp.vec3, device=device)
         self._spring_split_d = wp.zeros(springs.shape[0], dtype=wp.vec3, device=device)
         self._spring_dir_d = wp.array(direction.astype(np.float32), dtype=wp.vec3, device=device)
@@ -1849,6 +1858,7 @@ class SolverFBA(SolverBase):
             rayleigh_alpha=self._rayleigh_alpha,
             rayleigh_beta=self._rayleigh_beta,
             spring_bending_stiffness=self._spring_bending_stiffness(),
+            spring_corotated=self.rayleigh_corotated,
         )
         worlds = self._particle_world_h if self.model.world_count > 1 else None
         fs = factorize_and_sparse_inverse(A, self.model.particle_q.numpy(), worlds)
@@ -1968,7 +1978,7 @@ class SolverFBA(SolverBase):
                 dtype=wp.int32,
                 device=device,
             )
-        self._setup_springs(meta)
+        self._setup_springs(meta, dt)
         if meta["tet_indices"].shape[0] > 0:
             self._tet_indices_d = wp.array(
                 meta["tet_indices"].flatten().astype(np.int32),
@@ -2293,6 +2303,12 @@ class SolverFBA(SolverBase):
         wp.copy(self._x_cur, self._x_inertia)
         if self._spring_indices_d is not None:
             self._spring_first_d.fill_(1)
+            if self._spring_damped:
+                from .kernels import spring_length_kernel  # noqa: PLC0415
+
+                inputs = [state_in.particle_q, self._spring_indices_d]
+                S = self._spring_indices_d.shape[0]
+                wp.launch(spring_length_kernel, S, inputs, [self._spring_len0_d], device=device)
         # The contact forces of the step's sparse lite rows accumulate from zero.
         if self.nsn_lite_accumulate and (M > 0 or n_b):
             self._ensure_accumulation_buffers(3 * M + n_b)
@@ -2792,8 +2808,9 @@ class SolverFBA(SolverBase):
         if self._spring_indices_d is not None:
             S = self._spring_indices_d.shape[0]
             inputs = [self._x_cur, self._spring_indices_d, self._spring_rest_d, self._spring_k_d, self._spring_rho_d]
+            inputs += [self._spring_c_d, self._spring_len0_d, self._spring_first_d]
             outputs = [self._spring_dual_d, self._spring_split_d, self._spring_dir_d, self._spring_contrib_d]
-            wp.launch(self._k_spring, S, [*inputs, self._spring_first_d], outputs, device=device)
+            wp.launch(self._k_spring, S, inputs, outputs, device=device)
             wp.launch(self._k_clear_flag, 1, [self._spring_first_d], device=device)
             inputs = [self._spring_contrib_d, *self._particle_spring_csr_d]
             wp.launch(self._k_gather, dim=N, inputs=inputs, outputs=[self._rhs], device=device)

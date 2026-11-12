@@ -213,7 +213,9 @@ Model Inputs
   prox of the energy, so the iterations converge to the implicit Euler step
   of the springs and not to a softened one. The element weighs
   ``60 m / dt^2`` in the system matrix, ``m`` the mean mass of its two
-  particles, which sets how fast the iterations converge, not where.
+  particles, which sets how fast the iterations converge, not where: the
+  fewer, the nearer the stiffness is to the penalty, so springs far softer
+  than it, whose oscillation the step resolves, converge slowly.
   ``spring_damping`` and ``spring_control`` are not read.
 - **Activations**: the control's ``tet_activations`` grow each tetrahedron
   to ``1 - a`` times its rest volume, so a negative activation inflates it
@@ -236,8 +238,9 @@ Model Inputs
   spring enters ``K`` with its stiffness along every direction, so ``beta``
   also damps the swinging of a chain of springs. With
   ``rayleigh_corotated=True``, ``beta`` damps the stretch rate of ARAP
-  triangles instead and spares their rotation, so a released cloth flap falls
-  as fast as without damping.
+  triangles and the length rate of springs instead and spares their rotation,
+  so a released cloth flap falls as fast as without damping and a chain of
+  springs swings on while its stretch waves die out.
 - **Pins**: particles with zero inverse mass follow their pin targets through
   a stiff spring of ``pin_stiffness`` [N/m]. The targets start at the model
   positions and move with :meth:`~newton.solvers.SolverFBA.set_pin_targets`.
