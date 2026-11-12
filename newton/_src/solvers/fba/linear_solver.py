@@ -132,9 +132,43 @@ def pattern_from_groups(
     return offsets, columns, nnz
 
 
-def csr_without_zeros(offsets: wp.array, columns: wp.array, values: wp.array, n: int, nnz: int) -> tuple:
+class CsrStorage:
+    """Storage of :func:`csr_without_zeros` for matrices of ``n`` rows, kept across calls and grown with their
+    entries.
+
+    While the storage holds the entries, :func:`csr_without_zeros` returns the same matrices with the same arrays,
+    so a CUDA graph captured with them stays valid. Their ``nnz`` is the storage's capacity, an upper bound of the
+    entries: the row offsets delimit the entries, as ``warp.sparse`` allows.
+    """
+
+    def __init__(self, n: int, device):
+        self.n, self.device = n, device
+        self.offsets = wp.zeros(n + 1, dtype=wp.int32, device=device)
+        self.capacity = 0
+        self.matrices = None
+
+    def reserve(self, nnz: int) -> None:
+        """Hold at least ``nnz`` entries; growing replaces the matrices."""
+        if self.matrices is not None and nnz <= self.capacity:
+            return
+        capacity = max(nnz + nnz // 4, 1024)
+        self.columns = wp.zeros(capacity, dtype=wp.int32, device=self.device)
+        matrices = []
+        for _ in range(2):
+            m = wps.bsr_zeros(rows_of_blocks=self.n, cols_of_blocks=self.n, block_type=wp.float64, device=self.device)
+            values = wp.zeros(capacity, dtype=wp.float64, device=self.device)
+            m.offsets, m.columns, m.values, m.nnz = self.offsets, self.columns, values, capacity
+            matrices.append(m)
+        self.matrices, self.capacity = tuple(matrices), capacity
+
+
+def csr_without_zeros(
+    offsets: wp.array, columns: wp.array, values: wp.array, n: int, nnz: int, storage: CsrStorage | None = None
+) -> tuple:
     """The CSR matrix ``(offsets, columns, values)`` of ``n`` rows and ``nnz`` entries without its zero off-diagonal
-    entries, as a ``BsrMatrix`` of scalar blocks, and a matrix of its pattern for values to come."""
+    entries, as a ``BsrMatrix`` of scalar blocks, and a matrix of its pattern for values to come.
+
+    With ``storage``, of ``n`` rows, the matrices live in it."""
     from .kernels import csr_keep_kernel, csr_kept_entries_kernel, csr_kept_offsets_kernel  # noqa: PLC0415
 
     device = offsets.device
@@ -144,12 +178,19 @@ def csr_without_zeros(offsets: wp.array, columns: wp.array, values: wp.array, n:
     wp.launch(csr_kept_entries_kernel, nnz, inputs=[offsets, columns, values], outputs=[kept], device=device)
     wp.utils.array_scan(kept, position, inclusive=False)
     kept_nnz = int(position[nnz : nnz + 1].numpy()[0])
-    kept_offsets = wp.empty(n + 1, dtype=wp.int32, device=device)
-    kept_columns = wp.empty(kept_nnz, dtype=wp.int32, device=device)
-    kept_values = wp.empty(kept_nnz, dtype=wp.float64, device=device)
+    if storage is not None:
+        storage.reserve(kept_nnz)
+        matrices = storage.matrices
+        kept_offsets, kept_columns, kept_values = storage.offsets, storage.columns, matrices[0].values
+    else:
+        kept_offsets = wp.empty(n + 1, dtype=wp.int32, device=device)
+        kept_columns = wp.empty(kept_nnz, dtype=wp.int32, device=device)
+        kept_values = wp.empty(kept_nnz, dtype=wp.float64, device=device)
     inputs = [columns, values, kept, position]
     wp.launch(csr_keep_kernel, nnz, inputs=inputs, outputs=[kept_columns, kept_values], device=device)
     wp.launch(csr_kept_offsets_kernel, n + 1, inputs=[offsets, position], outputs=[kept_offsets], device=device)
+    if storage is not None:
+        return matrices
     matrices = []
     for vals in (kept_values, wp.empty(kept_nnz, dtype=wp.float64, device=device)):
         m = wps.bsr_zeros(rows_of_blocks=n, cols_of_blocks=n, block_type=wp.float64, device=device)
