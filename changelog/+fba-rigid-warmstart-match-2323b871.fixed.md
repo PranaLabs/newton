@@ -1,0 +1,1 @@
+Fix `SolverFBA` with `contact_warmstart=True` starting rigid contacts from the forces of other contacts of their shape pair when the pair's contacts tie in order or change in number; each contact now continues the previous contact whose anchors lie nearest, which keeps settled piles of rigid bodies still.

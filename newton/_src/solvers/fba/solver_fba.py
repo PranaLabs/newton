@@ -459,9 +459,9 @@ class SolverFBA(SolverBase):
             contact_warmstart: If ``True``, each step's contact NSN starts
                 from the multipliers that the previous step ended with on the
                 same rows rather than from zero: particle contacts matched by
-                particle and shape, rigid contacts by shape pair and rank,
-                joint rows by index, and the particle constraint rows while
-                their world's rows stay unchanged, with friction forces
+                particle and shape, rigid contacts by shape pair and nearest
+                anchors, joint rows by index, and the particle constraint rows
+                while their world's rows stay unchanged, with friction forces
                 re-expressed in the new tangents. A resting or held object then starts each step
                 at the contact forces that carry it, which a few iterations
                 cannot build up from zero. Face and self contacts start from
@@ -1329,7 +1329,7 @@ class SolverFBA(SolverBase):
             self._rc_tangents = [wp.empty(rc.count, dtype=wp.vec3, device=device) for _ in range(2)]
             wp.launch(rigid_contact_tangents_kernel, rc.count, [rc.normal], self._rc_tangents, device=device)
             ws.rigid.begin(rc.count, given_keys(rigid_contact_keys(rc.shape, self.model.shape_count)))
-            ws.rigid.restore(*rigid[:3], self._rc_tangents)
+            ws.rigid.restore(*rigid[:3], self._rc_tangents, rc.anchor, rc.normal)
         else:
             ws.rigid.begin(0, None)
         if joint is not None and joint[3]:
@@ -1349,7 +1349,8 @@ class SolverFBA(SolverBase):
         else:
             ws.particle.store(None, None, 0)
         if rigid is not None and rigid[3]:
-            ws.rigid.store(*rigid[:3], self._rc_tangents)
+            rc = self._rigid_contacts
+            ws.rigid.store(*rigid[:3], self._rc_tangents, rc.anchor, rc.normal)
         else:
             ws.rigid.store(None, None, 0)
         if joint is not None and joint[3]:
