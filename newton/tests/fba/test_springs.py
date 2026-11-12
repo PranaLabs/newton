@@ -67,8 +67,8 @@ class TestSpringSystem(unittest.TestCase):
     """The springs' terms of the constant PD system matrix and of its Rayleigh damping matrix."""
 
     def test_springs_weigh_their_penalty_in_A_and_their_stiffness_in_C(self):
-        """Weigh each spring's stencil ``x_b - x_a`` by its penalty ``60 m / dt^2`` in ``A``, ``m`` the mean mass of
-        its particles, and by its stiffness in the damping matrix ``C``."""
+        """Weigh each spring's stencil ``x_b - x_a`` by its penalty ``60 m / dt^2`` in ``A``, ``m`` the mass of its
+        lighter particle, and by its stiffness in the damping matrix ``C``."""
         builder = newton.ModelBuilder()
         for i, m in enumerate((0.02, 0.04, 0.06)):
             builder.add_particle(pos=(0.1 * i, 0.0, 0.0), vel=(0.0, 0.0, 0.0), mass=m, radius=0.0)
@@ -78,7 +78,7 @@ class TestSpringSystem(unittest.TestCase):
         dt, beta = 0.01, 0.002
         A, meta = build_pd_system(model, dt=dt, pin_stiffness=1.0e6, rayleigh_beta=np.full(3, beta))
         A = A.toarray()
-        rho = SPRING_INERTIA_FACTOR * np.array([0.03, 0.05]) / dt**2
+        rho = SPRING_INERTIA_FACTOR * np.array([0.02, 0.04]) / dt**2
         np.testing.assert_allclose(meta["spring_penalty"], rho)
         np.testing.assert_allclose(meta["spring_stiffness"], [500.0, 700.0])
         np.testing.assert_allclose(meta["spring_rest_length"], [0.1, 0.1], rtol=1e-6)
@@ -183,6 +183,29 @@ class TestSolverFBASprings(unittest.TestCase):
             x0, v0, masses, springs, np.full(n, seg), np.full(n, ke), dt, solver.pin_stiffness, masses == 0.0
         )
         np.testing.assert_allclose(s1.particle_q.numpy(), expected, atol=1.0e-6)
+
+    def test_heavy_weight_on_a_light_chain_converges(self):
+        """Hang a 1 kg weight from a chain of 20 springs of 1 g particles and throw it down at 2 m/s: weighed by its
+        lighter particle, the spring that holds the weight stays far stiffer than its penalty, and 10 iterations
+        reach the implicit Euler step."""
+        n, seg, mass, ke, dt = 20, 0.02, 1.0e-3, 2.0e4, 0.01
+        builder = _chain(n=n, seg=seg, mass=mass, ke=ke)
+        builder.particle_mass[n] = 1.0
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=10)
+        s0, s1 = model.state(), model.state()
+        x0 = s0.particle_q.numpy().astype(np.float64)
+        v0 = np.zeros_like(x0)
+        v0[1:, 2] = -2.0
+        s0.particle_qd.assign(v0.astype(np.float32))
+        solver.step(s0, s1, None, None, dt)
+        masses = np.r_[0.0, np.full(n - 1, mass), 1.0]
+        springs = np.stack([np.arange(n), np.arange(1, n + 1)], axis=1)
+        expected = _implicit_euler(
+            x0, v0, masses, springs, np.full(n, seg), np.full(n, ke), dt, solver.pin_stiffness, masses == 0.0
+        )
+        np.testing.assert_allclose(s1.particle_q.numpy(), expected, atol=1.0e-6)
+        self.assertGreater(np.abs(expected - x0).max(), 1.0e-3)
 
     def test_sagging_rope_settles_without_jitter(self):
         """Hang a rope of 80 stiff springs between two pins, every spring at rest length on an arc that sags 13 cm:

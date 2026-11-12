@@ -216,8 +216,8 @@ Model Inputs
   length with the dual, so a dual that pushes the particles apart harder
   than the penalty times the spring's length shortens the target instead of
   turning the spring over. The element weighs
-  ``60 m / dt^2`` in the system matrix, ``m`` the mean mass of its two
-  particles, which sets how fast the iterations converge, not where: springs
+  ``60 m / dt^2`` in the system matrix, ``m`` the mass of its lighter
+  particle, which sets how fast the iterations converge, not where: springs
   far softer than it, whose oscillation the step resolves, converge slowly.
   Stiffer springs converge their own stretch at that rate, but a long chain
   of them carries stretch waves that span many particles, and a dual that

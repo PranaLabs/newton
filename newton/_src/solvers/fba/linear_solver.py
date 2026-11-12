@@ -262,7 +262,7 @@ def particle_masses(model: Model) -> tuple[np.ndarray, np.ndarray]:
 
 
 # The penalty of a spring's ADMM stretch element, ``SPRING_INERTIA_FACTOR m / dt^2 + SPRING_BENDING_FACTOR EI / l^3``
-# with ``m`` the mean mass of its two particles: it weighs the element in the system matrix and sets how fast the
+# with ``m`` the mass of its lighter particle: it weighs the element in the system matrix and sets how fast the
 # iterations converge, not where they converge. The element's target also holds the spring's direction within an
 # iteration, so a penalty near the stiffness converges a chain's stretch fast but its swing slowly: half the stiffness
 # left a 1 m rope of 80 springs 25-50% of its length off its implicit Euler trajectory after 10 iterations, this
@@ -280,11 +280,15 @@ def spring_penalties(
     dt: float,
     bending_stiffness: np.ndarray | None = None,
 ) -> np.ndarray:
-    """The ADMM penalty ``rho`` [N/m] of each spring: ``60 m / dt^2 + 0.1 EI / l^3``, with ``m`` the mean mass of the
-    spring's particles, ``EI`` the bending stiffness [N m^2] of the rod the spring belongs to (none without
-    ``bending_stiffness``) and ``l`` its rest length; the spring's own stiffness where both its particles are held.
+    """The ADMM penalty ``rho`` [N/m] of each spring: ``60 m / dt^2 + 0.1 EI / l^3``, with ``m`` the mass of the
+    spring's lighter particle, a held particle, of zero ``mass``, counting as unbounded, ``EI`` the bending stiffness
+    [N m^2] of the rod the spring belongs to (none without ``bending_stiffness``) and ``l`` its rest length; the
+    spring's own stiffness where both its particles are held. A spring hangs a heavy particle from a light one
+    with the light one's penalty, which keeps the spring stiff against it, as the tension solve of its chain needs.
     """
-    rho = SPRING_INERTIA_FACTOR * 0.5 * (mass[indices[:, 0]] + mass[indices[:, 1]]) / (dt * dt)
+    pair = mass[indices]
+    lighter = np.where(pair > 0.0, pair, np.inf).min(axis=1)
+    rho = SPRING_INERTIA_FACTOR * np.where(np.isfinite(lighter), lighter, 0.0) / (dt * dt)
     if bending_stiffness is not None:
         with np.errstate(divide="ignore", invalid="ignore"):
             rho = rho + np.where(rest_length > 0.0, SPRING_BENDING_FACTOR * bending_stiffness / rest_length**3, 0.0)
