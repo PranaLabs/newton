@@ -386,18 +386,26 @@ class TestBuildRigidSystem(unittest.TestCase):
         self.assertEqual(build_rigid_system(model, np.zeros(0, dtype=np.int32), dt).shape, (0, 0))
 
     def test_solve_scalar_matches_dense(self):
-        """Solve the rigid system with ``solve_scalar`` as a dense solve does."""
+        """Solve the rigid system with ``solve_scalar``, of the factored system and of the block inverses, as a
+        dense solve does."""
+        from newton._src.solvers.fba.linear_solver import rigid_block_inverses  # noqa: PLC0415
+        from newton._src.solvers.fba.rigid import RigidBlockSolver  # noqa: PLC0415
+
         A = build_rigid_system(self._model(), np.array([0, 2]), 0.01)
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
-        solver = FBALinearSolver(factorize_and_sparse_inverse(A), device=device)
+        solvers = {
+            "factor": FBALinearSolver(factorize_and_sparse_inverse(A), device=device),
+            "blocks": RigidBlockSolver(wp.array(rigid_block_inverses(A), dtype=wp.spatial_matrixd, device=device)),
+        }
 
         b_np = np.random.default_rng(3).standard_normal(12)
         b = wp.array(b_np, dtype=wp.float64, device=device)
-        x = wp.empty(12, dtype=wp.float64, device=device)
-        solver.solve_scalar(b, x)
-
         x_ref = np.linalg.solve(A.toarray(), b_np)
-        np.testing.assert_allclose(x.numpy(), x_ref, rtol=1e-9, atol=1e-12 * np.abs(x_ref).max())
+        for name, solver in solvers.items():
+            with self.subTest(solver=name):
+                x = wp.empty(12, dtype=wp.float64, device=device)
+                solver.solve_scalar(b, x)
+                np.testing.assert_allclose(x.numpy(), x_ref, rtol=1e-9, atol=1e-12 * np.abs(x_ref).max())
 
     def test_rejects_massless_body(self):
         """Refuse a body without mass in the rigid system."""

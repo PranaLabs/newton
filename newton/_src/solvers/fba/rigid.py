@@ -19,8 +19,6 @@ names the body slot ``row_slot[r, k]`` (-1 for none) and its coefficients
 import numpy as np
 import warp as wp
 
-from .kernels import csr_row_of
-
 # Stability clamp on the rotation per step, |omega| * dt <= 0.5 [rad].
 _MAX_STEP_ROTATION = wp.constant(wp.float64(0.5))
 # Step rotations with squared norm below this are treated as numerical noise.
@@ -165,6 +163,190 @@ def row_incidence(row_slot: np.ndarray, slot_count: int) -> tuple[np.ndarray, np
 
 
 @wp.kernel
+def solve_rigid_blocks_kernel(
+    slot_inv_mass: wp.array[wp.spatial_matrixd],
+    b: wp.array[wp.float64],
+    # outputs
+    x: wp.array[wp.float64],
+):
+    """``x = A⁻¹ b`` for the block diagonal rigid system, one body slot per thread."""
+    k = wp.tid()
+    rhs = wp.spatial_vectord()
+    for c in range(6):
+        rhs[c] = b[6 * k + c]
+    out = slot_inv_mass[k] * rhs
+    for c in range(6):
+        x[6 * k + c] = out[c]
+
+
+class RigidBlockSolver:
+    """Solves the rigid system of :func:`~.linear_solver.build_rigid_system`, whose bodies do not couple, with the
+    inverse of each body's 6x6 block."""
+
+    def __init__(self, slot_inv_mass: wp.array[wp.spatial_matrixd]):
+        self.slot_inv_mass = slot_inv_mass
+
+    def solve_scalar(self, b: wp.array[wp.float64], x: wp.array[wp.float64]) -> None:
+        """Compute ``x = A⁻¹ b``; ``x`` must not alias ``b``."""
+        inv = self.slot_inv_mass
+        wp.launch(solve_rigid_blocks_kernel, inv.shape[0], inputs=[inv, b], outputs=[x], device=inv.device)
+
+
+@wp.kernel
+def _slot_entries_kernel(
+    row_slot: wp.array2d[wp.int32],
+    slot_count: int,
+    distinct: int,
+    # outputs
+    keys: wp.array[wp.int32],
+    values: wp.array[wp.int32],
+):
+    """Entry ``2 r + side`` of each row side keyed by its body slot, or by ``slot_count`` for a side without a slot
+    and, with ``distinct``, for a second side on the first side's slot."""
+    i = wp.tid()
+    r = i // 2
+    side = i - 2 * r
+    s = row_slot[r, side]
+    if s < 0 or (distinct != 0 and side == 1 and s == row_slot[r, 0]):
+        s = slot_count
+    keys[i] = s
+    values[i] = i
+
+
+@wp.kernel
+def _slot_starts_kernel(keys: wp.array[wp.int32], count: int, starts: wp.array[wp.int32]):
+    """The first of the ``count`` sorted entries whose slot is at least ``k``."""
+    k = wp.tid()
+    lo = int(0)
+    hi = count
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if keys[mid] < k:
+            lo = mid + 1
+        else:
+            hi = mid
+    starts[k] = lo
+
+
+@wp.kernel
+def _split_entries_kernel(
+    values: wp.array[wp.int32],
+    # outputs
+    entry_row: wp.array[wp.int32],
+    entry_side: wp.array[wp.int32],
+):
+    i = wp.tid()
+    row = values[i] // 2
+    entry_row[i] = row
+    entry_side[i] = values[i] - 2 * row
+
+
+def slot_entries(
+    row_slot: wp.array2d[wp.int32], rows: int, slot_count: int, distinct: bool = False
+) -> tuple[wp.array, wp.array, wp.array]:
+    """:func:`row_incidence` of the first ``rows`` rows of a device ``row_slot``, computed on its device.
+
+    The entries of slot ``k`` are ``start[k]:start[k + 1]``, ascending by row and then side, as
+    :func:`row_incidence` orders them; ``entry_row`` and ``entry_side`` hold ``2 * rows`` entries, of which those from
+    ``start[slot_count]`` on belong to no slot. With ``distinct``, a row enters each slot's entries once, as the
+    rows of a group do.
+    """
+    device = row_slot.device
+    start = wp.zeros(slot_count + 1, dtype=wp.int32, device=device)
+    count = 2 * rows
+    entry_row = wp.empty(max(count, 1), dtype=wp.int32, device=device)
+    entry_side = wp.empty(max(count, 1), dtype=wp.int32, device=device)
+    if count == 0:
+        return start, entry_row, entry_side
+    # radix_sort_pairs sorts in place in arrays twice the sorted length.
+    keys = wp.empty(2 * count, dtype=wp.int32, device=device)
+    values = wp.empty(2 * count, dtype=wp.int32, device=device)
+    inputs = [row_slot, slot_count, int(distinct)]
+    wp.launch(_slot_entries_kernel, count, inputs=inputs, outputs=[keys, values], device=device)
+    wp.utils.radix_sort_pairs(keys, values, count)
+    wp.launch(_slot_starts_kernel, slot_count + 1, inputs=[keys, count], outputs=[start], device=device)
+    wp.launch(_split_entries_kernel, count, inputs=[values], outputs=[entry_row, entry_side], device=device)
+    return start, entry_row, entry_side
+
+
+# Lanes of :func:`row_force_rhs_kernel` per body slot.
+ROW_FORCE_LANES = 32
+
+
+# Most body slots of a block of three rows: two per row.
+BLOCK_GROUPS = wp.constant(6)
+
+
+@wp.kernel
+def block_slot_groups_kernel(
+    row_slot: wp.array2d[wp.int32],
+    # outputs
+    groups: wp.array2d[wp.int32],
+):
+    """The body slots of each block of three rows, once each in their order, -1 after them."""
+    b = wp.tid()
+    count = int(0)
+    for a in range(3):
+        for x in range(2):
+            s = row_slot[3 * b + a, x]
+            if s >= 0:
+                seen = int(0)
+                for g in range(count):
+                    if groups[b, g] == s:
+                        seen = 1
+                if seen == 0:
+                    groups[b, count] = s
+                    count += 1
+    for g in range(count, BLOCK_GROUPS):
+        groups[b, g] = -1
+
+
+@wp.kernel
+def _group_entries_kernel(
+    groups: wp.array2d[wp.int32],
+    slot_count: int,
+    # outputs
+    keys: wp.array[wp.int32],
+    values: wp.array[wp.int32],
+):
+    """Entry ``G r + g`` of each row's groups keyed by its group, or by ``slot_count`` where it has none."""
+    i = wp.tid()
+    width = groups.shape[1]
+    r = i // width
+    s = groups[r, i - width * r]
+    if s < 0:
+        s = slot_count
+    keys[i] = s
+    values[i] = i
+
+
+@wp.kernel
+def _entry_rows_kernel(values: wp.array[wp.int32], width: int, rows: wp.array[wp.int32]):
+    i = wp.tid()
+    rows[i] = values[i] // width
+
+
+def group_entries(groups: wp.array2d[wp.int32], slot_count: int) -> tuple[wp.array, wp.array]:
+    """The rows of each group of ``groups``, ``(rows, G)`` with each row's groups distinct and -1 where unused,
+    computed on its device: ``(start, rows)``, the rows of group ``k`` ascending in ``rows[start[k]:start[k + 1]]``,
+    as :func:`slot_entries` gives them for rows of two sides."""
+    device = groups.device
+    count = groups.shape[0] * groups.shape[1]
+    start = wp.zeros(slot_count + 1, dtype=wp.int32, device=device)
+    rows = wp.empty(max(count, 1), dtype=wp.int32, device=device)
+    if count == 0:
+        return start, rows
+    # radix_sort_pairs sorts in place in arrays twice the sorted length.
+    keys = wp.empty(2 * count, dtype=wp.int32, device=device)
+    values = wp.empty(2 * count, dtype=wp.int32, device=device)
+    wp.launch(_group_entries_kernel, count, inputs=[groups, slot_count], outputs=[keys, values], device=device)
+    wp.utils.radix_sort_pairs(keys, values, count)
+    wp.launch(_slot_starts_kernel, slot_count + 1, inputs=[keys, count], outputs=[start], device=device)
+    wp.launch(_entry_rows_kernel, count, inputs=[values, groups.shape[1]], outputs=[rows], device=device)
+    return start, rows
+
+
+@wp.kernel
 def row_force_rhs_kernel(
     slot_entry_start: wp.array[wp.int32],
     entry_row: wp.array[wp.int32],
@@ -175,13 +357,17 @@ def row_force_rhs_kernel(
     # outputs
     b: wp.array[wp.float64],
 ):
-    """``b = b_const + Jᵀ f`` per body slot, gathered over the rows touching it."""
-    k = wp.tid()
+    """``b = b_const + Jᵀ f`` per body slot, gathered over the rows touching it, launched tiled with a block of lanes
+    per slot, :data:`ROW_FORCE_LANES` on CUDA: lane ``l`` sums the slot's entries ``l``, ``l + block_dim`` and so on,
+    and the lanes' sums add up in a fixed order."""
+    k, lane = wp.tid()
     acc = wp.spatial_vectord()
-    for e in range(slot_entry_start[k], slot_entry_start[k + 1]):
+    for e in range(slot_entry_start[k] + lane, slot_entry_start[k + 1], wp.block_dim()):
         acc += force[entry_row[e]] * row_jac[entry_row[e], entry_side[e]]
-    for c in range(6):
-        b[6 * k + c] = b_const[6 * k + c] + acc[c]
+    total = wp.tile_extract(wp.tile_sum(wp.tile(acc, preserve_type=True)), 0)
+    if lane == 0:
+        for c in range(6):
+            b[6 * k + c] = b_const[6 * k + c] + total[c]
 
 
 @wp.kernel
@@ -220,8 +406,29 @@ def rigid_delassus_kernel(
     W[i, j] = w
 
 
+# Lanes of :func:`rigid_delassus_rows_kernel` per row.
+DELASSUS_LANES = 32
+
+
 @wp.kernel
-def rigid_delassus_csr_kernel(
+def rigid_row_minv_jac_kernel(
+    row_slot: wp.array2d[wp.int32],
+    row_jac: wp.array2d[wp.spatial_vectord],
+    slot_inv_mass: wp.array[wp.spatial_matrixd],
+    # outputs
+    row_minv_jac: wp.array2d[wp.spatial_vectord],
+):
+    """``A⁻¹ Jᵀ`` of each row's side: its slot's block inverse times its Jacobian, zero on a side without a slot."""
+    i, x = wp.tid()
+    v = wp.spatial_vectord()
+    s = row_slot[i, x]
+    if s >= 0:
+        v = slot_inv_mass[s] * row_jac[i, x]
+    row_minv_jac[i, x] = v
+
+
+@wp.kernel
+def rigid_delassus_rows_kernel(
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],
     soft_offsets: wp.array[wp.int32],
@@ -231,40 +438,74 @@ def rigid_delassus_csr_kernel(
     soft_tail: int,
     row_slot: wp.array2d[wp.int32],
     row_jac: wp.array2d[wp.spatial_vectord],
-    slot_inv_mass: wp.array[wp.spatial_matrixd],
+    row_minv_jac: wp.array2d[wp.spatial_vectord],
     # outputs
     values: wp.array[wp.float64],
 ):
-    """The entries of :func:`rigid_delassus_kernel`'s ``W`` at a CSR pattern, one thread per entry, from the
-    deformable block ``W_soft`` in CSR form, without its zero entries."""
-    k = wp.tid()
-    i = csr_row_of(offsets, k)
-    j = columns[k]
-    w = wp.float64(0.0)
-    if (i < n_soft or i >= soft_tail) and (j < n_soft or j >= soft_tail):
-        si, sj = i, j
-        if i >= soft_tail:
-            si = n_soft + i - soft_tail
-        if j >= soft_tail:
-            sj = n_soft + j - soft_tail
-        lo = soft_offsets[si]
-        hi = soft_offsets[si + 1]
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if soft_columns[mid] < sj:
-                lo = mid + 1
-            else:
-                hi = mid
-        if lo < soft_offsets[si + 1]:
-            if soft_columns[lo] == sj:
-                w = soft_values[lo]
-    for x in range(2):
-        s = row_slot[i, x]
-        if s >= 0:
-            for y in range(2):
-                if row_slot[j, y] == s:
-                    w += wp.dot(row_jac[i, x], slot_inv_mass[s] * row_jac[j, y])
-    values[k] = w
+    """The entries of :func:`rigid_delassus_kernel`'s ``W`` at a CSR pattern, from the deformable block ``W_soft`` in
+    CSR form without its zero entries and the rows' ``A⁻¹ Jᵀ`` of :func:`rigid_row_minv_jac_kernel`. Launched tiled
+    with a block of lanes per row, :data:`DELASSUS_LANES` on CUDA: lane ``l`` takes the row's entries ``l``,
+    ``l + block_dim`` and so on."""
+    i, lane = wp.tid()
+    for k in range(offsets[i] + lane, offsets[i + 1], wp.block_dim()):
+        j = columns[k]
+        w = wp.float64(0.0)
+        if (i < n_soft or i >= soft_tail) and (j < n_soft or j >= soft_tail):
+            si, sj = i, j
+            if i >= soft_tail:
+                si = n_soft + i - soft_tail
+            if j >= soft_tail:
+                sj = n_soft + j - soft_tail
+            lo = soft_offsets[si]
+            hi = soft_offsets[si + 1]
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if soft_columns[mid] < sj:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            if lo < soft_offsets[si + 1]:
+                if soft_columns[lo] == sj:
+                    w = soft_values[lo]
+        for x in range(2):
+            s = row_slot[i, x]
+            if s >= 0:
+                for y in range(2):
+                    if row_slot[j, y] == s:
+                        w += wp.dot(row_jac[i, x], row_minv_jac[j, y])
+        values[k] = w
+
+
+@wp.kernel
+def rigid_delassus_blocks_kernel(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    row_slot: wp.array2d[wp.int32],
+    row_jac: wp.array2d[wp.spatial_vectord],
+    row_minv_jac: wp.array2d[wp.spatial_vectord],
+    # outputs
+    values: wp.array[wp.mat33d],
+):
+    """The 3x3 blocks of the rigid rows' ``W = J A⁻¹ Jᵀ`` at a block CSR pattern of blocks of three rows, each entry
+    as :func:`rigid_delassus_rows_kernel` forms it. Launched tiled with a block of lanes per block row,
+    :data:`DELASSUS_LANES` on CUDA: lane ``l`` takes the block row's blocks ``l``, ``l + block_dim`` and so on."""
+    bi, lane = wp.tid()
+    for k in range(offsets[bi] + lane, offsets[bi + 1], wp.block_dim()):
+        bj = columns[k]
+        block = wp.mat33d()
+        for a in range(3):
+            i = 3 * bi + a
+            for c in range(3):
+                j = 3 * bj + c
+                w = wp.float64(0.0)
+                for x in range(2):
+                    s = row_slot[i, x]
+                    if s >= 0:
+                        for y in range(2):
+                            if row_slot[j, y] == s:
+                                w += wp.dot(row_jac[i, x], row_minv_jac[j, y])
+                block[a, c] = w
+        values[k] = block
 
 
 @wp.kernel

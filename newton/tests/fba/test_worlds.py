@@ -1181,8 +1181,8 @@ class TestFBAWorlds(unittest.TestCase):
                     np.testing.assert_allclose(results[0], np.concatenate(results[1:]), atol=2e-6, rtol=0.0)
 
     def test_factor_splits_only_worlds(self):
-        """The particle and body systems of one world factor whole, also of disconnected cloths and bodies; those of
-        several worlds factor one world at a time."""
+        """The particle system of one world factors whole, also of disconnected cloths; those of several worlds factor
+        one world at a time. The bodies' system, block diagonal, factors nothing."""
         from newton._src.solvers.fba import linear_solver  # noqa: PLC0415
         from newton._src.solvers.fba.sparse_ldlt import factor_ldlt  # noqa: PLC0415
 
@@ -1191,7 +1191,7 @@ class TestFBAWorlds(unittest.TestCase):
         for x in (1.0, 2.0):
             body = source.add_body(xform=wp.transform((x, 0.0, 0.5), wp.quat_identity()))
             source.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
-        for worlds, expected in ((1, [8, 12]), (3, [8, 8, 8, 12, 12, 12])):
+        for worlds, expected in ((1, [8]), (3, [8, 8, 8])):
             with self.subTest(worlds=worlds):
                 model = _model([source] * worlds, "cpu")
                 solver = SolverFBA(model, iterations=1)
@@ -1301,8 +1301,14 @@ class TestFBAWorlds(unittest.TestCase):
             if M - m_s or n_b - b_s:
                 calls.append(("deformable", M - m_s, n_b - b_s, 3 * (M - m_s) + n_b - b_s))
             if m_s + m_r:
-                n_j = len(solver._rc_joint_rows_h)
-                calls.append(("two-way", m_s + m_r, n_j + b_s, 3 * (m_s + m_r) + n_j + b_s))
+                n_j, padded = len(solver._rc_joint_rows_h), getattr(solver, "_rc_padded", None)
+                if padded is None:
+                    calls.append(("two-way", m_s + m_r, n_j + b_s, 3 * (m_s + m_r) + n_j + b_s))
+                else:
+                    # Rows on bodies alone in one world: the storage's capacity of contacts, then all joint rows in
+                    # whole blocks of three rows.
+                    rows = 3 * padded.contacts + padded.joint_section
+                    calls.append(("two-way", padded.contacts, padded.joint_section, rows))
             return calls * iterations
 
         for device in self.devices:
@@ -1324,7 +1330,7 @@ class TestFBAWorlds(unittest.TestCase):
 
                         def record(*args, calls=calls, solve=solve, **kwargs):
                             W = kwargs["W_sparse"]
-                            rows = W[0].nrow if W is not None else kwargs["W_device"].shape[0]
+                            rows = W[0].shape[0] if W is not None else kwargs["W_device"].shape[0]
                             calls.append((kwargs["graph"], kwargs["m_contacts"], kwargs["n_bilateral"], rows))
                             return solve(*args, **kwargs)
 
@@ -1371,8 +1377,13 @@ class TestFBAWorlds(unittest.TestCase):
                                 # Each NSN solve of the step captures its graph at most once, not at every iteration.
                                 self.assertEqual(len(captures), len(set(captures)), (run, step))
                                 if sparse and wp.get_device(device).is_cuda:
-                                    # The sparse NSN solves on the device run from graphs: each path captures one.
-                                    self.assertEqual(sorted(captures), sorted({c[0] for c in calls}), (run, step))
+                                    # The sparse NSN solves on the device run from graphs: each path captures one,
+                                    # but padded rows replay the graph of an earlier step while their storage holds.
+                                    solved = {c[0] for c in calls}
+                                    if getattr(solver, "_rc_padded", None) is not None and step:
+                                        self.assertLessEqual(set(captures), solved, (run, step))
+                                    else:
+                                        self.assertEqual(sorted(captures), sorted(solved), (run, step))
                             step_paths.append([c[0] for c in calls[: len(calls) // iterations]])
                             if model.world_count > 1 and solver._anchor_count:
                                 keys = solver._anchor_previous_key_d.numpy()[: solver._anchor_count]

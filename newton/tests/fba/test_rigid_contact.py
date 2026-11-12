@@ -477,6 +477,105 @@ class TestSolverFBARigidContacts(unittest.TestCase):
                 np.testing.assert_allclose(np.diff(traj[:, 7]), a * self.H, rtol=5e-3)
 
 
+class TestSolverFBARigidContactStorage(unittest.TestCase):
+    """Four boxes dropped on each other: the rows of rigid contacts alone, padded to a capacity kept across steps."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not wp.is_cuda_available():
+            raise unittest.SkipTest("The padded rows serve the CUDA graph of the NSN step")
+
+    def _run(self, steps, capacity_scale=1, hinged=False):
+        """The body poses after each step and the NSN graph captures of each step, with the storage reserving
+        ``capacity_scale`` times the contacts. Four boxes drop on each other, or with ``hinged``, two chains of three
+        links, hinged one to the next, lie on the ground."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        cfg = newton.ModelBuilder.ShapeConfig(mu=0.5)
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane(cfg=cfg)
+        for i in range(0 if hinged else 4):
+            xform = wp.transform((0.02 * i, 0.0, 0.11 + 0.21 * i), wp.quat_rpy(0.05 * i, 0.03, 0.0))
+            builder.add_shape_box(builder.add_body(xform=xform), hx=0.1, hy=0.1, hz=0.1, cfg=cfg)
+        for c in range(2 if hinged else 0):
+            joints, parent = [], -1
+            for k in range(3):
+                link = builder.add_link(xform=wp.transform((0.25 * k, 0.3 * c, 0.05)))
+                builder.add_shape_box(link, hx=0.12, hy=0.05, hz=0.05, cfg=cfg)
+                if parent < 0:
+                    joints.append(builder.add_joint_free(link))
+                else:
+                    joints.append(
+                        builder.add_joint_revolute(
+                            parent,
+                            link,
+                            axis=(0.0, 1.0, 0.0),
+                            parent_xform=wp.transform((0.125, 0.0, 0.0)),
+                            child_xform=wp.transform((-0.125, 0.0, 0.0)),
+                        )
+                    )
+                parent = link
+            builder.add_articulation(joints)
+        model = builder.finalize()
+        solver = SolverFBA(
+            model, iterations=5, nsn_sparse_storage=True, nsn_linear_iterations=10, contact_warmstart=True
+        )
+        s0, s1 = model.state(), model.state()
+        pipeline = newton.CollisionPipeline(model)
+        contacts, poses, captures = pipeline.contacts(), [], []
+        reserve, enter = RC.RigidRowStorage.reserve, wp.ScopedCapture.__enter__
+        count = [0]
+
+        def counting_enter(capture):
+            count[0] += 1
+            return enter(capture)
+
+        with (
+            mock.patch.object(RC.RigidRowStorage, "reserve", lambda s, m: reserve(s, capacity_scale * m)),
+            mock.patch.object(wp.ScopedCapture, "__enter__", counting_enter),
+        ):
+            for _ in range(steps):
+                count[0] = 0
+                pipeline.collide(s0, contacts)
+                solver.step(s0, s1, None, contacts, 0.01)
+                s0, s1 = s1, s0
+                poses.append(s0.body_q.numpy())
+                captures.append(count[0])
+        return solver, np.array(poses), np.array(captures)
+
+    def test_padding_rows_leave_the_steps_unchanged(self):
+        """Step alike with four times the capacity: the padding rows take no part in the solve."""
+        solver, poses, _ = self._run(60)
+        wide, wide_poses, _ = self._run(60, capacity_scale=4)
+        self.assertIsNotNone(solver._rc_padded)
+        self.assertGreaterEqual(wide._rc_n_pad, 2 * solver._rc_n_pad)
+        np.testing.assert_array_equal(wide_poses, poses)
+
+    def test_graph_replays_across_steps(self):
+        """Capture the NSN step's graph once the contacts settle, and replay it in the following steps."""
+        _, poses, captures = self._run(60)
+        self.assertEqual(captures[30:].sum(), 0)
+        np.testing.assert_allclose(poses[-1][:, 2], 0.1 + 0.2 * np.arange(4), atol=2e-3)
+
+    def test_joint_rows_follow_the_padded_contact_rows(self):
+        """Keep chains lying on the ground at rest: their joint rows join the padded contact rows after the contacts'
+        capacity, and the NSN step's graph replays across steps."""
+        solver, poses, captures = self._run(60, hinged=True)
+        self.assertIsNotNone(solver._rc_padded)
+        self.assertEqual(len(solver._rc_joint_rows_h), 20)  # two chains of two revolutes of five rows
+        self.assertEqual(solver._rc_joint_offset, 3 * solver._rc_padded.contacts)
+        self.assertEqual(captures[1:].sum(), 0)
+        np.testing.assert_allclose(poses[-1][:, :3], poses[0][:, :3], atol=1e-4)
+
+    def test_padding_rows_with_joint_rows(self):
+        """Step alike with four times the capacity: the joint rows start further on, past more padding rows, which
+        take no part in the solve; only the order of the sums changes."""
+        solver, poses, _ = self._run(60, hinged=True)
+        wide, wide_poses, _ = self._run(60, capacity_scale=4, hinged=True)
+        self.assertGreaterEqual(wide._rc_joint_offset, 2 * solver._rc_joint_offset)
+        np.testing.assert_allclose(wide_poses, poses, rtol=0.0, atol=1e-9)
+
+
 class TestSolverFBAArticulationContacts(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -289,6 +289,147 @@ class TestPCRFusedSparse(_PCRTestCase):
         (_, _), (x, _) = self._both(A, np.zeros(600), max_iter=10)
         np.testing.assert_array_equal(x, 0.0)
 
+    def test_fused_iterations_take_the_block_preconditioner(self):
+        """Take the ten iterations with an exact block preconditioner on the trailing rows, as joint rows have, as
+        ``solve_sparse`` does, to rounding."""
+        import warp.sparse as wps  # noqa: PLC0415
+
+        n, m = 600, 30
+        A = self._sparse_spd(n, seed=8)
+        b = np.random.default_rng(9).standard_normal(n)
+        block_inv = wp.array(np.linalg.inv(A[n - m :, n - m :]), dtype=wp.float64, device=self.device)
+
+        @wp.kernel
+        def apply_block(inv: wp.array2d[wp.float64], v: wp.array[wp.float64], offset: int, out: wp.array[wp.float64]):
+            i = wp.tid()
+            acc = wp.float64(0.0)
+            for j in range(inv.shape[1]):
+                acc += inv[i, j] * v[offset + j]
+            out[offset + i] = acc
+
+        def block_precond(v, out):
+            wp.launch(apply_block, m, inputs=[block_inv, v, n - m], outputs=[out], device=self.device)
+
+        rows, cols = np.nonzero(A)
+        arrays = [wp.array(a, dtype=wp.int32, device=self.device) for a in (rows, cols)]
+        W = wps.bsr_from_triplets(n, n, *arrays, wp.array(A[rows, cols], dtype=wp.float64, device=self.device))
+        out = []
+        for name in ("solve_sparse", "solve_sparse_fused"):
+            solver = NSNPCRSolver(max_n=n, device=self.device, tol=1.0e-10, max_iter=10)
+            x = wp.zeros(n, dtype=wp.float64, device=self.device)
+            rhs = wp.array(b, dtype=wp.float64, device=self.device)
+            self.assertEqual(getattr(solver, name)(W, rhs, x, block_precond=block_precond), 10)
+            out.append(x.numpy())
+        np.testing.assert_allclose(out[1], out[0], rtol=1.0e-12, atol=1.0e-14 * np.abs(out[0]).max())
+
+    def test_factored_iterations_match_the_formed_matrix(self):
+        """Take the ten iterations of ``diag(c) W diag(c) + diag(e)`` by its factors as of the matrix formed, to
+        rounding, some scalings zero as weights of contact rows are: for short rows, for long rows that take the
+        tiled product, and with a block preconditioner on trailing rows."""
+        import warp.sparse as wps  # noqa: PLC0415
+
+        @wp.kernel
+        def apply_block(inv: wp.array2d[wp.float64], v: wp.array[wp.float64], o: int, out: wp.array[wp.float64]):
+            i = wp.tid()
+            acc = wp.float64(0.0)
+            for j in range(inv.shape[1]):
+                acc += inv[i, j] * v[o + j]
+            out[o + i] = acc
+
+        rng = np.random.default_rng(10)
+        for n, density in ((600, 0.01), (400, 0.5)):
+            S = np.where(rng.random((n, n)) < density, rng.standard_normal((n, n)), 0.0)
+            S = S + S.T
+            np.fill_diagonal(S, 0.0)
+            W = S + np.diag(np.abs(S).sum(axis=1) + rng.uniform(0.5, 2.0, n))
+            c = rng.uniform(0.2, 1.5, n)
+            c[::7] = 0.0
+            e = rng.uniform(0.0, 2.0, n) + (c == 0.0)
+            A = c[:, None] * W * c[None, :] + np.diag(e)
+            b = rng.standard_normal(n)
+            rows, cols = np.nonzero(W)
+            index = [wp.array(a, dtype=wp.int32, device=self.device) for a in (rows, cols)]
+            matrices = [
+                wps.bsr_from_triplets(n, n, *index, wp.array(M[rows, cols], dtype=wp.float64, device=self.device))
+                for M in (W, A)
+            ]
+            block_inv = wp.array(np.linalg.inv(A[n - 20 :, n - 20 :]), dtype=wp.float64, device=self.device)
+
+            def block_precond(v, out, n=n, block_inv=block_inv):
+                wp.launch(apply_block, 20, inputs=[block_inv, v, n - 20], outputs=[out], device=self.device)
+
+            for precond in (None, block_precond):
+                with self.subTest(n=n, block=precond is not None):
+                    out = []
+                    for factored in (False, True):
+                        solver = NSNPCRSolver(max_n=n, device=self.device, tol=1.0e-10, max_iter=10)
+                        self.assertTrue(solver.fuses_alone(n))
+                        x = wp.zeros(n, dtype=wp.float64, device=self.device)
+                        rhs = wp.array(b, dtype=wp.float64, device=self.device)
+                        if factored:
+                            factors = [wp.array(a, dtype=wp.float64, device=self.device) for a in (c, e, np.diag(A))]
+                            solver.solve_sparse_scaled(matrices[0], *factors, rhs, x, block_precond=precond)
+                        else:
+                            solver.solve_sparse_fused(matrices[1], rhs, x, block_precond=precond)
+                        out.append(x.numpy())
+                    np.testing.assert_allclose(out[1], out[0], rtol=1.0e-10, atol=1.0e-12 * np.abs(out[0]).max())
+
+    def test_block_matrix_iterations_match_the_scalar_matrix(self):
+        """Multiply a matrix of 3x3 blocks, take its diagonal, and take the ten factored iterations with it as with
+        the same matrix in scalar entries, to rounding."""
+        import warp.sparse as wps  # noqa: PLC0415
+
+        from newton._src.solvers.fba.linear_solver import Block3Matrix  # noqa: PLC0415
+        from newton._src.solvers.fba.nsn_pcr_solver import block3_diag, block3_mv  # noqa: PLC0415
+
+        rng = np.random.default_rng(12)
+        nb = 150
+        coupled = rng.random((nb, nb)) < 0.06
+        coupled = coupled | coupled.T | np.eye(nb, dtype=bool)
+        W = np.kron(coupled, np.ones((3, 3))) * rng.standard_normal((3 * nb, 3 * nb))
+        W = W + W.T
+        W += np.diag(np.abs(W).sum(axis=1) + 1.0)
+        n = 3 * nb
+        rows, cols = np.nonzero(coupled)
+        values = np.stack([W[3 * i : 3 * i + 3, 3 * j : 3 * j + 3] for i, j in zip(rows, cols, strict=True)])
+        offsets = np.r_[0, np.cumsum(np.bincount(rows, minlength=nb))].astype(np.int32)
+        B = Block3Matrix(
+            wp.array(offsets, dtype=wp.int32, device=self.device),
+            wp.array(cols.astype(np.int32), dtype=wp.int32, device=self.device),
+            wp.array(values, dtype=wp.mat33d, device=self.device),
+            nb,
+            len(rows),
+        )
+        x = rng.standard_normal(n)
+        y = wp.zeros(n, dtype=wp.float64, device=self.device)
+        block3_mv(B, wp.array(x, dtype=wp.float64, device=self.device), y)
+        np.testing.assert_allclose(y.numpy(), W @ x, rtol=1e-12, atol=1e-12)
+        diag = wp.zeros(n, dtype=wp.float64, device=self.device)
+        block3_diag(B, diag)
+        np.testing.assert_array_equal(diag.numpy(), np.diag(W))
+
+        c = rng.uniform(0.2, 1.5, n)
+        c[::5] = 0.0
+        e = rng.uniform(0.0, 2.0, n) + (c == 0.0)
+        a_diag = c * c * np.diag(W) + e
+        r, s = np.nonzero(W)
+        S = wps.bsr_from_triplets(
+            n,
+            n,
+            wp.array(r.astype(np.int32), dtype=wp.int32, device=self.device),
+            wp.array(s.astype(np.int32), dtype=wp.int32, device=self.device),
+            wp.array(W[r, s], dtype=wp.float64, device=self.device),
+        )
+        b = wp.array(rng.standard_normal(n), dtype=wp.float64, device=self.device)
+        out = []
+        for matrix in (S, B):
+            solver = NSNPCRSolver(max_n=n, device=self.device, tol=1.0e-10, max_iter=10)
+            x = wp.zeros(n, dtype=wp.float64, device=self.device)
+            factors = [wp.array(a, dtype=wp.float64, device=self.device) for a in (c, e, a_diag)]
+            solver.solve_sparse_scaled(matrix, *factors, b, x)
+            out.append(x.numpy())
+        np.testing.assert_allclose(out[1], out[0], rtol=1.0e-10, atol=1.0e-12 * np.abs(out[0]).max())
+
     def test_checked_runs_take_solve_sparse(self):
         """Run ``solve_sparse`` itself when the iteration cap exceeds its convergence check interval."""
         A = self._sparse_spd(300, seed=6)
