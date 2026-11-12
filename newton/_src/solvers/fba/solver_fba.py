@@ -4730,7 +4730,11 @@ class SolverFBA(SolverBase):
                 device=device,
             )
             rhs, dlam = self._nsn_rhs_d[:n_rows], self._nsn_dlam_d[:n_rows]
-            self._pcr_solver.solve_sparse(A_sp, rhs, dlam, block_precond=block_precond)
+            if block_precond is None:
+                # Fixed-count runs take the fused iteration: four launches per iteration instead of a dozen.
+                self._pcr_solver.solve_sparse_fused(A_sp, rhs, dlam)
+            else:
+                self._pcr_solver.solve_sparse(A_sp, rhs, dlam, block_precond=block_precond)
             wp.launch(K.axpy_lambda_kernel, n_rows, inputs=[self._nsn_dlam_d], outputs=[self._nsn_lam_d], device=device)
             # Per-contact box clamp of the tangent multipliers; no friction without a positive normal multiplier.
             wp.launch(K.coulomb_box_clamp_kernel, M, inputs=[mu_d], outputs=[self._nsn_lam_d], device=device)
