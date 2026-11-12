@@ -207,6 +207,14 @@ Model Inputs
   the rest angle. The same ``edge_ke`` bends an FBA cloth more stiffly than a
   :class:`~newton.solvers.SolverVBD` one, which scales it by the edge length.
 - **Soft bodies**: tetrahedra with the same stretching models.
+- **Springs**: each spring of the model is a stretch element of energy
+  ``spring_stiffness / 2 (|x_b - x_a| - spring_rest_length)^2``. Its local
+  step is an ADMM step: a scaled dual, kept from step to step, corrects the
+  prox of the energy, so the iterations converge to the implicit Euler step
+  of the springs and not to a softened one. The element weighs
+  ``60 m / dt^2`` in the system matrix, ``m`` the mean mass of its two
+  particles, which sets how fast the iterations converge, not where.
+  ``spring_damping`` and ``spring_control`` are not read.
 - **Activations**: the control's ``tet_activations`` grow each tetrahedron
   to ``1 - a`` times its rest volume, so a negative activation inflates it
   and a positive one contracts it: isotropically, or along a direction per
@@ -224,7 +232,9 @@ Model Inputs
   measures every change of an element's deformation gradient, rotations
   included, so ``beta`` damps the bending of a slender part far more than its
   bending stiffness alone suggests: in ``softbody_cantilever_fba``,
-  ``rayleigh_beta=2e-5`` brings a 2.4 m beam to rest within seconds. With
+  ``rayleigh_beta=2e-5`` brings a 2.4 m beam to rest within seconds. A
+  spring enters ``K`` with its stiffness along every direction, so ``beta``
+  also damps the swinging of a chain of springs. With
   ``rayleigh_corotated=True``, ``beta`` damps the stretch rate of ARAP
   triangles instead and spares their rotation, so a released cloth flap falls
   as fast as without damping.
@@ -248,7 +258,7 @@ Model Inputs
   of a set of connected bodies than the bodies have, as kinematic loops do,
   raise ``NotImplementedError``. A body turns by at most 0.5 rad per step.
 
-FBA does not simulate springs, equality constraints, mimic joints,
+FBA does not simulate equality constraints, mimic joints,
 particle-body attachments, joint limits, drives, armature, or joint friction, or
 the inputs of :class:`~newton.Control`, and it does not read the damping
 coefficients ``tri_kd``, ``edge_kd`` and ``k_damp`` of the elements.

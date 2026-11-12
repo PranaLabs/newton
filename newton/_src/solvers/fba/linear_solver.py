@@ -260,6 +260,35 @@ def particle_masses(model: Model) -> tuple[np.ndarray, np.ndarray]:
     return mass, inv_mass
 
 
+# The penalty of a spring's ADMM stretch element, ``SPRING_INERTIA_FACTOR m / dt^2 + SPRING_BENDING_FACTOR EI / l^3``
+# with ``m`` the mean mass of its two particles: it weighs the element in the system matrix and sets how fast the
+# iterations converge, not where they converge. The element's target also holds the spring's direction within an
+# iteration, so a penalty near the stiffness converges a chain's stretch fast but its swing slowly: half the stiffness
+# left a 1 m rope of 80 springs 25-50% of its length off its implicit Euler trajectory after 10 iterations, this
+# penalty 2-11%, at the price of up to 3% stretch at its release.
+SPRING_INERTIA_FACTOR = 60.0
+SPRING_BENDING_FACTOR = 0.1
+
+
+def spring_penalties(
+    mass: np.ndarray,
+    indices: np.ndarray,
+    rest_length: np.ndarray,
+    stiffness: np.ndarray,
+    dt: float,
+    bending_stiffness: np.ndarray | None = None,
+) -> np.ndarray:
+    """The ADMM penalty ``rho`` [N/m] of each spring: ``60 m / dt^2 + 0.1 EI / l^3``, with ``m`` the mean mass of the
+    spring's particles, ``EI`` the bending stiffness [N m^2] of the rod the spring belongs to (none without
+    ``bending_stiffness``) and ``l`` its rest length; the spring's own stiffness where both its particles are held.
+    """
+    rho = SPRING_INERTIA_FACTOR * 0.5 * (mass[indices[:, 0]] + mass[indices[:, 1]]) / (dt * dt)
+    if bending_stiffness is not None:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rho = rho + np.where(rest_length > 0.0, SPRING_BENDING_FACTOR * bending_stiffness / rest_length**3, 0.0)
+    return np.where(rho > 0.0, rho, stiffness)
+
+
 def build_pd_system(
     model: Model,
     dt: float,
@@ -268,6 +297,7 @@ def build_pd_system(
     tet_weight_scale: float | np.ndarray = 1.0,
     rayleigh_alpha: np.ndarray | None = None,
     rayleigh_beta: np.ndarray | None = None,
+    spring_bending_stiffness: np.ndarray | None = None,
 ) -> tuple[CsrMatrix, dict[str, Any]]:
     """Assemble the constant scalar PD Hessian ``A`` for cloth.
 
@@ -286,6 +316,8 @@ def build_pd_system(
         rayleigh_alpha: Mass-proportional damping coefficient of each particle [1/s], or ``None`` for none.
         rayleigh_beta: Stiffness-proportional damping coefficient of each particle [s], or ``None`` for none. An
             element takes the mean of its particles' coefficients.
+        spring_bending_stiffness: Bending stiffness [N m^2] of the rod each spring belongs to, which the spring's
+            ADMM penalty grows with (see :func:`spring_penalties`), or ``None`` for springs outside rods.
 
     Returns:
         A tuple ``(A, meta)`` where ``A`` is an ``N x N`` symmetric PSD CSR
@@ -300,7 +332,13 @@ def build_pd_system(
         - ``meta["edge_quad_scale"]`` : ``np.ndarray[float64]`` shape (E,)  (3/(A0+A1))
         - ``meta["edge_weight"]`` : ``np.ndarray[float64]`` shape (E,)
         - ``meta["pin_indices"]`` : ``np.ndarray[int32]`` (packed pinned indices)
+        - ``meta["spring_indices"]`` : ``np.ndarray[int32]`` shape (S, 2), the springs with positive stiffness
+        - ``meta["spring_rest_length"]``, ``meta["spring_stiffness"]``, ``meta["spring_penalty"]`` :
+          ``np.ndarray[float64]`` shape (S,)
         - ``meta["damping"]`` : :class:`CsrMatrix` of ``C``, or ``None`` without damping
+
+    A spring is the ADMM stretch element of :func:`~newton._src.solvers.fba.kernels.project_spring_admm_kernel`:
+    its penalty ``rho`` weighs it in ``A``, and its stiffness ``k``, the physical one, in ``C``.
     """
     N = model.particle_count
     mass, inv_mass = particle_masses(model)
@@ -479,6 +517,27 @@ def build_pd_system(
                     )
                 )
 
+    # ---- Springs: ADMM stretch elements on the stencil x_b - x_a ----
+    spring_indices = np.zeros((0, 2), dtype=np.int32)
+    spring_rest = np.zeros(0, dtype=np.float64)
+    spring_k = np.zeros(0, dtype=np.float64)
+    spring_rho = np.zeros(0, dtype=np.float64)
+    if model.spring_count > 0:
+        indices = model.spring_indices.numpy().astype(np.int32).reshape(-1, 2)
+        rest = model.spring_rest_length.numpy().astype(np.float64)
+        stiffness = model.spring_stiffness.numpy().astype(np.float64)
+        keep = stiffness > 0.0
+        spring_indices, spring_rest, spring_k = indices[keep], rest[keep], stiffness[keep]
+        bending = None if spring_bending_stiffness is None else np.asarray(spring_bending_stiffness)[keep]
+        spring_rho = spring_penalties(mass, spring_indices, spring_rest, spring_k, dt, bending)
+        a, b = spring_indices[:, 0], spring_indices[:, 1]
+        rows_s = np.concatenate([a, b, a, b])
+        cols_s = np.concatenate([a, b, b, a])
+        coo_parts.append((rows_s, cols_s, np.concatenate([spring_rho, spring_rho, -spring_rho, -spring_rho])))
+        if rayleigh_beta is not None:
+            beta_k = element_beta(spring_indices) * spring_k
+            damping_parts.append((rows_s, cols_s, np.concatenate([beta_k, beta_k, -beta_k, -beta_k])))
+
     # ---- Implicit Rayleigh damping: C / dt ----
     damping = None
     if damping_parts:
@@ -506,6 +565,10 @@ def build_pd_system(
         "edge_quad_scale": edge_quad_scale,
         "edge_weight": edge_weight,
         "pin_indices": pin_indices,
+        "spring_indices": spring_indices,
+        "spring_rest_length": spring_rest,
+        "spring_stiffness": spring_k,
+        "spring_penalty": spring_rho,
         "tet_indices": tet_indices,
         "tet_rest_inv": tet_rest_inv,
         "tet_volume": tet_volume,

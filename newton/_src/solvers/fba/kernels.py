@@ -7,6 +7,8 @@ import warnings
 
 import warp as wp
 
+from ...core.reset import reset_world_selected
+
 # 3x2 matrix type: Warp has no ``wp.mat32``.
 mat32 = wp.types.matrix(shape=(3, 2), dtype=wp.float32)
 
@@ -1722,6 +1724,92 @@ def project_pin_kernel(
     k = wp.tid()
     i = pin_indices[k]
     wp.atomic_add(rhs, i, pin_stiffness * x_ref[i])
+
+
+@wp.kernel
+def project_spring_admm_kernel(
+    x: wp.array[wp.vec3],
+    springs: wp.array2d[wp.int32],
+    rest_length: wp.array[wp.float32],
+    stiffness: wp.array[wp.float32],
+    penalty: wp.array[wp.float32],
+    first: wp.array[wp.int32],
+    # in-out state
+    dual: wp.array[wp.vec3],
+    split: wp.array[wp.vec3],
+    direction: wp.array[wp.vec3],
+    # outputs
+    contrib: wp.array2d[wp.vec3],
+):
+    """ADMM local step of each spring ``(a, b)``, a stretch element of energy ``k/2 (|x_b - x_a| - l)^2``.
+
+    The element enters the system matrix with its penalty ``rho`` as PD weight. Its scaled dual ``u`` first takes
+    the gap ``(x_b - x_a) - z`` of the latest global solution to the previous split ``z``, except in a step's first
+    local step (``first[0] != 0``); the split is then the prox of the spring's energy at ``y = x_b - x_a + u``,
+
+        z = (rho |y| + k l) / (rho + k) y / |y|,
+
+    and the element's target ``z - u`` adds ``rho (z - u)`` to the right-hand side of ``b`` and its negative to
+    ``a``'s. At a fixed point ``z = x_b - x_a`` and ``rho u`` is the spring force, so the iterations converge to the
+    implicit Euler step of the spring for any ``rho > 0``. A ``y`` of length at most ``1e-9 l`` keeps the
+    spring's last direction.
+
+    Args:
+        x: Current positions [m] of the particles.
+        springs: Particle pair ``(a, b)`` of each spring, shape ``[S, 2]``.
+        rest_length: Rest length ``l`` [m] of each spring.
+        stiffness: Stiffness ``k`` [N/m] of each spring.
+        penalty: ADMM penalty ``rho`` [N/m] of each spring.
+        first: ``first[0]`` is nonzero in the first local step of a time step.
+        dual: Scaled dual ``u`` [m] of each spring, kept across steps.
+        split: Split ``z`` [m] of each spring.
+        direction: Last direction of ``y`` of each spring.
+        contrib: Right-hand-side contribution to ``a`` and ``b`` of each spring, shape ``[S, 2]``.
+    """
+    e = wp.tid()
+    a = springs[e, 0]
+    b = springs[e, 1]
+    g = x[b] - x[a]
+    u = dual[e]
+    if first[0] == 0:
+        u = u + (g - split[e])
+    y = g + u
+    n = wp.length(y)
+    l0 = rest_length[e]
+    if not wp.isfinite(n):
+        n = 0.0
+    elif n > 1.0e-9 * l0 and n > 0.0:
+        direction[e] = y / n
+    k = stiffness[e]
+    rho = penalty[e]
+    z = (rho * n + k * l0) / (rho + k) * direction[e]
+    dual[e] = u
+    split[e] = z
+    p = rho * (z - u)
+    contrib[e, 0] = -p
+    contrib[e, 1] = p
+
+
+@wp.kernel
+def clear_flag_kernel(flag: wp.array[wp.int32]):
+    """``flag[0] = 0``."""
+    flag[0] = 0
+
+
+@wp.kernel
+def clear_spring_state_kernel(
+    springs: wp.array2d[wp.int32],
+    particle_world: wp.array[wp.int32],
+    mask: wp.array[wp.bool],
+    # outputs
+    dual: wp.array[wp.vec3],
+    split: wp.array[wp.vec3],
+):
+    """Zero the ADMM dual and split of the springs whose world ``mask`` selects."""
+    e = wp.tid()
+    if reset_world_selected(particle_world[springs[e, 0]], mask, mask.shape[0] - 1):
+        dual[e] = wp.vec3(0.0)
+        split[e] = wp.vec3(0.0)
 
 
 # ---------------------------------------------------------------------------

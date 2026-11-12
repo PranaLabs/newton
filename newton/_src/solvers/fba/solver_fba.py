@@ -84,7 +84,8 @@ class SolverFBA(SolverBase):
 
     Implements a Projective Dynamics (PD) local-global iteration for cloth
     and tetrahedral soft bodies, with ARAP, corotational or Neo-Hookean
-    stretching, isometric bending of cloth and soft pin constraints. The PD
+    stretching, isometric bending of cloth, springs whose ADMM local steps
+    converge to their implicit Euler step, and soft pin constraints. The PD
     Hessian is prefactored once (nested dissection ordering, multifrontal
     LDLᵀ); the sparse inverse ``S = L⁻¹`` is computed exactly on the
     elimination tree and uploaded to Warp BSR matrices. The runtime linear
@@ -498,7 +499,8 @@ class SolverFBA(SolverBase):
                 moving = attached_shapes[dynamic[attached[attached_shapes]]]
                 if (self._shape_world_h[moving] != self._body_world_h[attached[moving]]).any():
                     raise ValueError("shapes on integrated bodies must belong to the body's world")
-            for indices in (model.tri_indices, model.tet_indices, model.edge_indices):
+            springs = None if model.spring_indices is None else model.spring_indices.reshape((-1, 2))
+            for indices in (model.tri_indices, model.tet_indices, model.edge_indices, springs):
                 if indices is not None and indices.size:
                     ids = indices.numpy()
                     worlds = self._particle_world_h[np.maximum(ids, 0)]
@@ -515,8 +517,8 @@ class SolverFBA(SolverBase):
         # ---- Validate ----
         if model.particle_count == 0 and model.body_count == 0:
             raise ValueError("SolverFBA requires deformable elements or rigid bodies")
-        if model.particle_count > 0 and model.tri_count == 0 and model.tet_count == 0:
-            raise ValueError("SolverFBA requires at least one cloth triangle or tetrahedral element")
+        if model.particle_count > 0 and model.tri_count == 0 and model.tet_count == 0 and model.spring_count == 0:
+            raise ValueError("SolverFBA requires at least one cloth triangle, tetrahedral element or spring")
         if stretching_model not in ("arap", "corotational", "neohookean"):
             raise ValueError(
                 f"stretching_model={stretching_model!r} not supported; choose 'arap', 'corotational' or 'neohookean'"
@@ -765,6 +767,10 @@ class SolverFBA(SolverBase):
         self._edge_weight_d = None
         self._edge_norm_d = None
         self._pin_indices_d = self._inactive_d = None
+        # Springs, ADMM stretch elements (filled by _setup_pd_system): their particles, rest lengths, stiffnesses and
+        # penalties, their duals, splits and last directions kept across steps, and the flag of a step's first local
+        # step.
+        self._spring_indices_d = None
 
         # Tet device data (filled by _setup_pd_system).
         self._tet_indices_d = None
@@ -806,6 +812,8 @@ class SolverFBA(SolverBase):
         self._k_add_vec3 = _K.accumulate_vec3_kernel
         self._k_gather = _K.gather_per_particle_kernel
         self._k_pin = _K.project_pin_kernel
+        self._k_spring = _K.project_spring_admm_kernel
+        self._k_clear_flag = _K.clear_flag_kernel
         self._k_bending = _K.project_bending_kernel
         self._k_tri_arap = _K.project_stretching_arap_kernel
         self._k_tri_stretch_state = _K.tri_stretch_state_kernel
@@ -1789,6 +1797,38 @@ class SolverFBA(SolverBase):
             self._tri_lame_d = wp.array(tri_lame, dtype=wp.vec2, device=model.device)
             self._tet_lame_d = wp.array(tet_lame, dtype=wp.vec2, device=model.device)
 
+    def _spring_bending_stiffness(self) -> np.ndarray | None:
+        """Bending stiffness [N m^2] of the rod each of the model's springs belongs to, for the springs' ADMM
+        penalties, or ``None`` when no spring belongs to a rod."""
+        return None
+
+    def _setup_springs(self, meta: dict) -> None:
+        """Upload the springs of :func:`~newton._src.solvers.fba.linear_solver.build_pd_system`'s ``meta`` and
+        start their ADMM state: zero duals and splits, and the rest directions."""
+        from .linear_solver import build_particle_element_csr  # noqa: PLC0415
+
+        springs = meta["spring_indices"]
+        if springs.shape[0] == 0:
+            self._spring_indices_d = None
+            return
+        device = self._device
+        x0 = self.model.particle_q.numpy().astype(np.float64)
+        rest = x0[springs[:, 1]] - x0[springs[:, 0]]
+        length = np.linalg.norm(rest, axis=1)
+        direction = np.where(length[:, None] > 0.0, rest / np.maximum(length, 1.0e-30)[:, None], [1.0, 0.0, 0.0])
+        self._spring_indices_d = wp.array(springs.astype(np.int32), dtype=wp.int32, device=device)
+        f32 = (meta["spring_rest_length"], meta["spring_stiffness"], meta["spring_penalty"])
+        self._spring_rest_d, self._spring_k_d, self._spring_rho_d = (
+            wp.array(a.astype(np.float32), dtype=wp.float32, device=device) for a in f32
+        )
+        self._spring_dual_d = wp.zeros(springs.shape[0], dtype=wp.vec3, device=device)
+        self._spring_split_d = wp.zeros(springs.shape[0], dtype=wp.vec3, device=device)
+        self._spring_dir_d = wp.array(direction.astype(np.float32), dtype=wp.vec3, device=device)
+        self._spring_first_d = wp.ones(1, dtype=wp.int32, device=device)
+        self._spring_contrib_d = wp.zeros((springs.shape[0], 2), dtype=wp.vec3, device=device)
+        csr = build_particle_element_csr(springs, int(self.model.particle_count), 2)
+        self._particle_spring_csr_d = tuple(wp.array(a, dtype=wp.int32, device=device) for a in csr)
+
     def _setup_pd_system(self, dt: float) -> None:
         """Build / rebuild the PD Hessian, factor it, and upload device data."""
         self._update_materials()
@@ -1808,6 +1848,7 @@ class SolverFBA(SolverBase):
             tet_weight_scale=self._tet_gauge,
             rayleigh_alpha=self._rayleigh_alpha,
             rayleigh_beta=self._rayleigh_beta,
+            spring_bending_stiffness=self._spring_bending_stiffness(),
         )
         worlds = self._particle_world_h if self.model.world_count > 1 else None
         fs = factorize_and_sparse_inverse(A, self.model.particle_q.numpy(), worlds)
@@ -1927,6 +1968,7 @@ class SolverFBA(SolverBase):
                 dtype=wp.int32,
                 device=device,
             )
+        self._setup_springs(meta)
         if meta["tet_indices"].shape[0] > 0:
             self._tet_indices_d = wp.array(
                 meta["tet_indices"].flatten().astype(np.int32),
@@ -2249,6 +2291,8 @@ class SolverFBA(SolverBase):
             wp.launch(self._k_tri_stretch_state, model.tri_count, inputs, outputs, device=device)
         # Initialize current iterate x_cur = x_inertia (copy).
         wp.copy(self._x_cur, self._x_inertia)
+        if self._spring_indices_d is not None:
+            self._spring_first_d.fill_(1)
         # The contact forces of the step's sparse lite rows accumulate from zero.
         if self.nsn_lite_accumulate and (M > 0 or n_b):
             self._ensure_accumulation_buffers(3 * M + n_b)
@@ -2743,6 +2787,16 @@ class SolverFBA(SolverBase):
                 outputs=[self._rhs],
                 device=device,
             )
+        # Spring stretching projection, ADMM: deterministic (compute -> gather) scatter. The first local step of a
+        # time step clears the flag that keeps the duals from taking the previous step's splits.
+        if self._spring_indices_d is not None:
+            S = self._spring_indices_d.shape[0]
+            inputs = [self._x_cur, self._spring_indices_d, self._spring_rest_d, self._spring_k_d, self._spring_rho_d]
+            outputs = [self._spring_dual_d, self._spring_split_d, self._spring_dir_d, self._spring_contrib_d]
+            wp.launch(self._k_spring, S, [*inputs, self._spring_first_d], outputs, device=device)
+            wp.launch(self._k_clear_flag, 1, [self._spring_first_d], device=device)
+            inputs = [self._spring_contrib_d, *self._particle_spring_csr_d]
+            wp.launch(self._k_gather, dim=N, inputs=inputs, outputs=[self._rhs], device=device)
         # Tet stretching projection: deterministic compute+gather.
         if self._tet_indices_d is not None and model.tet_count > 0:
             if self.stretching_model == "arap":
@@ -3250,8 +3304,8 @@ class SolverFBA(SolverBase):
         """Restore selected body and particle state and clear the selected worlds' solver history.
 
         Requested fields are copied from the model defaults. Missing State arrays are skipped.
-        With ``flags=0``, the supplied physical state is preserved; friction anchors and warm-start
-        multipliers are cleared regardless of flags. Bodies are left untouched when
+        With ``flags=0``, the supplied physical state is preserved; friction anchors, warm-start
+        multipliers and the springs' ADMM duals are cleared regardless of flags. Bodies are left untouched when
         ``integrate_with_external_rigid_solver=True``.
 
         FBA uses maximal body coordinates, so ``JOINT_Q`` and ``JOINT_QD`` are ignored. To reset
@@ -3358,7 +3412,16 @@ class SolverFBA(SolverBase):
                         [ws.bilateral_lam, ws.bilateral_omega],
                         device=device,
                     )
+            if self._spring_indices_d is not None:
+                from .kernels import clear_spring_state_kernel  # noqa: PLC0415
+
+                inputs = [self._spring_indices_d, model.particle_world, world_mask]
+                outputs = [self._spring_dual_d, self._spring_split_d]
+                wp.launch(clear_spring_state_kernel, self._spring_indices_d.shape[0], inputs, outputs, device=device)
             return
+        if self._spring_indices_d is not None:
+            self._spring_dual_d.zero_()
+            self._spring_split_d.zero_()
         self._anchor_count = 0
         if self.friction_anchors and self.model.particle_count:
             self._anchor_step_d.fill_(-2)
