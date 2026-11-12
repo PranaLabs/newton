@@ -1020,14 +1020,18 @@ class SolverFBA(SolverBase):
                 storage.begin()
                 if R:
                     storage.select_joint_rows(joint_rows)
-        self._rc_padded = storage
+        self._rc_padded, self._rc_blocked = storage, False
         if storage is None:
             self._rc_joint_rows_d = wp.array(joint_rows, dtype=wp.int32, device=device)
             self._rc_joint_offset, self._rc_n_pad = n_s + n_c, n
         else:
             self._rc_joint_rows_d = storage.joint_select
             self._rc_joint_offset = 3 * storage.contacts
-            self._rc_n_pad = 3 * storage.contacts + storage.joint_rows
+            self._rc_n_pad = 3 * storage.contacts + storage.joint_section
+            # Padded rows whose PCR runs fused keep W in 3x3 blocks of three rows, which it multiplies with fewer
+            # column reads than scalar entries.
+            self._ensure_pcr_solver(self._rc_n_pad)
+            self._rc_blocked = self._pcr_solver.fuses_single(self._rc_n_pad)
         if storage is None:
             self._rc_row_slot_d = wp.full((n, 2), -1, dtype=wp.int32, device=device)
             self._rc_row_jac_d = wp.zeros((n, 2), dtype=wp.spatial_vectord, device=device)
@@ -1362,8 +1366,16 @@ class SolverFBA(SolverBase):
 
         if not n_s:
             # Rows on bodies alone: the body slots are the groups, sorted on the device. Padded rows keep the pattern
-            # in their storage.
-            start, rows, _ = slot_entries(self._rc_row_slot_d, n, self._rigid_bodies_d.shape[0], distinct=True)
+            # in their storage, of blocks of three rows that couple where any of their rows share a slot.
+            slots = self._rigid_bodies_d.shape[0]
+            if self._rc_blocked:
+                from .rigid import BLOCK_GROUPS, block_slot_groups_kernel, group_entries  # noqa: PLC0415
+
+                groups = wp.empty((n // 3, BLOCK_GROUPS), dtype=wp.int32, device=self._device)
+                wp.launch(block_slot_groups_kernel, n // 3, [self._rc_row_slot_d], [groups], device=self._device)
+                start, rows = group_entries(groups, slots)
+                return pattern_from_groups(groups, start, rows, self._rc_padded.blocks)
+            start, rows, _ = slot_entries(self._rc_row_slot_d, n, slots, distinct=True)
             storage = None if self._rc_padded is None else self._rc_padded.csr
             return pattern_from_groups(self._rc_row_slot_d, start, rows, storage)
         slots = self._rc_row_slot_d.numpy()
@@ -1387,24 +1399,38 @@ class SolverFBA(SolverBase):
             from .rigid import DELASSUS_LANES, rigid_delassus_rows_kernel, rigid_row_minv_jac_kernel  # noqa: PLC0415
 
             offsets, columns, nnz = self._rc_W_pattern
-            # Padded rows, on bodies alone, take W at their pattern in their storage, its few zero entries
-            # included; the other rows drop the zero entries of their pattern.
             padded = self._rc_padded
-            values = (
-                padded.csr.matrices[0].values
-                if padded is not None
-                else wp.empty(max(nnz, 1), dtype=wp.float64, device=device)
-            )
             soft = self._linear_solver.W_sparse[0] if n_s else None
             soft = (
                 [soft.offsets, soft.columns, soft.values] if n_s else [wp.zeros(1, dtype=wp.int32, device=device)] * 2
             )
             if not n_s:
                 soft.append(wp.empty(1, dtype=wp.float64, device=device))
-            # Each row side's A⁻¹ Jᵀ once, then each row's entries by a block of lanes.
+            # Each row side's A⁻¹ Jᵀ once, then each row's entries, or each block row's blocks, by a block of lanes.
             minv_jac = wp.empty_like(self._rc_row_jac_d)
             inputs = [self._rc_row_slot_d, self._rc_row_jac_d, self._slot_inv_mass_d]
             wp.launch(rigid_row_minv_jac_kernel, (n, 2), inputs=inputs, outputs=[minv_jac], device=device)
+            if self._rc_blocked:
+                from .rigid import rigid_delassus_blocks_kernel  # noqa: PLC0415
+
+                W = padded.blocks.matrix
+                wp.launch_tiled(
+                    rigid_delassus_blocks_kernel,
+                    dim=n // 3,
+                    inputs=[offsets, columns, self._rc_row_slot_d, self._rc_row_jac_d, minv_jac],
+                    outputs=[W.values],
+                    block_dim=DELASSUS_LANES,
+                    device=device,
+                )
+                self._rc_W_sparse = (W, None)
+                return
+            # Padded rows, on bodies alone, take W at their pattern in their storage, its few zero entries
+            # included; the other rows drop the zero entries of their pattern.
+            values = (
+                padded.csr.matrices[0].values
+                if padded is not None
+                else wp.empty(max(nnz, 1), dtype=wp.float64, device=device)
+            )
             inputs = [offsets, columns, *soft, n_s, n - self._rc_n_b, self._rc_row_slot_d, self._rc_row_jac_d, minv_jac]
             wp.launch_tiled(
                 rigid_delassus_rows_kernel,
@@ -4741,17 +4767,27 @@ class SolverFBA(SolverBase):
         from . import kernels as K  # noqa: PLC0415
 
         device, dt_w = self._device, wp.float64(dt)
+        from .nsn_pcr_solver import block3_diag, block3_mv  # noqa: PLC0415
+
         W_sp, A_sp = W_sparse
         self._ensure_nsn_sparse_scratch(n_rows)
         ol, wol, diag, shift, a_diag = (a[:n_rows] for a in self._nsn_sparse_scratch)
         pcr = self._pcr_solver
         lam, omega = self._nsn_lam_d[:n_rows], self._nsn_omega_d[:n_rows]
+        # W in 3x3 blocks, of padded rigid rows, comes with a fused PCR, which applies the Newton matrix factored.
+        blocked = getattr(W_sp, "block3", False)
+        if blocked and not pcr.fuses_alone(n_rows):
+            raise RuntimeError("SolverFBA keeps W in 3x3 blocks only for a fused PCR")
+        product = block3_mv if blocked else wps.bsr_mv
         # Frictional precond: dt²·W_ii for normal rows; dt·W_ii for tangents.
-        wps.bsr_get_diag(W_sp, out=diag)
+        if blocked:
+            block3_diag(W_sp, diag)
+        else:
+            wps.bsr_get_diag(W_sp, out=diag)
         wp.launch(K.precond_from_bsr_diag_coulomb_kernel, n_rows, [diag, dt_w], [self._nsn_precond_d], device=device)
         for _ in range(max_iters):
             wp.launch(K.compute_omega_times_lam_kernel, n_rows, [omega, lam], [ol], device=device)
-            wps.bsr_mv(W_sp, ol, wol)
+            product(W_sp, ol, wol)
             outputs = [self._nsn_penetration_d]
             wp.launch(K.compute_penetration_sparse_kernel, n_rows, [r_d, wol, dt_w], outputs, device=device)
             wp.launch(
@@ -4783,7 +4819,7 @@ class SolverFBA(SolverBase):
                 inputs += [self._nsn_contact_scale, int(W_sp.nrow)]
                 wp.launch(K.build_a_schur_csr_kernel, int(W_sp.nnz), inputs, [A_sp.values], device=device)
             wp.launch(K.compute_omega_times_lam_kernel, n_rows, [omega, lam], [ol], device=device)
-            wps.bsr_mv(W_sp, ol, wol)
+            product(W_sp, ol, wol)
             wp.launch(
                 K.compute_nsn_rhs_lite_bsr_kernel,
                 dim=n_rows,
