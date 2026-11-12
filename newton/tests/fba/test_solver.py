@@ -4830,5 +4830,57 @@ class TestLiteContactsOnBoxes(unittest.TestCase):
         np.testing.assert_allclose(heights, self._drop_on_boxes(1, "lite")[0], rtol=0.0, atol=1.0e-4)
 
 
+class TestContactOverflow(unittest.TestCase):
+    """Steps whose collision pipeline found more contacts than its buffers hold."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not wp.is_cuda_available():
+            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
+
+    def _step(self, builder, **capacity):
+        """Collide and step once, returning the stored contacts and the found ones."""
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=5, nsn_linear_iterations=10)
+        s0, s1 = model.state(), model.state()
+        pipeline = CollisionPipeline(model, verify_buffers=False, **capacity)
+        contacts = pipeline.contacts()
+        pipeline.collide(s0, contacts)
+        with self.assertWarns(RuntimeWarning):
+            solver.step(s0, s1, None, contacts, 0.01)
+        for a in (s1.body_q, s1.particle_q):
+            self.assertTrue(a is None or np.isfinite(a.numpy()).all())
+        return contacts
+
+    def test_rigid_overflow(self):
+        """Step a box on the ground with room for two of its contacts."""
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        builder.add_shape_box(builder.add_body(xform=wp.transform((0.0, 0.0, 0.5), wp.quat_identity())))
+        contacts = self._step(builder, rigid_contact_max=2)
+        self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 2)
+
+    def test_soft_overflow(self):
+        """Step a cloth on the ground with room for one of its particles' contacts."""
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0, 0.0, 0.005),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=1,
+            dim_y=1,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=1000.0,
+            tri_ka=0.0,
+            tri_kd=0.0,
+            particle_radius=0.01,
+        )
+        contacts = self._step(builder, soft_contact_max=1)
+        self.assertGreater(int(contacts.soft_contact_count.numpy()[0]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

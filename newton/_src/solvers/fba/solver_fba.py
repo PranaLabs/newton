@@ -15,7 +15,7 @@ from ...core.reset import reset_state_array
 from ...geometry import ParticleFlags
 from ...sim import BodyFlags, Contacts, Control, Model, ModelFlags, State, StateFlags
 from ..solver import SolverBase
-from .kernels import host_head
+from .kernels import host_head, stored_contact_count
 
 if TYPE_CHECKING:
     from numpy.typing import ArrayLike
@@ -3512,7 +3512,10 @@ class SolverFBA(SolverBase):
         # With a face contact margin, triangles can touch shapes that no particle touches.
         other_contacts = self._face_query is not None and self.face_contact_gap is not None
         other_contacts = other_contacts or self._self_contact is not None
-        M_raw = 0 if contacts is None else int(contacts.soft_contact_count.numpy()[0])
+        M_raw = 0
+        if contacts is not None:
+            capacity = contacts.soft_contact_particle.shape[0]
+            M_raw = stored_contact_count(contacts.soft_contact_count, capacity, "soft")
         if M_raw == 0 and not other_contacts:
             self._contact_count = 0
             return
