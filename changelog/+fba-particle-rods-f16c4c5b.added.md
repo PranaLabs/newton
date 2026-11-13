@@ -1,0 +1,1 @@
+Add particle rods to `SolverFBA`: `SolverFBA.add_particle_rod` lays an elastic rod along a polyline as particles, axial springs and bending elements that `SolverFBA.register_custom_attributes` registers as the custom frequency `fba:rod_bend`.

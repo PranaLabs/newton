@@ -7,6 +7,8 @@ import warnings
 
 import warp as wp
 
+from ...core.reset import reset_world_selected
+
 # 3x2 matrix type: Warp has no ``wp.mat32``.
 mat32 = wp.types.matrix(shape=(3, 2), dtype=wp.float32)
 
@@ -1722,6 +1724,232 @@ def project_pin_kernel(
     k = wp.tid()
     i = pin_indices[k]
     wp.atomic_add(rhs, i, pin_stiffness * x_ref[i])
+
+
+@wp.kernel
+def update_spring_dual_kernel(
+    x: wp.array[wp.vec3],
+    springs: wp.array2d[wp.int32],
+    rest_length: wp.array[wp.float32],
+    split: wp.array[wp.vec3],
+    first: wp.array[wp.int32],
+    # in-out state
+    dual: wp.array[wp.vec3],
+    direction: wp.array[wp.vec3],
+    # outputs
+    residual: wp.array[wp.float32],
+):
+    """Dual step of each spring ``(a, b)`` of :func:`project_spring_admm_kernel`: except in a step's first local
+    step (``first[0] != 0``), its scaled dual ``u`` takes the gap ``(x_b - x_a) - z`` of the latest global solution
+    to the previous split ``z``, and ``residual`` keeps the gap along the spring, the stretch that
+    :func:`spring_chain_tension_kernel` corrects the tensions for. The dual then keeps its part along the spring
+    alone, a tension, as a spring's force acts along it; in a step's first local step this turns the previous step's
+    tension to the spring's new direction. ``direction`` takes the spring's direction ``(x_b - x_a) / |x_b - x_a|``,
+    and keeps its last one where the spring is shorter than ``1e-9 l``.
+
+    Args:
+        x: Current positions [m] of the particles.
+        springs: Particle pair ``(a, b)`` of each spring, shape ``[S, 2]``.
+        rest_length: Rest length ``l`` [m] of each spring.
+        split: Split ``z`` [m] of each spring.
+        first: ``first[0]`` is nonzero in the first local step of a time step.
+        dual: Scaled dual ``u`` [m] of each spring, kept across steps.
+        direction: Direction of each spring.
+        residual: Gap [m] along each spring.
+    """
+    e = wp.tid()
+    g = x[springs[e, 1]] - x[springs[e, 0]]
+    n = wp.length(g)
+    if wp.isfinite(n) and n > 1.0e-9 * rest_length[e]:
+        direction[e] = g / n
+    d = direction[e]
+    u = dual[e]
+    r = wp.float32(0.0)
+    if first[0] == 0:
+        gap = g - split[e]
+        u = u + gap
+        r = wp.dot(gap, d)
+    dual[e] = wp.dot(u, d) * d
+    residual[e] = r
+
+
+@wp.kernel
+def spring_chain_tension_kernel(
+    chain_offsets: wp.array[wp.int32],
+    chain_springs: wp.array[wp.int32],
+    chain_diagonal: wp.array[wp.float32],
+    chain_link: wp.array[wp.float32],
+    chain_bend: wp.array[wp.float32],
+    chain_bend_scale: wp.array[wp.float32],
+    residual: wp.array[wp.float32],
+    direction: wp.array[wp.vec3],
+    penalty: wp.array[wp.float32],
+    first: wp.array[wp.int32],
+    # scratch
+    sweep_c: wp.array[wp.float32],
+    sweep_d: wp.array[wp.float32],
+    # in-out state
+    dual: wp.array[wp.vec3],
+):
+    """Tension solve of each chain of springs after their dual steps, one thread per chain, except in a step's first
+    local step.
+
+    A spring's dual step raises its tension by ``rho r`` for the stretch ``r`` beyond its target, an exact step for
+    stretch that moves the spring's particles alone, but long stretch waves along a chain move many particles and
+    converge slowly at that rate. With ``t`` the springs' directions and the particle positions responding through
+    their inverse masses ``w`` over a step ``h`` alone, the stretches respond to tensions through the tridiagonal
+    ``B = h^2 D_t W D_t^T`` of each chain, ``D_t`` the springs' stretch along ``t``; adding ``T = (B + C)^-1 r`` to
+    the tensions, with ``C = 1 / (k - rho)`` the compliance that the dual step leaves out, completes the Newton step
+    of the tensions of a chain whose particles nothing else holds, and stays below it where more holds them: the
+    system matrix holds the particles at least by their masses and the penalties. A rod's bending element, in the
+    system matrix, also resists a difference of the stretches of its two springs with ``kappa = EI / (v l_- l_+)``:
+    the solve adds ``L r`` for the chain's ``L`` of these, ``kappa`` on the diagonal from each bend at a spring's
+    ends and the bend's ``kappa`` times the cosine of its angle, with the signs of the springs' ends, between its
+    two springs. Each spring's row of ``L r`` takes the factor ``1 / (1 + L_ii C)``: where the bends hold a
+    spring's stretch as firmly as its own stiffness, as in a plug, the spring's compliance ``C`` in series bounds
+    the step. The fixed point is unchanged, as ``r`` vanishes there.
+
+    Args:
+        chain_offsets: Start of each chain in ``chain_springs``, shape ``[C + 1]``.
+        chain_springs: The springs of each chain in their order along it, shape ``[S]``.
+        chain_diagonal: ``B + C`` on the diagonal at each place of ``chain_springs``.
+        chain_link: ``h^2 w`` of the particle that a place's spring shares with the next, times the signs with which
+            it enters the two, zero at a chain's end; ``B`` couples the two by it times the cosine of their angle.
+        chain_bend: ``kappa`` [N/m] of the bend at the particle that a place's spring shares with the next, times
+            the same signs, zero without one.
+        chain_bend_scale: ``1 / (1 + L_ii C)`` of each place's spring.
+        residual: Stretch ``r`` [m] of each spring from :func:`update_spring_dual_kernel`.
+        direction: Direction ``t`` of each spring.
+        penalty: ADMM penalty ``rho`` [N/m] of each spring.
+        first: ``first[0]`` is nonzero in the first local step of a time step.
+        sweep_c: Scratch of the forward sweep, shape ``[S]``.
+        sweep_d: Scratch of the forward sweep, shape ``[S]``.
+        dual: Scaled dual ``u`` [m] of each spring, which takes ``T / rho`` along ``t``.
+    """
+    c = wp.tid()
+    if first[0] != 0:
+        return
+    start = chain_offsets[c]
+    end = chain_offsets[c + 1]
+    # Thomas algorithm: B is weakly diagonally dominant, each coupling at most the shared particle's term.
+    lower = wp.float32(0.0)
+    for i in range(start, end):
+        e = chain_springs[i]
+        upper = wp.float32(0.0)
+        if i + 1 < end:
+            upper = chain_link[i] * wp.dot(direction[e], direction[chain_springs[i + 1]])
+        diagonal = chain_diagonal[i]
+        rhs = residual[e]
+        if i > start:
+            diagonal = diagonal - lower * sweep_c[i - 1]
+            rhs = rhs - lower * sweep_d[i - 1]
+        sweep_c[i] = upper / diagonal
+        sweep_d[i] = rhs / diagonal
+        lower = upper
+    tension = wp.float32(0.0)
+    for j in range(end - start):
+        i = end - 1 - j
+        tension = sweep_d[i] - sweep_c[i] * tension
+        e = chain_springs[i]
+        bend = wp.float32(0.0)
+        if i > start:
+            k = chain_bend[i - 1]
+            f = chain_springs[i - 1]
+            bend += wp.abs(k) * residual[e] + k * wp.dot(direction[f], direction[e]) * residual[f]
+        if i + 1 < end:
+            k = chain_bend[i]
+            f = chain_springs[i + 1]
+            bend += wp.abs(k) * residual[e] + k * wp.dot(direction[e], direction[f]) * residual[f]
+        dual[e] = dual[e] + (tension + chain_bend_scale[i] * bend) / penalty[e] * direction[e]
+
+
+@wp.kernel
+def project_spring_admm_kernel(
+    x: wp.array[wp.vec3],
+    springs: wp.array2d[wp.int32],
+    rest_length: wp.array[wp.float32],
+    stiffness: wp.array[wp.float32],
+    penalty: wp.array[wp.float32],
+    damping: wp.array[wp.float32],
+    start_length: wp.array[wp.float32],
+    dual: wp.array[wp.vec3],
+    direction: wp.array[wp.vec3],
+    # outputs
+    split: wp.array[wp.vec3],
+    contrib: wp.array2d[wp.vec3],
+):
+    """ADMM local step of each spring ``(a, b)``, a stretch element of energy ``k/2 (|x_b - x_a| - l)^2``.
+
+    The element enters the system matrix with its penalty ``rho`` as PD weight. After the dual steps of
+    :func:`update_spring_dual_kernel` and :func:`spring_chain_tension_kernel`, its split is the prox of the spring's
+    energy along the spring's direction ``d`` at the signed length ``s = (x_b - x_a + u) . d``, with the viscous term
+    ``c / 2 (|z| - r_0)^2`` of a damping ``c`` [N/m] on its length ``r_0`` at the step's start,
+
+        z = (rho s + k l + c r_0) / (rho + k + c) d,
+
+    and the element's target ``z - u`` adds ``rho (z - u)`` to the right-hand side of ``b`` and its negative to
+    ``a``'s. At a fixed point ``z = x_b - x_a`` and ``rho u`` is the spring force, so the iterations converge to the
+    implicit Euler step of the spring for any ``rho > 0``. Along ``d``, a dual that pushes the particles apart harder
+    than ``rho |x_b - x_a|`` leaves a positive split, where the prox at ``x_b - x_a + u`` would turn the spring over.
+
+    Args:
+        x: Current positions [m] of the particles.
+        springs: Particle pair ``(a, b)`` of each spring, shape ``[S, 2]``.
+        rest_length: Rest length ``l`` [m] of each spring.
+        stiffness: Stiffness ``k`` [N/m] of each spring.
+        penalty: ADMM penalty ``rho`` [N/m] of each spring.
+        damping: Damping ``c = beta k / dt`` [N/m] of each spring's length rate, zero for none.
+        start_length: Length ``r_0`` [m] of each spring at the step's start.
+        dual: Scaled dual ``u`` [m] of each spring.
+        direction: Direction ``d`` of each spring, from :func:`update_spring_dual_kernel`.
+        split: Split ``z`` [m] of each spring.
+        contrib: Right-hand-side contribution to ``a`` and ``b`` of each spring, shape ``[S, 2]``.
+    """
+    e = wp.tid()
+    a = springs[e, 0]
+    b = springs[e, 1]
+    u = dual[e]
+    d = direction[e]
+    s = wp.dot(x[b] - x[a] + u, d)
+    if not wp.isfinite(s):
+        s = 0.0
+    k = stiffness[e]
+    rho = penalty[e]
+    c = damping[e]
+    z = (rho * s + k * rest_length[e] + c * start_length[e]) / (rho + k + c) * d
+    split[e] = z
+    p = rho * (z - u)
+    contrib[e, 0] = -p
+    contrib[e, 1] = p
+
+
+@wp.kernel
+def spring_length_kernel(x: wp.array[wp.vec3], springs: wp.array2d[wp.int32], length: wp.array[wp.float32]):
+    """The length of each spring."""
+    e = wp.tid()
+    length[e] = wp.length(x[springs[e, 1]] - x[springs[e, 0]])
+
+
+@wp.kernel
+def clear_flag_kernel(flag: wp.array[wp.int32]):
+    """``flag[0] = 0``."""
+    flag[0] = 0
+
+
+@wp.kernel
+def clear_spring_state_kernel(
+    springs: wp.array2d[wp.int32],
+    particle_world: wp.array[wp.int32],
+    mask: wp.array[wp.bool],
+    # outputs
+    dual: wp.array[wp.vec3],
+    split: wp.array[wp.vec3],
+):
+    """Zero the ADMM dual and split of the springs whose world ``mask`` selects."""
+    e = wp.tid()
+    if reset_world_selected(particle_world[springs[e, 0]], mask, mask.shape[0] - 1):
+        dual[e] = wp.vec3(0.0)
+        split[e] = wp.vec3(0.0)
 
 
 # ---------------------------------------------------------------------------

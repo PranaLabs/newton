@@ -13,7 +13,7 @@ import warp as wp
 
 from ...core.reset import reset_state_array
 from ...geometry import ParticleFlags
-from ...sim import BodyFlags, Contacts, Control, Model, ModelFlags, State, StateFlags
+from ...sim import BodyFlags, Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
 from ..solver import SolverBase
 from .kernels import host_head, stored_contact_count
 
@@ -84,7 +84,8 @@ class SolverFBA(SolverBase):
 
     Implements a Projective Dynamics (PD) local-global iteration for cloth
     and tetrahedral soft bodies, with ARAP, corotational or Neo-Hookean
-    stretching, isometric bending of cloth and soft pin constraints. The PD
+    stretching, isometric bending of cloth, springs whose ADMM local steps
+    converge to their implicit Euler step, and soft pin constraints. The PD
     Hessian is prefactored once (nested dissection ordering, multifrontal
     LDLᵀ); the sparse inverse ``S = L⁻¹`` is computed exactly on the
     elimination tree and uploaded to Warp BSR matrices. The runtime linear
@@ -447,9 +448,13 @@ class SolverFBA(SolverBase):
                 bulge flattens as fast as without damping, while stretch
                 waves stay damped. The system matrix is unchanged; each
                 iteration's right-hand side turns the triangle's stretch at
-                the step's start with its current rotation. Bending and
-                tetrahedra keep the constant damping. Needs
-                ``stretching_model="arap"`` and a nonzero ``rayleigh_beta``.
+                the step's start with its current rotation. Springs, in the
+                same way, damp their length rate alone, with ``beta`` times
+                their stiffness, in their local steps, and leave the system
+                matrix's damping: a swinging chain of springs swings on,
+                while its stretch waves die out. Bending and tetrahedra keep
+                the constant damping. Needs ``stretching_model="arap"`` and a
+                nonzero ``rayleigh_beta``.
             tet_activation_directions: Direction of each tetrahedron's growth
                 in the rest frame, shape ``(tet_count, 3)``: an activation
                 ``a`` stretches it by ``1 - a`` along its direction alone,
@@ -498,7 +503,9 @@ class SolverFBA(SolverBase):
                 moving = attached_shapes[dynamic[attached[attached_shapes]]]
                 if (self._shape_world_h[moving] != self._body_world_h[attached[moving]]).any():
                     raise ValueError("shapes on integrated bodies must belong to the body's world")
-            for indices in (model.tri_indices, model.tet_indices, model.edge_indices):
+            springs = None if model.spring_indices is None else model.spring_indices.reshape((-1, 2))
+            rod_bends = getattr(getattr(model, "fba", None), "rod_bend_particles", None)
+            for indices in (model.tri_indices, model.tet_indices, model.edge_indices, springs, rod_bends):
                 if indices is not None and indices.size:
                     ids = indices.numpy()
                     worlds = self._particle_world_h[np.maximum(ids, 0)]
@@ -515,8 +522,8 @@ class SolverFBA(SolverBase):
         # ---- Validate ----
         if model.particle_count == 0 and model.body_count == 0:
             raise ValueError("SolverFBA requires deformable elements or rigid bodies")
-        if model.particle_count > 0 and model.tri_count == 0 and model.tet_count == 0:
-            raise ValueError("SolverFBA requires at least one cloth triangle or tetrahedral element")
+        if model.particle_count > 0 and model.tri_count == 0 and model.tet_count == 0 and model.spring_count == 0:
+            raise ValueError("SolverFBA requires at least one cloth triangle, tetrahedral element or spring")
         if stretching_model not in ("arap", "corotational", "neohookean"):
             raise ValueError(
                 f"stretching_model={stretching_model!r} not supported; choose 'arap', 'corotational' or 'neohookean'"
@@ -765,6 +772,10 @@ class SolverFBA(SolverBase):
         self._edge_weight_d = None
         self._edge_norm_d = None
         self._pin_indices_d = self._inactive_d = None
+        # Springs, ADMM stretch elements (filled by _setup_pd_system): their particles, rest lengths, stiffnesses and
+        # penalties, their duals, splits and last directions kept across steps, and the flag of a step's first local
+        # step.
+        self._spring_indices_d = None
 
         # Tet device data (filled by _setup_pd_system).
         self._tet_indices_d = None
@@ -806,6 +817,10 @@ class SolverFBA(SolverBase):
         self._k_add_vec3 = _K.accumulate_vec3_kernel
         self._k_gather = _K.gather_per_particle_kernel
         self._k_pin = _K.project_pin_kernel
+        self._k_spring = _K.project_spring_admm_kernel
+        self._k_spring_dual = _K.update_spring_dual_kernel
+        self._k_spring_chain = _K.spring_chain_tension_kernel
+        self._k_clear_flag = _K.clear_flag_kernel
         self._k_bending = _K.project_bending_kernel
         self._k_tri_arap = _K.project_stretching_arap_kernel
         self._k_tri_stretch_state = _K.tri_stretch_state_kernel
@@ -1789,6 +1804,109 @@ class SolverFBA(SolverBase):
             self._tri_lame_d = wp.array(tri_lame, dtype=wp.vec2, device=model.device)
             self._tet_lame_d = wp.array(tet_lame, dtype=wp.vec2, device=model.device)
 
+    def _spring_bending_stiffness(self) -> np.ndarray | None:
+        """Bending stiffness [N m^2] of the rod each of the model's springs belongs to, for the springs' ADMM
+        penalties: the largest of the bending elements that share the spring's segment, zero for a spring outside
+        rods, or ``None`` when the model has no rod bending elements."""
+        from .linear_solver import rod_bending_elements  # noqa: PLC0415
+
+        model = self.model
+        bends, stiffness = rod_bending_elements(model)
+        if bends.shape[0] == 0 or not model.spring_count:
+            return None
+        n = np.int64(max(model.particle_count, 1))
+
+        def segment_key(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+            return np.minimum(a, b).astype(np.int64) * n + np.maximum(a, b)
+
+        keys = np.concatenate([segment_key(bends[:, 0], bends[:, 1]), segment_key(bends[:, 1], bends[:, 2])])
+        values = np.concatenate([stiffness, stiffness])
+        order = np.argsort(keys, kind="stable")
+        unique, first = np.unique(keys[order], return_index=True)
+        largest = np.maximum.reduceat(values[order], first)
+        springs = model.spring_indices.numpy().reshape(-1, 2)
+        spring_keys = segment_key(springs[:, 0], springs[:, 1])
+        at = np.minimum(np.searchsorted(unique, spring_keys), unique.size - 1)
+        return np.where(unique[at] == spring_keys, largest[at], 0.0)
+
+    def _setup_springs(self, meta: dict, dt: float) -> None:
+        """Upload the springs of :func:`~newton._src.solvers.fba.linear_solver.build_pd_system`'s ``meta`` and
+        start their ADMM state: zero duals and splits, and the rest directions; with corotated damping, also each
+        spring's damping ``beta k / dt`` of its length rate; and the chains of the tension solve,
+        :func:`~newton._src.solvers.fba.kernels.spring_chain_tension_kernel`."""
+        from .linear_solver import build_particle_element_csr, particle_masses, spring_chains  # noqa: PLC0415
+
+        springs = meta["spring_indices"]
+        if springs.shape[0] == 0:
+            self._spring_indices_d = None
+            return
+        device = self._device
+        x0 = self.model.particle_q.numpy().astype(np.float64)
+        rest = x0[springs[:, 1]] - x0[springs[:, 0]]
+        length = np.linalg.norm(rest, axis=1)
+        direction = np.where(length[:, None] > 0.0, rest / np.maximum(length, 1.0e-30)[:, None], [1.0, 0.0, 0.0])
+        self._spring_indices_d = wp.array(springs.astype(np.int32), dtype=wp.int32, device=device)
+        f32 = (meta["spring_rest_length"], meta["spring_stiffness"], meta["spring_penalty"])
+        self._spring_rest_d, self._spring_k_d, self._spring_rho_d = (
+            wp.array(a.astype(np.float32), dtype=wp.float32, device=device) for a in f32
+        )
+        damping = meta["spring_beta"] * meta["spring_stiffness"] / dt
+        self._spring_damped = bool((damping > 0.0).any())
+        self._spring_c_d = wp.array(damping.astype(np.float32), dtype=wp.float32, device=device)
+        self._spring_len0_d = wp.zeros(springs.shape[0], dtype=wp.float32, device=device)
+        self._spring_dual_d = wp.zeros(springs.shape[0], dtype=wp.vec3, device=device)
+        self._spring_split_d = wp.zeros(springs.shape[0], dtype=wp.vec3, device=device)
+        self._spring_dir_d = wp.array(direction.astype(np.float32), dtype=wp.vec3, device=device)
+        self._spring_first_d = wp.ones(1, dtype=wp.int32, device=device)
+        self._spring_contrib_d = wp.zeros((springs.shape[0], 2), dtype=wp.vec3, device=device)
+        csr = build_particle_element_csr(springs, int(self.model.particle_count), 2)
+        self._particle_spring_csr_d = tuple(wp.array(a, dtype=wp.int32, device=device) for a in csr)
+        # The tension solve: per place along each chain, the diagonal h^2 (w_a + w_b) + 1 / (k + c - rho) and the
+        # coupling h^2 w sign to the next spring; springs no stiffer than their penalty take no correction.
+        offsets, order, link, sign, scale = spring_chains(springs, int(self.model.particle_count))
+        _, inv_mass = particle_masses(self.model)
+        stiffness = meta["spring_stiffness"] + damping
+        excess = stiffness - meta["spring_penalty"]
+        compliance = np.where(excess > 1.0e-6 * stiffness, 1.0 / np.maximum(excess, 1.0e-30), 1.0e30)
+        h2 = dt * dt
+        diagonal = h2 * (inv_mass[springs] * scale).sum(axis=1) + compliance
+        coupling = np.where(link >= 0, h2 * inv_mass[np.maximum(link, 0)] * sign, 0.0)
+        self._spring_chain_offsets_d = wp.array(offsets, dtype=wp.int32, device=device)
+        self._spring_chain_order_d = wp.array(order, dtype=wp.int32, device=device)
+        self._spring_chain_diagonal_d = wp.array(diagonal[order].astype(np.float32), dtype=wp.float32, device=device)
+        self._spring_chain_link_d = wp.array(coupling.astype(np.float32), dtype=wp.float32, device=device)
+        # The rods' bends between consecutive springs of a chain: kappa = EI / (v l_- l_+), with the coupling's signs.
+        bend = np.zeros(springs.shape[0], dtype=np.float64)
+        rod_bend, rod_weight = meta.get("rod_bend_indices"), meta.get("rod_bend_weight")
+        if rod_bend is not None and rod_bend.shape[0] > 0:
+            x_rest = self.model.particle_q.numpy().astype(np.float64)
+            l_minus = np.linalg.norm(x_rest[rod_bend[:, 1]] - x_rest[rod_bend[:, 0]], axis=1)
+            l_plus = np.linalg.norm(x_rest[rod_bend[:, 2]] - x_rest[rod_bend[:, 1]], axis=1)
+            kappa = {
+                (min(a, c), b, max(a, c)): w / (lm * lp)
+                for (a, b, c), w, lm, lp in zip(rod_bend.tolist(), rod_weight, l_minus, l_plus, strict=True)
+            }
+            # A spring between held particles has no stretch to solve for: its bends couple nothing.
+            held_spring = (inv_mass[springs] == 0.0).all(axis=1)
+            for place in np.flatnonzero(link >= 0):
+                e, f, p = int(order[place]), int(order[place + 1]), int(link[place])
+                if held_spring[e] or held_spring[f]:
+                    continue
+                a = int(springs[e, 0] if springs[e, 1] == p else springs[e, 1])
+                c = int(springs[f, 0] if springs[f, 1] == p else springs[f, 1])
+                bend[place] = kappa.get((min(a, c), p, max(a, c)), 0.0) * sign[place]
+        # A spring held by its bends as firmly as by its own stiffness takes their stiffness in series with its
+        # compliance: each place's row of the bends' term scales by 1 / (1 + L_ii C).
+        diagonal_bend = np.abs(bend) + np.abs(np.r_[0.0, bend[:-1]] * (np.r_[-1, link[:-1]] >= 0))
+        bend_scale = 1.0 / (1.0 + diagonal_bend * compliance[order])
+        self._spring_chain_bend_d = wp.array(bend.astype(np.float32), dtype=wp.float32, device=device)
+        self._spring_chain_bend_scale_d = wp.array(bend_scale.astype(np.float32), dtype=wp.float32, device=device)
+        self._spring_residual_d = wp.zeros(springs.shape[0], dtype=wp.float32, device=device)
+        self._spring_sweep_d = (
+            wp.zeros(springs.shape[0], dtype=wp.float32, device=device),
+            wp.zeros(springs.shape[0], dtype=wp.float32, device=device),
+        )
+
     def _setup_pd_system(self, dt: float) -> None:
         """Build / rebuild the PD Hessian, factor it, and upload device data."""
         self._update_materials()
@@ -1808,6 +1926,8 @@ class SolverFBA(SolverBase):
             tet_weight_scale=self._tet_gauge,
             rayleigh_alpha=self._rayleigh_alpha,
             rayleigh_beta=self._rayleigh_beta,
+            spring_bending_stiffness=self._spring_bending_stiffness(),
+            spring_corotated=self.rayleigh_corotated,
         )
         worlds = self._particle_world_h if self.model.world_count > 1 else None
         fs = factorize_and_sparse_inverse(A, self.model.particle_q.numpy(), worlds)
@@ -1927,6 +2047,7 @@ class SolverFBA(SolverBase):
                 dtype=wp.int32,
                 device=device,
             )
+        self._setup_springs(meta, dt)
         if meta["tet_indices"].shape[0] > 0:
             self._tet_indices_d = wp.array(
                 meta["tet_indices"].flatten().astype(np.int32),
@@ -2249,6 +2370,14 @@ class SolverFBA(SolverBase):
             wp.launch(self._k_tri_stretch_state, model.tri_count, inputs, outputs, device=device)
         # Initialize current iterate x_cur = x_inertia (copy).
         wp.copy(self._x_cur, self._x_inertia)
+        if self._spring_indices_d is not None:
+            self._spring_first_d.fill_(1)
+            if self._spring_damped:
+                from .kernels import spring_length_kernel  # noqa: PLC0415
+
+                inputs = [state_in.particle_q, self._spring_indices_d]
+                S = self._spring_indices_d.shape[0]
+                wp.launch(spring_length_kernel, S, inputs, [self._spring_len0_d], device=device)
         # The contact forces of the step's sparse lite rows accumulate from zero.
         if self.nsn_lite_accumulate and (M > 0 or n_b):
             self._ensure_accumulation_buffers(3 * M + n_b)
@@ -2743,6 +2872,28 @@ class SolverFBA(SolverBase):
                 outputs=[self._rhs],
                 device=device,
             )
+        # Spring stretching projection, ADMM: the dual steps, the chains' tension solve, then the prox, a
+        # deterministic (compute -> gather) scatter. The first local step of a time step clears the flag that keeps
+        # the duals from taking the previous step's splits.
+        if self._spring_indices_d is not None:
+            S = self._spring_indices_d.shape[0]
+            inputs = [self._x_cur, self._spring_indices_d, self._spring_rest_d, self._spring_split_d]
+            outputs = [self._spring_dual_d, self._spring_dir_d, self._spring_residual_d]
+            wp.launch(self._k_spring_dual, S, [*inputs, self._spring_first_d], outputs, device=device)
+            inputs = [self._spring_chain_offsets_d, self._spring_chain_order_d, self._spring_chain_diagonal_d]
+            inputs += [self._spring_chain_link_d, self._spring_chain_bend_d, self._spring_chain_bend_scale_d]
+            inputs += [self._spring_residual_d]
+            inputs += [self._spring_dir_d, self._spring_rho_d]
+            inputs += [self._spring_first_d, *self._spring_sweep_d]
+            C = self._spring_chain_offsets_d.shape[0] - 1
+            wp.launch(self._k_spring_chain, C, inputs, [self._spring_dual_d], device=device)
+            inputs = [self._x_cur, self._spring_indices_d, self._spring_rest_d, self._spring_k_d, self._spring_rho_d]
+            inputs += [self._spring_c_d, self._spring_len0_d, self._spring_dual_d, self._spring_dir_d]
+            outputs = [self._spring_split_d, self._spring_contrib_d]
+            wp.launch(self._k_spring, S, inputs, outputs, device=device)
+            wp.launch(self._k_clear_flag, 1, [self._spring_first_d], device=device)
+            inputs = [self._spring_contrib_d, *self._particle_spring_csr_d]
+            wp.launch(self._k_gather, dim=N, inputs=inputs, outputs=[self._rhs], device=device)
         # Tet stretching projection: deterministic compute+gather.
         if self._tet_indices_d is not None and model.tet_count > 0:
             if self.stretching_model == "arap":
@@ -2870,6 +3021,121 @@ class SolverFBA(SolverBase):
         inputs += [self._contact_world_anchor_d, self._contact_shape_d, model.shape_body, body_q, body_com]
         inputs += [contacts.rigid_contact_max]
         wp.launch(soft_contact_force_kernel, M, inputs, [contact_f], device=device)
+
+    @classmethod
+    def register_custom_attributes(cls, builder: ModelBuilder) -> None:
+        """Register the custom attributes of SolverFBA: the bending elements of particle rods.
+
+        Registers the custom frequency ``fba:rod_bend``, one entry per bending element, with the attributes
+        ``fba:rod_bend_particles`` (``vec3i``), the rod's particles before, at and after the bend, and
+        ``fba:rod_bend_stiffness`` (``float32``), the rod's bending stiffness ``EI`` [N·m²]. The model holds them
+        as ``model.fba.rod_bend_particles`` and ``model.fba.rod_bend_stiffness``. :meth:`add_particle_rod`
+        registers them itself.
+
+        Args:
+            builder: Model builder to register the attributes on.
+        """
+        builder.add_custom_frequency(ModelBuilder.CustomFrequency(name="rod_bend", namespace="fba"))
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="rod_bend_particles",
+                frequency="fba:rod_bend",
+                dtype=wp.vec3i,
+                namespace="fba",
+                references="particle",
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="rod_bend_stiffness",
+                frequency="fba:rod_bend",
+                dtype=wp.float32,
+                namespace="fba",
+            )
+        )
+
+    @staticmethod
+    def add_particle_rod(
+        builder: ModelBuilder,
+        points: np.ndarray | list,
+        radius: float,
+        youngs_modulus: float,
+        density: float | None = None,
+        mass: float | None = None,
+        bending_stiffness: float | ArrayLike | None = None,
+    ) -> list[int]:
+        """Add an elastic rod of circular cross-section along a polyline, as particles that SolverFBA simulates.
+
+        Each vertex becomes a particle of radius ``radius`` whose mass is the rod's line density times half the
+        length of its segments; each segment, a spring of stiffness ``E pi r^2 / l``, the rod's axial stiffness
+        over the segment's rest length ``l``; and each interior vertex, a bending element, an entry of
+        ``fba:rod_bend`` (see :meth:`register_custom_attributes`), of energy
+
+            EI / (2 v) |(x_+ - x) / l_+ - (x - x_-) / l_-|^2,
+
+        with ``x_-``, ``x`` and ``x_+`` the vertex and its neighbors, ``l_-`` and ``l_+`` the rest lengths of its
+        two segments and ``v = (l_- + l_+) / 2``: for small turns ``phi`` of the rod at the vertex,
+        ``EI / 2 kappa^2 v`` with the curvature ``kappa = phi / v``. The rod is straight at rest, whatever the
+        polyline, and has no twist. Rest lengths come from ``points``. Contacts act at the particles, so a rod
+        whose segments are longer than about twice its radius can pass thin shapes between its particles.
+
+        A particle rod is not the rod of :meth:`~newton.ModelBuilder.add_rod`, a chain of rigid capsules joined
+        by rod joints. To hold an end, set its particles' mass to zero, which pins them.
+
+        Args:
+            builder: Model builder to add the rod to.
+            points: Vertices of the polyline [m], shape ``(N, 3)``, ``N >= 2``.
+            radius: Radius of the cross-section [m], also the particles' contact radius.
+            youngs_modulus: Young's modulus ``E`` [Pa].
+            density: Density [kg/m³] of the rod's material, for the line density ``density pi r^2``. Give
+                exactly one of ``density`` and ``mass``.
+            mass: Total mass [kg] of the rod, spread evenly over its length.
+            bending_stiffness: Bending stiffness ``EI`` [N·m²], for the whole rod or one per interior vertex,
+                shape ``(N - 2,)``, as a cable stiffens toward a plug; ``E pi r^4 / 4``, that of a solid circular
+                section, if ``None``. A rope takes one far below that.
+
+        Returns:
+            The indices of the rod's particles, in the order of ``points``.
+        """
+        points = np.asarray(points, dtype=np.float64)
+        if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] < 2:
+            raise ValueError("points must have shape (N, 3) with N >= 2")
+        segment = np.linalg.norm(np.diff(points, axis=0), axis=1)
+        if not (segment > 0.0).all():
+            raise ValueError("the rod's consecutive points must be distinct")
+        if not radius > 0.0 or not youngs_modulus > 0.0:
+            raise ValueError("radius and youngs_modulus must be positive")
+        if (density is None) == (mass is None):
+            raise ValueError("give exactly one of density and mass")
+        area = np.pi * radius * radius
+        line_density = density * area if density is not None else mass / segment.sum()
+        if not line_density > 0.0:
+            raise ValueError("the rod's density or mass must be positive")
+        if bending_stiffness is None:
+            bending_stiffness = youngs_modulus * np.pi * radius**4 / 4.0
+        bending = np.asarray(bending_stiffness, dtype=np.float64)
+        if bending.ndim not in (0, 1) or (bending.ndim == 1 and bending.shape != (points.shape[0] - 2,)):
+            raise ValueError("bending_stiffness must be a scalar or one value per interior vertex, shape (N - 2,)")
+        if (bending < 0.0).any():
+            raise ValueError("bending_stiffness must not be negative")
+        bending = np.broadcast_to(bending, (max(points.shape[0] - 2, 0),))
+        masses = 0.5 * line_density * (np.r_[segment, 0.0] + np.r_[0.0, segment])
+        SolverFBA.register_custom_attributes(builder)
+        particles = [
+            builder.add_particle(pos=tuple(p), vel=(0.0, 0.0, 0.0), mass=float(m), radius=radius)
+            for p, m in zip(points, masses, strict=True)
+        ]
+        for k, length in enumerate(segment):
+            stiffness = youngs_modulus * area / length
+            builder.add_spring(particles[k], particles[k + 1], ke=float(stiffness), kd=0.0, control=0.0)
+        for k in range(1, len(particles) - 1):
+            builder.add_custom_values(
+                **{
+                    "fba:rod_bend_particles": tuple(particles[k - 1 : k + 2]),
+                    "fba:rod_bend_stiffness": float(bending[k - 1]),
+                }
+            )
+        return particles
 
     def set_pin_targets(self, target_positions: wp.array | np.ndarray) -> None:
         """Update reference positions for pinned particles (dynamic pin).
@@ -3250,8 +3516,8 @@ class SolverFBA(SolverBase):
         """Restore selected body and particle state and clear the selected worlds' solver history.
 
         Requested fields are copied from the model defaults. Missing State arrays are skipped.
-        With ``flags=0``, the supplied physical state is preserved; friction anchors and warm-start
-        multipliers are cleared regardless of flags. Bodies are left untouched when
+        With ``flags=0``, the supplied physical state is preserved; friction anchors, warm-start
+        multipliers and the springs' ADMM duals are cleared regardless of flags. Bodies are left untouched when
         ``integrate_with_external_rigid_solver=True``.
 
         FBA uses maximal body coordinates, so ``JOINT_Q`` and ``JOINT_QD`` are ignored. To reset
@@ -3358,7 +3624,16 @@ class SolverFBA(SolverBase):
                         [ws.bilateral_lam, ws.bilateral_omega],
                         device=device,
                     )
+            if self._spring_indices_d is not None:
+                from .kernels import clear_spring_state_kernel  # noqa: PLC0415
+
+                inputs = [self._spring_indices_d, model.particle_world, world_mask]
+                outputs = [self._spring_dual_d, self._spring_split_d]
+                wp.launch(clear_spring_state_kernel, self._spring_indices_d.shape[0], inputs, outputs, device=device)
             return
+        if self._spring_indices_d is not None:
+            self._spring_dual_d.zero_()
+            self._spring_split_d.zero_()
         self._anchor_count = 0
         if self.friction_anchors and self.model.particle_count:
             self._anchor_step_d.fill_(-2)

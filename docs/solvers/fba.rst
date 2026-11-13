@@ -207,6 +207,52 @@ Model Inputs
   the rest angle. The same ``edge_ke`` bends an FBA cloth more stiffly than a
   :class:`~newton.solvers.SolverVBD` one, which scales it by the edge length.
 - **Soft bodies**: tetrahedra with the same stretching models.
+- **Springs**: each spring of the model is a stretch element of energy
+  ``spring_stiffness / 2 (|x_b - x_a| - spring_rest_length)^2``. Its local
+  step is an ADMM step: a scaled dual, kept from step to step, corrects the
+  prox of the energy, so the iterations converge to the implicit Euler step
+  of the springs and not to a softened one. The dual keeps its part along
+  the spring, a tension, and the prox acts along the spring at its signed
+  length with the dual, so a dual that pushes the particles apart harder
+  than the penalty times the spring's length shortens the target instead of
+  turning the spring over. The element weighs
+  ``60 m / dt^2`` in the system matrix, ``m`` the mass of its lighter
+  particle, which sets how fast the iterations converge, not where: springs
+  far softer than it, whose oscillation the step resolves, converge slowly.
+  Stiffer springs converge their own stretch at that rate, but a long chain
+  of them carries stretch waves that span many particles, and a dual that
+  lags its chain's swing makes a taut rope shake. After the dual steps, each
+  chain of springs, a path through particles of two springs, therefore
+  solves its tensions with the tridiagonal response of its stretches through
+  the particles' inverse masses, and the compliance that the dual steps
+  leave out: a rope of 80 springs between two pins settles at 10 iterations
+  as at 100, and one step of a chain of 40 springs a hundred times stiffer
+  than their penalty reaches the implicit Euler step in 10 iterations. Where
+  a chain meets more springs, the particle's inverse mass counts once for
+  each of them, which keeps the solve below the exact one.
+  ``spring_damping`` and ``spring_control`` are not read.
+- **Particle rods**: :meth:`~newton.solvers.SolverFBA.add_particle_rod`
+  lays an elastic rod of circular cross-section along a polyline: a particle
+  per vertex, its mass lumped by length and the rod's radius as its contact
+  radius, a spring per segment of stiffness ``E pi r^2 / l``, and a bending
+  element per interior vertex. A bending element is an entry of the custom
+  frequency ``fba:rod_bend`` (see
+  :meth:`~newton.solvers.SolverFBA.register_custom_attributes`) of energy
+  ``EI / (2 v) |(x_+ - x) / l_+ - (x - x_-) / l_-|^2``, with ``l_-`` and
+  ``l_+`` the rest lengths of the vertex's two segments and
+  ``v = (l_- + l_+) / 2``: ``EI / 2 kappa^2 v`` for small turns, straight at
+  rest. It adds to the constant system matrix alone, and raises the penalty
+  of the rod's springs by ``0.1 EI / l^3``. In the matrix it also resists a
+  difference of the stretches of its two springs with ``EI / (v l_- l_+)``,
+  far more than the penalty of a stiff rod's short segments, so the tension
+  solve of the rod's springs counts it too: a pin moved through a stiff rod
+  drags the rod along within 10 iterations. A 0.3 m rod of radius 5 mm
+  clamped at one end sags under its weight to within 0.2% of the
+  small-deflection sag of its discrete bending energy at ``E = 1e8`` Pa.
+  Rods carry no twist, and contacts act at their particles, so segments
+  longer than about twice the radius can pass thin shapes. These rods are
+  particles, unlike the rigid capsule chains of
+  :meth:`~newton.ModelBuilder.add_rod`.
 - **Activations**: the control's ``tet_activations`` grow each tetrahedron
   to ``1 - a`` times its rest volume, so a negative activation inflates it
   and a positive one contracts it: isotropically, or along a direction per
@@ -224,10 +270,13 @@ Model Inputs
   measures every change of an element's deformation gradient, rotations
   included, so ``beta`` damps the bending of a slender part far more than its
   bending stiffness alone suggests: in ``softbody_cantilever_fba``,
-  ``rayleigh_beta=2e-5`` brings a 2.4 m beam to rest within seconds. With
+  ``rayleigh_beta=2e-5`` brings a 2.4 m beam to rest within seconds. A
+  spring enters ``K`` with its stiffness along every direction, so ``beta``
+  also damps the swinging of a chain of springs. With
   ``rayleigh_corotated=True``, ``beta`` damps the stretch rate of ARAP
-  triangles instead and spares their rotation, so a released cloth flap falls
-  as fast as without damping.
+  triangles and the length rate of springs instead and spares their rotation,
+  so a released cloth flap falls as fast as without damping and a chain of
+  springs swings on while its stretch waves die out.
 - **Pins**: particles with zero inverse mass follow their pin targets through
   a stiff spring of ``pin_stiffness`` [N/m]. The targets start at the model
   positions and move with :meth:`~newton.solvers.SolverFBA.set_pin_targets`.
@@ -248,7 +297,7 @@ Model Inputs
   of a set of connected bodies than the bodies have, as kinematic loops do,
   raise ``NotImplementedError``. A body turns by at most 0.5 rad per step.
 
-FBA does not simulate springs, equality constraints, mimic joints,
+FBA does not simulate equality constraints, mimic joints,
 particle-body attachments, joint limits, drives, armature, or joint friction, or
 the inputs of :class:`~newton.Control`, and it does not read the damping
 coefficients ``tri_kd``, ``edge_kd`` and ``k_damp`` of the elements.

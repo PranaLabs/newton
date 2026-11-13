@@ -15,6 +15,7 @@ Runtime (on the device):
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
 from typing import Any
 
@@ -260,6 +261,122 @@ def particle_masses(model: Model) -> tuple[np.ndarray, np.ndarray]:
     return mass, inv_mass
 
 
+# The penalty of a spring's ADMM stretch element, ``SPRING_INERTIA_FACTOR m / dt^2 + SPRING_BENDING_FACTOR EI / l^3``
+# with ``m`` the mass of its lighter particle: it weighs the element in the system matrix and sets how fast the
+# iterations converge, not where they converge. The element's target also holds the spring's direction within an
+# iteration, so a penalty near the stiffness converges a chain's stretch fast but its swing slowly: half the stiffness
+# left a 1 m rope of 80 springs 25-50% of its length off its implicit Euler trajectory after 10 iterations, this
+# penalty 2-3%. It leaves the chain's stretch waves to the tension solve of the spring chains: released from the
+# horizontal, the rope stretches by 0.13% at 10 iterations as at 300, where the dual steps alone left 4.3%.
+SPRING_INERTIA_FACTOR = 60.0
+SPRING_BENDING_FACTOR = 0.1
+
+
+def spring_penalties(
+    mass: np.ndarray,
+    indices: np.ndarray,
+    rest_length: np.ndarray,
+    stiffness: np.ndarray,
+    dt: float,
+    bending_stiffness: np.ndarray | None = None,
+) -> np.ndarray:
+    """The ADMM penalty ``rho`` [N/m] of each spring: ``60 m / dt^2 + 0.1 EI / l^3``, with ``m`` the mass of the
+    spring's lighter particle, a held particle, of zero ``mass``, counting as unbounded, ``EI`` the bending stiffness
+    [N m^2] of the rod the spring belongs to (none without ``bending_stiffness``) and ``l`` its rest length; the
+    spring's own stiffness where both its particles are held. A spring hangs a heavy particle from a light one
+    with the light one's penalty, which keeps the spring stiff against it, as the tension solve of its chain needs.
+    """
+    pair = mass[indices]
+    lighter = np.where(pair > 0.0, pair, np.inf).min(axis=1)
+    rho = SPRING_INERTIA_FACTOR * np.where(np.isfinite(lighter), lighter, 0.0) / (dt * dt)
+    if bending_stiffness is not None:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rho = rho + np.where(rest_length > 0.0, SPRING_BENDING_FACTOR * bending_stiffness / rest_length**3, 0.0)
+    return np.where(rho > 0.0, rho, stiffness)
+
+
+def spring_chains(
+    indices: np.ndarray, particle_count: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """The springs as chains for their tension solve: paths whose inner particles join exactly two springs, cut at
+    particles that join one or more than two, and closed loops cut at one of their particles.
+
+    Args:
+        indices: Particle pair ``(a, b)`` of each spring, shape ``(S, 2)``.
+        particle_count: Number of particles.
+
+    Returns:
+        A tuple ``(offsets, order, link, sign, scale)``: the chains' starts in ``order``, shape ``(C + 1,)``; the
+        springs of each chain in their order along it, shape ``(S,)``; for each place in ``order``, the particle its
+        spring shares with the next spring of the chain, ``-1`` at a chain's end, shape ``(S,)``, and the product of
+        the signs with which that particle enters the two springs, ``+1`` as ``b`` and ``-1`` as ``a``, shape
+        ``(S,)``; and the factor of the inverse mass of each spring's particles ``a`` and ``b`` on the spring's
+        diagonal, shape ``(S, 2)``: 1 where the chain keeps the particle's couplings, the particle's number of
+        springs where it drops them, which bounds the dropped couplings.
+    """
+    indices = np.asarray(indices, dtype=np.int64).reshape(-1, 2)
+    S = indices.shape[0]
+    incident = [[] for _ in range(particle_count)]
+    for e, (a, b) in enumerate(indices.tolist()):
+        incident[a].append(e)
+        incident[b].append(e)
+    degree = np.array([len(i) for i in incident], dtype=np.int64)
+    visited = np.zeros(S, dtype=bool)
+    chains = []
+
+    def walk(e: int, p: int) -> list[int]:
+        """The chain from spring ``e``, entered at particle ``p``, through particles of two springs."""
+        chain = [e]
+        visited[e] = True
+        q = int(indices[e, 1] if indices[e, 0] == p else indices[e, 0])
+        while degree[q] == 2:
+            nxt = incident[q][0] if incident[q][0] != chain[-1] else incident[q][1]
+            if visited[nxt]:
+                break
+            chain.append(nxt)
+            visited[nxt] = True
+            q = int(indices[nxt, 1] if indices[nxt, 0] == q else indices[nxt, 0])
+        return chain
+
+    for p in range(particle_count):
+        if degree[p] != 2:
+            for e in incident[p]:
+                if not visited[e]:
+                    chains.append(walk(e, p))
+    for e in range(S):
+        if not visited[e]:
+            chains.append(walk(e, int(indices[e, 0])))
+    order = np.array([e for chain in chains for e in chain], dtype=np.int32).reshape(-1)
+    offsets = np.concatenate([[0], np.cumsum([len(c) for c in chains])]).astype(np.int32)
+    link = np.full(S, -1, dtype=np.int32)
+    sign = np.zeros(S, dtype=np.float64)
+    scale = degree[indices].astype(np.float64).reshape(-1, 2)
+    position = 0
+    for chain in chains:
+        for e, f in itertools.pairwise(chain):
+            shared = int(np.intersect1d(indices[e], indices[f])[0])
+            link[position] = shared
+            sign[position] = (1.0 if indices[e, 1] == shared else -1.0) * (1.0 if indices[f, 1] == shared else -1.0)
+            # The chain keeps the shared particle's coupling: its inverse mass counts once on both springs.
+            scale[e, 0 if indices[e, 0] == shared else 1] = 1.0
+            scale[f, 0 if indices[f, 0] == shared else 1] = 1.0
+            position += 1
+        position += 1
+    return offsets, order, link, sign, scale
+
+
+def rod_bending_elements(model: Model) -> tuple[np.ndarray, np.ndarray]:
+    """The bending elements of the model's particle rods, from the custom attributes that
+    :meth:`~newton.solvers.SolverFBA.register_custom_attributes` registers: each element's particles before, at and
+    after its bend, shape (B, 3), and its bending stiffness EI [N m^2], shape (B,)."""
+    fba = getattr(model, "fba", None)
+    particles = getattr(fba, "rod_bend_particles", None)
+    if particles is None or particles.shape[0] == 0:
+        return np.zeros((0, 3), dtype=np.int32), np.zeros(0, dtype=np.float64)
+    stiffness = fba.rod_bend_stiffness.numpy().astype(np.float64)
+    return particles.numpy().astype(np.int32).reshape(-1, 3), stiffness
+
+
 def build_pd_system(
     model: Model,
     dt: float,
@@ -268,6 +385,8 @@ def build_pd_system(
     tet_weight_scale: float | np.ndarray = 1.0,
     rayleigh_alpha: np.ndarray | None = None,
     rayleigh_beta: np.ndarray | None = None,
+    spring_bending_stiffness: np.ndarray | None = None,
+    spring_corotated: bool = False,
 ) -> tuple[CsrMatrix, dict[str, Any]]:
     """Assemble the constant scalar PD Hessian ``A`` for cloth.
 
@@ -286,6 +405,10 @@ def build_pd_system(
         rayleigh_alpha: Mass-proportional damping coefficient of each particle [1/s], or ``None`` for none.
         rayleigh_beta: Stiffness-proportional damping coefficient of each particle [s], or ``None`` for none. An
             element takes the mean of its particles' coefficients.
+        spring_bending_stiffness: Bending stiffness [N m^2] of the rod each spring belongs to, which the spring's
+            ADMM penalty grows with (see :func:`spring_penalties`), or ``None`` for springs outside rods.
+        spring_corotated: Damp the springs' length rate in their local steps, ``meta["spring_beta"]``, rather than
+            through ``C``, which damps every relative motion of their particles, rotations included.
 
     Returns:
         A tuple ``(A, meta)`` where ``A`` is an ``N x N`` symmetric PSD CSR
@@ -300,7 +423,17 @@ def build_pd_system(
         - ``meta["edge_quad_scale"]`` : ``np.ndarray[float64]`` shape (E,)  (3/(A0+A1))
         - ``meta["edge_weight"]`` : ``np.ndarray[float64]`` shape (E,)
         - ``meta["pin_indices"]`` : ``np.ndarray[int32]`` (packed pinned indices)
+        - ``meta["spring_indices"]`` : ``np.ndarray[int32]`` shape (S, 2), the springs with positive stiffness
+        - ``meta["spring_rest_length"]``, ``meta["spring_stiffness"]``, ``meta["spring_penalty"]`` :
+          ``np.ndarray[float64]`` shape (S,)
+        - ``meta["spring_beta"]`` : ``np.ndarray[float64]`` shape (S,), the stiffness damping coefficient [s] that
+          the springs' local steps apply to their length rate, zero unless ``spring_corotated``
+        - ``meta["rod_bend_indices"]`` : ``np.ndarray[int32]`` shape (B, 3), the bending elements of particle rods
+        - ``meta["rod_bend_weight"]`` : ``np.ndarray[float64]`` shape (B,), their weights ``EI / v``
         - ``meta["damping"]`` : :class:`CsrMatrix` of ``C``, or ``None`` without damping
+
+    A spring is the ADMM stretch element of :func:`~newton._src.solvers.fba.kernels.project_spring_admm_kernel`:
+    its penalty ``rho`` weighs it in ``A``, and its stiffness ``k``, the physical one, in ``C``.
     """
     N = model.particle_count
     mass, inv_mass = particle_masses(model)
@@ -479,6 +612,53 @@ def build_pd_system(
                     )
                 )
 
+    # ---- Springs: ADMM stretch elements on the stencil x_b - x_a ----
+    spring_indices = np.zeros((0, 2), dtype=np.int32)
+    spring_rest = np.zeros(0, dtype=np.float64)
+    spring_k = np.zeros(0, dtype=np.float64)
+    spring_rho = np.zeros(0, dtype=np.float64)
+    spring_beta = np.zeros(0, dtype=np.float64)
+    if model.spring_count > 0:
+        indices = model.spring_indices.numpy().astype(np.int32).reshape(-1, 2)
+        rest = model.spring_rest_length.numpy().astype(np.float64)
+        stiffness = model.spring_stiffness.numpy().astype(np.float64)
+        keep = stiffness > 0.0
+        spring_indices, spring_rest, spring_k = indices[keep], rest[keep], stiffness[keep]
+        bending = None if spring_bending_stiffness is None else np.asarray(spring_bending_stiffness)[keep]
+        spring_rho = spring_penalties(mass, spring_indices, spring_rest, spring_k, dt, bending)
+        a, b = spring_indices[:, 0], spring_indices[:, 1]
+        rows_s = np.concatenate([a, b, a, b])
+        cols_s = np.concatenate([a, b, b, a])
+        coo_parts.append((rows_s, cols_s, np.concatenate([spring_rho, spring_rho, -spring_rho, -spring_rho])))
+        spring_beta = np.zeros(spring_indices.shape[0], dtype=np.float64)
+        if rayleigh_beta is not None and spring_corotated:
+            spring_beta = element_beta(spring_indices)
+        elif rayleigh_beta is not None:
+            beta_k = element_beta(spring_indices) * spring_k
+            damping_parts.append((rows_s, cols_s, np.concatenate([beta_k, beta_k, -beta_k, -beta_k])))
+
+    # ---- Particle rod bending: the 3-particle stencil (x_+ - x) / l_+ - (x - x_-) / l_- ----
+    # With the rest lengths l_- and l_+ of the bend's two segments, the stencil measures the turn 2 sin(phi / 2) of an
+    # unstretched rod, and the weight EI / v, v = (l_- + l_+) / 2, makes the bend's energy (EI / 2) kappa^2 v for small
+    # turns. The target is zero, a straight rod: the element adds to A alone.
+    rod_bend, rod_ei = rod_bending_elements(model)
+    rod_weight = np.zeros(0, dtype=np.float64)
+    if rod_bend.shape[0] > 0:
+        x_rest = model.particle_q.numpy().astype(np.float64)
+        l_minus = np.linalg.norm(x_rest[rod_bend[:, 1]] - x_rest[rod_bend[:, 0]], axis=1)
+        l_plus = np.linalg.norm(x_rest[rod_bend[:, 2]] - x_rest[rod_bend[:, 1]], axis=1)
+        if (l_minus <= 0.0).any() or (l_plus <= 0.0).any():
+            raise ValueError("particle rod segments must have a positive rest length")
+        stencil = np.stack([1.0 / l_minus, -(1.0 / l_minus + 1.0 / l_plus), 1.0 / l_plus], axis=1)
+        rod_weight = rod_ei / (0.5 * (l_minus + l_plus))
+        block = rod_weight[:, None, None] * stencil[:, :, None] * stencil[:, None, :]
+        rows_b = np.repeat(rod_bend, 3, axis=1).reshape(-1)
+        cols_b = np.tile(rod_bend, (1, 3)).reshape(-1)
+        coo_parts.append((rows_b, cols_b, block.reshape(-1)))
+        if rayleigh_beta is not None:
+            beta_vals = (element_beta(rod_bend)[:, None, None] * block).reshape(-1)
+            damping_parts.append((rows_b, cols_b, beta_vals))
+
     # ---- Implicit Rayleigh damping: C / dt ----
     damping = None
     if damping_parts:
@@ -506,6 +686,13 @@ def build_pd_system(
         "edge_quad_scale": edge_quad_scale,
         "edge_weight": edge_weight,
         "pin_indices": pin_indices,
+        "spring_indices": spring_indices,
+        "spring_rest_length": spring_rest,
+        "spring_stiffness": spring_k,
+        "spring_penalty": spring_rho,
+        "spring_beta": spring_beta,
+        "rod_bend_indices": rod_bend,
+        "rod_bend_weight": rod_weight,
         "tet_indices": tet_indices,
         "tet_rest_inv": tet_rest_inv,
         "tet_volume": tet_volume,
