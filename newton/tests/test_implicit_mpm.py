@@ -42,6 +42,8 @@ from newton._src.solvers.implicit_mpm.solve_rheology import (
     _DelassusOperator,
     _linear_solver_result_norms,
     _nonlinear_solver_result_norms,
+    apply_rigidity_operator,
+    rigidity_product_chunk_count,
     solve_rheology,
     update_batched_condition,
 )
@@ -603,6 +605,55 @@ def test_majorized_rheology_solve(test, device, capture=False):
                     )
                     if contact:
                         test.assertLess(abs(v[2]), 1e-7)
+
+
+def test_rigidity_chunked_product_matches_bsr_mv(test, device):
+    """The chunked product for the few long rows of the rigidity operator's ``IJtm`` matches ``bsr_mv``."""
+    rng = np.random.default_rng(5)
+    node_count, body_count = 6000, 2
+    rows, cols = [], []
+    for node in range(node_count):
+        body = int(rng.integers(body_count))
+        rows += [node, node]
+        cols += [2 * body, 2 * body + 1]
+    J_values = rng.normal(size=(len(rows), 3, 3)).astype(np.float32)
+    IJtm_values = rng.normal(size=(len(rows), 3, 3)).astype(np.float32)
+    with wp.ScopedDevice(device):
+        J = sp.bsr_from_triplets(
+            node_count,
+            2 * body_count,
+            wp.array(rows, dtype=int),
+            wp.array(cols, dtype=int),
+            wp.array(J_values, dtype=wp.mat33),
+        )
+        IJtm = sp.bsr_from_triplets(
+            2 * body_count,
+            node_count,
+            wp.array(cols, dtype=int),
+            wp.array(rows, dtype=int),
+            wp.array(IJtm_values, dtype=wp.mat33),
+        )
+        chunk_count = rigidity_product_chunk_count(IJtm)
+        test.assertGreater(chunk_count, 1)
+        impulse = wp.array(rng.normal(size=(node_count, 3)).astype(np.float32), dtype=wp.vec3)
+        velocity_start = rng.normal(size=(node_count, 3)).astype(np.float32)
+
+        results = []
+        for chunk_sums in (None, wp.empty((3 * IJtm.nrow, chunk_count), dtype=float)):
+            velocity = wp.array(velocity_start, dtype=wp.vec3)
+            delta_body_qd = wp.empty(3 * IJtm.nrow, dtype=float)
+            apply_rigidity_operator((J, IJtm), impulse, velocity, delta_body_qd, chunk_sums=chunk_sums)
+            results.append((delta_body_qd.numpy(), velocity.numpy()))
+
+    expected_qd = -(
+        np.einsum("kij,kj->ki", IJtm_values, impulse.numpy()[np.array(rows)]).reshape(-1, 3).astype(np.float64)
+    )
+    body_qd = np.zeros((2 * body_count, 3))
+    np.add.at(body_qd, np.array(cols), expected_qd)
+    for qd, _velocity in results:
+        np.testing.assert_allclose(qd.reshape(-1, 3), body_qd, rtol=1.0e-4, atol=1.0e-3)
+    np.testing.assert_allclose(results[1][0], results[0][0], rtol=1.0e-4, atol=1.0e-3)
+    np.testing.assert_allclose(results[1][1], results[0][1], rtol=1.0e-4, atol=1.0e-2)
 
 
 def test_majorizer_capture(test, device):
@@ -2254,6 +2305,12 @@ add_function_test(
     "test_strain_matrix_values_buffer_persists",
     test_strain_matrix_values_buffer_persists,
     devices=devices,
+)
+add_function_test(
+    TestImplicitMPM,
+    "test_rigidity_chunked_product_matches_bsr_mv",
+    test_rigidity_chunked_product_matches_bsr_mv,
+    devices=get_cuda_test_devices(),
 )
 add_function_test(
     TestImplicitMPM,

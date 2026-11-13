@@ -1,0 +1,1 @@
+Speed up `SolverImplicitMPM` coupling with dynamic rigid colliders: the rigid-body response to collider impulses, applied every solver iteration, now sums each body's long row of collider nodes over many thread blocks.
