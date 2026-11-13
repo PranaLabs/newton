@@ -1,0 +1,1 @@
+Run the FBA particle rod examples with `nsn_sparse_storage=True`, about twice as fast: `particle_rods_fba` 10.8 ms, `hemp_rope_fba` 11.3 ms, `desk_cables_fba` 13.8 ms, `elastic_cords_fba` 39.7 ms and `rod_gripper_fba` 19.6 ms per 1/50 s frame on an RTX 5090.

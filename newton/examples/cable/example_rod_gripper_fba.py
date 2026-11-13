@@ -185,10 +185,12 @@ class Example:
         self.model.particle_mu = 0.6
 
         # Ten LG iterations per 5 ms step, the rope's segments colliding as capsules, and light Rayleigh damping.
+        # The contact solves keep their Delassus matrix in sparse storage, whose NSN step replays from step to step.
         self.solver = SolverFBA(
             self.model,
             iterations=10,
             nsn_linear_iterations=10,
+            nsn_sparse_storage=True,
             rod_contact=True,
             rayleigh_alpha=0.5,
             rayleigh_beta=1.0e-3,

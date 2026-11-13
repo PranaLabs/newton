@@ -144,10 +144,12 @@ class Example:
         # and light Rayleigh damping: mass-proportional
         # 0.5/s, and corotated stiffness damping of 2 ms on the rods' stretch and bending rates, which leaves their
         # swing alone.
+        # The contact solves keep their Delassus matrix in sparse storage, whose NSN step replays from step to step.
         self.solver = SolverFBA(
             self.model,
             iterations=10,
             nsn_linear_iterations=10,
+            nsn_sparse_storage=True,
             rayleigh_alpha=0.5,
             rayleigh_beta=2.0e-3,
             rayleigh_corotated=True,
