@@ -1,0 +1,1 @@
+Fix `SolverImplicitMPM` steps recorded in a CUDA graph after uncaptured steps writing freed memory with the `P1d` and `Q1d` strain bases, which could fail with an illegal memory access: the strain matrix now keeps its values buffer across steps.

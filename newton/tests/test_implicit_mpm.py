@@ -783,6 +783,32 @@ def _step_mpm(model, config, step_count=3, dt=0.01):
     return solver, state_0
 
 
+def test_strain_matrix_values_buffer_persists(test, device):
+    """The strain matrix keeps its values buffer across steps when the strain eigenbasis rotates it.
+
+    A step recorded in an outer graph replays the buffers its nodes were recorded with; rebinding the persistent
+    matrix's values to a new array each step left the graph writing a buffer freed after the capture.
+    """
+    with wp.ScopedDevice(device):
+        model = _make_mpm_particle_builder(gravity=(0.0, 0.0, 0.0), dimensions=(4, 2, 2)).finalize(device=device)
+        config = _make_mpm_config(grid_type="fixed")
+        config.separate_worlds = False
+        config.max_active_cell_count = 64
+        config.strain_basis = "P1d"
+        config.solver = "gs"
+        config.warmstart_mode = "particles"
+        solver = SolverImplicitMPM(model, config=config)
+        state_0 = model.state()
+        state_1 = model.state()
+        pointers = []
+        for _ in range(3):
+            solver.step(state_0, state_1, control=None, contacts=None, dt=0.01)
+            state_0, state_1 = state_1, state_0
+            pointers.append(solver._scratchpad.strain_matrix.values.ptr)
+        test.assertTrue(np.isfinite(state_0.particle_q.numpy()).all())
+        test.assertEqual(len(set(pointers)), 1, f"strain matrix values buffer changed across steps: {pointers}")
+
+
 def _compressive_shear_velocity(positions, amplitude):
     centered = positions - np.mean(positions, axis=0)
     return amplitude * np.column_stack(
@@ -2223,6 +2249,12 @@ add_function_test(
 )
 add_function_test(TestImplicitMPM, "test_majorized_rheology_solve", test_majorized_rheology_solve, devices=devices)
 add_function_test(TestImplicitMPM, "test_majorizer_capture", test_majorizer_capture, devices=get_cuda_test_devices())
+add_function_test(
+    TestImplicitMPM,
+    "test_strain_matrix_values_buffer_persists",
+    test_strain_matrix_values_buffer_persists,
+    devices=devices,
+)
 add_function_test(
     TestImplicitMPM,
     "test_rheology_residual_inactive_strain_nodes",
