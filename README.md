@@ -303,8 +303,14 @@ are still in the package; `python -m newton.examples --list` lists them all.
       </a>
     </td>
     <td align="center" width="33%">
+      <a href="newton/examples/cable/example_particle_rods_fba.py">
+        <img width="320" src="docs/images/examples/example_particle_rods_fba.jpg" alt="Particle Rods FBA">
+      </a>
     </td>
     <td align="center" width="33%">
+      <a href="newton/examples/cable/example_hemp_rope_fba.py">
+        <img width="320" src="docs/images/examples/example_hemp_rope_fba.jpg" alt="Hemp Rope FBA">
+      </a>
     </td>
   </tr>
   <tr>
@@ -313,8 +319,43 @@ are still in the package; `python -m newton.examples --list` lists them all.
       <sub>a soft bunny carried and swung by its ear tips</sub>
     </td>
     <td align="center" width="33%">
+      <code>python -m newton.examples particle_rods_fba</code><br>
+      <sub>ropes and a rod made of particles swing over a bar, sag and coil</sub>
     </td>
     <td align="center" width="33%">
+      <code>python -m newton.examples hemp_rope_fba</code><br>
+      <sub>a hemp rope lowered by a circling hand coils onto the floor</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="newton/examples/cable/example_desk_cables_fba.py">
+        <img width="320" src="docs/images/examples/example_desk_cables_fba.jpg" alt="Desk Cables FBA">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="newton/examples/cable/example_elastic_cords_fba.py">
+        <img width="320" src="docs/images/examples/example_elastic_cords_fba.jpg" alt="Elastic Cords FBA">
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="newton/examples/cable/example_rod_gripper_fba.py">
+        <img width="320" src="docs/images/examples/example_rod_gripper_fba.jpg" alt="Rod Gripper FBA">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples desk_cables_fba</code><br>
+      <sub>HDMI, USB-C and power cables with plugs; a hand carries one across the desk</sub>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples elastic_cords_fba</code><br>
+      <sub>bungee and elastic cords stretch as their balls swing, a rope does not</sub>
+    </td>
+    <td align="center" width="33%">
+      <code>python -m newton.examples rod_gripper_fba</code><br>
+      <sub>a rigid gripper picks up a rope by friction or by pinned particles</sub>
     </td>
   </tr>
 </table>
@@ -346,6 +387,8 @@ The rigid examples, timed the same way with this branch's code as of 2026-11-12:
 about 6,800 contacts, 6.3 ms per 1/50 s frame (3.2x real time); `convex_hulls_fba`, 9 bodies, 3.5 ms per 1/50 s frame
 (5.7x); `nonconvex_pile_fba`, 1,000 bodies of 5,130 convex parts and about 20,000 contacts, 15.8 ms per 1/50 s frame
 (1.3x).
+
+The particle rod examples, timed the same way with this branch's code as of 2026-11-13: `particle_rods_fba`, 395 particles, 22.5 ms per 1/50 s frame (0.9x); `hemp_rope_fba`, 251 particles, 23.0 ms per 1/50 s frame (0.9x); `desk_cables_fba`, 533 particles, 26.7 ms per 1/50 s frame (0.8x); `elastic_cords_fba`, 251 particles, 63.5 ms per 1/50 s frame (0.3x); `rod_gripper_fba`, 102 particles, 40.1 ms per 1/50 s frame (0.5x).
 
 ### Example Options
 

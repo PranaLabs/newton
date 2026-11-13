@@ -688,6 +688,55 @@ class TestCableExamples(NewtonTestCase):
 
 add_example_test(
     TestCableExamples,
+    name="cable.example_particle_rods_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 150},
+    use_viewer=True,
+)
+
+add_example_test(
+    TestCableExamples,
+    name="cable.example_hemp_rope_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 360},
+    use_viewer=True,
+)
+
+add_example_test(
+    TestCableExamples,
+    name="cable.example_desk_cables_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 360},
+    use_viewer=True,
+)
+
+add_example_test(
+    TestCableExamples,
+    name="cable.example_elastic_cords_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 100},
+    use_viewer=True,
+)
+
+add_example_test(
+    TestCableExamples,
+    name="cable.example_rod_gripper_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 350, "grasp": "friction"},
+    use_viewer=True,
+)
+
+add_example_test(
+    TestCableExamples,
+    name="cable.example_rod_gripper_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 350, "grasp": "pins"},
+    use_viewer=True,
+    test_suffix="pins",
+)
+
+add_example_test(
+    TestCableExamples,
     name="cable.example_cable_twist",
     devices=test_devices,
     use_viewer=True,
