@@ -3798,7 +3798,9 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 last_step_data.ws_stress_field.dof_values[pic.cell_particle_indices].assign(
                     scratch.stress_field.dof_values
                 )
-            else:
+            elif self._stress_warmstart in ("grid", "smoothed"):
+                # Only the grid stress warmstart reads the saved grid stress; the particle-backed one reads the
+                # particles, and saving would interpolate over the whole background grid every step.
                 last_step_data.ws_stress_field.dof_values.zero_()
 
                 fem.interpolate(

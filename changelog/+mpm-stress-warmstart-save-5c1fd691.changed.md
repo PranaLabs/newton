@@ -1,0 +1,1 @@
+Stop `SolverImplicitMPM` from interpolating the stress into the whole background grid every step when the stress warm start is particle-backed or disabled, since only the grid-backed warm start reads it.
