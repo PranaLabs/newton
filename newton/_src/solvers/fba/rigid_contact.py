@@ -132,6 +132,7 @@ def _rigid_contact_gather_kernel(
     body_slot: wp.array[wp.int32],
     body_com: wp.array[wp.vec3],
     shape_mu: wp.array[wp.float32],
+    mu_max: wp.int32,
     # outputs
     body: wp.array2d[wp.int32],
     anchor: wp.array2d[wp.vec3],
@@ -139,8 +140,8 @@ def _rigid_contact_gather_kernel(
     mu: wp.array[wp.float64],
     table: wp.array[wp.int32],
 ):
-    """Contact ``i`` of the sorted order: its bodies, anchors, normal and friction, and its slots and shapes in row
-    ``i`` of ``table[1:]``."""
+    """Contact ``i`` of the sorted order: its bodies, anchors, normal and friction (the mean of its shapes', or the
+    larger with ``mu_max``), and its slots and shapes in row ``i`` of ``table[1:]``."""
     i = wp.tid()
     c = order[i]
     s = wp.vec2i(shape0[c], shape1[c])
@@ -159,10 +160,15 @@ def _rigid_contact_gather_kernel(
         table[1 + 4 * i + k] = slot
         table[3 + 4 * i + k] = s[k]
     normal[i] = normal_in[c]
-    mu_sum = wp.float64(0.0)
+    m = wp.float64(0.0)
     if s[0] >= 0 and s[1] >= 0:
-        mu_sum = wp.float64(shape_mu[s[0]]) + wp.float64(shape_mu[s[1]])
-    mu[i] = mu_sum * wp.float64(0.5)
+        m0 = wp.float64(shape_mu[s[0]])
+        m1 = wp.float64(shape_mu[s[1]])
+        if mu_max != 0:
+            m = wp.max(m0, m1)
+        else:
+            m = (m0 + m1) * wp.float64(0.5)
+    mu[i] = m
 
 
 class RigidContactGather:
@@ -251,6 +257,7 @@ def gather_rigid_contacts(
     body_slot: np.ndarray | wp.array,
     device,
     buffers: RigidContactGather | None = None,
+    friction_max: bool = False,
 ) -> RigidContacts | None:
     """Collect the rigid contacts that touch a body the solver integrates.
 
@@ -267,6 +274,8 @@ def gather_rigid_contacts(
         device: Warp device for the contact arrays.
         buffers: Device buffers to reuse across calls. The arrays of the
             returned contacts are views into them, valid until the next call.
+        friction_max: Give a contact the larger of its shapes' friction
+            coefficients rather than their mean.
 
     Returns:
         The contacts, or ``None`` if no contact touches an integrated body.
@@ -320,6 +329,7 @@ def gather_rigid_contacts(
             body_slot,
             model.body_com,
             model.shape_material_mu,
+            wp.int32(1 if friction_max else 0),
         ],
         outputs=[B.body, B.anchor, B.normal, B.mu, B.table],
         device=device,
