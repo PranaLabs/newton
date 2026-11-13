@@ -1,0 +1,1 @@
+Add `bodies` and `body_points` to `SolverFBA.set_particle_constraints`: a bilateral particle row can hold a particle combination at a point of a dynamic rigid body, solved with the body's rows in the two-way NSN so that the body takes the row's force; three rows along independent directions tie a particle to the body point, as a rope tied to a rigid part.

@@ -290,7 +290,12 @@ Model Inputs
   contacts. With the lite operator, the rows that hold particles at points,
   or all rows with ``exact=True``, take one exact Newton step of their own.
   The ``cable_gripper_fba`` example builds the rows of cables through
-  tetrahedral bodies.
+  tetrahedral bodies. With ``bodies`` and ``body_points``, a row holds its
+  combination of particle positions against a point of a body that FBA
+  integrates and is solved with the body's rows, so that the body takes the
+  row's force: three rows along independent directions with target zero tie a
+  particle to that point, as a rope is tied to a rigid part. Such rows need
+  ``directions``, the full operator and one world.
 - **Rigid bodies**: FBA integrates the dynamic bodies and passes kinematic
   bodies through, or leaves every body to another solver with
   ``integrate_with_external_rigid_solver=True``. PRISMATIC, REVOLUTE, BALL,
@@ -299,8 +304,10 @@ Model Inputs
   of a set of connected bodies than the bodies have, as kinematic loops do,
   raise ``NotImplementedError``. A body turns by at most 0.5 rad per step.
 
-FBA does not simulate equality constraints, mimic joints,
-particle-body attachments, joint limits, drives, armature, or joint friction, or
+FBA does not simulate equality constraints, mimic joints, the model's
+particle-body attachments (tie particles to bodies with
+:meth:`~newton.solvers.SolverFBA.set_particle_constraints` instead), joint
+limits, drives, armature, or joint friction, or
 the inputs of :class:`~newton.Control`, and it does not read the damping
 coefficients ``tri_kd``, ``edge_kd`` and ``k_damp`` of the elements.
 
