@@ -284,7 +284,79 @@ def update_batched_condition(
     condition[0] = wp.where(stop, 0, 1)
 
 
-def apply_rigidity_operator(rigidity_operator, delta_collider_impulse, collider_velocity, delta_body_qd):
+_RIGIDITY_CHUNK_BLOCK_DIM = 64
+"""Threads per block summing one chunk of a long row of the rigidity operator's ``IJtm``."""
+_RIGIDITY_MAX_CHUNKS = 64
+"""Maximum number of chunks per scalar row of ``IJtm``."""
+_RIGIDITY_CHUNK_THREAD_BUDGET = 1 << 16
+"""Approximate number of threads the chunked ``IJtm`` product launches."""
+
+
+def rigidity_product_chunk_count(IJtm: sp.BsrMatrix) -> int:
+    """Return the number of chunks per row for the chunked ``IJtm @ x`` product, or 0 to use ``bsr_mv``.
+
+    ``IJtm`` has one 3x3 block row per rigid-body velocity block and one block column per collider node, so with
+    rigid colliders it has few rows of up to thousands of blocks. ``bsr_mv`` sums each scalar row with a single
+    thread block; splitting long rows into chunks summed by separate blocks spreads that work over the device.
+    """
+    if not IJtm.values.device.is_cuda or IJtm.nrow == 0:
+        return 0
+    if IJtm.nnz <= _RIGIDITY_CHUNK_BLOCK_DIM * IJtm.nrow:
+        return 0
+    chunks = _RIGIDITY_CHUNK_THREAD_BUDGET // (3 * _RIGIDITY_CHUNK_BLOCK_DIM * IJtm.nrow)
+    return max(1, min(_RIGIDITY_MAX_CHUNKS, chunks))
+
+
+@wp.kernel
+def _rigidity_chunk_sums_kernel(
+    A_offsets: wp.array[int],
+    A_row_counts: wp.array[int],
+    A_columns: wp.array[int],
+    A_values: wp.array[wp.mat33],
+    x: wp.array[wp.vec3],
+    chunk_sums: wp.array2d[float],
+):
+    """Sum one chunk of one scalar row of ``A @ x`` per thread block (3x3 blocks)."""
+    row, subrow, chunk, lane = wp.tid()
+
+    chunk_count = chunk_sums.shape[1]
+    beg = A_offsets[row]
+    end = A_offsets[row + 1]
+    if A_row_counts:
+        end = beg + A_row_counts[row]
+
+    per_chunk = (end - beg + chunk_count - 1) // chunk_count
+    chunk_beg = beg + chunk * per_chunk
+    chunk_end = wp.min(end, chunk_beg + per_chunk)
+
+    lane_sum = float(0.0)
+    for b in range(chunk_beg + lane, chunk_end, wp.block_dim()):
+        lane_sum += wp.dot(A_values[b][subrow], x[A_columns[b]])
+
+    wp.tile_store(chunk_sums[3 * row + subrow], wp.tile_sum(wp.tile(lane_sum)), offset=chunk)
+
+
+@wp.kernel
+def _rigidity_reduce_chunks_kernel(
+    alpha: float,
+    chunk_sums: wp.array2d[float],
+    y: wp.array[float],
+):
+    """``y = alpha * sum of the chunk sums`` per scalar row, in a fixed order."""
+    i = wp.tid()
+    total = float(0.0)
+    for chunk in range(chunk_sums.shape[1]):
+        total += chunk_sums[i, chunk]
+    y[i] = alpha * total
+
+
+def apply_rigidity_operator(
+    rigidity_operator,
+    delta_collider_impulse,
+    collider_velocity,
+    delta_body_qd,
+    chunk_sums: wp.array2d[float] | None = None,
+):
     """Apply collider rigidity feedback to the current collider velocities.
 
     Computes and applies a velocity correction induced by the rigid coupling
@@ -302,10 +374,30 @@ def apply_rigidity_operator(rigidity_operator, delta_collider_impulse, collider_
         delta_collider_impulse: Change in collider impulse to be applied.
         collider_velocity: Current collider velocity vector to be corrected in place.
         delta_body_qd: Change in body velocity to be applied.
+        chunk_sums: Optional ``(3 * IJtm.nrow, chunk_count)`` work array with ``chunk_count`` from
+            :func:`rigidity_product_chunk_count`; when given, ``IJtm @ delta_collider_impulse`` is computed by the
+            chunked product instead of ``bsr_mv``.
     """
 
     J, IJtm = rigidity_operator
-    sp.bsr_mv(IJtm, x=delta_collider_impulse, y=delta_body_qd, alpha=-1.0, beta=0.0)
+    if chunk_sums is None:
+        sp.bsr_mv(IJtm, x=delta_collider_impulse, y=delta_body_qd, alpha=-1.0, beta=0.0)
+    else:
+        wp.launch(
+            _rigidity_chunk_sums_kernel,
+            dim=(IJtm.nrow, 3, chunk_sums.shape[1], _RIGIDITY_CHUNK_BLOCK_DIM),
+            block_dim=_RIGIDITY_CHUNK_BLOCK_DIM,
+            inputs=[IJtm.offsets, IJtm.row_counts, IJtm.columns, IJtm.values, delta_collider_impulse],
+            outputs=[chunk_sums],
+            device=delta_body_qd.device,
+        )
+        wp.launch(
+            _rigidity_reduce_chunks_kernel,
+            dim=3 * IJtm.nrow,
+            inputs=[-1.0, chunk_sums],
+            outputs=[delta_body_qd],
+            device=delta_body_qd.device,
+        )
     sp.bsr_mv(J, x=delta_body_qd, y=collider_velocity, alpha=1.0, beta=1.0)
 
 
@@ -1611,9 +1703,15 @@ class _ContactSolver:
         self.collider_inv_mass = fem.borrow_temporary_like(self.collision.collider_friction, temporary_store)
 
         # Setup rigidity correction
+        self._rigidity_chunk_sums = None
         if self.collision.rigidity_operator is not None:
             J, IJtm = self.collision.rigidity_operator
             self.delta_body_qd = fem.borrow_temporary(temporary_store, shape=J.shape[1], dtype=float)
+            chunk_count = rigidity_product_chunk_count(IJtm)
+            if chunk_count > 0:
+                self._rigidity_chunk_sums = fem.borrow_temporary(
+                    temporary_store, shape=(3 * IJtm.nrow, chunk_count), dtype=float
+                )
 
             wp.launch(
                 compute_collider_inv_mass,
@@ -1639,6 +1737,8 @@ class _ContactSolver:
         self.collider_inv_mass.release()
         if self.collision.rigidity_operator is not None:
             self.delta_body_qd.release()
+        if self._rigidity_chunk_sums is not None:
+            self._rigidity_chunk_sums.release()
 
     def apply_rigidity_operator(self):
         if self.collision.rigidity_operator is not None:
@@ -1647,6 +1747,7 @@ class _ContactSolver:
                 self.delta_impulse,
                 self.collision.collider_velocities,
                 self.delta_body_qd,
+                chunk_sums=self._rigidity_chunk_sums,
             )
 
 
