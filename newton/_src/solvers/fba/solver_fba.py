@@ -5126,7 +5126,11 @@ class SolverFBA(SolverBase):
         blocked = getattr(W_sp, "block3", False)
         if blocked and not pcr.fuses_alone(n_rows):
             raise RuntimeError("SolverFBA keeps W in 3x3 blocks only for a fused PCR")
-        product = block3_mv if blocked else wps.bsr_mv
+        from .nsn_pcr_solver import _LONG_ROW, _TILED_MV  # noqa: PLC0415
+
+        # Long rows of W take the tiled product, as the conjugate residual iterations' products do.
+        tile = _TILED_MV if int(W_sp.nnz) > _LONG_ROW * n_rows else -1
+        product = block3_mv if blocked else functools.partial(wps.bsr_mv, tile_size=tile)
         # Frictional precond: dt²·W_ii for normal rows; dt·W_ii for tangents.
         if blocked:
             block3_diag(W_sp, diag)

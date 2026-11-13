@@ -200,6 +200,9 @@ _FUSED_BLOCK = wp.constant(256)
 _FUSED_MAX_BLOCKS = wp.constant(1024)
 # Threads per row of the tiled sparse product that the fused iteration takes for long rows.
 _TILED_MV = 64
+# Mean entries per row from which the products by W take the tiled product. warp.sparse picks it from 128 on, but
+# the rows of a rod's contacts, about 100 entries each, read several times faster together than one by one.
+_LONG_ROW = 64
 
 
 # ---------------------------------------------------------------------------
@@ -1490,9 +1493,9 @@ class NSNPCRSolver:
         blocked = getattr(W_bsr, "block3", False)
         if blocked and not scaled:
             raise ValueError("a matrix of 3x3 blocks takes solve_sparse_scaled")
-        # Rows of more than 128 entries on average, as warp.sparse counts them, take its tiled product: one block of
-        # threads per row reads the row's entries together, where one thread per row reads them one by one.
-        long_rows = int(W_bsr.nnz) > 2 * _TILED_MV * n
+        # Rows of more than _LONG_ROW entries on average take warp.sparse's tiled product: one block of threads per
+        # row reads the row's entries together, where one thread per row reads them one by one.
+        long_rows = int(W_bsr.nnz) > _LONG_ROW * n
         x.zero_()
         if scaled:
             wp.copy(diag, factors[2], count=n)
