@@ -3409,7 +3409,10 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             B = scratch.strain_matrix
             strain_mat_tmp = wp.empty_like(B.values)
             wp.launch(rotate_matrix_rows, dim=B.nnz, inputs=[M_ev, B.offsets, B.columns, B.values, strain_mat_tmp])
-            B.values = strain_mat_tmp
+            # Copy back instead of rebinding B.values: the strain matrix persists across steps, and a step recorded
+            # in an outer graph keeps the buffers its nodes were recorded with, so replacing the array here would
+            # leave the graph writing the previous step's values array after it is freed.
+            wp.copy(dest=B.values, src=strain_mat_tmp)
 
             C = scratch.compliance_matrix
             compliance_mat_tmp = wp.empty_like(C.values)
