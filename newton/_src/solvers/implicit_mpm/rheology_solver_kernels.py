@@ -993,7 +993,14 @@ def make_gs_solve_kernel(
     immediately propagating velocity updates within each color. Each unique combination
     of flags produces a separate Warp kernel compiled and cached via
     :func:`fem.cache.dynamic_kernel`.
+
+    With a fixed ``strain_velocity_node_count``, see :func:`make_cell_cached_gs_solve_kernel`.
     """
+    if strain_velocity_node_count > 0:
+        return make_cell_cached_gs_solve_kernel(
+            has_viscosity, has_dilatancy, has_compliance_mat, strain_velocity_node_count, has_rotation
+        )
+
     key = (has_viscosity, has_dilatancy, has_compliance_mat, has_rotation, strain_velocity_node_count)
 
     @fem.cache.dynamic_kernel(suffix=key, kernel_options={"fast_math": True})
@@ -1066,6 +1073,109 @@ def make_gs_solve_kernel(
                 )
 
     return gs_solve_kernel_impl
+
+
+def make_cell_cached_gs_solve_kernel(
+    has_viscosity: bool,
+    has_dilatancy: bool,
+    has_compliance_mat: bool,
+    strain_velocity_node_count: int,
+    has_rotation: bool = not _ISOTROPIC_LOCAL_LHS,
+):
+    """Return the Gauss-Seidel colored-block stress solve kernel for a fixed velocity stencil per strain node.
+
+    A fixed ``strain_velocity_node_count`` means a strain basis other than ``Q1`` on the ``Q1`` velocity basis:
+    each strain node couples to exactly the velocity nodes of its cell, the coloring is cell-based, and the strain
+    nodes of one color block share the same velocity columns in the same order. The kernel therefore loads the
+    cell's velocities and inverse masses once, keeps them in registers while it solves the block's strain nodes in
+    order, and writes the velocities back once. The arithmetic and its order are those of the generic kernel.
+    """
+    key = (has_viscosity, has_dilatancy, has_compliance_mat, has_rotation, strain_velocity_node_count)
+    node_count = strain_velocity_node_count
+    node_index_vec = wp.types.vector(length=node_count, dtype=int)
+    node_scalar_vec = wp.types.vector(length=node_count, dtype=float)
+    node_velocity_mat = wp.types.matrix(shape=(node_count, 3), dtype=float)
+
+    @fem.cache.dynamic_kernel(suffix=key, kernel_options={"fast_math": True})
+    def gs_solve_cell_cached_kernel_impl(
+        color: int,
+        launch_dim: int,
+        color_offsets: wp.array[int],
+        color_blocks: wp.array2d[int],
+        yield_params: wp.array[YieldParamVec],
+        strain_node_volume: wp.array[float],
+        compliance_mat_offsets: wp.array[int],
+        compliance_mat_columns: wp.array[int],
+        compliance_mat_values: wp.array[mat66],
+        strain_mat_offsets: wp.array[int],
+        strain_mat_columns: wp.array[int],
+        strain_mat_values: wp.array[mat13],
+        delassus_diagonal: wp.array[vec6],
+        delassus_rotation: wp.array[mat55],
+        inv_mass_matrix: wp.array[float],
+        local_strain_rhs: wp.array[vec6],
+        velocities: wp.array[wp.vec3],
+        local_stress: wp.array[vec6],
+        delta_correction: wp.array[vec6],
+    ):
+        i = wp.tid()
+        color_beg = color_offsets[color] + i
+        color_end = color_offsets[color + 1]
+
+        for color_offset in range(color_beg, color_end, launch_dim):
+            beg, end = color_blocks[0, color_offset], color_blocks[1, color_offset]
+
+            node_index = node_index_vec()
+            node_inv_mass = node_scalar_vec()
+            node_velocity = node_velocity_mat()
+            loaded = bool(False)
+
+            for tau_i in range(beg, end):
+                block_beg = strain_mat_offsets[tau_i]
+                if block_beg == strain_mat_offsets[tau_i + 1]:
+                    delta_correction[tau_i] = vec6(0.0)
+                    continue
+
+                if not loaded:
+                    for k in range(wp.static(node_count)):
+                        u_i = strain_mat_columns[block_beg + k]
+                        node_index[k] = u_i
+                        node_inv_mass[k] = inv_mass_matrix[u_i]
+                        node_velocity[k] = velocities[u_i]
+                    loaded = True
+
+                # tau = rhs + B v (+ C sigma), as in the generic local strain
+                local_strain = local_strain_rhs[tau_i]
+                for k in range(wp.static(node_count)):
+                    local_strain += _symmetric_part_op(strain_mat_values[block_beg + k], node_velocity[k])
+                if wp.static(has_compliance_mat):
+                    for b in range(compliance_mat_offsets[tau_i], compliance_mat_offsets[tau_i + 1]):
+                        local_strain += compliance_mat_values[b] @ local_stress[compliance_mat_columns[b]]
+
+                delta_stress = wp.static(make_solve_local_stress(has_viscosity, has_dilatancy, has_rotation))(
+                    tau_i,
+                    local_strain,
+                    yield_params,
+                    strain_node_volume,
+                    delassus_diagonal,
+                    delassus_rotation,
+                    local_stress,
+                )
+
+                local_stress[tau_i] += delta_stress
+                delta_correction[tau_i] = delta_stress
+
+                for k in range(wp.static(node_count)):
+                    delta_u = node_inv_mass[k] * _symmetric_part_transposed_op(
+                        strain_mat_values[block_beg + k], delta_stress
+                    )
+                    node_velocity[k] = node_velocity[k] + delta_u
+
+            if loaded:
+                for k in range(wp.static(node_count)):
+                    velocities[node_index[k]] = node_velocity[k]
+
+    return gs_solve_cell_cached_kernel_impl
 
 
 # ── Reordered (SoA) GS solver ───────────────────────────────────────────────
