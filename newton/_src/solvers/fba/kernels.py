@@ -1774,25 +1774,143 @@ def update_spring_dual_kernel(
 
 
 @wp.kernel
-def spring_chain_tension_kernel(
-    chain_offsets: wp.array[wp.int32],
+def interleave_row_dirs_kernel(
+    normal: wp.array[wp.vec3],
+    tangent1: wp.array[wp.vec3],
+    tangent2: wp.array[wp.vec3],
+    # outputs
+    row_dir: wp.array[wp.vec3],
+):
+    """The directions of the frictional contact rows, ``(n, t1, t2)`` of each contact in turn."""
+    c = wp.tid()
+    row_dir[3 * c] = normal[c]
+    row_dir[3 * c + 1] = tangent1[c]
+    row_dir[3 * c + 2] = tangent2[c]
+
+
+@wp.kernel
+def spring_chain_system_kernel(
     chain_springs: wp.array[wp.int32],
     chain_diagonal: wp.array[wp.float32],
     chain_link: wp.array[wp.float32],
+    residual: wp.array[wp.float32],
+    direction: wp.array[wp.vec3],
+    first: wp.array[wp.int32],
+    # outputs
+    lower: wp.array[wp.float32],
+    diagonal: wp.array[wp.float32],
+    upper: wp.array[wp.float32],
+    rhs: wp.array[wp.float32],
+):
+    """The tridiagonal systems of :func:`spring_chain_tension_kernel`, one row per place of ``chain_springs``, all
+    chains at once, except in a step's first local step.
+
+    Row ``i`` couples its spring to the previous and the next place's by ``chain_link`` times the cosine of the two
+    springs' angle. ``chain_link`` is zero at a chain's last place, so the couplings across the ends of consecutive
+    chains vanish and their systems stay apart.
+
+    Args:
+        chain_springs: The springs of each chain in their order along it, shape ``[S]``.
+        chain_diagonal: ``B + C`` on the diagonal at each place.
+        chain_link: ``h^2 w`` of the particle that a place's spring shares with the next, times the signs with which
+            it enters the two, zero at a chain's end.
+        residual: Stretch ``r`` [m] of each spring from :func:`update_spring_dual_kernel`.
+        direction: Direction ``t`` of each spring.
+        first: ``first[0]`` is nonzero in the first local step of a time step.
+        lower: Coupling of each row to the previous place, shape ``[S]``.
+        diagonal: Diagonal of each row, shape ``[S]``.
+        upper: Coupling of each row to the next place, shape ``[S]``.
+        rhs: Right-hand side ``r`` of each row, shape ``[S]``.
+    """
+    i = wp.tid()
+    if first[0] != 0:
+        return
+    n = chain_springs.shape[0]
+    e = chain_springs[i]
+    up = wp.float32(0.0)
+    if i + 1 < n:
+        up = chain_link[i] * wp.dot(direction[e], direction[chain_springs[i + 1]])
+    lo = wp.float32(0.0)
+    if i > 0:
+        lo = chain_link[i - 1] * wp.dot(direction[chain_springs[i - 1]], direction[e])
+    lower[i] = lo
+    diagonal[i] = chain_diagonal[i]
+    upper[i] = up
+    rhs[i] = residual[e]
+
+
+@wp.kernel
+def spring_chain_reduction_kernel(
+    stride: int,
+    first: wp.array[wp.int32],
+    lower: wp.array[wp.float32],
+    diagonal: wp.array[wp.float32],
+    upper: wp.array[wp.float32],
+    rhs: wp.array[wp.float32],
+    # outputs
+    lower_out: wp.array[wp.float32],
+    diagonal_out: wp.array[wp.float32],
+    upper_out: wp.array[wp.float32],
+    rhs_out: wp.array[wp.float32],
+):
+    """One level of the parallel cyclic reduction of the chains' tridiagonal systems: each row eliminates the rows
+    ``stride`` places before and after it, so that it couples the rows ``2 stride`` places away. After
+    ``ceil(log2(L))`` levels for the longest chain's ``L`` springs, every row stands alone. A coupling that reaches
+    past a chain's end is zero and stays zero, so rows of another chain contribute nothing.
+
+    Args:
+        stride: Distance [places] of the rows that each row eliminates.
+        first: ``first[0]`` is nonzero in the first local step of a time step.
+        lower: Coupling of each row to the row ``stride`` places before.
+        diagonal: Diagonal of each row.
+        upper: Coupling of each row to the row ``stride`` places after.
+        rhs: Right-hand side of each row.
+        lower_out: Coupling of each row to the row ``2 stride`` places before.
+        diagonal_out: Diagonal of each reduced row.
+        upper_out: Coupling of each row to the row ``2 stride`` places after.
+        rhs_out: Right-hand side of each reduced row.
+    """
+    i = wp.tid()
+    if first[0] != 0:
+        return
+    n = diagonal.shape[0]
+    b = diagonal[i]
+    d = rhs[i]
+    a_out = wp.float32(0.0)
+    c_out = wp.float32(0.0)
+    if i >= stride:
+        alpha = -lower[i] / diagonal[i - stride]
+        b += alpha * upper[i - stride]
+        d += alpha * rhs[i - stride]
+        a_out = alpha * lower[i - stride]
+    if i + stride < n:
+        gamma = -upper[i] / diagonal[i + stride]
+        b += gamma * lower[i + stride]
+        d += gamma * rhs[i + stride]
+        c_out = gamma * upper[i + stride]
+    lower_out[i] = a_out
+    diagonal_out[i] = b
+    upper_out[i] = c_out
+    rhs_out[i] = d
+
+
+@wp.kernel
+def spring_chain_tension_kernel(
+    chain_springs: wp.array[wp.int32],
     chain_bend: wp.array[wp.float32],
     chain_bend_scale: wp.array[wp.float32],
     residual: wp.array[wp.float32],
     direction: wp.array[wp.vec3],
     penalty: wp.array[wp.float32],
     first: wp.array[wp.int32],
-    # scratch
-    sweep_c: wp.array[wp.float32],
-    sweep_d: wp.array[wp.float32],
+    diagonal: wp.array[wp.float32],
+    rhs: wp.array[wp.float32],
     # in-out state
     dual: wp.array[wp.vec3],
 ):
-    """Tension solve of each chain of springs after their dual steps, one thread per chain, except in a step's first
-    local step.
+    """Tension solve of each chain of springs after their dual steps, one thread per spring, except in a step's first
+    local step: the tensions of the systems that :func:`spring_chain_system_kernel` sets up and
+    :func:`spring_chain_reduction_kernel` reduces to their diagonals.
 
     A spring's dual step raises its tension by ``rho r`` for the stretch ``r`` beyond its target, an exact step for
     stretch that moves the spring's particles alone, but long stretch waves along a chain move many particles and
@@ -1801,66 +1919,44 @@ def spring_chain_tension_kernel(
     ``B = h^2 D_t W D_t^T`` of each chain, ``D_t`` the springs' stretch along ``t``; adding ``T = (B + C)^-1 r`` to
     the tensions, with ``C = 1 / (k - rho)`` the compliance that the dual step leaves out, completes the Newton step
     of the tensions of a chain whose particles nothing else holds, and stays below it where more holds them: the
-    system matrix holds the particles at least by their masses and the penalties. A rod's bending element, in the
-    system matrix, also resists a difference of the stretches of its two springs with ``kappa = EI / (v l_- l_+)``:
-    the solve adds ``L r`` for the chain's ``L`` of these, ``kappa`` on the diagonal from each bend at a spring's
-    ends and the bend's ``kappa`` times the cosine of its angle, with the signs of the springs' ends, between its
-    two springs. Each spring's row of ``L r`` takes the factor ``1 / (1 + L_ii C)``: where the bends hold a
-    spring's stretch as firmly as its own stiffness, as in a plug, the spring's compliance ``C`` in series bounds
-    the step. The fixed point is unchanged, as ``r`` vanishes there.
+    system matrix holds the particles at least by their masses and the penalties. ``B + C`` is diagonally dominant,
+    each coupling at most the shared particle's term, which keeps its cyclic reduction stable. A rod's bending
+    element, in the system matrix, also resists a difference of the stretches of its two springs with
+    ``kappa = EI / (v l_- l_+)``: the solve adds ``L r`` for the chain's ``L`` of these, ``kappa`` on the diagonal from
+    each bend at a spring's ends and the bend's ``kappa`` times the cosine of its angle, with the signs of the springs'
+    ends, between its two springs. Each spring's row of ``L r`` takes the factor ``1 / (1 + L_ii C)``: where the bends
+    hold a spring's stretch as firmly as its own stiffness, as in a plug, the spring's compliance ``C`` in series
+    bounds the step. The fixed point is unchanged, as ``r`` vanishes there.
 
     Args:
-        chain_offsets: Start of each chain in ``chain_springs``, shape ``[C + 1]``.
         chain_springs: The springs of each chain in their order along it, shape ``[S]``.
-        chain_diagonal: ``B + C`` on the diagonal at each place of ``chain_springs``.
-        chain_link: ``h^2 w`` of the particle that a place's spring shares with the next, times the signs with which
-            it enters the two, zero at a chain's end; ``B`` couples the two by it times the cosine of their angle.
         chain_bend: ``kappa`` [N/m] of the bend at the particle that a place's spring shares with the next, times
-            the same signs, zero without one.
+            the signs with which it enters the two, zero without one and at a chain's end.
         chain_bend_scale: ``1 / (1 + L_ii C)`` of each place's spring.
         residual: Stretch ``r`` [m] of each spring from :func:`update_spring_dual_kernel`.
         direction: Direction ``t`` of each spring.
         penalty: ADMM penalty ``rho`` [N/m] of each spring.
         first: ``first[0]`` is nonzero in the first local step of a time step.
-        sweep_c: Scratch of the forward sweep, shape ``[S]``.
-        sweep_d: Scratch of the forward sweep, shape ``[S]``.
+        diagonal: Diagonal of each place's fully reduced row.
+        rhs: Right-hand side of each place's fully reduced row.
         dual: Scaled dual ``u`` [m] of each spring, which takes ``T / rho`` along ``t``.
     """
-    c = wp.tid()
+    i = wp.tid()
     if first[0] != 0:
         return
-    start = chain_offsets[c]
-    end = chain_offsets[c + 1]
-    # Thomas algorithm: B is weakly diagonally dominant, each coupling at most the shared particle's term.
-    lower = wp.float32(0.0)
-    for i in range(start, end):
-        e = chain_springs[i]
-        upper = wp.float32(0.0)
-        if i + 1 < end:
-            upper = chain_link[i] * wp.dot(direction[e], direction[chain_springs[i + 1]])
-        diagonal = chain_diagonal[i]
-        rhs = residual[e]
-        if i > start:
-            diagonal = diagonal - lower * sweep_c[i - 1]
-            rhs = rhs - lower * sweep_d[i - 1]
-        sweep_c[i] = upper / diagonal
-        sweep_d[i] = rhs / diagonal
-        lower = upper
-    tension = wp.float32(0.0)
-    for j in range(end - start):
-        i = end - 1 - j
-        tension = sweep_d[i] - sweep_c[i] * tension
-        e = chain_springs[i]
-        bend = wp.float32(0.0)
-        if i > start:
-            k = chain_bend[i - 1]
-            f = chain_springs[i - 1]
-            bend += wp.abs(k) * residual[e] + k * wp.dot(direction[f], direction[e]) * residual[f]
-        if i + 1 < end:
-            k = chain_bend[i]
-            f = chain_springs[i + 1]
-            bend += wp.abs(k) * residual[e] + k * wp.dot(direction[e], direction[f]) * residual[f]
-        dual[e] = dual[e] + (tension + chain_bend_scale[i] * bend) / penalty[e] * direction[e]
+    n = chain_springs.shape[0]
+    tension = rhs[i] / diagonal[i]
+    e = chain_springs[i]
+    bend = wp.float32(0.0)
+    if i > 0:
+        k = chain_bend[i - 1]
+        f = chain_springs[i - 1]
+        bend += wp.abs(k) * residual[e] + k * wp.dot(direction[f], direction[e]) * residual[f]
+    if i + 1 < n:
+        k = chain_bend[i]
+        f = chain_springs[i + 1]
+        bend += wp.abs(k) * residual[e] + k * wp.dot(direction[e], direction[f]) * residual[f]
+    dual[e] = dual[e] + (tension + chain_bend_scale[i] * bend) / penalty[e] * direction[e]
 
 
 @wp.kernel

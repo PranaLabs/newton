@@ -202,10 +202,12 @@ class Example:
         # Ten LG iterations per step, the cords' segments colliding as capsules, and Rayleigh damping:
         # mass-proportional 0.05/s, and corotated stiffness damping per cord, the rubber's and the rope's, of the
         # cords' stretch and bending rates.
+        # The contact solves keep their Delassus matrix in sparse storage, whose NSN step replays from step to step.
         self.solver = SolverFBA(
             self.model,
             iterations=10,
             nsn_linear_iterations=10,
+            nsn_sparse_storage=True,
             rod_contact=True,
             rayleigh_alpha=0.05,
             rayleigh_beta=np.asarray(beta),

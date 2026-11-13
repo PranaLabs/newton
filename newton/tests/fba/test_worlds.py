@@ -1378,9 +1378,9 @@ class TestFBAWorlds(unittest.TestCase):
                                 self.assertEqual(len(captures), len(set(captures)), (run, step))
                                 if sparse and wp.get_device(device).is_cuda:
                                     # The sparse NSN solves on the device run from graphs: each path captures one,
-                                    # but padded rows replay the graph of an earlier step while their storage holds.
+                                    # but a later step replays the graph of an earlier one while its key holds.
                                     solved = {c[0] for c in calls}
-                                    if getattr(solver, "_rc_padded", None) is not None and step:
+                                    if step:
                                         self.assertLessEqual(set(captures), solved, (run, step))
                                     else:
                                         self.assertEqual(sorted(captures), sorted(solved), (run, step))

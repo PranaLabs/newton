@@ -1,0 +1,1 @@
+Speed up `SolverFBA` NSN steps whose Delassus rows hold more than 64 entries on average, as those of a rod's contacts do: their products take warp.sparse's tiled product, which it picks itself only from 128 entries on.

@@ -388,7 +388,7 @@ about 6,800 contacts, 6.3 ms per 1/50 s frame (3.2x real time); `convex_hulls_fb
 (5.7x); `nonconvex_pile_fba`, 1,000 bodies of 5,130 convex parts and about 20,000 contacts, 15.8 ms per 1/50 s frame
 (1.3x).
 
-The particle rod examples, timed the same way with this branch's code as of 2026-11-13: `particle_rods_fba`, 395 particles, 22.5 ms per 1/50 s frame (0.9x); `hemp_rope_fba`, 251 particles, 23.0 ms per 1/50 s frame (0.9x); `desk_cables_fba`, 533 particles, 26.7 ms per 1/50 s frame (0.8x); `elastic_cords_fba`, 251 particles, 63.5 ms per 1/50 s frame (0.3x); `rod_gripper_fba`, 102 particles, 40.1 ms per 1/50 s frame (0.5x).
+The particle rod examples, timed the same way with this branch's code as of 2026-11-13: `particle_rods_fba`, 395 particles, 10.8 ms per 1/50 s frame (1.9x); `hemp_rope_fba`, 251 particles, 11.3 ms per 1/50 s frame (1.8x); `desk_cables_fba`, 533 particles, 13.8 ms per 1/50 s frame (1.4x); `elastic_cords_fba`, 251 particles, 39.7 ms per 1/50 s frame (0.5x); `rod_gripper_fba`, 102 particles, 19.6 ms per 1/50 s frame (1.0x).
 
 ### Example Options
 

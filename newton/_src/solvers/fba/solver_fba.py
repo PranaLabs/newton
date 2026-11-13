@@ -504,6 +504,8 @@ class SolverFBA(SolverBase):
         self._mixed = self._two_way_ls = None
         # The rows that :meth:`_swap_rows` exchanged into the solver, until it exchanges them back.
         self._swapped_rows = None
+        # Host copies of the step's contact rows for the Schur build, from the host contact path.
+        self._contact_host_rows = self._contact_extra_h = None
         self._empty_contact_scale = wp.empty(0, dtype=wp.float64, device=model.device)
         self._deformable_contact_scale = self._rigid_contact_scale = self._empty_contact_scale
         self._nsn_contact_scale = self._empty_contact_scale
@@ -853,6 +855,8 @@ class SolverFBA(SolverBase):
         self._k_pin = _K.project_pin_kernel
         self._k_spring = _K.project_spring_admm_kernel
         self._k_spring_dual = _K.update_spring_dual_kernel
+        self._k_spring_chain_system = _K.spring_chain_system_kernel
+        self._k_spring_chain_reduction = _K.spring_chain_reduction_kernel
         self._k_spring_chain = _K.spring_chain_tension_kernel
         self._k_clear_flag = _K.clear_flag_kernel
         self._k_bending = _K.project_bending_kernel
@@ -1905,7 +1909,9 @@ class SolverFBA(SolverBase):
         h2 = dt * dt
         diagonal = h2 * (inv_mass[springs] * scale).sum(axis=1) + compliance
         coupling = np.where(link >= 0, h2 * inv_mass[np.maximum(link, 0)] * sign, 0.0)
-        self._spring_chain_offsets_d = wp.array(offsets, dtype=wp.int32, device=device)
+        # The chains' systems are solved together by parallel cyclic reduction, ceil(log2(L)) levels for the longest
+        # chain's L springs, each from one set of rows to the other.
+        self._spring_chain_levels = int(np.ceil(np.log2(max(int(np.diff(offsets).max(initial=1)), 1))))
         self._spring_chain_order_d = wp.array(order, dtype=wp.int32, device=device)
         self._spring_chain_diagonal_d = wp.array(diagonal[order].astype(np.float32), dtype=wp.float32, device=device)
         self._spring_chain_link_d = wp.array(coupling.astype(np.float32), dtype=wp.float32, device=device)
@@ -1936,10 +1942,10 @@ class SolverFBA(SolverBase):
         self._spring_chain_bend_d = wp.array(bend.astype(np.float32), dtype=wp.float32, device=device)
         self._spring_chain_bend_scale_d = wp.array(bend_scale.astype(np.float32), dtype=wp.float32, device=device)
         self._spring_residual_d = wp.zeros(springs.shape[0], dtype=wp.float32, device=device)
-        self._spring_sweep_d = (
-            wp.zeros(springs.shape[0], dtype=wp.float32, device=device),
-            wp.zeros(springs.shape[0], dtype=wp.float32, device=device),
-        )
+        # The rows (lower, diagonal, upper, right-hand side) of the chains' systems, two sets for the reduction.
+        self._spring_chain_rows_d = [
+            [wp.zeros(springs.shape[0], dtype=wp.float32, device=device) for _ in range(4)] for _ in range(2)
+        ]
 
     def _setup_pd_system(self, dt: float) -> None:
         """Build / rebuild the PD Hessian, factor it, and upload device data."""
@@ -2497,6 +2503,10 @@ class SolverFBA(SolverBase):
                                 download=False,
                                 **self._contact_extra_args(),
                                 **self._constraint_args(),
+                                # The host copies hold the step's whole contact set, not one that a split swapped in.
+                                host_rows=self._contact_host_rows
+                                if self._swapped_rows is None and not self._two_way
+                                else None,
                             )
                         self._cached_W = True
                     # Residual + pene0 + warm-start all device-resident: the PD
@@ -2914,13 +2924,18 @@ class SolverFBA(SolverBase):
             inputs = [self._x_cur, self._spring_indices_d, self._spring_rest_d, self._spring_split_d]
             outputs = [self._spring_dual_d, self._spring_dir_d, self._spring_residual_d]
             wp.launch(self._k_spring_dual, S, [*inputs, self._spring_first_d], outputs, device=device)
-            inputs = [self._spring_chain_offsets_d, self._spring_chain_order_d, self._spring_chain_diagonal_d]
-            inputs += [self._spring_chain_link_d, self._spring_chain_bend_d, self._spring_chain_bend_scale_d]
-            inputs += [self._spring_residual_d]
-            inputs += [self._spring_dir_d, self._spring_rho_d]
-            inputs += [self._spring_first_d, *self._spring_sweep_d]
-            C = self._spring_chain_offsets_d.shape[0] - 1
-            wp.launch(self._k_spring_chain, C, inputs, [self._spring_dual_d], device=device)
+            rows, other = self._spring_chain_rows_d
+            inputs = [self._spring_chain_order_d, self._spring_chain_diagonal_d, self._spring_chain_link_d]
+            inputs += [self._spring_residual_d, self._spring_dir_d, self._spring_first_d]
+            wp.launch(self._k_spring_chain_system, S, inputs, rows, device=device)
+            for level in range(self._spring_chain_levels):
+                inputs = [1 << level, self._spring_first_d, *rows]
+                wp.launch(self._k_spring_chain_reduction, S, inputs, other, device=device)
+                rows, other = other, rows
+            inputs = [self._spring_chain_order_d, self._spring_chain_bend_d, self._spring_chain_bend_scale_d]
+            inputs += [self._spring_residual_d, self._spring_dir_d, self._spring_rho_d, self._spring_first_d]
+            inputs += [rows[1], rows[3]]
+            wp.launch(self._k_spring_chain, S, inputs, [self._spring_dual_d], device=device)
             inputs = [self._x_cur, self._spring_indices_d, self._spring_rest_d, self._spring_k_d, self._spring_rho_d]
             inputs += [self._spring_c_d, self._spring_len0_d, self._spring_dual_d, self._spring_dir_d]
             outputs = [self._spring_split_d, self._spring_contrib_d]
@@ -3707,8 +3722,8 @@ class SolverFBA(SolverBase):
         that is decoupled from Schur factor invalidation.
         """
         self._cached_W = False
-        # The graph of the sparse NSN step holds its matrices.
-        self._nsn_graph = None
+        # The graph of the sparse NSN step stays: its key holds the linear solver's array generation, the sizes and
+        # the identities of what it reads, and the Schur build writes its arrays in place while their shapes hold.
 
     # ------------------------------------------------------------------
     # Contact state (allocated lazily on first call).
@@ -3913,6 +3928,7 @@ class SolverFBA(SolverBase):
         # The contacts change, so the next solve rebuilds ``W`` from the new J.
         self._invalidate_schur_cache()
         self._contact_extra = None
+        self._contact_host_rows = None
 
         # With a face contact margin, triangles can touch shapes that no particle touches.
         other_contacts = self._face_query is not None and self.face_contact_gap is not None
@@ -4054,8 +4070,10 @@ class SolverFBA(SolverBase):
                     ]
                 extra = [np.concatenate([extra[0], sp[:, 1:]]), np.concatenate([extra[1], sa[:, 1:]])]
                 M = len(particle_h)
+        self._contact_extra_h = None
         if extra is not None:
             self._contact_extra = [wp.array(a, device=self._device) for a in extra]
+            self._contact_extra_h = extra
         if M == 0:
             self._contact_count = 0
             return
@@ -4157,6 +4175,10 @@ class SolverFBA(SolverBase):
         # Host mirrors of the basic contact fields, for the host paths that still read them.
         self._contact_particle_h = None if particle_h is None else particle_h.astype(np.int32)
         self._contact_alpha_h = alpha_h
+        # The rows' particles and coefficients on the host, for the Schur build without a read back.
+        if particle_h is not None:
+            extra_h = (None, None) if self._contact_extra_h is None else tuple(self._contact_extra_h)
+            self._contact_host_rows = (self._contact_particle_h, alpha_h, *extra_h)
         self._contact_count = M
 
         # Friction: tangent basis, tangent offsets, kinematic anchor velocity.
@@ -5030,8 +5052,14 @@ class SolverFBA(SolverBase):
         if pcr.max_iter > pcr.check_every or not wp.get_device(device).is_cuda:
             run()
             return
+        ls = self._linear_solver
         key = (
             name,
+            # The linear solver's arrays that the step reads: a new one raises their generation.
+            getattr(ls, "_graph_generation", 0),
+            getattr(ls, "_row_slots", None) is not None,
+            # The entries of W, which launches of the step count; a rigid step's pattern matrix may be None.
+            tuple(int(getattr(m, "nnz", 0)) for m in W_sparse),
             *(id(a) for a in (*W_sparse, *inputs, *tail[1])),
             sizes,
             precond_key,
@@ -5098,7 +5126,11 @@ class SolverFBA(SolverBase):
         blocked = getattr(W_sp, "block3", False)
         if blocked and not pcr.fuses_alone(n_rows):
             raise RuntimeError("SolverFBA keeps W in 3x3 blocks only for a fused PCR")
-        product = block3_mv if blocked else wps.bsr_mv
+        from .nsn_pcr_solver import _LONG_ROW, _TILED_MV  # noqa: PLC0415
+
+        # Long rows of W take the tiled product, as the conjugate residual iterations' products do.
+        tile = _TILED_MV if int(W_sp.nnz) > _LONG_ROW * n_rows else -1
+        product = block3_mv if blocked else functools.partial(wps.bsr_mv, tile_size=tile)
         # Frictional precond: dt²·W_ii for normal rows; dt·W_ii for tangents.
         if blocked:
             block3_diag(W_sp, diag)

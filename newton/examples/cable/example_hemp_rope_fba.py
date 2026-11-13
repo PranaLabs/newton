@@ -118,10 +118,12 @@ class Example:
         # Ten LG iterations per 10 ms step, at most ten conjugate residual iterations per contact solve, the rope's
         # segments colliding as capsules, and light Rayleigh damping: mass-proportional 0.2/s, and corotated
         # stiffness damping of 1 ms that damps the rope's stretch and bending rates but not its swing.
+        # The contact solves keep their Delassus matrix in sparse storage, whose NSN step replays from step to step.
         self.solver = SolverFBA(
             self.model,
             iterations=10,
             nsn_linear_iterations=10,
+            nsn_sparse_storage=True,
             rod_contact=True,
             rayleigh_alpha=0.2,
             rayleigh_beta=1.0e-3,
