@@ -61,6 +61,49 @@ def key_pose(t):
     return (1.0 - s) * np.array(c0) + s * np.array(c1), (1.0 - s) * g0 + s * g1
 
 
+@wp.func
+def key_pose_device(t: float, key_t: wp.array[float], key_c: wp.array[wp.vec3], key_g: wp.array[float]):
+    """:func:`key_pose` on the device."""
+    n = key_t.shape[0]
+    if t >= key_t[n - 1]:
+        return key_c[n - 1], key_g[n - 1]
+    i = int(0)
+    for k in range(n - 1):
+        if t >= key_t[k]:
+            i = k
+    s = (t - key_t[i]) / (key_t[i + 1] - key_t[i])
+    s = s * s * (3.0 - 2.0 * s)
+    return (1.0 - s) * key_c[i] + s * key_c[i + 1], (1.0 - s) * key_g[i] + s * key_g[i + 1]
+
+
+@wp.kernel
+def gripper_pose_kernel(
+    t: float,
+    dt: float,
+    key_t: wp.array[float],
+    key_c: wp.array[wp.vec3],
+    key_g: wp.array[float],
+    pads: wp.array[wp.int32],
+    palm: int,
+    pad_half_width: float,
+    palm_height: float,
+    # outputs
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+):
+    """Pose the pads and the palm at time ``t``, with the velocities of their motion over ``dt``."""
+    center, gap = key_pose_device(t, key_t, key_c, key_g)
+    ahead, gap_ahead = key_pose_device(t + dt, key_t, key_c, key_g)
+    for k in range(2):
+        side = 2.0 * float(k) - 1.0
+        offset = wp.vec3(0.0, side * (gap + pad_half_width), 0.0)
+        offset_ahead = wp.vec3(0.0, side * (gap_ahead + pad_half_width), 0.0)
+        body_q[pads[k]] = wp.transform(center + offset, wp.quat_identity())
+        body_qd[pads[k]] = wp.spatial_vector((ahead + offset_ahead - center - offset) / dt, wp.vec3(0.0))
+    body_q[palm] = wp.transform(center + wp.vec3(0.0, 0.0, palm_height), wp.quat_identity())
+    body_qd[palm] = wp.spatial_vector((ahead - center) / dt, wp.vec3(0.0))
+
+
 @wp.kernel
 def rope_tube_kernel(
     x: wp.array[wp.vec3],
@@ -155,6 +198,11 @@ class Example:
         self.contacts = self.pipeline.contacts()
         self.state_0, self.state_1 = self.model.state(), self.model.state()
         self.held = None  # rope particles held by the "pins" grasp, and their places in the pads' frame
+        # The key poses on the device, where the gripper is posed every step without a round trip through the host.
+        self.key_t = wp.array([k[0] for k in KEYS], dtype=float)
+        self.key_c = wp.array([k[1] for k in KEYS], dtype=wp.vec3)
+        self.key_g = wp.array([k[2] for k in KEYS], dtype=float)
+        self.pads_d = wp.array(self.pads, dtype=wp.int32)
         self.set_gripper(self.state_0, 0.0)
         self.set_gripper(self.state_1, 0.0)
 
@@ -177,19 +225,9 @@ class Example:
 
     def set_gripper(self, state, t):
         """Pose the pads and the palm at time ``t``, with the velocities of their motion."""
-        center, gap = key_pose(t)
-        ahead, gap_ahead = key_pose(t + self.sim_dt)
-        q, qd = state.body_q.numpy(), state.body_qd.numpy()
-        for side, body in zip((-1.0, 1.0), self.pads, strict=True):
-            offset = np.array((0.0, side * (gap + PAD[1]), 0.0))
-            offset_ahead = np.array((0.0, side * (gap_ahead + PAD[1]), 0.0))
-            q[body] = (*(center + offset), 0.0, 0.0, 0.0, 1.0)
-            qd[body] = (*((ahead + offset_ahead - center - offset) / self.sim_dt), 0.0, 0.0, 0.0)
-        top = center + np.array((0.0, 0.0, PAD[2] + 0.012))
-        q[self.palm] = (*top, 0.0, 0.0, 0.0, 1.0)
-        qd[self.palm] = (*((ahead - center) / self.sim_dt), 0.0, 0.0, 0.0)
-        state.body_q.assign(q)
-        state.body_qd.assign(qd)
+        inputs = [float(t), float(self.sim_dt), self.key_t, self.key_c, self.key_g, self.pads_d, self.palm]
+        inputs += [PAD[1], PAD[2] + 0.012]
+        wp.launch(gripper_pose_kernel, 1, inputs, [state.body_q, state.body_qd])
 
     def update_pins(self, t):
         """The "pins" grasp: take the rope's particles between the pads once they have closed, hold them at their
