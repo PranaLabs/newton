@@ -853,6 +853,8 @@ class SolverFBA(SolverBase):
         self._k_pin = _K.project_pin_kernel
         self._k_spring = _K.project_spring_admm_kernel
         self._k_spring_dual = _K.update_spring_dual_kernel
+        self._k_spring_chain_system = _K.spring_chain_system_kernel
+        self._k_spring_chain_reduction = _K.spring_chain_reduction_kernel
         self._k_spring_chain = _K.spring_chain_tension_kernel
         self._k_clear_flag = _K.clear_flag_kernel
         self._k_bending = _K.project_bending_kernel
@@ -1905,7 +1907,9 @@ class SolverFBA(SolverBase):
         h2 = dt * dt
         diagonal = h2 * (inv_mass[springs] * scale).sum(axis=1) + compliance
         coupling = np.where(link >= 0, h2 * inv_mass[np.maximum(link, 0)] * sign, 0.0)
-        self._spring_chain_offsets_d = wp.array(offsets, dtype=wp.int32, device=device)
+        # The chains' systems are solved together by parallel cyclic reduction, ceil(log2(L)) levels for the longest
+        # chain's L springs, each from one set of rows to the other.
+        self._spring_chain_levels = int(np.ceil(np.log2(max(int(np.diff(offsets).max(initial=1)), 1))))
         self._spring_chain_order_d = wp.array(order, dtype=wp.int32, device=device)
         self._spring_chain_diagonal_d = wp.array(diagonal[order].astype(np.float32), dtype=wp.float32, device=device)
         self._spring_chain_link_d = wp.array(coupling.astype(np.float32), dtype=wp.float32, device=device)
@@ -1936,10 +1940,10 @@ class SolverFBA(SolverBase):
         self._spring_chain_bend_d = wp.array(bend.astype(np.float32), dtype=wp.float32, device=device)
         self._spring_chain_bend_scale_d = wp.array(bend_scale.astype(np.float32), dtype=wp.float32, device=device)
         self._spring_residual_d = wp.zeros(springs.shape[0], dtype=wp.float32, device=device)
-        self._spring_sweep_d = (
-            wp.zeros(springs.shape[0], dtype=wp.float32, device=device),
-            wp.zeros(springs.shape[0], dtype=wp.float32, device=device),
-        )
+        # The rows (lower, diagonal, upper, right-hand side) of the chains' systems, two sets for the reduction.
+        self._spring_chain_rows_d = [
+            [wp.zeros(springs.shape[0], dtype=wp.float32, device=device) for _ in range(4)] for _ in range(2)
+        ]
 
     def _setup_pd_system(self, dt: float) -> None:
         """Build / rebuild the PD Hessian, factor it, and upload device data."""
@@ -2914,13 +2918,18 @@ class SolverFBA(SolverBase):
             inputs = [self._x_cur, self._spring_indices_d, self._spring_rest_d, self._spring_split_d]
             outputs = [self._spring_dual_d, self._spring_dir_d, self._spring_residual_d]
             wp.launch(self._k_spring_dual, S, [*inputs, self._spring_first_d], outputs, device=device)
-            inputs = [self._spring_chain_offsets_d, self._spring_chain_order_d, self._spring_chain_diagonal_d]
-            inputs += [self._spring_chain_link_d, self._spring_chain_bend_d, self._spring_chain_bend_scale_d]
-            inputs += [self._spring_residual_d]
-            inputs += [self._spring_dir_d, self._spring_rho_d]
-            inputs += [self._spring_first_d, *self._spring_sweep_d]
-            C = self._spring_chain_offsets_d.shape[0] - 1
-            wp.launch(self._k_spring_chain, C, inputs, [self._spring_dual_d], device=device)
+            rows, other = self._spring_chain_rows_d
+            inputs = [self._spring_chain_order_d, self._spring_chain_diagonal_d, self._spring_chain_link_d]
+            inputs += [self._spring_residual_d, self._spring_dir_d, self._spring_first_d]
+            wp.launch(self._k_spring_chain_system, S, inputs, rows, device=device)
+            for level in range(self._spring_chain_levels):
+                inputs = [1 << level, self._spring_first_d, *rows]
+                wp.launch(self._k_spring_chain_reduction, S, inputs, other, device=device)
+                rows, other = other, rows
+            inputs = [self._spring_chain_order_d, self._spring_chain_bend_d, self._spring_chain_bend_scale_d]
+            inputs += [self._spring_residual_d, self._spring_dir_d, self._spring_rho_d, self._spring_first_d]
+            inputs += [rows[1], rows[3]]
+            wp.launch(self._k_spring_chain, S, inputs, [self._spring_dual_d], device=device)
             inputs = [self._x_cur, self._spring_indices_d, self._spring_rest_d, self._spring_k_d, self._spring_rho_d]
             inputs += [self._spring_c_d, self._spring_len0_d, self._spring_dual_d, self._spring_dir_d]
             outputs = [self._spring_split_d, self._spring_contrib_d]
