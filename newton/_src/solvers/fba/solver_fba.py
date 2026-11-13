@@ -217,6 +217,8 @@ class SolverFBA(SolverBase):
         particle_self_contact_group_margins: ArrayLike | None = None,
         rod_contact: bool = False,
         rod_contact_gap: float | None = None,
+        rod_shape_contacts: bool = False,
+        rod_shape_contact_gap: float | None = None,
         rayleigh_alpha: float | ArrayLike = 0.0,
         rayleigh_beta: float | ArrayLike = 0.0,
         rayleigh_corotated: bool = False,
@@ -446,6 +448,19 @@ class SolverFBA(SolverBase):
                 contacts beyond the capsules' surfaces, which bounds the
                 relative motion of two segments per step that cannot pass a
                 contact. ``None`` takes the largest particle radius.
+            rod_shape_contacts: If ``True``, the springs, such as the
+                segments of particle rods, also collide with shapes as capsules
+                whose radius runs between their particles' radii: a segment
+                takes a contact at its deepest point inside a shape when that
+                point lies strictly between its particles and deeper than both,
+                a row on its two particles with that point's weights, as a face
+                contact is on a triangle's. A thin shape then cannot pass
+                between two particles of a rod, and a rod slides over a curve
+                without catching on its particles. Needs friction and the full
+                operator.
+            rod_shape_contact_gap: Detection distance [m] of the segment
+                contacts beyond the capsules' surfaces and the shape margins.
+                ``None`` takes the largest particle radius of the springs.
             rayleigh_alpha: Mass-proportional Rayleigh damping coefficient
                 [1/s]: a particle of mass ``m`` moving at ``v`` feels the force
                 ``-alpha m v``. A scalar for every particle, or one value per
@@ -729,6 +744,23 @@ class SolverFBA(SolverBase):
                 groups, margins, particle_self_contact_margin, query_radius - particle_self_contact_margin
             )
         self._rod_contact = None
+        self._segment_query, self.rod_shape_contact_gap = None, None
+        if rod_shape_contacts:
+            if not self.friction or nsn_schur_mode != "full":
+                raise ValueError("rod_shape_contacts needs friction=True and nsn_schur_mode='full'")
+            seg = model.spring_indices.numpy().reshape(-1, 2) if model.spring_count else np.zeros((0, 2), np.int32)
+            if model.spring_count:
+                seg = seg[model.spring_stiffness.numpy() > 0.0]
+            if not len(seg):
+                raise ValueError("rod_shape_contacts needs springs")
+            if rod_shape_contact_gap is None:
+                rod_shape_contact_gap = float(model.particle_radius.numpy()[seg].max())
+            if not rod_shape_contact_gap >= 0.0:
+                raise ValueError(f"rod_shape_contact_gap must be >= 0, got {rod_shape_contact_gap}")
+            from .face_contact import SegmentContactQuery  # noqa: PLC0415
+
+            self._segment_query = SegmentContactQuery(seg, model.device)
+            self.rod_shape_contact_gap = float(rod_shape_contact_gap)
         if rod_contact:
             if not self.friction or self.friction_anchors:
                 raise ValueError("rod_contact needs friction=True and no friction_anchors")
@@ -4087,6 +4119,7 @@ class SolverFBA(SolverBase):
         # With a face contact margin, triangles can touch shapes that no particle touches.
         other_contacts = self._face_query is not None and self.face_contact_gap is not None
         other_contacts = other_contacts or self._self_contact is not None or self._rod_contact is not None
+        other_contacts = other_contacts or self._segment_query is not None
         M_raw = 0
         if contacts is not None:
             capacity = contacts.soft_contact_particle.shape[0]
@@ -4107,6 +4140,7 @@ class SolverFBA(SolverBase):
         # contacts take that path, as their many contacts make the host round trip costly; the others keep the
         # host path.
         on_device = contacts is not None and self._face_query is None and self._rod_contact is None
+        on_device = on_device and self._segment_query is None
         if on_device and getattr(self._self_contact, "mode", None) == "vertex_face":
             M, shape_contacts = self._assemble_contacts_on_device(contacts, state, M_raw)
             particle_h = normal_h = alpha_h = shape_h = body_pos_h = record_h = extra = None
@@ -4188,6 +4222,28 @@ class SolverFBA(SolverBase):
                     record_h = np.concatenate([record_h, np.full(len(found[0]), -1, dtype=np.int32)])
                     extra = [np.full((M, 2), -1, dtype=np.int32), np.zeros((M, 2), dtype=np.float32)]
                     extra = [np.concatenate([extra[0], tri[:, 1:]]), np.concatenate([extra[1], bary[:, 1:]])]
+                    M = len(particle_h)
+            # Segment contacts of the rods follow: slot 0 holds the segment's first particle, the first extra slot
+            # the second.
+            if self._segment_query is not None:
+                src = state if state is not None else self.model
+                found = self._segment_query.query(
+                    self.model, src.particle_q, src.body_q, self.face_contact_edge_radius, self.rod_shape_contact_gap
+                )
+                if len(found[0]):
+                    seg, w = self._segment_query.seg[found[0]], found[2]
+                    particle_h, alpha_h = np.concatenate([particle_h, seg[:, 0]]), np.concatenate([alpha_h, w[:, 0]])
+                    shape_h = np.concatenate([shape_h, found[1].astype(shape_h.dtype)])
+                    body_pos_h = np.concatenate([body_pos_h, found[3].astype(body_pos_h.dtype)])
+                    normal_h = np.concatenate([normal_h, found[4].astype(normal_h.dtype)])
+                    record_h = np.concatenate([record_h, np.full(len(found[0]), -1, dtype=np.int32)])
+                    width = 1 if extra is None else extra[0].shape[1]
+                    if extra is None:
+                        extra = [np.full((M, 1), -1, dtype=np.int32), np.zeros((M, 1), dtype=np.float32)]
+                    seg_extra = np.full((len(seg), width), -1, dtype=np.int32)
+                    seg_alpha = np.zeros((len(seg), width), dtype=np.float32)
+                    seg_extra[:, 0], seg_alpha[:, 0] = seg[:, 1], w[:, 1]
+                    extra = [np.concatenate([extra[0], seg_extra]), np.concatenate([extra[1], seg_alpha])]
                     M = len(particle_h)
             # Self contacts follow, with a static anchor at the contact margin along their normal: their rows hold
             # n . sum_k alpha_k x_k >= margin and start without tangential offset.

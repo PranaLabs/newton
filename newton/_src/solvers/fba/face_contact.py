@@ -435,3 +435,193 @@ class FaceContactQuery:
         rows = np.nonzero(hit)[0]
         minima = np.asarray(particle)[rows], np.asarray(shape)[rows], out[0].numpy()[:m][hit], out[1].numpy()[:m][hit]
         return (*minima, rows)
+
+
+@wp.kernel
+def near_segment_kernel(
+    particle_q: wp.array[wp.vec3],
+    segments: wp.array2d[wp.int32],
+    particle_radius: wp.array[wp.float32],
+    particle_world: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[wp.int32],
+    shape_type: wp.array[wp.int32],
+    shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
+    shape_flags: wp.array[wp.int32],
+    shape_world: wp.array[wp.int32],
+    shape_margin: wp.array[wp.float32],
+    gap: float,
+    edge_radius: float,
+    shapes: wp.array[wp.int32],
+    count: wp.array[wp.int32],
+    pair: wp.array[wp.int64],
+):
+    """``shape * segment_count + segment`` of each pair whose segment, a capsule of its particles' radius, may come
+    within ``gap`` of the shape: no point of the segment is closer than its midpoint's distance minus half its
+    length. The shapes are ``shapes``, those that collide with particles."""
+    e, k = wp.tid()
+    s = shapes[k]
+    world = shape_world[s]
+    i, j = segments[e, 0], segments[e, 1]
+    if (shape_flags[s] & ShapeFlags.COLLIDE_PARTICLES) == 0 or (world >= 0 and world != particle_world[i]):
+        return
+    X_ws = shape_transform[s]
+    if shape_body[s] >= 0:
+        X_ws = wp.transform_multiply(body_q[shape_body[s]], X_ws)
+    X_sw = wp.transform_inverse(X_ws)
+    a = wp.transform_point(X_sw, particle_q[i])
+    b = wp.transform_point(X_sw, particle_q[j])
+    o = 0.5 * (a + b)
+    d = shape_sdf(shape_type[s], shape_scale[s], shape_source_ptr[s], o, edge_radius)[0]
+    reach = wp.max(particle_radius[i], particle_radius[j]) + shape_margin[s] + gap
+    if d - 0.5 * wp.length(b - a) <= reach:
+        pair[wp.atomic_add(count, 0, 1)] = wp.int64(s) * wp.int64(segments.shape[0]) + wp.int64(e)
+
+
+@wp.kernel
+def segment_contact_kernel(
+    particle_q: wp.array[wp.vec3],
+    segments: wp.array2d[wp.int32],
+    particle_radius: wp.array[wp.float32],
+    pair_segment: wp.array[wp.int32],
+    pair_shape: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[wp.int32],
+    shape_type: wp.array[wp.int32],
+    shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
+    shape_margin: wp.array[wp.float32],
+    gap: float,
+    iterations: int,
+    edge_radius: float,
+    count: wp.array[wp.int32],
+    pair: wp.array[wp.int32],
+    weight: wp.array[wp.float32],
+    depth: wp.array[wp.float32],
+    body_pos: wp.array[wp.vec3],
+    normal: wp.array[wp.vec3],
+):
+    """Deepest point of each candidate ``(segment, shape)`` pair, emitted if it lies strictly inside the segment,
+    deeper than both of its particles and within the capsule radius plus the shape margin plus ``gap`` of the shape.
+    The point is ``(1 - t) a + t b`` at the root of the signed distance's derivative along the segment, found by
+    bisection; ``weight`` is ``t``. ``body_pos`` is the closest surface point in the body frame, as
+    ``Contacts.soft_contact_body_pos``.
+    """
+    k = wp.tid()
+    e = pair_segment[k]
+    s = pair_shape[k]
+    X_bs = shape_transform[s]
+    X_ws = X_bs
+    if shape_body[s] >= 0:
+        X_ws = wp.transform_multiply(body_q[shape_body[s]], X_bs)
+    X_sw = wp.transform_inverse(X_ws)
+    a = wp.transform_point(X_sw, particle_q[segments[e, 0]])
+    b = wp.transform_point(X_sw, particle_q[segments[e, 1]])
+    geo, scale, mesh, r = shape_type[s], shape_scale[s], shape_source_ptr[s], edge_radius
+    ab = b - a
+    sa = shape_sdf(geo, scale, mesh, a, r)
+    sb = shape_sdf(geo, scale, mesh, b, r)
+    # The distance falls into the segment from both ends only if its derivative is negative at a and positive at b.
+    if wp.dot(wp.vec3(sa[1], sa[2], sa[3]), ab) >= 0.0 or wp.dot(wp.vec3(sb[1], sb[2], sb[3]), ab) <= 0.0:
+        return
+    lo = float(0.0)
+    hi = float(1.0)
+    for _ in range(iterations):
+        t = 0.5 * (lo + hi)
+        g = shape_sdf(geo, scale, mesh, a + t * ab, r)
+        if wp.dot(wp.vec3(g[1], g[2], g[3]), ab) < 0.0:
+            lo = t
+        else:
+            hi = t
+    t = 0.5 * (lo + hi)
+    x = a + t * ab
+    sd = shape_sdf(geo, scale, mesh, x, r)
+    radius = (1.0 - t) * particle_radius[segments[e, 0]] + t * particle_radius[segments[e, 1]]
+    if sd[0] >= wp.min(sa[0], sb[0]) or sd[0] > radius + shape_margin[s] + gap:
+        return
+    n = wp.normalize(wp.vec3(sd[1], sd[2], sd[3]))
+    idx = wp.atomic_add(count, 0, 1)
+    pair[idx] = k
+    weight[idx] = t
+    depth[idx] = sd[0]
+    body_pos[idx] = wp.transform_point(X_bs, x - sd[0] * n)
+    normal[idx] = wp.transform_vector(X_ws, n)
+
+
+class SegmentContactQuery:
+    """Segment contacts of rods: the deepest point of each spring segment inside a shape, between its particles.
+
+    Particle contacts hold the particles of a rod off a shape, but a thin shape, or a pulley's curve, can still slip
+    between two particles. A segment contact holds the capsule of a segment, as the segments of ``rod_contact`` hold
+    each other: a row on its two particles with the weights of the deepest point. Its optimum lies strictly inside the
+    segment, deeper than both particles; optima at the particles are the particle contacts'.
+    """
+
+    def __init__(self, segments: np.ndarray, device):
+        self.seg = np.asarray(segments, dtype=np.int32).reshape(-1, 2)
+        self.seg_d = wp.array(self.seg, dtype=wp.int32, device=device)
+        self.no_bodies = wp.empty(1, dtype=wp.transform, device=device)
+        self.device = device
+
+    def query(self, model, particle_q, body_q, edge_radius: float, gap: float, iterations: int = 40):
+        """Segment contacts as ``(segment, shape, weights (n, 2), body_pos, normal)`` arrays, ordered by shape and
+        segment; the weights of the segment's two particles sum to one."""
+        n_seg, device = len(self.seg), self.device
+        empty = (np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros((0, 2), np.float32))
+        empty += (np.zeros((0, 3), np.float32), np.zeros((0, 3), np.float32))
+        if not n_seg or not model.shape_count:
+            return empty
+        bodies = self.no_bodies if body_q is None or not body_q.shape[0] else body_q
+        if getattr(self, "shapes", None) is None:
+            # The shapes that collide with particles, read once: the model's flags, fixed after finalize.
+            flags = model.shape_flags.numpy()
+            self.shapes = wp.array(
+                np.flatnonzero(flags & int(ShapeFlags.COLLIDE_PARTICLES)).astype(np.int32),
+                dtype=wp.int32,
+                device=device,
+            )
+        if not self.shapes.shape[0]:
+            return empty
+        near_count = wp.zeros(1, dtype=wp.int32, device=device)
+        near = wp.empty(n_seg * self.shapes.shape[0], dtype=wp.int64, device=device)
+        wp.launch(
+            near_segment_kernel,
+            dim=(n_seg, self.shapes.shape[0]),
+            inputs=[
+                *(particle_q, self.seg_d, model.particle_radius, model.particle_world, bodies),
+                *(model.shape_transform, model.shape_body, model.shape_type, model.shape_scale),
+                *(model.shape_source_ptr, model.shape_flags, model.shape_world, model.shape_margin, gap, edge_radius),
+                self.shapes,
+            ],
+            outputs=[near_count, near],
+            device=device,
+        )
+        m_near = int(near_count.numpy()[0])
+        if not m_near:
+            return empty
+        candidates = np.sort(host_head(near, m_near))
+        cand_shape, cand_seg = np.divmod(candidates, n_seg)
+        count = wp.zeros(1, dtype=wp.int32, device=device)
+        out = [wp.empty(m_near, dtype=t, device=device) for t in (wp.int32, wp.float32, wp.float32, wp.vec3, wp.vec3)]
+        wp.launch(
+            segment_contact_kernel,
+            dim=m_near,
+            inputs=[
+                *(particle_q, self.seg_d, model.particle_radius),
+                *(wp.array(a.astype(np.int32), dtype=wp.int32, device=device) for a in (cand_seg, cand_shape)),
+                bodies,
+                *(model.shape_transform, model.shape_body, model.shape_type, model.shape_scale),
+                *(model.shape_source_ptr, model.shape_margin, gap, iterations, edge_radius),
+            ],
+            outputs=[count, *out],
+            device=device,
+        )
+        m = int(count.numpy()[0])
+        # The kernel emits in thread order: sort by candidate, which orders by shape and segment, for determinism.
+        order = np.argsort(host_head(out[0], m))
+        pair, t, _depth, body_pos, normal = (host_head(a, m)[order] for a in out)
+        weights = np.stack([1.0 - t, t], axis=1).astype(np.float32)
+        return cand_seg[pair], cand_shape[pair], weights, body_pos, normal
