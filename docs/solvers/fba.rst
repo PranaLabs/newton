@@ -384,6 +384,12 @@ Contacts
   such as those between separate bodies, which saves most of their memory and
   work for many contacts on many bodies, as in a pile of soft bodies. It
   needs friction and the full operator.
+- ``rigid_iteration_graph=True`` runs the rigid local-global iterations of a
+  step whose rows are built anew, such as one with particle contacts on
+  bodies, from a CUDA graph captured at the step's first iteration, bit for
+  bit the eager result with fewer launches from the host. Steps whose rigid
+  rows keep their padded storage replay the contact step's own graph across
+  steps instead. It needs CUDA and ``nsn_sparse_storage=True``.
 - The friction coefficient of a particle contact is its shape's ``mu``,
   ``model.particle_mu`` for self contacts, and the mean of the two shapes'
   ``mu`` for rigid contacts, or the larger of the two with
