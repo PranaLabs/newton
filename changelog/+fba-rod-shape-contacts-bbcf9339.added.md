@@ -1,0 +1,1 @@
+Add `rod_shape_contacts` to `SolverFBA`: the segments of rods (springs) also collide with shapes as capsules, taking a contact at their deepest point inside a shape when it lies between their particles, so that a thin bar cannot pass between two particles of a rod and a rod slides over a curve without catching on its particles.

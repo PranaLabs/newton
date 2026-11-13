@@ -354,6 +354,14 @@ Contacts
   largest sum of two radii plus the gap spans at the shortest spring do not
   collide, so that a straight rod never touches itself. The contacts are found
   on the host each step and take ``model.particle_mu`` as friction.
+- ``rod_shape_contacts=True`` makes the springs also collide with shapes as
+  capsules: a segment takes a contact at its deepest point inside a shape
+  when that point lies strictly between its particles and deeper than both,
+  a row on its two particles with that point's weights, as a face contact is
+  on a triangle's. A shape thinner than the gap between two particles' spheres
+  then cannot pass between them, and a rod slides over a curve without
+  catching on its particles. ``rod_shape_contact_gap`` sets the detection
+  distance. It needs friction and the full operator.
 - ``friction_anchors=True`` keeps the point a contact presses on across steps,
   on the other layer for a self contact or on a static shape, so its friction
   rows pull back the slip that a step's solve leaves instead of letting it add
