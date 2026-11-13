@@ -685,6 +685,8 @@ class SolverFBA(SolverBase):
         self._constraint_lengths = False  # the rows hold |sum_k c_k x_k|, along its direction at each iteration
         # set_particle_constraints(bodies=...): the body of each row (-1 for none) and its point in the body frame.
         self._constraint_body_h = self._constraint_body_d = self._constraint_point_d = None
+        # set_tendons: the step's tendon rows (body, point, target, middle, rest arrays) and their count.
+        self._tendons, self._tendon_count, self._tendon_ws = None, 0, None
         self._self_contact, self._lite_W = None, None
         self._held_rows = None  # the lite rows that hold particles at points, and their factor
         # Graph of the step's sparse lite contact correction, False once a capture failed: it would fail again.
@@ -1103,6 +1105,13 @@ class SolverFBA(SolverBase):
         self._rigid_contacts = rc
         m_s, m_r = 0, 0 if rc is None else rc.count
         slots = np.empty((0, 2), dtype=np.int32) if rc is None else rc.slot
+        # Tendon rows follow the rigid contacts as frictionless contacts of their own Jacobian.
+        m_t = self._tendon_count
+        if m_t:
+            tb = self._tendon_body_h
+            slots = np.concatenate(
+                [slots, np.where(tb >= 0, self._body_slot_h[np.maximum(tb, 0)], -1).astype(np.int32)]
+            )
         # Particle constraint rows on integrated bodies join the body rows, and so do all deformable rows with them.
         attach = self._constraint_rows is not None and self._constraint_body_h is not None
         if model.particle_count > 0 and self._contact_count > 0:
@@ -1115,8 +1124,9 @@ class SolverFBA(SolverBase):
                     self._two_way_world_h[self._contact_world_h[soft_slot >= 0]] = 1
                 slots = np.concatenate([np.stack([soft_slot, np.full(m_s, -1)], axis=1), slots])
         self._two_way, self._rc_counts, self._rc_n = m_s > 0 or attach, (m_s, m_r), 0
+        self._rc_tendons = m_t
         self._rc_padded, self._rc_n_pad, self._rc_n_b = None, 0, 0
-        if m_s + m_r == 0 and not attach:
+        if m_s + m_r + m_t == 0 and not attach:
             return
         if not self.friction or self.nsn_schur_mode != "full":
             raise NotImplementedError(
@@ -1132,7 +1142,7 @@ class SolverFBA(SolverBase):
         n_b = self._rc_n_b = (
             0 if self._constraint_rows is None or not (m_s or attach) else self._constraint_rows[0].shape[0]
         )
-        n_s, n_c = 3 * m_s, 3 * m_r
+        n_s, n_c = 3 * m_s, 3 * (m_r + m_t)
         n = self._rc_n = n_s + n_c + joint_rows.size + n_b
         # Rows of rigid contacts and joint rows keep their storage across steps, the contacts padded to their
         # capacity with inert rows and the joint rows to all joint rows, so that the NSN step's graph replays from
@@ -1146,7 +1156,7 @@ class SolverFBA(SolverBase):
                 if getattr(self, "_rc_storage", None) is None or self._rc_storage.joint_rows != R:
                     self._rc_storage = RigidRowStorage(device, R)
                 storage = self._rc_storage
-                storage.reserve(m_r)
+                storage.reserve(m_r + m_t)
                 storage.begin()
                 if R:
                     storage.select_joint_rows(joint_rows)
@@ -1166,7 +1176,7 @@ class SolverFBA(SolverBase):
             self._rc_row_slot_d = wp.full((n, 2), -1, dtype=wp.int32, device=device)
             self._rc_row_jac_d = wp.zeros((n, 2), dtype=wp.spatial_vectord, device=device)
             self._rc_pene0_d = wp.zeros(n, dtype=wp.float64, device=device)
-            self._rc_mu_d = wp.empty(m_s + m_r, dtype=wp.float64, device=device)
+            self._rc_mu_d = wp.zeros(m_s + m_r + m_t, dtype=wp.float64, device=device)
         else:
             self._rc_row_slot_d, self._rc_row_jac_d = storage.row_slot, storage.row_jac
             self._rc_pene0_d, self._rc_mu_d = storage.pene0, storage.mu
@@ -1208,6 +1218,22 @@ class SolverFBA(SolverBase):
                 device=device,
             )
             wp.copy(self._rc_mu_d, rc.mu, dest_offset=m_s, count=m_r)
+        if m_t:
+            from .rigid_contact import tendon_jacobian_kernel  # noqa: PLC0415
+
+            # The friction coefficient bounds the slide row by mu times the tension (the normal row's multiplier).
+            body, point, target, _middle, _rest, mu = self._tendons
+            wp.copy(self._rc_mu_d, mu, dest_offset=m_s + m_r, count=m_t)
+            wp.launch(
+                tendon_jacobian_kernel,
+                dim=m_t,
+                inputs=[
+                    *(body, point, target, mu, self._body_slot_d, model.body_com, self._rigid_q_pin_d),
+                    *(state_in.body_q, n_s + 3 * m_r),
+                ],
+                outputs=[self._rc_row_slot_d, self._rc_row_jac_d],
+                device=device,
+            )
         if joint_rows.size:
             wp.launch(
                 select_rows_kernel,
@@ -1273,7 +1299,7 @@ class SolverFBA(SolverBase):
             )
             self._rigid_world_rows = group_world_rows(worlds, device)
             soft_scale = (self._regularized_world_h[soft] | self._two_way_world_h[soft].astype(bool)) if m_s else []
-            scale = 1.0 + self.contact_regularization * np.r_[soft_scale, np.ones(m_r)]
+            scale = 1.0 + self.contact_regularization * np.r_[soft_scale, np.ones(m_r + m_t)]
             self._rigid_contact_scale = wp.array(scale, dtype=wp.float64, device=device)
 
     def _shape_body_host(self) -> np.ndarray:
@@ -1556,6 +1582,11 @@ class SolverFBA(SolverBase):
             ws.joint.begin(0, None)
         if bilateral is not None:
             ws.restore_bilateral(*bilateral)
+        m_t = getattr(self, "_rc_tendons", 0)
+        if m_t and self._rc_n and self._tendon_ws is not None and self._tendon_ws[2] == m_t:
+            first = 3 * (self._rc_counts[0] + self._rc_counts[1])
+            wp.copy(self._rc_lam_d, self._tendon_ws[0], dest_offset=first, count=3 * m_t)
+            wp.copy(self._rc_omega_d, self._tendon_ws[1], dest_offset=first, count=3 * m_t)
 
     def _store_warm_start(self) -> None:
         """Keep this step's final NSN rows for the next step's warm start."""
@@ -1575,6 +1606,18 @@ class SolverFBA(SolverBase):
         else:
             ws.joint.store(None, None, 0)
         ws.store_bilateral(*(bilateral if bilateral is not None else (None, None, 0, 0)))
+        m_t = getattr(self, "_rc_tendons", 0)
+        if m_t and self._rc_n:
+            # The tendons keep their rows from step to step: their forces carry over by tendon.
+            first = 3 * (self._rc_counts[0] + self._rc_counts[1])
+            if self._tendon_ws is None or self._tendon_ws[2] != m_t:
+                self._tendon_ws = (
+                    wp.empty(3 * m_t, dtype=wp.float64, device=self._device),
+                    wp.empty(3 * m_t, dtype=wp.float64, device=self._device),
+                    m_t,
+                )
+            wp.copy(self._tendon_ws[0], self._rc_lam_d, src_offset=first, count=3 * m_t)
+            wp.copy(self._tendon_ws[1], self._rc_omega_d, src_offset=first, count=3 * m_t)
 
     def _two_way_pattern(self, n: int, n_s: int, soft_tail: int) -> tuple:
         """CSR pattern of the two-way ``W`` of ``nsn_sparse_storage``: rows couple where their deformable rows'
@@ -1707,7 +1750,8 @@ class SolverFBA(SolverBase):
 
         rc, device, n, n_pad = self._rigid_contacts, self._device, self._rc_n, self._rc_n_pad
         (m_s, m_r), joint_rows, n_b = self._rc_counts, self._rc_joint_rows_d, self._rc_n_b
-        n_s, n_c, n_j, j0 = 3 * m_s, 3 * m_s + 3 * m_r, len(self._rc_joint_rows_h), self._rc_joint_offset
+        m_t = self._rc_tendons
+        n_s, n_c, n_j, j0 = 3 * m_s, 3 * m_s + 3 * (m_r + m_t), len(self._rc_joint_rows_h), self._rc_joint_offset
         if n_b and self._constraint_lengths:
             self._point_length_rows(self._x_cur)
             self._linear_solver.update_row_directions(self._constraint_rows[2], n_s)
@@ -1736,6 +1780,20 @@ class SolverFBA(SolverBase):
                 inputs=[
                     *(rc.body, rc.anchor, rc.normal, self._body_slot_d, *live, self._rigid_x_prev_d),
                     *(state_in.body_q, state_in.body_qd, self.model.body_com, wp.float64(dt), n_s),
+                ],
+                outputs=[self._rc_value_d],
+                device=device,
+            )
+        if m_t:
+            from .rigid_contact import tendon_gap_kernel  # noqa: PLC0415
+
+            wp.launch(
+                tendon_gap_kernel,
+                dim=m_t,
+                inputs=[
+                    *self._tendons,
+                    *(self._body_slot_d, *live, self._rigid_x_prev_d, state_in.body_q, state_in.body_qd),
+                    *(self.model.body_com, wp.float64(dt), n_s + 3 * m_r),
                 ],
                 outputs=[self._rc_value_d],
                 device=device,
@@ -3485,6 +3543,77 @@ class SolverFBA(SolverBase):
             sc.set_margin(float(margin), float(gap))
         else:
             sc.query_radius = float((margin + gap).max())
+
+    def set_tendons(self, bodies, points, targets, middle_lengths, rest_lengths, friction_coefficients=None) -> None:
+        """Hold tendons, inextensible strings between two bodies, taut or slack, in the following steps.
+
+        Tendon ``t`` runs from ``points[t, 0]`` on body ``bodies[t, 0]`` to ``points[t, 1]`` on ``bodies[t, 1]``
+        (points in the body frames; on body ``-1`` a fixed world point). Between its ends its path is fixed for the
+        step: from each end it runs straight to ``targets[t, k]`` (world), its next path point, such as where it
+        meets a pulley, and between the two targets it has the length ``middle_lengths[t]``. Its row holds the slack
+        ``rest_lengths[t] - L >= 0`` with ``L`` the middle length plus each end's run to its target, as a
+        frictionless contact: the tension is the row's force, zero while the string is slack. Within a step an end's
+        run is measured along the direction from its start-of-step position to its target, so that the row is linear
+        in the step, as a contact's normal gap is, also for an end at its target. An end on an
+        integrated body takes the force at its point along the string; an end on the world or on a body that
+        SolverFBA does not integrate is fixed for the step. The caller updates the paths before each step (the
+        targets move as the ends do round wrapped objects); the length changes only to second order as a target
+        slides along a wrapped surface, so the row needs no term for it.
+
+        A tendon with a friction coefficient ``mu = friction_coefficients[t]`` resists the string running over its
+        pulleys with a friction that grows with the load, as a linearized capstan or a bearing whose friction grows
+        with the tension: a second row holds the slide of its first end along its run at zero with a Coulomb force
+        of at most ``mu T``, ``T`` the tension, solved with the other rows. The first end then feels a tension
+        between ``T (1 - mu)`` and ``T (1 + mu)``, and ``mu <= 1`` keeps it nonnegative; a slack tendon carries no
+        friction.
+
+        The rows are solved with the rigid contacts (``friction=True``, ``nsn_schur_mode="full"``, one world).
+        ``None`` removes the tendons.
+
+        Args:
+            bodies: The two bodies of each tendon, shape ``(T, 2)``, ``-1`` for the world.
+            points: The ends' points in their bodies' frames [m], shape ``(T, 2, 3)``.
+            targets: Each end's next path point in the world [m], shape ``(T, 2, 3)``.
+            middle_lengths: The path's length between the two targets [m], shape ``(T,)``.
+            rest_lengths: The tendons' lengths [m], shape ``(T,)``.
+            friction_coefficients: Each tendon's friction coefficient ``0 <= mu <= 1`` on its slide over its pulleys,
+                shape ``(T,)``; ``None`` for none.
+        """
+        if bodies is None or len(bodies) == 0:
+            self._tendons, self._tendon_count, self._tendon_ws = None, 0, None
+            return
+        b = np.asarray(bodies, dtype=np.int32)
+        T = b.shape[0]
+        if b.shape != (T, 2) or np.shape(points) != (T, 2, 3) or np.shape(targets) != (T, 2, 3):
+            raise ValueError(f"bodies need shape ({T}, 2), points and targets ({T}, 2, 3)")
+        if np.shape(middle_lengths) != (T,) or np.shape(rest_lengths) != (T,):
+            raise ValueError(f"middle_lengths and rest_lengths need shape ({T},)")
+        mu = np.zeros(T) if friction_coefficients is None else np.asarray(friction_coefficients, dtype=np.float64)
+        if mu.shape != (T,) or (mu < 0.0).any() or (mu > 1.0).any():
+            raise ValueError(f"friction_coefficients need shape ({T},) and values in [0, 1]")
+        if (b < -1).any() or (b >= self.model.body_count).any():
+            raise ValueError("body indices out of range")
+        if not self.friction or self.nsn_schur_mode != "full" or self.model.world_count > 1:
+            raise NotImplementedError("tendons need friction=True, nsn_schur_mode='full' and one world")
+        if self.integrate_with_external_rigid_solver:
+            raise ValueError("tendons need the bodies that SolverFBA integrates")
+        device = self._device
+        arrays = (
+            (b, wp.int32),
+            (np.asarray(points, dtype=np.float32), wp.vec3),
+            (np.asarray(targets, dtype=np.float32), wp.vec3),
+            (np.asarray(middle_lengths, dtype=np.float64), wp.float64),
+            (np.asarray(rest_lengths, dtype=np.float64), wp.float64),
+            (mu, wp.float64),
+        )
+        if self._tendons is not None and self._tendon_count == T:
+            for dst, (a, _) in zip(self._tendons, arrays, strict=True):
+                dst.assign(a)  # the same arrays from step to step
+        else:
+            self._tendons = tuple(wp.array(a, dtype=t, device=device) for a, t in arrays)
+            self._tendon_ws = None
+        self._tendon_count = T
+        self._tendon_body_h = b
 
     def set_particle_constraints(
         self, particles, coefficients, targets, *, directions=None, exact=False, bodies=None, body_points=None
