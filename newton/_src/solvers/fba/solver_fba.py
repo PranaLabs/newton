@@ -3716,8 +3716,8 @@ class SolverFBA(SolverBase):
         that is decoupled from Schur factor invalidation.
         """
         self._cached_W = False
-        # The graph of the sparse NSN step holds its matrices.
-        self._nsn_graph = None
+        # The graph of the sparse NSN step stays: its key holds the linear solver's array generation, the sizes and
+        # the identities of what it reads, and the Schur build writes its arrays in place while their shapes hold.
 
     # ------------------------------------------------------------------
     # Contact state (allocated lazily on first call).
@@ -5039,8 +5039,14 @@ class SolverFBA(SolverBase):
         if pcr.max_iter > pcr.check_every or not wp.get_device(device).is_cuda:
             run()
             return
+        ls = self._linear_solver
         key = (
             name,
+            # The linear solver's arrays that the step reads: a new one raises their generation.
+            getattr(ls, "_graph_generation", 0),
+            getattr(ls, "_row_slots", None) is not None,
+            # The entries of W, which launches of the step count; a rigid step's pattern matrix may be None.
+            tuple(int(getattr(m, "nnz", 0)) for m in W_sparse),
             *(id(a) for a in (*W_sparse, *inputs, *tail[1])),
             sizes,
             precond_key,
