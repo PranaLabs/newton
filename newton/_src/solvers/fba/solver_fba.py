@@ -222,6 +222,7 @@ class SolverFBA(SolverBase):
         rayleigh_corotated: bool = False,
         tet_activation_directions: ArrayLike | None = None,
         contact_warmstart: bool = False,
+        rigid_contact_friction: str = "mean",
     ) -> None:
         """
         Args:
@@ -489,6 +490,9 @@ class SolverFBA(SolverBase):
                 at the contact forces that carry it, which a few iterations
                 cannot build up from zero. Face and self contacts start from
                 zero. Needs ``friction=True`` and ``nsn_schur_mode="full"``.
+            rigid_contact_friction: The friction coefficient of a rigid contact
+                from its two shapes' ``shape_material_mu``: ``"mean"``, their
+                mean, or ``"max"``, the larger, as MuJoCo combines them.
         """
         super().__init__(model)
         self._particle_world_h = model.particle_world.numpy()
@@ -600,6 +604,9 @@ class SolverFBA(SolverBase):
             raise ValueError("nsn_sparse_storage needs friction=True and nsn_schur_mode='full'")
         self.nsn_sparse_storage = bool(nsn_sparse_storage)
         self._nsn_graph = None
+        if rigid_contact_friction not in ("mean", "max"):
+            raise ValueError(f"rigid_contact_friction must be 'mean' or 'max', got {rigid_contact_friction!r}")
+        self.rigid_contact_friction = rigid_contact_friction
         if nsn_linear_iterations is not None and nsn_linear_iterations < 1:
             raise ValueError(f"nsn_linear_iterations must be >= 1 or None, got {nsn_linear_iterations}")
         self.nsn_linear_iterations = None if nsn_linear_iterations is None else int(nsn_linear_iterations)
@@ -1026,7 +1033,9 @@ class SolverFBA(SolverBase):
             self._rc_gather = RigidContactGather(device)
         rc = None
         if contacts is not None:
-            rc = gather_rigid_contacts(model, contacts, self._body_slot_d, device, self._rc_gather)
+            rc = gather_rigid_contacts(
+                model, contacts, self._body_slot_d, device, self._rc_gather, self.rigid_contact_friction == "max"
+            )
         self._rigid_contacts = rc
         m_s, m_r = 0, 0 if rc is None else rc.count
         slots = np.empty((0, 2), dtype=np.int32) if rc is None else rc.slot

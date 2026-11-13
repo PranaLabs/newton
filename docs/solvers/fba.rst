@@ -381,7 +381,8 @@ Contacts
   needs friction and the full operator.
 - The friction coefficient of a particle contact is its shape's ``mu``,
   ``model.particle_mu`` for self contacts, and the mean of the two shapes'
-  ``mu`` for rigid contacts.
+  ``mu`` for rigid contacts, or the larger of the two with
+  ``rigid_contact_friction="max"``, as MuJoCo combines them.
 - :attr:`~newton.solvers.SolverBase.ObservableKind.CONTACT_F` reports the
   force of each particle contact on its shape's body; see
   :ref:`solver_observables`.
