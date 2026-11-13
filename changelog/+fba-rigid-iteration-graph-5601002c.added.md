@@ -1,0 +1,1 @@
+Add `rigid_iteration_graph` to `SolverFBA`: a step whose rigid rows are built anew, such as one with rod contacts on bodies, captures its first rigid local-global iteration, the contact NSN step included, in a CUDA graph and replays it at its other iterations, bit for bit the eager result with fewer host launches. Off by default.

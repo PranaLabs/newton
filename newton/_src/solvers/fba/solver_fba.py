@@ -224,6 +224,7 @@ class SolverFBA(SolverBase):
         contact_warmstart: bool = False,
         rigid_contact_bin: float = 0.0,
         rigid_contact_friction: str = "mean",
+        rigid_iteration_graph: bool = False,
     ) -> None:
         """
         Args:
@@ -500,6 +501,15 @@ class SolverFBA(SolverBase):
             rigid_contact_friction: The friction coefficient of a rigid contact
                 from its two shapes' ``shape_material_mu``: ``"mean"``, their
                 mean, or ``"max"``, the larger, as MuJoCo combines them.
+            rigid_iteration_graph: If ``True``, a step whose rigid rows are
+                built anew, such as one with particle rows on bodies, captures
+                its first rigid local-global iteration, the contact NSN step
+                included, in a CUDA graph and replays it at its other
+                iterations, bit for bit the eager result, with fewer host
+                launches. Steps whose rigid rows keep their padded storage
+                replay the NSN step's own graph across steps instead. Needs
+                CUDA, ``nsn_sparse_storage`` and ``nsn_linear_iterations`` up
+                to the linear solver's check interval.
         """
         super().__init__(model)
         self._particle_world_h = model.particle_world.numpy()
@@ -611,6 +621,12 @@ class SolverFBA(SolverBase):
             raise ValueError("nsn_sparse_storage needs friction=True and nsn_schur_mode='full'")
         self.nsn_sparse_storage = bool(nsn_sparse_storage)
         self._nsn_graph = None
+        # With rigid_iteration_graph the rigid LG iteration replays from a CUDA graph, captured at the first iteration
+        # of a step (the solver's very first iteration runs eagerly: it creates the NSN step's solvers).
+        # ``_outer_capture`` makes the NSN step record its launches into that capture rather than capture or replay
+        # its own graph.
+        self._rigid_iter_graph, self._rigid_iter_count, self._outer_capture = None, 0, False
+        self.rigid_iteration_graph = bool(rigid_iteration_graph)
         if not rigid_contact_bin >= 0.0:
             raise ValueError(f"rigid_contact_bin must be >= 0, got {rigid_contact_bin}")
         self.rigid_contact_bin = float(rigid_contact_bin)
@@ -973,6 +989,8 @@ class SolverFBA(SolverBase):
         from .joints import joint_jacobian_kernel  # noqa: PLC0415
         from .rigid import prepare_rigid_step_kernel  # noqa: PLC0415
 
+        # The step's rows are new: its rigid iterations take a new graph.
+        self._rigid_iter_graph, self._rigid_iter_count = None, 0
         if self._rigid_dt is None or abs(self._rigid_dt - dt) > 1e-12:
             self._setup_rigid_system(dt)
         wp.copy(state_out.body_q, state_in.body_q)
@@ -1783,6 +1801,57 @@ class SolverFBA(SolverBase):
         ]
 
     def _rigid_iteration(self, state_in: State, state_out: State, dt: float) -> None:
+        """One LG iteration of the integrated bodies, with ``rigid_iteration_graph`` from a CUDA graph where it can.
+
+        The first iteration of a step is captured, launches included of the contact NSN step (which then records
+        into this capture rather than its own graph) and of its tail, and runs from the graph; the step's other
+        iterations replay it. The iteration reads nothing back to the host, so its launches are the same at every
+        iteration of the step. The solver's very first rigid iteration runs eagerly, as it creates the NSN step's
+        solvers; so do the iterations of a step whose rows keep their padded storage (the NSN step's own graph then
+        replays across steps), without the sparse NSN storage (whose NSN stops by reading the device), with length
+        rows (whose directions are set on the host) or whose capture failed.
+        """
+        capturable = (
+            self.rigid_iteration_graph
+            and wp.get_device(self._device).is_cuda
+            and self.nsn_sparse_storage
+            and getattr(self, "_rc_padded", None) is None
+            and not (self._rc_n_b and self._constraint_lengths)
+            and getattr(self, "_pcr_solver", None) is not None
+            and self._pcr_solver.max_iter <= self._pcr_solver.check_every
+        )
+        first = not getattr(self, "_rigid_iter_warm", False)
+        if not capturable or first or self._rigid_iter_graph is False:
+            self._rigid_iteration_eager(state_in, state_out, dt)
+            self._rigid_iter_count += 1
+            self._rigid_iter_warm = True
+            return
+        if self._rigid_iter_graph is None:
+            # Grow the buffers the step uses first, so that nothing allocates inside the capture.
+            if self._rc_n:
+                n = self._rc_n_pad
+                self._ensure_nsn_inner_buffers(n, alloc_2d=False)
+                self._ensure_pcr_solver(n)
+                self._ensure_nsn_sparse_scratch(n)
+                if self._rc_counts[0] or self._rc_n_b:
+                    self._linear_solver.reserve_lambda_correction()
+            self._outer_capture = True
+            try:
+                with wp.ScopedCapture(device=self._device) as capture:
+                    self._rigid_iteration_eager(state_in, state_out, dt)
+                self._rigid_iter_graph = capture.graph
+            except RuntimeError:
+                self._rigid_iter_graph = False
+            finally:
+                self._outer_capture = False
+            if self._rigid_iter_graph is False:
+                self._rigid_iteration_eager(state_in, state_out, dt)
+                self._rigid_iter_count += 1
+                return
+        wp.capture_launch(self._rigid_iter_graph)
+        self._rigid_iter_count += 1
+
+    def _rigid_iteration_eager(self, state_in: State, state_out: State, dt: float) -> None:
         """One LG iteration of the integrated bodies.
 
         Takes a Newton step on the joint forces and solves the contact NSN, both
@@ -5124,6 +5193,10 @@ class SolverFBA(SolverBase):
             if tail[0] is not None:
                 tail[0]()
 
+        if self._outer_capture:
+            # The rigid iteration's graph is being captured: record this step's launches into it.
+            run()
+            return
         pcr = self._pcr_solver
         precond_key = None
         if block_precond is not None:
