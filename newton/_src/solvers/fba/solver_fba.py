@@ -504,6 +504,8 @@ class SolverFBA(SolverBase):
         self._mixed = self._two_way_ls = None
         # The rows that :meth:`_swap_rows` exchanged into the solver, until it exchanges them back.
         self._swapped_rows = None
+        # Host copies of the step's contact rows for the Schur build, from the host contact path.
+        self._contact_host_rows = self._contact_extra_h = None
         self._empty_contact_scale = wp.empty(0, dtype=wp.float64, device=model.device)
         self._deformable_contact_scale = self._rigid_contact_scale = self._empty_contact_scale
         self._nsn_contact_scale = self._empty_contact_scale
@@ -2501,6 +2503,10 @@ class SolverFBA(SolverBase):
                                 download=False,
                                 **self._contact_extra_args(),
                                 **self._constraint_args(),
+                                # The host copies hold the step's whole contact set, not one that a split swapped in.
+                                host_rows=self._contact_host_rows
+                                if self._swapped_rows is None and not self._two_way
+                                else None,
                             )
                         self._cached_W = True
                     # Residual + pene0 + warm-start all device-resident: the PD
@@ -3922,6 +3928,7 @@ class SolverFBA(SolverBase):
         # The contacts change, so the next solve rebuilds ``W`` from the new J.
         self._invalidate_schur_cache()
         self._contact_extra = None
+        self._contact_host_rows = None
 
         # With a face contact margin, triangles can touch shapes that no particle touches.
         other_contacts = self._face_query is not None and self.face_contact_gap is not None
@@ -4063,8 +4070,10 @@ class SolverFBA(SolverBase):
                     ]
                 extra = [np.concatenate([extra[0], sp[:, 1:]]), np.concatenate([extra[1], sa[:, 1:]])]
                 M = len(particle_h)
+        self._contact_extra_h = None
         if extra is not None:
             self._contact_extra = [wp.array(a, device=self._device) for a in extra]
+            self._contact_extra_h = extra
         if M == 0:
             self._contact_count = 0
             return
@@ -4166,6 +4175,10 @@ class SolverFBA(SolverBase):
         # Host mirrors of the basic contact fields, for the host paths that still read them.
         self._contact_particle_h = None if particle_h is None else particle_h.astype(np.int32)
         self._contact_alpha_h = alpha_h
+        # The rows' particles and coefficients on the host, for the Schur build without a read back.
+        if particle_h is not None:
+            extra_h = (None, None) if self._contact_extra_h is None else tuple(self._contact_extra_h)
+            self._contact_host_rows = (self._contact_particle_h, alpha_h, *extra_h)
         self._contact_count = M
 
         # Friction: tangent basis, tangent offsets, kinematic anchor velocity.

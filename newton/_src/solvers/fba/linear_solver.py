@@ -1365,6 +1365,7 @@ class FBALinearSolver:
         bilateral_particles: wp.array | None = None,
         bilateral_alpha: wp.array | None = None,
         bilateral_dir: wp.array | None = None,
+        host_rows: tuple | None = None,
     ) -> np.ndarray | None:
         """Build ``W = J · A⁻¹ · Jᵀ`` as a dense NumPy array (batched GPU implementation).
 
@@ -1406,6 +1407,9 @@ class FBALinearSolver:
                 when unused; slot 0 must be used.
             bilateral_alpha: Their coefficients, shape ``[B, K]``, dtype float32.
             bilateral_dir: Direction of each bilateral row, shape ``[B]``, dtype vec3.
+            host_rows: Optional host copies ``(j_indices, j_alpha, j_extra_indices, j_extra_alpha)`` of the device
+                arrays, the latter two ``None`` without extra particles, which spare their read back. Without
+                bilateral rows, the directions of frictional rows are then interleaved on the device.
 
         Returns:
             Dense float64 NumPy array of shape ``(M, M)`` (frictionless) or
@@ -1427,25 +1431,35 @@ class FBALinearSolver:
         # Frictionless: total_rows == M, each row uses normal direction.
         # Frictional: total_rows == 3M, rows interleaved [n_c, t1_c, t2_c].
         # ``j_*`` arrays may be over-allocated (capacity > M); slice to active range.
-        idx_np = host_head(j_indices, M)  # (M,) int32, small, needed for row dir array
-        n_np = host_head(j_normals, M)  # (M, 3) float32
-        a_np = host_head(j_alpha, M)  # (M,) float32
-        if has_friction:
-            t1_np = host_head(j_tangent1, M)  # (M, 3) float32
-            t2_np = host_head(j_tangent2, M)  # (M, 3) float32
+        if host_rows is not None and len(host_rows[0]) != M:
+            host_rows = None
+        no_bilateral = bilateral_particles is None or bilateral_particles.shape[0] == 0
+        device_dirs = host_rows is not None and has_friction and no_bilateral
+        if host_rows is not None:
+            idx_np = np.asarray(host_rows[0][:M], dtype=np.int32)
+            a_np = np.asarray(host_rows[1][:M], dtype=np.float32)
+        else:
+            idx_np = host_head(j_indices, M)  # (M,) int32, small, needed for row dir array
+            a_np = host_head(j_alpha, M)  # (M,) float32
+        if not device_dirs:
+            n_np = host_head(j_normals, M)  # (M, 3) float32
+            if has_friction:
+                t1_np = host_head(j_tangent1, M)  # (M, 3) float32
+                t2_np = host_head(j_tangent2, M)  # (M, 3) float32
 
         # Build (total_rows,) arrays for particle index, direction, alpha.
         row_particle = np.empty(total_rows, dtype=np.int32)
-        row_dir = np.empty((total_rows, 3), dtype=np.float32)
+        row_dir = None if device_dirs else np.empty((total_rows, 3), dtype=np.float32)
         row_alpha = np.empty(total_rows, dtype=np.float32)
         if has_friction:
             # Frictional: 3 rows per contact, interleaved (n, t1, t2).
             row_particle[0::3] = idx_np
             row_particle[1::3] = idx_np
             row_particle[2::3] = idx_np
-            row_dir[0::3] = n_np
-            row_dir[1::3] = t1_np
-            row_dir[2::3] = t2_np
+            if row_dir is not None:
+                row_dir[0::3] = n_np
+                row_dir[1::3] = t1_np
+                row_dir[2::3] = t2_np
             row_alpha[0::3] = a_np
             row_alpha[1::3] = a_np
             row_alpha[2::3] = a_np
@@ -1455,10 +1469,17 @@ class FBALinearSolver:
             row_alpha[:] = a_np
 
         extra_p = extra_a = None
-        extra_h = None if j_extra_indices is None else host_head(j_extra_indices, M)
+        if j_extra_indices is None:
+            extra_h = extra_ah = None
+        elif host_rows is not None and host_rows[2] is not None:
+            extra_h, extra_ah = np.asarray(host_rows[2][:M]), np.asarray(host_rows[3][:M])
+        else:
+            extra_h, extra_ah = host_head(j_extra_indices, M), None
         if extra_h is not None and (extra_h >= 0).any():
             extra_p = np.repeat(extra_h, rows_per_contact, axis=0)
-            extra_a = np.repeat(host_head(j_extra_alpha, M), rows_per_contact, axis=0)
+            if extra_ah is None:
+                extra_ah = host_head(j_extra_alpha, M)
+            extra_a = np.repeat(extra_ah, rows_per_contact, axis=0)
         if bilateral_particles is not None and bilateral_particles.shape[0]:
             # Bilateral rows follow the contact rows; their first particle takes slot 0.
             b_p, b_a = bilateral_particles.numpy(), bilateral_alpha.numpy()
@@ -1485,7 +1506,14 @@ class FBALinearSolver:
 
         # Upload direction arrays to device, in place while their shapes hold (see :meth:`_persist`).
         row_particle_d = self._persist("_row_particle_d", row_particle.astype(np.int32), wp.int32)
-        row_dir_d = self._persist("_row_dir_d", row_dir.astype(np.float32), wp.vec3)
+        if row_dir is None:
+            from .kernels import interleave_row_dirs_kernel  # noqa: PLC0415
+
+            row_dir_d = self._persist_empty("_row_dir_d", (total_rows,), wp.vec3)
+            inputs = [j_normals, j_tangent1, j_tangent2]
+            wp.launch(interleave_row_dirs_kernel, M, inputs, [row_dir_d], device=dev)
+        else:
+            row_dir_d = self._persist("_row_dir_d", row_dir.astype(np.float32), wp.vec3)
         row_alpha_d = self._persist("_row_alpha_d", row_alpha.astype(np.float32), wp.float32)
 
         # --- Allocate/reuse the W device buffer, grown by :func:`dense_schur_capacity`. ---
@@ -1603,7 +1631,10 @@ class FBALinearSolver:
         # We precompute ``perm[isodofs[a]]`` per isodof. Using ``invperm`` here
         # silently builds the wrong matrix (different particles map under the
         # two permutations) and produces NaN downstream once contacts engage.
-        perm_h = self._perm.numpy()
+        # The factor's permutation holds with the factor: read it back once.
+        perm_h = getattr(self, "_perm_h", None)
+        if perm_h is None:
+            perm_h = self._perm_h = self._perm.numpy()
         isodof_perm_h = perm_h[isodofs_h].astype(np.int32)
 
         # --- Upload to device (allocate / reuse buffers) ---
@@ -1848,6 +1879,17 @@ class FBALinearSolver:
             current.assign(values)
             return current
         array = wp.array(values, dtype=dtype, device=self.device)
+        setattr(self, name, array)
+        self._graph_generation = getattr(self, "_graph_generation", 0) + 1
+        return array
+
+    def _persist_empty(self, name: str, shape: tuple, dtype) -> wp.array:
+        """The array ``name`` of ``shape`` for the device to fill, kept while its shape holds, as :meth:`_persist`
+        keeps the arrays it writes."""
+        current = getattr(self, name, None)
+        if current is not None and current.shape == tuple(shape) and current.dtype == dtype:
+            return current
+        array = wp.empty(shape, dtype=dtype, device=self.device)
         setattr(self, name, array)
         self._graph_generation = getattr(self, "_graph_generation", 0) + 1
         return array

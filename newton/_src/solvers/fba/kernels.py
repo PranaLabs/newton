@@ -1774,6 +1774,21 @@ def update_spring_dual_kernel(
 
 
 @wp.kernel
+def interleave_row_dirs_kernel(
+    normal: wp.array[wp.vec3],
+    tangent1: wp.array[wp.vec3],
+    tangent2: wp.array[wp.vec3],
+    # outputs
+    row_dir: wp.array[wp.vec3],
+):
+    """The directions of the frictional contact rows, ``(n, t1, t2)`` of each contact in turn."""
+    c = wp.tid()
+    row_dir[3 * c] = normal[c]
+    row_dir[3 * c + 1] = tangent1[c]
+    row_dir[3 * c + 2] = tangent2[c]
+
+
+@wp.kernel
 def spring_chain_system_kernel(
     chain_springs: wp.array[wp.int32],
     chain_diagonal: wp.array[wp.float32],

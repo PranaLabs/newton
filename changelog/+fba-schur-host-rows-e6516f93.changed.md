@@ -1,0 +1,1 @@
+Speed up `SolverFBA` steps on the host contact path: the Schur build takes the contact rows' particles and coefficients from the host copies that the contact assembly already holds, interleaves the rows' directions on the device, and reads the factor's permutation back once, instead of reading all of them back at every step.
