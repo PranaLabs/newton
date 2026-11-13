@@ -1,0 +1,1 @@
+Speed up the `SolverImplicitMPM` Gauss-Seidel stress solve for strain bases other than `Q1` on the `Q1` velocity basis, such as `P0` and `P1d`, by keeping a cell's velocities in registers while its strain nodes are solved.

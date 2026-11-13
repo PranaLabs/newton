@@ -26,6 +26,8 @@ from newton._src.solvers.implicit_mpm.rheology_solver_kernels import (
     _symmetric_part_transposed_op,
     apply_stress_gs,
     compute_delassus_diagonal,
+    make_gs_solve_kernel,
+    mat13,
     mat55,
     mat66,
     postprocess_stress_and_strain,
@@ -302,7 +304,7 @@ def test_assembled_elastic_stiffness(test, device):
 
 
 @contextmanager
-def _coupled_rheology(device, grid_type="dense", max_active_cell_count=-1):
+def _coupled_rheology(device, grid_type="dense", max_active_cell_count=-1, strain_basis="P0"):
     with wp.ScopedDevice(device):
         builder = _make_mpm_particle_builder(gravity=(0, 0, 0), dimensions=(4, 2, 2))
         model = builder.finalize(device=device)
@@ -315,7 +317,7 @@ def _coupled_rheology(device, grid_type="dense", max_active_cell_count=-1):
             grid_padding=0,
             max_active_cell_count=max_active_cell_count,
             velocity_basis="Q1",
-            strain_basis="P0",
+            strain_basis=strain_basis,
             collider_basis="Q1",
             solver="gs",
             warmstart_mode="none",
@@ -605,6 +607,67 @@ def test_majorized_rheology_solve(test, device, capture=False):
                     )
                     if contact:
                         test.assertLess(abs(v[2]), 1e-7)
+
+
+def test_cell_cached_gs_matches_generic(test, device):
+    """The Gauss-Seidel kernel for a fixed velocity stencil, which keeps a cell's velocities in registers, matches
+    the generic kernel sweep for sweep."""
+    for strain_basis in ("P0", "P1d"):
+        with (
+            test.subTest(strain_basis=strain_basis),
+            _coupled_rheology(device, strain_basis=strain_basis) as (
+                operator,
+                _store,
+            ),
+        ):
+            rheology, momentum = operator.rheology, operator.momentum
+            operator.compute_diagonal_factorization(split_mass=False, majorize=True)
+            n = rheology.stress.shape[0]
+            rng = np.random.default_rng(3)
+            rheology.elastic_strain_delta.assign(rng.uniform(-2.0e-3, 1.0e-3, size=(n, 6)).astype(np.float32))
+            velocity_start = rng.uniform(-0.05, 0.05, size=(momentum.velocity.shape[0], 3)).astype(np.float32)
+            color_count = rheology.color_offsets.shape[0] - 1
+            launch_dim = 64
+
+            results = []
+            for node_count in (-1, 8):
+                kernel = make_gs_solve_kernel(
+                    rheology.has_viscosity, rheology.has_dilatancy, rheology.compliance_mat.nnz > 0, node_count
+                )
+                velocity = wp.array(velocity_start, dtype=wp.vec3)
+                stress = wp.zeros_like(rheology.stress)
+                delta_stress = wp.zeros_like(rheology.stress)
+                for _sweep in range(3):
+                    for color in range(color_count):
+                        wp.launch(
+                            kernel,
+                            dim=launch_dim,
+                            inputs=[
+                                color,
+                                launch_dim,
+                                rheology.color_offsets,
+                                rheology.color_blocks,
+                                rheology.yield_params,
+                                rheology.strain_node_volume,
+                                rheology.compliance_mat.offsets,
+                                rheology.compliance_mat.columns,
+                                rheology.compliance_mat.values,
+                                rheology.strain_mat.offsets,
+                                rheology.strain_mat.columns,
+                                rheology.strain_mat.values.view(dtype=mat13),
+                                operator.delassus_diagonal,
+                                operator.delassus_rotation,
+                                momentum.inv_volume,
+                                rheology.elastic_strain_delta,
+                            ],
+                            outputs=[velocity, stress, delta_stress],
+                        )
+                results.append((velocity.numpy(), stress.numpy(), delta_stress.numpy()))
+
+            test.assertGreater(np.abs(results[0][1]).max(), 0.0)
+            for generic, cached in zip(results[0], results[1], strict=True):
+                # Same operations in the same order; on CUDA the compiler may fuse multiply-adds differently.
+                np.testing.assert_allclose(cached, generic, rtol=1.0e-5, atol=1.0e-6 * np.abs(generic).max())
 
 
 def test_rigidity_chunked_product_matches_bsr_mv(test, device):
@@ -2300,6 +2363,9 @@ add_function_test(
 )
 add_function_test(TestImplicitMPM, "test_majorized_rheology_solve", test_majorized_rheology_solve, devices=devices)
 add_function_test(TestImplicitMPM, "test_majorizer_capture", test_majorizer_capture, devices=get_cuda_test_devices())
+add_function_test(
+    TestImplicitMPM, "test_cell_cached_gs_matches_generic", test_cell_cached_gs_matches_generic, devices=devices
+)
 add_function_test(
     TestImplicitMPM,
     "test_strain_matrix_values_buffer_persists",
