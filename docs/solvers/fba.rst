@@ -365,6 +365,11 @@ Contacts
 - A contact on a body that FBA integrates acts at the contact point of the
   step start, which moves with the body to first order in its rotation over
   the step, so a ball keeps rolling at its speed on flat ground.
+- ``rigid_contact_bin`` [m], if positive, keeps only the deepest rigid
+  contact of a body pair in each cell of that size around the first body and
+  each of 26 normal directions before the solve, so that two finely
+  decomposed meshes do not bring thousands of contacts whose rows all couple
+  through the two bodies. ``0`` (default) keeps every contact.
 - ``contact_warmstart=True`` starts each step's contact multipliers from the
   previous step's on the same contacts and constraints rather than from zero,
   so that a resting or held object starts its step at the forces that carry

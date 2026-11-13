@@ -222,6 +222,7 @@ class SolverFBA(SolverBase):
         rayleigh_corotated: bool = False,
         tet_activation_directions: ArrayLike | None = None,
         contact_warmstart: bool = False,
+        rigid_contact_bin: float = 0.0,
         rigid_contact_friction: str = "mean",
     ) -> None:
         """
@@ -490,6 +491,12 @@ class SolverFBA(SolverBase):
                 at the contact forces that carry it, which a few iterations
                 cannot build up from zero. Face and self contacts start from
                 zero. Needs ``friction=True`` and ``nsn_schur_mode="full"``.
+            rigid_contact_bin: If positive [m], keep only the deepest of the
+                rigid contacts of a body pair in each cell of this size around
+                the first body, per normal direction (26 directions), before
+                they enter the solve: a pair of finely decomposed meshes emits
+                thousands of contacts whose rows all couple through the two
+                bodies. ``0`` keeps them all.
             rigid_contact_friction: The friction coefficient of a rigid contact
                 from its two shapes' ``shape_material_mu``: ``"mean"``, their
                 mean, or ``"max"``, the larger, as MuJoCo combines them.
@@ -604,6 +611,9 @@ class SolverFBA(SolverBase):
             raise ValueError("nsn_sparse_storage needs friction=True and nsn_schur_mode='full'")
         self.nsn_sparse_storage = bool(nsn_sparse_storage)
         self._nsn_graph = None
+        if not rigid_contact_bin >= 0.0:
+            raise ValueError(f"rigid_contact_bin must be >= 0, got {rigid_contact_bin}")
+        self.rigid_contact_bin = float(rigid_contact_bin)
         if rigid_contact_friction not in ("mean", "max"):
             raise ValueError(f"rigid_contact_friction must be 'mean' or 'max', got {rigid_contact_friction!r}")
         self.rigid_contact_friction = rigid_contact_friction
@@ -1036,12 +1046,14 @@ class SolverFBA(SolverBase):
             rc = gather_rigid_contacts(
                 model, contacts, self._body_slot_d, device, self._rc_gather, self.rigid_contact_friction == "max"
             )
+        if rc is not None and self.rigid_contact_bin > 0.0:
+            rc = self._reduce_rigid_contacts(rc, state_in)
         self._rigid_contacts = rc
         m_s, m_r = 0, 0 if rc is None else rc.count
         slots = np.empty((0, 2), dtype=np.int32) if rc is None else rc.slot
         if model.particle_count > 0 and self._contact_count > 0:
             shape = host_head(self._contact_shape_d, self._contact_count)
-            body = np.where(shape >= 0, model.shape_body.numpy()[np.maximum(shape, 0)], -1)
+            body = np.where(shape >= 0, self._shape_body_host()[np.maximum(shape, 0)], -1)
             soft_slot = np.where(body >= 0, self._body_slot_h[np.maximum(body, 0)], -1)
             if (soft_slot >= 0).any():
                 m_s = self._contact_count
@@ -1185,6 +1197,70 @@ class SolverFBA(SolverBase):
             scale = 1.0 + self.contact_regularization * np.r_[soft_scale, np.ones(m_r)]
             self._rigid_contact_scale = wp.array(scale, dtype=wp.float64, device=device)
 
+    def _shape_body_host(self) -> np.ndarray:
+        """The model's shape-to-body map on the host, read once (the model's, fixed after finalize)."""
+        if getattr(self, "_shape_body_h", None) is None:
+            self._shape_body_h = self.model.shape_body.numpy()
+        return self._shape_body_h
+
+    def _reduce_rigid_contacts(self, rc, state_in: State):
+        """Keep one contact per bin of each body pair: the contacts of a pair binned by their side-0 anchor, in cells
+        of ``rigid_contact_bin`` [m], and by their normal, rounded to the 26 directions of a 3x3x3 grid, and in each
+        bin the deepest at the step-start poses. A body resting on finely tessellated geometry, such as a thin-walled
+        cup of many prisms on a bolt of many convex parts, otherwise takes thousands of contacts, whose rows all
+        couple in ``W`` through the body: its cost grows with their square. The kept contacts keep their order."""
+        from .rigid_contact import RigidContacts  # noqa: PLC0415
+
+        m = rc.count
+        if m <= 1:
+            return rc
+        body = rc.body.numpy()
+        anchor_h, normal_h, mu_h = rc.anchor.numpy(), rc.normal.numpy(), rc.mu.numpy()
+        anchor, normal = anchor_h.astype(np.float64), normal_h.astype(np.float64)
+        q = state_in.body_q.numpy().astype(np.float64)
+        if getattr(self, "_body_com_h", None) is None:
+            self._body_com_h = self.model.body_com.numpy().astype(np.float64)  # the model's, fixed
+        com = self._body_com_h
+        world = np.empty((m, 2, 3))
+        for k in range(2):
+            b = body[:, k]
+            dyn = b >= 0
+            world[~dyn, k] = anchor[~dyn, k]
+            if dyn.any():
+                bq = q[b[dyn]]
+                x, y, z, w = bq[:, 3], bq[:, 4], bq[:, 5], bq[:, 6]
+                R = np.stack(
+                    [
+                        np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)], -1),
+                        np.stack([2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)], -1),
+                        np.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], -1),
+                    ],
+                    1,
+                )
+                c_world = bq[:, :3] + np.einsum("nij,nj->ni", R, com[b[dyn]])
+                world[dyn, k] = c_world + np.einsum("nij,nj->ni", R, anchor[dyn, k])
+        gap = np.einsum("ij,ij->i", world[:, 1] - world[:, 0], normal)
+        cell = np.floor(anchor[:, 0] / self.rigid_contact_bin).astype(np.int64)
+        direction = np.rint(normal * 1.4).astype(np.int64)  # 0.36 from the axes: 26 directions
+        keys = np.concatenate([body.astype(np.int64), cell, direction], axis=1)
+        # One contact per bin, the deepest; ties keep the earlier contact (np.lexsort is stable).
+        order = np.lexsort((np.arange(m), gap, *keys.T[::-1]))
+        k_sorted = keys[order]
+        first = np.ones(m, dtype=bool)
+        first[1:] = (k_sorted[1:] != k_sorted[:-1]).any(axis=1)
+        keep = np.sort(order[first])
+        if len(keep) == m:
+            return rc
+        device = self._device
+        return RigidContacts(
+            slot=np.ascontiguousarray(rc.slot[keep]),
+            shape=np.ascontiguousarray(rc.shape[keep]),
+            body=wp.array(body[keep], dtype=wp.int32, device=device),
+            anchor=wp.array(anchor_h[keep], dtype=wp.vec3, device=device),
+            normal=wp.array(normal_h[keep], dtype=wp.vec3, device=device),
+            mu=wp.array(mu_h[keep], dtype=wp.float64, device=device),
+        )
+
     _CONTACT_ROW_ARRAYS = (
         "_contact_particle_d",
         "_contact_record_d",
@@ -1230,7 +1306,7 @@ class SolverFBA(SolverBase):
         if self.model.world_count == 1 or M == 0:
             return
         shape = host_head(self._contact_shape_d, M)
-        body = np.where(shape >= 0, self.model.shape_body.numpy()[np.maximum(shape, 0)], -1)
+        body = np.where(shape >= 0, self._shape_body_host()[np.maximum(shape, 0)], -1)
         coupled = np.zeros(self.model.world_count, dtype=bool)
         coupled[self._contact_world_h[np.where(body >= 0, self._body_slot_h[np.maximum(body, 0)], -1) >= 0]] = True
         contact, row = coupled[self._contact_world_h], coupled[self._constraint_world_h]

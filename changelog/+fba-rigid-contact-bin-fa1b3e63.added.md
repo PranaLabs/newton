@@ -1,0 +1,1 @@
+Add `rigid_contact_bin` to `SolverFBA`: before the solve, keep only the deepest rigid contact of a body pair in each cell of that size and each of 26 normal directions, so that finely decomposed meshes (a thin-walled cup of many prisms on a bolt of many convex parts) no longer bring thousands of contacts whose rows all couple through the two bodies.
