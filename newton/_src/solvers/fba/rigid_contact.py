@@ -565,6 +565,85 @@ def particle_contact_body_jacobian_kernel(
 
 
 @wp.kernel
+def attachment_body_jacobian_kernel(
+    row_body: wp.array[wp.int32],
+    row_point: wp.array[wp.vec3],
+    direction: wp.array[wp.vec3],
+    body_slot: wp.array[wp.int32],
+    body_com: wp.array[wp.vec3],
+    q_pin: wp.array[wp.quatd],
+    body_q0: wp.array[wp.transform],
+    row_offset: wp.int32,
+    # outputs
+    row_slot: wp.array2d[wp.int32],
+    row_jac: wp.array2d[wp.spatial_vectord],
+):
+    """Body side of the particle constraint rows on bodies, rows ``row_offset + b``, at the pinned frame.
+
+    Row ``b`` measures ``d · v - d · a`` for its particle combination ``v`` and the point ``a`` of its body, so the
+    body adds ``-(R_pinᵀ d, R_pinᵀ r0 x R_pinᵀ d)`` with ``r0`` the point's lever relative to the COM at the
+    step-start pose ``body_q0``, as a particle contact's anchor does. Rows on no body or on a body that SolverFBA does
+    not integrate get no body side.
+    """
+    b = wp.tid()
+    body = row_body[b]
+    s = wp.int32(-1)
+    if body >= 0:
+        s = body_slot[body]
+    row = row_offset + b
+    row_slot[row, 0] = s
+    row_slot[row, 1] = -1
+    coeffs = wp.spatial_vectord()
+    if s >= 0:
+        d_loc = wp.quat_rotate_inv(q_pin[s], wp.vec3d(direction[b]))
+        q0 = wp.normalize(wp.quatd(wp.transform_get_rotation(body_q0[body])))
+        lever = wp.quat_rotate_inv(q_pin[s], wp.quat_rotate(q0, wp.vec3d(row_point[b] - body_com[body])))
+        coeffs = -slot_coefficients(d_loc, wp.cross(lever, d_loc))
+    row_jac[row, 0] = coeffs
+    row_jac[row, 1] = wp.spatial_vectord()
+
+
+@wp.kernel
+def attachment_body_residual_kernel(
+    row_body: wp.array[wp.int32],
+    row_point: wp.array[wp.vec3],
+    direction: wp.array[wp.vec3],
+    body_slot: wp.array[wp.int32],
+    body_com: wp.array[wp.vec3],
+    slot_x: wp.array[wp.vec3d],
+    slot_q: wp.array[wp.quatd],
+    body_q0: wp.array[wp.transform],
+    row_jac: wp.array2d[wp.spatial_vectord],
+    u: wp.array[wp.float64],
+    u_free: wp.array[wp.float64],
+    row_offset: wp.int32,
+    # outputs
+    r: wp.array[wp.float64],
+    pene0: wp.array[wp.float64],
+):
+    """Add the body side to the residual ``target - d · v`` of the particle constraint rows on bodies: the point
+    ``a`` of the body at its live pose, to first order in the turn since ``body_q0``, ``r += d · a``, plus the shift
+    ``J_body (u - u_free)`` back to the free-flight DOFs; the anchor value takes the step-start point's ``d · a0``."""
+    b = wp.tid()
+    body = row_body[b]
+    if body < 0:
+        return
+    s = body_slot[body]
+    if s < 0:
+        return
+    d = wp.vec3d(direction[b])
+    q0 = wp.normalize(wp.quatd(wp.transform_get_rotation(body_q0[body])))
+    a = _moved_anchor(slot_x[s], slot_q[s], q0, wp.quat_rotate(q0, wp.vec3d(row_point[b] - body_com[body])))
+    a0 = wp.vec3d(wp.transform_point(body_q0[body], row_point[b]))
+    row = row_offset + b
+    delta = wp.dot(d, a)
+    for i in range(6):
+        delta += row_jac[row, 0][i] * (u[6 * s + i] - u_free[6 * s + i])
+    r[row] += delta
+    pene0[row] += wp.dot(d, a0)
+
+
+@wp.kernel
 def particle_contact_body_residual_kernel(
     contact_shape: wp.array[wp.int32],
     contact_body_pos: wp.array[wp.vec3],
