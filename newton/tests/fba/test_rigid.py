@@ -106,7 +106,13 @@ class TestFBARigidKernels(unittest.TestCase):
             rigid.retract_rigid_kernel,
             dim=1,
             inputs=[bodies, u, q_pin, x_prev, body_q, wp.array([wp.vec3(*body["com"])], dtype=wp.vec3), wp.float64(DT)],
-            outputs=[q_out, qd_out, wp.empty(1, dtype=wp.vec3d), wp.empty(1, dtype=wp.quatd)],
+            outputs=[
+                q_out,
+                qd_out,
+                wp.empty(1, dtype=wp.vec3d),
+                wp.empty(1, dtype=wp.quatd),
+                wp.empty(1, dtype=wp.vec3d),
+            ],
             device=self.device,
         )
 

@@ -26,6 +26,20 @@ _ROTATION_NOISE_SQ = wp.constant(wp.float64(1.0e-28))
 
 
 @wp.func
+def _rotation_vector(q: wp.quatd) -> wp.vec3d:
+    """Rotation vector of the unit quaternion ``q``, the shorter way round."""
+    v = wp.vec3d(q[0], q[1], q[2])
+    w = q[3]
+    if w < wp.float64(0.0):
+        v = -v
+        w = -w
+    s = wp.length(v)
+    if s < wp.float64(1.0e-12):
+        return wp.float64(2.0) * v
+    return (wp.float64(2.0) * wp.atan2(s, w) / s) * v
+
+
+@wp.func
 def _clamp_step_rotation(omega: wp.vec3d, dt: wp.float64) -> wp.vec3d:
     n = wp.length(omega)
     if n * dt > _MAX_STEP_ROTATION:
@@ -114,13 +128,16 @@ def retract_rigid_kernel(
     body_qd: wp.array[wp.spatial_vector],
     x_live: wp.array[wp.vec3d],
     q_live: wp.array[wp.quatd],
+    turn: wp.array[wp.vec3d],
 ):
     """Map the solved DOFs back to body poses and velocities.
 
     The COM moves to ``R_pin chi``; the orientation is retracted from the
     step-start one, ``q = exp(R_pin rho) q_prev``, with the rotation clamped
     like the pinned frame. Velocities are ``v = (x - x_prev) / dt`` and
-    ``ω = R_pin rho / dt``. The COM pose is also kept in float64 per slot.
+    ``ω = R_pin rho / dt``. The COM pose is also kept in float64 per slot, with
+    the turn ``q q_prevˉ¹`` since the step start as a rotation vector, which moves
+    the anchors of the slot's rows.
     """
     k = wp.tid()
     i = bodies[k]
@@ -129,7 +146,8 @@ def retract_rigid_kernel(
     rho = wp.vec3d(u[6 * k + 3], u[6 * k + 4], u[6 * k + 5])
 
     x = wp.quat_rotate(qp, chi)
-    q = wp.normalize(wp.quatd(wp.transform_get_rotation(body_q_prev[i])))
+    q0 = wp.normalize(wp.quatd(wp.transform_get_rotation(body_q_prev[i])))
+    q = q0
     omega = wp.vec3d(0.0, 0.0, 0.0)
     if wp.length_sq(rho) >= _ROTATION_NOISE_SQ:
         omega = wp.quat_rotate(qp, _clamp_step_rotation(rho / dt, dt))
@@ -138,6 +156,7 @@ def retract_rigid_kernel(
     v = (x - x_prev[k]) / dt
     x_live[k] = x
     q_live[k] = q
+    turn[k] = _rotation_vector(q * wp.quat_inverse(q0))
     origin = x - wp.quat_rotate(q, wp.vec3d(body_com[i]))
     body_q[i] = wp.transform(wp.vec3(origin), wp.quat(q))
     body_qd[i] = wp.spatial_vector(wp.vec3(v), wp.vec3(omega))

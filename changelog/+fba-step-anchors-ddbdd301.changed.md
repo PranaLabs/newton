@@ -1,0 +1,1 @@
+Speed up the rigid iterations of `SolverFBA` with rigid contacts or tendons: the parts of their rows' values that stay fixed through a step, the anchors at the step start and their levers and friction targets, are formed once per step, and the retraction keeps each body's turn since the step start, instead of every iteration forming them again.

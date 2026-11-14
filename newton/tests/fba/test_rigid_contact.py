@@ -158,7 +158,7 @@ class TestRigidContactRows(unittest.TestCase):
     def _gap(self, u, dt, q_pin=None):
         x0 = wp.array(self.x0[:2], dtype=wp.vec3d)
         q0 = wp.array(self.q0[:2] if q_pin is None else q_pin, dtype=wp.quatd)
-        x, q = wp.empty(2, dtype=wp.vec3d), wp.empty(2, dtype=wp.quatd)
+        x, q, turn = wp.empty(2, dtype=wp.vec3d), wp.empty(2, dtype=wp.quatd), wp.empty(2, dtype=wp.vec3d)
         scratch = [wp.empty(2, dtype=wp.transform), wp.empty(2, dtype=wp.spatial_vector)]
         wp.launch(
             retract_rigid_kernel,
@@ -172,17 +172,25 @@ class TestRigidContactRows(unittest.TestCase):
                 self.model.body_com,
                 wp.float64(1.0),
             ],
-            outputs=[*scratch, x, q],
+            outputs=[*scratch, x, q, turn],
             device="cpu",
         )
         gap, rc, state = wp.empty(9, dtype=wp.float64), self.rc, self.state
+        anchors = [wp.empty((3, 2), dtype=wp.vec3d) for _ in range(4)]
+        wp.launch(
+            RC.rigid_contact_anchor_kernel,
+            dim=3,
+            inputs=[
+                *(rc.body, rc.anchor, rc.normal, self.slot, x0, state.body_q, state.body_qd),
+                *(self.model.body_com, wp.float64(dt)),
+            ],
+            outputs=anchors,
+            device="cpu",
+        )
         wp.launch(
             RC.rigid_contact_gap_kernel,
             dim=3,
-            inputs=[
-                *(rc.body, rc.anchor, rc.normal, self.slot, x, q, x0),
-                *(state.body_q, state.body_qd, self.model.body_com, wp.float64(dt), 0),
-            ],
+            inputs=[*(rc.body, rc.normal, *anchors, self.slot, x, turn, 0)],
             outputs=[gap],
             device="cpu",
         )
@@ -304,7 +312,7 @@ class TestParticleContactBodyRows(unittest.TestCase):
             retract_rigid_kernel,
             dim=2,
             inputs=[self.slot, wp.array(u, dtype=wp.float64), q0, x0, self.model.body_q, self.model.body_com, 1.0],
-            outputs=[*scratch, x, q],
+            outputs=[*scratch, x, q, wp.empty(2, dtype=wp.vec3d)],
         )
         r = wp.zeros(9, dtype=wp.float64)
         wp.launch(

@@ -24,7 +24,7 @@ import warp as wp
 
 from ...sim import Contacts, Model
 from .kernels import host_head, stored_contact_count
-from .rigid import slot_coefficients
+from .rigid import _rotation_vector, slot_coefficients
 
 
 @dataclass
@@ -366,20 +366,6 @@ def _row_direction(n: wp.vec3d, k: int) -> wp.vec3d:
 
 
 @wp.func
-def _rotation_vector(q: wp.quatd) -> wp.vec3d:
-    """Rotation vector of the unit quaternion ``q``, the shorter way round."""
-    v = wp.vec3d(q[0], q[1], q[2])
-    w = q[3]
-    if w < wp.float64(0.0):
-        v = -v
-        w = -w
-    s = wp.length(v)
-    if s < wp.float64(1.0e-12):
-        return wp.float64(2.0) * v
-    return (wp.float64(2.0) * wp.atan2(s, w) / s) * v
-
-
-@wp.func
 def _moved_anchor(x: wp.vec3d, q: wp.quatd, q0: wp.quatd, r0: wp.vec3d) -> wp.vec3d:
     """Anchor of lever ``r0`` at the step start on a body now at COM ``x`` and turned from ``q0`` to ``q``, to first
     order in the turn."""
@@ -471,6 +457,54 @@ def _side_anchor(
     a0 = x0 + wp.quat_rotate(q0, r)
     v = wp.vec3d(wp.spatial_top(body_qd0[b])) + wp.cross(wp.vec3d(wp.spatial_bottom(body_qd0[b])), a0 - x0)
     return a0, a0, a0 + dt * v
+
+
+@wp.func
+def _live_anchor(
+    b: int,
+    start: wp.vec3d,
+    lever: wp.vec3d,
+    fixed_target: wp.vec3d,
+    body_slot: wp.array[wp.int32],
+    slot_x: wp.array[wp.vec3d],
+    slot_turn: wp.array[wp.vec3d],
+):
+    """A side's anchor at the live pose and its friction target, as :func:`_side_anchor` forms them, from its
+    step-constant parts (:func:`_constant_anchor`) and its slot's turn since the step start."""
+    if b >= 0:
+        s = body_slot[b]
+        if s >= 0:
+            a = slot_x[s] + lever + wp.cross(slot_turn[s], lever)
+            return a, a
+    return start, fixed_target
+
+
+@wp.func
+def _constant_anchor(
+    b: int,
+    r: wp.vec3d,
+    body_slot: wp.array[wp.int32],
+    slot_x0: wp.array[wp.vec3d],
+    body_q0: wp.array[wp.transform],
+    body_qd0: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    dt: wp.float64,
+):
+    """The step-constant parts of :func:`_side_anchor`: the anchor at the step start, its lever in the world on an
+    integrated body (zero elsewhere) and its friction target elsewhere (the start on an integrated body)."""
+    zero = wp.vec3d(0.0, 0.0, 0.0)
+    if b < 0:
+        return r, zero, r
+    q0 = wp.normalize(wp.quatd(wp.transform_get_rotation(body_q0[b])))
+    s = body_slot[b]
+    if s >= 0:
+        r0 = wp.quat_rotate(q0, r)
+        start = slot_x0[s] + r0
+        return start, r0, start
+    x0 = wp.vec3d(wp.transform_get_translation(body_q0[b])) + wp.quat_rotate(q0, wp.vec3d(body_com[b]))
+    a0 = x0 + wp.quat_rotate(q0, r)
+    v = wp.vec3d(wp.spatial_top(body_qd0[b])) + wp.cross(wp.vec3d(wp.spatial_bottom(body_qd0[b])), a0 - x0)
+    return a0, zero, a0 + dt * v
 
 
 @wp.func
@@ -604,21 +638,46 @@ def tendon_soft_kernel(
 
 
 @wp.kernel
-def tendon_gap_kernel(
+def tendon_anchor_kernel(
     body: wp.array2d[wp.int32],
     point: wp.array2d[wp.vec3],
     target: wp.array2d[wp.vec3],
-    middle: wp.array[wp.float64],
-    rest: wp.array[wp.float64],
-    friction_coefficient: wp.array[wp.float64],
     body_slot: wp.array[wp.int32],
-    slot_x: wp.array[wp.vec3d],
-    slot_q: wp.array[wp.quatd],
     slot_x0: wp.array[wp.vec3d],
     body_q0: wp.array[wp.transform],
     body_qd0: wp.array[wp.spatial_vector],
     body_com: wp.array[wp.vec3],
     dt: wp.float64,
+    # outputs
+    end_direction: wp.array2d[wp.vec3d],
+    end_start: wp.array2d[wp.vec3d],
+    end_lever: wp.array2d[wp.vec3d],
+):
+    """The step-constant parts of each tendon end for :func:`tendon_gap_kernel`: the unit direction ``e`` from the
+    end's step-start position toward its next path point, and the end's anchor parts of :func:`_constant_anchor`."""
+    t = wp.tid()
+    for side in range(2):
+        b = body[t, side]
+        lever, p0 = _tendon_end(b, point[t, side], body_com, body_q0)
+        start, lever0, _target = _constant_anchor(b, lever, body_slot, slot_x0, body_q0, body_qd0, body_com, dt)
+        end_direction[t, side] = wp.normalize(wp.vec3d(target[t, side]) - p0)
+        end_start[t, side] = start
+        end_lever[t, side] = lever0
+
+
+@wp.kernel
+def tendon_gap_kernel(
+    body: wp.array2d[wp.int32],
+    target: wp.array2d[wp.vec3],
+    middle: wp.array[wp.float64],
+    rest: wp.array[wp.float64],
+    friction_coefficient: wp.array[wp.float64],
+    end_direction: wp.array2d[wp.vec3d],
+    end_start: wp.array2d[wp.vec3d],
+    end_lever: wp.array2d[wp.vec3d],
+    body_slot: wp.array[wp.int32],
+    slot_x: wp.array[wp.vec3d],
+    slot_turn: wp.array[wp.vec3d],
     row_offset: int,
     # outputs
     gap: wp.array[wp.float64],
@@ -629,18 +688,15 @@ def tendon_gap_kernel(
     as a contact's normal is, also where an end reaches its target (a run of zero length, where the distance has a
     kink and the start-of-step direction would point the wrong way once the end passes the target). With a
     friction coefficient, row ``r + 1`` holds the first end's slide along that direction over the step,
-    ``e · (p - p0)``."""
+    ``e · (p - p0)``. The ends' step-constant parts come from :func:`tendon_anchor_kernel`."""
     t = wp.tid()
     length = middle[t]
     slide = wp.float64(0.0)
     for side in range(2):
-        b = body[t, side]
-        lever, p0 = _tendon_end(b, point[t, side], body_com, body_q0)
-        start, live, _target = _side_anchor(
-            b, lever, body_slot, slot_x, slot_q, slot_x0, body_q0, body_qd0, body_com, dt
-        )
+        start = end_start[t, side]
+        live, _target = _live_anchor(body[t, side], start, end_lever[t, side], start, body_slot, slot_x, slot_turn)
         goal = wp.vec3d(target[t, side])
-        e = wp.normalize(goal - p0)
+        e = end_direction[t, side]
         length += wp.dot(e, goal - live)
         if side == 0 and friction_coefficient[t] > wp.float64(0.0):
             slide = wp.dot(e, live - start)
@@ -689,36 +745,64 @@ def rigid_contact_soft_kernel(
 
 
 @wp.kernel
-def rigid_contact_gap_kernel(
+def rigid_contact_anchor_kernel(
     body: wp.array2d[wp.int32],
     anchor: wp.array2d[wp.vec3],
     normal: wp.array[wp.vec3],
     body_slot: wp.array[wp.int32],
-    slot_x: wp.array[wp.vec3d],
-    slot_q: wp.array[wp.quatd],
     slot_x0: wp.array[wp.vec3d],
     body_q0: wp.array[wp.transform],
     body_qd0: wp.array[wp.spatial_vector],
     body_com: wp.array[wp.vec3],
     dt: wp.float64,
+    # outputs
+    start: wp.array2d[wp.vec3d],
+    lever: wp.array2d[wp.vec3d],
+    fixed_target: wp.array2d[wp.vec3d],
+    tangent: wp.array2d[wp.vec3d],
+):
+    """The step-constant parts of rigid contact ``c``'s rows for :func:`rigid_contact_gap_kernel`: per side, the
+    anchor parts of :func:`_constant_anchor`; the directions of its two friction rows."""
+    c = wp.tid()
+    for side in range(2):
+        a0, r0, target = _constant_anchor(
+            body[c, side], wp.vec3d(anchor[c, side]), body_slot, slot_x0, body_q0, body_qd0, body_com, dt
+        )
+        start[c, side] = a0
+        lever[c, side] = r0
+        fixed_target[c, side] = target
+    n = wp.vec3d(normal[c])
+    tangent[c, 0] = _row_direction(n, 1)
+    tangent[c, 1] = _row_direction(n, 2)
+
+
+@wp.kernel
+def rigid_contact_gap_kernel(
+    body: wp.array2d[wp.int32],
+    normal: wp.array[wp.vec3],
+    start: wp.array2d[wp.vec3d],
+    lever: wp.array2d[wp.vec3d],
+    fixed_target: wp.array2d[wp.vec3d],
+    tangent: wp.array2d[wp.vec3d],
+    body_slot: wp.array[wp.int32],
+    slot_x: wp.array[wp.vec3d],
+    slot_turn: wp.array[wp.vec3d],
     row_offset: int,
     # outputs
     gap: wp.array[wp.float64],
 ):
     """Row values at the live pose: the normal gap ``n · (a1 - a0)`` and the
-    tangential slip ``t · ((a1 - a1⁰) - (a0 - a0⁰))`` over the step [m]."""
+    tangential slip ``t · ((a1 - a1⁰) - (a0 - a0⁰))`` over the step [m]. The step-constant parts come from
+    :func:`rigid_contact_anchor_kernel`."""
     c = wp.tid()
     n = wp.vec3d(normal[c])
-    start0, live0, target0 = _side_anchor(
-        body[c, 0], wp.vec3d(anchor[c, 0]), body_slot, slot_x, slot_q, slot_x0, body_q0, body_qd0, body_com, dt
-    )
-    start1, live1, target1 = _side_anchor(
-        body[c, 1], wp.vec3d(anchor[c, 1]), body_slot, slot_x, slot_q, slot_x0, body_q0, body_qd0, body_com, dt
-    )
+    start0, start1 = start[c, 0], start[c, 1]
+    live0, target0 = _live_anchor(body[c, 0], start0, lever[c, 0], fixed_target[c, 0], body_slot, slot_x, slot_turn)
+    live1, target1 = _live_anchor(body[c, 1], start1, lever[c, 1], fixed_target[c, 1], body_slot, slot_x, slot_turn)
     slip = (target1 - start1) - (target0 - start0)
     gap[row_offset + 3 * c] = wp.dot(n, live1 - live0)
-    gap[row_offset + 3 * c + 1] = wp.dot(_row_direction(n, 1), slip)
-    gap[row_offset + 3 * c + 2] = wp.dot(_row_direction(n, 2), slip)
+    gap[row_offset + 3 * c + 1] = wp.dot(tangent[c, 0], slip)
+    gap[row_offset + 3 * c + 2] = wp.dot(tangent[c, 1], slip)
 
 
 @wp.func
