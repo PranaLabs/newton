@@ -3735,6 +3735,33 @@ class SolverFBA(SolverBase):
         self._tendon_count = T
         self._tendon_body_h = b
 
+    def set_tendon_paths(self, targets: wp.array, middle_lengths: wp.array) -> None:
+        """Move the paths of the tendons of :meth:`set_tendons` for the following steps: each end's next path point
+        ``targets`` and the length ``middle_lengths`` between the two, as there, from arrays on the solver's device.
+
+        They are copied on the device, so that the tendons' paths can be routed on the device each step without
+        reading the bodies' poses back to the host or uploading the paths.
+
+        Args:
+            targets: Each end's next path point in the world [m], shape ``(T, 2)`` of ``wp.vec3``.
+            middle_lengths: The path's length between the two targets [m], shape ``(T,)`` of ``wp.float64``.
+        """
+        if not self._tendon_count:
+            raise ValueError("set_tendon_paths moves the paths of tendons that set_tendons holds")
+        T = self._tendon_count
+        if not isinstance(targets, wp.array) or targets.dtype != wp.vec3 or tuple(targets.shape) != (T, 2):
+            raise ValueError(f"targets need a wp.array of wp.vec3 of shape ({T}, 2)")
+        if (
+            not isinstance(middle_lengths, wp.array)
+            or middle_lengths.dtype != wp.float64
+            or tuple(middle_lengths.shape) != (T,)
+        ):
+            raise ValueError(f"middle_lengths need a wp.array of wp.float64 of shape ({T},)")
+        if targets.device != self._tendons[2].device or middle_lengths.device != self._tendons[3].device:
+            raise ValueError(f"targets and middle_lengths need the solver's device, {self._tendons[2].device}")
+        wp.copy(self._tendons[2], targets)
+        wp.copy(self._tendons[3], middle_lengths)
+
     def set_particle_constraints(
         self, particles, coefficients, targets, *, directions=None, exact=False, bodies=None, body_points=None
     ) -> None:

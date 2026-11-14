@@ -1,0 +1,1 @@
+Add `SolverFBA.set_tendon_paths()`, which moves the tendons' path points and middle lengths from arrays on the solver's device, so that tendon paths can be routed on the device each step without a host round trip.
