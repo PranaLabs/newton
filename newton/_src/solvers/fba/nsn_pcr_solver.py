@@ -198,6 +198,9 @@ _PCR_BLOCK_DIM = 128
 # partial sums each block reduces in one tile: up to 262144 rows.
 _FUSED_BLOCK = wp.constant(256)
 _FUSED_MAX_BLOCKS = wp.constant(1024)
+# Up to this many blocks, every thread of the fused iteration adds the blocks' partial sums one by one, in the same
+# order, where a tile reduction of all _FUSED_MAX_BLOCKS slots would cost the block several times more.
+_SERIAL_BLOCKS = wp.constant(32)
 # Threads per row of the tiled sparse product that the fused iteration takes for long rows.
 _TILED_MV = 64
 # Mean entries per row from which the products by W take the tiled product. warp.sparse picks it from 128 on, but
@@ -560,6 +563,19 @@ def _fused_pcr_dots_given_kernel(
     wp.tile_store(partial_chart, wp.tile_sum(wp.tile_map(wp.mul, d_t, dd_t)), offset=(b,))
 
 
+@wp.func
+def _blocks_total(partial: wp.array[wp.float64]) -> wp.float64:
+    """The sum of the fused iteration's per-block partial sums ``partial``, one per block, the same in every thread:
+    added in order up to :data:`_SERIAL_BLOCKS` blocks, by a tile reduction past them."""
+    total = wp.float64(0.0)
+    if partial.shape[0] <= _SERIAL_BLOCKS:
+        for k in range(partial.shape[0]):
+            total += partial[k]
+    else:
+        total = wp.tile_extract(wp.tile_sum(wp.tile_load(partial, shape=(_FUSED_MAX_BLOCKS,))), 0)
+    return total
+
+
 @wp.kernel
 def _fused_pcr_step_kernel(
     partial_den: wp.array[wp.float64],
@@ -583,9 +599,9 @@ def _fused_pcr_step_kernel(
     """The protected step length from the summed blocks, which every block forms alike, and ``x += alpha d``,
     ``r -= alpha q``, ``s -= alpha h``; with ``scaled``, also ``sw = scale s`` for a factored matrix."""
     b, lane = wp.tid()
-    den = wp.tile_extract(wp.tile_sum(wp.tile_load(partial_den, shape=(_FUSED_MAX_BLOCKS,))), 0)
-    curvature = wp.tile_extract(wp.tile_sum(wp.tile_load(partial_curvature, shape=(_FUSED_MAX_BLOCKS,))), 0)
-    chart = wp.tile_extract(wp.tile_sum(wp.tile_load(partial_chart, shape=(_FUSED_MAX_BLOCKS,))), 0)
+    den = _blocks_total(partial_den)
+    curvature = _blocks_total(partial_curvature)
+    chart = _blocks_total(partial_chart)
     stop = stopped[0] != wp.float64(0.0)
     if not stop:
         if not (den > wp.float64(0.0) and curvature > eta * chart):
@@ -721,7 +737,7 @@ def _fused_pcr_direction_kernel(
     """``beta = rho_new / rho`` from the summed blocks, ``d = beta d + s`` and ``q = beta q + h``; the first thread
     keeps ``rho_new`` in the other slot."""
     b, lane = wp.tid()
-    rho_new = wp.tile_extract(wp.tile_sum(wp.tile_load(partial_rho, shape=(_FUSED_MAX_BLOCKS,))), 0)
+    rho_new = _blocks_total(partial_rho)
     rho = rho_buf[slot]
     beta = wp.float64(0.0)
     if rho != wp.float64(0.0):
