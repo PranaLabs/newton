@@ -103,6 +103,20 @@ class TestRigidIterationGraph(unittest.TestCase):
         state = self._check(_boxes_and_flap, captured=False)
         self.assertTrue(np.isfinite(state.body_q.numpy()).all())
 
+    def test_steps_before_any_contact(self):
+        """A box falling onto the ground takes its first steps without contact rows, then lands: with the option the
+        rigid iterations run from the start and step bit for bit as eager ones."""
+
+        def falling_box():
+            builder = newton.ModelBuilder()
+            builder.add_ground_plane()
+            body = builder.add_body(xform=wp.transform((0.0, 0.0, 0.3), wp.quat_identity()))
+            builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
+            return builder.finalize(), {"nsn_sparse_storage": True, "nsn_linear_iterations": 10}
+
+        state = self._check(falling_box, captured=False)
+        self.assertAlmostEqual(float(state.body_q.numpy()[0, 2]), 0.05, delta=2e-3)  # landed on the ground
+
     def test_off_by_default(self):
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
