@@ -327,7 +327,11 @@ Model Inputs
   so that the string never pushes its first end; within a step it is a
   coefficient ``min(1, mu + F0 / T_prev)`` from the previous step's tension,
   and ``mu`` alone after a step without tension, so that a slack string that
-  snaps taut is not held by the whole catch impulse.
+  snaps taut is not held by the whole catch impulse. ``tendon_time`` makes
+  the length limits soft as ``rigid_contact_time`` does contacts: a taut
+  string stretches ``T tau² / m`` and stops a load it catches over a few
+  steps, its damper acting on the stretch of a taut string only, so that a
+  slack string pulls nothing.
   Tendons need the full operator and one world.
 
 FBA does not simulate equality constraints, mimic joints, the model's

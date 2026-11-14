@@ -229,6 +229,8 @@ class SolverFBA(SolverBase):
         rigid_iteration_graph: bool = False,
         rigid_contact_time: float = 0.0,
         rigid_contact_damping: float = 1.0,
+        tendon_time: float = 0.0,
+        tendon_damping: float = 1.0,
     ) -> None:
         """
         Args:
@@ -541,10 +543,20 @@ class SolverFBA(SolverBase):
                 ``beta = 2 zeta / (x + 2 zeta)``. ``0`` keeps rigid contacts
                 hard. The start gap counts only in penetration (above zero it
                 is taken as zero), so that contacts reported before the bodies
-                touch, within their detection gap, do not brake them. Tendon
-                and particle contact rows are not softened.
+                touch, within their detection gap, do not brake them. Particle
+                contacts are not softened, nor are tendon rows (see
+                ``tendon_time``).
             rigid_contact_damping: The damping ratio ``zeta`` of soft rigid
                 contacts (``1``, critical: no bounce).
+            tendon_time: With a positive time constant [s], the length limits
+                of the tendons (:meth:`set_tendons`) are soft in the same way:
+                a taut string stretches ``T tau² / m`` under its tension ``T``
+                for the effective mass ``m`` of its row, and stops a load it
+                catches over a few steps instead of one. Their damper acts on
+                the stretch of a taut string only (the start gap is clamped
+                to ``<= 0``), so that a slack string pulls nothing. ``0``
+                keeps tendons inextensible.
+            tendon_damping: The damping ratio of soft tendon limits.
         """
         super().__init__(model)
         self._particle_world_h = model.particle_world.numpy()
@@ -665,6 +677,10 @@ class SolverFBA(SolverBase):
         if not (rigid_contact_time >= 0.0 and rigid_contact_damping >= 0.0):
             raise ValueError("rigid_contact_time and rigid_contact_damping must be >= 0")
         self.rigid_contact_time, self.rigid_contact_damping = float(rigid_contact_time), float(rigid_contact_damping)
+        if not (tendon_time >= 0.0 and tendon_damping >= 0.0):
+            raise ValueError("tendon_time and tendon_damping must be >= 0")
+        # Soft tendon limits: the same spring-damper on the tendons' length rows.
+        self.tendon_time, self.tendon_damping = float(tendon_time), float(tendon_damping)
         # The soft rigid contacts' per-contact arrays (eps, beta, start gap) of the step; empty arrays for none.
         self._nsn_soft_off = tuple(wp.empty(0, dtype=wp.float64, device=model.device) for _ in range(3))
         self._nsn_soft = self._rc_soft = self._nsn_soft_off
@@ -1206,11 +1222,15 @@ class SolverFBA(SolverBase):
             self._rc_pene0_d = wp.zeros(n, dtype=wp.float64, device=device)
             self._rc_mu_d = wp.zeros(m_s + m_r + m_t, dtype=wp.float64, device=device)
             soft = (wp.zeros(m_s + m_r + m_t, dtype=wp.float64, device=device) for _ in range(3))
-            self._rc_soft = tuple(soft) if self.rigid_contact_time > 0.0 else self._nsn_soft_off
+            self._rc_soft = (
+                tuple(soft) if self.rigid_contact_time > 0.0 or self.tendon_time > 0.0 else self._nsn_soft_off
+            )
         else:
             self._rc_row_slot_d, self._rc_row_jac_d = storage.row_slot, storage.row_jac
             self._rc_pene0_d, self._rc_mu_d = storage.pene0, storage.mu
-            self._rc_soft = storage.soft if self.rigid_contact_time > 0.0 else self._nsn_soft_off
+            self._rc_soft = (
+                storage.soft if self.rigid_contact_time > 0.0 or self.tendon_time > 0.0 else self._nsn_soft_off
+            )
         self._rc_lam_soft_d = wp.empty(n_s + n_b, dtype=wp.float64, device=device) if n_b else None
         if m_s or attach:
             from .rigid_contact import particle_contact_body_jacobian_kernel  # noqa: PLC0415
@@ -1279,6 +1299,24 @@ class SolverFBA(SolverBase):
                 outputs=[mu, self._rc_mu_d],
                 device=device,
             )
+            if self.tendon_time > 0.0:
+                from .rigid_contact import tendon_soft_kernel  # noqa: PLC0415
+
+                x_t, zeta_t = self._rigid_dt / self.tendon_time, self.tendon_damping
+                wp.launch(
+                    tendon_soft_kernel,
+                    dim=m_t,
+                    inputs=[
+                        *(body, point, target, self._tendons[3], self._tendons[4], model.body_com, state_in.body_q),
+                        *(
+                            wp.float64(1.0 / (x_t * x_t + 2.0 * zeta_t * x_t)),
+                            wp.float64(2.0 * zeta_t / (x_t + 2.0 * zeta_t)),
+                        ),
+                        m_s + m_r,
+                    ],
+                    outputs=list(self._rc_soft),
+                    device=device,
+                )
             wp.launch(
                 tendon_jacobian_kernel,
                 dim=m_t,
