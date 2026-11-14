@@ -1115,7 +1115,7 @@ class SolverFBA(SolverBase):
                     self._two_way_world_h[self._contact_world_h[soft_slot >= 0]] = 1
                 slots = np.concatenate([np.stack([soft_slot, np.full(m_s, -1)], axis=1), slots])
         self._two_way, self._rc_counts, self._rc_n = m_s > 0 or attach, (m_s, m_r), 0
-        self._rc_padded, self._rc_n_pad = None, 0
+        self._rc_padded, self._rc_n_pad, self._rc_n_b = None, 0, 0
         if m_s + m_r == 0 and not attach:
             return
         if not self.friction or self.nsn_schur_mode != "full":
