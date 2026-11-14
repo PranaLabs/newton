@@ -1,0 +1,1 @@
+Speed up `SolverFBA`'s reduction of rigid contacts by bins (`rigid_contact_bin`): it now runs on the device within the contact gather, instead of reading the contacts and body poses back to the host and uploading the kept contacts every step.

@@ -45,11 +45,8 @@ class TestRigidContactBin(unittest.TestCase):
 
     def test_one_contact_per_bin(self):
         """The reduction keeps one contact of each bin, in their order."""
-        from newton.solvers import SolverFBA  # noqa: PLC0415
-
         size = 0.05
         model = _scene("cuda:0")
-        solver = SolverFBA(model, iterations=1, rigid_contact_bin=size)
         state = model.state()
         pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
@@ -57,7 +54,7 @@ class TestRigidContactBin(unittest.TestCase):
         slot = np.full(model.body_count, -1, dtype=np.int32)
         slot[0] = 0
         full = gather_rigid_contacts(model, contacts, slot, "cuda:0")
-        kept = solver._reduce_rigid_contacts(full, state)
+        kept = gather_rigid_contacts(model, contacts, slot, "cuda:0", bin_size=size, body_q=state.body_q)
         self.assertGreater(full.count, 4 * kept.count)
         all_keys, kept_keys = _keys(full, size), _keys(kept, size)
         self.assertEqual(sorted(kept_keys), sorted(set(all_keys)))
