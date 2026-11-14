@@ -56,6 +56,10 @@ class RigidContacts:
 
 
 _DROPPED_PAIR = wp.constant(wp.int64(0x7FFFFFFFFFFFFFFF))
+# The bin keys of the reduction by bins (gather_rigid_contacts with a bin size): a contact past the count takes a key
+# past every bin; a cell index takes 21 bits, clamped to +-(2**20 - 1) cells.
+_NO_BIN = wp.constant(wp.int64(0x7FFFFFFFFFFFFFFF))
+_CELL_LIMIT = wp.constant(wp.int64((1 << 20) - 1))
 
 
 @wp.func
@@ -171,6 +175,118 @@ def _rigid_contact_gather_kernel(
     mu[i] = m
 
 
+@wp.func
+def _step_start_anchor(b: int, a: wp.vec3d, body_q: wp.array[wp.transform], body_com: wp.array[wp.vec3]):
+    """World point of anchor ``a`` (relative to the COM in the body frame, in the world on no body) at ``body_q``."""
+    if b < 0:
+        return a
+    tf = body_q[b]
+    q = wp.normalize(wp.quatd(wp.transform_get_rotation(tf)))
+    return wp.vec3d(wp.transform_get_translation(tf)) + wp.quat_rotate(q, wp.vec3d(body_com[b]) + a)
+
+
+@wp.kernel
+def _contact_bin_keys_kernel(
+    table: wp.array[wp.int32],
+    body: wp.array2d[wp.int32],
+    anchor: wp.array2d[wp.vec3],
+    normal: wp.array[wp.vec3],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    size: wp.float64,
+    body_count: wp.int64,
+    # outputs
+    key_hi: wp.array[wp.int64],
+    key_mid: wp.array[wp.int64],
+    depth: wp.array[wp.float64],
+    order: wp.array[wp.int32],
+):
+    """Gathered contact ``i``'s bin as two keys, its bodies with its normal rounded to the 26 directions of a 3x3x3
+    grid, and the cell of its side-0 anchor in cells of ``size``; and its normal gap at the poses ``body_q``. The
+    contacts past the count in ``table[0]`` take keys past every bin."""
+    i = wp.tid()
+    order[i] = i
+    if i >= table[0]:
+        key_hi[i] = _NO_BIN
+        key_mid[i] = _NO_BIN
+        depth[i] = wp.float64(0.0)
+        return
+    b0, b1 = body[i, 0], body[i, 1]
+    a0 = wp.vec3d(anchor[i, 0])
+    n = wp.vec3d(normal[i])
+    gap = wp.dot(
+        _step_start_anchor(b1, wp.vec3d(anchor[i, 1]), body_q, body_com) - _step_start_anchor(b0, a0, body_q, body_com),
+        n,
+    )
+    if gap == wp.float64(0.0):
+        gap = wp.float64(0.0)  # -0 and +0 compare equal; the radix sort keys alone would split them
+    depth[i] = gap
+    mid = wp.int64(0)
+    code = wp.int64(0)
+    for k in range(3):
+        cell = wp.int64(wp.floor(a0[k] / size))
+        cell = wp.clamp(cell, -_CELL_LIMIT, _CELL_LIMIT) + _CELL_LIMIT
+        mid = mid * wp.int64(1 << 21) + cell
+        code = code * wp.int64(3) + wp.int64(wp.rint(n[k] * wp.float64(1.4))) + wp.int64(1)
+    pair = (wp.int64(b0) + wp.int64(1)) * (body_count + wp.int64(1)) + wp.int64(b1) + wp.int64(1)
+    key_hi[i] = pair * wp.int64(27) + code
+    key_mid[i] = mid
+
+
+@wp.kernel
+def _contact_bin_first_kernel(
+    order: wp.array[wp.int32],
+    key_hi: wp.array[wp.int64],
+    key_mid: wp.array[wp.int64],
+    # outputs
+    keep: wp.array[wp.int32],
+):
+    """Keep the contact at position ``p`` of the order by bin and depth when it is the first of its bin."""
+    p = wp.tid()
+    i = order[p]
+    first = wp.int32(0)
+    if key_hi[i] != _NO_BIN:
+        first = wp.int32(1)
+        if p > 0:
+            j = order[p - 1]
+            if key_hi[j] == key_hi[i] and key_mid[j] == key_mid[i]:
+                first = wp.int32(0)
+    keep[i] = first
+
+
+@wp.kernel
+def _contact_bin_compact_kernel(
+    keep: wp.array[wp.int32],
+    dest: wp.array[wp.int32],
+    table: wp.array[wp.int32],
+    body: wp.array2d[wp.int32],
+    anchor: wp.array2d[wp.vec3],
+    normal: wp.array[wp.vec3],
+    mu: wp.array[wp.float64],
+    n: int,
+    # outputs
+    kept_table: wp.array[wp.int32],
+    kept_body: wp.array2d[wp.int32],
+    kept_anchor: wp.array2d[wp.vec3],
+    kept_normal: wp.array[wp.vec3],
+    kept_mu: wp.array[wp.float64],
+):
+    """Move the kept contacts, in their order, to the front of the ``kept_*`` arrays, and their rows of ``table``
+    with their count."""
+    i = wp.tid()
+    if keep[i] != 0:
+        k = dest[i]
+        for side in range(2):
+            kept_body[k, side] = body[i, side]
+            kept_anchor[k, side] = anchor[i, side]
+        kept_normal[k] = normal[i]
+        kept_mu[k] = mu[i]
+        for j in range(4):
+            kept_table[1 + 4 * k + j] = table[1 + 4 * i + j]
+    if i == n - 1:
+        kept_table[0] = dest[i] + keep[i]
+
+
 class RigidContactGather:
     """Device buffers of :func:`gather_rigid_contacts`, kept across steps and grown with the contact count."""
 
@@ -194,6 +310,18 @@ class RigidContactGather:
         self.anchor = wp.empty((cap, 2), dtype=wp.vec3, device=d)
         self.normal = wp.empty(cap, dtype=wp.vec3, device=d)
         self.mu = wp.empty(cap, dtype=wp.float64, device=d)
+        # The reduction by bins: each contact's bin keys, the order by bin and depth, the kept contacts' places, and
+        # the kept contacts.
+        self.bin_hi = wp.empty(cap, dtype=wp.int64, device=d)
+        self.bin_mid = wp.empty(cap, dtype=wp.int64, device=d)
+        self.bin_order = wp.empty(2 * cap, dtype=wp.int32, device=d)
+        self.keep = wp.empty(cap, dtype=wp.int32, device=d)
+        self.dest = wp.empty(cap, dtype=wp.int32, device=d)
+        self.kept_table = wp.empty(1 + 4 * cap, dtype=wp.int32, device=d)
+        self.kept_body = wp.empty((cap, 2), dtype=wp.int32, device=d)
+        self.kept_anchor = wp.empty((cap, 2), dtype=wp.vec3, device=d)
+        self.kept_normal = wp.empty(cap, dtype=wp.vec3, device=d)
+        self.kept_mu = wp.empty(cap, dtype=wp.float64, device=d)
         self.capacity = cap
 
 
@@ -260,6 +388,8 @@ def gather_rigid_contacts(
     device,
     buffers: RigidContactGather | None = None,
     friction_max: bool = False,
+    bin_size: float = 0.0,
+    body_q: wp.array | None = None,
 ) -> RigidContacts | None:
     """Collect the rigid contacts that touch a body the solver integrates.
 
@@ -268,6 +398,13 @@ def gather_rigid_contacts(
     depend on the order the collision pipeline emitted them in. The selection
     and the sort run on the device; the host reads the contact count and the
     kept contacts' slots and shapes.
+
+    With a positive ``bin_size`` only one contact per bin of each body pair is kept: the contacts of a pair are
+    binned by their side-0 anchor, in cells of ``bin_size`` [m], and by their normal, rounded to the 26 directions of
+    a 3x3x3 grid, and in each bin the deepest at the poses ``body_q`` is kept (of equally deep ones, the first). A body
+    resting on finely tessellated geometry, such as a thin-walled cup of many prisms on a bolt of many convex parts,
+    otherwise takes thousands of contacts, whose rows all couple in ``W`` through the body: its cost grows with their
+    square. The kept contacts keep their order. The reduction runs on the device too.
 
     Args:
         model: The Newton model.
@@ -278,6 +415,8 @@ def gather_rigid_contacts(
             returned contacts are views into them, valid until the next call.
         friction_max: Give a contact the larger of its shapes' friction
             coefficients rather than their mean.
+        bin_size: The cell size [m] of the reduction by bins, 0 for none.
+        body_q: The body poses at which the reduction measures the contacts' depths (with a ``bin_size``).
 
     Returns:
         The contacts, or ``None`` if no contact touches an integrated body.
@@ -336,7 +475,28 @@ def gather_rigid_contacts(
         outputs=[B.body, B.anchor, B.normal, B.mu, B.table],
         device=device,
     )
-    table = host_head(B.table, 1 + 4 * n)
+    arrays = (B.table, B.body, B.anchor, B.normal, B.mu)
+    if bin_size > 0.0:
+        # Stable passes again: the depth (the index breaks its ties), then the cell, then the bodies and direction.
+        inputs = [B.table, B.body, B.anchor, B.normal, body_q, model.body_com, wp.float64(bin_size)]
+        inputs.append(wp.int64(max(model.body_count, 1)))
+        outputs = [B.bin_hi, B.bin_mid, B.keyf, B.bin_order]
+        wp.launch(_contact_bin_keys_kernel, n, inputs=inputs, outputs=outputs, device=device)
+        wp.utils.radix_sort_pairs(B.keyf, B.bin_order, n)
+        for key in (B.bin_mid, B.bin_hi):
+            wp.launch(_gather_int64_kernel, n, inputs=[key, B.bin_order], outputs=[B.key64], device=device)
+            wp.utils.radix_sort_pairs(B.key64, B.bin_order, n)
+        wp.launch(_contact_bin_first_kernel, n, [B.bin_order, B.bin_hi, B.bin_mid], [B.keep], device=device)
+        wp.utils.array_scan(B.keep[:n], B.dest[:n], inclusive=False)
+        wp.launch(
+            _contact_bin_compact_kernel,
+            n,
+            inputs=[B.keep, B.dest, B.table, B.body, B.anchor, B.normal, B.mu, n],
+            outputs=[B.kept_table, B.kept_body, B.kept_anchor, B.kept_normal, B.kept_mu],
+            device=device,
+        )
+        arrays = (B.kept_table, B.kept_body, B.kept_anchor, B.kept_normal, B.kept_mu)
+    table = host_head(arrays[0], 1 + 4 * n)
     m = int(table[0])
     if m == 0:
         return None
@@ -344,10 +504,10 @@ def gather_rigid_contacts(
     return RigidContacts(
         slot=np.ascontiguousarray(rows[:, :2]),
         shape=np.ascontiguousarray(rows[:, 2:]),
-        body=B.body[:m],
-        anchor=B.anchor[:m],
-        normal=B.normal[:m],
-        mu=B.mu[:m],
+        body=arrays[1][:m],
+        anchor=arrays[2][:m],
+        normal=arrays[3][:m],
+        mu=arrays[4][:m],
     )
 
 
