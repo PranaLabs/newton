@@ -1027,6 +1027,7 @@ class SolverFBA(SolverBase):
         self._rigid_u_d = wp.empty(6 * m, dtype=wp.float64, device=device)
         self._rigid_x_live_d = wp.empty(m, dtype=wp.vec3d, device=device)
         self._rigid_q_live_d = wp.empty(m, dtype=wp.quatd, device=device)
+        self._rigid_turn_d = wp.empty(m, dtype=wp.vec3d, device=device)
         self._rigid_u_free_d = wp.empty(6 * m, dtype=wp.float64, device=device)
         self._rigid_b_iter_d = wp.empty(6 * m, dtype=wp.float64, device=device)
         self._body_slot_h = np.full(model.body_count, -1, dtype=np.int32)
@@ -1119,10 +1120,11 @@ class SolverFBA(SolverBase):
             self._joint_force_d.zero_()
         return True
 
-    def _begin_rigid_contacts(self, contacts: Contacts | None, state_in: State) -> None:
+    def _begin_rigid_contacts(self, contacts: Contacts | None, state_in: State, dt: float) -> None:
         """Collect this step's rigid contacts and assemble their rows and ``W`` at the pinned frame.
 
-        The rows' levers are the anchors' at the step-start poses of ``state_in``.
+        The rows' levers are the anchors' at the step-start poses of ``state_in``; the parts of the rows' values
+        that stay fixed through the step are formed here, once.
 
         The joint rows of every articulation a contact touches join the contact
         rows, so one NSN solve couples them; other articulations keep their
@@ -1132,7 +1134,11 @@ class SolverFBA(SolverBase):
         """
         from .joints import select_rows_kernel  # noqa: PLC0415
         from .rigid import row_incidence, slot_entries  # noqa: PLC0415
-        from .rigid_contact import gather_rigid_contacts, rigid_contact_jacobian_kernel  # noqa: PLC0415
+        from .rigid_contact import (  # noqa: PLC0415
+            gather_rigid_contacts,
+            rigid_contact_anchor_kernel,
+            rigid_contact_jacobian_kernel,
+        )
 
         model, device = self.model, self._device
         if getattr(self, "_rc_gather", None) is None:
@@ -1269,6 +1275,20 @@ class SolverFBA(SolverBase):
                 device=device,
             )
             wp.copy(self._rc_mu_d, rc.mu, dest_offset=m_s, count=m_r)
+            anchors = getattr(self, "_rc_anchors", None)
+            if anchors is None or anchors[0].shape[0] < m_r:
+                cap = max(m_r, 64 if anchors is None else int(1.5 * anchors[0].shape[0]))
+                anchors = self._rc_anchors = tuple(wp.empty((cap, 2), dtype=wp.vec3d, device=device) for _ in range(4))
+            wp.launch(
+                rigid_contact_anchor_kernel,
+                dim=m_r,
+                inputs=[
+                    *(rc.body, rc.anchor, rc.normal, self._body_slot_d, self._rigid_x_prev_d, state_in.body_q),
+                    *(state_in.body_qd, model.body_com, wp.float64(dt)),
+                ],
+                outputs=list(anchors),
+                device=device,
+            )
             if self.rigid_contact_time > 0.0:
                 from .rigid_contact import rigid_contact_soft_kernel  # noqa: PLC0415
 
@@ -1287,7 +1307,11 @@ class SolverFBA(SolverBase):
                     device=device,
                 )
         if m_t:
-            from .rigid_contact import tendon_friction_kernel, tendon_jacobian_kernel  # noqa: PLC0415
+            from .rigid_contact import (  # noqa: PLC0415
+                tendon_anchor_kernel,
+                tendon_friction_kernel,
+                tendon_jacobian_kernel,
+            )
 
             # The step's friction coefficient bounds the slide row by mu times the tension (the normal row's
             # multiplier): the tendon's coefficient plus its friction force over last step's tension, at most 1.
@@ -1325,6 +1349,19 @@ class SolverFBA(SolverBase):
                     *(state_in.body_q, n_s + 3 * m_r),
                 ],
                 outputs=[self._rc_row_slot_d, self._rc_row_jac_d],
+                device=device,
+            )
+            ends = getattr(self, "_tendon_ends", None)
+            if ends is None or ends[0].shape[0] != m_t:
+                ends = self._tendon_ends = tuple(wp.empty((m_t, 2), dtype=wp.vec3d, device=device) for _ in range(3))
+            wp.launch(
+                tendon_anchor_kernel,
+                dim=m_t,
+                inputs=[
+                    *(body, point, target, self._body_slot_d, self._rigid_x_prev_d, state_in.body_q),
+                    *(state_in.body_qd, model.body_com, wp.float64(dt)),
+                ],
+                outputs=list(ends),
                 device=device,
             )
         if joint_rows.size:
@@ -1886,8 +1923,8 @@ class SolverFBA(SolverBase):
                 rigid_contact_gap_kernel,
                 dim=m_r,
                 inputs=[
-                    *(rc.body, rc.anchor, rc.normal, self._body_slot_d, *live, self._rigid_x_prev_d),
-                    *(state_in.body_q, state_in.body_qd, self.model.body_com, wp.float64(dt), n_s),
+                    *(rc.body, rc.normal, *self._rc_anchors, self._body_slot_d, self._rigid_x_live_d),
+                    *(self._rigid_turn_d, n_s),
                 ],
                 outputs=[self._rc_value_d],
                 device=device,
@@ -1895,13 +1932,13 @@ class SolverFBA(SolverBase):
         if m_t:
             from .rigid_contact import tendon_gap_kernel  # noqa: PLC0415
 
+            body, _point, target, middle, rest, mu = self._tendons
             wp.launch(
                 tendon_gap_kernel,
                 dim=m_t,
                 inputs=[
-                    *self._tendons,
-                    *(self._body_slot_d, *live, self._rigid_x_prev_d, state_in.body_q, state_in.body_qd),
-                    *(self.model.body_com, wp.float64(dt), n_s + 3 * m_r),
+                    *(body, target, middle, rest, mu, *self._tendon_ends, self._body_slot_d),
+                    *(self._rigid_x_live_d, self._rigid_turn_d, n_s + 3 * m_r),
                 ],
                 outputs=[self._rc_value_d],
                 device=device,
@@ -2035,7 +2072,10 @@ class SolverFBA(SolverBase):
                 self.model.body_com,
                 wp.float64(dt),
             ],
-            outputs=[state_out.body_q, state_out.body_qd, self._rigid_x_live_d, self._rigid_q_live_d],
+            outputs=[
+                *(state_out.body_q, state_out.body_qd),
+                *(self._rigid_x_live_d, self._rigid_q_live_d, self._rigid_turn_d),
+            ],
             device=self._device,
         )
 
@@ -2646,7 +2686,7 @@ class SolverFBA(SolverBase):
         rigid = rigid and self._begin_rigid_step(state_in, state_out, dt)
         if self.model.particle_count == 0:
             if rigid:
-                self._begin_rigid_contacts(contacts, state_in)
+                self._begin_rigid_contacts(contacts, state_in, dt)
                 if self._warm_start is not None:
                     self._restore_warm_start()
             for _ in range(self.iterations if rigid else 0):
@@ -2775,7 +2815,7 @@ class SolverFBA(SolverBase):
             mixed = self._mixed
             if mixed is not None:
                 self._swap_rows(mixed.two_way)
-            self._begin_rigid_contacts(contacts, state_in)
+            self._begin_rigid_contacts(contacts, state_in, dt)
             if mixed is not None:
                 self._swap_rows(mixed.two_way)
         if self._warm_start is not None:

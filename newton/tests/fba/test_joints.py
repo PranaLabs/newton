@@ -228,7 +228,7 @@ class TestFBAJointKernels(unittest.TestCase):
                     model.body_com,
                     wp.float64(1.0),
                 ],
-                outputs=[*scratch, x_live, q_live],
+                outputs=[*scratch, x_live, q_live, wp.empty(3, dtype=wp.vec3d, device="cpu")],
                 device="cpu",
             )
             res = wp.empty(R, dtype=wp.float64, device="cpu")
