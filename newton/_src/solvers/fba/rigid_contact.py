@@ -532,6 +532,46 @@ def tendon_jacobian_kernel(
 
 
 @wp.kernel
+def tendon_friction_kernel(
+    coefficient: wp.array[wp.float64],
+    force: wp.array[wp.float64],
+    tension: wp.array[wp.float64],
+    offset: int,
+    # outputs
+    mu_step: wp.array[wp.float64],
+    mu: wp.array[wp.float64],
+):
+    """Tendon ``t``'s friction coefficient for the step, into its slot ``offset + t`` of the contacts' ``mu``:
+    ``mu + F0 / T``, at most 1, with ``T`` the tension it held at the end of the previous step. After a step without
+    tension (before its first, or after a slack step) it is ``mu`` alone: the ``F0`` part starts at the step after the
+    string holds a tension, so that the step in which a slack string snaps taut does not hold its slide with the
+    whole catch impulse (the error is at most an ``F0 dt`` impulse in that step). The slide row's Coulomb bound, this
+    coefficient times the tension multiplier, is then about ``F0 + mu T`` under a tension, never above it, and zero
+    while the tendon is slack."""
+    t = wp.tid()
+    m = coefficient[t]
+    f0 = force[t]
+    held = tension[t]
+    if f0 > wp.float64(0.0) and held > wp.float64(1.0e-12):
+        m = wp.min(wp.float64(1.0), m + f0 / held)
+    mu_step[t] = m
+    mu[offset + t] = m
+
+
+@wp.kernel
+def tendon_tension_kernel(
+    lam: wp.array[wp.float64],
+    first_row: int,
+    dt: wp.float64,
+    # outputs
+    tension: wp.array[wp.float64],
+):
+    """Tendon ``t``'s tension at the end of the step [N]: its row's multiplier (a force over ``dt²``), not below 0."""
+    t = wp.tid()
+    tension[t] = wp.max(lam[first_row + 3 * t], wp.float64(0.0)) * dt * dt
+
+
+@wp.kernel
 def tendon_gap_kernel(
     body: wp.array2d[wp.int32],
     point: wp.array2d[wp.vec3],
