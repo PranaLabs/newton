@@ -471,6 +471,113 @@ def _side_anchor(
     return a0, a0, a0 + dt * v
 
 
+@wp.func
+def _tendon_end(
+    b: int,
+    point: wp.vec3,
+    body_com: wp.array[wp.vec3],
+    body_q0: wp.array[wp.transform],
+):
+    """A tendon end's point relative to the centre of mass in the body frame (its world point on no body), and its
+    world position at the step start."""
+    if b < 0:
+        return wp.vec3d(point), wp.vec3d(point)
+    q0 = wp.normalize(wp.quatd(wp.transform_get_rotation(body_q0[b])))
+    lever = wp.vec3d(point - body_com[b])
+    com0 = wp.vec3d(wp.transform_get_translation(body_q0[b])) + wp.quat_rotate(q0, wp.vec3d(body_com[b]))
+    return lever, com0 + wp.quat_rotate(q0, lever)
+
+
+@wp.kernel
+def tendon_jacobian_kernel(
+    body: wp.array2d[wp.int32],
+    point: wp.array2d[wp.vec3],
+    target: wp.array2d[wp.vec3],
+    friction_coefficient: wp.array[wp.float64],
+    body_slot: wp.array[wp.int32],
+    body_com: wp.array[wp.vec3],
+    q_pin: wp.array[wp.quatd],
+    body_q0: wp.array[wp.transform],
+    row_offset: int,
+    # outputs
+    row_slot: wp.array2d[wp.int32],
+    row_jac: wp.array2d[wp.spatial_vectord],
+):
+    """Row ``row_offset + 3t`` of tendon ``t``, its slack ``L0 - L``: an end at ``p`` adds ``e · dp`` to it, with ``e``
+    the unit direction from ``p`` toward the end's next path point ``target`` (the path's length falls by that much,
+    its other points staying on their wraps to first order), so side ``k`` contributes
+    ``(R_pinᵀ e, R_pinᵀ r0 x R_pinᵀ e)``, ``r0`` the end's lever relative to the COM at the step start. With a
+    friction coefficient, row ``r + 1`` is the slide of the first end along its run, the first side's coefficients
+    alone; the other rows stay inert (no slot, zero coefficients)."""
+    t = wp.tid()
+    r = row_offset + 3 * t
+    for side in range(2):
+        b = body[t, side]
+        s = wp.int32(-1)
+        if b >= 0:
+            s = body_slot[b]
+        row_slot[r, side] = s
+        coeffs = wp.spatial_vectord()
+        if s >= 0:
+            lever, p0 = _tendon_end(b, point[t, side], body_com, body_q0)
+            e = wp.normalize(wp.vec3d(target[t, side]) - p0)
+            q0 = wp.normalize(wp.quatd(wp.transform_get_rotation(body_q0[b])))
+            d_loc = wp.quat_rotate_inv(q_pin[s], e)
+            arm = wp.quat_rotate_inv(q_pin[s], wp.quat_rotate(q0, lever))
+            coeffs = slot_coefficients(d_loc, wp.cross(arm, d_loc))
+        row_jac[r, side] = coeffs
+        if side == 0 and s >= 0 and friction_coefficient[t] > wp.float64(0.0):
+            row_slot[r + 1, 0] = s
+            row_jac[r + 1, 0] = coeffs
+
+
+@wp.kernel
+def tendon_gap_kernel(
+    body: wp.array2d[wp.int32],
+    point: wp.array2d[wp.vec3],
+    target: wp.array2d[wp.vec3],
+    middle: wp.array[wp.float64],
+    rest: wp.array[wp.float64],
+    friction_coefficient: wp.array[wp.float64],
+    body_slot: wp.array[wp.int32],
+    slot_x: wp.array[wp.vec3d],
+    slot_q: wp.array[wp.quatd],
+    slot_x0: wp.array[wp.vec3d],
+    body_q0: wp.array[wp.transform],
+    body_qd0: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    dt: wp.float64,
+    row_offset: int,
+    # outputs
+    gap: wp.array[wp.float64],
+):
+    """Row values of tendon ``t`` at the live pose: its slack ``L0 - L``, with ``L`` the length between its ends'
+    next path points (``middle``, fixed for the step) plus each end's run to its next path point along the
+    direction ``e`` from the end's start-of-step position, the row's direction: the row is linear within the step,
+    as a contact's normal is, also where an end reaches its target (a run of zero length, where the distance has a
+    kink and the start-of-step direction would point the wrong way once the end passes the target). With a
+    friction coefficient, row ``r + 1`` holds the first end's slide along that direction over the step,
+    ``e · (p - p0)``."""
+    t = wp.tid()
+    length = middle[t]
+    slide = wp.float64(0.0)
+    for side in range(2):
+        b = body[t, side]
+        lever, p0 = _tendon_end(b, point[t, side], body_com, body_q0)
+        start, live, _target = _side_anchor(
+            b, lever, body_slot, slot_x, slot_q, slot_x0, body_q0, body_qd0, body_com, dt
+        )
+        goal = wp.vec3d(target[t, side])
+        e = wp.normalize(goal - p0)
+        length += wp.dot(e, goal - live)
+        if side == 0 and friction_coefficient[t] > wp.float64(0.0):
+            slide = wp.dot(e, live - start)
+    r = row_offset + 3 * t
+    gap[r] = rest[t] - length
+    gap[r + 1] = slide
+    gap[r + 2] = wp.float64(0.0)
+
+
 @wp.kernel
 def rigid_contact_gap_kernel(
     body: wp.array2d[wp.int32],

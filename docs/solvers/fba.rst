@@ -303,6 +303,25 @@ Model Inputs
   articulation; DISTANCE and ROD joints, and joints that lock more directions
   of a set of connected bodies than the bodies have, as kinematic loops do,
   raise ``NotImplementedError``. A body turns by at most 0.5 rad per step.
+- **Tendons**: :meth:`~newton.solvers.SolverFBA.set_tendons` adds
+  inextensible strings between two bodies, or between a body and a fixed
+  point, for the next step: each holds ``L <= rest`` with ``L`` the length
+  between the two targets (the path's next points from the ends, such as where
+  it meets a pulley) plus each end's run to its target. A tendon pulls,
+  never pushes, and takes no force while slack. Its row is a frictionless
+  contact with the ends' bodies in the rigid Newton step, its Jacobian the
+  directions from the ends toward their targets (the length's derivative,
+  since the path between the targets is fixed for the step), and its value
+  measures the runs along those directions, so that it is linear within the
+  step, as a contact's normal gap is, also for an end that reaches its target.
+  The caller sets the tendons before each step from the current poses,
+  routing them over fixed pulleys. A friction coefficient ``mu`` per tendon
+  resists the string running over its pulleys with a friction that grows with
+  the load, as a linearized capstan or a bearing friction: a second row holds
+  the slide of its first end along its run with a Coulomb force of at most
+  ``mu`` times the tension, solved with the contacts, so that a slack tendon
+  carries no friction and ``mu <= 1`` keeps the first end's tension
+  ``T (1 - mu)`` nonnegative. Tendons need the full operator and one world.
 
 FBA does not simulate equality constraints, mimic joints, the model's
 particle-body attachments (tie particles to bodies with
