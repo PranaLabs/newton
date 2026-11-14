@@ -321,7 +321,14 @@ Model Inputs
   the slide of its first end along its run with a Coulomb force of at most
   ``mu`` times the tension, solved with the contacts, so that a slack tendon
   carries no friction and ``mu <= 1`` keeps the first end's tension
-  ``T (1 - mu)`` nonnegative. Tendons need the full operator and one world.
+  ``T (1 - mu)`` nonnegative. A friction force ``F0`` per tendon adds a part
+  that does not grow with the load (a bearing's seal drag, the string's
+  bending over its pulleys): the bound becomes ``F0 + mu T``, at most ``T``,
+  so that the string never pushes its first end; within a step it is a
+  coefficient ``min(1, mu + F0 / T_prev)`` from the previous step's tension,
+  and ``mu`` alone after a step without tension, so that a slack string that
+  snaps taut is not held by the whole catch impulse.
+  Tendons need the full operator and one world.
 
 FBA does not simulate equality constraints, mimic joints, the model's
 particle-body attachments (tie particles to bodies with

@@ -687,6 +687,8 @@ class SolverFBA(SolverBase):
         self._constraint_body_h = self._constraint_body_d = self._constraint_point_d = None
         # set_tendons: the step's tendon rows (body, point, target, middle, rest arrays) and their count.
         self._tendons, self._tendon_count, self._tendon_ws = None, 0, None
+        # set_tendons: each tendon's friction coefficient and force, and its tension at the end of the last step.
+        self._tendon_friction = self._tendon_tension = None
         self._self_contact, self._lite_W = None, None
         self._held_rows = None  # the lite rows that hold particles at points, and their factor
         # Graph of the step's sparse lite contact correction, False once a capture failed: it would fail again.
@@ -1219,11 +1221,18 @@ class SolverFBA(SolverBase):
             )
             wp.copy(self._rc_mu_d, rc.mu, dest_offset=m_s, count=m_r)
         if m_t:
-            from .rigid_contact import tendon_jacobian_kernel  # noqa: PLC0415
+            from .rigid_contact import tendon_friction_kernel, tendon_jacobian_kernel  # noqa: PLC0415
 
-            # The friction coefficient bounds the slide row by mu times the tension (the normal row's multiplier).
+            # The step's friction coefficient bounds the slide row by mu times the tension (the normal row's
+            # multiplier): the tendon's coefficient plus its friction force over last step's tension, at most 1.
             body, point, target, _middle, _rest, mu = self._tendons
-            wp.copy(self._rc_mu_d, mu, dest_offset=m_s + m_r, count=m_t)
+            wp.launch(
+                tendon_friction_kernel,
+                dim=m_t,
+                inputs=[*self._tendon_friction, self._tendon_tension, m_s + m_r],
+                outputs=[mu, self._rc_mu_d],
+                device=device,
+            )
             wp.launch(
                 tendon_jacobian_kernel,
                 dim=m_t,
@@ -1587,6 +1596,21 @@ class SolverFBA(SolverBase):
             first = 3 * (self._rc_counts[0] + self._rc_counts[1])
             wp.copy(self._rc_lam_d, self._tendon_ws[0], dest_offset=first, count=3 * m_t)
             wp.copy(self._rc_omega_d, self._tendon_ws[1], dest_offset=first, count=3 * m_t)
+
+    def _store_tendon_tension(self) -> None:
+        """Keep each tendon's tension at the end of the step, for the next step's friction coefficient."""
+        m_t = getattr(self, "_rc_tendons", 0)
+        if not m_t or not self._rc_n or self._tendon_tension is None:
+            return
+        from .rigid_contact import tendon_tension_kernel  # noqa: PLC0415
+
+        wp.launch(
+            tendon_tension_kernel,
+            dim=m_t,
+            inputs=[self._rc_lam_d, 3 * (self._rc_counts[0] + self._rc_counts[1]), wp.float64(self._rigid_dt)],
+            outputs=[self._tendon_tension],
+            device=self._device,
+        )
 
     def _store_warm_start(self) -> None:
         """Keep this step's final NSN rows for the next step's warm start."""
@@ -2542,6 +2566,8 @@ class SolverFBA(SolverBase):
                     self._restore_warm_start()
             for _ in range(self.iterations if rigid else 0):
                 self._rigid_iteration(state_in, state_out, dt)
+            if rigid:
+                self._store_tendon_tension()
             if rigid and self._warm_start is not None:
                 self._store_warm_start()
             if contact_f is not None:
@@ -3034,6 +3060,7 @@ class SolverFBA(SolverBase):
 
         if mixed is not None:
             self._end_mixed_rows()
+        self._store_tendon_tension()
         if self._warm_start is not None:
             self._store_warm_start()
         if self.friction_anchors:
@@ -3544,7 +3571,9 @@ class SolverFBA(SolverBase):
         else:
             sc.query_radius = float((margin + gap).max())
 
-    def set_tendons(self, bodies, points, targets, middle_lengths, rest_lengths, friction_coefficients=None) -> None:
+    def set_tendons(
+        self, bodies, points, targets, middle_lengths, rest_lengths, friction_coefficients=None, friction_forces=None
+    ) -> None:
         """Hold tendons, inextensible strings between two bodies, taut or slack, in the following steps.
 
         Tendon ``t`` runs from ``points[t, 0]`` on body ``bodies[t, 0]`` to ``points[t, 1]`` on ``bodies[t, 1]``
@@ -3565,7 +3594,13 @@ class SolverFBA(SolverBase):
         with the tension: a second row holds the slide of its first end along its run at zero with a Coulomb force
         of at most ``mu T``, ``T`` the tension, solved with the other rows. The first end then feels a tension
         between ``T (1 - mu)`` and ``T (1 + mu)``, and ``mu <= 1`` keeps it nonnegative; a slack tendon carries no
-        friction.
+        friction. A friction force ``F0 = friction_forces[t]`` [N] adds a part that does not grow with the load (a
+        bearing's seal drag, the string's bending over its pulleys): the bound becomes ``F0 + mu T``, at most ``T``,
+        so that the string never pushes its first end, and still none while slack. Within a step it is the
+        coefficient ``min(1, mu + F0 / T_prev)`` times the tension, ``T_prev`` the tension at the end of the
+        previous step; after a step without tension (before the first, or after a slack step) the coefficient is
+        ``mu`` alone, so that the ``F0`` part starts at the step after the string holds a tension and the step in
+        which a slack string snaps taut does not hold its slide with the whole catch impulse.
 
         The rows are solved with the rigid contacts (``friction=True``, ``nsn_schur_mode="full"``, one world).
         ``None`` removes the tendons.
@@ -3578,9 +3613,12 @@ class SolverFBA(SolverBase):
             rest_lengths: The tendons' lengths [m], shape ``(T,)``.
             friction_coefficients: Each tendon's friction coefficient ``0 <= mu <= 1`` on its slide over its pulleys,
                 shape ``(T,)``; ``None`` for none.
+            friction_forces: Each tendon's friction force ``F0 >= 0`` on its slide that does not grow with the load
+                [N], shape ``(T,)``; ``None`` for none.
         """
         if bodies is None or len(bodies) == 0:
             self._tendons, self._tendon_count, self._tendon_ws = None, 0, None
+            self._tendon_friction = self._tendon_tension = None
             return
         b = np.asarray(bodies, dtype=np.int32)
         T = b.shape[0]
@@ -3591,6 +3629,9 @@ class SolverFBA(SolverBase):
         mu = np.zeros(T) if friction_coefficients is None else np.asarray(friction_coefficients, dtype=np.float64)
         if mu.shape != (T,) or (mu < 0.0).any() or (mu > 1.0).any():
             raise ValueError(f"friction_coefficients need shape ({T},) and values in [0, 1]")
+        f0 = np.zeros(T) if friction_forces is None else np.asarray(friction_forces, dtype=np.float64)
+        if f0.shape != (T,) or (f0 < 0.0).any():
+            raise ValueError(f"friction_forces need shape ({T},) and no negative value")
         if (b < -1).any() or (b >= self.model.body_count).any():
             raise ValueError("body indices out of range")
         if not self.friction or self.nsn_schur_mode != "full" or self.model.world_count > 1:
@@ -3604,13 +3645,20 @@ class SolverFBA(SolverBase):
             (np.asarray(targets, dtype=np.float32), wp.vec3),
             (np.asarray(middle_lengths, dtype=np.float64), wp.float64),
             (np.asarray(rest_lengths, dtype=np.float64), wp.float64),
-            (mu, wp.float64),
+            (mu, wp.float64),  # the step's coefficient, set from the two below at the step
         )
         if self._tendons is not None and self._tendon_count == T:
             for dst, (a, _) in zip(self._tendons, arrays, strict=True):
                 dst.assign(a)  # the same arrays from step to step
+            self._tendon_friction[0].assign(mu)
+            self._tendon_friction[1].assign(f0)
         else:
             self._tendons = tuple(wp.array(a, dtype=t, device=device) for a, t in arrays)
+            self._tendon_friction = (
+                wp.array(mu, dtype=wp.float64, device=device),
+                wp.array(f0, dtype=wp.float64, device=device),
+            )
+            self._tendon_tension = wp.zeros(T, dtype=wp.float64, device=device)
             self._tendon_ws = None
         self._tendon_count = T
         self._tendon_body_h = b
