@@ -1,0 +1,1 @@
+Speed up the fused conjugate residual iterations of `SolverFBA`'s sparse NSN: with up to 32 blocks of rows, each thread adds the blocks' partial sums in order instead of the block reducing a tile of 1024 slots.
