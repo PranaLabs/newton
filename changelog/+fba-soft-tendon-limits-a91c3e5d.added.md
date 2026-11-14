@@ -1,0 +1,1 @@
+Add `tendon_time` and `tendon_damping` to `SolverFBA`: soft tendon length limits, the spring-damper of soft rigid contacts on each tendon's length row, so that a string stops a load it catches over a few steps instead of one; its damper acts on a taut string's stretch only, and the limits stay inextensible by default.

@@ -270,6 +270,60 @@ class TestTendons(unittest.TestCase):
                 self.assertLess(max(tops), 2e-3)
                 self.assertLess(max(speeds), 1.0)
 
+    def _hang(self, sparse, tau, steps, drop=0.0, dt=0.002):
+        """A 0.1 kg box on a 0.3 m string from a fixed point, let go at rest with its top ``drop`` above the string's
+        reach (0.3 m - drop below the point). Returns its top's depth below the point and its vertical speed per
+        step."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        anchor, length = np.array([0.0, 0.0, 1.0]), 0.3
+        model, (box,) = _boxes([anchor - (0.0, 0.0, length - drop + H)], [0.1])
+        solver = SolverFBA(
+            model,
+            iterations=10,
+            nsn_sparse_storage=sparse,
+            nsn_linear_iterations=10 if sparse else None,
+            tendon_time=tau,
+        )
+        s0, s1 = model.state(), model.state()
+        depth, speed = [], []
+        for _ in range(steps):
+            solver.set_tendons([[-1, box]], [[anchor, (0.0, 0.0, H)]], [[anchor, anchor]], [0.0], [length])
+            solver.step(s0, s1, None, None, dt)
+            s0, s1 = s1, s0
+            depth.append(anchor[2] - (_point_in(s0.body_q.numpy(), box, (0.0, 0.0, H))[2]))
+            speed.append(float(s0.body_qd.numpy()[box, 2]))
+        return np.array(depth), np.array(speed)
+
+    def test_soft_limit_stretches_by_its_time_constant(self):
+        """With tendon_time tau = 4 ms a box hanging at rest stretches its string by g tau² (0.157 mm), the
+        deflection of a spring of stiffness m / tau² under its weight; an inextensible string holds its length."""
+        tau = 0.004
+        for sparse in (False, True):
+            with self.subTest(sparse=sparse):
+                depth, _speed = self._hang(sparse, tau, 150)
+                self.assertAlmostEqual((depth[-20:].mean() - 0.3) / (9.81 * tau * tau), 1.0, delta=0.05)
+                depth, _speed = self._hang(sparse, 0.0, 60)
+                self.assertLess(abs(depth[-20:].mean() - 0.3), 2e-6)
+
+    def test_soft_limit_catches_over_several_steps(self):
+        """A box falls 0.1 m on a slack string, freely until the string is taut (the soft limit pulls nothing while
+        slack), and is caught at 1.4 m/s: the inextensible string stops it in one step, the soft one (10 ms,
+        critically damped) over several, without a rebound, and then holds it g tau² (1 mm) lower."""
+        dt = 0.002
+        for sparse in (False, True):
+            with self.subTest(sparse=sparse):
+                hard_depth, hard_speed = self._hang(sparse, 0.0, 120, drop=0.1, dt=dt)
+                tau = 0.01
+                soft_depth, soft_speed = self._hang(sparse, tau, 120, drop=0.1, dt=dt)
+                falling = hard_depth < 0.299  # the string still slack
+                self.assertGreater(int(falling.sum()), 50)
+                np.testing.assert_allclose(soft_depth[falling], hard_depth[falling], atol=1e-9)
+                kick = lambda v: float(np.max(np.diff(v)))  # noqa: E731
+                self.assertLess(kick(soft_speed), 0.5 * kick(hard_speed))
+                self.assertLess(soft_speed.max(), 0.1 * np.sqrt(2 * 9.81 * 0.1))
+                self.assertAlmostEqual(soft_depth[-1] - hard_depth[-1], 9.81 * tau * tau, delta=1e-4)
+
     def test_tendons_are_validated(self):
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
@@ -288,6 +342,9 @@ class TestTendons(unittest.TestCase):
             )
         solver.set_tendons(None, None, None, None, None)
         self.assertEqual(solver._tendon_count, 0)
+        for kwargs in ({"tendon_time": -0.001}, {"tendon_damping": -1.0}):
+            with self.assertRaises(ValueError):
+                SolverFBA(model, iterations=1, **kwargs)
 
 
 def _point_in(body_q, body, local):

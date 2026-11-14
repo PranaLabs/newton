@@ -574,6 +574,36 @@ def tendon_tension_kernel(
 
 
 @wp.kernel
+def tendon_soft_kernel(
+    body: wp.array2d[wp.int32],
+    point: wp.array2d[wp.vec3],
+    target: wp.array2d[wp.vec3],
+    middle: wp.array[wp.float64],
+    rest: wp.array[wp.float64],
+    body_com: wp.array[wp.vec3],
+    body_q0: wp.array[wp.transform],
+    eps: wp.float64,
+    beta: wp.float64,
+    offset: int,
+    # outputs
+    soft_eps: wp.array[wp.float64],
+    soft_beta: wp.array[wp.float64],
+    soft_gap0: wp.array[wp.float64],
+):
+    """Tendon ``t``'s soft-limit entries at ``offset + t``: ``eps``, ``beta`` and its stretch at the step start,
+    ``min(0, rest - (middle + sum |target - end|))``: the damper acts on the stretch of a taut string only, so that a
+    slack string does not pull before it is taut."""
+    t = wp.tid()
+    length = middle[t]
+    for side in range(2):
+        _lever, p0 = _tendon_end(body[t, side], point[t, side], body_com, body_q0)
+        length += wp.length(wp.vec3d(target[t, side]) - p0)
+    soft_eps[offset + t] = eps
+    soft_beta[offset + t] = beta
+    soft_gap0[offset + t] = wp.min(rest[t] - length, wp.float64(0.0))
+
+
+@wp.kernel
 def tendon_gap_kernel(
     body: wp.array2d[wp.int32],
     point: wp.array2d[wp.vec3],
