@@ -235,6 +235,8 @@ class RigidRowStorage:
         self.row_jac = wp.empty((n, 2), dtype=wp.spatial_vectord, device=d)
         self.pene0 = wp.zeros(n, dtype=wp.float64, device=d)
         self.mu = wp.empty(contacts, dtype=wp.float64, device=d)
+        # soft rigid contacts: relative compliance, damping weight and start gap per contact
+        self.soft = tuple(wp.zeros(contacts, dtype=wp.float64, device=d) for _ in range(3))
         self.value = wp.empty(n, dtype=wp.float64, device=d)
         self.r = wp.empty(n, dtype=wp.float64, device=d)
         self.lam = wp.empty(n, dtype=wp.float64, device=d)
@@ -247,7 +249,7 @@ class RigidRowStorage:
         """Clear the rows for a step; the rows of its contacts are written after."""
         self.row_slot.fill_(-1)
         self.row_jac.zero_()
-        for a in (self.mu, self.r, self.lam, self.omega):
+        for a in (self.mu, self.r, self.lam, self.omega, *self.soft):
             a.zero_()
 
 
@@ -616,6 +618,44 @@ def tendon_gap_kernel(
     gap[r] = rest[t] - length
     gap[r + 1] = slide
     gap[r + 2] = wp.float64(0.0)
+
+
+@wp.kernel
+def rigid_contact_soft_kernel(
+    body: wp.array2d[wp.int32],
+    anchor: wp.array2d[wp.vec3],
+    normal: wp.array[wp.vec3],
+    body_slot: wp.array[wp.int32],
+    slot_x: wp.array[wp.vec3d],
+    slot_q: wp.array[wp.quatd],
+    slot_x0: wp.array[wp.vec3d],
+    body_q0: wp.array[wp.transform],
+    body_qd0: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    dt: wp.float64,
+    eps: wp.float64,
+    beta: wp.float64,
+    offset: int,
+    # outputs
+    soft_eps: wp.array[wp.float64],
+    soft_beta: wp.array[wp.float64],
+    soft_gap0: wp.array[wp.float64],
+):
+    """Rigid contact ``c``'s soft-contact entries at ``offset + c``: its relative compliance ``eps``, its damping
+    weight ``beta`` and its normal gap at the step start ``n · (a1⁰ - a0⁰)`` [m], clamped at zero from above. The
+    damper acts in penetration only: a contact that the collision pipeline reports before the bodies touch, within
+    its detection gap, would otherwise brake their approach with ``beta`` times that gap before they meet."""
+    c = wp.tid()
+    n = wp.vec3d(normal[c])
+    start0, _live0, _t0 = _side_anchor(
+        body[c, 0], wp.vec3d(anchor[c, 0]), body_slot, slot_x, slot_q, slot_x0, body_q0, body_qd0, body_com, dt
+    )
+    start1, _live1, _t1 = _side_anchor(
+        body[c, 1], wp.vec3d(anchor[c, 1]), body_slot, slot_x, slot_q, slot_x0, body_q0, body_qd0, body_com, dt
+    )
+    soft_eps[offset + c] = eps
+    soft_beta[offset + c] = beta
+    soft_gap0[offset + c] = wp.min(wp.dot(n, start1 - start0), wp.float64(0.0))
 
 
 @wp.kernel

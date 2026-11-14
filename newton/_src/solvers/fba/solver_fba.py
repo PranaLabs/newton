@@ -227,6 +227,8 @@ class SolverFBA(SolverBase):
         rigid_contact_bin: float = 0.0,
         rigid_contact_friction: str = "mean",
         rigid_iteration_graph: bool = False,
+        rigid_contact_time: float = 0.0,
+        rigid_contact_damping: float = 1.0,
     ) -> None:
         """
         Args:
@@ -525,6 +527,24 @@ class SolverFBA(SolverBase):
                 replay the NSN step's own graph across steps instead. Needs
                 CUDA, ``nsn_sparse_storage`` and ``nsn_linear_iterations`` up
                 to the linear solver's check interval.
+            rigid_contact_time: With a positive time constant ``tau`` [s],
+                the normal rows of rigid contacts are soft: a spring and a
+                damper in parallel (Kelvin-Voigt), of stiffness
+                ``m / tau²`` and damping ratio ``rigid_contact_damping`` for
+                the row's effective mass ``m``, that act while the row holds
+                a force, so that a contact sinks ``F tau² / m`` under the
+                force ``F`` and an impact spreads over a few steps instead of
+                one. Their backward Euler step is the complementarity
+                ``0 <= lambda _|_ g + eps b - beta g_start >= 0``, ``b`` the
+                row's force times ``W_ii``, ``g_start`` its gap at the step
+                start, ``x = dt / tau``, ``eps = 1 / (x² + 2 zeta x)`` and
+                ``beta = 2 zeta / (x + 2 zeta)``. ``0`` keeps rigid contacts
+                hard. The start gap counts only in penetration (above zero it
+                is taken as zero), so that contacts reported before the bodies
+                touch, within their detection gap, do not brake them. Tendon
+                and particle contact rows are not softened.
+            rigid_contact_damping: The damping ratio ``zeta`` of soft rigid
+                contacts (``1``, critical: no bounce).
         """
         super().__init__(model)
         self._particle_world_h = model.particle_world.numpy()
@@ -642,6 +662,12 @@ class SolverFBA(SolverBase):
         # its own graph.
         self._rigid_iter_graph, self._rigid_iter_count, self._outer_capture = None, 0, False
         self.rigid_iteration_graph = bool(rigid_iteration_graph)
+        if not (rigid_contact_time >= 0.0 and rigid_contact_damping >= 0.0):
+            raise ValueError("rigid_contact_time and rigid_contact_damping must be >= 0")
+        self.rigid_contact_time, self.rigid_contact_damping = float(rigid_contact_time), float(rigid_contact_damping)
+        # The soft rigid contacts' per-contact arrays (eps, beta, start gap) of the step; empty arrays for none.
+        self._nsn_soft_off = tuple(wp.empty(0, dtype=wp.float64, device=model.device) for _ in range(3))
+        self._nsn_soft = self._rc_soft = self._nsn_soft_off
         if not rigid_contact_bin >= 0.0:
             raise ValueError(f"rigid_contact_bin must be >= 0, got {rigid_contact_bin}")
         self.rigid_contact_bin = float(rigid_contact_bin)
@@ -1179,9 +1205,12 @@ class SolverFBA(SolverBase):
             self._rc_row_jac_d = wp.zeros((n, 2), dtype=wp.spatial_vectord, device=device)
             self._rc_pene0_d = wp.zeros(n, dtype=wp.float64, device=device)
             self._rc_mu_d = wp.zeros(m_s + m_r + m_t, dtype=wp.float64, device=device)
+            soft = (wp.zeros(m_s + m_r + m_t, dtype=wp.float64, device=device) for _ in range(3))
+            self._rc_soft = tuple(soft) if self.rigid_contact_time > 0.0 else self._nsn_soft_off
         else:
             self._rc_row_slot_d, self._rc_row_jac_d = storage.row_slot, storage.row_jac
             self._rc_pene0_d, self._rc_mu_d = storage.pene0, storage.mu
+            self._rc_soft = storage.soft if self.rigid_contact_time > 0.0 else self._nsn_soft_off
         self._rc_lam_soft_d = wp.empty(n_s + n_b, dtype=wp.float64, device=device) if n_b else None
         if m_s or attach:
             from .rigid_contact import particle_contact_body_jacobian_kernel  # noqa: PLC0415
@@ -1220,6 +1249,23 @@ class SolverFBA(SolverBase):
                 device=device,
             )
             wp.copy(self._rc_mu_d, rc.mu, dest_offset=m_s, count=m_r)
+            if self.rigid_contact_time > 0.0:
+                from .rigid_contact import rigid_contact_soft_kernel  # noqa: PLC0415
+
+                # Kelvin-Voigt rows: x = dt / tau, eps = 1 / (x² + 2 zeta x), beta = 2 zeta / (x + 2 zeta).
+                x, zeta = self._rigid_dt / self.rigid_contact_time, self.rigid_contact_damping
+                wp.launch(
+                    rigid_contact_soft_kernel,
+                    dim=m_r,
+                    inputs=[
+                        *(rc.body, rc.anchor, rc.normal, self._body_slot_d, self._rigid_x_live_d),
+                        *(self._rigid_q_live_d, self._rigid_x_prev_d, state_in.body_q, state_in.body_qd),
+                        *(model.body_com, wp.float64(self._rigid_dt), wp.float64(1.0 / (x * x + 2.0 * zeta * x))),
+                        *(wp.float64(2.0 * zeta / (x + 2.0 * zeta)), m_s),
+                    ],
+                    outputs=list(self._rc_soft),
+                    device=device,
+                )
         if m_t:
             from .rigid_contact import tendon_friction_kernel, tendon_jacobian_kernel  # noqa: PLC0415
 
@@ -1901,6 +1947,7 @@ class SolverFBA(SolverBase):
             # The joint rows' block of A_schur is their W: Cholesky-factored per articulation.
             block_precond=functools.partial(self._joint_system.solve_rows, joint_rows, j0) if n_j else None,
             contact_regularization=self.contact_regularization,
+            soft_rows=self._rc_soft,
         )
         return self._nsn_lam_apply_d
 
@@ -4879,6 +4926,7 @@ class SolverFBA(SolverBase):
                 precond_v,
                 pene0_d,
                 dt_w,
+                *self._nsn_soft_off,
             ],
             outputs=[omega_v, compliance_v, h_v],
             device=device,
@@ -5543,6 +5591,7 @@ class SolverFBA(SolverBase):
             id(pcr),
             id(pcr.world_rows),
             id(self._nsn_contact_scale),
+            *(id(a) for a in self._nsn_soft),
             # The step's buffers, which grow with the rows of another NSN solve.
             self._nsn_inner_n,
             id(self._nsn_sparse_scratch[0]),
@@ -5559,7 +5608,16 @@ class SolverFBA(SolverBase):
             cached = self._nsn_graph = (
                 key,
                 graph,
-                (W_sparse, inputs, block_precond, pcr, tail[1], pcr.world_rows, self._nsn_contact_scale),
+                (
+                    W_sparse,
+                    inputs,
+                    block_precond,
+                    pcr,
+                    tail[1],
+                    pcr.world_rows,
+                    self._nsn_contact_scale,
+                    self._nsn_soft,
+                ),
                 self._nsn_sparse_scratch,
             )
             if graph is None:
@@ -5622,7 +5680,10 @@ class SolverFBA(SolverBase):
             wp.launch(
                 K.compute_frictional_fb_kernel,
                 dim=M,
-                inputs=[self._nsn_penetration_d, self._nsn_lam_d, mu_d, self._nsn_precond_d, pene0_d, dt_w],
+                inputs=[
+                    *(self._nsn_penetration_d, self._nsn_lam_d, mu_d, self._nsn_precond_d, pene0_d, dt_w),
+                    *self._nsn_soft,
+                ],
                 outputs=[self._nsn_omega_d, self._nsn_compliance_d, self._nsn_h_d],
                 device=device,
             )
@@ -5693,6 +5754,7 @@ class SolverFBA(SolverBase):
         n_bilateral: int = 0,
         block_precond: Callable[[wp.array, wp.array], None] | None = None,
         contact_regularization: float = 0.0,
+        soft_rows: tuple | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """GPU version of ``solve_nsn_coulomb`` (``newton/tests/fba/_reference.py``), the frictional NSN inner.
 
@@ -5783,6 +5845,8 @@ class SolverFBA(SolverBase):
         cap = self._nsn_inner_n
         self._pcr_solver.world_rows = world_rows
         self._nsn_contact_scale = self._empty_contact_scale if contact_scale is None else contact_scale
+        # Soft rigid contacts (eps, beta, start gap per contact) for the law of this solve.
+        self._nsn_soft = self._nsn_soft_off if soft_rows is None else soft_rows
         if graph is not None and W_sparse is not None and skip_download:
             inputs = (r_device, pene0_device, mu_device, lam_init_device, omega_init_device)
             if all(a is not None for a in inputs):
@@ -5901,6 +5965,7 @@ class SolverFBA(SolverBase):
                         self._nsn_precond_d,
                         pene0_d,
                         dt_w,
+                        *self._nsn_soft,
                     ],
                     outputs=[
                         self._nsn_omega_d,
