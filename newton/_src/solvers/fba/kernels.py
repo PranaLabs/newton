@@ -2558,6 +2558,32 @@ def fb_unilateral_row_wp(
 
 
 @wp.func
+def fb_unilateral_row_soft_wp(
+    penetration: wp.float64,
+    lam: wp.float64,
+    precond: wp.float64,
+    dt: wp.float64,
+    pene0: wp.float64,
+    compliance_rel: wp.float64,
+    shift: wp.float64,
+) -> wp.vec3d:
+    """:func:`fb_unilateral_row_wp` of a soft contact: the complementarity ``0 <= lam _|_ g + eps b - shift >= 0``,
+    ``b = precond lam``, ``eps = compliance_rel`` and ``shift = beta g_start``, the backward Euler step of a spring
+    and a damper in parallel (Kelvin-Voigt) that act while the row holds a force. The Newton step's diagonal takes
+    the ``eps`` term with the row's ``omega``.
+    """
+    plam = precond * lam
+    pene = penetration + compliance_rel * plam - shift
+    root = wp.sqrt(pene * pene + plam * plam)
+    if root < wp.float64(1.0e-30):
+        return wp.vec3d(wp.float64(0.0), precond / (dt * dt), wp.float64(0.0))
+    omega = wp.float64(1.0) - pene / root
+    compliance = (wp.float64(1.0) - plam / root + compliance_rel * omega) * (precond / (dt * dt))
+    h = -(pene + plam - root) + omega * (penetration + pene0)
+    return wp.vec3d(omega, compliance, h)
+
+
+@wp.func
 def fb_frictional_row_wp(
     penetration: wp.float64,
     lam_t: wp.float64,
@@ -2939,6 +2965,9 @@ def compute_frictional_fb_kernel(
     precond: wp.array[wp.float64],  # (3M,)
     pene0: wp.array[wp.float64],  # (3M,)
     dt: wp.float64,
+    soft_eps: wp.array[wp.float64],  # (M,) or empty: soft contacts' relative compliance
+    soft_beta: wp.array[wp.float64],  # (M,) or empty: their damping weight of the start gap
+    soft_gap0: wp.array[wp.float64],  # (M,) or empty: their normal gap at the step start [m]
     omega: wp.array[wp.float64],  # (3M,) output
     compliance: wp.array[wp.float64],  # (3M,) output
     h: wp.array[wp.float64],  # (3M,) output
@@ -2959,6 +2988,9 @@ def compute_frictional_fb_kernel(
         precond: Per-row preconditioner, shape ``[3M]``.
         pene0: Per-row anchor projection, shape ``[3M]``.
         dt: Timestep.
+        soft_eps, soft_beta, soft_gap0: Per contact, or empty for none: a contact with ``soft_eps`` or ``soft_beta``
+            positive holds its normal row as :func:`fb_unilateral_row_soft_wp`, shifted by
+            ``soft_beta * soft_gap0``.
         omega: Output FB weighting, shape ``[3M]``.
         compliance: Output diagonal compliance, shape ``[3M]``.
         h: Output Schur RHS contribution, shape ``[3M]``.
@@ -2969,7 +3001,16 @@ def compute_frictional_fb_kernel(
     idx_t2 = 3 * c + 2
     lam_n = lam[idx_n]
     mu_c = mu[c]
-    out_n = fb_unilateral_row_wp(penetration[idx_n], lam_n, precond[idx_n], dt, pene0[idx_n])
+    soft = False
+    if soft_eps.shape[0] > 0:
+        soft = soft_eps[c] > wp.float64(0.0) or soft_beta[c] > wp.float64(0.0)
+    if soft:
+        # a soft contact (``soft_*``): see :func:`fb_unilateral_row_soft_wp`
+        out_n = fb_unilateral_row_soft_wp(
+            penetration[idx_n], lam_n, precond[idx_n], dt, pene0[idx_n], soft_eps[c], soft_beta[c] * soft_gap0[c]
+        )
+    else:
+        out_n = fb_unilateral_row_wp(penetration[idx_n], lam_n, precond[idx_n], dt, pene0[idx_n])
     omega[idx_n] = out_n[0]
     compliance[idx_n] = out_n[1]
     h[idx_n] = out_n[2]

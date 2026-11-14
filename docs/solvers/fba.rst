@@ -340,6 +340,20 @@ coefficients ``tri_kd``, ``edge_kd`` and ``k_damp`` of the elements.
 Contacts
 --------
 
+- ``rigid_contact_time`` makes the normal rows of rigid contacts soft: a
+  spring and a damper in parallel (Kelvin-Voigt) of time constant ``tau`` and
+  damping ratio ``rigid_contact_damping``, acting while a row holds a force,
+  for the row's effective mass. A contact then sinks ``F tau² / m`` under a
+  force ``F``, and an impact of a heavy body on a light one spreads over a few
+  steps instead of being settled in one, which a hard contact answers with a
+  large rotation of the light body in that step. The backward Euler step of
+  the pair is the complementarity ``0 <= lambda _|_ g + eps b - beta g_start
+  >= 0`` with ``b`` the row's force times ``W_ii``, ``g_start`` its gap at the
+  step start, taken as zero above zero so that contacts reported within the
+  detection gap do not brake bodies before they touch, ``x = dt / tau``,
+  ``eps = 1 / (x² + 2 zeta x)`` and ``beta = 2 zeta / (x + 2 zeta)``; it adds
+  ``eps`` to the row's diagonal of the Newton matrix. The default ``0`` keeps rigid contacts hard; tendon and
+  particle contact rows stay hard.
 - ``nsn_schur_mode`` selects the contact operator of the Newton steps.
   ``"full"`` (default) builds it from the factored system matrix. ``"lite"``
   replaces the inverse system matrix by the inverse masses, which decouples
