@@ -8,9 +8,10 @@
 # tilts, gathers its shoulders together, crosses its front over its back and
 # opens again, with cloth self-contact throughout; light Rayleigh stiffness
 # damping calms its swing after each move. Each handle holds one vertex with
-# three particle-constraint rows of the lite contact operator. Two substeps
-# of five iterations leave some triangles crossed where the cloth folds
-# sharply; the test checks every frame that at most 400 pairs intersect.
+# three particle-constraint rows of the lite contact operator, which keeps
+# the contact forces of each step's earlier iterations. Two substeps of five
+# iterations leave a few triangles crossed where the cloth folds sharply;
+# the test checks every frame that at most 100 pairs intersect.
 #
 # Command: python -m newton.examples shirt_pins_fba
 ###########################################################################
@@ -73,6 +74,10 @@ class Example:
             particle_topological_contact_filter_threshold=1,
             particle_rest_shape_contact_exclusion_radius=0.009,
             nsn_linear_iterations=10,
+            # The layers that press on each other take the forces whose motion through the system matrix holds them
+            # apart, rather than those that the particles' masses alone predict would: far fewer triangles cross
+            # where the cloth folds.
+            nsn_lite_accumulate=True,
             # Light stiffness damping [s] halves the swing left after each move of the handles.
             rayleigh_beta=1.0e-4,
         )
@@ -136,7 +141,7 @@ class Example:
         if self._surface_check is None:
             self._surface_check = SurfaceIntersectionCheck(self.model)
         intersections = self._surface_check.intersections(self.state_0.particle_q)
-        assert intersections <= 400, f"{intersections} intersecting shirt triangle pairs at {self.sim_time:.3f}s"
+        assert intersections <= 100, f"{intersections} intersecting shirt triangle pairs at {self.sim_time:.3f}s"
         speed = float(np.linalg.norm(self.state_0.particle_qd.numpy(), axis=1).max())
         error = self.pins.error(p)
         assert speed < 5.0, f"shirt speed {speed:.3f} at {self.sim_time:.3f}s"
