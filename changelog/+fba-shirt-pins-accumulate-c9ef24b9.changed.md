@@ -1,0 +1,1 @@
+Accumulate the lite contact forces within each step in the `shirt_pins_fba` example (`nsn_lite_accumulate=True`): its most crossed triangle pairs in a frame drop from 299 to 61, and its check allows 100 instead of 400.

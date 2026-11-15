@@ -521,8 +521,8 @@ Examples
   ``U(-A, A)`` with seed 42, clipped to the joint limits; it leaves the
   fingers, the timing, the initial pose and the IK state unchanged.
 - ``shirt_pins_fba``, ``bunny_ears_fba``: two handles move a T-shirt by its
-  shoulders, with self-contact and light Rayleigh stiffness damping, and a
-  soft bunny by its ears.
+  shoulders, with self-contact, the lite operator accumulating its contact
+  forces and light Rayleigh stiffness damping, and a soft bunny by its ears.
 - ``shirt_fold_fba``: two Franka arms fold a dropped T-shirt, its sides in and
   its hem up, their fingers squeezing the cloth into a bulge that they hold,
   at two steps per frame with the lite operator accumulating its contact
