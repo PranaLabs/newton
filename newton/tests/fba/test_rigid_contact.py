@@ -103,7 +103,7 @@ class TestGatherRigidContacts(unittest.TestCase):
         contacts = pipeline.contacts()
         pipeline.collide(state, contacts)
         self.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 8)
-        with self.assertWarns(RuntimeWarning):
+        with self.assertWarns(newton.exceptions.NewtonWarning):
             rc = gather_rigid_contacts(model, contacts, _slots(model), self.device)
         self.assertEqual(rc.count, 4)
         body = rc.body.numpy()

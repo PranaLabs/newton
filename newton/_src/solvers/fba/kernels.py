@@ -8,6 +8,7 @@ import warnings
 import warp as wp
 
 from ...core.reset import reset_world_selected
+from ...exceptions import NewtonWarning
 
 # 3x2 matrix type: Warp has no ``wp.mat32``.
 mat32 = wp.types.matrix(shape=(3, 2), dtype=wp.float32)
@@ -4887,7 +4888,7 @@ def stored_contact_count(count: wp.array, capacity: int, kind: str) -> int:
         warnings.warn(
             f"SolverFBA: the collision pipeline found more {kind} contacts than its buffers hold and dropped the "
             f"others; construct the CollisionPipeline with a larger {kind}_contact_max.",
-            RuntimeWarning,
+            NewtonWarning,
             stacklevel=3,
         )
         return capacity

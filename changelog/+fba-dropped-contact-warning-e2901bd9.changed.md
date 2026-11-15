@@ -1,0 +1,1 @@
+Report the contacts that `SolverFBA` drops when the collision pipeline's contact buffers overflow with a `newton.exceptions.NewtonWarning` instead of a `RuntimeWarning`, as Newton's other warnings do.

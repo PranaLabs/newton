@@ -166,7 +166,7 @@ class TestFBARigidRows(unittest.TestCase):
         rng = np.random.default_rng(0)
         blocks = rng.standard_normal((3, 6, 6))
         blocks = blocks @ blocks.transpose(0, 2, 1) + 6.0 * np.eye(6)
-        A = sp.block_diag(blocks, format="csr")
+        A = sp.block_diag([sp.csr_matrix(b) for b in blocks], format="csr")
         np.testing.assert_allclose(rigid_block_inverses(A), np.linalg.inv(blocks), rtol=1e-10)
         A = A.tolil()
         A[0, 6] = A[6, 0] = 1.0  # couples two bodies

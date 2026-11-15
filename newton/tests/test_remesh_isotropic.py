@@ -99,12 +99,14 @@ class TestRemeshIsotropic(unittest.TestCase):
         self.assertGreater(np.percentile(quality(u, g), 1), 0.75)
 
     def test_remesh_mesh_takes_the_isotropic_method(self):
-        """Remesh through ``newton.utils.remesh_mesh(method="isotropic")`` to the mesh ``remesh_isotropic`` gives."""
+        """Remesh through ``newton.utils.remesh_mesh(method="isotropic")`` to the mesh ``remesh_isotropic`` gives for
+        the mesh's single-precision vertices."""
         v, f = graded_sheet()
-        mesh = newton.utils.remesh_mesh(newton.Mesh(v, f.ravel()), method="isotropic", edge_length=1.0)
-        u, g = remesh_isotropic(v, f, edge_length=1.0)
-        np.testing.assert_allclose(mesh.vertices, u)
-        np.testing.assert_array_equal(mesh.indices.reshape(-1, 3), g)
+        mesh = newton.Mesh(v, f.ravel())
+        remeshed = newton.utils.remesh_mesh(mesh, method="isotropic", edge_length=1.0)
+        u, g = remesh_isotropic(mesh.vertices, mesh.indices.reshape(-1, 3), edge_length=1.0)
+        np.testing.assert_array_equal(remeshed.vertices, np.asarray(u, dtype=np.float32))
+        np.testing.assert_array_equal(remeshed.indices.reshape(-1, 3), g)
 
 
 if __name__ == "__main__":
