@@ -442,8 +442,6 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
         for override in ({0: 0.03}, {0: -0.001}, {1: 0.002}):
             with self.subTest(override=override), self.assertRaises(ValueError):
                 newton.solvers.SolverFBA(solver.model, shape_particle_radius_override=override)
-        with self.assertRaises(ValueError):
-            newton.solvers.SolverFBA(solver.model, friction_anchors=True, shape_particle_radius_override={0: 0.002})
 
     def test_sparse_storage(self):
         """Rest the cloth on the top face where the dense full NSN does, to rounding, and clear the edge where it drapes

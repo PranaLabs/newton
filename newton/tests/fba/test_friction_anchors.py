@@ -19,9 +19,26 @@ _SHEET = {
 }
 
 
+def _tilted(slope):
+    """A builder with gravity tilted along x by ``arctan(slope)`` and shapes of friction 0.5."""
+    theta = np.arctan(slope)
+    builder = newton.ModelBuilder(gravity=(9.81 * np.sin(theta), 0.0, -9.81 * np.cos(theta)))
+    builder.default_shape_cfg.mu = 0.5
+    return builder
+
+
+def _finalize(builder):
+    """The model of a builder with a static box whose top face is at z = 0, and particle friction 0.5."""
+    builder.add_shape_box(-1, xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()), hx=0.3, hy=0.3, hz=0.05)
+    model = builder.finalize()
+    model.particle_mu = 0.5
+    return model
+
+
 class TestFrictionAnchors(unittest.TestCase):
     """An 8 cm patch of 1 cm cells rests 12 mm over a sheet of 1 cm cells under gravity tilted along x, with friction
-    0.5, solved with the lite operator: each step's solve leaves a little slip in the stacked contacts."""
+    0.5, solved with the lite operator: each step's solve leaves a little slip in the stacked contacts. The anchors
+    also hold with other contact options, on a sheet or ropes on a static box."""
 
     @classmethod
     def setUpClass(cls):
@@ -126,6 +143,122 @@ class TestFrictionAnchors(unittest.TestCase):
         theta = np.arctan(slope)
         coulomb = 0.5 * 9.81 * (np.sin(theta) - 0.5 * np.cos(theta)) * (steps / fps) ** 2
         np.testing.assert_allclose(s0.particle_q.numpy()[sheet:, 0].mean() - x0, coulomb, rtol=0.25)
+
+    def _run(self, model, steps, *, shift=0.0, moved=slice(None), fps=180, **options):
+        """Step ``model`` with the solver ``options``, shifting the ``moved`` particles by ``shift`` [m] along x
+        before the last step. Returns the solver and how far [m] each particle moved along x after half a second."""
+        solver = newton.solvers.SolverFBA(model, iterations=5, nsn_linear_iterations=10, **options)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.008) if model.shape_count else None
+        contacts = pipeline.contacts() if pipeline else None
+        s0, s1, start = model.state(), model.state(), None
+        for k in range(steps):
+            if shift and k == steps - 1:
+                q = s0.particle_q.numpy()
+                q[moved, 0] += shift
+                s0.particle_q.assign(q)
+            if pipeline:
+                pipeline.collide(s0, contacts)
+            solver.step(s0, s1, None, contacts, 1.0 / fps)
+            s0, s1 = s1, s0
+            if k + 1 == fps // 2:
+                start = s0.particle_q.numpy()[:, 0]
+        x = s0.particle_q.numpy()[:, 0]
+        self.assertTrue(np.isfinite(x).all())
+        return solver, x - start
+
+    @staticmethod
+    def _last_contacts(solver):
+        """The particle, the shape (-1 for none), whether it kept an anchor and whether it pressed, of each contact of
+        the last step."""
+        M = solver._contact_count
+        lam = solver._lam_coulomb_persistent_d.numpy()[: 3 * M : 3]
+        particle, shape = solver._contact_particle_d.numpy()[:M], solver._contact_shape_d.numpy()[:M]
+        return particle, shape, solver._anchor_flag_d.numpy()[:M], lam > 0.0
+
+    def test_anchors_with_a_shape_radius_override(self):
+        """Hold a sheet of 8 mm particle radii, 2 mm thick against a static box by shape_particle_radius_override, on
+        the box tilted to 0.9 times the friction coefficient, where it creeps down without anchors. An anchor lapses
+        beyond a quarter of the 2 mm contact distance: shifted by 0.25 mm between two steps, the sheet keeps its
+        anchors on the box, by 1 mm it does not."""
+
+        def sheet(slope):
+            builder = _tilted(slope)
+            corner = wp.vec3(-0.08, -0.08, 0.004)
+            builder.add_cloth_grid(pos=corner, dim_x=16, dim_y=16, cell_x=0.01, cell_y=0.01, **_SHEET)
+            return _finalize(builder)
+
+        options = {"nsn_schur_mode": "lite", "shape_particle_radius_override": {0: 0.002}}
+        _, creep = self._run(sheet(0.45), 270, **options)
+        _, held = self._run(sheet(0.45), 270, friction_anchors=True, **options)
+        self.assertGreater(creep.mean(), 5.0e-4)
+        self.assertLess(abs(held.mean()), 5.0e-5)
+        for shift, kept in ((2.5e-4, 1), (1.0e-3, 0)):
+            solver, _ = self._run(sheet(0.0), 91, shift=shift, friction_anchors=True, **options)
+            _, shape, anchored, _ = self._last_contacts(solver)
+            with self.subTest(shift=shift):
+                self.assertGreater(np.count_nonzero(shape == 0), 0)
+                np.testing.assert_array_equal(anchored[shape == 0], kept)
+
+    def test_anchors_with_self_contact_groups(self):
+        """Hold the patch on the pinned sheet tilted to 0.9 times the friction coefficient, both in one self-contact
+        group whose 12 mm margin exceeds the 4 mm between groups, where the patch creeps down without anchors. An
+        anchor lapses beyond a quarter of the group's margin: shifted by 2 mm between two steps, the patch keeps its
+        anchors on the sheet, by 4 mm it does not."""
+
+        def options(model, anchors):
+            return {
+                "nsn_schur_mode": "lite",
+                "particle_enable_self_contact": True,
+                "particle_self_contact_margin": 0.004,
+                "particle_topological_contact_filter_threshold": 1,
+                "particle_self_contact_group_ids": np.zeros(model.particle_count, dtype=np.int32),
+                "particle_self_contact_group_margins": [0.012],
+                "friction_anchors": anchors,
+            }
+
+        model, sheet = self._stack(0.45, box=False)
+        _, creep = self._run(model, 270, **options(model, False))
+        model, sheet = self._stack(0.45, box=False)
+        _, held = self._run(model, 270, **options(model, True))
+        self.assertGreater(creep[sheet:].mean(), 3.0e-3)
+        self.assertLess(abs(held[sheet:].mean()), 5.0e-5)
+        for shift, kept in ((2.0e-3, 1), (4.0e-3, 0)):
+            model, sheet = self._stack(0.0, box=False)
+            solver, _ = self._run(model, 91, shift=shift, moved=slice(sheet, None), **options(model, True))
+            particle, shape, anchored, _ = self._last_contacts(solver)
+            patch = anchored[(shape < 0) & (particle >= sheet)]
+            with self.subTest(shift=shift):
+                self.assertGreater(len(patch), 0)
+                np.testing.assert_array_equal(patch, kept)
+
+    def test_anchors_with_rod_contacts(self):
+        """Hold two touching ropes on a static box tilted to 0.9 times the friction coefficient, where they creep down
+        without anchors, with the full operator too; on a level box, a rope lying across another presses on it through
+        rod contacts, which keep the step's point, while the lower rope keeps its anchors on the box."""
+
+        def ropes(slope, crossing):
+            builder = _tilted(slope)
+            radius, y = 0.004, np.linspace(-0.1, 0.1, 21)
+            rod = newton.solvers.SolverFBA.add_particle_rod
+            rod(builder, np.c_[np.zeros(21), y, np.full(21, radius)], radius, 1.0e7, density=1000.0)
+            if crossing:
+                points = np.c_[y, np.zeros(21), np.full(21, 3.0 * radius + 1.0e-3)]
+            else:  # alongside it uphill, its particles half a segment along
+                points = np.c_[np.full(21, -2.0 * radius - 5.0e-4), y + 0.005, np.full(21, radius)]
+            rod(builder, points, radius, 1.0e7, density=1000.0)
+            return _finalize(builder)
+
+        _, creep = self._run(ropes(0.45, False), 270, rod_contact=True)
+        _, held = self._run(ropes(0.45, False), 270, rod_contact=True, friction_anchors=True)
+        self.assertGreater(creep.mean(), 5.0e-3)
+        self.assertLess(abs(held.mean()), 5.0e-5)
+        solver, _ = self._run(ropes(0.0, True), 91, rod_contact=True, friction_anchors=True)
+        particle, shape, anchored, pressed = self._last_contacts(solver)
+        self.assertTrue((pressed & (shape < 0)).any())
+        self.assertFalse(anchored[shape < 0].any())
+        lower = (shape == 0) & (particle < 21)
+        self.assertEqual(np.count_nonzero(lower), 21)
+        self.assertTrue(anchored[lower].all())
 
     def test_friction_anchors_need_friction(self):
         """Refuse friction anchors without friction, and an anchor exclusion without anchors."""

@@ -4439,6 +4439,9 @@ def friction_anchor_apply_kernel(
     shape_count: wp.int64,
     self_margin: float,
     world_margins: wp.array[wp.float32],
+    groups: wp.array[wp.int32],  # (N,) self-contact group of each particle, empty without margins within groups
+    group_margins: wp.array[wp.float32],  # self-contact margin within each group
+    shape_radius: wp.array[wp.float32],  # particle contact thickness against each shape, -1 for none; may be empty
     step: wp.int32,
     anchor_triangle: wp.array[wp.vec3i],  # (N,) triangle of each particle's self-contact anchor
     anchor_bary: wp.array[wp.vec3],  # (N,) its barycentric coordinates
@@ -4465,8 +4468,9 @@ def friction_anchor_apply_kernel(
     is the point that the contact of the same particle and shape kept in the step before, found by bisection of that
     step's sorted keys. With the anchor ``p_a`` and the step's point ``p``, both from the start positions, the rows
     take ``t . (p - p_a)`` off their offsets, so that they hold the particle at the anchor. An anchor whose tangential
-    distance exceeds the reach, a quarter of the contact distance (the self-contact margin, or the particle radius
-    plus the shape margin), lapses. Contacts with shapes on bodies and face contacts keep the step's point.
+    distance exceeds the reach, a quarter of the contact distance (the self-contact margin, within a group the group's,
+    or the particle radius, or its contact thickness against the shape, plus the shape margin), lapses. Contacts with
+    shapes on bodies, face contacts, and edge-edge, vertex-vertex and rod contacts keep the step's point.
     """
     c = wp.tid()
     s = contact_shape[c]
@@ -4492,8 +4496,13 @@ def friction_anchor_apply_kernel(
         if extra_alpha[c, 0] > 0.0:
             vertex_face = False
     if vertex_face:
-        reach = 0.25 * world_value(particle_world[p], world_margins, self_margin)
-        # Vertex-vertex self contacts, with one further particle, keep the step's point.
+        margin = world_value(particle_world[p], world_margins, self_margin)
+        if groups.shape[0] > 0:
+            if groups[p] == groups[first]:
+                margin = group_margins[groups[p]]
+        reach = 0.25 * margin
+        # Vertex-vertex self contacts, with one further particle, and the rod contacts of a particle with a segment,
+        # with two, keep the step's point.
         if anchor_step[p] == step - 1 and extra_particle.shape[1] >= 3:
             a = anchor_triangle[p]
             b = anchor_bary[p]
@@ -4515,6 +4524,9 @@ def friction_anchor_apply_kernel(
         static = wp.int32(1)
         reach = particle_radius[p]
         if s >= 0:
+            if s < shape_radius.shape[0]:
+                if shape_radius[s] >= 0.0:
+                    reach = shape_radius[s]
             reach = reach + shape_margin[s]
             if shape_body[s] >= 0:
                 static = 0

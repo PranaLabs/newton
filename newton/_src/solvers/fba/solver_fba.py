@@ -253,14 +253,18 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 friction cone still bounds the force: a contact pulled harder
                 than ``mu`` times its normal force slides as without the
                 point, which trails it by at most a quarter of the contact
-                distance (the self-contact margin, or the particle radius plus
-                the shape margin) and then moves to it; with a contact distance
-                of zero it stays where it was set. A contact drops its
-                point when it carries no normal force or acts on a particle
-                that rows hold at a point. Vertex-vertex self contacts,
-                contacts with shapes on bodies, face contacts, and the contacts
-                of a step in which one touches a body that FBA integrates keep
-                the step's point. Needs ``friction=True``.
+                distance (the self-contact margin, that of the contact's
+                group with ``particle_self_contact_group_ids``, or the
+                particle radius, or the radius that
+                ``shape_particle_radius_override`` gives against the shape,
+                plus the shape margin) and then moves to it; with a contact
+                distance of zero it stays where it was set. A contact drops
+                its point when it carries no normal force or acts on a
+                particle that rows hold at a point. Vertex-vertex and
+                edge-edge self contacts, rod contacts, contacts with shapes on
+                bodies, face contacts, and the contacts of a step in which one
+                touches a body that FBA integrates keep the step's point.
+                Needs ``friction=True``.
             lambda_cap: Optional clamp on the magnitude of each contact
                 row's multiplier, in force units [N]. The multipliers are
                 forces divided by ``dt²``, so the clamp is divided by ``dt²``
@@ -284,7 +288,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 lies between 0 and the smallest particle radius, since the
                 collision pipeline still finds the contacts at the particle
                 radii. Other shapes and self contacts keep the particle
-                radii. Not supported with ``friction_anchors``.
+                radii.
             nsn_schur_mode: Contact operator ``W`` of the NSN steps.
                 ``"full"`` (default) builds ``J A⁻¹ Jᵀ`` from the prefactored
                 system matrix ``A``. ``"lite"`` replaces ``A⁻¹`` by
@@ -402,11 +406,16 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 ``particle_self_contact_mode="vertex_face"``.
             particle_self_contact_edge_edge_ratio: An edge pair takes a
                 contact only where its edges come nearer than this times the
-                distance of its particles' nearest triangles. Below 1, between
-                flat layers the vertex-face contacts hold the edges apart, and
-                only ridges, such as creases, bring edges that near; 1 also
-                covers edges of layers whose vertex-face contacts barely hold
-                them, at a few percent more contacts.
+                distance of its particles' nearest triangles, so that it adds
+                rows where the vertex-face contacts do not hold the edges
+                apart, as at creases. Every edge pair of two flat layers lies
+                exactly as near as its particles' triangles, so a ratio of 1
+                or more takes all of them, more than the vertex-face contacts
+                of the layers; below 1, as the default 0.9, the vertex-face
+                contacts alone hold flat layers apart. Folded cloth whose
+                layers press on each other takes 1, which also covers edges
+                that the vertex-face contacts barely hold, at a few percent
+                more contacts where the layers are not flat.
             particle_self_contact_margin: Self-contact distance [m]: the
                 distance at which a particle and a triangle or particle stop.
             particle_self_contact_gap: Additional detection distance [m]: self
@@ -429,8 +438,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 where it is 0 or without it. Needs
                 ``particle_enable_self_contact=True`` with
                 ``particle_self_contact_mode="vertex_face"``;
-                not supported with ``particle_self_contact_edge_edge`` or
-                ``friction_anchors``.
+                not supported with ``particle_self_contact_edge_edge``, nor
+                with per-world margins of :meth:`set_particle_self_contact`.
             particle_self_contact_group_margins: Self-contact margin [m]
                 within each group of ``particle_self_contact_group_ids``; 0
                 lets the particles of a group pass through its triangles, and
@@ -446,7 +455,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 the springs as the largest sum of two radii plus the gap spans
                 at the shortest spring never collide, so that a straight rod
                 does not touch itself. Needs ``friction=True``; friction takes
-                ``model.particle_mu``. Not supported with ``friction_anchors``.
+                ``model.particle_mu``.
             rod_contact_gap: Additional detection distance [m] of the rod
                 contacts beyond the capsules' surfaces, which bounds the
                 relative motion of two segments per step that cannot pass a
@@ -762,8 +771,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
             raise ValueError("particle_self_contact_group_margins needs particle_self_contact_group_ids")
         self._self_contact_groups = particle_self_contact_group_ids is not None
         if self._self_contact_groups:
-            if self._self_contact is None or self.friction_anchors:
-                raise ValueError("self-contact groups need particle_enable_self_contact and no friction_anchors")
+            if self._self_contact is None:
+                raise ValueError("self-contact groups need particle_enable_self_contact")
             groups = np.asarray(particle_self_contact_group_ids)
             if not np.issubdtype(groups.dtype, np.integer) or groups.shape != (model.particle_count,):
                 raise ValueError("particle_self_contact_group_ids needs one integer group per particle")
@@ -801,8 +810,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
             self._segment_query = SegmentContactQuery(seg, model.device)
             self.rod_shape_contact_gap = float(rod_shape_contact_gap)
         if rod_contact:
-            if not self.friction or self.friction_anchors:
-                raise ValueError("rod_contact needs friction=True and no friction_anchors")
+            if not self.friction:
+                raise ValueError("rod_contact needs friction=True")
             springs = model.spring_indices.numpy().reshape(-1, 2) if model.spring_count else np.zeros((0, 2))
             if model.spring_count:
                 springs = springs[model.spring_stiffness.numpy() > 0.0]
@@ -840,8 +849,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
         # Per-shape particle contact thickness, -1 where the particle radius holds; None without overrides.
         self._shape_radius_d = None
         if shape_particle_radius_override:
-            if self.friction_anchors:
-                raise ValueError("shape_particle_radius_override is not supported with friction_anchors")
             smallest = float(model.particle_radius.numpy().min()) if model.particle_count else 0.0
             radii = np.full(max(n_shapes, 1), -1.0, dtype=np.float32)
             for shape, radius in shape_particle_radius_override.items():
@@ -3525,7 +3532,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         Each vertex becomes a particle of radius ``radius`` whose mass is the rod's line density times half the
         length of its segments; each segment, a spring of stiffness ``E pi r^2 / l``, the rod's axial stiffness
         over the segment's rest length ``l``; and each interior vertex, a bending element, an entry of
-        ``fba:rod_bend`` (see :meth:`register_custom_attributes`), of energy
+        ``fba:rod_bend`` (see :meth:`register_custom_attributes`), of energy::
 
             EI / (2 v) |(x_+ - x) / l_+ - (x - x_-) / l_-|^2,
 
@@ -3615,9 +3622,12 @@ class SolverFBA(TendonStateMixin, SolverBase):
     def set_particle_self_contact(self, *, margin: float | ArrayLike, gap: float | ArrayLike | None = None) -> None:
         """Change the self-contact distance and detection gap for the following steps.
 
-        A cloth dropped onto a surface needs a margin and gap that its layers cannot pass in one step; once it lies
-        still, a thinner margin lets folded layers stack closer. Thinner than half the longest edge, vertex-face
-        contacts need ``particle_self_contact_edge_edge=True`` to keep crossing edges apart.
+        The margin is a contact thickness of the solver rather than of the material. A cloth dropped onto a surface
+        needs a margin and gap that its layers cannot pass in one step, since the contacts are found once per step at
+        its start, and, with ``nsn_schur_mode="lite"``, a margin deeper than the impact presses its contacts in; once
+        it lies still, a thinner margin lets folded layers stack closer. Thinned over a second or so rather than at
+        once, the margin lets the stacked layers settle instead of dropping together. Thinner than half the longest
+        edge, vertex-face contacts need ``particle_self_contact_edge_edge=True`` to keep crossing edges apart.
 
         Args:
             margin: Positive self-contact distance [m]. A scalar applies to all worlds. An array of shape
@@ -4431,16 +4441,23 @@ class SolverFBA(TendonStateMixin, SolverBase):
         self._ensure_anchor_buffers(M)
         (extra_particle, extra_alpha), has_extra = self._anchor_extra()
         shape_body, shape_margin = self._anchor_shapes()
-        margin = self.particle_self_contact_margin if self._self_contact is not None else 0.0
+        sc = self._self_contact
+        if not hasattr(self, "_anchor_no_values"):
+            self._anchor_no_values = wp.empty(0, dtype=wp.float32, device=self._device)
+        none = self._anchor_no_values
+        margin = self.particle_self_contact_margin if sc is not None else 0.0
         inputs = [self._contact_shape_d, self._contact_particle_d, extra_particle, extra_alpha, wp.int32(has_extra)]
         inputs += [self._contact_normal_d, self._contact_tangent1_d, self._contact_tangent2_d]
         inputs += [self._contact_world_anchor_d, state_in.particle_q, self.model.particle_radius]
         inputs += [shape_body, shape_margin, wp.int64(max(self.model.shape_count, 1)), float(margin)]
-        inputs += [
-            self._self_contact.world_margins
-            if self._self_contact is not None
-            else wp.empty(0, dtype=wp.float32, device=self._device)
-        ]
+        inputs += [sc.world_margins if sc is not None else none]
+        # The margins of the self contacts within groups, as the contact assembly takes them, and the particles'
+        # contact thickness against the shapes of shape_particle_radius_override.
+        if self._self_contact_groups and sc.within_groups:
+            inputs += [sc.groups, sc.group_margins]
+        else:
+            inputs += [self._empty_indices, none]
+        inputs += [none if self._shape_radius_d is None else self._shape_radius_d]
         inputs += [wp.int32(self._anchor_step), self._anchor_triangle_d, self._anchor_bary_d, self._anchor_step_d]
         inputs += [self._anchor_previous_key_d, self._anchor_previous_point_d, self._anchor_previous_pressed_d]
         inputs += [wp.int32(self._anchor_count)]
