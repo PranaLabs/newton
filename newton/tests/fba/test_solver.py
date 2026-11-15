@@ -364,8 +364,9 @@ class TestBuildRigidSystem(unittest.TestCase):
 
     def _model(self):
         builder = newton.ModelBuilder()
-        # Body 0: products of inertia exceed I_xx (needs diagonal pivoting).
-        builder.add_body(mass=2.0, inertia=wp.mat33(0.1, 0.2, 0.0, 0.2, 0.5, 0.0, 0.0, 0.0, 0.3), lock_inertia=True)
+        # Body 0: products of inertia exceed I_xx (needs diagonal pivoting), with principal moments (0.583, 0.017,
+        # 0.58) that satisfy the triangle inequality, so that finalize keeps them.
+        builder.add_body(mass=2.0, inertia=wp.mat33(0.1, 0.2, 0.0, 0.2, 0.5, 0.0, 0.0, 0.0, 0.58), lock_inertia=True)
         builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)), is_kinematic=True)
         builder.add_body(mass=3.0, inertia=wp.mat33(0.4, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.6), lock_inertia=True)
         return builder.finalize()
@@ -4854,7 +4855,7 @@ class TestContactOverflow(unittest.TestCase):
         pipeline = CollisionPipeline(model, verify_buffers=False, **capacity)
         contacts = pipeline.contacts()
         pipeline.collide(s0, contacts)
-        with self.assertWarns(RuntimeWarning):
+        with self.assertWarns(newton.exceptions.NewtonWarning):
             solver.step(s0, s1, None, contacts, 0.01)
         for a in (s1.body_q, s1.particle_q):
             self.assertTrue(a is None or np.isfinite(a.numpy()).all())
