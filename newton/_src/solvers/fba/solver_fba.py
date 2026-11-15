@@ -15,6 +15,7 @@ from ...core.reset import reset_state_array
 from ...geometry import ParticleFlags
 from ...sim import BodyFlags, Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
 from ..solver import SolverBase
+from ..tendon_state import TendonStateMixin
 from .kernels import host_head, stored_contact_count
 
 if TYPE_CHECKING:
@@ -59,7 +60,7 @@ def _host_mirror(name: str) -> property:
     return property(get, put)
 
 
-class SolverFBA(SolverBase):
+class SolverFBA(TendonStateMixin, SolverBase):
     """Fast But Accurate projective-dynamics solver for cloth, soft bodies and rigid bodies.
 
     .. experimental::
@@ -229,8 +230,6 @@ class SolverFBA(SolverBase):
         rigid_iteration_graph: bool = False,
         rigid_contact_time: float = 0.0,
         rigid_contact_damping: float = 1.0,
-        tendon_time: float = 0.0,
-        tendon_damping: float = 1.0,
     ) -> None:
         """
         Args:
@@ -544,19 +543,10 @@ class SolverFBA(SolverBase):
                 hard. The start gap counts only in penetration (above zero it
                 is taken as zero), so that contacts reported before the bodies
                 touch, within their detection gap, do not brake them. Particle
-                contacts are not softened, nor are tendon rows (see
-                ``tendon_time``).
+                contacts and tendon rows are not softened by it; tendons take
+                the compliance and damping of their spans.
             rigid_contact_damping: The damping ratio ``zeta`` of soft rigid
                 contacts (``1``, critical: no bounce).
-            tendon_time: With a positive time constant [s], the length limits
-                of the tendons (:meth:`set_tendons`) are soft in the same way:
-                a taut string stretches ``T tau² / m`` under its tension ``T``
-                for the effective mass ``m`` of its row, and stops a load it
-                catches over a few steps instead of one. Their damper acts on
-                the stretch of a taut string only (the start gap is clamped
-                to ``<= 0``), so that a slack string pulls nothing. ``0``
-                keeps tendons inextensible.
-            tendon_damping: The damping ratio of soft tendon limits.
         """
         super().__init__(model)
         self._particle_world_h = model.particle_world.numpy()
@@ -677,10 +667,6 @@ class SolverFBA(SolverBase):
         if not (rigid_contact_time >= 0.0 and rigid_contact_damping >= 0.0):
             raise ValueError("rigid_contact_time and rigid_contact_damping must be >= 0")
         self.rigid_contact_time, self.rigid_contact_damping = float(rigid_contact_time), float(rigid_contact_damping)
-        if not (tendon_time >= 0.0 and tendon_damping >= 0.0):
-            raise ValueError("tendon_time and tendon_damping must be >= 0")
-        # Soft tendon limits: the same spring-damper on the tendons' length rows.
-        self.tendon_time, self.tendon_damping = float(tendon_time), float(tendon_damping)
         # The soft rigid contacts' per-contact arrays (eps, beta, start gap) of the step; empty arrays for none.
         self._nsn_soft_off = tuple(wp.empty(0, dtype=wp.float64, device=model.device) for _ in range(3))
         self._nsn_soft = self._rc_soft = self._nsn_soft_off
@@ -731,6 +717,10 @@ class SolverFBA(SolverBase):
         self._tendons, self._tendon_count, self._tendon_ws = None, 0, None
         # set_tendons: each tendon's friction coefficient and force, and its tension at the end of the last step.
         self._tendon_friction = self._tendon_tension = None
+        # Each tendon row's softness: compliance [m/N] and damping [N·s/m] of its spans, or a time constant [s] and
+        # damping ratio relative to its effective mass (fba:tendon_time); and the tendon groups of the model's
+        # tendons (ModelBuilder.add_tendon), None without them.
+        self._tendon_soft, self._tendon_soft_any, self._model_tendon_groups = None, False, None
         self._self_contact, self._lite_W = None, None
         self._held_rows = None  # the lite rows that hold particles at points, and their factor
         # Graph of the step's sparse lite contact correction, False once a capture failed: it would fail again.
@@ -981,6 +971,7 @@ class SolverFBA(SolverBase):
         self._k_tet_corot = _K.project_stretching_corotational_tet_kernel
         self._k_tri_nh = _K.project_stretching_neohookean_kernel
         self._k_tet_nh = _K.project_stretching_neohookean_tet_kernel
+        self._init_model_tendons()
 
     @property
     def _contact_v_anchor_h(self) -> np.ndarray:
@@ -1234,13 +1225,13 @@ class SolverFBA(SolverBase):
             self._rc_mu_d = wp.zeros(m_s + m_r + m_t, dtype=wp.float64, device=device)
             soft = (wp.zeros(m_s + m_r + m_t, dtype=wp.float64, device=device) for _ in range(3))
             self._rc_soft = (
-                tuple(soft) if self.rigid_contact_time > 0.0 or self.tendon_time > 0.0 else self._nsn_soft_off
+                tuple(soft) if self.rigid_contact_time > 0.0 or self._tendon_soft_any else self._nsn_soft_off
             )
         else:
             self._rc_row_slot_d, self._rc_row_jac_d = storage.row_slot, storage.row_jac
             self._rc_pene0_d, self._rc_mu_d = storage.pene0, storage.mu
             self._rc_soft = (
-                storage.soft if self.rigid_contact_time > 0.0 or self.tendon_time > 0.0 else self._nsn_soft_off
+                storage.soft if self.rigid_contact_time > 0.0 or self._tendon_soft_any else self._nsn_soft_off
             )
         self._rc_lam_soft_d = wp.empty(n_s + n_b, dtype=wp.float64, device=device) if n_b else None
         if m_s or attach:
@@ -1328,24 +1319,6 @@ class SolverFBA(SolverBase):
                 outputs=[mu, self._rc_mu_d],
                 device=device,
             )
-            if self.tendon_time > 0.0:
-                from .rigid_contact import tendon_soft_kernel  # noqa: PLC0415
-
-                x_t, zeta_t = self._rigid_dt / self.tendon_time, self.tendon_damping
-                wp.launch(
-                    tendon_soft_kernel,
-                    dim=m_t,
-                    inputs=[
-                        *(body, point, target, self._tendons[3], self._tendons[4], model.body_com, state_in.body_q),
-                        *(
-                            wp.float64(1.0 / (x_t * x_t + 2.0 * zeta_t * x_t)),
-                            wp.float64(2.0 * zeta_t / (x_t + 2.0 * zeta_t)),
-                        ),
-                        m_s + m_r,
-                    ],
-                    outputs=list(self._rc_soft),
-                    device=device,
-                )
             wp.launch(
                 tendon_jacobian_kernel,
                 dim=m_t,
@@ -1356,6 +1329,22 @@ class SolverFBA(SolverBase):
                 outputs=[self._rc_row_slot_d, self._rc_row_jac_d],
                 device=device,
             )
+            if self._tendon_soft_any:
+                from .rigid_contact import tendon_soft_kernel  # noqa: PLC0415
+
+                # The spring-damper of each tendon row from its compliance and damping and the row's W_ii, or from
+                # its time constant relative to the row's effective mass.
+                wp.launch(
+                    tendon_soft_kernel,
+                    dim=m_t,
+                    inputs=[
+                        *(body, point, target, self._tendons[3], self._tendons[4], *self._tendon_soft),
+                        *(self._rc_row_slot_d, self._rc_row_jac_d, self._slot_inv_mass_d, model.body_com),
+                        *(state_in.body_q, wp.float64(self._rigid_dt), n_s + 3 * m_r, m_s + m_r),
+                    ],
+                    outputs=list(self._rc_soft),
+                    device=device,
+                )
             ends = getattr(self, "_tendon_ends", None)
             if ends is None or ends[0].shape[0] != m_t:
                 ends = self._tendon_ends = tuple(wp.empty((m_t, 2), dtype=wp.vec3d, device=device) for _ in range(3))
@@ -2631,6 +2620,7 @@ class SolverFBA(SolverBase):
         self._two_way_world_h.fill(0)
         rigid = self.model.body_count > 0 and not self.integrate_with_external_rigid_solver
         rigid = rigid and self._begin_rigid_step(state_in, state_out, dt)
+        self._route_model_tendons(state_in)
         if self.model.particle_count == 0:
             if rigid:
                 self._begin_rigid_contacts(contacts, state_in, dt)
@@ -2640,6 +2630,7 @@ class SolverFBA(SolverBase):
                 self._rigid_iteration(state_in, state_out, dt)
             if rigid:
                 self._store_tendon_tension()
+            self._save_model_tendons(state_out)
             if rigid and self._warm_start is not None:
                 self._store_warm_start()
             if contact_f is not None:
@@ -3133,6 +3124,7 @@ class SolverFBA(SolverBase):
         if mixed is not None:
             self._end_mixed_rows()
         self._store_tendon_tension()
+        self._save_model_tendons(state_out)
         if self._warm_start is not None:
             self._store_warm_start()
         if self.friction_anchors:
@@ -3469,7 +3461,8 @@ class SolverFBA(SolverBase):
 
     @classmethod
     def register_custom_attributes(cls, builder: ModelBuilder) -> None:
-        """Register the custom attributes of SolverFBA: the bending elements of particle rods.
+        """Register the custom attributes of SolverFBA: the bending elements of particle rods and the friction and
+        softness of tendons.
 
         Registers the custom frequency ``fba:rod_bend``, one entry per bending element, with the attributes
         ``fba:rod_bend_particles`` (``vec3i``), the rod's particles before, at and after the bend, and
@@ -3477,9 +3470,26 @@ class SolverFBA(SolverBase):
         as ``model.fba.rod_bend_particles`` and ``model.fba.rod_bend_stiffness``. :meth:`add_particle_rod`
         registers them itself.
 
+        For the model's tendons (:meth:`~newton.ModelBuilder.add_tendon`) it registers, per tendon guide,
+        ``fba:guide_friction_force`` [N] (default 0), a friction force on the string running over the guide that
+        does not grow with the load (a bearing's seal drag, the string's bending over a pulley); and per tendon
+        ``fba:tendon_time`` [s] (default 0) and ``fba:tendon_damping_ratio`` (default 1), a spring and damper on the
+        tendon's length relative to its rows' effective mass, as MuJoCo's ``solref`` time constant and damping
+        ratio, in place of its spans' compliance and damping (a compatibility setting for scenes tuned in MuJoCo).
+
         Args:
             builder: Model builder to register the attributes on.
         """
+        for name, frequency, default in (
+            ("guide_friction_force", Model.AttributeFrequency.TENDON_GUIDE, 0.0),
+            ("tendon_time", Model.AttributeFrequency.TENDON, 0.0),
+            ("tendon_damping_ratio", Model.AttributeFrequency.TENDON, 1.0),
+        ):
+            builder.add_custom_attribute(
+                ModelBuilder.CustomAttribute(
+                    name=name, frequency=frequency, dtype=wp.float32, namespace="fba", default=default
+                )
+            )
         builder.add_custom_frequency(ModelBuilder.CustomFrequency(name="rod_bend", namespace="fba"))
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
@@ -3643,6 +3653,194 @@ class SolverFBA(SolverBase):
         else:
             sc.query_radius = float((margin + gap).max())
 
+    def _init_model_tendons(self) -> None:
+        """Take the tendons of the model (:meth:`~newton.ModelBuilder.add_tendon`) as tendon rows that SolverFBA
+        routes itself.
+
+        Each tendon splits at its interior anchors into groups of guides between two anchors. A group is one row on
+        its total length, as :meth:`set_tendons` holds one: the material passes freely through its pinholes and
+        rollers, and its two anchors take the force. The guides between a group's anchors must be on bodies that
+        SolverFBA does not integrate (static or kinematic), since the row reaches the bodies of its anchors alone.
+        Newton's routing of the tendons (:class:`~newton._src.solvers.tendon_state.TendonStateMixin`, shared with
+        the other solvers) places the spans' ends and the rollers' tangent points at each step's start.
+        """
+        from ...sim.tendon import TendonGuideType  # noqa: PLC0415
+
+        model = self.model
+        if not getattr(model, "tendon_count", 0) or not model.tendon_segment_count:
+            return
+        if model.world_count > 1:
+            raise NotImplementedError("SolverFBA simulates the model's tendons in one world")
+        if not self.friction or self.nsn_schur_mode != "full":
+            raise NotImplementedError("tendons need friction=True and nsn_schur_mode='full'")
+        if self.integrate_with_external_rigid_solver:
+            raise ValueError("tendons need the bodies that SolverFBA integrates")
+        start = model.tendon_start.numpy()
+        guide_type = model.tendon_guide_type.numpy()
+        guide_body = model.tendon_guide_body.numpy()
+        dynamic = (model.body_flags.numpy() & int(BodyFlags.DYNAMIC)) != 0
+        anchor = int(TendonGuideType.ANCHOR)
+        groups = []
+        for t in range(model.tendon_count):
+            first, end = int(start[t]), int(start[t + 1])
+            if guide_type[first] != anchor or guide_type[end - 1] != anchor:
+                raise NotImplementedError(f"SolverFBA needs tendon {t} to start and end at anchors")
+            for g in range(first + 1, end):
+                if g == end - 1 or guide_type[g] == anchor:
+                    groups.append((t, first, g))
+                    first = g
+        for t, a, b in groups:
+            for g in range(a + 1, b):
+                if dynamic[guide_body[g]]:
+                    raise NotImplementedError(
+                        f"SolverFBA routes tendon {t} only over guides on bodies that it does not integrate: guide "
+                        f"{g} is on the dynamic body {guide_body[g]}"
+                    )
+        self._init_tendon_state(model)
+        group = np.asarray(groups, dtype=np.int32)
+        G, device = group.shape[0], self._device
+        ends = guide_body[group[:, 1:]].astype(np.int32)
+        points = model.tendon_guide_offset.numpy()[group[:, 1:]].astype(np.float32)
+        self._model_tendon_groups_h = group
+        self._model_tendon_groups = wp.array(group, dtype=wp.int32, device=device)
+        self._tendons = (
+            wp.array(ends, dtype=wp.int32, device=device),
+            wp.array(points, dtype=wp.vec3, device=device),
+            wp.zeros((G, 2), dtype=wp.vec3, device=device),
+            *(wp.zeros(G, dtype=wp.float64, device=device) for _ in range(3)),
+        )
+        self._tendon_friction = tuple(wp.zeros(G, dtype=wp.float64, device=device) for _ in range(2))
+        self._tendon_tension = wp.zeros(G, dtype=wp.float64, device=device)
+        self._tendon_soft = tuple(wp.zeros(G, dtype=wp.float64, device=device) for _ in range(4))
+        self._tendon_count, self._tendon_body_h, self._tendon_ws = G, ends, None
+        self._model_tendon_rest()
+        self._model_tendon_properties()
+
+    def _model_tendon_rest(self) -> None:
+        """The rest length of each model tendon group: the material of its spans and of its rollers' arcs in the
+        routing's initial state, as Newton's total cable of a tendon."""
+        from ...sim.tendon import TendonGuideType  # noqa: PLC0415
+        from ..tendon_state import _transform_point_np, _transform_vector_np  # noqa: PLC0415
+
+        model, initial = self.model, self._tendon_initial_state
+        rest_seg = initial["tendon_segment_rest_length"].numpy()
+        seg_active = initial["tendon_segment_active"].numpy()
+        seg_l = initial["tendon_segment_active_guide_l"].numpy()
+        seg_r = initial["tendon_segment_active_guide_r"].numpy()
+        att_l = initial["tendon_segment_attachment_l"].numpy().astype(np.float64)
+        att_r = initial["tendon_segment_attachment_r"].numpy().astype(np.float64)
+        guide_active = initial["tendon_guide_active"].numpy()
+        guide_type = model.tendon_guide_type.numpy()
+        guide_body = model.tendon_guide_body.numpy()
+        guide_radius = model.tendon_guide_radius.numpy()
+        guide_offset = model.tendon_guide_offset.numpy().astype(np.float64)
+        guide_axis = model.tendon_guide_axis.numpy().astype(np.float64)
+        body_q = model.body_q.numpy().astype(np.float64)
+        rest = np.zeros(self._tendon_count)
+        for k, (t, a, b) in enumerate(self._model_tendon_groups_h):
+            segs = [s for s in (i - t for i in range(a, b)) if seg_active[s]]
+            rest[k] = sum(rest_seg[s] for s in segs)
+            for g in range(a + 1, b):
+                if guide_type[g] != int(TendonGuideType.ROLLER) or not guide_active[g]:
+                    continue
+                left = [s for s in segs if seg_r[s] == g]
+                right = [s for s in segs if seg_l[s] == g]
+                if not left or not right:
+                    continue
+                q = body_q[guide_body[g]]
+                center = _transform_point_np(q, guide_offset[g])
+                normal = _transform_vector_np(q, guide_axis[g])
+                r_l, r_r = att_r[left[0]] - center, att_l[right[0]] - center
+                r_l -= np.dot(r_l, normal) * normal
+                r_r -= np.dot(r_r, normal) * normal
+                theta = abs(np.arctan2(np.dot(np.cross(r_l, r_r), normal), np.dot(r_l, r_r)))
+                rest[k] += theta * guide_radius[g]
+        self._tendons[4].assign(rest)
+
+    def _model_tendon_properties(self) -> None:
+        """Each model tendon group's softness and friction force: the compliance and damping summed over its spans,
+        as Newton merges spans; the time constant and damping ratio of its tendon (``fba:tendon_time``,
+        ``fba:tendon_damping_ratio``); the friction forces of its guides (``fba:guide_friction_force``), summed."""
+        model = self.model
+        compliance = model.tendon_segment_compliance.numpy()
+        damping = model.tendon_segment_damping.numpy()
+        fba = getattr(model, "fba", None)
+
+        def attribute(name, count, default):
+            values = getattr(fba, name, None)
+            return np.full(count, default) if values is None else values.numpy().astype(np.float64).reshape(-1)
+
+        force = attribute("guide_friction_force", model.tendon_guide_count, 0.0)
+        time = attribute("tendon_time", model.tendon_count, 0.0)
+        ratio = attribute("tendon_damping_ratio", model.tendon_count, 1.0)
+        if (force < 0.0).any() or (time < 0.0).any() or (ratio < 0.0).any():
+            raise ValueError("fba:guide_friction_force, fba:tendon_time and fba:tendon_damping_ratio must be >= 0")
+        group = self._model_tendon_groups_h
+        segments = [np.arange(a, b) - t for t, a, b in group]
+        values = (
+            np.array([compliance[s].sum() for s in segments]),
+            np.array([damping[s].sum() for s in segments]),
+            time[group[:, 0]],
+            ratio[group[:, 0]],
+        )
+        for array, value in zip(self._tendon_soft, values, strict=True):
+            array.assign(value)
+        self._tendon_friction[1].assign(np.array([force[a : b + 1].sum() for _, a, b in group]))
+        self._tendon_soft_any = bool((values[0] > 0.0).any() or (values[2] > 0.0).any())
+
+    def _route_model_tendons(self, state_in: State) -> None:
+        """Route the model's tendons at the step's start poses with Newton's shared routing, and write each group's
+        targets, middle length and friction coefficient for the step's tendon rows."""
+        if self._model_tendon_groups is None:
+            return
+        from ..tendon_kernels import update_tendon_attachments  # noqa: PLC0415
+        from .rigid_contact import model_tendon_paths_kernel  # noqa: PLC0415
+
+        model, body_q, device = self.model, state_in.body_q, self._device
+        self._load_tendon_history(state_in)
+        self._snapshot_tendon_step_state()
+        self._update_tendon_guide_active(model, body_q)
+        self._prepare_tendon_route(model, body_q)
+        self._rebaseline_tendon_geometry(body_q)
+        wp.launch(
+            update_tendon_attachments,
+            dim=model.tendon_segment_count,
+            inputs=[
+                *(body_q, model.tendon_start, self.tendon_guide_tendon, model.tendon_guide_body),
+                *(model.tendon_guide_type, model.tendon_guide_flags, model.tendon_guide_radius),
+                *(model.tendon_guide_orientation, model.tendon_guide_offset, model.tendon_guide_axis),
+                *(self.tendon_segment_active, self.tendon_segment_active_guide_l, self.tendon_segment_active_guide_r),
+                *(self.tendon_guide_active, self.tendon_guide_active_step),
+                *(self.tendon_segment_attachment_l_local_step, self.tendon_segment_attachment_r_local_step, 0),
+            ],
+            outputs=[
+                *(self.tendon_segment_attachment_l, self.tendon_segment_attachment_r),
+                *(self.tendon_segment_attachment_l_local, self.tendon_segment_attachment_r_local),
+                *(self.tendon_segment_rolling_delta_l, self.tendon_segment_rolling_delta_r, self.tendon_segment_length),
+            ],
+            device=device,
+        )
+        self._update_tendon_cone_rows(model, body_q, False)
+        wp.launch(
+            model_tendon_paths_kernel,
+            dim=self._tendon_count,
+            inputs=[
+                *(self._model_tendon_groups, model.tendon_guide_type, model.tendon_guide_body),
+                *(model.tendon_guide_radius, model.tendon_guide_offset, model.tendon_guide_axis),
+                *(self.tendon_guide_active, self.tendon_segment_active),
+                *(self.tendon_segment_active_guide_l, self.tendon_segment_active_guide_r),
+                *(self.tendon_segment_attachment_l, self.tendon_segment_attachment_r, self.tendon_segment_length),
+                *(self.tendon_guide_cap_ratio, body_q),
+            ],
+            outputs=[self._tendons[2], self._tendons[3], self._tendon_friction[0]],
+            device=device,
+        )
+
+    def _save_model_tendons(self, state_out: State) -> None:
+        """Keep the routing history of the model's tendons in the output state, as Newton's other solvers do."""
+        if self._model_tendon_groups is not None:
+            self._save_tendon_history(state_out)
+
     def set_tendons(
         self, bodies, points, targets, middle_lengths, rest_lengths, friction_coefficients=None, friction_forces=None
     ) -> None:
@@ -3675,7 +3873,10 @@ class SolverFBA(SolverBase):
         which a slack string snaps taut does not hold its slide with the whole catch impulse.
 
         The rows are solved with the rigid contacts (``friction=True``, ``nsn_schur_mode="full"``, one world).
-        ``None`` removes the tendons.
+        ``None`` removes the tendons. These tendons are inextensible; the tendons of the model
+        (:meth:`~newton.ModelBuilder.add_tendon`), which SolverFBA routes itself, take the compliance and damping of
+        their spans, and a model with tendons cannot take these as well. This low-level path, for callers that route
+        their tendons themselves, will be removed.
 
         Args:
             bodies: The two bodies of each tendon, shape ``(T, 2)``, ``-1`` for the world.
@@ -3688,9 +3889,12 @@ class SolverFBA(SolverBase):
             friction_forces: Each tendon's friction force ``F0 >= 0`` on its slide that does not grow with the load
                 [N], shape ``(T,)``; ``None`` for none.
         """
+        if self._model_tendon_groups is not None:
+            raise ValueError("the model's tendons (ModelBuilder.add_tendon) cannot be combined with set_tendons")
         if bodies is None or len(bodies) == 0:
             self._tendons, self._tendon_count, self._tendon_ws = None, 0, None
             self._tendon_friction = self._tendon_tension = None
+            self._tendon_soft, self._tendon_soft_any = None, False
             return
         b = np.asarray(bodies, dtype=np.int32)
         T = b.shape[0]
@@ -3732,6 +3936,12 @@ class SolverFBA(SolverBase):
             )
             self._tendon_tension = wp.zeros(T, dtype=wp.float64, device=device)
             self._tendon_ws = None
+            # Inextensible: no compliance, damping or time constant.
+            self._tendon_soft = (
+                *(wp.zeros(T, dtype=wp.float64, device=device) for _ in range(3)),
+                wp.ones(T, dtype=wp.float64, device=device),
+            )
+        self._tendon_soft_any = False
         self._tendon_count = T
         self._tendon_body_h = b
 
@@ -3746,6 +3956,8 @@ class SolverFBA(SolverBase):
             targets: Each end's next path point in the world [m], shape ``(T, 2)`` of ``wp.vec3``.
             middle_lengths: The path's length between the two targets [m], shape ``(T,)`` of ``wp.float64``.
         """
+        if self._model_tendon_groups is not None:
+            raise ValueError("SolverFBA routes the model's tendons (ModelBuilder.add_tendon) itself")
         if not self._tendon_count:
             raise ValueError("set_tendon_paths moves the paths of tendons that set_tendons holds")
         T = self._tendon_count
@@ -4137,6 +4349,13 @@ class SolverFBA(SolverBase):
             raise ValueError("'state' argument is required.")
         world_mask = self._normalize_reset_world_mask(world_mask)
         model, device = self.model, self._device
+        if self._model_tendon_groups is not None:
+            # The routing history of the model's tendons, their rest lengths from the routing's (possibly edited)
+            # baseline, and their rows' tension and warm start.
+            self._reset_tendon_state(state, world_mask)
+            self._model_tendon_rest()
+            self._tendon_tension.zero_()
+            self._tendon_ws = None
         flags_value = int(StateFlags.ALL if flags is None else flags)
         fields = [
             ("particle_q", StateFlags.PARTICLE_Q, model.particle_world),
@@ -4244,7 +4463,8 @@ class SolverFBA(SolverBase):
         ``ModelFlags.SHAPE_PROPERTIES`` stands for changes of the particles and elements, whose masses,
         materials and rest shapes the factored system matrix holds; Newton has no flag of its own for them.
         ``BODY_PROPERTIES``, ``BODY_INERTIAL_PROPERTIES`` and ``JOINT_PROPERTIES`` rebuild the system of the
-        integrated bodies and their joint rows.
+        integrated bodies and their joint rows. ``TENDON_PROPERTIES`` refreshes the tendons' compliance, damping and
+        FBA attributes; their rest lengths take effect at the next :meth:`reset`.
         """
         if flags & ModelFlags.SHAPE_PROPERTIES:
             self._linear_solver = self._two_way_ls = self._mixed = None
@@ -4252,6 +4472,11 @@ class SolverFBA(SolverBase):
             self._invalidate_schur_cache()
         if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.BODY_INERTIAL_PROPERTIES | ModelFlags.JOINT_PROPERTIES):
             self._rigid_dt = None
+        if flags & ModelFlags.TENDON_PROPERTIES and self._model_tendon_groups is not None:
+            # Compliance, damping and the FBA tendon attributes take effect at the next step; rest-length edits,
+            # as in Newton's routing, at the next reset.
+            self._refresh_tendon_properties()
+            self._model_tendon_properties()
 
     def _invalidate_schur_cache(self) -> None:
         """Drop the per-step ``W`` cache.

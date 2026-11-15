@@ -303,36 +303,40 @@ Model Inputs
   articulation; DISTANCE and ROD joints, and joints that lock more directions
   of a set of connected bodies than the bodies have, as kinematic loops do,
   raise ``NotImplementedError``. A body turns by at most 0.5 rad per step.
-- **Tendons**: :meth:`~newton.solvers.SolverFBA.set_tendons` adds
-  inextensible strings between two bodies, or between a body and a fixed
-  point, for the next step: each holds ``L <= rest`` with ``L`` the length
-  between the two targets (the path's next points from the ends, such as where
-  it meets a pulley) plus each end's run to its target. A tendon pulls,
-  never pushes, and takes no force while slack. Its row is a frictionless
-  contact with the ends' bodies in the rigid Newton step, its Jacobian the
-  directions from the ends toward their targets (the length's derivative,
-  since the path between the targets is fixed for the step), and its value
-  measures the runs along those directions, so that it is linear within the
-  step, as a contact's normal gap is, also for an end that reaches its target.
-  The caller sets the tendons before each step from the current poses,
-  routing them over fixed pulleys. A friction coefficient ``mu`` per tendon
-  resists the string running over its pulleys with a friction that grows with
-  the load, as a linearized capstan or a bearing friction: a second row holds
-  the slide of its first end along its run with a Coulomb force of at most
-  ``mu`` times the tension, solved with the contacts, so that a slack tendon
-  carries no friction and ``mu <= 1`` keeps the first end's tension
-  ``T (1 - mu)`` nonnegative. A friction force ``F0`` per tendon adds a part
-  that does not grow with the load (a bearing's seal drag, the string's
-  bending over its pulleys): the bound becomes ``F0 + mu T``, at most ``T``,
-  so that the string never pushes its first end; within a step it is a
-  coefficient ``min(1, mu + F0 / T_prev)`` from the previous step's tension,
-  and ``mu`` alone after a step without tension, so that a slack string that
-  snaps taut is not held by the whole catch impulse. ``tendon_time`` makes
-  the length limits soft as ``rigid_contact_time`` does contacts: a taut
-  string stretches ``T tau² / m`` and stops a load it catches over a few
-  steps, its damper acting on the stretch of a taut string only, so that a
-  slack string pulls nothing.
-  Tendons need the full operator and one world.
+- **Tendons**: FBA simulates the model's tendons
+  (:meth:`~newton.ModelBuilder.add_tendon`) and routes them itself with
+  Newton's routing of anchors, pinholes and rollers, the same as the other
+  solvers'. Each tendon splits at its interior anchors into groups, and a group
+  is one row on its total length: it holds ``L <= rest``, its rest length the
+  group's material (its spans and its rollers' arcs), so that the material
+  passes freely through pinholes and rollers, and its anchors take the force.
+  The guides between a group's anchors must be on bodies that FBA does not
+  integrate (static or kinematic). A tendon pulls, never pushes, and takes no
+  force while slack. Its row is a frictionless contact with the anchors' bodies
+  in the rigid Newton step, its Jacobian the directions from the anchors toward
+  the next points of the path at the step's start (the length's derivative,
+  since the path between them is fixed for the step), and its value measures
+  the runs along those directions, so that it is linear within the step, as a
+  contact's normal gap is, also for an end that reaches its next point.
+  Friction acts on the slide of the group's first anchor along its run, solved
+  with the contacts: the guides' capstan coefficients ``mu`` give it a Coulomb
+  bound of ``min(1, sum mu theta)`` times the tension, ``theta`` the guides'
+  wrap angles at the step's start (a linearized capstan), so that a slack
+  tendon carries no friction and the first anchor's tension stays nonnegative;
+  a guide's ``fba:guide_friction_force`` ``F0`` [N] adds a part that does not
+  grow with the load, the bound ``F0 + mu T`` at most ``T``, within a step a
+  coefficient from the previous step's tension (``mu`` alone after a step
+  without tension, so that a string snapping taut is not held by the catch).
+  The spans' compliance and damping, summed over a group as Newton merges
+  spans, make its row a spring and damper in parallel on the stretch of a taut
+  string, so that a slack string pulls nothing and a caught load stops over a
+  few steps; ``fba:tendon_time`` and ``fba:tendon_damping_ratio`` per tendon
+  instead take them relative to the row's effective mass, as MuJoCo's
+  ``solref`` does, for scenes tuned in MuJoCo.
+  :meth:`~newton.solvers.SolverFBA.register_custom_attributes` registers these
+  attributes. :meth:`~newton.solvers.SolverFBA.set_tendons` remains for a
+  while for callers that route their own inextensible tendons, but not with
+  the model's. Tendons need the full operator and one world.
 
 FBA does not simulate equality constraints, mimic joints, the model's
 particle-body attachments (tie particles to bodies with
