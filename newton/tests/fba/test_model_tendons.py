@@ -47,8 +47,14 @@ def _solver(model, sparse, **kwargs):
     )
 
 
-def _run(model, solver, steps, dt):
+def _run(model, solver, steps, dt, velocities=None):
+    """Step from rest, or from the linear ``velocities`` of some bodies; returns the last state and the poses."""
     s0, s1 = model.state(), model.state()
+    if velocities:
+        qd = s0.body_qd.numpy()
+        for body, v in velocities.items():
+            qd[body, :3] = v
+        s0.body_qd.assign(qd)
     trace = []
     for _ in range(steps):
         solver.step(s0, s1, None, None, dt)
@@ -57,9 +63,10 @@ def _run(model, solver, steps, dt):
     return s0, np.array(trace)
 
 
-def _atwood(m1, m2, drop=0.4, pinholes=True, mu=0.0, force=0.0, radius=0.05):
+def _atwood(m1, m2, drop=0.4, pinholes=True, mu=0.0, force=0.0, radius=0.05, slack=0.0):
     """Boxes of ``m1`` and ``m2`` hanging ``drop`` below two pinholes 0.2 m apart, or on both sides of one roller of
-    ``radius`` (``pinholes=False``), on one string from the first box's top to the second's, at rest."""
+    ``radius`` (``pinholes=False``), on one string from the first box's top to the second's, at rest; with
+    ``slack``, the pinholes' string is that much longer than its path."""
     builder = _builder()
     if pinholes:
         A, B = np.array([-0.1, 0.0, 1.0]), np.array([0.1, 0.0, 1.0])
@@ -70,9 +77,17 @@ def _atwood(m1, m2, drop=0.4, pinholes=True, mu=0.0, force=0.0, radius=0.05):
     b2 = _box(builder, B - (0.0, 0.0, drop + H), m2)
     attributes = {"fba:guide_friction_force": force}
     if pinholes:
+        rest = (drop, 0.2, drop + slack) if slack else (-1.0, -1.0, -1.0)
         middle = [
-            newton.TendonGuide(body=fixed, guide_type=PINHOLE, offset=tuple(A), mu=mu, custom_attributes=attributes),
-            newton.TendonGuide(body=fixed, guide_type=PINHOLE, offset=tuple(B), mu=mu),
+            newton.TendonGuide(
+                body=fixed,
+                guide_type=PINHOLE,
+                offset=tuple(A),
+                mu=mu,
+                rest_length=rest[0],
+                custom_attributes=attributes,
+            ),
+            newton.TendonGuide(body=fixed, guide_type=PINHOLE, offset=tuple(B), mu=mu, rest_length=rest[1]),
         ]
     else:
         middle = [
@@ -87,7 +102,10 @@ def _atwood(m1, m2, drop=0.4, pinholes=True, mu=0.0, force=0.0, radius=0.05):
                 custom_attributes=attributes,
             )
         ]
-    builder.add_tendon([_top(b1), *middle, _top(b2)])
+    last = _top(b2)
+    if pinholes and slack:
+        last = newton.TendonGuide(body=b2, guide_type=ANCHOR, offset=(0.0, 0.0, H), rest_length=rest[2])
+    builder.add_tendon([_top(b1), *middle, last])
     return builder.finalize(), b1, b2
 
 
@@ -300,6 +318,160 @@ class TestModelTendons(unittest.TestCase):
                 self.assertTrue(engaged)
                 self.assertLess(max(lengths), rest + 2e-3)
 
+    def test_pendulum_keeps_its_length(self):
+        """A box hanging 0.5 m off a fixed point, let go 30 degrees out, swings on the taut string: its top stays at
+        the string's length from the point, and the box swings down through the bottom."""
+        anchor, length = np.array([0.0, 0.0, 1.0]), 0.5
+        a = np.radians(30)
+        top = anchor + length * np.array([np.sin(a), 0.0, -np.cos(a)])
+        for sparse in (False, True):
+            with self.subTest(sparse=sparse):
+                builder = _builder()
+                fixed = _fixed(builder, tuple(anchor))
+                box = _box(builder, top - (0.0, 0.0, H), 0.2)
+                builder.add_tendon([newton.TendonGuide(body=fixed, guide_type=ANCHOR), _top(box)])
+                model = builder.finalize()
+                _state, trace = _run(model, _solver(model, sparse), 120, 0.004)
+                tops = np.array([_point(q[box], (0.0, 0.0, H)) for q in trace])
+                distances = np.linalg.norm(tops - anchor, axis=1)
+                self.assertLess(distances.max(), length + 2e-4)
+                self.assertGreater(distances.min(), length - 2e-3)
+                self.assertLess(tops[:, 0].min(), 0.0)  # swung through the bottom to the other side
+
+    def test_friction_force_never_pushes(self):
+        """The Atwood machine sliding at 0.3 m/s (the 20 g box rising) against a guide friction force of 1 N, far
+        above the tension: the friction stops the slide but never exceeds the tension, so the string never pushes
+        the 20 g box down faster than it falls freely, and the boxes come to rest."""
+        dt = 0.002
+        for sparse in (False, True):
+            with self.subTest(sparse=sparse):
+                model, b1, b2 = _atwood(0.02, 0.03, force=1.0)
+                solver = _solver(model, sparse)
+                s0, s1 = model.state(), model.state()
+                qd = s0.body_qd.numpy()
+                qd[b1, 2], qd[b2, 2] = 0.3, -0.3
+                s0.body_qd.assign(qd)
+                v1 = []
+                for _ in range(100):
+                    solver.step(s0, s1, None, None, dt)
+                    s0, s1 = s1, s0
+                    v1.append(float(s0.body_qd.numpy()[b1, 2]))
+                a1 = np.diff(np.concatenate([[0.3], v1])) / dt
+                self.assertGreater(a1.min(), -G * 1.05)
+                np.testing.assert_allclose(s0.body_qd.numpy()[[b1, b2], 2], 0.0, atol=2e-3)
+
+    def test_friction_force_after_a_catch(self):
+        """The Atwood machine with its string 2 cm longer than its path, released from rest, with a friction force of
+        0.05 N: both boxes fall freely 1 cm until the string catches them at 0.443 m/s, which leaves the 20 g box
+        rising at 0.089 m/s. The step of the catch is not held by the friction (the F0 part starts at the step after
+        the string holds a tension), and the 20 g box then accelerates at ((m2 - m1) g - F0) / (m1 + m2)."""
+        dt, f0, m1, m2 = 0.002, 0.05, 0.02, 0.03
+        t_catch = np.sqrt(2 * 0.01 / G)
+        for sparse in (False, True):
+            with self.subTest(sparse=sparse):
+                model, b1, _b2 = _atwood(m1, m2, force=f0, slack=0.02)
+                solver = _solver(model, sparse)
+                s0, s1 = model.state(), model.state()
+                v1 = []
+                for _ in range(150):
+                    solver.step(s0, s1, None, None, dt)
+                    s0, s1 = s1, s0
+                    v1.append(float(s0.body_qd.numpy()[b1, 2]))
+                v1 = np.array(v1)
+                caught = int(np.argmax(v1 > 0.0))
+                self.assertGreater(caught, 0)
+                self.assertGreater(v1[caught], 0.02)  # the catch step rises (it sticks at 0 when held)
+                theory = 0.443 * (m2 - m1) / (m1 + m2) + ((m2 - m1) * G - f0) / (m1 + m2) * (0.3 - t_catch)
+                self.assertAlmostEqual(v1[-1] / theory, 1.0, delta=0.04)
+
+    def test_slack_tendon_carries_no_friction(self):
+        """A 1 kg box without gravity, the first anchor of a 1 m string through a pinhole 0.3 m away, moves toward the
+        pinhole at 0.5 m/s: the slack string with the pinhole's capstan mu 1 and a friction force of 1 N neither slows
+        nor pushes it."""
+        A = np.array([0.0, 0.0, 1.0])
+        for sparse in (False, True):
+            with self.subTest(sparse=sparse):
+                builder = _builder(gravity=0.0)
+                fixed = _fixed(builder)
+                box = _box(builder, A + np.array([0.3, 0.0, 0.0]), 1.0)
+                builder.add_tendon(
+                    [
+                        newton.TendonGuide(body=box, guide_type=ANCHOR),
+                        newton.TendonGuide(
+                            body=fixed,
+                            guide_type=PINHOLE,
+                            offset=tuple(A),
+                            mu=1.0,
+                            rest_length=0.7,
+                            custom_attributes={"fba:guide_friction_force": 1.0},
+                        ),
+                        newton.TendonGuide(
+                            body=fixed, guide_type=ANCHOR, offset=tuple(A + np.array([0.0, 0.0, 0.1])), rest_length=0.3
+                        ),
+                    ]
+                )
+                model = builder.finalize()
+                state, _trace = _run(model, _solver(model, sparse), 100, 0.004, {box: (-0.5, 0.0, 0.0)})
+                np.testing.assert_allclose(state.body_qd.numpy()[box, :3], (-0.5, 0.0, 0.0), atol=1e-6)
+                self.assertAlmostEqual(float(state.body_q.numpy()[box, 0]), 0.3 - 0.5 * 0.4, delta=1e-5)
+
+    def test_slack_string_pulls_nothing(self):
+        """A box 0.1 m below a fixed point on a 0.3 m string falls freely until the string goes taut, then hangs."""
+        anchor, dt = np.array([0.0, 0.0, 1.0]), 0.002
+        builder = _builder()
+        fixed = _fixed(builder, tuple(anchor))
+        box = _box(builder, anchor - (0.0, 0.0, 0.1 + H), 0.1)
+        builder.add_tendon(
+            [
+                newton.TendonGuide(body=fixed, guide_type=ANCHOR),
+                newton.TendonGuide(body=box, guide_type=ANCHOR, offset=(0.0, 0.0, H), rest_length=0.3),
+            ]
+        )
+        model = builder.finalize()
+        _state, trace = _run(model, _solver(model, True), 200, dt)
+        top = trace[:, box, 2] + H
+        free = 0.9 - 0.5 * G * ((np.arange(200) + 1) * dt) ** 2
+        falling = top > anchor[2] - 0.29
+        np.testing.assert_allclose(top[falling], free[falling], atol=2e-3)  # free fall while slack
+        self.assertAlmostEqual(top[-1], anchor[2] - 0.3, delta=2e-3)  # caught at the string's length
+
+    def test_end_held_at_its_target(self):
+        """A box whose top is tied by a string of zero length to a fixed point, pushed sideways: the end sits on its
+        target, where the run's direction flips as the end passes it. With many iterations per step the box swings
+        about the point and stays within about one step's travel (1.2 mm) of it, without the iterations running
+        away."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        anchor = np.array([0.0, 0.0, 1.0])
+        for sparse in (False, True):
+            with self.subTest(sparse=sparse):
+                builder = _builder()
+                fixed = _fixed(builder, tuple(anchor))
+                box = _box(builder, anchor - (0.0, 0.0, H + 1e-4), 0.1)
+                builder.add_tendon(
+                    [
+                        newton.TendonGuide(body=fixed, guide_type=ANCHOR),
+                        newton.TendonGuide(body=box, guide_type=ANCHOR, offset=(0.0, 0.0, H), rest_length=0.0),
+                    ]
+                )
+                model = builder.finalize()
+                solver = SolverFBA(
+                    model, iterations=40, nsn_sparse_storage=sparse, nsn_linear_iterations=10 if sparse else None
+                )
+                s0, s1 = model.state(), model.state()
+                qd = s0.body_qd.numpy()
+                qd[box, 0] = 0.3
+                s0.body_qd.assign(qd)
+                tops, speeds = [], []
+                for _ in range(150):
+                    solver.step(s0, s1, None, None, 0.004)
+                    s0, s1 = s1, s0
+                    q = s0.body_q.numpy()[box]
+                    tops.append(np.linalg.norm(_point(q, (0.0, 0.0, H)) - anchor))
+                    speeds.append(np.linalg.norm(s0.body_qd.numpy()[box, :3]))
+                self.assertLess(max(tops), 2e-3)
+                self.assertLess(max(speeds), 1.0)
+
     def test_model_tendons_are_validated(self):
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
@@ -317,14 +489,23 @@ class TestModelTendons(unittest.TestCase):
         )
         with self.assertRaises(NotImplementedError):
             SolverFBA(builder.finalize(), iterations=1)
-        model, b1, b2 = _atwood(0.02, 0.03)
-        solver = SolverFBA(model, iterations=1)
-        with self.assertRaises(ValueError):  # the model's tendons and set_tendons do not combine
-            solver.set_tendons([[b1, b2]], [[(0, 0, H), (0, 0, H)]], [[(0, 0, 1), (0, 0, 1)]], [0.0], [1.0])
-        with self.assertRaises(ValueError):
-            solver.set_tendon_paths(wp.zeros((1, 2), dtype=wp.vec3), wp.zeros(1, dtype=wp.float64))
+        model, _b1, _b2 = _atwood(0.02, 0.03)
+        self.assertEqual(SolverFBA(model, iterations=1)._tendon_count, 1)
         with self.assertRaises(NotImplementedError):
             SolverFBA(model, iterations=1, nsn_schur_mode="lite")
+
+
+def _point(q, local):
+    """World position of the body-frame point ``local`` of a body at pose ``q``."""
+    x, y, z, w = q[3:]
+    R = np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ]
+    )
+    return q[:3] + R @ np.asarray(local)
 
 
 def _routed_length(solver, state):
