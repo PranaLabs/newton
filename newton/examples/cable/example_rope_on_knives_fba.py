@@ -162,7 +162,7 @@ class Example:
     def test_final(self):
         if not self.segment_contacts:
             return
-        # The rope rests on every blade edge, its surface within 1 mm of the edge, and hangs clear of the floor.
+        # The rope lies across every blade edge, no edge more than 1 mm into it, and hangs clear of the floor.
         for x_blade in BLADE_X:
             z = self.rope_height_at(x_blade)
             assert z > BLADE_TOP + ROPE_RADIUS - 0.001, f"the blade at x={x_blade} cut into the rope to z={z:.4f} m"
