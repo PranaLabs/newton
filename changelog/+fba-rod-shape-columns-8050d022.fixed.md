@@ -1,0 +1,1 @@
+Fix `SolverFBA(rod_shape_contacts=True)` raising in a step that also takes rod or self contacts without face contacts: the rows of the segment contacts, with one further particle, now widen to the three of the rod and self contacts.

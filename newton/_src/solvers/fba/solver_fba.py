@@ -4729,10 +4729,9 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 if extra is None:
                     extra = [np.full((M, 3), -1, dtype=np.int32), np.zeros((M, 3), dtype=np.float32)]
                 elif extra[0].shape[1] < 3:
-                    extra = [
-                        np.pad(extra[0], ((0, 0), (0, 1)), constant_values=-1),
-                        np.pad(extra[1], ((0, 0), (0, 1))),
-                    ]
+                    # The face contacts take two further particles and the segment contacts one.
+                    pad = ((0, 0), (0, 3 - extra[0].shape[1]))
+                    extra = [np.pad(extra[0], pad, constant_values=-1), np.pad(extra[1], pad)]
                 extra = [np.concatenate([extra[0], sp[:, 1:]]), np.concatenate([extra[1], sa[:, 1:]])]
                 M = len(particle_h)
         self._contact_extra_h = None

@@ -62,7 +62,7 @@ class TestRodOverThinBar(unittest.TestCase):
         if not wp.is_cuda_available():
             raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
 
-    def _run(self, segments):
+    def _run(self, segments, **options):
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
         seg, zb = 0.006, 0.4
@@ -94,6 +94,7 @@ class TestRodOverThinBar(unittest.TestCase):
             rayleigh_corotated=True,
             rod_shape_contacts=segments,
             face_contact_edge_radius=5e-4,
+            **options,
         )
         pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.003)
         contacts = pipeline.contacts()
@@ -108,6 +109,11 @@ class TestRodOverThinBar(unittest.TestCase):
     def test_segments_keep_the_string_on_the_bar(self):
         self.assertFalse(self._run(False))
         self.assertTrue(self._run(True))
+
+    def test_segments_with_rod_contacts(self):
+        """Keep the string on the bar with rod contacts too, found between its legs within a 4 mm gap: the rows of
+        the segment contacts, with one further particle, join those of the rod contacts, with three."""
+        self.assertTrue(self._run(True, rod_contact=True, rod_contact_gap=0.004))
 
 
 class TestRodShapeContactOptions(unittest.TestCase):
