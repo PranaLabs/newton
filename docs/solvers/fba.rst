@@ -420,7 +420,9 @@ Contacts
   on a triangle's. A shape thinner than the gap between two particles' spheres
   then cannot pass between them, and a rod slides over a curve without
   catching on its particles. ``rod_shape_contact_gap`` sets the detection
-  distance. It needs friction and the full operator.
+  distance. It needs friction and the full operator. In the
+  ``rope_on_knives_fba`` example, a rope rests on blades thinner than the gaps
+  between its particles' spheres.
 - ``friction_anchors=True`` keeps the point a contact presses on across steps,
   on the other layer for a vertex-face self contact or on a static shape, so
   its friction rows pull back the slip that a step's solve leaves instead of
@@ -517,6 +519,11 @@ Examples
   it down elsewhere, holding it by the friction of its pads
   (``--grasp friction``) or by particle constraint rows at the particles
   between them (``--grasp pins``).
+- ``rope_on_knives_fba``: an 8 mm rope with its particles 12.5 mm apart drops
+  onto five steel blades 1 mm thick and comes to rest across their edges by
+  its segment contacts (``rod_shape_contacts=True``). With
+  ``--no-segment-contacts``, the blades pass between its particles and the
+  rope falls through them to the floor.
 - ``cloth_dual_franka_fba``: two Franka arms integrated by
   :class:`~newton.solvers.SolverFeatherstone` pinch the corners of a square
   towel and fold it twice into a square, with light Rayleigh mass damping.
