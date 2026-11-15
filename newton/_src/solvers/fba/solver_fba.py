@@ -713,9 +713,10 @@ class SolverFBA(TendonStateMixin, SolverBase):
         self._constraint_lengths = False  # the rows hold |sum_k c_k x_k|, along its direction at each iteration
         # set_particle_constraints(bodies=...): the body of each row (-1 for none) and its point in the body frame.
         self._constraint_body_h = self._constraint_body_d = self._constraint_point_d = None
-        # set_tendons: the step's tendon rows (body, point, target, middle, rest arrays) and their count.
+        # The tendon rows of the model's tendons, one per group: the step's (body, point, target, middle, rest,
+        # friction coefficient) arrays and their count, each group's friction coefficient and force, its tension at
+        # the end of the last step, and the warm start of its rows.
         self._tendons, self._tendon_count, self._tendon_ws = None, 0, None
-        # set_tendons: each tendon's friction coefficient and force, and its tension at the end of the last step.
         self._tendon_friction = self._tendon_tension = None
         # Each tendon row's softness: compliance [m/N] and damping [N·s/m] of its spans, or a time constant [s] and
         # damping ratio relative to its effective mass (fba:tendon_time); and the tendon groups of the model's
@@ -3657,9 +3658,9 @@ class SolverFBA(TendonStateMixin, SolverBase):
         """Take the tendons of the model (:meth:`~newton.ModelBuilder.add_tendon`) as tendon rows that SolverFBA
         routes itself.
 
-        Each tendon splits at its interior anchors into groups of guides between two anchors. A group is one row on
-        its total length, as :meth:`set_tendons` holds one: the material passes freely through its pinholes and
-        rollers, and its two anchors take the force. The guides between a group's anchors must be on bodies that
+        Each tendon splits at its interior anchors into groups of guides between two anchors. A group is one
+        unilateral row on its total length in the rigid NSN, solved with the contacts: the material passes freely
+        through its pinholes and rollers, and its two anchors take the force. The guides between a group's anchors must be on bodies that
         SolverFBA does not integrate (static or kinematic), since the row reaches the bodies of its anchors alone.
         Newton's routing of the tendons (:class:`~newton._src.solvers.tendon_state.TendonStateMixin`, shared with
         the other solvers) places the spans' ends and the rollers' tangent points at each step's start.
@@ -3840,139 +3841,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
         """Keep the routing history of the model's tendons in the output state, as Newton's other solvers do."""
         if self._model_tendon_groups is not None:
             self._save_tendon_history(state_out)
-
-    def set_tendons(
-        self, bodies, points, targets, middle_lengths, rest_lengths, friction_coefficients=None, friction_forces=None
-    ) -> None:
-        """Hold tendons, inextensible strings between two bodies, taut or slack, in the following steps.
-
-        Tendon ``t`` runs from ``points[t, 0]`` on body ``bodies[t, 0]`` to ``points[t, 1]`` on ``bodies[t, 1]``
-        (points in the body frames; on body ``-1`` a fixed world point). Between its ends its path is fixed for the
-        step: from each end it runs straight to ``targets[t, k]`` (world), its next path point, such as where it
-        meets a pulley, and between the two targets it has the length ``middle_lengths[t]``. Its row holds the slack
-        ``rest_lengths[t] - L >= 0`` with ``L`` the middle length plus each end's run to its target, as a
-        frictionless contact: the tension is the row's force, zero while the string is slack. Within a step an end's
-        run is measured along the direction from its start-of-step position to its target, so that the row is linear
-        in the step, as a contact's normal gap is, also for an end at its target. An end on an
-        integrated body takes the force at its point along the string; an end on the world or on a body that
-        SolverFBA does not integrate is fixed for the step. The caller updates the paths before each step (the
-        targets move as the ends do round wrapped objects); the length changes only to second order as a target
-        slides along a wrapped surface, so the row needs no term for it.
-
-        A tendon with a friction coefficient ``mu = friction_coefficients[t]`` resists the string running over its
-        pulleys with a friction that grows with the load, as a linearized capstan or a bearing whose friction grows
-        with the tension: a second row holds the slide of its first end along its run at zero with a Coulomb force
-        of at most ``mu T``, ``T`` the tension, solved with the other rows. The first end then feels a tension
-        between ``T (1 - mu)`` and ``T (1 + mu)``, and ``mu <= 1`` keeps it nonnegative; a slack tendon carries no
-        friction. A friction force ``F0 = friction_forces[t]`` [N] adds a part that does not grow with the load (a
-        bearing's seal drag, the string's bending over its pulleys): the bound becomes ``F0 + mu T``, at most ``T``,
-        so that the string never pushes its first end, and still none while slack. Within a step it is the
-        coefficient ``min(1, mu + F0 / T_prev)`` times the tension, ``T_prev`` the tension at the end of the
-        previous step; after a step without tension (before the first, or after a slack step) the coefficient is
-        ``mu`` alone, so that the ``F0`` part starts at the step after the string holds a tension and the step in
-        which a slack string snaps taut does not hold its slide with the whole catch impulse.
-
-        The rows are solved with the rigid contacts (``friction=True``, ``nsn_schur_mode="full"``, one world).
-        ``None`` removes the tendons. These tendons are inextensible; the tendons of the model
-        (:meth:`~newton.ModelBuilder.add_tendon`), which SolverFBA routes itself, take the compliance and damping of
-        their spans, and a model with tendons cannot take these as well. This low-level path, for callers that route
-        their tendons themselves, will be removed.
-
-        Args:
-            bodies: The two bodies of each tendon, shape ``(T, 2)``, ``-1`` for the world.
-            points: The ends' points in their bodies' frames [m], shape ``(T, 2, 3)``.
-            targets: Each end's next path point in the world [m], shape ``(T, 2, 3)``.
-            middle_lengths: The path's length between the two targets [m], shape ``(T,)``.
-            rest_lengths: The tendons' lengths [m], shape ``(T,)``.
-            friction_coefficients: Each tendon's friction coefficient ``0 <= mu <= 1`` on its slide over its pulleys,
-                shape ``(T,)``; ``None`` for none.
-            friction_forces: Each tendon's friction force ``F0 >= 0`` on its slide that does not grow with the load
-                [N], shape ``(T,)``; ``None`` for none.
-        """
-        if self._model_tendon_groups is not None:
-            raise ValueError("the model's tendons (ModelBuilder.add_tendon) cannot be combined with set_tendons")
-        if bodies is None or len(bodies) == 0:
-            self._tendons, self._tendon_count, self._tendon_ws = None, 0, None
-            self._tendon_friction = self._tendon_tension = None
-            self._tendon_soft, self._tendon_soft_any = None, False
-            return
-        b = np.asarray(bodies, dtype=np.int32)
-        T = b.shape[0]
-        if b.shape != (T, 2) or np.shape(points) != (T, 2, 3) or np.shape(targets) != (T, 2, 3):
-            raise ValueError(f"bodies need shape ({T}, 2), points and targets ({T}, 2, 3)")
-        if np.shape(middle_lengths) != (T,) or np.shape(rest_lengths) != (T,):
-            raise ValueError(f"middle_lengths and rest_lengths need shape ({T},)")
-        mu = np.zeros(T) if friction_coefficients is None else np.asarray(friction_coefficients, dtype=np.float64)
-        if mu.shape != (T,) or (mu < 0.0).any() or (mu > 1.0).any():
-            raise ValueError(f"friction_coefficients need shape ({T},) and values in [0, 1]")
-        f0 = np.zeros(T) if friction_forces is None else np.asarray(friction_forces, dtype=np.float64)
-        if f0.shape != (T,) or (f0 < 0.0).any():
-            raise ValueError(f"friction_forces need shape ({T},) and no negative value")
-        if (b < -1).any() or (b >= self.model.body_count).any():
-            raise ValueError("body indices out of range")
-        if not self.friction or self.nsn_schur_mode != "full" or self.model.world_count > 1:
-            raise NotImplementedError("tendons need friction=True, nsn_schur_mode='full' and one world")
-        if self.integrate_with_external_rigid_solver:
-            raise ValueError("tendons need the bodies that SolverFBA integrates")
-        device = self._device
-        arrays = (
-            (b, wp.int32),
-            (np.asarray(points, dtype=np.float32), wp.vec3),
-            (np.asarray(targets, dtype=np.float32), wp.vec3),
-            (np.asarray(middle_lengths, dtype=np.float64), wp.float64),
-            (np.asarray(rest_lengths, dtype=np.float64), wp.float64),
-            (mu, wp.float64),  # the step's coefficient, set from the two below at the step
-        )
-        if self._tendons is not None and self._tendon_count == T:
-            for dst, (a, _) in zip(self._tendons, arrays, strict=True):
-                dst.assign(a)  # the same arrays from step to step
-            self._tendon_friction[0].assign(mu)
-            self._tendon_friction[1].assign(f0)
-        else:
-            self._tendons = tuple(wp.array(a, dtype=t, device=device) for a, t in arrays)
-            self._tendon_friction = (
-                wp.array(mu, dtype=wp.float64, device=device),
-                wp.array(f0, dtype=wp.float64, device=device),
-            )
-            self._tendon_tension = wp.zeros(T, dtype=wp.float64, device=device)
-            self._tendon_ws = None
-            # Inextensible: no compliance, damping or time constant.
-            self._tendon_soft = (
-                *(wp.zeros(T, dtype=wp.float64, device=device) for _ in range(3)),
-                wp.ones(T, dtype=wp.float64, device=device),
-            )
-        self._tendon_soft_any = False
-        self._tendon_count = T
-        self._tendon_body_h = b
-
-    def set_tendon_paths(self, targets: wp.array, middle_lengths: wp.array) -> None:
-        """Move the paths of the tendons of :meth:`set_tendons` for the following steps: each end's next path point
-        ``targets`` and the length ``middle_lengths`` between the two, as there, from arrays on the solver's device.
-
-        They are copied on the device, so that the tendons' paths can be routed on the device each step without
-        reading the bodies' poses back to the host or uploading the paths.
-
-        Args:
-            targets: Each end's next path point in the world [m], shape ``(T, 2)`` of ``wp.vec3``.
-            middle_lengths: The path's length between the two targets [m], shape ``(T,)`` of ``wp.float64``.
-        """
-        if self._model_tendon_groups is not None:
-            raise ValueError("SolverFBA routes the model's tendons (ModelBuilder.add_tendon) itself")
-        if not self._tendon_count:
-            raise ValueError("set_tendon_paths moves the paths of tendons that set_tendons holds")
-        T = self._tendon_count
-        if not isinstance(targets, wp.array) or targets.dtype != wp.vec3 or tuple(targets.shape) != (T, 2):
-            raise ValueError(f"targets need a wp.array of wp.vec3 of shape ({T}, 2)")
-        if (
-            not isinstance(middle_lengths, wp.array)
-            or middle_lengths.dtype != wp.float64
-            or tuple(middle_lengths.shape) != (T,)
-        ):
-            raise ValueError(f"middle_lengths need a wp.array of wp.float64 of shape ({T},)")
-        if targets.device != self._tendons[2].device or middle_lengths.device != self._tendons[3].device:
-            raise ValueError(f"targets and middle_lengths need the solver's device, {self._tendons[2].device}")
-        wp.copy(self._tendons[2], targets)
-        wp.copy(self._tendons[3], middle_lengths)
 
     def set_particle_constraints(
         self, particles, coefficients, targets, *, directions=None, exact=False, bodies=None, body_points=None

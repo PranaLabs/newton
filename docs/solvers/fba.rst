@@ -334,9 +334,7 @@ Model Inputs
   instead take them relative to the row's effective mass, as MuJoCo's
   ``solref`` does, for scenes tuned in MuJoCo.
   :meth:`~newton.solvers.SolverFBA.register_custom_attributes` registers these
-  attributes. :meth:`~newton.solvers.SolverFBA.set_tendons` remains for a
-  while for callers that route their own inextensible tendons, but not with
-  the model's. Tendons need the full operator and one world.
+  attributes. Tendons need the full operator and one world.
 
 FBA does not simulate equality constraints, mimic joints, the model's
 particle-body attachments (tie particles to bodies with

@@ -1,1 +1,0 @@
-Remove the `tendon_time` and `tendon_damping` options of `SolverFBA`: the model's tendons take their softness from their spans' compliance and damping, or from the per-tendon attributes `fba:tendon_time` and `fba:tendon_damping_ratio` relative to the row's effective mass; tendons set with `SolverFBA.set_tendons` are inextensible.
