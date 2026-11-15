@@ -1,0 +1,1 @@
+Describe `SolverFBA`'s cloth bending as the plate it amounts to: on equilateral triangles, a bending stiffness of `3 * edge_ke` and Poisson's ratio -1/3, so a plate of stiffness `D` bent mostly about one axis takes `edge_ke = D / 3`. The docs called `edge_ke` a bending modulus, which made such a plate three times too stiff.

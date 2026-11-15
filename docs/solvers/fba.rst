@@ -203,8 +203,13 @@ Model Inputs
   ``"neohookean"`` take the elements' Lamé parameters; the
   :class:`~newton.solvers.SolverFBA` reference states how projective dynamics
   scales them. Interior edges add the isometric bending energy of Bergou et
-  al. with ``edge_ke`` as a bending modulus [N·m] and ``edge_rest_angle`` as
-  the rest angle. The same ``edge_ke`` bends an FBA cloth more stiffly than a
+  al., with ``edge_rest_angle`` as the rest angle. On equilateral triangles
+  it is the energy of an isotropic plate of bending stiffness
+  ``3 * edge_ke`` [N·m] and Poisson's ratio ``-1/3``, so a plate of
+  stiffness ``D`` that bends mostly about one axis takes ``edge_ke = D / 3``;
+  on grids of right triangles, bending about a diagonal axis is stiffer, by
+  the factors the :class:`~newton.solvers.SolverFBA` reference gives. The
+  same ``edge_ke`` bends an FBA cloth more stiffly than a
   :class:`~newton.solvers.SolverVBD` one, which scales it by the edge length.
 - **Soft bodies**: tetrahedra with the same stretching models.
 - **Springs**: each spring of the model is a stretch element of energy

@@ -126,12 +126,24 @@ class SolverFBA(TendonStateMixin, SolverBase):
     adds the isometric bending energy of Bergou et al. (2006),
     ``1/2 * edge_ke * 3 / (A0 + A1) * |sum_k q_k x_k|^2``, with the cotangent
     weights ``q`` of the edge's two triangles and their rest areas ``A0`` and
-    ``A1``; ``edge_rest_angle`` sets its rest curvature. ``edge_ke`` is thus a
-    bending modulus [N·m], and the bending energy of a given shape converges
-    as the mesh is refined. :class:`~newton.solvers.SolverVBD` scales
-    ``edge_ke`` by the edge length instead, ``1/2 * edge_ke * |e| * theta^2``
-    for a dihedral angle ``theta``: at small angles the same ``edge_ke``
-    bends an FBA cloth ``3 * |e| / (A0 + A1)`` times as stiffly.
+    ``A1``; ``edge_rest_angle`` sets its rest curvature. As the mesh is
+    refined, the bending energy of a given shape converges to that of a plate
+    whose stiffness depends on the triangles. On equilateral triangles it is
+    an isotropic plate of bending stiffness ``D = 3 * edge_ke`` [N·m] and
+    Poisson's ratio ``-1/3``, with the energy density
+    ``D / 2 * ((k1 + k2)^2 - 8/3 * k1 * k2)`` for the principal curvatures
+    ``k1`` and ``k2``: for a plate of stiffness ``D`` that bends mostly about
+    one axis, as in folds, drape or a cantilever, pass ``edge_ke = D / 3``.
+    On grids of right triangles, bending about an axis along the grid lines
+    takes the same ``3 * edge_ke``, and bending about a diagonal axis is
+    stiffer: 1.5 times with alternating diagonals, and with parallel
+    diagonals, as :meth:`~newton.ModelBuilder.add_cloth_grid` makes them,
+    3 times about an axis across the diagonals and not at all about one
+    along them. :class:`~newton.solvers.SolverVBD` scales ``edge_ke`` by the
+    edge length instead, ``1/2 * edge_ke * |e| * theta^2`` for a dihedral
+    angle ``theta``: at small angles ``|sum_k q_k x_k|`` is ``|e| * theta``,
+    so the same ``edge_ke`` bends an FBA cloth ``3 * |e| / (A0 + A1)`` times
+    as stiffly.
 
     Rayleigh damping, ``rayleigh_alpha`` and ``rayleigh_beta``, applies the
     forces ``-(alpha M + beta K) v`` by implicit Euler, with ``M`` the
