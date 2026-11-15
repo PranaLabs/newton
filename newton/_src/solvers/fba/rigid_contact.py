@@ -23,6 +23,8 @@ import numpy as np
 import warp as wp
 
 from ...sim import Contacts, Model
+from ...sim.tendon import TendonGuideType
+from ..tendon_kernels import wrapped_arc_length
 from .kernels import host_head, stored_contact_count
 from .rigid import _rotation_vector, slot_coefficients
 
@@ -774,27 +776,139 @@ def tendon_soft_kernel(
     target: wp.array2d[wp.vec3],
     middle: wp.array[wp.float64],
     rest: wp.array[wp.float64],
+    compliance: wp.array[wp.float64],
+    damping: wp.array[wp.float64],
+    time_constant: wp.array[wp.float64],
+    damping_ratio: wp.array[wp.float64],
+    row_slot: wp.array2d[wp.int32],
+    row_jac: wp.array2d[wp.spatial_vectord],
+    slot_inv_mass: wp.array[wp.spatial_matrixd],
     body_com: wp.array[wp.vec3],
     body_q0: wp.array[wp.transform],
-    eps: wp.float64,
-    beta: wp.float64,
+    dt: wp.float64,
+    row_offset: int,
     offset: int,
     # outputs
     soft_eps: wp.array[wp.float64],
     soft_beta: wp.array[wp.float64],
     soft_gap0: wp.array[wp.float64],
 ):
-    """Tendon ``t``'s soft-limit entries at ``offset + t``: ``eps``, ``beta`` and its stretch at the step start,
-    ``min(0, rest - (middle + sum |target - end|))``: the damper acts on the stretch of a taut string only, so that a
-    slack string does not pull before it is taut."""
+    """Tendon ``t``'s soft-limit entries at ``offset + t``, from its compliance ``C`` [m/N] and damping ``c``
+    [N·s/m]: the backward Euler step of a spring ``1 / C`` and a damper ``c`` in parallel on its length row (row
+    ``row_offset + 3t``), ``g + C dt / (dt + c C) F = c C / (dt + c C) g_start``. Its ``eps`` is that compliance
+    relative to the row's ``W_ii`` (``A⁻¹`` of its bodies along its Jacobian), ``eps = dt C / (W_ii (dt + c C))``,
+    as the normal law scales the force by ``dt² W_ii``; ``beta = c C / (dt + c C)``. With a positive time constant
+    ``tau`` the spring and damper are instead relative to the row's effective mass, as MuJoCo's solref takes them:
+    ``x = dt / tau``, ``eps = 1 / (x² + 2 zeta x)``, ``beta = 2 zeta / (x + 2 zeta)``. The start gap is the stretch
+    at the step start, ``min(0, rest - (middle + sum |target - end|))``: the damper acts on the stretch of a taut
+    string only, so that a slack string does not pull before it is taut. A tendon of zero compliance and no time
+    constant stays hard."""
     t = wp.tid()
     length = middle[t]
     for side in range(2):
         _lever, p0 = _tendon_end(body[t, side], point[t, side], body_com, body_q0)
         length += wp.length(wp.vec3d(target[t, side]) - p0)
+    c_t = compliance[t]
+    eps = wp.float64(0.0)
+    beta = wp.float64(0.0)
+    if time_constant[t] > wp.float64(0.0):
+        x_t = dt / time_constant[t]
+        zeta = damping_ratio[t]
+        eps = wp.float64(1.0) / (x_t * x_t + wp.float64(2.0) * zeta * x_t)
+        beta = wp.float64(2.0) * zeta / (x_t + wp.float64(2.0) * zeta)
+    elif c_t > wp.float64(0.0):
+        r = row_offset + 3 * t
+        w = wp.float64(0.0)
+        for side_a in range(2):
+            s = row_slot[r, side_a]
+            if s >= 0:
+                for side_b in range(2):
+                    if row_slot[r, side_b] == s:
+                        w += wp.dot(row_jac[r, side_a], slot_inv_mass[s] * row_jac[r, side_b])
+        denominator = dt + damping[t] * c_t
+        if w > wp.float64(0.0):
+            eps = dt * c_t / (w * denominator)
+        beta = damping[t] * c_t / denominator
     soft_eps[offset + t] = eps
     soft_beta[offset + t] = beta
     soft_gap0[offset + t] = wp.min(rest[t] - length, wp.float64(0.0))
+
+
+@wp.kernel
+def model_tendon_paths_kernel(
+    group: wp.array2d[wp.int32],
+    guide_type: wp.array[int],
+    guide_body: wp.array[int],
+    guide_radius: wp.array[float],
+    guide_offset: wp.array[wp.vec3],
+    guide_axis: wp.array[wp.vec3],
+    guide_active: wp.array[bool],
+    seg_active: wp.array[int],
+    seg_guide_l: wp.array[int],
+    seg_guide_r: wp.array[int],
+    seg_attachment_l: wp.array[wp.vec3],
+    seg_attachment_r: wp.array[wp.vec3],
+    seg_length: wp.array[float],
+    guide_cap_ratio: wp.array[float],
+    body_q: wp.array[wp.transform],
+    # outputs
+    target: wp.array2d[wp.vec3],
+    middle: wp.array[wp.float64],
+    coefficient: wp.array[wp.float64],
+):
+    """The path of tendon group ``g`` for the step, from Newton's route of the model's tendons at the step start.
+
+    ``group[g]`` is the tendon and the group's first and last guides, anchors on the bodies of its two ends; the
+    guides between them are fixed for the step. Each end's target is the point where its span meets the next guide
+    (a pinhole, a roller's tangent point, or for a single span the other end at the step start), and ``middle`` the
+    length between the two targets: the active spans between them and the arcs on the active rollers (for a single
+    span, minus its length, so that the ends' runs add up to it). The friction coefficient on the first end's slide is
+    the linearized capstan of the group's guides, ``min(1, sum mu theta)``, from Newton's ratios ``exp(mu theta)``.
+    """
+    g = wp.tid()
+    t = group[g, 0]
+    a = group[g, 1]
+    b = group[g, 2]
+    first = int(-1)
+    last = int(-1)
+    count = int(0)
+    for i in range(a, b):
+        s = i - t
+        if seg_active[s] != 0:
+            if first < 0:
+                first = s
+            last = s
+            count += 1
+    target[g, 0] = seg_attachment_r[first]
+    target[g, 1] = seg_attachment_l[last]
+    length = wp.float64(0.0)
+    if count == 1:
+        length = -wp.float64(seg_length[first])
+    else:
+        for i in range(a, b):
+            s = i - t
+            if seg_active[s] != 0 and s != first and s != last:
+                length += wp.float64(seg_length[s])
+        for k in range(a + 1, b):
+            if guide_type[k] == int(TendonGuideType.ROLLER) and guide_active[k]:
+                pt_left = wp.vec3(0.0)
+                pt_right = wp.vec3(0.0)
+                for i in range(a, b):
+                    s = i - t
+                    if seg_active[s] != 0:
+                        if seg_guide_r[s] == k:
+                            pt_left = seg_attachment_r[s]
+                        if seg_guide_l[s] == k:
+                            pt_right = seg_attachment_l[s]
+                pose = body_q[guide_body[k]]
+                center = wp.transform_point(pose, guide_offset[k])
+                normal = wp.transform_vector(pose, guide_axis[k])
+                length += wp.float64(wrapped_arc_length(pt_left, pt_right, center, guide_radius[k], normal))
+    middle[g] = length
+    mu_theta = wp.float64(0.0)
+    for k in range(a + 1, b):
+        mu_theta += wp.float64(wp.log(wp.max(guide_cap_ratio[k], 1.0)))
+    coefficient[g] = wp.min(mu_theta, wp.float64(1.0))
 
 
 @wp.kernel
