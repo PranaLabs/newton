@@ -1,0 +1,1 @@
+Let `SolverFBA(friction_anchors=True)` combine with `rod_contact`, `shape_particle_radius_override` and `particle_self_contact_group_ids`, which it refused: an anchor lapses beyond a quarter of the contact distance that the radius override or the group margin sets, and rod contacts keep the step's point.

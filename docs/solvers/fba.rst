@@ -380,10 +380,16 @@ Contacts
   keep crossing edges apart when the margin reaches half of the longest edge;
   ``particle_self_contact_edge_edge=True`` adds edge-edge contacts at creases
   for thinner margins, ``particle_self_contact_edge_edge_ratio`` sets how near
-  their edges must come compared with their particles' nearest triangles, and
+  their edges must come compared with their particles' nearest triangles
+  (below 1 by default, since every edge pair of two flat layers lies exactly
+  as near as its particles' triangles; folded layers that press on each
+  other take 1, at a few percent more contacts), and
   :meth:`~newton.solvers.SolverFBA.set_particle_self_contact` changes the
   margin between steps, so that a dropped cloth can land with a thick margin
-  and fold with a thin one. Pass a scalar to set all worlds, or arrays of shape
+  and fold with a thin one: the margin is the solver's contact thickness, not
+  the cloth's, and fast layers need a thicker one, since the contacts are
+  found once per step and the lite operator lets an impact press them in.
+  Pass a scalar to set all worlds, or arrays of shape
   ``(model.world_count + 1,)`` to set ``margin`` and ``gap`` independently per
   world, with the last entry for global particles. Per-world values require
   self-contact groups to be disabled and persist across solver resets; the
@@ -392,7 +398,7 @@ Contacts
   particle a group, such as one per body of a pile: the particles and
   triangles of two groups keep the margin apart, and those of one group the
   group's margin from ``particle_self_contact_group_margins``, or do not
-  collide.
+  collide. Groups do not combine with edge-edge contacts or per-world margins.
 - ``rod_contact=True`` makes the model's springs, such as the segments of
   particle rods, collide with each other as capsules whose radius runs
   between their particles' radii. A particle takes a contact with each
@@ -416,11 +422,16 @@ Contacts
   catching on its particles. ``rod_shape_contact_gap`` sets the detection
   distance. It needs friction and the full operator.
 - ``friction_anchors=True`` keeps the point a contact presses on across steps,
-  on the other layer for a self contact or on a static shape, so its friction
-  rows pull back the slip that a step's solve leaves instead of letting it add
-  up. With the lite operator, that slip lets stacked cloth layers creep apart
-  over seconds. :meth:`~newton.solvers.SolverFBA.set_friction_anchor_exclusion`
-  frees chosen particles of their anchors, so that a grasp can gather cloth.
+  on the other layer for a vertex-face self contact or on a static shape, so
+  its friction rows pull back the slip that a step's solve leaves instead of
+  letting it add up. With the lite operator, that slip lets stacked cloth
+  layers creep apart over seconds. The anchors work with either operator,
+  self-contact groups, rod contacts and ``shape_particle_radius_override``;
+  edge-edge, vertex-vertex and rod contacts, face contacts, contacts with
+  shapes on bodies, and the contacts of a world whose particles touch a body
+  that FBA integrates in the step keep the step's point.
+  :meth:`~newton.solvers.SolverFBA.set_friction_anchor_exclusion` frees
+  chosen particles of their anchors, so that a grasp can gather cloth.
 - Rigid contacts between shapes on bodies that FBA integrates need
   ``friction=True`` and the full operator.
 - A contact on a body that FBA integrates acts at the contact point of the

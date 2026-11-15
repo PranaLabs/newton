@@ -156,7 +156,7 @@ class TestRodContactSimulation(unittest.TestCase):
         np.testing.assert_allclose(x[middle, 1], 0.0, atol=1.0e-4)
 
     def test_rod_contact_options_are_validated(self):
-        """Reject rod contacts on a model without springs, without friction, or with friction anchors."""
+        """Reject rod contacts on a model without springs or without friction, and a negative gap."""
         builder = newton.ModelBuilder()
         builder.add_cloth_grid(
             pos=wp.vec3(0.0, 0.0, 0.0),
@@ -173,9 +173,8 @@ class TestRodContactSimulation(unittest.TestCase):
         builder = newton.ModelBuilder()
         _rod(builder, (0.0, 0.0, 0.0), (0.1, 0.0, 0.0), 4, 0.005)
         model = builder.finalize(device="cpu")
-        for kwargs in ({"friction": False}, {"friction_anchors": True}):
-            with self.assertRaisesRegex(ValueError, "rod_contact needs friction=True and no friction_anchors"):
-                SolverFBA(model, rod_contact=True, **kwargs)
+        with self.assertRaisesRegex(ValueError, "rod_contact needs friction=True"):
+            SolverFBA(model, rod_contact=True, friction=False)
         with self.assertRaisesRegex(ValueError, "rod_contact_gap must be >= 0"):
             SolverFBA(model, rod_contact=True, rod_contact_gap=-1.0)
 

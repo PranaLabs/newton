@@ -462,7 +462,8 @@ class SelfContact:
         edge_edge: With ``mode="vertex_face"``, also find edge-edge contacts.
         edge_edge_ratio: An edge pair takes a contact only where its edges come nearer than this times the nearest
             triangles of its particles: between flat layers the vertex-face contacts hold the edges apart, and only
-            ridges, such as creases, bring edges nearer than their particles.
+            ridges, such as creases, bring edges nearer than their particles. Every edge pair of two flat layers lies
+            exactly as near as its particles' triangles, so a ratio of 1 or more takes all of them.
     """
 
     def __init__(
