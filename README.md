@@ -410,6 +410,9 @@ are still in the package; `python -m newton.examples --list` lists them all.
       </a>
     </td>
     <td align="center" width="33%">
+      <a href="newton/examples/multiphysics/example_water_wheel_fba.py">
+        <img width="320" src="docs/images/examples/example_water_wheel_fba.jpg" alt="Water Wheel FBA">
+      </a>
     </td>
     <td align="center" width="33%">
     </td>
@@ -420,6 +423,8 @@ are still in the package; `python -m newton.examples --list` lists them all.
       <sub>MPM water fills a hinged bamboo tube until it tips, pours into a basin and knocks back on a stone</sub>
     </td>
     <td align="center" width="33%">
+      <code>python -m newton.examples water_wheel_fba</code><br>
+      <sub>MPM water from a bamboo pipe fills the buckets of an overshot wheel and turns it against its load</sub>
     </td>
     <td align="center" width="33%">
     </td>
@@ -457,7 +462,7 @@ contacts, 14.0 ms per 1/50 s frame of four steps (1.4x).
 
 The particle rod examples, timed the same way with this branch's code as of 2026-11-13: `particle_rods_fba`, 395 particles, 10.8 ms per 1/50 s frame (1.9x); `hemp_rope_fba`, 251 particles, 11.3 ms per 1/50 s frame (1.8x); `desk_cables_fba`, 533 particles, 13.8 ms per 1/50 s frame (1.4x); `elastic_cords_fba`, 251 particles, 39.7 ms per 1/50 s frame (0.5x); `rod_gripper_fba`, 102 particles, 19.6 ms per 1/50 s frame (1.0x). `rope_on_knives_fba`, timed the same way as of 2026-11-15: 58 particles, 10.1 ms per 1/50 s frame (2.0x).
 
-`shishi_odoshi_fba`, timed the same way as of 2026-11-16, its water an MPM grid of 5 mm voxels and its tube one body of SolverFBA coupled once per step: 16,000 to 33,000 water particles (they gather in the basin over time), 430 to 480 ms per 1/30 s frame of 32 coupled steps (0.07x real time).
+`shishi_odoshi_fba`, timed the same way as of 2026-11-16, its water an MPM grid of 5 mm voxels and its tube one body of SolverFBA coupled once per step: 16,000 to 33,000 water particles (they gather in the basin over time), 430 to 480 ms per 1/30 s frame of 32 coupled steps (0.07x real time). `water_wheel_fba`, timed the same way with the same water grid: 4,500 to 5,100 water particles once the wheel turns steadily, 218 ms per 1/30 s frame of 16 coupled steps (0.15x real time).
 
 ### Example Options
 
