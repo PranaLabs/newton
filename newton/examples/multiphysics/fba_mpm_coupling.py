@@ -1,0 +1,203 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+"""Coupling of hinged bodies that SolverFBA integrates to the material of SolverImplicitMPM, for the examples.
+
+The two solvers exchange the material's impulse on the bodies once per FBA step:
+
+1. Before the FBA step, :meth:`HingeCoupling.apply_impulses` sets each body's impulse from the last MPM step as a
+   constant force over the step.
+2. After it, :meth:`HingeCoupling.update_colliders` gives MPM each body at its pose at the step's start, turning with
+   FBA's velocity at its end less the spin that the applied impulse gave it. MPM sees the body as a collider that turns
+   about its hinge with its moment of inertia about it (:meth:`HingeCoupling.collider_arrays`), so that each MPM step
+   solves the material and the bodies' response to it together.
+3. After the MPM step, :meth:`HingeCoupling.collect_impulses` sums the collider impulses on each body for the next
+   FBA step.
+"""
+
+import numpy as np
+import warp as wp
+
+import newton
+
+
+@wp.kernel
+def collect_impulses_kernel(
+    impulses: wp.array[wp.vec3],
+    positions: wp.array[wp.vec3],
+    collider_ids: wp.array[int],
+    collider_body: wp.array[int],
+    coupled_index: wp.array[int],
+    hinge_point: wp.array[wp.vec3],
+    # outputs
+    out: wp.array2d[wp.vec3],
+):
+    """Add each MPM collider impulse to its body's ``out[k, 0]``, the linear impulse, and ``out[k, 1]``, the angular
+    impulse about the body's hinge, ``k`` the body's index among the coupled bodies."""
+    i = wp.tid()
+    c = collider_ids[i]
+    if c < 0 or c >= collider_body.shape[0]:
+        return
+    b = collider_body[c]
+    if b < 0:
+        return
+    k = coupled_index[b]
+    if k < 0:
+        return
+    j = impulses[i]
+    wp.atomic_add(out, k, 0, j)
+    wp.atomic_add(out, k, 1, wp.cross(positions[i] - hinge_point[k], j))
+
+
+@wp.kernel
+def apply_impulses_kernel(
+    impulse: wp.array2d[wp.vec3],
+    bodies: wp.array[int],
+    hinge_point: wp.array[wp.vec3],
+    inv_dt: float,
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    # outputs
+    applied: wp.array2d[wp.vec3],
+    body_f: wp.array[wp.spatial_vector],
+):
+    """Set each coupled body's impulse of the last MPM step as a constant force over the FBA step, a force at its
+    center of mass and the torque about it, and keep the impulse as the one applied."""
+    k = wp.tid()
+    b = bodies[k]
+    p = impulse[k, 0]
+    l_hinge = impulse[k, 1]
+    applied[k, 0] = p
+    applied[k, 1] = l_hinge
+    com = wp.transform_point(body_q[b], body_com[b])
+    body_f[b] = body_f[b] + wp.spatial_vector(p * inv_dt, (l_hinge - wp.cross(com - hinge_point[k], p)) * inv_dt)
+
+
+@wp.kernel
+def update_colliders_kernel(
+    bodies: wp.array[int],
+    hinge_point: wp.array[wp.vec3],
+    hinge_axis: wp.array[wp.vec3],
+    inv_axis_inertia: wp.array[float],
+    applied: wp.array2d[wp.vec3],
+    body_q_start: wp.array[wp.transform],
+    body_q_end: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    # outputs
+    collider_q: wp.array[wp.transform],
+    collider_qd: wp.array[wp.spatial_vector],
+):
+    """Each coupled body as MPM's collider sees it over a step: its pose at the step's start, and FBA's velocity at its
+    end less the spin that the applied impulse gave it, taken at the hinge, the collider's reference point."""
+    k = wp.tid()
+    b = bodies[k]
+    com = wp.transform_point(body_q_end[b], body_com[b])
+    w = wp.spatial_bottom(body_qd[b])
+    v_hinge = wp.spatial_top(body_qd[b]) + wp.cross(w, hinge_point[k] - com)
+    axis = hinge_axis[k]
+    w = w - axis * (wp.dot(axis, applied[k, 1]) * inv_axis_inertia[k])
+    collider_q[b] = body_q_start[b]
+    collider_qd[b] = wp.spatial_vector(v_hinge, w)
+
+
+class HingeCoupling:
+    """Couple bodies of ``model`` that turn about hinges fixed in the world to SolverImplicitMPM.
+
+    Args:
+        model: The model of the bodies, integrated by SolverFBA.
+        state: A state of ``model`` at the bodies' initial poses.
+        hinges: Per coupled body, ``(body, point, axis)``: a point of its hinge's axis and the axis's direction, in the
+            world frame.
+    """
+
+    def __init__(self, model: newton.Model, state: newton.State, hinges):
+        self.model = model
+        self.count = len(hinges)
+        device = model.device
+        body_q = state.body_q.numpy()
+        mass, com, inertia = model.body_mass.numpy(), model.body_com.numpy(), model.body_inertia.numpy()
+        index = np.full(model.body_count, -1, dtype=np.int32)
+        points, axes, inv_axis_inertia = [], [], []
+        # MPM's per-body collider data: the hinge in the body frame as the reference point, a mass beyond any
+        # material's (no translation) and the inverse moment of inertia about the axis alone.
+        self.collider_com = np.zeros((model.body_count, 3), dtype=np.float32)
+        self.collider_mass = np.zeros(model.body_count, dtype=np.float32)
+        self.collider_inv_inertia = np.zeros((model.body_count, 3, 3), dtype=np.float32)
+        for k, (body, hinge_point, hinge_axis) in enumerate(hinges):
+            index[body] = k
+            point = np.asarray(hinge_point, dtype=np.float64)
+            axis = np.asarray(hinge_axis, dtype=np.float64) / np.linalg.norm(hinge_axis)
+            xform = wp.transform(wp.vec3(*body_q[body][:3]), wp.quat(*body_q[body][3:]))
+            local_point = np.array(wp.transform_point(wp.transform_inverse(xform), wp.vec3(*point)))
+            local_axis = np.array(wp.quat_rotate_inv(wp.transform_get_rotation(xform), wp.vec3(*axis)))
+            r = com[body] - local_point
+            # The moment of inertia about the axis: about the center of mass, plus the mass at its distance from
+            # the axis.
+            moment = local_axis @ inertia[body] @ local_axis + mass[body] * (r @ r - (r @ local_axis) ** 2)
+            points.append(point)
+            axes.append(axis)
+            inv_axis_inertia.append(1.0 / moment)
+            self.collider_com[body] = local_point
+            self.collider_mass[body] = 1.0e9
+            self.collider_inv_inertia[body] = np.outer(local_axis, local_axis) / moment
+        self.coupled_index = wp.array(index, dtype=int, device=device)
+        self.bodies = wp.array([h[0] for h in hinges], dtype=int, device=device)
+        self.hinge_point = wp.array(np.array(points), dtype=wp.vec3, device=device)
+        self.hinge_axis = wp.array(np.array(axes), dtype=wp.vec3, device=device)
+        self.inv_axis_inertia = wp.array(np.array(inv_axis_inertia), dtype=float, device=device)
+        self.impulse = wp.zeros((self.count, 2), dtype=wp.vec3, device=device)
+        self.applied = wp.zeros((self.count, 2), dtype=wp.vec3, device=device)
+        self.body_q_start = wp.clone(state.body_q)
+        self.collider_q = wp.clone(state.body_q)
+        self.collider_qd = wp.zeros_like(state.body_qd)
+
+    def setup_collider_args(self) -> dict:
+        """The per-body arguments of :meth:`SolverImplicitMPM.setup_collider` for the coupled bodies."""
+        device = self.model.device
+        return {
+            "body_com": wp.array(self.collider_com, dtype=wp.vec3, device=device),
+            "body_mass": wp.array(self.collider_mass, dtype=float, device=device),
+            "body_inv_inertia": wp.array(self.collider_inv_inertia, dtype=wp.mat33, device=device),
+            "body_q": self.collider_q,
+        }
+
+    def attach(self, mpm_state: newton.State) -> None:
+        """Let ``mpm_state``, the material's state, carry the colliders' poses and velocities."""
+        mpm_state.body_q = self.collider_q
+        mpm_state.body_qd = self.collider_qd
+
+    def apply_impulses(self, state: newton.State, dt: float) -> None:
+        """Before an FBA step of ``dt``: keep the bodies' start poses and add the material's last impulse on them to
+        ``state.body_f``."""
+        wp.copy(self.body_q_start, state.body_q)
+        wp.launch(
+            apply_impulses_kernel,
+            dim=self.count,
+            inputs=[self.impulse, self.bodies, self.hinge_point, 1.0 / dt, state.body_q, self.model.body_com],
+            outputs=[self.applied, state.body_f],
+        )
+
+    def update_colliders(self, state: newton.State) -> None:
+        """After the FBA step: the colliders that the MPM step sees, from the step's start and end states."""
+        wp.launch(
+            update_colliders_kernel,
+            dim=self.count,
+            inputs=[
+                *(self.bodies, self.hinge_point, self.hinge_axis, self.inv_axis_inertia, self.applied),
+                *(self.body_q_start, state.body_q, state.body_qd, self.model.body_com),
+            ],
+            outputs=[self.collider_q, self.collider_qd],
+        )
+
+    def collect_impulses(self, mpm: newton.solvers.SolverImplicitMPM, mpm_state: newton.State) -> None:
+        """After the MPM step: sum the collider impulses on each body for the next FBA step."""
+        impulses, positions, ids = mpm.collect_collider_impulses(mpm_state)
+        self.impulse.zero_()
+        if ids.shape[0] > 0:
+            wp.launch(
+                collect_impulses_kernel,
+                dim=ids.shape[0],
+                inputs=[impulses, positions, ids, mpm.collider_body_index, self.coupled_index, self.hinge_point],
+                outputs=[self.impulse],
+            )
