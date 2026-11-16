@@ -1,0 +1,1 @@
+Add the `sand_castle_fba` example: a wrecking ball that `SolverFBA` integrates on a revolute joint swings through a castle of cohesive `SolverImplicitMPM` sand, through the sand's impulse on the ball once per FBA step.
