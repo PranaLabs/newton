@@ -263,6 +263,27 @@ are still in the package; `python -m newton.examples --list` lists them all.
     </td>
   </tr>
   <tr>
+    <td align="center" width="33%">
+      <a href="newton/examples/contacts/example_chain_net_fba.py">
+        <img width="320" src="docs/images/examples/example_chain_net_fba.jpg" alt="Chain Net FBA">
+      </a>
+    </td>
+    <td align="center" width="33%">
+    </td>
+    <td align="center" width="33%">
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples chain_net_fba</code><br>
+      <sub>a net of 1,080 interlocked chain links, its rim fixed, falls into a bowl</sub>
+    </td>
+    <td align="center" width="33%">
+    </td>
+    <td align="center" width="33%">
+    </td>
+  </tr>
+  <tr>
     <td colspan="3"><h3>Soft Bodies</h3></td>
   </tr>
   <tr>
@@ -407,7 +428,8 @@ time per wall-clock time. The claw machine is timed over its first 300 frames, w
 The rigid examples, timed the same way with this branch's code as of 2026-11-12: `convex_pile_fba`, 1,000 bodies and
 about 6,800 contacts, 6.3 ms per 1/50 s frame (3.2x real time); `convex_hulls_fba`, 9 bodies, 3.5 ms per 1/50 s frame
 (5.7x); `nonconvex_pile_fba`, 1,000 bodies of 5,130 convex parts and about 20,000 contacts, 15.8 ms per 1/50 s frame
-(1.3x).
+(1.3x). `chain_net_fba`, timed the same way as of 2026-11-16: 1,008 links of 14 capsules each, 6,000 to 9,500
+contacts, 14.0 ms per 1/50 s frame of four steps (1.4x).
 
 The particle rod examples, timed the same way with this branch's code as of 2026-11-13: `particle_rods_fba`, 395 particles, 10.8 ms per 1/50 s frame (1.9x); `hemp_rope_fba`, 251 particles, 11.3 ms per 1/50 s frame (1.8x); `desk_cables_fba`, 533 particles, 13.8 ms per 1/50 s frame (1.4x); `elastic_cords_fba`, 251 particles, 39.7 ms per 1/50 s frame (0.5x); `rod_gripper_fba`, 102 particles, 19.6 ms per 1/50 s frame (1.0x). `rope_on_knives_fba`, timed the same way as of 2026-11-15: 58 particles, 10.1 ms per 1/50 s frame (2.0x).
 
