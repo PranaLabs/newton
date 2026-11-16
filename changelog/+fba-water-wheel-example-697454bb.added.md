@@ -1,0 +1,1 @@
+Add the `water_wheel_fba` example: `SolverImplicitMPM` water from a pipe turns an overshot wheel that `SolverFBA` integrates on a revolute joint, against the joint's damping as its load, through the water's impulse on the wheel once per FBA step.

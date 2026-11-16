@@ -522,6 +522,10 @@ Examples
   again. The two solvers exchange the water's impulse on the tube once per FBA
   step, MPM seeing the tube as a collider that turns about the hinge with its
   moment of inertia.
+- ``water_wheel_fba``: an overshot water wheel through the same coupling: water
+  from a pipe fills the buckets just past the wheel's top, and their weight
+  turns the wheel against its axle's damping, its load, until the two torques
+  meet.
 - ``convex_pile_fba``: a thousand rigid bodies of eight convex shapes drop
   into an open box and settle in a pile.
 - ``convex_hulls_fba``: convex hull colliders: a stack of five cubes, and cubes
