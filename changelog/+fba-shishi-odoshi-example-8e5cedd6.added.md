@@ -1,0 +1,1 @@
+Add the `shishi_odoshi_fba` example: `SolverImplicitMPM` water coupled to a hinged bamboo tube that `SolverFBA` integrates, through the water's impulse on the tube once per FBA step; the tube fills, tips, pours into a basin and swings back onto a stone.

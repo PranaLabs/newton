@@ -516,6 +516,12 @@ Examples
 - ``cloth_on_knives_fba``: cloth on notched blades with face contacts and light
   Rayleigh stiffness damping.
 - ``cloth_on_boxes_fba``: cloth on rigid bodies with joints.
+- ``shishi_odoshi_fba``: water of :class:`~newton.solvers.SolverImplicitMPM`
+  coupled to a body that FBA integrates: a spout fills a bamboo tube on a
+  hinge until it tips, pours into a basin, swings back onto a stone and fills
+  again. The two solvers exchange the water's impulse on the tube once per FBA
+  step, MPM seeing the tube as a collider that turns about the hinge with its
+  moment of inertia.
 - ``convex_pile_fba``: a thousand rigid bodies of eight convex shapes drop
   into an open box and settle in a pile.
 - ``convex_hulls_fba``: convex hull colliders: a stack of five cubes, and cubes
