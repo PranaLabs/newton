@@ -15,8 +15,8 @@ The two solvers exchange the material's impulse on the bodies once per FBA step:
 3. After the MPM step, :meth:`HingeCoupling.collect_impulses` sums the collider impulses on each body for the next
    FBA step.
 
-:class:`ParticleSource` lets particles join the material over time, as from a spout, and leave it past a box, through
-the solver's public API.
+:class:`ParticleSource` lets particles join the material over time, as from a spout, and :class:`ParticleDrain` takes
+those that leave a box out of it, through the solver's public API.
 """
 
 import numpy as np
@@ -182,6 +182,13 @@ class HingeCoupling:
             outputs=[self.applied, state.body_f],
         )
 
+    def hold(self, state: newton.State) -> None:
+        """Instead of an FBA step: the bodies stay at rest where ``state`` has them, and the material's last impulse
+        on them is dropped."""
+        self.impulse.zero_()
+        self.applied.zero_()
+        wp.copy(self.body_q_start, state.body_q)
+
     def update_colliders(self, state: newton.State) -> None:
         """After the FBA step: the colliders that the MPM step sees, from the step's start and end states."""
         wp.launch(
@@ -245,15 +252,68 @@ def restart_kernel(
     jp[i] = 1.0
 
 
-class ParticleSource:
+class ParticleDrain:
+    """Takes the SolverImplicitMPM particles that leave a box out of the material, through the solver's public API.
+
+    A particle beyond a fixed grid makes the MPM step's collider impulses non-finite, so the box lies inside the
+    grid and :meth:`drain` runs after every step. Taking particles out and putting them back goes through the model's
+    particle flags and :meth:`SolverImplicitMPM.notify_model_changed`, so a step that changes the particles reads them
+    back to the host.
+
+    Args:
+        mpm: The material's solver.
+        model: The material's model.
+        state: The material's state.
+        drain_lo: The drain box's lower corner [m].
+        drain_hi: The drain box's upper corner [m].
+        hidden: Where the particles wait [m] once they leave.
+    """
+
+    def __init__(self, mpm, model, state, drain_lo, drain_hi, hidden):
+        self.mpm, self.model, self.state = mpm, model, state
+        self.drain_lo, self.drain_hi = np.asarray(drain_lo), np.asarray(drain_hi)
+        self.hidden = np.asarray(hidden)
+        self.flags = model.particle_flags.numpy()
+        self.escaping = wp.zeros(1, dtype=int, device=model.device)
+        self.free = []  # the particles out of the material
+
+    def active(self) -> np.ndarray:
+        """Whether each particle is in the material."""
+        return (self.flags & int(newton.ParticleFlags.ACTIVE)) != 0
+
+    def _write(self, q, qd) -> None:
+        self.state.particle_q.assign(q)
+        self.state.particle_qd.assign(qd)
+        self.model.particle_flags.assign(self.flags)
+        self.mpm.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
+
+    def retire(self, particles) -> None:
+        """Take the particles ``particles`` out of the material."""
+        q, qd = self.state.particle_q.numpy(), self.state.particle_qd.numpy()
+        q[particles], qd[particles] = self.hidden, 0.0
+        self.flags[particles] &= ~int(newton.ParticleFlags.ACTIVE)
+        self.free.extend(np.asarray(particles, dtype=np.int64).tolist())
+        self._write(q, qd)
+
+    def drain(self) -> None:
+        """Take out the particles outside the drain box or no longer finite, after a step that moved some there."""
+        self.escaping.zero_()
+        inputs = [self.state.particle_q, self.model.particle_flags, wp.vec3(*self.drain_lo), wp.vec3(*self.drain_hi)]
+        wp.launch(escaping_kernel, self.model.particle_count, inputs=inputs, outputs=[self.escaping])
+        if not self.escaping.numpy()[0]:
+            return
+        q = self.state.particle_q.numpy()
+        inside = np.all((q > self.drain_lo) & (q < self.drain_hi), axis=1) & np.all(np.isfinite(q), axis=1)
+        self.retire(np.flatnonzero(self.active() & ~inside))
+
+
+class ParticleSource(ParticleDrain):
     """A stream of SolverImplicitMPM particles that join the material, as from a spout, and leave it past a box.
 
     The stream leaves ``origin`` in layers of the points ``layer`` (relative to ``origin``), one layer every
     ``interval``, each particle placed and moving where its flight from its layer's point puts it when it joins, and
-    undeformed. It takes its particles from a pool of inactive ones, and particles that leave the drain box go back
-    to the pool: a particle beyond a fixed grid makes the MPM step's collider impulses non-finite. Both go through the
-    solver's public API, the model's particle flags and :meth:`SolverImplicitMPM.notify_model_changed`, so a step
-    that changes the particles reads them back to the host.
+    undeformed. It takes its particles from a pool of inactive ones, and the particles that leave the drain box
+    (:class:`ParticleDrain`) go back to the pool.
 
     Args:
         mpm: The material's solver.
@@ -271,34 +331,13 @@ class ParticleSource:
     """
 
     def __init__(self, mpm, model, state, pool, origin, layer, velocity, interval, drain_lo, drain_hi, hidden, gravity):
-        self.mpm, self.model, self.state = mpm, model, state
+        super().__init__(mpm, model, state, drain_lo, drain_hi, hidden)
         self.free = list(np.asarray(pool, dtype=np.int64)[::-1])  # taken from the end
         self.origin, self.layer = np.asarray(origin, dtype=np.float64), np.asarray(layer, dtype=np.float64)
         self.velocity, self.interval = np.asarray(velocity, dtype=np.float64), float(interval)
-        self.drain_lo, self.drain_hi = np.asarray(drain_lo), np.asarray(drain_hi)
-        self.hidden, self.gravity = np.asarray(hidden), np.asarray(gravity)
-        self.flags = model.particle_flags.numpy()
-        self.escaping = wp.zeros(1, dtype=int, device=model.device)
+        self.gravity = np.asarray(gravity)
         self.next_layer = 0
         self.flowing = True
-
-    def active(self) -> np.ndarray:
-        """Whether each particle is in the material."""
-        return (self.flags & int(newton.ParticleFlags.ACTIVE)) != 0
-
-    def _write(self, q, qd) -> None:
-        self.state.particle_q.assign(q)
-        self.state.particle_qd.assign(qd)
-        self.model.particle_flags.assign(self.flags)
-        self.mpm.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
-
-    def retire(self, particles) -> None:
-        """Take the particles ``particles`` out of the material, back into the pool."""
-        q, qd = self.state.particle_q.numpy(), self.state.particle_qd.numpy()
-        q[particles], qd[particles] = self.hidden, 0.0
-        self.flags[particles] &= ~int(newton.ParticleFlags.ACTIVE)
-        self.free.extend(np.asarray(particles, dtype=np.int64).tolist())
-        self._write(q, qd)
 
     def emit(self, time: float, duration: float) -> None:
         """Let the layers due before ``time + duration`` join, placed and moving as their flight from the stream's
@@ -330,17 +369,6 @@ class ParticleSource:
             ],
         )
         self._write(q, qd)
-
-    def drain(self) -> None:
-        """Take out the particles outside the drain box or no longer finite, after a step that moved some there."""
-        self.escaping.zero_()
-        inputs = [self.state.particle_q, self.model.particle_flags, wp.vec3(*self.drain_lo), wp.vec3(*self.drain_hi)]
-        wp.launch(escaping_kernel, self.model.particle_count, inputs=inputs, outputs=[self.escaping])
-        if not self.escaping.numpy()[0]:
-            return
-        q = self.state.particle_q.numpy()
-        inside = np.all((q > self.drain_lo) & (q < self.drain_hi), axis=1) & np.all(np.isfinite(q), axis=1)
-        self.retire(np.flatnonzero(self.active() & ~inside))
 
 
 def stream_layout(direction, spacing, flow, side_count):

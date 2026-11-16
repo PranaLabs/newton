@@ -526,6 +526,9 @@ Examples
   from a pipe fills the buckets just past the wheel's top, and their weight
   turns the wheel against its axle's damping, its load, until the two torques
   meet.
+- ``sand_castle_fba``: a wrecking ball on a rod swings through a castle of damp
+  sand, MPM sand with friction and a small cohesion, through the same coupling;
+  the sand takes nearly half of the ball's energy.
 - ``convex_pile_fba``: a thousand rigid bodies of eight convex shapes drop
   into an open box and settle in a pile.
 - ``convex_hulls_fba``: convex hull colliders: a stack of five cubes, and cubes
