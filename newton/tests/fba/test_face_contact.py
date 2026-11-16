@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import itertools
 import unittest
 from unittest import mock
 
@@ -544,6 +545,100 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
         ):
             with self.subTest(**option), self.assertRaises(ValueError):
                 newton.solvers.SolverFBA(model, face_contacts=True, **option)
+
+
+def _kuhn_cube(cells, size):
+    """Nodes and tetrahedra of a cube of side ``size`` standing on the plane ``z = 0`` about the z axis, each of its
+    ``cells**3`` cells split into six tetrahedra around its main diagonal."""
+    ids = np.arange((cells + 1) ** 3).reshape((cells + 1,) * 3)
+    nodes = np.stack(np.meshgrid(*[np.arange(cells + 1)] * 3, indexing="ij"), axis=-1).reshape(-1, 3) * (size / cells)
+    nodes[:, :2] -= 0.5 * size
+    tets = []
+    for i, j, k in itertools.product(range(cells), repeat=3):
+        c = [ids[i + (m & 1), j + (m >> 1 & 1), k + (m >> 2 & 1)] for m in range(8)]
+        for a, b in ((1, 2), (1, 4), (2, 1), (2, 4), (4, 1), (4, 2)):
+            t = [c[0], c[a], c[a | b], c[7]]
+            if np.linalg.det(nodes[t[1:]] - nodes[t[0]]) < 0.0:
+                t[1], t[2] = t[2], t[1]
+            tets.append(t)
+    return nodes, np.array(tets, dtype=np.int32)
+
+
+class TestSolverFBAOnMeshFace(unittest.TestCase):
+    """A soft cube and a cloth sheet that lie exactly on the top face of a closed mesh or convex hull box, their
+    particle radii 1 mm."""
+
+    RADIUS = 1.0e-3
+    DT = 1.0 / 500.0
+
+    @classmethod
+    def setUpClass(cls):
+        if not wp.is_cuda_available():
+            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
+
+    def _first_step(self, body, shape, face_contacts):
+        """Start positions and the velocities after one step."""
+        builder = newton.ModelBuilder()
+        half = np.array([0.3, 0.3, 0.05])
+        box = _box_mesh(half)
+        box = newton.Mesh(np.asarray(box.vertices) - [0.0, 0.0, half[2]], box.indices)  # top face at z = 0
+        cfg = newton.ModelBuilder.ShapeConfig(mu=0.6)
+        if shape == "hull":
+            builder.add_shape_convex_hull(-1, mesh=box, cfg=cfg)
+        else:
+            builder.add_shape_mesh(-1, mesh=box, cfg=cfg)
+        if body == "soft":
+            nodes, tets = _kuhn_cube(2, 0.04)
+            builder.add_soft_mesh(
+                pos=wp.vec3(0.0),
+                rot=wp.quat_identity(),
+                scale=1.0,
+                vel=wp.vec3(0.0),
+                vertices=[wp.vec3(*p) for p in nodes],
+                indices=tets.reshape(-1).tolist(),
+                density=1050.0,
+                k_mu=1.0e4,
+                k_lambda=0.0,
+                k_damp=0.0,
+                particle_radius=self.RADIUS,
+            )
+        else:
+            builder.add_cloth_grid(
+                pos=wp.vec3(-0.02, -0.02, 0.0),
+                rot=wp.quat_identity(),
+                vel=wp.vec3(0.0),
+                dim_x=4,
+                dim_y=4,
+                cell_x=0.01,
+                cell_y=0.01,
+                mass=1.0e-4,
+                tri_ke=1.0e3,
+                tri_ka=1.0e3,
+                edge_ke=1.0e-4,
+                particle_radius=self.RADIUS,
+            )
+        model = builder.finalize()
+        solver = newton.solvers.SolverFBA(model, iterations=10, face_contacts=face_contacts)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.005)
+        contacts, s0, s1 = pipeline.contacts(), model.state(), model.state()
+        pipeline.collide(s0, contacts)
+        solver.step(s0, s1, None, contacts, self.DT)
+        return s0.particle_q.numpy(), s1.particle_qd.numpy()
+
+    def test_bodies_lift_straight_off_the_face(self):
+        """Push the particles on the face straight up by their radius in one step, and none sideways.
+
+        Their particle contacts used to take normals along the face at random, which pushed each sideways by its
+        radius; face contacts at such normals fight one another and pushed them several times as fast.
+        """
+        lift = self.RADIUS / self.DT
+        for body, shape, face_contacts in itertools.product(("soft", "cloth"), ("hull", "mesh"), (False, True)):
+            with self.subTest(body=body, shape=shape, face_contacts=face_contacts):
+                x, v = self._first_step(body, shape, face_contacts)
+                on_face = x[:, 2] == 0.0
+                self.assertEqual(int(on_face.sum()), 9 if body == "soft" else 25)
+                np.testing.assert_allclose(v[on_face, 2], lift, rtol=0.02)
+                self.assertLess(float(np.linalg.norm(v[:, :2], axis=1).max()), 0.01 * lift)
 
 
 class TestMeshNeighbors(unittest.TestCase):

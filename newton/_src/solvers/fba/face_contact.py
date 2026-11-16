@@ -17,7 +17,7 @@ import numpy as np
 import warp as wp
 
 from ...geometry import kernels as sdf
-from ...geometry.flags import ShapeFlags
+from ...geometry.flags import MeshSignMethod, ShapeFlags
 from ...geometry.types import Axis, GeoType
 from .kernels import host_head
 
@@ -37,9 +37,9 @@ def shape_sdf(geo_type: int, scale: wp.vec3, mesh: wp.uint64, x: wp.vec3, edge_r
         if q.result:
             delta = x - wp.cw_mul(wp.mesh_eval_position(mesh, q.face, q.u, q.v), scale)
             d = q.sign * wp.length(delta)
-            g = wp.mesh_eval_face_normal(mesh, q.face)
-            if wp.length(delta) > 0.0:
-                g = q.sign * wp.normalize(delta)
+            g = sdf.mesh_contact_normal(
+                mesh, q.face, wp.cw_div(x, scale), delta, q.sign, scale, int(MeshSignMethod.NORMAL)
+            )
     elif geo_type == GeoType.SPHERE:
         d = sdf.sdf_sphere(x, scale[0])
         g = sdf.sdf_sphere_grad(x, scale[0])
