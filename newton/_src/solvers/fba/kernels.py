@@ -3029,6 +3029,9 @@ def compute_frictional_fb_kernel(
 def bilateral_law_kernel(
     pene0: wp.array[wp.float64],
     row_offset: wp.int32,
+    lam: wp.array[wp.float64],
+    row_compliance: wp.array[wp.float64],
+    dt: wp.float64,
     # outputs
     omega: wp.array[wp.float64],
     compliance: wp.array[wp.float64],
@@ -3038,12 +3041,21 @@ def bilateral_law_kernel(
 
     With ``omega = 1``, no compliance and ``h = pene0``, the NSN step solves
     ``W dλ = -penetration / dt²`` on these rows: a Newton step that drives
-    their violation to zero.
+    their violation to zero. A row with a positive ``row_compliance`` ``e``
+    [m/N] (indexed from ``row_offset``; an empty array for none) is soft: it
+    holds ``penetration + e f = 0`` for its force ``f = dt² λ``, with the
+    compliance ``e`` and ``h = pene0 - e f``.
     """
-    i = row_offset + wp.tid()
+    k = wp.tid()
+    i = row_offset + k
+    e = wp.float64(0.0)
+    if row_compliance.shape[0] > 0:
+        e = row_compliance[k]
     omega[i] = wp.float64(1.0)
-    compliance[i] = wp.float64(0.0)
+    compliance[i] = e
     h[i] = pene0[i]
+    if e > wp.float64(0.0):
+        h[i] = pene0[i] - e * dt * dt * lam[i]
 
 
 @wp.kernel
