@@ -434,6 +434,27 @@ are still in the package; `python -m newton.examples --list` lists them all.
       <sub>A wrecking ball on a rod swings through a castle of damp MPM sand</sub>
     </td>
   </tr>
+  <tr>
+    <td align="center" width="33%">
+      <a href="newton/examples/multiphysics/example_batter_mixer_fba.py">
+        <img width="320" src="docs/images/examples/example_batter_mixer_fba.jpg" alt="Batter Mixer FBA">
+      </a>
+    </td>
+    <td align="center" width="33%">
+    </td>
+    <td align="center" width="33%">
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="33%">
+      <code>python -m newton.examples batter_mixer_fba</code><br>
+      <sub>A motor's paddle marbles viscous vanilla and chocolate MPM batter in a bowl</sub>
+    </td>
+    <td align="center" width="33%">
+    </td>
+    <td align="center" width="33%">
+    </td>
+  </tr>
 </table>
 
 ### Performance
@@ -467,7 +488,7 @@ contacts, 14.0 ms per 1/50 s frame of four steps (1.4x).
 
 The particle rod examples, timed the same way with this branch's code as of 2026-11-13: `particle_rods_fba`, 395 particles, 10.8 ms per 1/50 s frame (1.9x); `hemp_rope_fba`, 251 particles, 11.3 ms per 1/50 s frame (1.8x); `desk_cables_fba`, 533 particles, 13.8 ms per 1/50 s frame (1.4x); `elastic_cords_fba`, 251 particles, 39.7 ms per 1/50 s frame (0.5x); `rod_gripper_fba`, 102 particles, 19.6 ms per 1/50 s frame (1.0x). `rope_on_knives_fba`, timed the same way as of 2026-11-15: 58 particles, 10.1 ms per 1/50 s frame (2.0x).
 
-`shishi_odoshi_fba`, timed the same way as of 2026-11-16, its water an MPM grid of 5 mm voxels and its tube one body of SolverFBA coupled once per step: 16,000 to 33,000 water particles (they gather in the basin over time), 430 to 480 ms per 1/30 s frame of 32 coupled steps (0.07x real time). `water_wheel_fba`, timed the same way with the same water grid: 4,500 to 5,100 water particles once the wheel turns steadily, 218 ms per 1/30 s frame of 16 coupled steps (0.15x real time). `sand_castle_fba`, timed the same way: 44,000 sand particles on a grid of 7.5 mm voxels, 97 ms per 1/30 s frame of 16 coupled steps while the ball waits and 145 to 170 ms once it swings (0.23x real time over 5 s).
+`shishi_odoshi_fba`, timed the same way as of 2026-11-16, its water an MPM grid of 5 mm voxels and its tube one body of SolverFBA coupled once per step: 16,000 to 33,000 water particles (they gather in the basin over time), 430 to 480 ms per 1/30 s frame of 32 coupled steps (0.07x real time). `water_wheel_fba`, timed the same way with the same water grid: 4,500 to 5,100 water particles once the wheel turns steadily, 218 ms per 1/30 s frame of 16 coupled steps (0.15x real time). `sand_castle_fba`, timed the same way: 44,000 sand particles on a grid of 7.5 mm voxels, 97 ms per 1/30 s frame of 16 coupled steps while the ball waits and 145 to 170 ms once it swings (0.23x real time over 5 s). `batter_mixer_fba`, timed the same way: 56,000 batter particles on a grid of 5 mm voxels, 209 ms per 1/30 s frame of 16 coupled steps (0.16x real time).
 
 ### Example Options
 

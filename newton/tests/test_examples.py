@@ -1923,6 +1923,13 @@ add_example_test(
     test_options={"num-frames": 45},
     use_viewer=True,
 )
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_batter_mixer_fba",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 45},
+    use_viewer=True,
+)
 
 
 class TestSoftbodyExamples(NewtonTestCase):
