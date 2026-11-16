@@ -1,0 +1,1 @@
+Add the `meat_cutter_fba` example: a lever cutter that `SolverFBA` integrates on a revolute joint, pressed down by a hand, cuts a layered slab of `SolverImplicitMPM` pork belly in two, through the meat's impulse on the blade once per FBA step.

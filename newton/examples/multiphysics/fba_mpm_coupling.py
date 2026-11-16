@@ -78,6 +78,12 @@ def apply_impulses_kernel(
 
 
 @wp.kernel
+def stop_bodies_kernel(bodies: wp.array[int], body_qd: wp.array[wp.spatial_vector]):
+    """Bring the coupled bodies to rest."""
+    body_qd[bodies[wp.tid()]] = wp.spatial_vector()
+
+
+@wp.kernel
 def update_colliders_kernel(
     bodies: wp.array[int],
     hinge_point: wp.array[wp.vec3],
@@ -183,11 +189,12 @@ class HingeCoupling:
         )
 
     def hold(self, state: newton.State) -> None:
-        """Instead of an FBA step: the bodies stay at rest where ``state`` has them, and the material's last impulse
-        on them is dropped."""
+        """Instead of an FBA step: the bodies stop where ``state`` has them and stay at rest, and the material's last
+        impulse on them is dropped."""
         self.impulse.zero_()
         self.applied.zero_()
         wp.copy(self.body_q_start, state.body_q)
+        wp.launch(stop_bodies_kernel, dim=self.count, inputs=[self.bodies], outputs=[state.body_qd])
 
     def update_colliders(self, state: newton.State) -> None:
         """After the FBA step: the colliders that the MPM step sees, from the step's start and end states."""

@@ -533,6 +533,10 @@ Examples
   stirs viscous batter that sticks to its bowl, through the same coupling. The
   batter's drag sets the paddle's speed, and the paddle marbles vanilla and
   chocolate batter.
+- ``meat_cutter_fba``: a lever cutter, pressed down by a hand and lifted back,
+  cuts a slab of pork belly in two through the same coupling. The meat's
+  layers of lean, fat and skin are elastic MPM solids that yield past their
+  own strengths.
 - ``convex_pile_fba``: a thousand rigid bodies of eight convex shapes drop
   into an open box and settle in a pile.
 - ``convex_hulls_fba``: convex hull colliders: a stack of five cubes, and cubes
