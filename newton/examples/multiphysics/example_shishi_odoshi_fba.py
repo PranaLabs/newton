@@ -30,7 +30,7 @@ import warp as wp
 import newton
 import newton.examples
 from newton.examples.multiphysics import shishi_odoshi_fba_utils as geo
-from newton.examples.multiphysics.fba_mpm_coupling import HingeCoupling
+from newton.examples.multiphysics.fba_mpm_coupling import HingeCoupling, ParticleSource, stream_layout
 from newton.solvers import SolverFBA, SolverImplicitMPM
 
 WATER_DENSITY = 1000.0
@@ -40,25 +40,6 @@ GRANITE = (0.34, 0.34, 0.36)
 WOOD = (0.36, 0.28, 0.20)
 WATER = (0.25, 0.52, 0.92)
 HIDDEN = (0.0, 0.0, -10.0)  # where the water particles wait before they leave the spout, and after they drain
-
-
-@wp.kernel
-def escaping_kernel(
-    q: wp.array[wp.vec3],
-    flags: wp.array[wp.int32],
-    lo: wp.vec3,
-    hi: wp.vec3,
-    # outputs
-    count: wp.array[int],
-):
-    """Count the active water particles outside the box ``[lo, hi]`` or no longer finite."""
-    i = wp.tid()
-    if (flags[i] & newton.ParticleFlags.ACTIVE) == 0:
-        return
-    p = q[i]
-    inside = p[0] > lo[0] and p[1] > lo[1] and p[2] > lo[2] and p[0] < hi[0] and p[1] < hi[1] and p[2] < hi[2]
-    if not inside or not (wp.isfinite(p[0]) and wp.isfinite(p[1]) and wp.isfinite(p[2])):
-        wp.atomic_add(count, 0, 1)
 
 
 def convex_hull(points):
@@ -84,8 +65,8 @@ class Example:
         builder.add_ground_plane(height=geo.GROUND_Z, cfg=contact, color=(0.16, 0.17, 0.15))
         boxes = geo.basin_boxes()
         for center, half in boxes:
-            builder.add_shape_box(-1, xform=wp.transform(center, wp.quat_identity()), hx=half[0], hy=half[1], hz=half[2],
-                                  cfg=contact, color=GRANITE)  # fmt: skip
+            box = wp.transform(center, wp.quat_identity())
+            builder.add_shape_box(-1, xform=box, hx=half[0], hy=half[1], hz=half[2], cfg=contact, color=GRANITE)
         stone_center, stone_points = geo.stone()
         stone = convex_hull(stone_points)
         builder.add_shape_convex_hull(-1, xform=wp.transform(tuple(stone_center), wp.quat_identity()), mesh=stone,
@@ -135,11 +116,13 @@ class Example:
         voxel = 0.005
         spacing = 0.5 * voxel
         prefill = geo.prefill_points(spacing, args.fill_level, np.random.default_rng(0))
-        stream, stream_time, self.stream_velocity = geo.stream_layout(spacing, 17.0e-6, args.water_seconds, 3)
+        along = np.array([np.cos(geo.SPOUT_SLOPE), 0.0, -np.sin(geo.SPOUT_SLOPE)])
+        layer, velocity, interval = stream_layout(along, spacing, 17.0e-6, 3)
+        pool = int(args.water_seconds / interval) * len(layer)
         # A fixed grid around the water's reach, sized by two particles at its corners that the solver's setup sees.
         self.domain_lo = np.array([-0.60, -0.20, geo.GROUND_Z - 0.02])
         self.domain_hi = np.array([0.10, 0.20, 0.22])
-        positions = np.concatenate([prefill, np.tile(HIDDEN, (len(stream), 1)), [self.domain_lo, self.domain_hi]])
+        positions = np.concatenate([prefill, np.tile(HIDDEN, (pool, 1)), [self.domain_lo, self.domain_hi]])
         count = len(positions)
         active = int(newton.ParticleFlags.ACTIVE)
         water_builder = newton.ModelBuilder()
@@ -149,7 +132,7 @@ class Example:
             vel=[(0.0, 0.0, 0.0)] * count,
             mass=[WATER_DENSITY * spacing**3] * count,
             radius=[0.5 * spacing] * count,
-            flags=[active] * len(prefill) + [0] * len(stream) + [active] * 2,
+            flags=[active] * len(prefill) + [0] * pool + [active] * 2,
         )
         self.water_model = water_builder.finalize()
         # Water: no friction and no yield stress (no shear strength), and pressure that holds in tension as in
@@ -173,16 +156,24 @@ class Example:
 
         self.water_state = self.water_model.state()
         self.water_state.mpm.particle_Jp.fill_(1.0)
-        # The emission schedule on the host: each stream particle's time and place at the pipe's end.
-        self.emit_time = np.concatenate([-np.ones(len(prefill)), stream_time, [-1.0, -1.0]])
-        self.emit_position = np.concatenate([prefill, stream, [HIDDEN, HIDDEN]])
-        self.particle_q = self.water_state.particle_q.numpy()
-        self.particle_qd = self.water_state.particle_qd.numpy()
-        self.particle_flags = self.water_model.particle_flags.numpy()
-        # The grid is sized: the corner particles leave.
-        self.particle_flags[-2:] = 0
-        self.particle_q[-2:] = HIDDEN
-        self.write_particles()
+        # The spout's stream, 3 x 3 particles across a little below the pipe's axis, takes the waiting particles;
+        # water leaves the scene 1 cm inside the grid's box.
+        self.source = ParticleSource(
+            self.mpm,
+            self.water_model,
+            self.water_state,
+            pool=np.arange(len(prefill), len(prefill) + pool),
+            origin=geo.SPOUT_END - 0.006 * np.array([np.sin(geo.SPOUT_SLOPE), 0.0, np.cos(geo.SPOUT_SLOPE)]),
+            layer=layer,
+            velocity=velocity,
+            interval=interval,
+            drain_lo=self.domain_lo + 0.01,
+            drain_hi=self.domain_hi - 0.01,
+            hidden=HIDDEN,
+            gravity=(0.0, 0.0, -9.81),
+        )
+        # The grid is sized: the corner particles leave, into the pool.
+        self.source.retire([count - 2, count - 1])
 
         # The tube as MPM's collider: it turns about the hinge with the tube's moment of inertia about it. The ground,
         # the basin and the stone are static colliders, each its own mesh, so that their signed distances combine as
@@ -211,55 +202,10 @@ class Example:
             **self.coupling.setup_collider_args(),
         )
 
-        # Water leaves the scene 1 cm inside the grid's box, before it leaves the grid: a particle beyond the grid
-        # would make the MPM step's collider impulses non-finite.
-        self.drain_lo, self.drain_hi = self.domain_lo + 0.01, self.domain_hi - 0.01
-        self.escaping = wp.zeros(1, dtype=int)
         self.lowest_angle = float(geo.REST)
 
         self.viewer.set_model(self.model)
         self.viewer.set_camera(pos=wp.vec3(0.03, -0.91, 0.42), pitch=-30.0, yaw=90.0)
-
-    def write_particles(self):
-        """Hand the host's particle positions, velocities and flags to the water and let the solver see the flags."""
-        self.water_state.particle_q.assign(self.particle_q)
-        self.water_state.particle_qd.assign(self.particle_qd)
-        self.water_model.particle_flags.assign(self.particle_flags)
-        self.mpm.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
-
-    def emit(self):
-        """Let the stream particles due by the frame's end leave the pipe, placed and moving where their flight from
-        the pipe's end puts them at the frame's start."""
-        due = (self.emit_time >= 0.0) & (self.emit_time < self.sim_time + self.frame_dt)
-        if not due.any():
-            return
-        self.particle_q = self.water_state.particle_q.numpy()
-        self.particle_qd = self.water_state.particle_qd.numpy()
-        tau = (self.sim_time - self.emit_time[due])[:, None]
-        gravity = np.array([0.0, 0.0, -9.81])
-        self.particle_q[due] = self.emit_position[due] + self.stream_velocity * tau + 0.5 * tau * tau * gravity
-        self.particle_qd[due] = self.stream_velocity + tau * gravity
-        self.particle_flags[due] |= int(newton.ParticleFlags.ACTIVE)
-        self.emit_time[due] = -1.0
-        self.write_particles()
-
-    def drain(self):
-        """Take out the water that left the drain box (or is no longer finite), once a step finds some."""
-        self.escaping.zero_()
-        inputs = [self.water_state.particle_q, self.water_model.particle_flags, wp.vec3(*self.drain_lo)]
-        inputs.append(wp.vec3(*self.drain_hi))
-        wp.launch(escaping_kernel, self.water_model.particle_count, inputs=inputs, outputs=[self.escaping])
-        if not self.escaping.numpy()[0]:
-            return
-        self.particle_q = self.water_state.particle_q.numpy()
-        self.particle_qd = self.water_state.particle_qd.numpy()
-        q = self.particle_q
-        inside = np.all((q > self.drain_lo) & (q < self.drain_hi), axis=1) & np.all(np.isfinite(q), axis=1)
-        drained = ((self.particle_flags & int(newton.ParticleFlags.ACTIVE)) != 0) & ~inside
-        self.particle_q[drained] = HIDDEN
-        self.particle_qd[drained] = 0.0
-        self.particle_flags[drained] &= ~int(newton.ParticleFlags.ACTIVE)
-        self.write_particles()
 
     def simulate(self):
         for _ in range(self.sim_substeps):
@@ -274,10 +220,10 @@ class Example:
             self.mpm.step(self.water_state, self.water_state, None, None, self.sim_dt)
             self.mpm.project_outside(self.water_state, self.water_state, self.sim_dt)
             self.coupling.collect_impulses(self.mpm, self.water_state)
-            self.drain()
+            self.source.drain()
 
     def step(self):
-        self.emit()
+        self.source.emit(self.sim_time, self.frame_dt)
         self.simulate()
         self.sim_time += self.frame_dt
         q = self.state_0.body_q.numpy()[self.tube]
@@ -295,15 +241,14 @@ class Example:
         # The water tipped the tube onto the basin's rim.
         assert self.lowest_angle < geo.TILT + 0.1, f"the tube turned only to {np.degrees(self.lowest_angle):.1f} deg"
         q = self.water_state.particle_q.numpy()
-        active = (self.particle_flags & int(newton.ParticleFlags.ACTIVE)) != 0
+        active = self.source.active()
         assert np.all(np.isfinite(q[active])), "non-finite water"
         x0, x1, y0, y1 = geo.BASIN_INNER
         in_basin = (q[:, 0] > x0) & (q[:, 0] < x1) & (q[:, 1] > y0) & (q[:, 1] < y1) & (q[:, 2] < -0.15) & active
         assert in_basin.sum() > 1000, f"only {in_basin.sum()} water particles reached the basin"
 
     def render(self):
-        active = (self.particle_flags & int(newton.ParticleFlags.ACTIVE)) != 0
-        points = self.water_state.particle_q.numpy()[active]
+        points = self.water_state.particle_q.numpy()[self.source.active()]
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
         if len(points):

@@ -225,21 +225,3 @@ def prefill_points(spacing, level, rng):
     p = p[mouth_cavity_sdf(p) < -0.5 * s]
     world = p @ rot_y(REST).T
     return world[world[:, 2] < level]
-
-
-def stream_layout(spacing, flow, seconds, side_count):
-    """The spout's water: square layers of ``side_count`` x ``side_count`` particles leaving the pipe's end along it
-    at the speed that carries ``flow`` [m^3/s], for ``seconds``. Returns their positions at their emission times, the
-    times and the stream velocity."""
-    along = np.array([np.cos(SPOUT_SLOPE), 0.0, -np.sin(SPOUT_SLOPE)])
-    side = np.array([0.0, 1.0, 0.0])
-    normal = np.cross(along, side)
-    speed = flow / (side_count * side_count * spacing**2)
-    layer_dt = spacing / speed
-    layers = int(np.ceil(seconds / layer_dt))
-    offsets = (np.arange(side_count) - 0.5 * (side_count - 1)) * spacing
-    lateral = np.array([a * side + b * normal for a in offsets for b in offsets])
-    origin = SPOUT_END + 0.5 * spacing * along - 0.006 * normal
-    positions = np.tile(origin + lateral, (layers, 1))
-    times = np.repeat(np.arange(layers) * layer_dt, side_count * side_count)
-    return positions, times, speed * along
