@@ -1703,6 +1703,100 @@ def test_open_mesh_soft_contact_uses_normal_sign(test, device):
     test.assertLess(float(np.dot(auto_normal, parity_normal)), -0.99)
 
 
+def _make_closed_box(half: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Box with half extents ``half`` centered at the origin, its triangles wound outward."""
+    corners = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)], dtype=np.float32) * half
+    quads = [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1), (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)]
+    return corners, np.array([t for a, b, c, d in quads for t in ((a, b, c), (a, c, d))], dtype=np.int32)
+
+
+def _soft_contact_normals(test, device, mesh_id, geo_type, scale, mesh_properties: int, points) -> np.ndarray:
+    """Run ``create_soft_contacts`` for particles of radius 1 cm against one static mesh shape at the origin and return
+    their contact normals in particle order, asserting a contact for each."""
+    n = len(points)
+    outputs = [wp.zeros(1, dtype=wp.int32, device=device)]
+    outputs += [
+        wp.empty(n, dtype=t, device=device)
+        for t in (wp.int32, wp.vec3i, wp.vec3, wp.int32, wp.vec3, wp.vec3, wp.vec3, wp.int32)
+    ]
+    wp.launch(
+        create_soft_contacts,
+        dim=n,
+        inputs=[
+            wp.array([wp.vec2i(i, 0) for i in range(n)], dtype=wp.vec2i, device=device),
+            wp.array(np.asarray(points, dtype=np.float32), dtype=wp.vec3, device=device),
+            wp.full(n, 0.01, dtype=wp.float32, device=device),
+            wp.full(n, int(ParticleFlags.ACTIVE), dtype=wp.int32, device=device),
+            wp.full(n, -1, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.transform, device=device),
+            wp.array([wp.transform()], dtype=wp.transform, device=device),
+            wp.array([-1], dtype=wp.int32, device=device),
+            wp.array([int(geo_type)], dtype=wp.int32, device=device),
+            wp.array([wp.vec3(*scale)], dtype=wp.vec3, device=device),
+            wp.array([mesh_id], dtype=wp.uint64, device=device),
+            wp.array([mesh_properties], dtype=wp.int32, device=device),
+            wp.array([-1], dtype=wp.int32, device=device),
+            # No shape bounds: no culling.
+            wp.empty(0, dtype=wp.vec3, device=device),
+            wp.empty(0, dtype=wp.vec3, device=device),
+            wp.array([0.0], dtype=wp.float32, device=device),
+            0.0,
+            wp.array([0.0], dtype=wp.float32, device=device),
+            n,
+            wp.array([int(ShapeFlags.COLLIDE_PARTICLES)], dtype=wp.int32, device=device),
+            wp.array([0], dtype=wp.int32, device=device),
+            wp.empty(0, dtype=HeightfieldData, device=device),
+            wp.empty(0, dtype=wp.float32, device=device),
+            False,
+        ],
+        outputs=outputs,
+        device=device,
+    )
+    test.assertEqual(int(outputs[0].numpy()[0]), n)
+    return outputs[7].numpy()[np.argsort(outputs[1].numpy())]
+
+
+def test_soft_contact_normal_on_mesh_surface(test, device):
+    """Give a particle that lies on a mesh's surface the outward normal of its face.
+
+    There, the offset from the closest point to the particle is the closest point's rounding error, which lies along
+    the face: its direction gave such particles a normal in the plane of the face, at random. The normal of a face
+    seen through a nonuniform scale follows the inverse scale, and on a watertight mesh, signed by parity, a probe off
+    the face turns a face wound inward outward.
+    """
+    half = np.array([0.5, 0.5, 0.1], dtype=np.float32)
+    box = _make_warp_mesh(*_make_closed_box(half), device)
+    # Inside the two top triangles and on their shared diagonal, on the +x face, and 1 mm out from the edge between
+    # them in x and z, which keeps the direction of its offset.
+    points = [[0.05, 0.03, 0.1], [-0.31, 0.22, 0.1], [0.2, 0.2, 0.1], [-0.4, -0.4, 0.1], [0.0, 0.0, 0.1]]
+    points += [[0.5, 0.1, 0.05], [0.5, -0.3, -0.02], [0.501, 0.0, 0.101]]
+    expected = [[0.0, 0.0, 1.0]] * 5 + [[1.0, 0.0, 0.0]] * 2 + [[np.sqrt(0.5), 0.0, np.sqrt(0.5)]]
+    for geo_type, properties in itertools.product(
+        (GeoType.MESH, GeoType.CONVEX_MESH), (0, int(MeshProperties.WATERTIGHT))
+    ):
+        normals = _soft_contact_normals(test, device, box.id, geo_type, (1.0, 1.0, 1.0), properties, points)
+        np.testing.assert_allclose(normals, expected, atol=1e-4, err_msg=f"{geo_type!r}, properties {properties}")
+
+    # The slanted face of a corner tetrahedron, scaled by (2, 1, 0.5): x / 2 + y + 2 z = 1.
+    vertices = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+    tet = _make_warp_mesh(vertices, np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]]), device)
+    scale = np.array([2.0, 1.0, 0.5], dtype=np.float32)
+    weights = np.array([[0.2, 0.3, 0.5], [0.6, 0.2, 0.2], [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]], dtype=np.float32)
+    points = weights @ (vertices[1:] * scale)
+    normal = np.array([0.5, 1.0, 2.0]) / np.linalg.norm([0.5, 1.0, 2.0])
+    for properties in (0, int(MeshProperties.WATERTIGHT)):
+        normals = _soft_contact_normals(test, device, tet.id, GeoType.MESH, scale, properties, points)
+        np.testing.assert_allclose(normals, np.tile(normal, (3, 1)), atol=1e-4, err_msg=f"properties {properties}")
+
+    # The +x face of the mixed-winding pile proxy is wound inward.
+    pile = _make_warp_mesh(*_make_mixed_winding_convex_pile_proxy(), device)
+    points = [[0.12, 0.018, 0.012], [0.12, -0.03, -0.02]]
+    normals = _soft_contact_normals(
+        test, device, pile.id, GeoType.CONVEX_MESH, (1.0, 1.0, 1.0), int(MeshProperties.WATERTIGHT), points
+    )
+    np.testing.assert_allclose(normals, [[1.0, 0.0, 0.0]] * 2, atol=1e-4)
+
+
 add_function_test(
     TestMeshSignQueries,
     "test_mixed_winding_convex_pile_contact_normal",
@@ -1715,6 +1809,13 @@ add_function_test(
     "test_open_mesh_soft_contact_uses_normal_sign",
     test_open_mesh_soft_contact_uses_normal_sign,
     devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestMeshSignQueries,
+    "test_soft_contact_normal_on_mesh_surface",
+    test_soft_contact_normal_on_mesh_surface,
+    devices=get_test_devices(),
     check_output=False,
 )
 add_function_test(

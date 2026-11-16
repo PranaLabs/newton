@@ -1013,6 +1013,44 @@ def mesh_query_point_sign(mesh: wp.uint64, point: wp.vec3, max_dist: float, sign
 
 
 @wp.func
+def mesh_contact_normal(
+    mesh: wp.uint64,
+    face: int,
+    query: wp.vec3,
+    delta: wp.vec3,
+    sign: float,
+    scale: wp.vec3,
+    sign_method: int,
+) -> wp.vec3:
+    """Outward unit normal of a signed closest-point query on a mesh, in the scaled shape frame.
+
+    ``query`` is the queried point in the mesh frame, ``delta`` the offset from the closest point on
+    ``face`` to it in the scaled shape frame, and ``sign`` the query's sign by ``sign_method``. The
+    closest point carries the rounding error of the face's and the point's coordinates, so where
+    ``delta`` is no longer than that, its direction is noise: a point that lies on the surface would
+    take a random normal, one along the face itself. The face's normal stands in there, turned
+    outward by its winding for :attr:`MeshSignMethod.NORMAL`, whose sign takes the winding as
+    outward, and by the parity of a point just off the face for :attr:`MeshSignMethod.PARITY`, as the
+    winding of a watertight mesh may face either way.
+    """
+    m = wp.mesh_get(mesh)
+    a = m.points[m.indices[3 * face + 0]]
+    b = m.points[m.indices[3 * face + 1]]
+    c = m.points[m.indices[3 * face + 2]]
+    size = wp.max(wp.max(wp.max(wp.abs(a)), wp.max(wp.abs(b))), wp.max(wp.max(wp.abs(c)), wp.max(wp.abs(query))))
+    # About a hundred float32 epsilons of the coordinates.
+    if wp.length(delta) > 1.0e-5 * size * wp.max(wp.abs(scale)):
+        return wp.normalize(delta) * sign
+    n = wp.mesh_eval_face_normal(mesh, face)
+    if sign_method == MeshSignMethod.PARITY:
+        h = 1.0e-3 * size
+        probe = wp.mesh_query_point_sign_parity(mesh, query + h * n, 2.0 * h)
+        if probe.result and probe.sign < 0.0:
+            n = -n
+    return wp.normalize(wp.cw_div(n, scale))
+
+
+@wp.func
 def mesh_sdf(mesh: wp.uint64, point: wp.vec3, max_dist: float):
     res = wp.mesh_query_point_sign_parity(mesh, point, max_dist)
 
@@ -1313,11 +1351,12 @@ def create_soft_contacts(
         # Use magnitude of components: the search radius must always be positive
         # regardless of mirror parity.
         min_scale = wp.min(wp.min(wp.abs(geo_scale[0]), wp.abs(geo_scale[1])), wp.abs(geo_scale[2]))
+        sign_method = resolve_mesh_sign_method(shape_mesh_properties[shape_index])
         query = mesh_query_point_sign(
             mesh,
             wp.cw_div(x_local, geo_scale),
             margin + s_margin / min_scale + radius / min_scale,
-            resolve_mesh_sign_method(shape_mesh_properties[shape_index]),
+            sign_method,
         )
         if query.result:
             sign = query.sign
@@ -1334,7 +1373,9 @@ def create_soft_contacts(
             delta = x_local - shape_p
 
             d = wp.length(delta) * sign
-            n = wp.normalize(delta) * sign
+            n = mesh_contact_normal(
+                mesh, face_index, wp.cw_div(x_local, geo_scale), delta, sign, geo_scale, sign_method
+            )
             v = shape_v
 
     if geo_type == GeoType.PLANE:
