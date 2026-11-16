@@ -29,7 +29,10 @@ def _rows(model, device="cpu"):
 
 
 def _row_args(rows, slot):
-    return [rows.row_joint, rows.row_angular, rows.row_dir, rows.parent, rows.child, rows.X_pj, rows.X_cj, slot]
+    return [
+        *(rows.row_joint, rows.row_angular, rows.row_kind, rows.row_dir),
+        *(rows.parent, rows.child, rows.X_pj, rows.X_cj, slot),
+    ]
 
 
 def _add_satisfied_chain(builder):
@@ -173,12 +176,12 @@ class TestFBAJointKernels(unittest.TestCase):
         R = rows.row_joint.shape[0]
         none = wp.full(model.body_count, -1, dtype=wp.int32, device="cpu")
         res = wp.empty(R, dtype=wp.float64, device="cpu")
-        args = [rows.row_joint, rows.row_angular, rows.row_dir, rows.parent, rows.child, rows.X_pj, rows.X_cj, none]
+        args = _row_args(rows, none)
         empty = [wp.empty(0, dtype=wp.vec3d, device="cpu"), wp.empty(0, dtype=wp.quatd, device="cpu")]
         wp.launch(
             J.joint_residual_kernel,
             dim=R,
-            inputs=[*args, *empty, model.body_q, model.body_com],
+            inputs=[*args, *empty, model.body_q, model.body_com, wp.zeros(R, dtype=wp.float64, device="cpu")],
             outputs=[res],
             device="cpu",
         )
@@ -235,7 +238,14 @@ class TestFBAJointKernels(unittest.TestCase):
             wp.launch(
                 J.joint_residual_kernel,
                 dim=R,
-                inputs=[*row_args, x_live, q_live, model.body_q, model.body_com],
+                inputs=[
+                    *row_args,
+                    x_live,
+                    q_live,
+                    model.body_q,
+                    model.body_com,
+                    wp.zeros(R, dtype=wp.float64, device="cpu"),
+                ],
                 outputs=[res],
                 device="cpu",
             )
@@ -350,6 +360,126 @@ class TestSolverFBAJoints(unittest.TestCase):
             errors.append(abs(np.arctan2(tf[0], -tf[1]) - ode.y[0, -1]))
         self.assertLess(errors[0], 2e-2)
         self.assertAlmostEqual(errors[0] / errors[1], 2.0, delta=0.2)
+
+
+class TestSolverFBAJointLimits(unittest.TestCase):
+    """SolverFBA enforces the limits and the passive damping of revolute and prismatic joints."""
+
+    def _run(self, model, h, steps, **solver_args):
+        """Each step's body poses and velocities, ``[step, body, 7 or 6]``, and its count of limit rows."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        solver = SolverFBA(model, iterations=5, **solver_args)
+        s0, s1 = model.state(), model.state()
+        q, qd, limit_rows = [], [], []
+        for _ in range(steps):
+            solver.step(s0, s1, None, None, h)
+            s0, s1 = s1, s0
+            q.append(s0.body_q.numpy().astype(np.float64))
+            qd.append(s0.body_qd.numpy().astype(np.float64))
+            limit_rows.append(solver._rc_limits)
+        return np.array(q), np.array(qd), limit_rows
+
+    @staticmethod
+    def _pendulum(builder, lower, upper, damping=0.0):
+        """A unit body on a revolute joint about z at the origin, its COM 1 m out along +x."""
+        link = _link(builder, xform=wp.transform((1.0, 0.0, 0.0)))
+        joint = builder.add_joint_revolute(
+            -1,
+            link,
+            axis=(0.0, 0.0, 1.0),
+            child_xform=wp.transform((-1.0, 0.0, 0.0)),
+            limit_lower=lower,
+            limit_upper=upper,
+            damping=damping,
+        )
+        builder.add_articulation([joint])
+
+    def test_revolute_limit_stops_the_pendulum(self):
+        """Stop a pendulum released horizontally at its lower limit and hold it there, with its two limit rows
+        present only near the limits."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        self._pendulum(builder, -0.5, 0.5)
+        q, qd, limit_rows = self._run(builder.finalize(), 0.005, 200)
+        angle = np.arctan2(q[:, 0, 1], q[:, 0, 0])
+        self.assertGreater(angle.min(), -0.5 - 1e-3)
+        self.assertAlmostEqual(angle[-1], -0.5, delta=1e-4)
+        self.assertLess(abs(qd[-1, 0, 5]), 1e-3)
+        # Released at 0.5 rad from either limit, it starts without limit rows; it ends with the lower one.
+        self.assertEqual((limit_rows[0], limit_rows[-1]), (0, 1))
+
+    def test_prismatic_limit_holds_the_slider(self):
+        """Hold a slider that gravity pulls along its axis at its lower limit."""
+        builder = newton.ModelBuilder()
+        link = _link(builder)
+        joint = builder.add_joint_prismatic(-1, link, axis=(1.0, 0.0, 0.0), limit_lower=-0.2, limit_upper=0.5)
+        builder.add_articulation([joint])
+        model = builder.finalize()
+        model.gravity.assign([wp.vec3(-9.81, 0.0, 0.0)])
+        q, qd, _ = self._run(model, 0.01, 100)
+        self.assertGreater(q[:, 0, 0].min(), -0.2 - 1e-4)
+        np.testing.assert_allclose(q[-1, 0, :3], [-0.2, 0.0, 0.0], atol=1e-5)
+        self.assertLess(abs(qd[-1, 0, 0]), 1e-4)
+
+    def test_damping_matches_implicit_euler(self):
+        """Slow a free spin and a free slide of unit inertia with damping ``c`` by ``1 / (1 + c dt)`` per step,
+        alone in the joint system and, near a limit, with the limit's row in the contact solve."""
+        dt, n = 0.01, 40
+        for kind, c, lower in (("revolute", 0.5, -1.0e10), ("revolute", 5.0, -1.0e10), ("prismatic", 2.0, -1.0e10),
+                               ("revolute", 2.0, -0.01), ("prismatic", 2.0, -0.001)):  # fmt: skip
+            with self.subTest(kind=kind, damping=c, lower=lower):
+                builder = newton.ModelBuilder()
+                link = _link(builder)
+                add = builder.add_joint_revolute if kind == "revolute" else builder.add_joint_prismatic
+                upper = 2.0 if lower > -1.0 else 1.0e10
+                joint = add(-1, link, axis=(0.0, 0.0, 1.0), damping=c, limit_lower=lower, limit_upper=upper)
+                builder.add_articulation([joint])
+                model = builder.finalize()
+                model.gravity.assign([wp.vec3(0.0, 0.0, 0.0)])
+                lane = 5 if kind == "revolute" else 2
+                qd0 = model.body_qd.numpy()
+                qd0[0, lane] = 1.0
+                model.body_qd.assign(qd0)
+                _q, qd, limit_rows = self._run(model, dt, n)
+                expected = (1.0 / (1.0 + c * dt)) ** np.arange(1, n + 1)
+                np.testing.assert_allclose(qd[:, 0, lane], expected, rtol=1e-5)
+                # Starting next to its lower limit, the axis takes its row for its first steps, which moves the joint
+                # rows into the contact solve, the damper among them; moving away, it drops the row.
+                near = lower > -1.0
+                self.assertEqual((limit_rows[0], limit_rows[-1]), (int(near), 0))
+
+    def test_limits_in_several_worlds(self):
+        """Stop the pendulums of two worlds at their own lower limits."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        for lower in (-0.5, -0.3):
+            world = newton.ModelBuilder(up_axis=newton.Axis.Y)
+            self._pendulum(world, lower, 0.5)
+            builder.add_world(world)
+        q, _qd, _ = self._run(builder.finalize(), 0.005, 200)
+        angle = np.arctan2(q[-1, :, 1], q[-1, :, 0])
+        np.testing.assert_allclose(angle, [-0.5, -0.3], atol=1e-4)
+
+    def test_default_joints_take_no_limit_or_damper_rows(self):
+        """Give joints at the default infinite limits and zero damping no limit candidates and no damper rows."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder()
+        _add_satisfied_chain(builder)
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=5)
+        solver.step(model.state(), model.state(), None, None, 0.01)
+        self.assertIsNone(solver._limits)
+        self.assertFalse(solver._joint_dampers)
+        self.assertEqual(solver._joint_system.compliance.shape[0], 0)
+
+    def test_refuses_revolute_limits_known_up_to_turns(self):
+        """Refuse a revolute axis with one finite limit, or with limits 2 pi or more apart."""
+        for lower, upper in ((-0.5, 1.0e10), (-1.0e10, 0.5), (-3.2, 3.2)):
+            with self.subTest(lower=lower, upper=upper):
+                builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+                self._pendulum(builder, lower, upper)
+                with self.assertRaises(NotImplementedError):
+                    self._run(builder.finalize(), 0.01, 1)
 
 
 if __name__ == "__main__":

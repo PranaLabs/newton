@@ -345,6 +345,8 @@ class RigidRowStorage:
         self.joint_rows = joint_rows
         self.joint_section = 3 * ((joint_rows + 2) // 3)
         self.joint_select = wp.full(max(self.joint_section, 1), -1, dtype=wp.int32, device=device)
+        # The joint rows' compliance in the NSN (the damper rows'), kept for the graph that replays across steps.
+        self.bilateral_compliance = wp.zeros(max(self.joint_section, 1), dtype=wp.float64, device=device)
 
     def select_joint_rows(self, rows: np.ndarray) -> None:
         """Take the joint rows ``rows`` for the step's NSN rows that follow the contacts' capacity."""

@@ -241,8 +241,8 @@ The maximal-coordinate solvers (:class:`~newton.solvers.SolverSemiImplicit`,
 enforce joints as pairwise body constraints but do not use the articulation kinematic-tree structure.
 :class:`~newton.solvers.SolverVBD` supports a subset of joint types through maximal-coordinate
 constraints, with unified compliant ALM by default and a deprecated legacy AVBD path.
-:class:`~newton.solvers.SolverFBA` enforces joints as bilateral maximal-coordinate constraints, without limits or
-drives.
+:class:`~newton.solvers.SolverFBA` enforces joints as bilateral maximal-coordinate constraints, the limits of
+revolute and prismatic joints as unilateral rows, without drives.
 :class:`~newton.solvers.SolverStyle3D` and :class:`~newton.solvers.SolverImplicitMPM` do not support joints.
 
 **Joint types**
@@ -387,7 +387,7 @@ drives.
      - |yes|
      - |yes|
      - |yes|
-     - |no|
+     - |yes| :sup:`14`
    * - :attr:`~newton.Model.joint_limit_ke` / :attr:`~newton.Model.joint_limit_kd`
      - |yes|
      - |no|
@@ -417,6 +417,8 @@ drives.
      - |no|
 
 | :sup:`2` Not enforced for BALL joints in SemiImplicit.
+| :sup:`14` FBA enforces the limits of REVOLUTE and PRISMATIC joints as hard unilateral rows (a revolute joint
+  needs both limits, less than 2 pi apart) and ignores those of BALL and D6 joints.
 
 **Actuation and control**
 
