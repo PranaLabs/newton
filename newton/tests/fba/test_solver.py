@@ -243,6 +243,74 @@ class TestBendingQMatchesReference(unittest.TestCase):
             with_bending - without_bending, expected, rtol=0.0, atol=1e-5 * np.abs(expected).max()
         )
 
+    @staticmethod
+    def _plate_ratios(builder):
+        """The bending energy of small deflections ``z`` of the flat sheet in ``builder``, ``1/2 z^T K z`` with its
+        bending matrix ``K``, per area, in units of ``edge_ke * k^2 / 2`` for curvature ``k = 1``: of cylinders whose
+        curvature runs at 0, 45, 90 and 135 degrees to x, a dome and a saddle."""
+        model = builder.finalize(device="cpu")
+        bending = model.edge_bending_properties.numpy().copy()  # a CPU array's numpy() is a view
+        with_bending = build_pd_system(model, dt=1.0, pin_stiffness=0.0)[0].toarray()
+        model.edge_bending_properties.assign(bending * np.array([0.0, 1.0], dtype=np.float32))
+        K = with_bending - build_pd_system(model, dt=1.0, pin_stiffness=0.0)[0].toarray()
+        p = model.particle_q.numpy().astype(np.float64)
+        x, y = p[:, 0] - p[:, 0].mean(), p[:, 1] - p[:, 1].mean()
+        tri = model.tri_indices.numpy()
+        area = 0.5 * np.abs(np.cross(p[tri[:, 1]] - p[tri[:, 0]], p[tri[:, 2]] - p[tri[:, 0]])[:, 2]).sum()
+
+        def ratio(z):
+            return float(z @ (K @ z)) / area
+
+        cylinders = [ratio(0.5 * (math.cos(a) * x + math.sin(a) * y) ** 2) for a in np.radians([0, 45, 90, 135])]
+        return cylinders, ratio(0.5 * (x * x + y * y)), ratio(0.5 * (x * x - y * y))
+
+    def test_bending_is_a_plate_of_three_times_edge_ke(self):
+        """On equilateral triangles, bend a flat sheet as an isotropic plate of bending stiffness ``3 * edge_ke`` and
+        Poisson's ratio ``-1/3``: cylinders in every direction, a dome and a saddle take 3, 4 and 8 times
+        ``edge_ke * k^2 / 2`` per area. On ``add_cloth_grid``'s right triangles with parallel diagonals, bending about
+        a grid line or along the diagonals takes 3 times, and about an axis across the diagonals 9 times. The sheets'
+        30 cells per side leave the ratios up to 3% low at their boundary."""
+        n, h = 30, math.sqrt(3.0) / 2.0
+        rows = round(n / h)
+        vertices = [wp.vec3((i + 0.5 * (j % 2)) / n, j * h / n, 0.0) for j in range(rows + 1) for i in range(n + 1)]
+        indices = []
+        for j in range(rows):
+            for i in range(n):
+                a, b = j * (n + 1) + i, j * (n + 1) + i + 1
+                c, d = a + n + 1, b + n + 1
+                indices += [a, b, c, b, d, c] if j % 2 == 0 else [a, b, d, a, d, c]
+        builder = newton.ModelBuilder()
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0),
+            vertices=vertices,
+            indices=indices,
+            density=1.0,
+            edge_ke=1.0,
+        )
+        cylinders, dome, saddle = self._plate_ratios(builder)
+        for value, expected in zip([*cylinders, dome, saddle], [3.0, 3.0, 3.0, 3.0, 4.0, 8.0], strict=True):
+            self.assertAlmostEqual(value, expected, delta=0.04 * expected)
+
+        builder = newton.ModelBuilder()
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=n,
+            dim_y=n,
+            cell_x=1.0 / n,
+            cell_y=1.0 / n,
+            mass=0.01,
+            edge_ke=1.0,
+        )
+        cylinders, _, _ = self._plate_ratios(builder)
+        # Its diagonals run at 135 degrees: a curvature along them bends the sheet about an axis across them.
+        for value, expected in zip(cylinders, [3.0, 3.0, 3.0, 9.0], strict=True):
+            self.assertAlmostEqual(value, expected, delta=0.04 * expected)
+
 
 class TestSparseInverse(unittest.TestCase):
     """compute_lower_inverse matches dense np.linalg.inv on small SPD matrices."""
