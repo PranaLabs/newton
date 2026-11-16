@@ -181,7 +181,10 @@ class TestFBAJointKernels(unittest.TestCase):
         wp.launch(
             J.joint_residual_kernel,
             dim=R,
-            inputs=[*args, *empty, model.body_q, model.body_com, wp.zeros(R, dtype=wp.float64, device="cpu")],
+            inputs=[
+                *(*args, *empty, model.body_q, model.body_com),
+                *(wp.zeros(R, dtype=wp.float64, device="cpu"), wp.zeros(R, dtype=wp.quatd, device="cpu")),
+            ],
             outputs=[res],
             device="cpu",
         )
@@ -245,6 +248,7 @@ class TestFBAJointKernels(unittest.TestCase):
                     model.body_q,
                     model.body_com,
                     wp.zeros(R, dtype=wp.float64, device="cpu"),
+                    wp.zeros(R, dtype=wp.quatd, device="cpu"),
                 ],
                 outputs=[res],
                 device="cpu",
@@ -447,6 +451,39 @@ class TestSolverFBAJointLimits(unittest.TestCase):
                 # rows into the contact solve, the damper among them; moving away, it drops the row.
                 near = lower > -1.0
                 self.assertEqual((limit_rows[0], limit_rows[-1]), (int(near), 0))
+
+    def test_ball_and_d6_damping_match_implicit_euler(self):
+        """Damp each free axis of a ball and a D6 joint by its own coefficient: a free body of unit inertia on a ball
+        joint at its COM slows its spin by ``1 / (1 + c dt)`` per step about every axis, and one on a D6 joint free
+        along x and y and about z, damped along x and about z, slows its slide along x and its spin alone."""
+        dt, n = 0.01, 40
+        cases = (
+            ("ball", [0.8, 0.8, 0.8], [0.0, 0.0, 0.0, 1.0, 0.5, -0.3]),
+            ("d6", [3.0, 0.0, 0.0, 0.0, 0.0, 4.0], [1.0, 0.5, 0.0, 0.0, 0.0, 0.4]),
+        )
+        for kind, damping, qd0 in cases:
+            with self.subTest(kind=kind):
+                builder = newton.ModelBuilder()
+                link = _link(builder)
+                if kind == "ball":
+                    joint = builder.add_joint_ball(-1, link, damping=damping[0])
+                    lanes, coefficient = [3, 4, 5], damping  # body_qd lanes about x, y and z
+                else:
+                    joint = builder.add_joint_d6(
+                        -1,
+                        link,
+                        linear_axes=[Dof(axis=(1.0, 0.0, 0.0), damping=damping[0]), Dof(axis=(0.0, 1.0, 0.0))],
+                        angular_axes=[Dof(axis=(0.0, 0.0, 1.0), damping=damping[5])],
+                    )
+                    lanes, coefficient = [0, 1, 5], [damping[0], 0.0, damping[5]]  # along x and y, about z
+                builder.add_articulation([joint])
+                model = builder.finalize()
+                model.gravity.assign([wp.vec3(0.0, 0.0, 0.0)])
+                model.body_qd.assign(np.array([qd0], dtype=np.float32))
+                _q, qd, _ = self._run(model, dt, n)
+                for lane, c in zip(lanes, coefficient, strict=True):
+                    expected = qd0[lane] * (1.0 / (1.0 + c * dt)) ** np.arange(1, n + 1)
+                    np.testing.assert_allclose(qd[:, 0, lane], expected, rtol=1e-5, atol=1e-7, err_msg=f"lane {lane}")
 
     def test_limits_in_several_worlds(self):
         """Stop the pendulums of two worlds at their own lower limits."""

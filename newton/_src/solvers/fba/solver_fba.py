@@ -176,13 +176,14 @@ class SolverFBA(TendonStateMixin, SolverBase):
     per locked direction. The free axis of a revolute or prismatic joint takes
     its limits, ``Model.joint_limit_lower`` and ``Model.joint_limit_upper``, as
     hard unilateral rows solved with the rigid contacts, each joining a step
-    when the axis comes near the limit, and its passive damping
+    when the axis comes near the limit; a revolute axis needs both limits, less
+    than 2 pi apart. Every free axis of a joint takes its passive damping
     ``Model.joint_damping`` as a soft row in the joint system, the backward
-    Euler step of the force ``-c q_dot``. A revolute axis needs both limits,
-    less than 2 pi apart. The limits' stiffness and damping
-    (``joint_limit_ke``, ``joint_limit_kd``), drives, armature and joint
-    friction are not read, nor are the limits and damping of ball and D6
-    joints.
+    Euler step of the force ``-c q_dot``, where an angular axis's rate is the
+    relative angular velocity along it in the parent's joint frame. The limits'
+    stiffness and damping (``joint_limit_ke``, ``joint_limit_kd``), drives,
+    armature and joint friction are not read, nor are the limits of ball and
+    D6 joints.
 
     Notes:
         - Float32 ``particle_q`` output: the interior linear solver
@@ -1077,6 +1078,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         self._joint_system = BilateralSystem(self._joint_rows, slot, self._slot_inv_mass_d, device)
         self._joint_dampers = bool((self._joint_rows.row_damping > 0.0).any())
         self._joint_row_start_d = wp.zeros(R, dtype=wp.float64, device=device)
+        self._joint_row_q_start_d = wp.zeros(R, dtype=wp.quatd, device=device)
         self._limits = build_joint_limits(self.model, self._joint_rows, slot, device)
         if self._limits is not None:
             if not self.friction or self.nsn_schur_mode != "full":
@@ -1166,7 +1168,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
                         *self._joint_row_args()[:-1],
                         *(self._no_slot_d, self._rigid_x_prev_d, self._rigid_q_pin_d, state_in.body_q, model.body_com),
                     ],
-                    outputs=[self._joint_row_start_d],
+                    outputs=[self._joint_row_start_d, self._joint_row_q_start_d],
                     device=self._device,
                 )
             self._joint_system.set_dt(dt)
@@ -2263,6 +2265,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
                     *self._joint_row_args(),
                     *(self._rigid_x_live_d, self._rigid_q_live_d, state_in.body_q, self.model.body_com),
                     self._joint_row_start_d,
+                    self._joint_row_q_start_d,
                 ],
                 outputs=[self._joint_residual_d],
                 device=self._device,

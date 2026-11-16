@@ -8,10 +8,10 @@ direction: the complement of its free linear axes locks the anchor offset, and
 the complement of its free angular axes locks the relative rotation. Directions
 are expressed in the joint frame carried by the parent body.
 
-The free axis of a revolute or prismatic joint with passive damping
-(``Model.joint_damping``) adds a soft row, a damper on the axis's motion over
-the step, and each finite limit of such an axis (``Model.joint_limit_lower``
-and ``Model.joint_limit_upper``) a candidate for a unilateral limit row, which
+Each free axis with passive damping (``Model.joint_damping``) adds a soft
+row, a damper on the axis's motion over the step, and each finite limit of the
+free axis of a revolute or prismatic joint (``Model.joint_limit_lower`` and
+``Model.joint_limit_upper``) a candidate for a unilateral limit row, which
 joins the step's rigid contact rows when the axis comes near the limit.
 """
 
@@ -32,7 +32,7 @@ _AXIS_JOINTS = (JointType.PRISMATIC, JointType.REVOLUTE)
 ROW_LOCKED = wp.constant(0)
 """A row that locks a direction of a joint."""
 ROW_DAMPER = wp.constant(1)
-"""A soft row that damps the motion along the free axis of a revolute or prismatic joint."""
+"""A soft row that damps the motion along a free axis of a joint."""
 
 
 @dataclass
@@ -127,19 +127,12 @@ def build_joint_rows(model: Model, body_slot: np.ndarray, device) -> JointRows |
         block = find(max(pslot[j], cslot[j]))
         rows += [(block, k, 0, d, ROW_LOCKED, 0.0) for d in locked_directions(axes[:n_lin])]
         rows += [(block, k, 1, d, ROW_LOCKED, 0.0) for d in locked_directions(axes[n_lin:])]
-        # The free axis of a revolute or prismatic joint takes its passive damping as a soft row.
-        if jtype[j] in _AXIS_JOINTS and damping[qd_start[j]] > 0.0:
-            d = np.asarray(axes[0], dtype=np.float64)
-            rows.append(
-                (
-                    block,
-                    k,
-                    int(jtype[j] == JointType.REVOLUTE),
-                    d / np.linalg.norm(d),
-                    ROW_DAMPER,
-                    float(damping[qd_start[j]]),
-                )
-            )
+        # Each free axis takes its passive damping as a soft row.
+        for i in range(n_lin + n_ang):
+            c = float(damping[qd_start[j] + i])
+            if c > 0.0:
+                d = np.asarray(axes[i], dtype=np.float64)
+                rows.append((block, k, int(i >= n_lin), d / np.linalg.norm(d), ROW_DAMPER, c))
     if not rows:
         return None
     rows.sort(key=lambda r: r[0])
@@ -420,13 +413,17 @@ def joint_residual_kernel(
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
     row_start: wp.array[wp.float64],
+    row_q_start: wp.array[wp.quatd],
     # outputs
     residual: wp.array[wp.float64],
 ):
     """Violation of each row at the live pose: the anchor offset ``R_Jaᵀ (x_Jc - x_Ja)``
     or the rotation ``2 nu`` along the locked direction, zero when satisfied. A
-    damper row holds its axis's motion since the step start, from the
-    coordinate ``row_start`` there (:func:`joint_axis_start_kernel`)."""
+    damper row holds its axis's motion since the step start
+    (:func:`joint_axis_start_kernel`): along a linear axis the change of the
+    offset, about an angular axis ``b`` the angle ``2 atan2(nu · b, eta)`` of
+    the relative rotation's increment ``(nu, eta)`` in the parent's joint
+    frame, which for a revolute joint is the change of its angle."""
     r = wp.tid()
     j = row_joint[r]
     xa, qa = _com_frame(joint_parent[j], body_slot, slot_x, slot_q, body_q, body_com)
@@ -434,10 +431,15 @@ def joint_residual_kernel(
     q_ja = qa * wp.quatd(wp.transform_get_rotation(X_pj[j]))
     b = wp.vec3d(row_dir[r])
     if row_kind[r] == ROW_DAMPER:
-        motion = axis_coordinate(row_angular[r], b, xa, qa, xc, qc, X_pj[j], X_cj[j]) - row_start[r]
         if row_angular[r] == 1:
-            motion = wrap_angle(motion)
-        residual[r] = motion
+            q_rel = _relative_rotation(q_ja, qc * wp.quatd(wp.transform_get_rotation(X_cj[j])))
+            q_step = q_rel * wp.quat_inverse(row_q_start[r])
+            if q_step[3] < 0.0:
+                q_step = q_step * wp.float64(-1.0)
+            nu = wp.vec3d(q_step[0], q_step[1], q_step[2])
+            residual[r] = wp.float64(2.0) * wp.atan2(wp.dot(nu, b), q_step[3])
+        else:
+            residual[r] = axis_coordinate(0, b, xa, qa, xc, qc, X_pj[j], X_cj[j]) - row_start[r]
     elif row_angular[r] == 1:
         q_rel = _relative_rotation(q_ja, qc * wp.quatd(wp.transform_get_rotation(X_cj[j])))
         residual[r] = wp.float64(2.0) * wp.dot(b, wp.vec3d(q_rel[0], q_rel[1], q_rel[2]))
@@ -464,18 +466,26 @@ def joint_axis_start_kernel(
     body_com: wp.array[wp.vec3],
     # outputs
     row_start: wp.array[wp.float64],
+    row_q_start: wp.array[wp.quatd],
 ):
-    """Each damper row's axis coordinate (:func:`axis_coordinate`) at the given poses, zero for locked rows. For the
-    step start, ``body_slot`` is -1 for every body, so that the poses come from ``body_q``: the pinned frame of an
-    integrated body is already turned by its start velocity."""
+    """Each damper row's state at the given poses, from which its residual measures the step's motion: a linear
+    row's axis offset (:func:`axis_coordinate`) in ``row_start``, an angular row's relative rotation
+    ``R_Jaᵀ R_Jc`` in ``row_q_start``. For the step start, ``body_slot`` is -1 for every body, so that the poses come
+    from ``body_q``: the pinned frame of an integrated body is already turned by its start velocity."""
     r = wp.tid()
     value = wp.float64(0.0)
+    q_rel = wp.quatd(0.0, 0.0, 0.0, 1.0)
     if row_kind[r] == ROW_DAMPER:
         j = row_joint[r]
         xa, qa = _com_frame(joint_parent[j], body_slot, slot_x, slot_q, body_q, body_com)
         xc, qc = _com_frame(joint_child[j], body_slot, slot_x, slot_q, body_q, body_com)
-        value = axis_coordinate(row_angular[r], wp.vec3d(row_dir[r]), xa, qa, xc, qc, X_pj[j], X_cj[j])
+        if row_angular[r] == 1:
+            q_ja = qa * wp.quatd(wp.transform_get_rotation(X_pj[j]))
+            q_rel = _relative_rotation(q_ja, qc * wp.quatd(wp.transform_get_rotation(X_cj[j])))
+        else:
+            value = axis_coordinate(0, wp.vec3d(row_dir[r]), xa, qa, xc, qc, X_pj[j], X_cj[j])
     row_start[r] = value
+    row_q_start[r] = q_rel
 
 
 @wp.func

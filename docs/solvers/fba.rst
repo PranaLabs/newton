@@ -39,7 +39,7 @@ held by other objects:
   :class:`~newton.solvers.SolverFeatherstone` integrates.
 
 Choose another solver for differentiable simulation and for articulations that need drives or actuators: FBA
-treats joints as bilateral constraints, with the limits and passive damping of revolute and prismatic joints, so
+treats joints as bilateral constraints, with the limits of revolute and prismatic joints and passive damping, so
 integrate such an articulation with another solver and pass
 ``integrate_with_external_rigid_solver=True``. See the :ref:`Supported
 Features` matrix and the :ref:`Joint feature support` tables for a comparison
@@ -315,13 +315,17 @@ Model Inputs
   ends the step's free flight, within 0.02 rad (2 mm for a prismatic axis) plus
   the free flight's motion of the limit. A revolute axis needs both limits,
   less than 2 pi apart, and measures its angle from the middle of its range;
-  one finite limit, or a wider range, raises ``NotImplementedError``. Its
-  passive damping :attr:`~newton.Model.joint_damping` (the ``damping`` of
-  :class:`~newton.ModelBuilder.JointDofConfig`, MJCF's ``damping``) is a soft
+  one finite limit, or a wider range, raises ``NotImplementedError``. Every
+  free axis of a joint, also of BALL and D6 joints, takes its passive damping
+  :attr:`~newton.Model.joint_damping` (the ``damping`` of
+  :class:`~newton.ModelBuilder.JointDofConfig`, MJCF's ``damping``) as a soft
   row in the articulation's joint system, the backward Euler step of the force
   ``-c q_dot``: it slows the axis by the factor ``1 / (1 + c dt / I)`` per step
-  for an axis of effective inertia ``I``. Joints at the default infinite limits
-  and zero damping take no such rows. Limits need the full operator.
+  for an axis of effective inertia ``I``. An angular axis's rate is the
+  relative angular velocity along it in the parent's joint frame, and its
+  motion over a step that of the relative rotation's increment. Joints at the
+  default infinite limits and zero damping take no such rows. Limits need the
+  full operator.
 - **Tendons**: FBA simulates the model's tendons
   (:meth:`~newton.ModelBuilder.add_tendon`) and routes them itself with
   Newton's routing of anchors, pinholes and rollers, the same as the other
@@ -358,7 +362,7 @@ Model Inputs
 FBA does not simulate equality constraints, mimic joints, the model's
 particle-body attachments (tie particles to bodies with
 :meth:`~newton.solvers.SolverFBA.set_particle_constraints` instead), the
-limits and damping of BALL and D6 joints, the limit stiffness and damping
+limits of BALL and D6 joints, the limit stiffness and damping
 ``joint_limit_ke`` and ``joint_limit_kd`` (its limits are hard), drives,
 armature, or joint friction, or
 the inputs of :class:`~newton.Control`, and it does not read the damping
