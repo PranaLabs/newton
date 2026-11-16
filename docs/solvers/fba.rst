@@ -504,6 +504,10 @@ Examples
 - ``nonconvex_pile_fba``: a thousand rigid bodies of eight non-convex shapes,
   CoACD-decomposed meshes and compounds of boxes, drop into an open box and
   settle in a pile.
+- ``chain_net_fba``: a net of 1,080 interlocked steel chain links, after the
+  huge chain net of Affine Body Dynamics (Lan et al. 2022, Fig. 13), its rim
+  fixed, falls into a bowl and swings back; each link collides as 14 capsules,
+  and ``--size`` sets the links per side of its grid.
 - ``twisting_bar_fba``, ``squeezing_ball_fba``: a soft bar twisted by its
   pinned ends and a soft ball dragged by spinning cylinders.
 - ``softbody_franka_fba``: a Franka arm integrated by
