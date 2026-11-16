@@ -1,0 +1,1 @@
+Add the `batter_mixer_fba` example: a paddle that `SolverFBA` turns on a revolute joint under a motor's constant torque stirs viscous `SolverImplicitMPM` batter, through the batter's impulse on the paddle once per FBA step; the batter's drag sets the paddle's speed.

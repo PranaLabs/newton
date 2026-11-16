@@ -529,6 +529,10 @@ Examples
 - ``sand_castle_fba``: a wrecking ball on a rod swings through a castle of damp
   sand, MPM sand with friction and a small cohesion, through the same coupling;
   the sand takes nearly half of the ball's energy.
+- ``batter_mixer_fba``: a mixer's paddle, turned by a motor's constant torque,
+  stirs viscous batter that sticks to its bowl, through the same coupling. The
+  batter's drag sets the paddle's speed, and the paddle marbles vanilla and
+  chocolate batter.
 - ``convex_pile_fba``: a thousand rigid bodies of eight convex shapes drop
   into an open box and settle in a pile.
 - ``convex_hulls_fba``: convex hull colliders: a stack of five cubes, and cubes
