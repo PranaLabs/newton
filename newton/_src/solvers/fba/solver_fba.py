@@ -208,13 +208,18 @@ class SolverFBA(TendonStateMixin, SolverBase):
     rigid contacts, each joining a step when the axis comes near the limit; a
     revolute axis needs both limits, and those of a full turn or more are left
     out with a warning. Every free axis of a joint takes its passive damping
-    ``Model.joint_damping`` as a soft row in the joint system, the backward
-    Euler step of the force ``-c q_dot``, where an angular axis's rate is the
-    relative angular velocity along it in the parent's joint frame (the
-    child's for the second axis of a two-axis D6 joint). The limits'
-    stiffness and damping (``joint_limit_ke``, ``joint_limit_kd``), drives,
-    armature and joint friction are not read, nor are the limits of ball and
-    D6 joints.
+    ``Model.joint_damping``, its drive (``Model.joint_target_ke`` and
+    ``Model.joint_target_kd`` toward the control's ``joint_target_q`` and
+    ``joint_target_qd``) and its armature ``Model.joint_armature`` as a soft
+    row in the joint system, the backward Euler step of the force
+    ``ke (q* - q) + kd (q_dot* - q_dot) - c q_dot - I_a q_ddot``, where an
+    angular axis's rate is the relative angular velocity along it in the
+    parent's joint frame (the child's for the second axis of a two-axis D6
+    joint); a position drive needs a linear axis or the angular axis of a joint
+    with one. ``Control.joint_f`` adds the joints' generalized forces to their
+    bodies. The limits' stiffness and damping (``joint_limit_ke``,
+    ``joint_limit_kd``), the effort and velocity limits and joint friction are
+    not read, nor are the limits of ball and D6 joints.
 
     Notes:
         - Float32 ``particle_q`` output: the interior linear solver
@@ -1140,9 +1145,12 @@ class SolverFBA(TendonStateMixin, SolverBase):
             return
         R = int(self._joint_rows.block_start[-1])
         self._joint_system = BilateralSystem(self._joint_rows, slot, self._slot_inv_mass_d, device)
-        self._joint_dampers = bool((self._joint_rows.row_damping > 0.0).any())
+        self._joint_dampers = bool(self._joint_rows.row_soft.any())
         self._joint_row_start_d = wp.zeros(R, dtype=wp.float64, device=device)
         self._joint_row_q_start_d = wp.zeros(R, dtype=wp.quatd, device=device)
+        # The soft rows' target motion over the step (joint_soft_row_kernel), zero on the other rows.
+        self._joint_row_target_d = wp.zeros(R, dtype=wp.float64, device=device)
+        self._warn_unapplied_dof_properties()
         self._limits = build_joint_limits(self.model, self._joint_rows, slot, device)
         if self._limits is not None:
             if not self.friction or self.nsn_schur_mode != "full":
@@ -1163,7 +1171,31 @@ class SolverFBA(TendonStateMixin, SolverBase):
         self._joint_residual_d = wp.empty(R, dtype=wp.float64, device=device)
         self._joint_force_d = wp.empty(R, dtype=wp.float64, device=device)
 
-    def _begin_rigid_step(self, state_in: State, state_out: State, dt: float) -> bool:
+    def _warn_unapplied_dof_properties(self) -> None:
+        """Warn about the DOF properties of the integrated joints that FBA does not apply: the effort limits of
+        driven DOFs, joint friction and velocity limits."""
+        model, rows = self.model, self._joint_rows
+        start, dim = model.joint_qd_start.numpy(), model.joint_dof_dim.numpy()
+        dofs = np.concatenate([np.arange(start[j], start[j] + dim[j].sum()) for j in rows.joint_index])
+        if dofs.size == 0:
+            return
+
+        def values(name, default=0.0):
+            array = getattr(model, f"joint_{name}", None)
+            return np.full(dofs.size, default) if array is None else array.numpy()[dofs]
+
+        driven = (values("target_ke") > 0.0) | (values("target_kd") > 0.0)
+        unapplied = []
+        if (driven & (values("effort_limit", np.inf) < 1.0e6)).any():
+            unapplied.append("joint_effort_limit (drive forces are not limited)")
+        if (values("friction") > 0.0).any():
+            unapplied.append("joint_friction")
+        if (values("velocity_limit", np.inf) < 1.0e6).any():
+            unapplied.append("joint_velocity_limit")
+        if unapplied:
+            warnings.warn(f"SolverFBA does not apply {', '.join(unapplied)}", NewtonWarning, stacklevel=2)
+
+    def _begin_rigid_step(self, state_in: State, state_out: State, dt: float, control: Control | None = None) -> bool:
         """Start the step of the integrated bodies at their free-flight solution.
 
         Kinematic bodies pass through. The joint Jacobian and ``W`` are
@@ -1196,6 +1228,30 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 advance_unintegrated_kernel, model.body_count, inputs, [self._joint_body_q_d], device=self._device
             )
         m = self._rigid_bodies_d.shape[0]
+        body_f = state_in.body_f
+        joint_f = None if control is None else control.joint_f
+        if joint_f is not None and joint_f.shape[0] and model.joint_count:
+            from .joints import joint_wrench_kernel  # noqa: PLC0415
+
+            # The joints' generalized forces join the external wrenches.
+            if getattr(self, "_rigid_body_f_d", None) is None or self._rigid_body_f_d.shape[0] != model.body_count:
+                self._rigid_body_f_d = wp.empty(model.body_count, dtype=wp.spatial_vector, device=self._device)
+            if body_f is None:
+                self._rigid_body_f_d.zero_()
+            else:
+                wp.copy(self._rigid_body_f_d, body_f)
+            wp.launch(
+                joint_wrench_kernel,
+                dim=model.joint_count,
+                inputs=[
+                    *(model.joint_type, model.joint_enabled, model.joint_parent, model.joint_child),
+                    *(model.joint_X_p, model.joint_X_c, model.joint_axis, model.joint_qd_start, model.joint_dof_dim),
+                    *(state_in.body_q, model.body_com, joint_f),
+                ],
+                outputs=[self._rigid_body_f_d],
+                device=self._device,
+            )
+            body_f = self._rigid_body_f_d
         wp.launch(
             prepare_rigid_step_kernel,
             dim=m,
@@ -1203,7 +1259,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 self._rigid_bodies_d,
                 state_in.body_q,
                 state_in.body_qd,
-                state_in.body_f,
+                body_f,
                 model.body_com,
                 model.body_mass,
                 model.body_inertia,
@@ -1232,9 +1288,9 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 device=self._device,
             )
             if self._joint_dampers:
-                from .joints import joint_axis_start_kernel  # noqa: PLC0415
+                from .joints import joint_axis_start_kernel, joint_soft_row_kernel  # noqa: PLC0415
 
-                # The damper rows' axis coordinates at the step start, from which they measure the step's motion.
+                # The soft rows' axis coordinates at the step start, from which they measure the step's motion.
                 wp.launch(
                     joint_axis_start_kernel,
                     dim=self._joint_residual_d.shape[0],
@@ -1245,7 +1301,25 @@ class SolverFBA(TendonStateMixin, SolverBase):
                     outputs=[self._joint_row_start_d, self._joint_row_q_start_d],
                     device=self._device,
                 )
-            self._joint_system.set_dt(dt)
+                # Their compliance and target motion from the drives, the damping and the armature.
+                rows = self._joint_rows
+                target_q = getattr(control, "joint_target_q", None)
+                target_qd = getattr(control, "joint_target_qd", None)
+                wp.launch(
+                    joint_soft_row_kernel,
+                    dim=self._joint_residual_d.shape[0],
+                    inputs=[
+                        *(rows.row_joint, rows.row_angular, rows.row_kind, rows.row_dir, rows.row_dof, rows.row_coord),
+                        *(rows.parent, rows.child, rows.X_pj, rows.X_cj, state_in.body_q, state_in.body_qd),
+                        *(model.body_com, model.joint_damping, model.joint_armature),
+                        *(model.joint_target_ke, model.joint_target_kd),
+                        model.joint_target_q if target_q is None else target_q,
+                        model.joint_target_qd if target_qd is None else target_qd,
+                        wp.float64(dt),
+                    ],
+                    outputs=[self._joint_system.compliance, self._joint_row_target_d],
+                    device=self._device,
+                )
             self._joint_system.factor(self._joint_row_slot_d, self._joint_row_jac_d)
             self._joint_force_d.zero_()
         return True
@@ -2341,6 +2415,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
                     *(self._rigid_x_live_d, self._rigid_q_live_d, self._joint_body_q_d, self.model.body_com),
                     self._joint_row_start_d,
                     self._joint_row_q_start_d,
+                    self._joint_row_target_d,
                 ],
                 outputs=[self._joint_residual_d],
                 device=self._device,
@@ -2935,7 +3010,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         self._two_way, self._rc_n, self._mixed = False, 0, None
         self._two_way_world_h.fill(0)
         rigid = self.model.body_count > 0 and not self.integrate_with_external_rigid_solver
-        rigid = rigid and self._begin_rigid_step(state_in, state_out, dt)
+        rigid = rigid and self._begin_rigid_step(state_in, state_out, dt, control)
         self._route_model_tendons(state_in)
         if self.model.particle_count == 0:
             if rigid:

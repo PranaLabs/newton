@@ -8,9 +8,11 @@ direction: the complement of its free linear axes locks the anchor offset, and
 the complement of its free angular axes locks the relative rotation. Directions
 are expressed in the joint frame carried by the parent body.
 
-Each free axis with passive damping (``Model.joint_damping``) adds a soft
-row, a damper on the axis's motion over the step, and each finite limit of the
-free axis of a revolute or prismatic joint (``Model.joint_limit_lower`` and
+Each free axis with passive damping (``Model.joint_damping``), a drive
+(``Model.joint_target_ke`` or ``Model.joint_target_kd``) or armature
+(``Model.joint_armature``) adds a soft row on the axis's motion over the step,
+the backward Euler step of their forces, and each finite limit of the free axis
+of a revolute or prismatic joint (``Model.joint_limit_lower`` and
 ``Model.joint_limit_upper``) a candidate for a unilateral limit row, which
 joins the step's rigid contact rows when the axis comes near the limit.
 """
@@ -37,14 +39,15 @@ _AXIS_JOINTS = (JointType.PRISMATIC, JointType.REVOLUTE)
 ROW_LOCKED = wp.constant(0)
 """A row that locks a direction of a joint."""
 ROW_DAMPER = wp.constant(1)
-"""A soft row that damps the motion along a free axis of a joint, carried by the parent's joint frame."""
+"""A soft row on the motion along a free axis of a joint, carried by the parent's joint frame: its passive damping,
+drive and armature."""
 ROW_HOOKE = wp.constant(2)
 """A row that locks the twist of a D6 joint with two free angular axes, ``a0`` carried by the parent and ``a1`` by
 the child, as Newton composes the joint's rotation ``q(a0, q0) q(a1, q1)``: it holds the angle between the two
 axes."""
 ROW_DAMPER_CHILD = wp.constant(3)
-"""A soft row that damps the rotation about a free axis carried by the child's joint frame: the second axis of a D6
-joint with two free angular axes."""
+"""A soft row on the rotation about a free axis carried by the child's joint frame: the second axis of a D6 joint
+with two free angular axes."""
 
 
 @wp.func
@@ -82,7 +85,14 @@ class JointRows:
     row_axis2: wp.array[wp.vec3]
     """A :data:`ROW_HOOKE` row's second axis in the joint frame, zero for the other rows, shape [row_count]."""
     row_damping: np.ndarray
-    """Damping coefficient [N·s/m or N·m·s/rad] of each damper row, 0 for locked rows, shape [row_count]."""
+    """Passive damping coefficient [N·s/m or N·m·s/rad] of each soft row, 0 for locked rows, shape [row_count]."""
+    row_soft: np.ndarray
+    """Whether each row is a soft row (:data:`ROW_DAMPER` or :data:`ROW_DAMPER_CHILD`), shape [row_count]."""
+    row_dof: wp.array[wp.int32]
+    """Model DOF of each soft row, -1 for the other rows, shape [row_count]."""
+    row_coord: wp.array[wp.int32]
+    """Model coordinate of each soft row's position target, -1 for the other rows and for axes without a position
+    drive, shape [row_count]."""
     block_start: np.ndarray
     """Row range per independent block, shape [block_count + 1]."""
     joint_index: np.ndarray
@@ -155,29 +165,45 @@ def build_joint_rows(model: Model, body_slot: np.ndarray, device) -> JointRows |
         root[find(pslot[j])] = find(cslot[j])
 
     axis, qd_start, dof_dim = model.joint_axis.numpy(), model.joint_qd_start.numpy(), model.joint_dof_dim.numpy()
-    damping = model.joint_damping.numpy() if model.joint_damping is not None else np.zeros(len(axis))
+    q_start = model.joint_q_start.numpy()
+
+    def per_dof(values):
+        return values.numpy().astype(np.float64) if values is not None else np.zeros(len(axis))
+
+    damping, armature = per_dof(model.joint_damping), per_dof(model.joint_armature)
+    target_ke, target_kd = per_dof(model.joint_target_ke), per_dof(model.joint_target_kd)
     zero = np.zeros(3)
-    rows = []  # (block, local joint index, angular, direction, kind, damping, second axis)
+    # (block, local joint index, angular, direction, kind, damping, second axis, dof, coordinate)
+    rows = []
     for k, j in enumerate(joints):
         n_lin, n_ang = dof_dim[j]
         axes = np.array(axis[qd_start[j] : qd_start[j] + n_lin + n_ang], dtype=np.float64)
         block = find(max(pslot[j], cslot[j]))
-        rows += [(block, k, 0, d, ROW_LOCKED, 0.0, zero) for d in locked_directions(axes[:n_lin])]
+        rows += [(block, k, 0, d, ROW_LOCKED, 0.0, zero, -1, -1) for d in locked_directions(axes[:n_lin])]
         kinds = [ROW_DAMPER] * (n_lin + n_ang)
         if n_ang == 2:
             # The rotation q(a0, q0) q(a1, q1) keeps the angle between a0 in the parent's joint frame and a1 in the
             # child's, and turns about a1 in the child's frame; the axes as Newton orthonormalizes them.
             axes[n_lin:] = hooke_axes(axes[n_lin], axes[n_lin + 1])
-            rows.append((block, k, 1, axes[n_lin], ROW_HOOKE, 0.0, axes[n_lin + 1]))
+            rows.append((block, k, 1, axes[n_lin], ROW_HOOKE, 0.0, axes[n_lin + 1], -1, -1))
             kinds[n_lin + 1] = ROW_DAMPER_CHILD
         else:
-            rows += [(block, k, 1, d, ROW_LOCKED, 0.0, zero) for d in locked_directions(axes[n_lin:])]
-        # Each free axis takes its passive damping as a soft row.
+            rows += [(block, k, 1, d, ROW_LOCKED, 0.0, zero, -1, -1) for d in locked_directions(axes[n_lin:])]
+        # Each free axis takes its passive damping, drive and armature as a soft row.
         for i in range(n_lin + n_ang):
-            c = float(damping[qd_start[j] + i])
-            if c > 0.0:
-                d = axes[i] / np.linalg.norm(axes[i])
-                rows.append((block, k, int(i >= n_lin), d, kinds[i], c, zero))
+            dof = qd_start[j] + i
+            if max(damping[dof], armature[dof], target_ke[dof], target_kd[dof]) <= 0.0:
+                continue
+            coord = -1
+            if target_ke[dof] > 0.0:
+                if i >= n_lin and n_ang > 1:
+                    raise NotImplementedError(
+                        f"SolverFBA drives the angle of a joint with one free angular axis only; joint {j} has "
+                        f"{n_ang} and a position gain on DOF {dof}"
+                    )
+                coord = q_start[j] + i
+            d = axes[i] / np.linalg.norm(axes[i])
+            rows.append((block, k, int(i >= n_lin), d, kinds[i], float(damping[dof]), zero, dof, coord))
     if not rows:
         return None
     rows.sort(key=lambda r: r[0])
@@ -186,7 +212,7 @@ def build_joint_rows(model: Model, body_slot: np.ndarray, device) -> JointRows |
     slots = np.array([find(i) for i in range(len(root))])
     locked = np.array([r[4] in (ROW_LOCKED, ROW_HOOKE) for r in rows])
     for start, stop in itertools.pairwise(block_start):
-        # The damper rows are soft: they keep W positive definite whatever they share with the locked rows.
+        # The soft rows keep W positive definite whatever they share with the locked rows.
         count = int(np.count_nonzero(locked[start:stop]))
         if count > 6 * np.count_nonzero(slots == blocks[start]):
             raise NotImplementedError(
@@ -210,6 +236,9 @@ def build_joint_rows(model: Model, body_slot: np.ndarray, device) -> JointRows |
         row_dir=wp.array(np.array([r[3] for r in rows]), dtype=wp.vec3, device=device),
         row_axis2=wp.array(np.array([r[6] for r in rows]), dtype=wp.vec3, device=device),
         row_damping=np.array([r[5] for r in rows], dtype=np.float64),
+        row_soft=~locked,
+        row_dof=wp.array([r[7] for r in rows], dtype=wp.int32, device=device),
+        row_coord=wp.array([r[8] for r in rows], dtype=wp.int32, device=device),
         block_start=block_start,
         joint_index=joints.astype(np.int32),
     )
@@ -522,14 +551,16 @@ def joint_residual_kernel(
     body_com: wp.array[wp.vec3],
     row_start: wp.array[wp.float64],
     row_q_start: wp.array[wp.quatd],
+    row_target: wp.array[wp.float64],
     # outputs
     residual: wp.array[wp.float64],
 ):
     """Violation of each row at the live pose: the anchor offset ``R_Jaᵀ (x_Jc - x_Ja)``
     or the rotation ``2 nu`` along the locked direction, or for a
     :data:`ROW_HOOKE` row ``(R_Ja a0) · (R_Jc a1) - a0 · a1``, zero when
-    satisfied. A damper row holds its axis's motion since the step start
-    (:func:`joint_axis_start_kernel`): along a linear axis the change of the
+    satisfied. A soft row holds its axis's motion since the step start
+    (:func:`joint_axis_start_kernel`) less its target motion ``row_target``
+    (:func:`joint_soft_row_kernel`): along a linear axis the change of the
     offset, about an angular axis ``b`` the angle ``2 atan2(nu · b, eta)`` of
     the relative rotation's increment ``(nu, eta)`` in the parent's joint
     frame, which for a revolute joint is the change of its angle, or in the
@@ -553,9 +584,9 @@ def joint_residual_kernel(
             if q_step[3] < 0.0:
                 q_step = q_step * wp.float64(-1.0)
             nu = wp.vec3d(q_step[0], q_step[1], q_step[2])
-            residual[r] = wp.float64(2.0) * wp.atan2(wp.dot(nu, b), q_step[3])
+            residual[r] = wp.float64(2.0) * wp.atan2(wp.dot(nu, b), q_step[3]) - row_target[r]
         else:
-            residual[r] = axis_coordinate(0, b, xa, qa, xc, qc, X_pj[j], X_cj[j]) - row_start[r]
+            residual[r] = axis_coordinate(0, b, xa, qa, xc, qc, X_pj[j], X_cj[j]) - row_start[r] - row_target[r]
     elif row_angular[r] == 1:
         q_rel = _relative_rotation(q_ja, qc * wp.quatd(wp.transform_get_rotation(X_cj[j])))
         residual[r] = wp.float64(2.0) * wp.dot(b, wp.vec3d(q_rel[0], q_rel[1], q_rel[2]))
@@ -603,6 +634,156 @@ def joint_axis_start_kernel(
             value = axis_coordinate(0, wp.vec3d(row_dir[r]), xa, qa, xc, qc, X_pj[j], X_cj[j])
     row_start[r] = value
     row_q_start[r] = q_rel
+
+
+@wp.kernel
+def joint_soft_row_kernel(
+    row_joint: wp.array[wp.int32],
+    row_angular: wp.array[wp.int32],
+    row_kind: wp.array[wp.int32],
+    row_dir: wp.array[wp.vec3],
+    row_dof: wp.array[wp.int32],
+    row_coord: wp.array[wp.int32],
+    joint_parent: wp.array[wp.int32],
+    joint_child: wp.array[wp.int32],
+    X_pj: wp.array[wp.transform],
+    X_cj: wp.array[wp.transform],
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    joint_damping: wp.array[wp.float32],
+    joint_armature: wp.array[wp.float32],
+    joint_target_ke: wp.array[wp.float32],
+    joint_target_kd: wp.array[wp.float32],
+    joint_target_q: wp.array[wp.float32],
+    joint_target_qd: wp.array[wp.float32],
+    dt: wp.float64,
+    # outputs
+    compliance: wp.array[wp.float64],
+    target: wp.array[wp.float64],
+):
+    """Each soft row's compliance and target motion over a step of ``dt`` from the poses and velocities at the
+    step's start, 0 for the other rows.
+
+    An axis of coordinate ``q`` takes the drive force ``ke (q* - q) + kd (q_dot* - q_dot)``, the passive damping
+    ``-c q_dot`` and the armature's inertial force ``-I_a q_ddot``, each at the step's end: with the axis's motion
+    ``g`` over the step, ``q_dot = g / dt`` and ``q_ddot = (g / dt - q_dot0) / dt``, the total force is
+    ``f = b - k g`` with ``k = ke + (kd + c) / dt + I_a / dt²`` and ``b = ke (q* - q0) + kd q_dot* + I_a q_dot0 / dt``.
+    The row holds ``g - g* + C f = 0`` with the compliance ``C = 1 / k`` and the target motion ``g* = b / k``. A
+    damper alone keeps ``C = dt / c``. ``q0`` and ``q_dot0`` are the axis's coordinate and rate at the start: the
+    angle about an angular axis ``b`` of the relative rotation in the parent's joint frame and the relative angular
+    velocity along it (along the child's frame axis for an axis the child carries), or the anchor offset along a
+    linear axis and its rate in the parent's joint frame.
+    """
+    r = wp.tid()
+    if not _is_damper(row_kind[r]):
+        compliance[r] = wp.float64(0.0)
+        target[r] = wp.float64(0.0)
+        return
+    dof = row_dof[r]
+    c = wp.float64(joint_damping[dof])
+    arm = wp.float64(joint_armature[dof])
+    ke = wp.float64(joint_target_ke[dof])
+    kd = wp.float64(joint_target_kd[dof])
+    if ke == wp.float64(0.0) and arm == wp.float64(0.0) and kd == wp.float64(0.0):
+        # A damper alone, or a row whose coefficients were all zeroed, which then takes no force.
+        compliance[r] = wp.where(c > wp.float64(0.0), dt / c, wp.float64(1.0e30))
+        target[r] = wp.float64(0.0)
+        return
+    j = row_joint[r]
+    a = joint_parent[j]
+    ch = joint_child[j]
+    xa = wp.vec3d(0.0, 0.0, 0.0)
+    qa = wp.quatd(0.0, 0.0, 0.0, 1.0)
+    va = wp.vec3d(0.0, 0.0, 0.0)
+    wa = wp.vec3d(0.0, 0.0, 0.0)
+    if a >= 0:
+        xa = wp.vec3d(wp.transform_point(body_q[a], body_com[a]))
+        qa = wp.quatd(wp.transform_get_rotation(body_q[a]))
+        va = wp.vec3d(wp.spatial_top(body_qd[a]))
+        wa = wp.vec3d(wp.spatial_bottom(body_qd[a]))
+    xc = wp.vec3d(wp.transform_point(body_q[ch], body_com[ch]))
+    qc = wp.quatd(wp.transform_get_rotation(body_q[ch]))
+    vc = wp.vec3d(wp.spatial_top(body_qd[ch]))
+    wc = wp.vec3d(wp.spatial_bottom(body_qd[ch]))
+    q_ja = qa * wp.quatd(wp.transform_get_rotation(X_pj[j]))
+    b = wp.vec3d(row_dir[r])
+    rate = wp.float64(0.0)
+    if row_angular[r] == 1:
+        d = wp.quat_rotate(q_ja, b)
+        if row_kind[r] == ROW_DAMPER_CHILD:
+            d = wp.quat_rotate(qc * wp.quatd(wp.transform_get_rotation(X_cj[j])), b)
+        rate = wp.dot(wc - wa, d)
+    else:
+        r_a = wp.quat_rotate(qa, wp.vec3d(wp.transform_get_translation(X_pj[j])))
+        r_c = wp.quat_rotate(qc, wp.vec3d(wp.transform_get_translation(X_cj[j])))
+        offset = (xc + r_c) - (xa + r_a)
+        v_rel = (vc + wp.cross(wc, r_c)) - (va + wp.cross(wa, r_a)) - wp.cross(wa, offset)
+        rate = wp.dot(b, wp.quat_rotate_inv(q_ja, v_rel))
+    force = arm * rate / dt
+    if kd > wp.float64(0.0):
+        force += kd * wp.float64(joint_target_qd[dof])
+    if row_coord[r] >= 0:
+        q0 = axis_coordinate(row_angular[r], b, xa, qa, xc, qc, X_pj[j], X_cj[j])
+        force += ke * (wp.float64(joint_target_q[row_coord[r]]) - q0)
+    stiffness = ke * dt * dt + (kd + c) * dt + arm
+    compliance[r] = dt * dt / stiffness
+    target[r] = force * dt * dt / stiffness
+
+
+@wp.kernel
+def joint_wrench_kernel(
+    joint_type: wp.array[wp.int32],
+    joint_enabled: wp.array[wp.bool],
+    joint_parent: wp.array[wp.int32],
+    joint_child: wp.array[wp.int32],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_qd_start: wp.array[wp.int32],
+    joint_dof_dim: wp.array2d[wp.int32],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    joint_f: wp.array[wp.float32],
+    # outputs
+    body_f: wp.array[wp.spatial_vector],
+):
+    """Add each joint's generalized forces ``joint_f`` to its bodies' wrenches about their centers of mass, as
+    :class:`~newton.solvers.SolverSemiImplicit` applies them: a FREE or DISTANCE joint's world wrench to the child,
+    and along each axis, in the parent's joint frame, the force or torque to the child at its joint anchor and the
+    opposite to the parent at its own."""
+    j = wp.tid()
+    if not joint_enabled[j]:
+        return
+    t = joint_type[j]
+    c = joint_child[j]
+    start = joint_qd_start[j]
+    if t == JointType.FREE or t == JointType.DISTANCE:
+        f = wp.vec3(joint_f[start], joint_f[start + 1], joint_f[start + 2])
+        tau = wp.vec3(joint_f[start + 3], joint_f[start + 4], joint_f[start + 5])
+        wp.atomic_add(body_f, c, wp.spatial_vector(f, tau))
+        return
+    p = joint_parent[j]
+    X_wp = joint_X_p[j]
+    r_p = wp.vec3(0.0)
+    if p >= 0:
+        X_wp = wp.transform_multiply(body_q[p], X_wp)
+        r_p = wp.transform_get_translation(X_wp) - wp.transform_point(body_q[p], body_com[p])
+    X_wc = wp.transform_multiply(body_q[c], joint_X_c[j])
+    r_c = wp.transform_get_translation(X_wc) - wp.transform_point(body_q[c], body_com[c])
+    n_lin = joint_dof_dim[j, 0]
+    n_ang = joint_dof_dim[j, 1]
+    f = wp.vec3(0.0)
+    tau = wp.vec3(0.0)
+    for i in range(n_lin):
+        f += joint_f[start + i] * wp.transform_vector(X_wp, joint_axis[start + i])
+    for i in range(n_ang):
+        tau += joint_f[start + n_lin + i] * wp.transform_vector(X_wp, joint_axis[start + n_lin + i])
+    if wp.length_sq(f) == 0.0 and wp.length_sq(tau) == 0.0:
+        return
+    if p >= 0:
+        wp.atomic_sub(body_f, p, wp.spatial_vector(f, tau + wp.cross(r_p, f)))
+    wp.atomic_add(body_f, c, wp.spatial_vector(f, tau + wp.cross(r_c, f)))
 
 
 @wp.func
@@ -906,10 +1087,10 @@ class BilateralSystem:
     each block is Cholesky-factored once per step. ``slot_inv_mass`` holds the
     inverse 6x6 diagonal blocks of the rigid system matrix.
 
-    A damper row of coefficient ``c`` is soft: over a step ``dt`` it holds its
-    axis's motion ``g`` and force ``f`` at ``g + (dt / c) f = 0``, the backward
-    Euler step of the damper, so its diagonal of ``W`` gains the compliance
-    ``dt / c`` and its residual the term ``(dt / c) f``.
+    A soft row holds its axis's motion ``g`` and force ``f`` at
+    ``g - g* + C f = 0``, the backward Euler step of its damper, drive and
+    armature (:func:`joint_soft_row_kernel`), so its diagonal of ``W`` gains
+    the compliance ``C`` and its residual the term ``C f``.
     """
 
     def __init__(self, rows: JointRows, body_slot: np.ndarray, slot_inv_mass: wp.array, device):
@@ -938,24 +1119,12 @@ class BilateralSystem:
         self.rhs = wp.zeros((n_blocks, self.tile), dtype=wp.float64, device=device)
         self.df = wp.zeros_like(self.rhs)
         self.device = device
-        # The damper rows' coefficients, and each row's compliance for the step (dt / c, zero on locked rows): an
-        # empty array without damper rows.
-        self.damping = np.asarray(rows.row_damping, dtype=np.float64)
-        has_dampers = bool((self.damping > 0.0).any())
-        self.compliance = wp.zeros(R if has_dampers else 0, dtype=wp.float64, device=device)
-        self._compliance_dt = None
-
-    def set_dt(self, dt: float) -> None:
-        """Set the damper rows' compliance ``dt / c`` for steps of ``dt``."""
-        if self.compliance.shape[0] == 0 or self._compliance_dt == dt:
-            return
-        damped = self.damping > 0.0
-        self.compliance.assign(np.where(damped, dt / np.where(damped, self.damping, 1.0), 0.0))
-        self._compliance_dt = dt
+        # Each row's compliance for the step, zero on locked rows, set by joint_soft_row_kernel: an empty array
+        # without soft rows.
+        self.compliance = wp.zeros(R if bool(rows.row_soft.any()) else 0, dtype=wp.float64, device=device)
 
     def factor(self, row_slot: wp.array2d[wp.int32], row_jac: wp.array2d[wp.spatial_vectord]) -> None:
-        """Assemble and factor ``W`` for this step's Jacobian, the damper rows' compliance (:meth:`set_dt`) on its
-        diagonal."""
+        """Assemble and factor ``W`` for this step's Jacobian, the soft rows' compliance on its diagonal."""
         wp.launch(
             bilateral_delassus_kernel,
             dim=self.W.shape,
@@ -968,7 +1137,7 @@ class BilateralSystem:
         )
 
     def update(self, residual: wp.array[wp.float64], force: wp.array[wp.float64]) -> None:
-        """Newton step on the rows: ``force += W⁻¹ (-residual)``, the damper rows' soft term included."""
+        """Newton step on the rows: ``force += W⁻¹ (-residual)``, the soft rows' term included."""
         R = residual.shape[0]
         wp.launch(
             bilateral_rhs_kernel,
