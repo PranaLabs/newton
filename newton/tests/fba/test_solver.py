@@ -373,6 +373,47 @@ class TestFBALinearSolver(unittest.TestCase):
             r = A.dot(x_np[:, c]) - b_np[:, c]
             self.assertLess(np.linalg.norm(r) / max(np.linalg.norm(b_np[:, c]), 1e-12), 1e-6)
 
+    def test_vector_solve_matches_the_scalar_solves(self):
+        """Solve the three components of a cloth system at once to the bits of three scalar solves: one pass over the
+        sparse inverse's long rows sums them as the scalar products do."""
+        from newton._src.solvers.fba.linear_solver import (  # noqa: PLC0415
+            FBALinearSolver,
+            build_pd_system,
+            factorize_and_sparse_inverse,
+        )
+
+        builder = newton.ModelBuilder()
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=24,
+            dim_y=24,
+            cell_x=0.01,
+            cell_y=0.01,
+            mass=0.01,
+            tri_ke=1.0e3,
+            edge_ke=1.0e-2,
+        )
+        model = builder.finalize(device="cpu")
+        A, _meta = build_pd_system(model, dt=0.01, pin_stiffness=1.0e12)
+        fs = factorize_and_sparse_inverse(A, model.particle_q.numpy())
+        self.assertGreater(fs.S.indptr[-1] / A.shape[0], 64.0)  # rows long enough for the tiled products
+        rng = np.random.default_rng(3)
+        for device in ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else []):
+            with self.subTest(device=device):
+                solver = FBALinearSolver(fs, device=device)
+                b = wp.array(rng.standard_normal((A.shape[0], 3)), dtype=wp.vec3, device=device)
+                x = wp.empty(A.shape[0], dtype=wp.vec3, device=device)
+                solver.solve(b, x)
+                expected = np.empty((A.shape[0], 3), dtype=np.float32)
+                for c in range(3):
+                    scalar = wp.array(b.numpy()[:, c].astype(np.float64), dtype=wp.float64, device=device)
+                    out = wp.empty(A.shape[0], dtype=wp.float64, device=device)
+                    solver.solve_scalar(scalar, out)
+                    expected[:, c] = out.numpy().astype(np.float32)
+                np.testing.assert_array_equal(x.numpy(), expected)
+
     def test_solve_spd_with_dominant_off_diagonal(self):
         """Solve an SPD system whose off-diagonal entries exceed the diagonal.
 
