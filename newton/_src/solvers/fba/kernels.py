@@ -5012,6 +5012,34 @@ def compute_v_anchor_kernel(
 
 
 @wp.kernel
+def add_surface_velocity_kernel(
+    record: wp.array[wp.int32],  # (M,) index of each row's contact in Contacts, -1 for face and self contacts
+    shape_idx: wp.array[wp.int32],  # (M,)
+    shape_body: wp.array[wp.int32],  # (n_shapes,)
+    has_shape_body: wp.int32,
+    body_q: wp.array[wp.transform],  # (n_bodies,)
+    has_body_q: wp.int32,
+    body_vel: wp.array[wp.vec3],  # Contacts.soft_contact_body_vel, in the body frame
+    v_anchor: wp.array[wp.vec3d],  # (M,) inout
+):
+    """Add the surface velocity of each particle contact's shape, as of a conveyor or an animated mesh, which the
+    collision pipeline reports in the shape's body frame, to the contact's anchor velocity."""
+    c = wp.tid()
+    k = record[c]
+    if k < 0:
+        return
+    v = body_vel[k]
+    if v[0] == 0.0 and v[1] == 0.0 and v[2] == 0.0:
+        return
+    b = wp.int32(-1)
+    if has_shape_body != 0:
+        b = shape_body[shape_idx[c]]
+    if b >= 0 and has_body_q != 0:
+        v = wp.transform_vector(body_q[b], v)
+    v_anchor[c] = v_anchor[c] + wp.vec3d(v)
+
+
+@wp.kernel
 def compute_v_anchor_from_body_kernel(
     shape_idx: wp.array[wp.int32],  # (M,) shape index per contact
     shape_body: wp.array[wp.int32],  # (n_shapes,) body index per shape (-1 = static)
