@@ -61,7 +61,7 @@ class TestRigidIterationGraph(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if not wp.is_cuda_available():
-            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
+            raise unittest.SkipTest("rigid_iteration_graph replays CUDA graphs")
 
     def _run(self, scene, graph, steps=60, dt=0.005):
         from newton.solvers import SolverFBA  # noqa: PLC0415

@@ -14,11 +14,6 @@ from newton.solvers import SolverFBA
 class TestCable(unittest.TestCase):
     """An 8 x 2 x 2 cm finger of 5 mm cells clamped at x = 0, with a cable of seven 1 cm segments at height ``z``."""
 
-    @classmethod
-    def setUpClass(cls):
-        if not wp.is_cuda_available():
-            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
-
     def _finger(self, z=0.018):
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         mu, lam = 1.0e6 / 2.6, 1.0e6 * 0.3 / (1.3 * 0.4)  # young 1 MPa, poisson 0.3

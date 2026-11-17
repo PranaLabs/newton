@@ -29,7 +29,7 @@ def _scene(device, gravity=(0.0, 0.0, -9.81)):
 class TestGatherFriction(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        cls.device = wp.get_device()
 
     def _mu(self, **kwargs):
         model = _scene(self.device)
@@ -56,16 +56,11 @@ class TestSolverFriction(unittest.TestCase):
 
     H, STEPS = 0.01, 30
 
-    @classmethod
-    def setUpClass(cls):
-        if not wp.is_cuda_available():
-            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
-
     def _slide(self, **solver_args):
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
         theta = np.arctan(0.55)
-        model = _scene("cuda:0", gravity=(9.81 * np.sin(theta), 0.0, -9.81 * np.cos(theta)))
+        model = _scene(wp.get_device(), gravity=(9.81 * np.sin(theta), 0.0, -9.81 * np.cos(theta)))
         solver = SolverFBA(model, iterations=10, **solver_args)
         s0, s1 = model.state(), model.state()
         pipeline = newton.CollisionPipeline(model)
@@ -87,7 +82,7 @@ class TestSolverFriction(unittest.TestCase):
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
         with self.assertRaises(ValueError):
-            SolverFBA(_scene("cuda:0"), rigid_contact_friction="min")
+            SolverFBA(_scene(wp.get_device()), rigid_contact_friction="min")
 
 
 if __name__ == "__main__":

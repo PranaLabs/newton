@@ -54,11 +54,6 @@ def _drop(height, steps, sparse, gap=1e-4, **soft):
 
 
 class TestSoftRigidContacts(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        if not wp.is_cuda_available():
-            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
-
     def test_rest_sinks_by_the_static_deflection(self):
         """The ball at rest on the box sinks g tau² (0.157 mm for tau = 4 ms), the deflection of a spring of
         stiffness m / tau² under its weight; hard contacts keep it on the surface."""

@@ -376,11 +376,6 @@ class TestSolverFBARigidContacts(unittest.TestCase):
 
     MU, H = 0.5, 0.01
 
-    @classmethod
-    def setUpClass(cls):
-        if not wp.is_cuda_available():
-            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
-
     def _run(self, gravity, v0, steps, **solver_args):
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
@@ -585,11 +580,6 @@ class TestSolverFBARigidContactStorage(unittest.TestCase):
 
 
 class TestSolverFBAArticulationContacts(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        if not wp.is_cuda_available():
-            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
-
     def test_hinged_plank_rests_on_ground(self):
         """Rest the far end of a frictionless plank hinged at one end on the ground.
 
@@ -722,11 +712,6 @@ class TestSolverFBAArticulationContacts(unittest.TestCase):
 
 class TestSolverFBATwoWayContacts(unittest.TestCase):
     """A cloth patch over a free box: particle contacts push on both."""
-
-    @classmethod
-    def setUpClass(cls):
-        if not wp.is_cuda_available():
-            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
 
     def _run(
         self, gravity, cloth_z, v_cloth, box_density, particle_mass, steps, ground=False, observe=False, **solver_args

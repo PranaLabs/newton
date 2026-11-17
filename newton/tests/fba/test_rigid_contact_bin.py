@@ -38,23 +38,18 @@ def _keys(rc, size):
 
 
 class TestRigidContactBin(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        if not wp.is_cuda_available():
-            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
-
     def test_one_contact_per_bin(self):
         """The reduction keeps one contact of each bin, in their order."""
         size = 0.05
-        model = _scene("cuda:0")
+        model = _scene(wp.get_device())
         state = model.state()
         pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
         pipeline.collide(state, contacts)
         slot = np.full(model.body_count, -1, dtype=np.int32)
         slot[0] = 0
-        full = gather_rigid_contacts(model, contacts, slot, "cuda:0")
-        kept = gather_rigid_contacts(model, contacts, slot, "cuda:0", bin_size=size, body_q=state.body_q)
+        full = gather_rigid_contacts(model, contacts, slot, wp.get_device())
+        kept = gather_rigid_contacts(model, contacts, slot, wp.get_device(), bin_size=size, body_q=state.body_q)
         self.assertGreater(full.count, 4 * kept.count)
         all_keys, kept_keys = _keys(full, size), _keys(kept, size)
         self.assertEqual(sorted(kept_keys), sorted(set(all_keys)))
@@ -69,7 +64,7 @@ class TestRigidContactBin(unittest.TestCase):
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
         def rest(**kwargs):
-            model = _scene("cuda:0")
+            model = _scene(wp.get_device())
             solver = SolverFBA(model, iterations=10, **kwargs)
             s0, s1 = model.state(), model.state()
             pipeline = newton.CollisionPipeline(model)
@@ -90,7 +85,7 @@ class TestRigidContactBin(unittest.TestCase):
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
         with self.assertRaises(ValueError):
-            SolverFBA(_scene("cuda:0"), rigid_contact_bin=-0.01)
+            SolverFBA(_scene(wp.get_device()), rigid_contact_bin=-0.01)
 
 
 if __name__ == "__main__":

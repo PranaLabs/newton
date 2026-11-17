@@ -147,11 +147,6 @@ class TestRowGroup(unittest.TestCase):
 class TestSolverFBAContactWarmStart(unittest.TestCase):
     """Contacts of resting cloth start each step from the forces they ended the previous one with."""
 
-    @classmethod
-    def setUpClass(cls):
-        if not wp.is_cuda_available():
-            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
-
     @staticmethod
     def _cloth(builder, z):
         grid = {"dim_x": 4, "dim_y": 4, "cell_x": 0.1, "cell_y": 0.1, "tri_ke": 500.0, "tri_ka": 1.0e3, "edge_ke": 1.0}
