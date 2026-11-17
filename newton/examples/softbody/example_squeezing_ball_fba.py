@@ -6,7 +6,8 @@
 #
 # A 6859-particle Neo-Hookean tet ball drops between two pairs of rolling
 # cylinders (mu=0.5, |omega|=3 rad/s) onto a static plane (mu=0.5).  The
-# rolling cylinders friction-drag the ball laterally as it passes through.
+# rolling cylinders, kinematic bodies spun at a prescribed rate,
+# friction-drag the ball laterally as it passes through.
 #
 # Command: python -m newton.examples squeezing_ball_fba
 ###########################################################################
@@ -213,17 +214,15 @@ class Example:
             particle_radius=0.0,
         )
 
-        # Each cylinder is two shapes:
-        #   - collision: full-size, invisible primitive (drives physics + NSN
-        #     friction kinematics via ``shape_angular_velocity``),
+        # Each cylinder is a kinematic body that spins at its prescribed rate, with two shapes:
+        #   - collision: full-size, invisible primitive; its contacts take the body's surface velocity into their
+        #     friction,
         #   - visual: UV-mapped triangle mesh as a site (non-colliding),
         #     with a tiled 2x2 checker texture so the rotation is visible.
         # The visual mesh is shrunk by ``_CYL_VISUAL_SHRINK`` so it sits just
         # inside the collision surface (collision unaffected).
-        self._cyl_shape_ids: list[int] = []  # visual mesh shape ids (rotate per step)
-        self._cyl_collision_ids: list[int] = []  # collision-cylinder shape ids
+        self._cyl_bodies: list[int] = []
         self._cyl_init_xforms: list[wp.transform] = []
-        self._cyl_angles: list[float] = []
 
         cyl_visual_verts, cyl_visual_idx, cyl_visual_uvs = _make_cylinder_mesh(
             _CYL_RADIUS * _CYL_VISUAL_SHRINK,
@@ -243,29 +242,14 @@ class Example:
 
         for base, axis, _omega in _CYLINDERS:
             xform = _cyl_xform(base, axis)
+            body = builder.add_body(xform=xform, mass=1.0, is_kinematic=True)
 
             cfg_collision = builder.default_shape_cfg.copy()
             cfg_collision.is_visible = False
-            coll_id = builder.add_shape_cylinder(
-                body=-1,
-                xform=xform,
-                radius=_CYL_RADIUS,
-                half_height=_CYL_HALF_HEIGHT,
-                cfg=cfg_collision,
-            )
-            self._cyl_collision_ids.append(coll_id)
-
-            cfg_visual = builder.default_site_cfg.copy()
-            vis_id = builder.add_shape_mesh(
-                body=-1,
-                xform=xform,
-                mesh=cyl_visual_mesh,
-                cfg=cfg_visual,
-                color=_CYL_COLOR,
-            )
-            self._cyl_shape_ids.append(vis_id)
+            builder.add_shape_cylinder(body, radius=_CYL_RADIUS, half_height=_CYL_HALF_HEIGHT, cfg=cfg_collision)
+            builder.add_shape_mesh(body, mesh=cyl_visual_mesh, cfg=builder.default_site_cfg.copy(), color=_CYL_COLOR)
+            self._cyl_bodies.append(body)
             self._cyl_init_xforms.append(xform)
-            self._cyl_angles.append(0.0)
 
         builder.add_shape_plane(
             plane=(0.0, 1.0, 0.0, 10.0),
@@ -283,13 +267,10 @@ class Example:
         self.model.particle_mass.assign(mass_arr)
         self.model.particle_inv_mass.assign(inv_mass_arr)
 
-        shape_omega = {self._cyl_collision_ids[i]: _CYLINDERS[i][2] for i in range(len(_CYLINDERS))}
-
         self.solver = SolverFBA(
             self.model,
             iterations=_PD_ITER,
             stretching_model="neohookean",
-            shape_angular_velocity=shape_omega,
             # The scene's constraint_solver.linear_solver.max_iterations.
             nsn_linear_iterations=10,
         )
@@ -309,52 +290,23 @@ class Example:
         # starts at y = 5.6 m and it comes to rest on the plane at y = -10 m.
         self.viewer.set_camera(pos=wp.vec3(16.39, 4.01, 16.39), pitch=-15.0, yaw=-135.0)
 
-        # Cache the initial shape_transform array as a NumPy buffer; per-step
-        # rotation updates write into a copy of this and assign in bulk.
-        self._shape_transform_init_np = self.model.shape_transform.numpy().copy()
-
         # Cache ball-mesh data for the custom blue-purple render.
         self._ball_tri_indices = self.model.tri_indices.flatten()
 
-    @staticmethod
-    def _quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        """Hamilton product of two quats in (x, y, z, w) order: ``a ∘ b``."""
-        ax, ay, az, aw = a
-        bx, by, bz, bw = b
-        return np.array(
-            [
-                aw * bx + ax * bw + ay * bz - az * by,
-                aw * by - ax * bz + ay * bw + az * bx,
-                aw * bz + ax * by - ay * bx + az * bw,
-                aw * bw - ax * bx - ay * by - az * bz,
-            ],
-            dtype=np.float64,
-        )
-
-    def _advance_cylinder_rotation(self) -> None:
-        """Update each visual-cylinder mesh's shape_transform to spin about
-        its local +Z axis.  Collision cylinders stay at their initial xform:
-        they're rotationally symmetric so this is invariant to physics,
-        and ``shape_angular_velocity`` carries the kinematic surface speed
-        to NSN's friction step directly. Both spin right-handed about the
-        cylinder's local +Z axis.
-        """
-        new_xforms = self._shape_transform_init_np.copy()
-        for i, (_base, _axis, omega) in enumerate(_CYLINDERS):
-            self._cyl_angles[i] += omega * self.frame_dt
-            angle = self._cyl_angles[i]
-            cyl_xform = self._cyl_init_xforms[i]
-            half = angle * 0.5
-            q_local = np.array([0.0, 0.0, math.sin(half), math.cos(half)], dtype=np.float64)
-            base_q = np.asarray(cyl_xform.q, dtype=np.float64)
-            new_q = self._quat_mul(base_q, q_local)
-            vis_id = self._cyl_shape_ids[i]
-            new_xforms[vis_id][:3] = np.asarray(cyl_xform.p, dtype=np.float64)
-            new_xforms[vis_id][3:] = new_q
-        self.model.shape_transform.assign(new_xforms.astype(np.float32))
+    def _spin_cylinders(self, state) -> None:
+        """Turn each kinematic cylinder by its rate to the current time about its axis and give it that angular
+        velocity, so that the contacts' friction takes the surface's motion."""
+        q, qd = state.body_q.numpy(), state.body_qd.numpy()
+        for body, xform, (_base, axis, omega) in zip(self._cyl_bodies, self._cyl_init_xforms, _CYLINDERS, strict=True):
+            turn = wp.quat_from_axis_angle(wp.vec3(*axis.tolist()), omega * self.sim_time)
+            q[body, :3] = np.asarray(xform.p)
+            q[body, 3:] = np.asarray(turn * xform.q)
+            qd[body] = (0.0, 0.0, 0.0, *(omega * axis))
+        state.body_q.assign(q)
+        state.body_qd.assign(qd)
 
     def step(self):
-        self._advance_cylinder_rotation()
+        self._spin_cylinders(self.state_0)
         self.state_0.clear_forces()
         self.pipeline.collide(self.state_0, self.contacts)
         self.solver.step(self.state_0, self.state_1, None, self.contacts, self.frame_dt)

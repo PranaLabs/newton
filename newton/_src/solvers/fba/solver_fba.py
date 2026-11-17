@@ -250,7 +250,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
         stretching_model: Literal["arap", "corotational", "neohookean"] = "arap",
         friction: bool = True,
         friction_anchors: bool = False,
-        shape_angular_velocity: dict[int, float] | None = None,
         shape_particle_radius_override: dict[int, float] | None = None,
         nsn_schur_mode: Literal["full", "lite"] = "full",
         nsn_sparse_storage: bool = False,
@@ -320,12 +319,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 bodies, face contacts, and the contacts of a step in which one
                 touches a body that FBA integrates keep the step's point.
                 Needs ``friction=True``.
-            shape_angular_velocity: Optional ``{shape_index: ω}`` mapping of
-                angular speeds [rad/s], right-handed about each listed shape's
-                local +Z axis (Newton's cylinder primitive axis). The surface
-                velocity ``ω · cross(axis_world, world_anchor - shape_center)``
-                enters the residual of the friction rows; the shape geometry
-                itself stays static. Defaults to no kinematic motion.
             shape_particle_radius_override: Optional ``{shape_index: radius}``
                 mapping of the contact thickness [m] of the particles against
                 the listed shapes: their particle and face contacts stop this
@@ -929,19 +922,10 @@ class SolverFBA(TendonStateMixin, SolverBase):
         self._rigid_dt: float | None = None
         self._rigid_linear_solver = None
 
-        # Per-shape kinematic angular velocity (rad/s about local +Z).
-        n_shapes = model.shape_count
-        self._shape_omega_h = np.zeros(max(n_shapes, 1), dtype=np.float64)
-        for s_idx, omega in (shape_angular_velocity or {}).items():
-            if not 0 <= int(s_idx) < n_shapes:
-                raise ValueError(f"shape_angular_velocity names shape {s_idx}, but the model has {n_shapes} shapes")
-            self._shape_omega_h[int(s_idx)] = float(omega)
-        # Device mirror consumed by the GPU contact kernels; the
-        # host array stays the source of truth (small, rarely modified).
-        self._shape_omega_d = wp.array(self._shape_omega_h, dtype=wp.float64, device=model.device)
         # Per-shape particle contact thickness, -1 where the particle radius holds; None without overrides.
         self._shape_radius_d = None
         if shape_particle_radius_override:
+            n_shapes = model.shape_count
             smallest = float(model.particle_radius.numpy().min()) if model.particle_count else 0.0
             radii = np.full(max(n_shapes, 1), -1.0, dtype=np.float32)
             for shape, radius in shape_particle_radius_override.items():
@@ -1659,7 +1643,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
         "_contact_shape_d",
         "_contact_body_pos_d",
         "_contact_world_anchor_d",
-        "_contact_is_spinning_d",
         "_contact_tangent1_offset_d",
         "_contact_tangent2_offset_d",
         "_contact_v_anchor_d",
@@ -4880,12 +4863,11 @@ class SolverFBA(TendonStateMixin, SolverBase):
         self._contact_tangent2_d = wp.empty(cap, dtype=wp.vec3, device=device)
         # Device-resident scratch buffers consumed by the
         # ``_ingest_contacts`` GPU kernels (world anchor, tangent offsets,
-        # spinning flag, v_anchor). Sized to ``cap`` once here so kernel
+        # v_anchor). Sized to ``cap`` once here so kernel
         # launches in :meth:`_ingest_contacts` never re-allocate.
         self._contact_shape_d = wp.empty(cap, dtype=wp.int32, device=device)
         self._contact_body_pos_d = wp.empty(cap, dtype=wp.vec3, device=device)
         self._contact_world_anchor_d = wp.empty(cap, dtype=wp.vec3, device=device)
-        self._contact_is_spinning_d = wp.empty(cap, dtype=wp.int32, device=device)
         self._contact_tangent1_offset_d = wp.empty(cap, dtype=wp.float64, device=device)
         self._contact_tangent2_offset_d = wp.empty(cap, dtype=wp.float64, device=device)
         self._contact_v_anchor_d = wp.empty(cap, dtype=wp.vec3d, device=device)
@@ -5121,13 +5103,12 @@ class SolverFBA(TendonStateMixin, SolverBase):
         self._ensure_contact_buffers(M)
 
         # Per-contact bookkeeping (world_anchor, n·anchor offset, tangent
-        # basis, t·anchor tangent offsets, v_anchor for rolling cylinders)
+        # basis, t·anchor tangent offsets, v_anchor of moving shapes)
         # runs on GPU.
         from .kernels import (  # noqa: PLC0415
             compute_normal_offset_kernel,
             compute_tangent_basis_kernel,
             compute_tangent_offsets_kernel,
-            compute_v_anchor_kernel,
             compute_world_anchor_kernel,
         )
 
@@ -5162,11 +5143,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
         shape_transform_arr = (
             model.shape_transform if hasattr(model, "shape_transform") and model.shape_transform is not None else None
         )
-        has_shape_transform = wp.int32(1 if shape_transform_arr is not None and shape_transform_arr.size > 0 else 0)
         if shape_transform_arr is None or shape_transform_arr.size == 0:
             shape_transform_arr = wp.empty(1, dtype=wp.transform, device=device)
-
-        has_shape_omega = wp.int32(1 if self._shape_omega_d.size > 0 else 0)
 
         # World-frame anchor: static-shape contacts pass body_pos through,
         # dynamic contacts apply body_q.
@@ -5226,19 +5204,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
             wp.launch(
                 compute_tangent_basis_kernel,
                 dim=M,
-                inputs=[
-                    self._contact_normal_d,
-                    self._contact_shape_d,
-                    self._shape_omega_d,
-                    shape_transform_arr,
-                    has_shape_omega,
-                    has_shape_transform,
-                ],
-                outputs=[
-                    self._contact_tangent1_d,
-                    self._contact_tangent2_d,
-                    self._contact_is_spinning_d,
-                ],
+                inputs=[self._contact_normal_d],
+                outputs=[self._contact_tangent1_d, self._contact_tangent2_d],
                 device=device,
             )
             wp.launch(
@@ -5255,24 +5222,9 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 ],
                 device=device,
             )
-            wp.launch(
-                compute_v_anchor_kernel,
-                dim=M,
-                inputs=[
-                    self._contact_is_spinning_d,
-                    self._contact_shape_d,
-                    self._shape_omega_d,
-                    shape_transform_arr,
-                    self._contact_world_anchor_d,
-                ],
-                outputs=[self._contact_v_anchor_d],
-                device=device,
-            )
-            # When the contact's parent shape is attached to a moving rigid
-            # body, body-driven 6-DoF velocity supersedes the
-            # per-shape ``shape_angular_velocity``.  This kernel only writes
-            # contacts whose ``shape_body[s] >= 0``; static-shape contacts keep
-            # the value computed above by ``compute_v_anchor_kernel``.
+            # The anchors of static shapes stand still; those of shapes on bodies move with the bodies, and so do
+            # the surfaces of conveyors and animated meshes.
+            self._contact_v_anchor_d[:M].zero_()
             body_qd_arr = body_src.body_qd if getattr(body_src, "body_qd", None) is not None else None
             if (
                 has_shape_body == wp.int32(1)

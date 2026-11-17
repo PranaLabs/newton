@@ -1,0 +1,1 @@
+Remove the `shape_angular_velocity` option of `SolverFBA`, which let a static shape act as if it spun: spin a kinematic body instead, whose velocity its contacts' friction already takes, as the `squeezing_ball_fba` example now does. The option also lost its spin where a contact's normal ran along the axis, and friction anchors held particles against it.
