@@ -217,7 +217,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
     parent's joint frame (the child's for the second axis of a two-axis D6
     joint); a position drive needs a linear axis or the angular axis of a joint
     with one. ``Control.joint_f`` adds the joints' generalized forces to their
-    bodies. The limits' stiffness and damping (``joint_limit_ke``,
+    bodies. A mimic joint (``Model.joint_mimic_joint``) holds each coordinate
+    at ``c0 + c1`` times its leader's by a hard row on both joints' axes. The limits' stiffness and damping (``joint_limit_ke``,
     ``joint_limit_kd``), the effort and velocity limits and joint friction are
     not read, nor are the limits of ball and D6 joints.
 
@@ -612,6 +613,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         # The joints' limit candidates (none without finite limits on revolute and prismatic axes), the step's limit
         # rows, and whether the joints have damper rows.
         self._limits, self._rc_limits, self._limit_ws, self._joint_dampers = None, 0, None, False
+        self._rc_mimic = None  # the mimic pairs among the rows of the step's rigid contact solve
         self._two_way_world_h = np.zeros(model.world_count, dtype=np.int32)
         self._two_way_world_d = wp.empty(0, dtype=wp.int32, device=model.device)
         # The rows of a step whose worlds split between the two-way and the deformable NSN, and the Schur rows of the
@@ -1432,6 +1434,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         )
 
         model, device = self.model, self._device
+        self._rc_mimic = None
         if getattr(self, "_rc_gather", None) is None:
             from .rigid_contact import RigidContactGather  # noqa: PLC0415
 
@@ -1509,6 +1512,14 @@ class SolverFBA(TendonStateMixin, SolverBase):
             blocks = self._slot_block[slots[slots >= 0]]
             joint_rows = np.flatnonzero(np.isin(self._joint_row_block, blocks[blocks >= 0])).astype(np.int32)
         self._rc_joint_rows_h = joint_rows
+        # The mimic pairs among the joint rows that join this solve, as positions among them.
+        self._rc_mimic = None
+        if self._joint_rows is not None and len(self._joint_rows.mimic_rows) and joint_rows.size:
+            pairs = self._joint_rows.mimic_rows
+            joined = np.isin(pairs[:, 0], joint_rows)
+            if joined.any():
+                # Positions among the joined joint rows, which the rows' offset turns into rows of the solve.
+                self._rc_mimic = (np.searchsorted(joint_rows, pairs[joined]), self._joint_rows.mimic_coeffs[joined])
         # Particle constraint rows follow the joint rows when the deformable rows join this solve.
         n_b = self._rc_n_b = (
             0 if self._constraint_rows is None or not (m_s or attach) else self._constraint_rows[0].shape[0]
@@ -1519,6 +1530,10 @@ class SolverFBA(TendonStateMixin, SolverBase):
         # capacity with inert rows and the joint rows to all joint rows, so that the NSN step's graph replays from
         # step to step.
         storage = None
+        if self.nsn_sparse_storage and self._rc_mimic is not None:
+            raise NotImplementedError(
+                "SolverFBA solves the contacts of mimic joints only with nsn_sparse_storage=False"
+            )
         if self.nsn_sparse_storage and not m_s and not attach and model.world_count == 1:
             if wp.get_device(device).is_cuda:
                 from .rigid_contact import RigidRowStorage  # noqa: PLC0415
@@ -1543,6 +1558,12 @@ class SolverFBA(TendonStateMixin, SolverBase):
             # column reads than scalar entries.
             self._ensure_pcr_solver(self._rc_n_pad)
             self._rc_blocked = self._pcr_solver.fuses_single(self._rc_n_pad)
+        if self._rc_mimic is not None:
+            # The mimic pairs' rows in this solve, their coefficients and their block (the solve's one).
+            local, coeffs = self._rc_mimic
+            rows_d = wp.array((local + self._rc_joint_offset).astype(np.int32), dtype=wp.int32, device=device)
+            block_d = wp.zeros(len(local), dtype=wp.int32, device=device)
+            self._rc_mimic = (rows_d, wp.array(coeffs, dtype=wp.float64, device=device), block_d)
         if storage is None:
             self._rc_row_slot_d = wp.full((n, 2), -1, dtype=wp.int32, device=device)
             self._rc_row_jac_d = wp.zeros((n, 2), dtype=wp.spatial_vectord, device=device)
@@ -2206,6 +2227,11 @@ class SolverFBA(TendonStateMixin, SolverBase):
             outputs=[self._rc_W_d],
             device=device,
         )
+        if self._rc_mimic is not None:
+            from .joints import combine_mimic_matrix  # noqa: PLC0415
+
+            rows, coeffs, block = self._rc_mimic
+            combine_mimic_matrix(self._rc_W_d.reshape((1, n, n)), block, rows, coeffs, device)
 
     def _point_length_rows(self, x: wp.array) -> None:
         """Point the length rows of :meth:`set_particle_constraints` along their combination at ``x``."""
@@ -2321,6 +2347,12 @@ class SolverFBA(TendonStateMixin, SolverBase):
                     outputs=[self._rc_r_d[lo:]],
                     device=device,
                 )
+        if self._rc_mimic is not None:
+            from .joints import mimic_combine_kernel  # noqa: PLC0415
+
+            # The mimic pairs' shifts back to the free flight combine as their rows do; their values already did.
+            rows, coeffs, _ = self._rc_mimic
+            wp.launch(mimic_combine_kernel, rows.shape[0], [rows, coeffs, 0, 0], [self._rc_r_d], device=device)
         if n_b:
             wp.launch(
                 particle_constraint_residual_kernel,
@@ -2346,6 +2378,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         if m_s or n_b:
             self._linear_solver.reserve_lambda_correction()
         tail_objects = (self._linear_solver, self._rc_lam_d, self._rc_omega_d, self._rc_lam_soft_d, self._rhs)
+        tail_objects += () if self._rc_mimic is None else self._rc_mimic[:2]
         tail_objects += tuple(
             getattr(self, name, None)
             for name in ("_x_cur", "_lam_coulomb_persistent_d", "_omega_coulomb_persistent_d", "_joint_force_d")
@@ -2388,8 +2421,14 @@ class SolverFBA(TendonStateMixin, SolverBase):
     ) -> None:
         """Keep the two-way NSN step's multipliers, correct the particle positions and write the forces of the joint
         rows ``joint_rows``, which start at row ``joint_offset``."""
-        from .joints import scatter_values_kernel  # noqa: PLC0415
+        from .joints import mimic_force_kernel, scatter_values_kernel  # noqa: PLC0415
 
+        if self._rc_mimic is not None:
+            # The leaders' rows of the mimic pairs carry -c1 times their followers' forces.
+            rows, coeffs, _ = self._rc_mimic
+            wp.launch(
+                mimic_force_kernel, rows.shape[0], [rows, coeffs, 0], [self._nsn_lam_apply_d], device=self._device
+            )
         wp.copy(self._rc_lam_d, self._nsn_lam_d, count=n)
         wp.copy(self._rc_omega_d, self._nsn_omega_d, count=n)
         if m_s or n_b:
@@ -2527,6 +2566,13 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 outputs=[self._joint_residual_d],
                 device=self._device,
             )
+            system = self._joint_system
+            if system.mimic_rows.shape[0]:
+                from .joints import mimic_combine_kernel  # noqa: PLC0415
+
+                inputs = [system.mimic_rows, system.mimic_coeffs, 0, 1]
+                outputs = [self._joint_residual_d]
+                wp.launch(mimic_combine_kernel, system.mimic_rows.shape[0], inputs, outputs, device=self._device)
             self._joint_system.update(self._joint_residual_d, self._joint_force_d)
         force = self._solve_rigid_contacts(state_in, dt) if self._rc_n else None
         if self._joint_rows is not None:

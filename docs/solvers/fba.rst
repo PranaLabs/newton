@@ -390,6 +390,18 @@ Model Inputs
   articulation it integrates sets them. Joints at the default infinite limits,
   zero damping and armature and no drive take no such rows. Limits need the
   full operator.
+- **Mimic joints**: a mimic joint (:attr:`~newton.Model.joint_mimic_joint`
+  and :attr:`~newton.Model.joint_mimic_coeffs`) holds each coordinate at
+  ``c0 + c1`` times its leader's, as a hard row: a pair of rows on the
+  follower's and the leader's axes, combined into one row in the
+  articulation's joint system, and in the contact solve when contacts touch
+  the articulation, so that its force acts on both joints, equal and
+  opposite. FBA holds mimics between PRISMATIC, REVOLUTE and D6 joints of the
+  same axes, at most one of them angular, whose leader is a joint on bodies it
+  integrates; it warns about mimics of other joint types and leaves them out,
+  as the other solvers do. A revolute coordinate is its angle in
+  ``(-pi, pi]``. Mimic joints that contacts touch need
+  ``nsn_sparse_storage=False``.
 - **Tendons**: FBA simulates the model's tendons
   (:meth:`~newton.ModelBuilder.add_tendon`) and routes them itself with
   Newton's routing of anchors, pinholes and rollers, the same as the other
@@ -423,7 +435,7 @@ Model Inputs
   :meth:`~newton.solvers.SolverFBA.register_custom_attributes` registers these
   attributes. Tendons need the full operator and one world.
 
-FBA does not simulate equality constraints, mimic joints, the
+FBA does not simulate equality constraints, the
 limits of BALL and D6 joints, the limit stiffness and damping
 ``joint_limit_ke`` and ``joint_limit_kd`` (its limits are hard), the effort
 and velocity limits and the friction of joint DOFs, or the inputs of

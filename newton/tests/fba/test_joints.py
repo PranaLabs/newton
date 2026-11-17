@@ -997,5 +997,128 @@ class TestSolverFBAJointDrives(unittest.TestCase):
                         step(model)
 
 
+class TestSolverFBAMimicJoints(unittest.TestCase):
+    """SolverFBA holds mimic joints (``Model.joint_mimic_joint``) at ``c0 + c1`` times their leaders' coordinates."""
+
+    @staticmethod
+    def _hand(kind, c0, c1, free_base=False, grasp=False):
+        """A base of 2 kg with two fingers of 0.1 kg on prismatic joints along y or revolute joints about x, the
+        first driven to 0.03 m or 0.4 rad and the second its mimic; with ``grasp``, box fingers close on a box of
+        50 g between them. Without gravity. The model and the two joints."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        base = builder.add_link(mass=2.0, inertia=wp.mat33(np.eye(3) * 0.01), lock_inertia=True)
+        fingers = []
+        for side in (1.0, -1.0):
+            xform = wp.transform((0.0, 0.05 * side, 0.0))
+            finger = builder.add_link(mass=0.1, inertia=wp.mat33(np.eye(3) * 1e-4), lock_inertia=True, xform=xform)
+            if grasp:
+                builder.add_shape_box(finger, hx=0.01, hy=0.01, hz=0.02)
+            fingers.append(finger)
+        joints = [builder.add_joint_free(base) if free_base else builder.add_joint_fixed(-1, base)]
+        target = 0.03 if kind == "prismatic" else 0.4
+        for k, side in enumerate((1.0, -1.0)):
+            add = builder.add_joint_prismatic if kind == "prismatic" else builder.add_joint_revolute
+            axis = (0.0, -side, 0.0) if kind == "prismatic" else (1.0, 0.0, 0.0)
+            drive = {"target_ke": 2000.0, "target_kd": 50.0, "target_pos": target} if k == 0 else {}
+            parent_xform = wp.transform((0.0, 0.05 * side, 0.0))
+            joints.append(add(base, fingers[k], axis=axis, parent_xform=parent_xform, **drive))
+        builder.add_articulation(joints)
+        if grasp:
+            box = builder.add_body(mass=0.05, inertia=wp.mat33(np.eye(3) * 1e-5), lock_inertia=True)
+            builder.add_shape_box(box, hx=0.015, hy=0.02, hz=0.015)
+        model = builder.finalize()
+        leaders = model.joint_mimic_joint.numpy()
+        leaders[joints[2]] = joints[1]
+        model.joint_mimic_joint.assign(leaders)
+        coeffs = model.joint_mimic_coeffs.numpy()
+        coeffs[joints[2]] = (c0, c1)
+        model.joint_mimic_coeffs.assign(coeffs)
+        return model, joints[1], joints[2]
+
+    @staticmethod
+    def _run(model, leader, follower, steps, dt, contacts=False):
+        """The two joints' coordinates and the bodies' total linear momentum after each step, and the solver."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        solver = SolverFBA(model, iterations=5)
+        pipeline = newton.CollisionPipeline(model) if contacts else None
+        found = pipeline.contacts() if contacts else None
+        s0, s1, joint_state = model.state(), model.state(), model.state()
+        start = model.joint_q_start.numpy()
+        out, joined = [], False
+        for _ in range(steps):
+            if pipeline is not None:
+                pipeline.collide(s0, found)
+            solver.step(s0, s1, None, found, dt)
+            s0, s1 = s1, s0
+            joined |= solver._rc_mimic is not None
+            newton.eval_ik(model, s0, joint_state.joint_q, joint_state.joint_qd)
+            q = joint_state.joint_q.numpy()
+            momentum = (s0.body_qd.numpy()[:, :3] * model.body_mass.numpy()[:, None]).sum(axis=0)
+            out.append((q[start[leader]], q[start[follower]], np.abs(momentum).max()))
+        return np.array(out), joined
+
+    def test_followers_hold_the_leaders_coordinates(self):
+        """Hold a prismatic and a revolute follower at ``c0 + c1`` times their leader's coordinate at every step while
+        the leader's drive moves it to its target."""
+        for kind in ("prismatic", "revolute"):
+            for c0, c1 in ((0.0, 1.0), (0.01, 0.5), (-0.02, -2.0)):
+                with self.subTest(kind=kind, c0=c0, c1=c1):
+                    model, leader, follower = self._hand(kind, c0, c1)
+                    out, _ = self._run(model, leader, follower, 100, 0.01)
+                    np.testing.assert_allclose(out[:, 1], c0 + c1 * out[:, 0], rtol=0.0, atol=1e-6)
+                    self.assertAlmostEqual(out[-1, 0], 0.03 if kind == "prismatic" else 0.4, delta=1e-4)
+
+    def test_mimic_forces_conserve_momentum(self):
+        """Keep the total momentum of a free hand whose fingers move asymmetrically, ``c1 = 0.5``, at zero: the pair
+        applies equal and opposite forces to its three bodies."""
+        for kind in ("prismatic", "revolute"):
+            with self.subTest(kind=kind):
+                model, leader, follower = self._hand(kind, 0.01, 0.5, free_base=True)
+                out, _ = self._run(model, leader, follower, 100, 0.01)
+                np.testing.assert_allclose(out[:, 1], 0.01 + 0.5 * out[:, 0], rtol=0.0, atol=1e-6)
+                self.assertLess(out[:, 2].max(), 1e-6)
+
+    def test_mimic_fingers_grasp_through_the_contact_solve(self):
+        """Close mimic fingers on a box, which brings their joint rows into the contact solve: the fingers stop at the
+        box, the follower at ``c1`` times the leader, the box between them."""
+        for c1 in (1.0, 0.5):
+            with self.subTest(c1=c1):
+                model, leader, follower = self._hand("prismatic", 0.0, c1, grasp=True)
+                out, joined = self._run(model, leader, follower, 150, 0.005, contacts=True)
+                self.assertTrue(joined)
+                np.testing.assert_allclose(out[:, 1], c1 * out[:, 0], rtol=0.0, atol=1e-6)
+                # The fingers' inner faces 4 cm apart, the box's width: 0.07 m between the finger centers.
+                np.testing.assert_allclose(0.1 - out[-1, 0] - out[-1, 1], 0.06, atol=2e-4)
+
+    def test_unsupported_mimics(self):
+        """Warn about a mimic between ball joints, which Newton's solvers leave out, and refuse one between D6 joints
+        with two angular axes, whose angles FBA does not measure."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        for kind in ("ball", "d6"):
+            with self.subTest(kind=kind):
+                builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+                links = [_link(builder) for _ in range(2)]
+                if kind == "ball":
+                    joints = [builder.add_joint_ball(-1, link) for link in links]
+                else:
+                    axes = [Dof(axis=(1.0, 0.0, 0.0)), Dof(axis=(0.0, 1.0, 0.0))]
+                    joints = [builder.add_joint_d6(-1, link, angular_axes=axes) for link in links]
+                for joint in joints:
+                    builder.add_articulation([joint])
+                model = builder.finalize()
+                leaders = model.joint_mimic_joint.numpy()
+                leaders[joints[1]] = joints[0]
+                model.joint_mimic_joint.assign(leaders)
+                solver = SolverFBA(model)
+                if kind == "ball":
+                    with self.assertWarnsRegex(newton.exceptions.NewtonWarning, "mimic"):
+                        solver.step(model.state(), model.state(), None, None, 0.01)
+                else:
+                    with self.assertRaisesRegex(NotImplementedError, "at most one angular axis"):
+                        solver.step(model.state(), model.state(), None, None, 0.01)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
