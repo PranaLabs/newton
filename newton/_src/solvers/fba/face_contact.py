@@ -73,6 +73,13 @@ def shape_sdf(geo_type: int, scale: wp.vec3, mesh: wp.uint64, x: wp.vec3, edge_r
 
 
 @wp.func
+def box_distance(lower: wp.vec3, upper: wp.vec3, x: wp.vec3) -> float:
+    """Distance [m] from ``x`` to the box from ``lower`` to ``upper``, 0 inside: a lower bound of the signed
+    distance to any shape inside the box, such as a shape within its collision bounds."""
+    return wp.length(wp.max(wp.max(lower - x, x - upper), wp.vec3(0.0)))
+
+
+@wp.func
 def min_index(a: wp.vec3) -> int:
     """Index of the smallest component, the first on ties."""
     j = int(0)
@@ -169,6 +176,8 @@ def near_face_kernel(
     shape_source_ptr: wp.array[wp.uint64],
     shape_flags: wp.array[wp.int32],
     shape_world: wp.array[wp.int32],
+    shape_lower: wp.array[wp.vec3],
+    shape_upper: wp.array[wp.vec3],
     gap: float,
     edge_radius: float,
     count: wp.array[wp.int32],
@@ -176,7 +185,8 @@ def near_face_kernel(
 ):
     """``shape * tri_count + face`` of each pair whose triangle may come within ``gap`` of the shape: the
     signed distance changes no faster than the point moves, so no triangle point is closer than the
-    centroid's distance minus the triangle's radius about the centroid."""
+    centroid's distance minus the triangle's radius about the centroid. Triangles that far from the shape's
+    collision bounds, ``shape_lower`` to ``shape_upper`` in the shape frame, skip the signed distance."""
     f, s = wp.tid()
     world = shape_world[s]
     # A local shape and a particle of another world do not touch; global particles touch every shape.
@@ -194,6 +204,8 @@ def near_face_kernel(
     c = wp.transform_point(X_sw, particle_q[tri_indices[f, 2]])
     o = (a + b + c) / 3.0
     radius = wp.max(wp.length(a - o), wp.max(wp.length(b - o), wp.length(c - o)))
+    if box_distance(shape_lower[s], shape_upper[s], o) - radius > gap:
+        return
     d = shape_sdf(shape_type[s], shape_scale[s], shape_source_ptr[s], o, edge_radius)[0]
     if d - radius <= gap:
         pair[wp.atomic_add(count, 0, 1)] = wp.int64(s) * wp.int64(tri_indices.shape[0]) + wp.int64(f)
@@ -369,7 +381,8 @@ class FaceContactQuery:
                 inputs=[
                     *(particle_q, self.tri_d, model.particle_world, bodies),
                     *(model.shape_transform, model.shape_body, model.shape_type, model.shape_scale),
-                    *(model.shape_source_ptr, model.shape_flags, model.shape_world, gap, edge_radius),
+                    *(model.shape_source_ptr, model.shape_flags, model.shape_world),
+                    *(model.shape_collision_aabb_lower, model.shape_collision_aabb_upper, gap, edge_radius),
                 ],
                 outputs=[near_count, near],
                 device=device,
@@ -463,6 +476,8 @@ def near_segment_kernel(
     shape_flags: wp.array[wp.int32],
     shape_world: wp.array[wp.int32],
     shape_margin: wp.array[wp.float32],
+    shape_lower: wp.array[wp.vec3],
+    shape_upper: wp.array[wp.vec3],
     gap: float,
     edge_radius: float,
     shapes: wp.array[wp.int32],
@@ -471,7 +486,8 @@ def near_segment_kernel(
 ):
     """``shape * segment_count + segment`` of each pair whose segment, a capsule of its particles' radius, may come
     within ``gap`` of the shape: no point of the segment is closer than its midpoint's distance minus half its
-    length. The shapes are ``shapes``; those without ``COLLIDE_PARTICLES`` at the step are skipped."""
+    length. The shapes are ``shapes``; those without ``COLLIDE_PARTICLES`` at the step are skipped, and segments that
+    far from a shape's collision bounds skip the signed distance."""
     e, k = wp.tid()
     s = shapes[k]
     world = shape_world[s]
@@ -487,8 +503,10 @@ def near_segment_kernel(
     a = wp.transform_point(X_sw, particle_q[i])
     b = wp.transform_point(X_sw, particle_q[j])
     o = 0.5 * (a + b)
-    d = shape_sdf(shape_type[s], shape_scale[s], shape_source_ptr[s], o, edge_radius)[0]
     reach = wp.max(particle_radius[i], particle_radius[j]) + shape_margin[s] + gap
+    if box_distance(shape_lower[s], shape_upper[s], o) - 0.5 * wp.length(b - a) > reach:
+        return
+    d = shape_sdf(shape_type[s], shape_scale[s], shape_source_ptr[s], o, edge_radius)[0]
     if d - 0.5 * wp.length(b - a) <= reach:
         pair[wp.atomic_add(count, 0, 1)] = wp.int64(s) * wp.int64(segments.shape[0]) + wp.int64(e)
 
@@ -602,7 +620,8 @@ class SegmentContactQuery:
             inputs=[
                 *(particle_q, self.seg_d, model.particle_radius, model.particle_world, bodies),
                 *(model.shape_transform, model.shape_body, model.shape_type, model.shape_scale),
-                *(model.shape_source_ptr, model.shape_flags, model.shape_world, model.shape_margin, gap, edge_radius),
+                *(model.shape_source_ptr, model.shape_flags, model.shape_world, model.shape_margin),
+                *(model.shape_collision_aabb_lower, model.shape_collision_aabb_upper, gap, edge_radius),
                 self.shapes,
             ],
             outputs=[near_count, near],

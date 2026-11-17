@@ -1,0 +1,1 @@
+Speed up `SolverFBA` face contacts with a `face_contact_gap` and rod shape contacts: triangles and rod segments beyond the collision bounds of a shape no longer evaluate its signed distance, which cut the near phase of a 64 x 64 cloth among 40 mesh shapes on the CPU from 54 to 6.7 ms per step.
