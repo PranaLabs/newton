@@ -29,7 +29,8 @@ def shape_sdf(geo_type: int, scale: wp.vec3, mesh: wp.uint64, x: wp.vec3, edge_r
     """Signed distance [m] and its gradient at ``x`` in the shape frame; ``1e6`` for unsupported shapes.
 
     Box and cylinder edges are rounded by ``edge_radius``: inside a sharp edge the gradient jumps
-    between the two faces, so a point that sinks into the edge would flip its normal. Meshes use the
+    between the two faces, so a point that sinks into the edge would flip its normal. Barrel cylinders
+    (``scale[2]``, the barrel radius, positive) keep their edges. Meshes use the
     closest point and sign of Warp's query, scaled as in Newton's particle contacts.
     """
     d = float(1.0e6)
@@ -53,9 +54,15 @@ def shape_sdf(geo_type: int, scale: wp.vec3, mesh: wp.uint64, x: wp.vec3, edge_r
         d = sdf.sdf_capsule(x, scale[0], scale[1], int(Axis.Z))
         g = sdf.sdf_capsule_grad(x, scale[0], scale[1], int(Axis.Z))
     elif geo_type == GeoType.CYLINDER:
-        r = wp.min(edge_radius, 0.5 * wp.min(scale[0], scale[1]))
-        d = sdf.sdf_cylinder(x, scale[0] - r, scale[1] - r, int(Axis.Z)) - r
-        g = sdf.sdf_cylinder_grad(x, scale[0] - r, scale[1] - r, int(Axis.Z))
+        if scale[2] > 0.0:
+            # A barrel, of radius scale[2] at its middle, as Newton's particle contacts take it; its edges are not
+            # rounded.
+            d = sdf.sdf_cylinder(x, scale[0], scale[1], int(Axis.Z), -1.0, scale[2])
+            g = sdf.sdf_cylinder_grad(x, scale[0], scale[1], int(Axis.Z), -1.0, scale[2])
+        else:
+            r = wp.min(edge_radius, 0.5 * wp.min(scale[0], scale[1]))
+            d = sdf.sdf_cylinder(x, scale[0] - r, scale[1] - r, int(Axis.Z)) - r
+            g = sdf.sdf_cylinder_grad(x, scale[0] - r, scale[1] - r, int(Axis.Z))
     elif geo_type == GeoType.CONE:
         d = sdf.sdf_cone(x, scale[0], scale[1], int(Axis.Z))
         g = sdf.sdf_cone_grad(x, scale[0], scale[1], int(Axis.Z))
@@ -172,8 +179,10 @@ def near_face_kernel(
     centroid's distance minus the triangle's radius about the centroid."""
     f, s = wp.tid()
     world = shape_world[s]
+    # A local shape and a particle of another world do not touch; global particles touch every shape.
+    particle_world_f = particle_world[tri_indices[f, 0]]
     if (shape_flags[s] & ShapeFlags.COLLIDE_PARTICLES) == 0 or (
-        world >= 0 and world != particle_world[tri_indices[f, 0]]
+        world >= 0 and particle_world_f >= 0 and world != particle_world_f
     ):
         return
     X_ws = shape_transform[s]
@@ -462,12 +471,14 @@ def near_segment_kernel(
 ):
     """``shape * segment_count + segment`` of each pair whose segment, a capsule of its particles' radius, may come
     within ``gap`` of the shape: no point of the segment is closer than its midpoint's distance minus half its
-    length. The shapes are ``shapes``, those that collide with particles."""
+    length. The shapes are ``shapes``; those without ``COLLIDE_PARTICLES`` at the step are skipped."""
     e, k = wp.tid()
     s = shapes[k]
     world = shape_world[s]
     i, j = segments[e, 0], segments[e, 1]
-    if (shape_flags[s] & ShapeFlags.COLLIDE_PARTICLES) == 0 or (world >= 0 and world != particle_world[i]):
+    if (shape_flags[s] & ShapeFlags.COLLIDE_PARTICLES) == 0 or (
+        world >= 0 and particle_world[i] >= 0 and world != particle_world[i]
+    ):
         return
     X_ws = shape_transform[s]
     if shape_body[s] >= 0:
@@ -577,14 +588,10 @@ class SegmentContactQuery:
         if not n_seg or not model.shape_count:
             return empty
         bodies = self.no_bodies if body_q is None or not body_q.shape[0] else body_q
-        if getattr(self, "shapes", None) is None:
-            # The shapes that collide with particles, read once: the model's flags, fixed after finalize.
-            flags = model.shape_flags.numpy()
-            self.shapes = wp.array(
-                np.flatnonzero(flags & int(ShapeFlags.COLLIDE_PARTICLES)).astype(np.int32),
-                dtype=wp.int32,
-                device=device,
-            )
+        if getattr(self, "shapes", None) is None or self.shapes.shape[0] != model.shape_count:
+            # Every shape: the kernel reads the shapes' flags at each step, which a scene may switch, as Newton's
+            # particle contacts do.
+            self.shapes = wp.array(np.arange(model.shape_count, dtype=np.int32), dtype=wp.int32, device=device)
         if not self.shapes.shape[0]:
             return empty
         near_count = wp.zeros(1, dtype=wp.int32, device=device)

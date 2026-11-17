@@ -4839,7 +4839,9 @@ class SolverFBA(TendonStateMixin, SolverBase):
         if hasattr(self, "_contact_buf_max") and self._contact_buf_max >= max_contacts:
             return
         device = self._device
-        cap = max(max_contacts, 16)
+        # Half again as many as needed, so that a climbing contact count, as of settling cloth, reallocates the
+        # buffers, and recaptures the graphs that hold them, at a few steps rather than at every step.
+        cap = max(max_contacts + max_contacts // 2, 16)
         self._contact_buf_max = cap
         self._contact_particle_d = wp.empty(cap, dtype=wp.int32, device=device)
         # The index in Contacts of the particle contact each row comes from, -1 for face and self contacts.
@@ -5268,6 +5270,15 @@ class SolverFBA(TendonStateMixin, SolverBase):
                     outputs=[self._contact_v_anchor_d],
                     device=device,
                 )
+
+            # The surface velocity of the contacts' shapes, of conveyors or animated meshes.
+            body_vel = None if contacts is None else getattr(contacts, "soft_contact_body_vel", None)
+            if body_vel is not None and body_vel.size:
+                from .kernels import add_surface_velocity_kernel  # noqa: PLC0415
+
+                inputs = [self._contact_record_d, self._contact_shape_d, shape_body_arr, has_shape_body]
+                inputs += [body_q_arr, has_body_q, body_vel]
+                wp.launch(add_surface_velocity_kernel, M, inputs, [self._contact_v_anchor_d], device=device)
 
             # Per-contact friction coefficients from the shape and particle materials.
             particle_mu = float(getattr(model, "particle_mu", 0.5))

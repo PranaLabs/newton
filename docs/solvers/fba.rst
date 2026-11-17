@@ -516,6 +516,13 @@ Contacts
   ``model.particle_mu`` for self contacts, and the mean of the two shapes'
   ``mu`` for rigid contacts, or the larger of the two with
   ``rigid_contact_friction="max"``, as MuJoCo combines them.
+- A particle contact's friction holds the particle to its shape's surface
+  velocity, ``Contacts.soft_contact_body_vel``, which the collision pipeline
+  reports for conveyors and animated meshes; rigid contacts do not read
+  ``Contacts.rigid_contact_surface_velocity``. Face and rod-segment contacts
+  take barrel cylinders' bulge, read the shapes' ``COLLIDE_PARTICLES`` flags
+  at each step, and let particles of no world touch every shape, as Newton's
+  particle contacts do.
 - :attr:`~newton.solvers.SolverBase.ObservableKind.CONTACT_F` reports the
   force of each particle contact on its shape's body; see
   :ref:`solver_observables`.
