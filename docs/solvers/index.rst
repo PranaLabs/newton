@@ -506,7 +506,7 @@ revolute and prismatic joints as unilateral rows, and the drives, damping and ar
      - |no|
      - |yes| :sup:`13`
      - |no|
-     - |no|
+     - |yes| :sup:`16`
 
 | :sup:`3` Featherstone eliminates follower degrees of freedom from its reduced dynamics and transfers follower forces and inertia to the reference joint.
 | :sup:`4` SemiImplicit enforces joint-owned mimic relationships with penalty springs configured by ``joint_mimic_ke`` and ``joint_mimic_kd``.
@@ -523,6 +523,8 @@ revolute and prismatic joints as unilateral rows, and the drives, damping and ar
 | :sup:`15` FBA takes the backward Euler step of each drive with the axis's damping and armature. Position drives
   need a linear axis or the angular axis of a joint with one; drive forces are not limited to
   ``joint_effort_limit``.
+| :sup:`16` FBA solves attachments to the dynamic bodies it integrates as soft rows with the bodies' contacts and
+  joints, with the full contact operator in one world.
 
 .. _Particle-body attachments:
 
@@ -543,9 +545,14 @@ a single particle has no orientation, so there is no angular counterpart. Forces
 are equal and opposite, including the torque about the body's center of mass, and
 the path is independent of contact, so it stays active without penetration.
 
+:class:`~newton.solvers.SolverFBA` solves an attachment to a dynamic body it
+integrates as three soft rows along the world axes, the backward Euler step of
+the same spring and damper, together with the body's contacts and joints.
+
 Both endpoints must be integrated by the same solver, so
-:class:`~newton.solvers.SolverVBD` rejects attachments when it is constructed
-with ``integrate_with_external_rigid_solver=True``.
+:class:`~newton.solvers.SolverVBD` and :class:`~newton.solvers.SolverFBA`
+reject attachments when they are constructed with
+``integrate_with_external_rigid_solver=True``.
 
 When the endpoints belong to two different solvers in a coupled simulation,
 :class:`~newton.solvers.experimental.coupled.SolverCoupledADMM` turns the same
