@@ -192,8 +192,10 @@ when the time step changes or after
 :meth:`~newton.solvers.SolverFBA.notify_model_changed` with
 ``SHAPE_PROPERTIES`` or ``BODY_INERTIAL_PROPERTIES``, and other changes to
 those arrays take effect only then. A step reads its contacts back to
-the host, so it cannot be captured in a CUDA graph; it captures and replays
-its own local-global iterations. FBA runs on the CPU and on CUDA devices.
+the host, so it cannot be captured in a graph and raises if called during a
+capture; it captures and replays its own local-global iterations. FBA runs
+on the CPU and on CUDA devices. A step may write its output into its input
+state.
 
 Model Inputs
 ------------
@@ -385,8 +387,9 @@ particle-body attachments (tie particles to bodies with
 limits of BALL and D6 joints, the limit stiffness and damping
 ``joint_limit_ke`` and ``joint_limit_kd`` (its limits are hard), drives,
 armature, or joint friction, or
-the inputs of :class:`~newton.Control`, and it does not read the damping
-coefficients ``tri_kd``, ``edge_kd`` and ``k_damp`` of the elements.
+the inputs of :class:`~newton.Control` other than ``tet_activations``, and it
+does not read the damping coefficients ``tri_kd``, ``edge_kd`` and ``k_damp``
+of the elements.
 
 Contacts
 --------
