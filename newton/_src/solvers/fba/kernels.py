@@ -3473,8 +3473,6 @@ def fb_newton_lite_coulomb_kernel(
     # ---- global state ----
     inv_mass: wp.array[wp.float64],  # (N,)
     dt: wp.float64,
-    cap_internal: wp.float64,  # lambda_cap / dt² (or sentinel; see caller)
-    use_cap: wp.int32,  # 1 = clip, 0 = no-op
     # ---- inout / outputs ----
     lam: wp.array[wp.float64],  # (3M,) inout
     omega: wp.array[wp.float64],  # (3M,) inout: warm-started on entry, written on exit
@@ -3494,7 +3492,7 @@ def fb_newton_lite_coulomb_kernel(
     3. Evaluate the FB rows (normal + 2 tangents) to refresh ``(ω, c, h)``.
     4. Build ``A_schur = ωωᵀ ⊙ W + diag(c)`` and ``rhs = (1/dt²)·(h - ω · J_x)``.
     5. Invert the ``3x3`` ``A_schur`` and apply ``dλ``.
-    6. Optional symmetric ``lambda_cap``, then the Coulomb clamp.
+    6. The Coulomb clamp.
     7. Write ``lam_apply = dt² · ω · λ`` for the correction step.
 
     Memory cost: ``O(M)`` (no Schur matrix materialised).  Scales linearly
@@ -3506,10 +3504,6 @@ def fb_newton_lite_coulomb_kernel(
         r, pene0: Per-row arrays of length ``3M`` (rows interleaved ``[n, t1, t2]``).
         inv_mass: Per-particle inverse mass, length ``N``.
         dt: Timestep.
-        cap_internal: ``lambda_cap / dt²`` (in solver-internal units); only
-            applied when ``use_cap == 1``.
-        use_cap: ``1`` to enable the symmetric ``[-cap, +cap]`` clip,
-            ``0`` to disable.
         lam: Per-row lambda buffer, length ``3M``.  Warm-started on entry,
             updated on exit.
         omega: Per-row FB weight buffer, length ``3M``.  Warm-started on entry,
@@ -3647,21 +3641,6 @@ def fb_newton_lite_coulomb_kernel(
         lam_n = lam_n + dlam_n
         lam_t1 = lam_t1 + dlam_t1
         lam_t2 = lam_t2 + dlam_t2
-
-    # Optional symmetric lambda cap, before the Coulomb clamp as in the dense path.
-    if use_cap == wp.int32(1):
-        if lam_n > cap_internal:
-            lam_n = cap_internal
-        if lam_n < -cap_internal:
-            lam_n = -cap_internal
-        if lam_t1 > cap_internal:
-            lam_t1 = cap_internal
-        if lam_t1 < -cap_internal:
-            lam_t1 = -cap_internal
-        if lam_t2 > cap_internal:
-            lam_t2 = cap_internal
-        if lam_t2 < -cap_internal:
-            lam_t2 = -cap_internal
 
     # Coulomb box clamp of the tangent multipliers, as the dense NSN and the per-particle lite kernel apply it:
     # no friction without a positive normal multiplier, else within [-mu lam_n, mu lam_n].
@@ -4046,8 +4025,6 @@ def fb_newton_lite_coulomb_per_particle_kernel(
     # ---- global state ----
     inv_mass: wp.array[wp.float64],  # (N,)
     dt: wp.float64,
-    cap_internal: wp.float64,  # lambda_cap / dt²
-    use_cap: wp.int32,
     n_contact_rows: wp.int32,  # 3M; the rows after them are bilateral
     # ---- inout / outputs ----
     lam: wp.array[wp.float64],  # (3M,) inout
@@ -4259,18 +4236,6 @@ def fb_newton_lite_coulomb_per_particle_kernel(
         for ai in range(k_total):
             lam_l[ai] = lam_l[ai] + dlam_l[ai]
 
-    # Optional symmetric lambda cap on the contact rows, before the Coulomb clamp as in the dense path.
-    if use_cap == wp.int32(1):
-        for ai in range(k_total):
-            if isodof_row_indices[row_start + ai] >= n_contact_rows:
-                continue
-            v = lam_l[ai]
-            if v > cap_internal:
-                v = cap_internal
-            if v < -cap_internal:
-                v = -cap_internal
-            lam_l[ai] = v
-
     # Coulomb box clamp per contact (each contact = 3 consecutive rows): no friction without a positive normal
     # multiplier, else within [-mu lam_n, mu lam_n]. Identify contact-c normal local index, clamp its t1 and t2.
     for ai in range(k_total):
@@ -4342,29 +4307,6 @@ def coulomb_box_clamp_kernel(
     bound = mu[c] * lam_n
     lam[3 * c + 1] = wp.clamp(lam[3 * c + 1], -bound, bound)
     lam[3 * c + 2] = wp.clamp(lam[3 * c + 2], -bound, bound)
-
-
-@wp.kernel
-def lambda_cap_clip_kernel(
-    cap_internal: wp.float64,
-    lam: wp.array[wp.float64],  # inout
-):
-    """Symmetric clip: ``lam[i] = clip(lam[i], -cap, +cap)``.
-
-    Implements the CPU post-loop ``np.clip(lam, -cap_internal,
-    cap_internal, out=lam)`` where ``cap_internal = lambda_cap / dt²``.
-    The conversion factor is applied at the caller; this kernel only
-    knows the internal-units cap.
-
-    Args:
-        cap_internal: Symmetric cap in internal lambda units (fp64).
-        lam: Lambda buffer (fp64), shape ``[n_rows]``. Modified in place.
-    """
-    i = wp.tid()
-    if lam[i] > cap_internal:
-        lam[i] = cap_internal
-    if lam[i] < -cap_internal:
-        lam[i] = -cap_internal
 
 
 @wp.kernel
