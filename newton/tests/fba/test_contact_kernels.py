@@ -18,7 +18,7 @@ import warp as wp
 import newton
 from newton._src.solvers.fba import SolverFBA
 from newton._src.solvers.fba import kernels as K
-from newton.tests.fba._reference import compute_tangent_basis, quat_rotate_z_axis, transform_point
+from newton.tests.fba._reference import compute_tangent_basis, transform_point
 
 
 def _make_transform(pos: tuple[float, float, float], quat: tuple[float, float, float, float]):
@@ -191,7 +191,7 @@ class TestComputeTangentBasisKernel(unittest.TestCase):
         self.assertAlmostEqual(float(np.linalg.norm(t2)), 1.0, delta=1e-5)
 
     def test_tangent_basis_orthonormal_default(self):
-        """Build orthonormal tangents for contacts on shapes that do not spin and flag none of them as spinning."""
+        """Build orthonormal tangents for contacts."""
         normals_np = np.array(
             [
                 [0.0, 0.0, 1.0],
@@ -203,33 +203,15 @@ class TestComputeTangentBasisKernel(unittest.TestCase):
         )
         M = normals_np.shape[0]
         normals = wp.array(normals_np, dtype=wp.vec3)
-        shape_idx = wp.array(np.full(M, -1, dtype=np.int32), dtype=wp.int32)
-        shape_omega = wp.empty(1, dtype=wp.float64)
-        shape_transform = wp.empty(1, dtype=wp.transform)
         t1 = wp.zeros(M, dtype=wp.vec3)
         t2 = wp.zeros(M, dtype=wp.vec3)
-        is_spin = wp.zeros(M, dtype=wp.int32)
 
-        wp.launch(
-            K.compute_tangent_basis_kernel,
-            dim=M,
-            inputs=[
-                normals,
-                shape_idx,
-                shape_omega,
-                shape_transform,
-                wp.int32(0),
-                wp.int32(0),
-            ],
-            outputs=[t1, t2, is_spin],
-        )
+        wp.launch(K.compute_tangent_basis_kernel, dim=M, inputs=[normals], outputs=[t1, t2])
 
         t1_np = t1.numpy()
         t2_np = t2.numpy()
-        is_spin_np = is_spin.numpy()
         for c in range(M):
             self._check_orthonormal(normals_np[c].astype(np.float64), t1_np[c], t2_np[c])
-            self.assertEqual(int(is_spin_np[c]), 0)
 
         # Spot check: when |nx| > 0.9 we use ref = (0,1,0), else (1,0,0).
         # For n=(1,0,0) and ref=(0,1,0): t1 = cross(n, ref) = (0,0,1)
@@ -251,26 +233,10 @@ class TestComputeTangentBasisKernel(unittest.TestCase):
 
         M = normals_np.shape[0]
         normals = wp.array(normals_np.astype(np.float32), dtype=wp.vec3)
-        shape_idx = wp.array(np.full(M, -1, dtype=np.int32), dtype=wp.int32)
-        shape_omega = wp.empty(1, dtype=wp.float64)
-        shape_transform = wp.empty(1, dtype=wp.transform)
         t1 = wp.zeros(M, dtype=wp.vec3)
         t2 = wp.zeros(M, dtype=wp.vec3)
-        is_spin = wp.zeros(M, dtype=wp.int32)
 
-        wp.launch(
-            K.compute_tangent_basis_kernel,
-            dim=M,
-            inputs=[
-                normals,
-                shape_idx,
-                shape_omega,
-                shape_transform,
-                wp.int32(0),
-                wp.int32(0),
-            ],
-            outputs=[t1, t2, is_spin],
-        )
+        wp.launch(K.compute_tangent_basis_kernel, dim=M, inputs=[normals], outputs=[t1, t2])
 
         t1_np = t1.numpy()
         t2_np = t2.numpy()
@@ -278,54 +244,6 @@ class TestComputeTangentBasisKernel(unittest.TestCase):
             t1_ref, t2_ref = compute_tangent_basis(normals_np[c])
             np.testing.assert_allclose(t1_np[c], t1_ref, atol=1e-5)
             np.testing.assert_allclose(t2_np[c], t2_ref, atol=1e-5)
-
-    def test_tangent_basis_spinning_cylinder(self):
-        """Align the first tangent of a contact on a spinning cylinder with ``cross(normal, axis)`` and flag it as
-        spinning."""
-        # Spinning cylinder: shape_omega ≠ 0, shape transform points the local
-        # +Z axis along world +Y. Expected t1 = normalize(cross(n, axis_world)).
-        # Choose normal along +Z so cross(n, axis) (= +Y) -> -X direction.
-        s2 = float(np.sqrt(2.0) / 2.0)
-        # Rotate 90° about +X: q = (sin45, 0, 0, cos45) maps local +Z → world +Y
-        shape_quat = (s2, 0.0, 0.0, s2)
-        normals_np = np.array([[0.0, 0.0, 1.0]], dtype=np.float32)
-        normals = wp.array(normals_np, dtype=wp.vec3)
-        shape_idx = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32)
-        shape_omega = wp.array(np.array([5.0], dtype=np.float64), dtype=wp.float64)
-        shape_transform = wp.array(
-            [_make_transform((0.0, 0.0, 0.0), shape_quat)],
-            dtype=wp.transform,
-        )
-        t1 = wp.zeros(1, dtype=wp.vec3)
-        t2 = wp.zeros(1, dtype=wp.vec3)
-        is_spin = wp.zeros(1, dtype=wp.int32)
-
-        wp.launch(
-            K.compute_tangent_basis_kernel,
-            dim=1,
-            inputs=[
-                normals,
-                shape_idx,
-                shape_omega,
-                shape_transform,
-                wp.int32(1),
-                wp.int32(1),
-            ],
-            outputs=[t1, t2, is_spin],
-        )
-
-        # Reference: axis_world = q * (0,0,1) = (0,1,0).
-        # t1 = normalize(cross((0,0,1), (0,1,0))) = normalize((-1,0,0)) = (-1,0,0)
-        axis_world = quat_rotate_z_axis(np.array(shape_quat, dtype=np.float64))
-        n = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-        t1_ref = np.cross(n, axis_world)
-        t1_ref /= np.linalg.norm(t1_ref)
-        t2_ref = np.cross(n, t1_ref)
-        t2_ref /= np.linalg.norm(t2_ref)
-
-        np.testing.assert_allclose(t1.numpy()[0], t1_ref.astype(np.float32), atol=1e-5)
-        np.testing.assert_allclose(t2.numpy()[0], t2_ref.astype(np.float32), atol=1e-5)
-        self.assertEqual(int(is_spin.numpy()[0]), 1)
 
 
 class TestComputeTangentOffsetsKernel(unittest.TestCase):
@@ -359,64 +277,6 @@ class TestComputeTangentOffsetsKernel(unittest.TestCase):
         t2_off_ref = np.einsum("ij,ij->i", t2_np.astype(np.float64), anchor_np.astype(np.float64))
         np.testing.assert_allclose(t1_off.numpy(), t1_off_ref, atol=1e-5)
         np.testing.assert_allclose(t2_off.numpy(), t2_off_ref, atol=1e-5)
-
-
-class TestComputeVAnchorKernel(unittest.TestCase):
-    """Verify rolling cylinder kinematic anchor velocity."""
-
-    @classmethod
-    def setUpClass(cls):
-        wp.init()
-
-    def test_v_anchor_zero_for_non_spinning(self):
-        """Give contacts on shapes that do not spin a zero anchor velocity."""
-        M = 3
-        is_spin = wp.array(np.zeros(M, dtype=np.int32), dtype=wp.int32)
-        shape_idx = wp.array(np.full(M, -1, dtype=np.int32), dtype=wp.int32)
-        shape_omega = wp.empty(1, dtype=wp.float64)
-        shape_transform = wp.empty(1, dtype=wp.transform)
-        anchor = wp.array(np.random.default_rng(3).standard_normal((M, 3)).astype(np.float32), dtype=wp.vec3)
-        v_anchor = wp.zeros(M, dtype=wp.vec3d)
-
-        wp.launch(
-            K.compute_v_anchor_kernel,
-            dim=M,
-            inputs=[is_spin, shape_idx, shape_omega, shape_transform, anchor],
-            outputs=[v_anchor],
-        )
-
-        np.testing.assert_array_equal(v_anchor.numpy(), np.zeros((M, 3), dtype=np.float64))
-
-    def test_v_anchor_rolling_cylinder(self):
-        """Give a contact on a spinning cylinder the anchor velocity ``omega · cross(axis, r)``."""
-        # Cylinder centered at (0.5, 0.0, 0.0); local +Z axis rotated to world
-        # +Y. Anchor at (0.5, 0.0, 1.0) → r_local = (0, 0, 1). cross(axis, r)
-        # = cross((0,1,0), (0,0,1)) = (1, 0, 0). v_anchor = omega · (1, 0, 0).
-        s2 = float(np.sqrt(2.0) / 2.0)
-        shape_quat = (s2, 0.0, 0.0, s2)  # rotates local +Z → world +Y
-        shape_pos = (0.5, 0.0, 0.0)
-        omega = 3.5
-
-        is_spin = wp.array(np.array([1], dtype=np.int32), dtype=wp.int32)
-        shape_idx = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32)
-        shape_omega = wp.array(np.array([omega], dtype=np.float64), dtype=wp.float64)
-        shape_transform = wp.array([_make_transform(shape_pos, shape_quat)], dtype=wp.transform)
-        anchor = wp.array(np.array([[0.5, 0.0, 1.0]], dtype=np.float32), dtype=wp.vec3)
-        v_anchor = wp.zeros(1, dtype=wp.vec3d)
-
-        wp.launch(
-            K.compute_v_anchor_kernel,
-            dim=1,
-            inputs=[is_spin, shape_idx, shape_omega, shape_transform, anchor],
-            outputs=[v_anchor],
-        )
-
-        axis_world = quat_rotate_z_axis(np.array(shape_quat, dtype=np.float64))
-        r_local = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-        cross_ar = np.cross(axis_world, r_local)
-        expected = omega * cross_ar
-        got = v_anchor.numpy()[0]
-        np.testing.assert_allclose(got, expected, atol=1e-6)
 
 
 class TestIngestContactsIntegration(unittest.TestCase):

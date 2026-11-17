@@ -4227,10 +4227,11 @@ class SolverFBALambdaWarmStartTests(unittest.TestCase):
 
 
 class SolverFBAKinematicCylinderTests(unittest.TestCase):
-    """Per-shape angular velocity surfaces in the tangent offsets of the friction rows."""
+    """The surface velocity of a kinematic body's shape surfaces in the tangent offsets of the friction rows."""
 
-    def _ball_and_cylinder(self):
-        """Tiny tet ball + 1 cylinder (axis +X world). Returns (model, pipeline, contacts)."""
+    def _ball_and_cylinder(self, kinematic):
+        """Tiny tet ball over one cylinder (axis +X world), static or on a kinematic body. Returns (model, pipeline,
+        contacts)."""
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y, gravity=(0.0, -10.0, 0.0))
         builder.add_soft_grid(
             pos=wp.vec3(0.0, 0.5, 0.0),
@@ -4250,119 +4251,45 @@ class SolverFBAKinematicCylinderTests(unittest.TestCase):
         )
         # Z-aligned cylinder primitive → rotate to +X via 90° about -Y.
         half = math.pi / 4.0
-        qy = -math.sin(half)
-        qw = math.cos(half)
-        q = wp.quat(0.0, qy, 0.0, qw)
-        builder.add_shape_cylinder(
-            body=-1,
-            xform=wp.transform(wp.vec3(0.0, -0.2, 0.0), q),
-            radius=0.3,
-            half_height=2.0,
-            cfg=newton.ModelBuilder.ShapeConfig(mu=0.5),
-        )
+        q = wp.quat(0.0, -math.sin(half), 0.0, math.cos(half))
+        xform = wp.transform(wp.vec3(0.0, -0.2, 0.0), q)
+        cfg = newton.ModelBuilder.ShapeConfig(mu=0.5)
+        if kinematic:
+            body = builder.add_body(xform=xform, mass=1.0, is_kinematic=True)
+            builder.add_shape_cylinder(body, radius=0.3, half_height=2.0, cfg=cfg)
+        else:
+            builder.add_shape_cylinder(-1, xform=xform, radius=0.3, half_height=2.0, cfg=cfg)
         model = builder.finalize()
         pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.2)
         contacts = pipeline.contacts()
         return model, pipeline, contacts
 
-    def test_default_no_kinematic_motion(self) -> None:
-        """Spin no shape by default."""
-        model, _, _ = self._ball_and_cylinder()
-        solver = SolverFBA(model, friction=True)
-        self.assertTrue(np.all(solver._shape_omega_h == 0.0))
-
-    def test_kinematic_motion_stored_per_shape(self) -> None:
-        """Store the angular velocity given for a spinning shape with that shape."""
-        model, _, _ = self._ball_and_cylinder()
-        solver = SolverFBA(
-            model,
-            friction=True,
-            shape_angular_velocity={0: -3.0},
-        )
-        self.assertEqual(float(solver._shape_omega_h[0]), -3.0)
-
     def test_kinematic_anchor_velocity_shifts_offsets(self) -> None:
-        """Give contacts on a spinning shape a nonzero anchor velocity, and contacts on a shape that does not spin a
-        zero one."""
-        model, pipeline, contacts = self._ball_and_cylinder()
-        s_in = model.state()
-        s_out = model.state()
-
-        # Drop the ball onto the cylinder to land contacts.
-        solver_static = SolverFBA(
-            model,
-            friction=True,
-        )
-        for _ in range(20):
-            s_in.clear_forces()
-            pipeline.collide(s_in, contacts)
-            solver_static.step(s_in, s_out, None, contacts, 1.0 / 60.0)
-            s_in, s_out = s_out, s_in
-            if solver_static._contact_count > 0:
-                break
-        self.assertGreater(solver_static._contact_count, 0, "Need at least one contact for the kinematic path.")
-
-        solver_spin = SolverFBA(
-            model,
-            friction=True,
-            shape_angular_velocity={0: -3.0},
-        )
-        # Drive one step on both so _ingest_contacts ran on each.
-        s2 = model.state()
-        solver_static.step(s_in, s_out, None, contacts, 1.0 / 60.0)
-        solver_spin.step(s_in, s2, None, contacts, 1.0 / 60.0)
-
-        # static path: v_anchor must be exactly zero.
-        np.testing.assert_allclose(
-            solver_static._contact_v_anchor_h[: solver_static._contact_count],
-            0.0,
-        )
-        # spin path: v_anchor must be nonzero for at least one contact.
-        self.assertGreater(
-            float(np.linalg.norm(solver_spin._contact_v_anchor_h[: solver_spin._contact_count])),
-            1e-6,
-            "Expected ω ≠ 0 to produce nonzero v_anchor.",
-        )
-
-    def test_cylinder_aligned_basis_for_spinning_shape(self) -> None:
-        """Align the tangent basis of contacts on a spinning shape with the rolling direction and the axis.
-
-        The basis is ``(cross(normal, axis), normalize(cross(normal, t1)))``: the anchor velocity lies almost entirely
-        along t1, and its projection onto t2, the axial direction, is about zero.
-        """
-        model, pipeline, contacts = self._ball_and_cylinder()
-        s_in = model.state()
-        s_out = model.state()
-        solver_spin = SolverFBA(
-            model,
-            friction=True,
-            shape_angular_velocity={0: -3.0},
-        )
-        for _ in range(20):
-            s_in.clear_forces()
-            pipeline.collide(s_in, contacts)
-            solver_spin.step(s_in, s_out, None, contacts, 1.0 / 60.0)
-            s_in, s_out = s_out, s_in
-            if solver_spin._contact_count > 0:
-                break
-        self.assertGreater(solver_spin._contact_count, 0)
-
-        M = solver_spin._contact_count
-        v = solver_spin._contact_v_anchor_h[:M]
-        t1 = solver_spin._contact_tangent1_d.numpy()[:M].astype(np.float64)
-        t2 = solver_spin._contact_tangent2_d.numpy()[:M].astype(np.float64)
-        proj_t1 = np.einsum("ij,ij->i", t1, v)
-        proj_t2 = np.einsum("ij,ij->i", t2, v)
-        # The v_anchor projection onto the axial t2 must be ≈ 0.
-        # Allow small slack for numerical SVD / float32 round-trip on tangent arrays.
-        self.assertLess(float(np.max(np.abs(proj_t2))), 1e-4)
-        # And t1 must carry most of the v_anchor norm.
-        v_norm = np.linalg.norm(v, axis=1)
-        self.assertGreater(
-            float(np.min(np.abs(proj_t1) / np.maximum(v_norm, 1e-12))),
-            0.95,
-            "v_anchor should lie almost entirely along the rolling tangent t1.",
-        )
+        """Give contacts on a kinematic cylinder spinning about its axis a nonzero anchor velocity along the rolling
+        direction, and contacts on a static cylinder a zero one."""
+        for kinematic in (False, True):
+            with self.subTest(kinematic=kinematic):
+                model, pipeline, contacts = self._ball_and_cylinder(kinematic)
+                solver = SolverFBA(model, friction=True)
+                s_in, s_out = model.state(), model.state()
+                for _ in range(20):
+                    if kinematic:
+                        s_in.body_qd.assign(np.array([[0.0, 0.0, 0.0, -3.0, 0.0, 0.0]], dtype=np.float32))
+                    s_in.clear_forces()
+                    pipeline.collide(s_in, contacts)
+                    solver.step(s_in, s_out, None, contacts, 1.0 / 60.0)
+                    s_in, s_out = s_out, s_in
+                    if solver._contact_count > 0:
+                        break
+                M = solver._contact_count
+                self.assertGreater(M, 0, "Need at least one contact for the kinematic path.")
+                v = solver._contact_v_anchor_d.numpy()[:M]
+                if not kinematic:
+                    np.testing.assert_allclose(v, 0.0)
+                    continue
+                # A surface spinning about +X moves perpendicular to the axis.
+                self.assertGreater(float(np.linalg.norm(v, axis=1).min()), 1.0e-3)
+                np.testing.assert_allclose(v[:, 0], 0.0, atol=1.0e-9)
 
 
 class ParticleElementCsrTests(unittest.TestCase):
