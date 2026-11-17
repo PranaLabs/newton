@@ -16,6 +16,7 @@ joins the step's rigid contact rows when the axis comes near the limit.
 """
 
 import itertools
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,7 +24,9 @@ import numpy as np
 import warp as wp
 
 from ...core.types import MAXVAL
+from ...exceptions import NewtonWarning
 from ...sim import JointType, Model
+from ...sim.articulation import transform_2d_rotational_axes
 from .rigid import ROW_FORCE_LANES, row_force_rhs_kernel, row_incidence, slot_coefficients
 
 wp.set_module_options({"enable_backward": False})
@@ -34,7 +37,19 @@ _AXIS_JOINTS = (JointType.PRISMATIC, JointType.REVOLUTE)
 ROW_LOCKED = wp.constant(0)
 """A row that locks a direction of a joint."""
 ROW_DAMPER = wp.constant(1)
-"""A soft row that damps the motion along a free axis of a joint."""
+"""A soft row that damps the motion along a free axis of a joint, carried by the parent's joint frame."""
+ROW_HOOKE = wp.constant(2)
+"""A row that locks the twist of a D6 joint with two free angular axes, ``a0`` carried by the parent and ``a1`` by
+the child, as Newton composes the joint's rotation ``q(a0, q0) q(a1, q1)``: it holds the angle between the two
+axes."""
+ROW_DAMPER_CHILD = wp.constant(3)
+"""A soft row that damps the rotation about a free axis carried by the child's joint frame: the second axis of a D6
+joint with two free angular axes."""
+
+
+@wp.func
+def _is_damper(kind: wp.int32) -> bool:
+    return kind == ROW_DAMPER or kind == ROW_DAMPER_CHILD
 
 
 @dataclass
@@ -59,15 +74,34 @@ class JointRows:
     row_angular: wp.array[wp.int32]
     """1 for a rotational row, 0 for a translational row, shape [row_count]."""
     row_kind: wp.array[wp.int32]
-    """:data:`ROW_LOCKED` or :data:`ROW_DAMPER` per row, shape [row_count]."""
+    """:data:`ROW_LOCKED`, :data:`ROW_DAMPER`, :data:`ROW_HOOKE` or :data:`ROW_DAMPER_CHILD` per row, shape
+    [row_count]."""
     row_dir: wp.array[wp.vec3]
-    """Locked direction, or the damped axis, in the joint frame, shape [row_count]."""
+    """Locked direction, the damped axis, or a :data:`ROW_HOOKE` row's first axis, in the joint frame, shape
+    [row_count]."""
+    row_axis2: wp.array[wp.vec3]
+    """A :data:`ROW_HOOKE` row's second axis in the joint frame, zero for the other rows, shape [row_count]."""
     row_damping: np.ndarray
     """Damping coefficient [N·s/m or N·m·s/rad] of each damper row, 0 for locked rows, shape [row_count]."""
     block_start: np.ndarray
     """Row range per independent block, shape [block_count + 1]."""
     joint_index: np.ndarray
     """Model joint of each joint of the rows, shape [joint_count]."""
+
+
+# A kernel of its own module, so that the rows' setup does not compile this module for the CPU.
+@wp.kernel(module="unique")
+def _hooke_axes_kernel(axis_0: wp.vec3, axis_1: wp.vec3, out: wp.array[wp.vec3]):
+    a0, a1 = transform_2d_rotational_axes(axis_0, axis_1, 0.0)
+    out[0] = a0
+    out[1] = a1
+
+
+def hooke_axes(axis_0: np.ndarray, axis_1: np.ndarray) -> np.ndarray:
+    """The two free angular axes of a D6 joint as Newton composes its rotation, orthonormalized, shape [2, 3]."""
+    out = wp.empty(2, dtype=wp.vec3, device="cpu")
+    wp.launch(_hooke_axes_kernel, 1, [wp.vec3(*axis_0), wp.vec3(*axis_1)], [out], device="cpu")
+    return out.numpy().astype(np.float64)
 
 
 def locked_directions(free_axes: np.ndarray) -> np.ndarray:
@@ -122,26 +156,35 @@ def build_joint_rows(model: Model, body_slot: np.ndarray, device) -> JointRows |
 
     axis, qd_start, dof_dim = model.joint_axis.numpy(), model.joint_qd_start.numpy(), model.joint_dof_dim.numpy()
     damping = model.joint_damping.numpy() if model.joint_damping is not None else np.zeros(len(axis))
-    rows = []  # (block, local joint index, angular, direction, kind, damping)
+    zero = np.zeros(3)
+    rows = []  # (block, local joint index, angular, direction, kind, damping, second axis)
     for k, j in enumerate(joints):
         n_lin, n_ang = dof_dim[j]
-        axes = axis[qd_start[j] : qd_start[j] + n_lin + n_ang]
+        axes = np.array(axis[qd_start[j] : qd_start[j] + n_lin + n_ang], dtype=np.float64)
         block = find(max(pslot[j], cslot[j]))
-        rows += [(block, k, 0, d, ROW_LOCKED, 0.0) for d in locked_directions(axes[:n_lin])]
-        rows += [(block, k, 1, d, ROW_LOCKED, 0.0) for d in locked_directions(axes[n_lin:])]
+        rows += [(block, k, 0, d, ROW_LOCKED, 0.0, zero) for d in locked_directions(axes[:n_lin])]
+        kinds = [ROW_DAMPER] * (n_lin + n_ang)
+        if n_ang == 2:
+            # The rotation q(a0, q0) q(a1, q1) keeps the angle between a0 in the parent's joint frame and a1 in the
+            # child's, and turns about a1 in the child's frame; the axes as Newton orthonormalizes them.
+            axes[n_lin:] = hooke_axes(axes[n_lin], axes[n_lin + 1])
+            rows.append((block, k, 1, axes[n_lin], ROW_HOOKE, 0.0, axes[n_lin + 1]))
+            kinds[n_lin + 1] = ROW_DAMPER_CHILD
+        else:
+            rows += [(block, k, 1, d, ROW_LOCKED, 0.0, zero) for d in locked_directions(axes[n_lin:])]
         # Each free axis takes its passive damping as a soft row.
         for i in range(n_lin + n_ang):
             c = float(damping[qd_start[j] + i])
             if c > 0.0:
-                d = np.asarray(axes[i], dtype=np.float64)
-                rows.append((block, k, int(i >= n_lin), d / np.linalg.norm(d), ROW_DAMPER, c))
+                d = axes[i] / np.linalg.norm(axes[i])
+                rows.append((block, k, int(i >= n_lin), d, kinds[i], c, zero))
     if not rows:
         return None
     rows.sort(key=lambda r: r[0])
     blocks = np.array([r[0] for r in rows])
     block_start = np.flatnonzero(np.r_[True, blocks[1:] != blocks[:-1], True]).astype(np.int32)
     slots = np.array([find(i) for i in range(len(root))])
-    locked = np.array([r[4] == ROW_LOCKED for r in rows])
+    locked = np.array([r[4] in (ROW_LOCKED, ROW_HOOKE) for r in rows])
     for start, stop in itertools.pairwise(block_start):
         # The damper rows are soft: they keep W positive definite whatever they share with the locked rows.
         count = int(np.count_nonzero(locked[start:stop]))
@@ -165,6 +208,7 @@ def build_joint_rows(model: Model, body_slot: np.ndarray, device) -> JointRows |
         row_angular=wp.array([r[2] for r in rows], dtype=wp.int32, device=device),
         row_kind=wp.array([r[4] for r in rows], dtype=wp.int32, device=device),
         row_dir=wp.array(np.array([r[3] for r in rows]), dtype=wp.vec3, device=device),
+        row_axis2=wp.array(np.array([r[6] for r in rows]), dtype=wp.vec3, device=device),
         row_damping=np.array([r[5] for r in rows], dtype=np.float64),
         block_start=block_start,
         joint_index=joints.astype(np.int32),
@@ -220,9 +264,12 @@ def build_joint_limits(model: Model, rows: JointRows, body_slot: np.ndarray, dev
     Returns:
         The limits, or ``None`` if no such axis has a finite limit.
 
+    Revolute limits whose range spans a full turn or more, such as the +-2 pi of many arm descriptions, are left out
+    with a :class:`~newton.exceptions.NewtonWarning`: the axis's angle is known up to whole turns only, and lies within such a
+    range at every turn.
+
     Raises:
-        NotImplementedError: If a revolute axis has a single finite limit, or a range of 2 pi or more: its angle is
-            known up to whole turns only.
+        NotImplementedError: If a revolute axis has a single finite limit: its angle is known up to whole turns only.
         ValueError: If an axis's lower limit exceeds its upper one.
     """
     jtype, qd_start, axis = model.joint_type.numpy(), model.joint_qd_start.numpy(), model.joint_axis.numpy()
@@ -230,6 +277,7 @@ def build_joint_limits(model: Model, rows: JointRows, body_slot: np.ndarray, dev
     parent, child = rows.parent.numpy(), rows.child.numpy()
     world = model.body_world.numpy()
     limits = []  # (joint, angular, axis, bound, sign, center, margin)
+    turns = []
     for k, j in enumerate(rows.joint_index):
         if jtype[j] not in _AXIS_JOINTS:
             continue
@@ -243,11 +291,14 @@ def build_joint_limits(model: Model, rows: JointRows, body_slot: np.ndarray, dev
         angular = int(jtype[j] == JointType.REVOLUTE)
         center, margin = 0.0, LIMIT_MARGIN_LINEAR
         if angular:
-            if not (has_lo and has_hi) or hi - lo >= 2.0 * np.pi:
+            if not (has_lo and has_hi):
                 raise NotImplementedError(
-                    f"SolverFBA limits revolute joints within a range of less than 2 pi with both limits finite; "
-                    f"joint {j} has limits ({lo}, {hi})"
+                    f"SolverFBA limits revolute joints with both limits finite; joint {j} has limits ({lo}, {hi})"
                 )
+            if hi - lo >= 2.0 * np.pi:
+                # An angle known up to whole turns lies within such a range at every turn.
+                turns.append(int(j))
+                continue
             center, margin = 0.5 * (lo + hi), LIMIT_MARGIN_ANGULAR
         a = np.asarray(axis[dof], dtype=np.float64)
         a = a / np.linalg.norm(a)
@@ -255,6 +306,13 @@ def build_joint_limits(model: Model, rows: JointRows, body_slot: np.ndarray, dev
             limits.append((k, angular, a, lo, 1.0, center, margin))
         if has_hi:
             limits.append((k, angular, a, hi, -1.0, center, margin))
+    if turns:
+        warnings.warn(
+            f"SolverFBA does not enforce the limits of revolute joints {turns}, whose ranges span a full turn or more: "
+            "it knows their angles up to whole turns",
+            NewtonWarning,
+            stacklevel=2,
+        )
     if not limits:
         return None
     k = np.array([lim[0] for lim in limits])
@@ -295,6 +353,35 @@ def _com_frame(
         return slot_x[s], slot_q[s]
     q = wp.normalize(wp.quatd(wp.transform_get_rotation(body_q[b])))
     return wp.vec3d(wp.transform_get_translation(body_q[b])) + wp.quat_rotate(q, wp.vec3d(body_com[b])), q
+
+
+@wp.kernel
+def advance_unintegrated_kernel(
+    body_slot: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    dt: float,
+    # outputs
+    body_q_end: wp.array[wp.transform],
+):
+    """The poses at the step's end of the bodies that the solver does not integrate: a kinematic body moves on at its
+    prescribed velocity, its center of mass at ``body_qd``'s linear part and its orientation at the angular part
+    (both in the world frame), as Newton prescribes ``q + qd dt``; a static one stays. The integrated bodies, whose
+    poses come from their slots, keep their state poses."""
+    b = wp.tid()
+    tf = body_q[b]
+    if body_slot[b] >= 0:
+        body_q_end[b] = tf
+        return
+    v = wp.spatial_top(body_qd[b])
+    w = wp.spatial_bottom(body_qd[b])
+    q = wp.transform_get_rotation(tf)
+    com = wp.transform_point(tf, body_com[b])
+    angle = wp.length(w) * dt
+    if angle > 0.0:
+        q = wp.normalize(wp.quat_from_axis_angle(wp.normalize(w), angle) * q)
+    body_q_end[b] = wp.transform(com + v * dt - wp.quat_rotate(q, body_com[b]), q)
 
 
 @wp.func
@@ -345,6 +432,7 @@ def joint_jacobian_kernel(
     row_angular: wp.array[wp.int32],
     row_kind: wp.array[wp.int32],
     row_dir: wp.array[wp.vec3],
+    row_axis2: wp.array[wp.vec3],
     joint_parent: wp.array[wp.int32],
     joint_child: wp.array[wp.int32],
     X_pj: wp.array[wp.transform],
@@ -361,35 +449,52 @@ def joint_jacobian_kernel(
     """Row coefficients on the DOFs ``(chi, rho)`` of the parent and child body.
 
     Evaluated at the pinned frame. A translational row along ``d = R_Ja b`` acts
-    on the anchor velocities; a rotational row uses the direction
+    on the anchor velocities, and a locked one also on the parent's turn of
+    ``d`` by the anchors' offset; a rotational row uses the direction
     ``d = R_Ja (eta b + nu x b)`` of the relative rotation ``(eta, nu)``, which
     makes it the exact derivative of the residual ``2 nu · b``. A damper row
     on a rotation axis ``b`` uses ``d = R_Ja b``, the derivative of the angle
-    about ``b`` while the other directions stay locked. World coefficients are
+    about ``b`` while the other directions stay locked, or ``d = R_Jc b`` for
+    an axis the child carries. A :data:`ROW_HOOKE` row on the axes
+    ``u = R_Ja a0`` and ``v = R_Jc a1`` takes ``u x v`` on the parent and
+    ``v x u`` on the child, the derivative of ``u · v``. World coefficients are
     rotated into each body's pinned frame.
     """
     r = wp.tid()
     j = row_joint[r]
     a = joint_parent[j]
     c = joint_child[j]
-    _xa, qa = _com_frame(a, body_slot, slot_x, slot_q, body_q, body_com)
-    _xc, qc = _com_frame(c, body_slot, slot_x, slot_q, body_q, body_com)
+    xa, qa = _com_frame(a, body_slot, slot_x, slot_q, body_q, body_com)
+    xc, qc = _com_frame(c, body_slot, slot_x, slot_q, body_q, body_com)
     q_ja = qa * wp.quatd(wp.transform_get_rotation(X_pj[j]))
     b = wp.vec3d(row_dir[r])
     lin = wp.vec3d(0.0, 0.0, 0.0)
     ang_a = wp.vec3d(0.0, 0.0, 0.0)
     ang_c = wp.vec3d(0.0, 0.0, 0.0)
-    if row_angular[r] == 1:
+    if row_kind[r] == ROW_HOOKE:
+        q_jc = qc * wp.quatd(wp.transform_get_rotation(X_cj[j]))
+        n = wp.cross(wp.quat_rotate(q_ja, b), wp.quat_rotate(q_jc, wp.vec3d(row_axis2[r])))
+        ang_a = n
+        ang_c = -n
+    elif row_angular[r] == 1:
         d = wp.quat_rotate(q_ja, b)
         if row_kind[r] == ROW_LOCKED:
             q_rel = _relative_rotation(q_ja, qc * wp.quatd(wp.transform_get_rotation(X_cj[j])))
             d = wp.quat_rotate(q_ja, q_rel[3] * b + wp.cross(wp.vec3d(q_rel[0], q_rel[1], q_rel[2]), b))
+        elif row_kind[r] == ROW_DAMPER_CHILD:
+            d = wp.quat_rotate(qc * wp.quatd(wp.transform_get_rotation(X_cj[j])), b)
         ang_a = -d
         ang_c = d
     else:
         lin = wp.quat_rotate(q_ja, b)
-        ang_a = -wp.cross(wp.quat_rotate(qa, wp.vec3d(wp.transform_get_translation(X_pj[j]))), lin)
-        ang_c = wp.cross(wp.quat_rotate(qc, wp.vec3d(wp.transform_get_translation(X_cj[j]))), lin)
+        r_a = wp.quat_rotate(qa, wp.vec3d(wp.transform_get_translation(X_pj[j])))
+        r_c = wp.quat_rotate(qc, wp.vec3d(wp.transform_get_translation(X_cj[j])))
+        ang_a = -wp.cross(r_a, lin)
+        ang_c = wp.cross(r_c, lin)
+        if row_kind[r] == ROW_LOCKED:
+            # The locked direction turns with the parent, so the parent's turn also moves the row by the anchors'
+            # offset along it: zero for coincident anchors, the slide of a prismatic joint across it.
+            ang_a = ang_a + wp.cross(lin, (xc + r_c) - (xa + r_a))
     sa = -1
     if a >= 0:
         sa = body_slot[a]
@@ -405,6 +510,7 @@ def joint_residual_kernel(
     row_angular: wp.array[wp.int32],
     row_kind: wp.array[wp.int32],
     row_dir: wp.array[wp.vec3],
+    row_axis2: wp.array[wp.vec3],
     joint_parent: wp.array[wp.int32],
     joint_child: wp.array[wp.int32],
     X_pj: wp.array[wp.transform],
@@ -420,22 +526,30 @@ def joint_residual_kernel(
     residual: wp.array[wp.float64],
 ):
     """Violation of each row at the live pose: the anchor offset ``R_Jaᵀ (x_Jc - x_Ja)``
-    or the rotation ``2 nu`` along the locked direction, zero when satisfied. A
-    damper row holds its axis's motion since the step start
+    or the rotation ``2 nu`` along the locked direction, or for a
+    :data:`ROW_HOOKE` row ``(R_Ja a0) · (R_Jc a1) - a0 · a1``, zero when
+    satisfied. A damper row holds its axis's motion since the step start
     (:func:`joint_axis_start_kernel`): along a linear axis the change of the
     offset, about an angular axis ``b`` the angle ``2 atan2(nu · b, eta)`` of
     the relative rotation's increment ``(nu, eta)`` in the parent's joint
-    frame, which for a revolute joint is the change of its angle."""
+    frame, which for a revolute joint is the change of its angle, or in the
+    child's joint frame for an axis the child carries."""
     r = wp.tid()
     j = row_joint[r]
     xa, qa = _com_frame(joint_parent[j], body_slot, slot_x, slot_q, body_q, body_com)
     xc, qc = _com_frame(joint_child[j], body_slot, slot_x, slot_q, body_q, body_com)
     q_ja = qa * wp.quatd(wp.transform_get_rotation(X_pj[j]))
     b = wp.vec3d(row_dir[r])
-    if row_kind[r] == ROW_DAMPER:
+    if row_kind[r] == ROW_HOOKE:
+        q_jc = qc * wp.quatd(wp.transform_get_rotation(X_cj[j]))
+        a1 = wp.vec3d(row_axis2[r])
+        residual[r] = wp.dot(wp.quat_rotate(q_ja, b), wp.quat_rotate(q_jc, a1)) - wp.dot(b, a1)
+    elif _is_damper(row_kind[r]):
         if row_angular[r] == 1:
             q_rel = _relative_rotation(q_ja, qc * wp.quatd(wp.transform_get_rotation(X_cj[j])))
             q_step = q_rel * wp.quat_inverse(row_q_start[r])
+            if row_kind[r] == ROW_DAMPER_CHILD:
+                q_step = wp.quat_inverse(row_q_start[r]) * q_rel
             if q_step[3] < 0.0:
                 q_step = q_step * wp.float64(-1.0)
             nu = wp.vec3d(q_step[0], q_step[1], q_step[2])
@@ -457,6 +571,7 @@ def joint_axis_start_kernel(
     row_angular: wp.array[wp.int32],
     row_kind: wp.array[wp.int32],
     row_dir: wp.array[wp.vec3],
+    row_axis2: wp.array[wp.vec3],
     joint_parent: wp.array[wp.int32],
     joint_child: wp.array[wp.int32],
     X_pj: wp.array[wp.transform],
@@ -477,7 +592,7 @@ def joint_axis_start_kernel(
     r = wp.tid()
     value = wp.float64(0.0)
     q_rel = wp.quatd(0.0, 0.0, 0.0, 1.0)
-    if row_kind[r] == ROW_DAMPER:
+    if _is_damper(row_kind[r]):
         j = row_joint[r]
         xa, qa = _com_frame(joint_parent[j], body_slot, slot_x, slot_q, body_q, body_com)
         xc, qc = _com_frame(joint_child[j], body_slot, slot_x, slot_q, body_q, body_com)
@@ -538,13 +653,15 @@ def joint_limit_near_kernel(
     slot_x: wp.array[wp.vec3d],
     slot_q: wp.array[wp.quatd],
     body_q: wp.array[wp.transform],
+    body_q_end: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
     # outputs
     near: wp.array[wp.int32],
 ):
     """1 for each limit whose row joins the step, else 0: one whose gap at the step start (``body_q``, read for every
-    body through ``no_slot``, -1 per body) or after the step's free flight (``slot_x``, ``slot_q``) falls within its
-    margin plus the free flight's change of the gap."""
+    body through ``no_slot``, -1 per body) or after the step's free flight (``slot_x``, ``slot_q``, and the other
+    bodies at their step-end poses ``body_q_end``) falls within its margin plus the free flight's change of the
+    gap."""
     k = wp.tid()
     g0 = limit_gap(
         k, joint, angular, axis, bound, sign, center, joint_parent, joint_child, X_pj, X_cj, no_slot,
@@ -552,7 +669,7 @@ def joint_limit_near_kernel(
     )  # fmt: skip
     g1 = limit_gap(
         k, joint, angular, axis, bound, sign, center, joint_parent, joint_child, X_pj, X_cj, body_slot,
-        slot_x, slot_q, body_q, body_com,
+        slot_x, slot_q, body_q_end, body_com,
     )  # fmt: skip
     near[k] = wp.where(wp.min(g0, g1) < margin[k] + wp.abs(g1 - g0), 1, 0)
 

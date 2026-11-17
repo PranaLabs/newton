@@ -173,14 +173,19 @@ class SolverFBA(TendonStateMixin, SolverBase):
     grown shape.
 
     Joints between the bodies that SolverFBA integrates are bilateral rows, one
-    per locked direction. The free axis of a revolute or prismatic joint takes
-    its limits, ``Model.joint_limit_lower`` and ``Model.joint_limit_upper``, as
-    hard unilateral rows solved with the rigid contacts, each joining a step
-    when the axis comes near the limit; a revolute axis needs both limits, less
-    than 2 pi apart. Every free axis of a joint takes its passive damping
+    per locked direction; a D6 joint with two free angular axes holds the angle
+    between the first axis in the parent's joint frame and the second in the
+    child's, as Newton composes its rotation. A kinematic body takes part at
+    the pose its velocity reaches by the step's end. The free axis of a
+    revolute or prismatic joint takes its limits, ``Model.joint_limit_lower``
+    and ``Model.joint_limit_upper``, as hard unilateral rows solved with the
+    rigid contacts, each joining a step when the axis comes near the limit; a
+    revolute axis needs both limits, and those of a full turn or more are left
+    out with a warning. Every free axis of a joint takes its passive damping
     ``Model.joint_damping`` as a soft row in the joint system, the backward
     Euler step of the force ``-c q_dot``, where an angular axis's rate is the
-    relative angular velocity along it in the parent's joint frame. The limits'
+    relative angular velocity along it in the parent's joint frame (the
+    child's for the second axis of a two-axis D6 joint). The limits'
     stiffness and damping (``joint_limit_ke``, ``joint_limit_kd``), drives,
     armature and joint friction are not read, nor are the limits of ball and
     D6 joints.
@@ -1031,11 +1036,24 @@ class SolverFBA(TendonStateMixin, SolverBase):
             self._omega_unilateral_persistent = self._omega_unilateral_persistent_d.numpy()[:M].astype(np.float64)
 
     def _setup_rigid_system(self, dt: float) -> None:
-        """Factor the rigid block for the dynamic bodies this solver integrates."""
+        """Factor the rigid block for the dynamic bodies this solver integrates.
+
+        A setup that raises leaves no system behind, so that the next step sets it up again and raises again rather
+        than stepping without its bodies."""
+        try:
+            self._build_rigid_system(dt)
+        except BaseException:
+            self._rigid_dt = None
+            self._rigid_linear_solver = None
+            self._joint_rows = None
+            raise
+
+    def _build_rigid_system(self, dt: float) -> None:
         from .linear_solver import build_rigid_system, rigid_block_inverses  # noqa: PLC0415
         from .rigid import RigidBlockSolver  # noqa: PLC0415
 
         self._rigid_dt = dt
+        self._rigid_body_flags_h = self.model.body_flags.numpy().copy() if self.model.body_count else None
         if self._warm_start is not None:
             # The multipliers are forces divided by dt^2: those of another dt do not carry over.
             self._warm_start.clear()
@@ -1124,6 +1142,16 @@ class SolverFBA(TendonStateMixin, SolverBase):
         if ls is None:
             return False
         model = self.model
+        if self._joint_rows is not None:
+            from .joints import advance_unintegrated_kernel  # noqa: PLC0415
+
+            # Joints hold integrated bodies to the poses that the bodies they do not integrate reach at the step's end.
+            if getattr(self, "_joint_body_q_d", None) is None or self._joint_body_q_d.shape[0] != model.body_count:
+                self._joint_body_q_d = wp.empty(model.body_count, dtype=wp.transform, device=self._device)
+            inputs = [self._body_slot_d, state_in.body_q, state_in.body_qd, model.body_com, dt]
+            wp.launch(
+                advance_unintegrated_kernel, model.body_count, inputs, [self._joint_body_q_d], device=self._device
+            )
         m = self._rigid_bodies_d.shape[0]
         wp.launch(
             prepare_rigid_step_kernel,
@@ -1154,7 +1182,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
                     *self._joint_row_args(),
                     self._rigid_x_prev_d,
                     self._rigid_q_pin_d,
-                    state_in.body_q,
+                    self._joint_body_q_d,
                     model.body_com,
                 ],
                 outputs=[self._joint_row_slot_d, self._joint_row_jac_d],
@@ -1239,7 +1267,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 inputs=[
                     *(lim.joint, lim.angular, lim.axis, lim.bound, lim.sign, lim.center, lim.margin),
                     *(rows.parent, rows.child, rows.X_pj, rows.X_cj, self._body_slot_d, self._no_slot_d),
-                    *(self._rigid_x_live_d, self._rigid_q_live_d, state_in.body_q, model.body_com),
+                    *(self._rigid_x_live_d, self._rigid_q_live_d, state_in.body_q, self._joint_body_q_d),
+                    model.body_com,
                 ],
                 outputs=[self._limit_near_d],
                 device=device,
@@ -1477,7 +1506,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 inputs=[
                     *(self._rc_limit_rows_d, lim.joint, lim.angular, lim.axis, lim.sign),
                     *(rows.parent, rows.child, rows.X_pj, rows.X_cj, self._body_slot_d),
-                    *(self._rigid_x_prev_d, self._rigid_q_pin_d, state_in.body_q, model.body_com),
+                    *(self._rigid_x_prev_d, self._rigid_q_pin_d, self._joint_body_q_d, model.body_com),
                     n_s + 3 * (m_r + m_t),
                 ],
                 outputs=[self._rc_row_slot_d, self._rc_row_jac_d],
@@ -2042,7 +2071,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 inputs=[
                     *(self._rc_limit_rows_d, lim.joint, lim.angular, lim.axis, lim.bound, lim.sign, lim.center),
                     *(rows.parent, rows.child, rows.X_pj, rows.X_cj, self._body_slot_d),
-                    *(*live, state_in.body_q, self.model.body_com, n_s + 3 * (m_r + m_t)),
+                    *(*live, self._joint_body_q_d, self.model.body_com, n_s + 3 * (m_r + m_t)),
                 ],
                 outputs=[self._rc_value_d],
                 device=device,
@@ -2191,6 +2220,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
             rows.row_angular,
             rows.row_kind,
             rows.row_dir,
+            rows.row_axis2,
             rows.parent,
             rows.child,
             rows.X_pj,
@@ -2266,7 +2296,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 dim=self._joint_residual_d.shape[0],
                 inputs=[
                     *self._joint_row_args(),
-                    *(self._rigid_x_live_d, self._rigid_q_live_d, state_in.body_q, self.model.body_com),
+                    *(self._rigid_x_live_d, self._rigid_q_live_d, self._joint_body_q_d, self.model.body_com),
                     self._joint_row_start_d,
                     self._joint_row_q_start_d,
                 ],
@@ -4505,6 +4535,13 @@ class SolverFBA(TendonStateMixin, SolverBase):
                         [ws.bilateral_lam, ws.bilateral_omega],
                         device=device,
                     )
+                if self._limit_ws is not None:
+                    # The three rows of each joint limit, in the world of the limit's child.
+                    world = wp.array(np.repeat(self._limits.world, 3), dtype=wp.int32, device=device)
+                    inputs = [world, world_mask]
+                    wp.launch(
+                        clear_bilateral_worlds_kernel, world.shape[0], inputs, list(self._limit_ws), device=device
+                    )
             if self._spring_indices_d is not None:
                 from .kernels import clear_spring_state_kernel  # noqa: PLC0415
 
@@ -4520,21 +4557,30 @@ class SolverFBA(TendonStateMixin, SolverBase):
             self._anchor_step_d.fill_(-2)
         if self._warm_start is not None:
             self._warm_start.clear()
+        self._limit_ws = None
 
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         """Rebuild and factor the system matrices at the next step.
 
         ``ModelFlags.SHAPE_PROPERTIES`` stands for changes of the particles and elements, whose masses,
         materials and rest shapes the factored system matrix holds; Newton has no flag of its own for them.
-        ``BODY_PROPERTIES``, ``BODY_INERTIAL_PROPERTIES`` and ``JOINT_PROPERTIES`` rebuild the system of the
-        integrated bodies and their joint rows. ``TENDON_PROPERTIES`` refreshes the tendons' compliance, damping and
-        FBA attributes; their rest lengths take effect at the next :meth:`reset`.
+        ``BODY_INERTIAL_PROPERTIES``, ``JOINT_PROPERTIES``, ``JOINT_DOF_PROPERTIES`` and
+        ``JOINT_DOF_FORCE_PROPERTIES`` (joint damping and limits) rebuild the system of the integrated bodies and their
+        joint rows, and so does ``BODY_PROPERTIES`` when it changes which bodies are dynamic; body poses and
+        velocities are read at every step. ``TENDON_PROPERTIES`` refreshes the tendons' compliance, damping and FBA
+        attributes; their rest lengths take effect at the next :meth:`reset`.
         """
         if flags & ModelFlags.SHAPE_PROPERTIES:
             self._linear_solver = self._two_way_ls = self._mixed = None
             self._dt_setup = None
             self._invalidate_schur_cache()
-        if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.BODY_INERTIAL_PROPERTIES | ModelFlags.JOINT_PROPERTIES):
+        rigid = ModelFlags.BODY_INERTIAL_PROPERTIES | ModelFlags.JOINT_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES
+        rigid |= ModelFlags.JOINT_DOF_FORCE_PROPERTIES
+        body_flags = getattr(self, "_rigid_body_flags_h", None)
+        if flags & ModelFlags.BODY_PROPERTIES and self.model.body_count:
+            if body_flags is None or not np.array_equal(body_flags, self.model.body_flags.numpy()):
+                self._rigid_dt = None
+        if flags & rigid:
             self._rigid_dt = None
         if flags & ModelFlags.TENDON_PROPERTIES and self._model_tendon_groups is not None:
             # Compliance, damping and the FBA tendon attributes take effect at the next step; rest-length edits,

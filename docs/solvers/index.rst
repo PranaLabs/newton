@@ -418,7 +418,7 @@ revolute and prismatic joints as unilateral rows, without drives.
 
 | :sup:`2` Not enforced for BALL joints in SemiImplicit.
 | :sup:`14` FBA enforces the limits of REVOLUTE and PRISMATIC joints as hard unilateral rows (a revolute joint
-  needs both limits, less than 2 pi apart) and ignores those of BALL and D6 joints.
+  needs both limits; it leaves out a range of a full turn or more) and ignores those of BALL and D6 joints.
 
 **Actuation and control**
 

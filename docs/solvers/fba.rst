@@ -310,24 +310,34 @@ Model Inputs
   bodies through, or leaves every body to another solver with
   ``integrate_with_external_rigid_solver=True``. PRISMATIC, REVOLUTE, BALL,
   FIXED, and D6 joints are bilateral constraints, at most 64 rows per
-  articulation; DISTANCE and ROD joints, and joints that lock more directions
-  of a set of connected bodies than the bodies have, as kinematic loops do,
-  raise ``NotImplementedError``. A body turns by at most 0.5 rad per step.
+  articulation, the damper rows below included; DISTANCE and ROD joints, and
+  joints that lock more directions of a set of connected bodies than the
+  bodies have, as kinematic loops do, raise ``NotImplementedError``. A D6
+  joint with two free angular axes ``a0`` and ``a1`` turns as Newton composes
+  it, ``q(a0, q0) q(a1, q1)``: it holds the angle between ``a0`` in the
+  parent's joint frame and ``a1`` in the child's, as a universal joint does.
+  Joints hold a dynamic body to a kinematic one where the kinematic body's
+  prescribed velocity ``body_qd`` takes it by the step's end. A body turns by
+  at most 0.5 rad per step. FBA does not write ``State.joint_q`` and
+  ``State.joint_qd``: :func:`~newton.eval_ik` computes them from the bodies.
 - **Joint limits and damping**: the free axis of a REVOLUTE or PRISMATIC joint
   takes its limits, :attr:`~newton.Model.joint_limit_lower` and
   :attr:`~newton.Model.joint_limit_upper`, as hard unilateral rows, solved with
   the rigid contacts: a limit's row joins a step when the axis starts it, or
   ends the step's free flight, within 0.02 rad (2 mm for a prismatic axis) plus
-  the free flight's motion of the limit. A revolute axis needs both limits,
-  less than 2 pi apart, and measures its angle from the middle of its range;
-  one finite limit, or a wider range, raises ``NotImplementedError``. Every
+  the free flight's motion of the limit. A revolute axis measures its angle
+  from the middle of its range and needs both limits: one finite limit raises
+  ``NotImplementedError``. FBA knows the angle up to whole turns, so it leaves
+  out, with a warning, the limits of a range of a full turn or more, such as
+  the ``+-2 pi`` of many arm descriptions. Every
   free axis of a joint, also of BALL and D6 joints, takes its passive damping
   :attr:`~newton.Model.joint_damping` (the ``damping`` of
   :class:`~newton.ModelBuilder.JointDofConfig`, MJCF's ``damping``) as a soft
   row in the articulation's joint system, the backward Euler step of the force
   ``-c q_dot``: it slows the axis by the factor ``1 / (1 + c dt / I)`` per step
   for an axis of effective inertia ``I``. An angular axis's rate is the
-  relative angular velocity along it in the parent's joint frame, and its
+  relative angular velocity along it in the parent's joint frame, or the
+  child's for the second axis of a D6 joint with two angular axes, and its
   motion over a step that of the relative rotation's increment. Joints at the
   default infinite limits and zero damping take no such rows. Limits need the
   full operator.
