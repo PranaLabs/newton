@@ -1,0 +1,1 @@
+Allow recording `SolverFBA` steps with particle-shape contacts into CUDA graphs with `nsn_schur_mode="lite"`, friction and one world: such steps take every slot of the contact buffer as a row, sorted on the device, after a step with the same contacts outside the graph has reserved the buffers.

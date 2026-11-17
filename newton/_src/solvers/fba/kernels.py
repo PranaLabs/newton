@@ -3098,6 +3098,110 @@ def soft_contact_keys_kernel(
     values[i] = i
 
 
+_INERT_KEY = wp.constant(wp.int64(9223372036854775807))
+
+
+@wp.kernel
+def capacity_contact_keys_kernel(
+    count: wp.array[wp.int32],
+    particle: wp.array[wp.int32],
+    shape: wp.array[wp.int32],
+    shape_count: int,
+    pinned: wp.array[wp.int32],  # 1 for each particle the solver holds, or empty
+    # outputs
+    keys: wp.array[wp.int64],
+    values: wp.array[wp.int32],
+):
+    """Keys that sort the particle-shape contacts of a contact buffer by particle and then shape, its whole capacity
+    at once: the slots past the stored count, sentinel slots and the contacts of held particles take the largest key
+    and sort last, as inert rows."""
+    i = wp.tid()
+    values[i] = i
+    p = particle[i]
+    inert = i >= count[0] or p < 0
+    if not inert and pinned.shape[0] > 0:
+        inert = pinned[p] != 0
+    if inert:
+        keys[i] = _INERT_KEY
+    else:
+        keys[i] = wp.int64(p) * wp.int64(shape_count) + wp.int64(shape[i])
+
+
+@wp.kernel
+def capacity_contact_rows_kernel(
+    keys: wp.array[wp.int64],
+    order: wp.array[wp.int32],
+    contact_particle: wp.array[wp.int32],
+    contact_shape: wp.array[wp.int32],
+    contact_body_pos: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    # outputs
+    particle: wp.array[wp.int32],
+    normal: wp.array[wp.vec3],
+    alpha: wp.array[wp.float32],
+    shape: wp.array[wp.int32],
+    body_pos: wp.array[wp.vec3],
+    record: wp.array[wp.int32],
+):
+    """The contact rows in key order, the active contacts first; an inert row has particle and shape 0, coefficient
+    0 and record -1, so that it moves nothing (:func:`inert_contact_offset_kernel` also separates it)."""
+    c = wp.tid()
+    i = order[c]
+    if keys[c] == _INERT_KEY:
+        particle[c] = 0
+        normal[c] = wp.vec3(0.0, 0.0, 1.0)
+        alpha[c] = 0.0
+        shape[c] = 0
+        body_pos[c] = wp.vec3(0.0)
+        record[c] = -1
+    else:
+        particle[c] = contact_particle[i]
+        normal[c] = contact_normal[i]
+        alpha[c] = 1.0
+        shape[c] = contact_shape[i]
+        body_pos[c] = contact_body_pos[i]
+        record[c] = i
+
+
+@wp.kernel
+def inert_contact_offset_kernel(
+    record: wp.array[wp.int32],
+    # outputs
+    offset: wp.array[wp.float64],
+):
+    """Give each inert contact row (record -1) a gap of 1e6 m, so that its Newton step keeps its multipliers at 0."""
+    c = wp.tid()
+    if record[c] < 0:
+        offset[c] = wp.float64(-1.0e6)
+
+
+@wp.kernel
+def lite_particle_row_count_kernel(
+    record: wp.array[wp.int32],
+    particle: wp.array[wp.int32],
+    # outputs
+    counts: wp.array[wp.int32],
+):
+    """Count the three lite rows of each active contact (record >= 0) on its particle."""
+    c = wp.tid()
+    if record[c] >= 0:
+        wp.atomic_add(counts, particle[c], 3)
+
+
+@wp.kernel
+def lite_capacity_rows_kernel(
+    particle: wp.array[wp.int32],
+    alpha: wp.array[wp.float32],
+    # outputs
+    row_particle: wp.array[wp.int32],
+    row_alpha: wp.array[wp.float32],
+):
+    """The particle and coefficient of each of the three lite rows of each contact."""
+    r = wp.tid()
+    row_particle[r] = particle[r // 3]
+    row_alpha[r] = alpha[r // 3]
+
+
 @wp.func
 def world_value(world: int, values: wp.array[wp.float32], default: float) -> float:
     """A per-world parameter, including the final global slot, or its uniform default."""

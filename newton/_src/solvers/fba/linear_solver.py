@@ -2085,6 +2085,75 @@ class FBALinearSolver:
 
         return total_rows
 
+    def reserve_lite_rows_capacity(self, num_contacts: int) -> None:
+        """Allocate the row metadata of :meth:`setup_lite_rows_capacity` for ``num_contacts`` contacts and the buffers
+        of :meth:`apply_lambda_correction_combined` for their rows, so that a graph capture of them allocates
+        nothing."""
+        rows, n, dev = 3 * int(num_contacts), self.n, self.device
+        if getattr(self, "_cap_rows", -1) != rows:
+            self._cap_rows = rows
+            self._cap_row_particle = wp.empty(rows, dtype=wp.int32, device=dev)
+            self._cap_row_alpha = wp.empty(rows, dtype=wp.float32, device=dev)
+            self._cap_row_dir = wp.empty(rows, dtype=wp.vec3, device=dev)
+            self._cap_row_indices = wp.array(np.arange(rows, dtype=np.int32), dtype=wp.int32, device=dev)
+        if getattr(self, "_cap_particles", -1) != n:
+            self._cap_particles = n
+            self._cap_counts = wp.zeros(n + 1, dtype=wp.int32, device=dev)
+            self._cap_offsets = wp.zeros(n + 1, dtype=wp.int32, device=dev)
+            self._cap_unique = wp.array(np.arange(n, dtype=np.int32), dtype=wp.int32, device=dev)
+            self._cap_no_dirs = wp.empty(0, dtype=wp.vec3, device=dev)
+        total = getattr(self, "_row_total", 0)
+        self._row_total = max(total, rows)
+        self.reserve_lambda_correction()
+        self._row_total = total
+
+    def setup_lite_rows_capacity(
+        self,
+        num_contacts: int,
+        j_indices: wp.array,
+        j_normals: wp.array,
+        j_alpha: wp.array,
+        j_tangent1: wp.array,
+        j_tangent2: wp.array,
+        j_record: wp.array,
+    ) -> None:
+        """The lite row metadata of :meth:`setup_lite_row_meta` on the device alone, for the frictional contact rows of
+        a contact buffer's whole capacity: the active contacts (record >= 0) sorted by particle first, the inert ones
+        after them. The rows of a particle are then consecutive, so that the particle's range in the CSR is three
+        times its count of active contacts, accumulated; the inert rows lie past every range. Every particle takes
+        the per-particle Newton step (:func:`kernels.fb_newton_lite_coulomb_per_particle_kernel`)."""
+        from .kernels import (  # noqa: PLC0415
+            _MAX_ROWS_PER_PARTICLE,
+            lite_capacity_rows_kernel,
+            lite_particle_row_count_kernel,
+            lite_row_dirs_kernel,
+        )
+
+        M, dev = int(num_contacts), self.device
+        self.reserve_lite_rows_capacity(M)
+        rows = 3 * M
+        wp.launch(
+            lite_capacity_rows_kernel,
+            rows,
+            [j_indices, j_alpha],
+            [self._cap_row_particle, self._cap_row_alpha],
+            device=dev,
+        )
+        inputs = [j_normals, j_tangent1, j_tangent2, self._cap_no_dirs, 3, rows]
+        wp.launch(lite_row_dirs_kernel, rows, inputs, [self._cap_row_dir], device=dev)
+        self._cap_counts.zero_()
+        wp.launch(lite_particle_row_count_kernel, M, [j_record, j_indices], [self._cap_counts], device=dev)
+        wp.utils.array_scan(self._cap_counts, self._cap_offsets, inclusive=False)
+        self._row_particle_d, self._row_alpha_d, self._row_dir_d = (
+            self._cap_row_particle,
+            self._cap_row_alpha,
+            self._cap_row_dir,
+        )
+        self._row_total, self._row_slots = rows, None
+        self._isodof_row_offsets_d, self._isodof_row_indices_d = self._cap_offsets, self._cap_row_indices
+        self._isodof_unique_d, self._n_isodofs = self._cap_unique, self.n
+        self._isodof_max_rows = int(_MAX_ROWS_PER_PARTICLE)
+
     def build_schur_lite_triplets(self, total_rows: int, cols_d: wp.array, vals_d: wp.array) -> wps.BsrMatrix:
         """``W = H (dt^2 M^-1) H^T`` from the triplets of ``H``, rows of 1 x 3 blocks over the particles in four
         slots per row, so that slot ``t`` lies in row ``t // 4``; slots with a negative column are skipped.
