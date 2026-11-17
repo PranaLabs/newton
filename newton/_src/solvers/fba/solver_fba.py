@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy as cp
 import functools
+import hashlib
 import math
 import warnings
 from collections.abc import Callable
@@ -32,6 +33,27 @@ def _element_lame(materials: wp.array | None, count: int) -> tuple[np.ndarray, n
         return np.zeros(0), np.zeros(0)
     rows = materials.numpy().astype(np.float64)
     return rows[:, 0], rows[:, 1]
+
+
+# The model arrays that the factored particle system holds, which a SHAPE_PROPERTIES notification checks.
+_PARTICLE_SYSTEM_ARRAYS = (
+    "particle_mass",
+    "particle_inv_mass",
+    "particle_flags",
+    "particle_q",
+    "tri_indices",
+    "tri_poses",
+    "tri_materials",
+    "tri_areas",
+    "tet_indices",
+    "tet_poses",
+    "tet_materials",
+    "edge_indices",
+    "edge_bending_properties",
+    "spring_indices",
+    "spring_rest_length",
+    "spring_stiffness",
+)
 
 
 def _damping_coefficients(name: str, value, count: int) -> np.ndarray | None:
@@ -2475,6 +2497,35 @@ class SolverFBA(TendonStateMixin, SolverBase):
             self._tri_lame_d = wp.array(tri_lame, dtype=wp.vec2, device=model.device)
             self._tet_lame_d = wp.array(tet_lame, dtype=wp.vec2, device=model.device)
 
+    def _edge_norms(self) -> np.ndarray:
+        """The interior edges' rest curvatures, signed by ``model.edge_rest_angle``, float32."""
+        edge_indices, edge_quad_q = self._edge_meta
+        ei = self.model.edge_indices.numpy()
+        rest_angle = self.model.edge_rest_angle.numpy()[(ei[:, 0] >= 0) & (ei[:, 1] >= 0)].astype(np.float64)
+        x_rest = self.model.particle_q.numpy().astype(np.float64)
+        v0, v1, v3 = (x_rest[edge_indices[:, k]] for k in (0, 1, 3))
+        e_len = np.maximum(np.linalg.norm(v1 - v0, axis=1), 1.0e-20)
+        h3 = np.linalg.norm(np.cross(v1 - v0, v3 - v0), axis=1) / e_len
+        return (np.abs(edge_quad_q[:, 3]) * 2.0 * h3 * np.sin(0.5 * rest_angle)).astype(np.float32)
+
+    def _particle_system_key(self) -> tuple[bytes, bytes]:
+        """Digests of the model arrays that the factored particle system holds (masses, flags, rest positions,
+        elements, materials, springs and rod bending), and of the edges' rest angles, which only the bending
+        targets read."""
+        model = self.model
+        fba = getattr(model, "fba", None)
+        arrays = [getattr(model, name, None) for name in _PARTICLE_SYSTEM_ARRAYS]
+        arrays += [getattr(fba, name, None) for name in ("rod_bend_particles", "rod_bend_stiffness")]
+        system = hashlib.blake2b(digest_size=16)
+        for a in arrays:
+            if a is not None and a.size:
+                system.update(np.ascontiguousarray(a.numpy()).tobytes())
+            system.update(b"|")
+        rest = hashlib.blake2b(digest_size=16)
+        if model.edge_rest_angle is not None and model.edge_rest_angle.size:
+            rest.update(model.edge_rest_angle.numpy().tobytes())
+        return system.digest(), rest.digest()
+
     def _spring_bending_stiffness(self) -> np.ndarray | None:
         """Bending stiffness [N m^2] of the rod each of the model's springs belongs to, for the springs' ADMM
         penalties: the largest of the bending elements that share the spring's segment, zero for a spring outside
@@ -2664,6 +2715,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
             self._tri_F_prev_d = wp.zeros(len(tri), dtype=mat32, device=device)
             self._tri_S_prev_d = wp.zeros(len(tri), dtype=wp.mat22, device=device)
         self._dt_setup = dt
+        self._particle_key = self._particle_system_key()
         if self._warm_start is not None:
             # The multipliers are forces divided by dt^2: those of another dt do not carry over.
             self._warm_start.clear()
@@ -2712,18 +2764,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
             # a flat hinge, and folding it by ``θ`` about the shared edge moves
             # the opposite vertex v3 by ``2 h3 sin(θ / 2)``, with h3 its
             # distance from the edge.
-            ei = self.model.edge_indices.numpy()
-            rest_angle = self.model.edge_rest_angle.numpy()[(ei[:, 0] >= 0) & (ei[:, 1] >= 0)].astype(np.float64)
-            x_rest = self.model.particle_q.numpy().astype(np.float64)
-            v0, v1, v3 = (x_rest[meta["edge_indices"][:, k]] for k in (0, 1, 3))
-            e_len = np.maximum(np.linalg.norm(v1 - v0, axis=1), 1.0e-20)
-            h3 = np.linalg.norm(np.cross(v1 - v0, v3 - v0), axis=1) / e_len
-            edge_norm = np.abs(meta["edge_quad_q"][:, 3]) * 2.0 * h3 * np.sin(0.5 * rest_angle)
-            self._edge_norm_d = wp.array(
-                edge_norm.astype(np.float32),
-                dtype=wp.float32,
-                device=device,
-            )
+            self._edge_meta = (meta["edge_indices"], meta["edge_quad_q"])
+            self._edge_norm_d = wp.array(self._edge_norms(), dtype=wp.float32, device=device)
         if meta["pin_indices"].shape[0] > 0:
             self._pin_indices_d = wp.array(
                 meta["pin_indices"].astype(np.int32),
@@ -4647,17 +4689,26 @@ class SolverFBA(TendonStateMixin, SolverBase):
         """Rebuild and factor the system matrices at the next step.
 
         ``ModelFlags.SHAPE_PROPERTIES`` stands for changes of the particles and elements, whose masses,
-        materials and rest shapes the factored system matrix holds; Newton has no flag of its own for them.
+        materials and rest shapes the factored system matrix holds; Newton has no flag of its own for them. The
+        solver factors the matrix again only when those arrays changed, so that edits of shapes alone, such as of
+        their friction, keep the factor and the solver's warm start; edits of ``edge_rest_angle`` alone refresh the
+        bending targets.
         ``BODY_INERTIAL_PROPERTIES``, ``JOINT_PROPERTIES``, ``JOINT_DOF_PROPERTIES`` and
         ``JOINT_DOF_FORCE_PROPERTIES`` (joint damping and limits) rebuild the system of the integrated bodies and their
         joint rows, and so does ``BODY_PROPERTIES`` when it changes which bodies are dynamic; body poses and
         velocities are read at every step. ``TENDON_PROPERTIES`` refreshes the tendons' compliance, damping and FBA
         attributes; their rest lengths take effect at the next :meth:`reset`.
         """
-        if flags & ModelFlags.SHAPE_PROPERTIES:
-            self._linear_solver = self._two_way_ls = self._mixed = None
-            self._dt_setup = None
-            self._invalidate_schur_cache()
+        if flags & ModelFlags.SHAPE_PROPERTIES and self._linear_solver is not None:
+            system, rest = self._particle_system_key()
+            if system != self._particle_key[0]:
+                self._linear_solver = self._two_way_ls = self._mixed = None
+                self._dt_setup = None
+                self._invalidate_schur_cache()
+            elif rest != self._particle_key[1] and self._edge_norm_d is not None:
+                # Rest angles enter the bending targets alone, not the factored matrix.
+                self._edge_norm_d.assign(self._edge_norms())
+                self._particle_key = (system, rest)
         rigid = ModelFlags.BODY_INERTIAL_PROPERTIES | ModelFlags.JOINT_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES
         rigid |= ModelFlags.JOINT_DOF_FORCE_PROPERTIES
         body_flags = getattr(self, "_rigid_body_flags_h", None)

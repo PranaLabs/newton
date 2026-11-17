@@ -190,8 +190,11 @@ particles, the elements and their materials, and the Rayleigh damping
 coefficients; the solver factors it again
 when the time step changes or after
 :meth:`~newton.solvers.SolverFBA.notify_model_changed` with
-``SHAPE_PROPERTIES`` or ``BODY_INERTIAL_PROPERTIES``, and other changes to
-those arrays take effect only then. A step reads its contacts back to
+``SHAPE_PROPERTIES`` (Newton has no flag of its own for particles and
+elements) when those arrays changed, and other changes to them take effect
+only then. Edits of shapes alone, such as of their friction, keep the factor
+and the contact warm start, and edits of ``edge_rest_angle`` alone refresh the
+bending targets without factoring. A step reads its contacts back to
 the host, so it cannot be captured in a graph and raises if called during a
 capture; it captures and replays its own local-global iterations. FBA runs
 on the CPU and on CUDA devices. A step may write its output into its input

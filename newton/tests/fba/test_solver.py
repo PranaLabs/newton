@@ -1389,7 +1389,8 @@ class TestSolverFBAReconfigure(unittest.TestCase):
         self.assertIs(linsolver_a, linsolver_b, "linear solver should not rebuild when dt unchanged")
 
     def test_notify_shape_properties_forces_resetup(self):
-        """Rebuild the linear solver at the next step after ``notify_model_changed(SHAPE_PROPERTIES)``."""
+        """Rebuild the linear solver at the next step after ``notify_model_changed(SHAPE_PROPERTIES)`` reports a
+        change of the cloth's material."""
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
@@ -1417,6 +1418,9 @@ class TestSolverFBAReconfigure(unittest.TestCase):
         linsolver_a = solver._linear_solver
         self.assertIsNotNone(linsolver_a)
 
+        materials = model.tri_materials.numpy()
+        materials[:, 0] *= 2.0
+        model.tri_materials.assign(materials)
         solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
         self.assertIsNone(solver._linear_solver, "notify_model_changed should clear _linear_solver")
         self.assertIsNone(solver._dt_setup, "notify_model_changed should clear _dt_setup")
@@ -1516,6 +1520,35 @@ class TestSolverFBAReconfigure(unittest.TestCase):
         # JOINT_PROPERTIES shouldn't affect FBA cloth.
         solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
         self.assertIs(solver._linear_solver, linsolver_a, "FBA should ignore JOINT_PROPERTIES")
+
+    def test_shape_properties_refactor_only_changed_particles(self):
+        """Keep the factor after SHAPE_PROPERTIES reports a friction edit, factor anew after a mass edit, and take an
+        edge_rest_angle edit into the bending targets without factoring."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._build_4x4_cloth()
+        solver = SolverFBA(model, iterations=5)
+        s0, s1 = model.state(), model.state()
+        solver.step(s0, s1, None, None, 1.0 / 60.0)
+        factor = solver._linear_solver
+        model.shape_material_mu.assign(np.full(model.shape_count, 0.9, dtype=np.float32))
+        solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+        self.assertIs(solver._linear_solver, factor)
+        norms = solver._edge_norm_d.numpy().copy()
+        angles = model.edge_rest_angle.numpy()
+        angles[:] = 0.5
+        model.edge_rest_angle.assign(angles)
+        solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+        self.assertIs(solver._linear_solver, factor)
+        self.assertGreater(np.abs(solver._edge_norm_d.numpy() - norms).max(), 0.0)
+        mass = model.particle_mass.numpy()
+        mass[mass > 0.0] *= 2.0
+        model.particle_mass.assign(mass)
+        model.particle_inv_mass.assign(np.where(mass > 0.0, 1.0 / np.maximum(mass, 1e-30), 0.0).astype(np.float32))
+        solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
+        self.assertIsNone(solver._linear_solver)
+        solver.step(s0, s1, None, None, 1.0 / 60.0)
+        self.assertIsNotNone(solver._linear_solver)
 
 
 class TestSolverFBAStability(unittest.TestCase):
