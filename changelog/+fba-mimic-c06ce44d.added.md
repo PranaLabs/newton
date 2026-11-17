@@ -1,0 +1,1 @@
+Add mimic joints to `SolverFBA`: a follower's coordinates are held at `c0 + c1` times its leader's (`Model.joint_mimic_joint`, `Model.joint_mimic_coeffs`) by hard rows on both joints' axes, also when contacts touch the articulation, for PRISMATIC, REVOLUTE and D6 joints with at most one angular axis.

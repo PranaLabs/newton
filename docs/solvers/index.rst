@@ -497,7 +497,7 @@ revolute and prismatic joints as unilateral rows, and the drives, damping and ar
      - |yes| :sup:`6`
      - |yes| :sup:`5`
      - |no|
-     - |no|
+     - |yes| :sup:`17`
    * - Particle-body attachments
      - |no|
      - |no|
@@ -525,6 +525,8 @@ revolute and prismatic joints as unilateral rows, and the drives, damping and ar
   ``joint_effort_limit``.
 | :sup:`16` FBA solves attachments to the dynamic bodies it integrates as soft rows with the bodies' contacts and
   joints, with the full contact operator in one world.
+| :sup:`17` FBA holds each follower coordinate by a hard row combined from rows on both joints' axes, for PRISMATIC,
+  REVOLUTE, and D6 joints with at most one angular axis.
 
 .. _Particle-body attachments:
 

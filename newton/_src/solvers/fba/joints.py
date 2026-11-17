@@ -15,6 +15,12 @@ the backward Euler step of their forces, and each finite limit of the free axis
 of a revolute or prismatic joint (``Model.joint_limit_lower`` and
 ``Model.joint_limit_upper``) a candidate for a unilateral limit row, which
 joins the step's rigid contact rows when the axis comes near the limit.
+
+A mimic joint (``Model.joint_mimic_joint``) holds each coordinate at ``c0 + c1``
+times its leader's, as a pair of rows on the two axes, the follower's and the
+leader's, combined into one row on their Newton system: the follower's row takes
+the leader's minus ``c1`` times, and the leader's row stays inert, its force
+``-c1`` times the follower's.
 """
 
 import itertools
@@ -48,6 +54,9 @@ axes."""
 ROW_DAMPER_CHILD = wp.constant(3)
 """A soft row on the rotation about a free axis carried by the child's joint frame: the second axis of a D6 joint
 with two free angular axes."""
+ROW_MIMIC = wp.constant(4)
+"""A row on the coordinate of a free axis, half of a mimic pair: the follower's row, combined with its leader's, holds
+the follower's coordinate at ``c0 + c1`` times the leader's."""
 
 
 @wp.func
@@ -93,6 +102,10 @@ class JointRows:
     row_coord: wp.array[wp.int32]
     """Model coordinate of each soft row's position target, -1 for the other rows and for axes without a position
     drive, shape [row_count]."""
+    mimic_rows: np.ndarray
+    """The follower's and the leader's row of each mimic pair, shape [pair_count, 2]."""
+    mimic_coeffs: np.ndarray
+    """The offset ``c0`` and multiplier ``c1`` of each mimic pair, shape [pair_count, 2]."""
     block_start: np.ndarray
     """Row range per independent block, shape [block_count + 1]."""
     joint_index: np.ndarray
@@ -164,6 +177,27 @@ def build_joint_rows(model: Model, body_slot: np.ndarray, device) -> JointRows |
     for j in joints[(pslot[joints] >= 0) & (cslot[joints] >= 0)]:
         root[find(pslot[j])] = find(cslot[j])
 
+    # A mimic joint and its leader share their block.
+    local = np.full(model.joint_count, -1)
+    local[joints] = np.arange(joints.size)
+    mimics = []
+    if model.joint_mimic_joint is not None and (model.joint_mimic_joint.numpy()[joints] >= 0).any():
+        from ...sim.joint_mimic import has_supported_joint_mimics  # noqa: PLC0415
+
+        if has_supported_joint_mimics(model, "SolverFBA"):
+            leaders, coeffs = model.joint_mimic_joint.numpy(), model.joint_mimic_coeffs.numpy()
+            supported = (JointType.PRISMATIC, JointType.REVOLUTE, JointType.D6)
+            for j in joints:
+                lead = leaders[j]
+                if lead < 0 or jtype[j] not in supported or jtype[lead] not in supported:
+                    continue
+                if local[lead] < 0:
+                    raise NotImplementedError(
+                        f"SolverFBA needs the leader {lead} of mimic joint {j} to be a joint on the bodies it integrates"
+                    )
+                root[find(max(pslot[j], cslot[j]))] = find(max(pslot[lead], cslot[lead]))
+                mimics.append((j, lead, float(coeffs[j][0]), float(coeffs[j][1])))
+
     axis, qd_start, dof_dim = model.joint_axis.numpy(), model.joint_qd_start.numpy(), model.joint_dof_dim.numpy()
     q_start = model.joint_q_start.numpy()
 
@@ -173,22 +207,22 @@ def build_joint_rows(model: Model, body_slot: np.ndarray, device) -> JointRows |
     damping, armature = per_dof(model.joint_damping), per_dof(model.joint_armature)
     target_ke, target_kd = per_dof(model.joint_target_ke), per_dof(model.joint_target_kd)
     zero = np.zeros(3)
-    # (block, local joint index, angular, direction, kind, damping, second axis, dof, coordinate)
+    # (block, local joint index, angular, direction, kind, damping, second axis, dof, coordinate, mimic pair and side)
     rows = []
     for k, j in enumerate(joints):
         n_lin, n_ang = dof_dim[j]
         axes = np.array(axis[qd_start[j] : qd_start[j] + n_lin + n_ang], dtype=np.float64)
         block = find(max(pslot[j], cslot[j]))
-        rows += [(block, k, 0, d, ROW_LOCKED, 0.0, zero, -1, -1) for d in locked_directions(axes[:n_lin])]
+        rows += [(block, k, 0, d, ROW_LOCKED, 0.0, zero, -1, -1, -1) for d in locked_directions(axes[:n_lin])]
         kinds = [ROW_DAMPER] * (n_lin + n_ang)
         if n_ang == 2:
             # The rotation q(a0, q0) q(a1, q1) keeps the angle between a0 in the parent's joint frame and a1 in the
             # child's, and turns about a1 in the child's frame; the axes as Newton orthonormalizes them.
             axes[n_lin:] = hooke_axes(axes[n_lin], axes[n_lin + 1])
-            rows.append((block, k, 1, axes[n_lin], ROW_HOOKE, 0.0, axes[n_lin + 1], -1, -1))
+            rows.append((block, k, 1, axes[n_lin], ROW_HOOKE, 0.0, axes[n_lin + 1], -1, -1, -1))
             kinds[n_lin + 1] = ROW_DAMPER_CHILD
         else:
-            rows += [(block, k, 1, d, ROW_LOCKED, 0.0, zero, -1, -1) for d in locked_directions(axes[n_lin:])]
+            rows += [(block, k, 1, d, ROW_LOCKED, 0.0, zero, -1, -1, -1) for d in locked_directions(axes[n_lin:])]
         # Each free axis takes its passive damping, drive and armature as a soft row.
         for i in range(n_lin + n_ang):
             dof = qd_start[j] + i
@@ -203,14 +237,37 @@ def build_joint_rows(model: Model, body_slot: np.ndarray, device) -> JointRows |
                     )
                 coord = q_start[j] + i
             d = axes[i] / np.linalg.norm(axes[i])
-            rows.append((block, k, int(i >= n_lin), d, kinds[i], float(damping[dof]), zero, dof, coord))
+            rows.append((block, k, int(i >= n_lin), d, kinds[i], float(damping[dof]), zero, dof, coord, -1))
+    # Each coordinate of a mimic joint takes a pair of rows: the follower's axis and the leader's.
+    pair_coeffs = []
+    for j, lead, c0, c1 in mimics:
+        dims = (tuple(dof_dim[j]), tuple(dof_dim[lead]))
+        if dims[0] != dims[1] or (dims[0][1] > 1):
+            raise NotImplementedError(
+                f"SolverFBA's mimic joints need the follower {j} and the leader {lead} to have the same axes, with "
+                f"at most one angular axis; got {dims[0]} and {dims[1]}"
+            )
+        block = find(max(pslot[j], cslot[j]))
+        n_lin = dims[0][0]
+        for i in range(sum(dims[0])):
+            pair = len(pair_coeffs)
+            for side, joint in enumerate((j, lead)):
+                d = axis[qd_start[joint] + i] / np.linalg.norm(axis[qd_start[joint] + i])
+                rows.append((block, local[joint], int(i >= n_lin), d, ROW_MIMIC, 0.0, zero, -1, -1, 2 * pair + side))
+            pair_coeffs.append((c0, c1))
     if not rows:
         return None
     rows.sort(key=lambda r: r[0])
     blocks = np.array([r[0] for r in rows])
     block_start = np.flatnonzero(np.r_[True, blocks[1:] != blocks[:-1], True]).astype(np.int32)
     slots = np.array([find(i) for i in range(len(root))])
-    locked = np.array([r[4] in (ROW_LOCKED, ROW_HOOKE) for r in rows])
+    # A mimic pair locks one direction, its follower's row; the leader's row is inert.
+    locked = np.array([r[4] in (ROW_LOCKED, ROW_HOOKE) or (r[4] == ROW_MIMIC and r[9] % 2 == 0) for r in rows])
+    soft = np.array([r[4] in (ROW_DAMPER, ROW_DAMPER_CHILD) for r in rows])
+    mimic_rows = np.zeros((len(pair_coeffs), 2), dtype=np.int32)
+    for index, r in enumerate(rows):
+        if r[9] >= 0:
+            mimic_rows[r[9] // 2, r[9] % 2] = index
     for start, stop in itertools.pairwise(block_start):
         # The soft rows keep W positive definite whatever they share with the locked rows.
         count = int(np.count_nonzero(locked[start:stop]))
@@ -236,11 +293,13 @@ def build_joint_rows(model: Model, body_slot: np.ndarray, device) -> JointRows |
         row_dir=wp.array(np.array([r[3] for r in rows]), dtype=wp.vec3, device=device),
         row_axis2=wp.array(np.array([r[6] for r in rows]), dtype=wp.vec3, device=device),
         row_damping=np.array([r[5] for r in rows], dtype=np.float64),
-        row_soft=~locked,
+        row_soft=soft,
         row_dof=wp.array([r[7] for r in rows], dtype=wp.int32, device=device),
         row_coord=wp.array([r[8] for r in rows], dtype=wp.int32, device=device),
         block_start=block_start,
         joint_index=joints.astype(np.int32),
+        mimic_rows=mimic_rows,
+        mimic_coeffs=np.array(pair_coeffs, dtype=np.float64).reshape(-1, 2),
     )
 
 
@@ -520,7 +579,7 @@ def joint_jacobian_kernel(
         r_c = wp.quat_rotate(qc, wp.vec3d(wp.transform_get_translation(X_cj[j])))
         ang_a = -wp.cross(r_a, lin)
         ang_c = wp.cross(r_c, lin)
-        if row_kind[r] == ROW_LOCKED:
+        if row_kind[r] == ROW_LOCKED or row_kind[r] == ROW_MIMIC:
             # The locked direction turns with the parent, so the parent's turn also moves the row by the anchors'
             # offset along it: zero for coincident anchors, the slide of a prismatic joint across it.
             ang_a = ang_a + wp.cross(lin, (xc + r_c) - (xa + r_a))
@@ -575,6 +634,9 @@ def joint_residual_kernel(
         q_jc = qc * wp.quatd(wp.transform_get_rotation(X_cj[j]))
         a1 = wp.vec3d(row_axis2[r])
         residual[r] = wp.dot(wp.quat_rotate(q_ja, b), wp.quat_rotate(q_jc, a1)) - wp.dot(b, a1)
+    elif row_kind[r] == ROW_MIMIC:
+        # The axis's coordinate, which mimic_combine_kernel turns into the pair's violation.
+        residual[r] = axis_coordinate(row_angular[r], b, xa, qa, xc, qc, X_pj[j], X_cj[j])
     elif _is_damper(row_kind[r]):
         if row_angular[r] == 1:
             q_rel = _relative_rotation(q_ja, qc * wp.quatd(wp.transform_get_rotation(X_cj[j])))
@@ -729,6 +791,100 @@ def joint_soft_row_kernel(
     stiffness = ke * dt * dt + (kd + c) * dt + arm
     compliance[r] = dt * dt / stiffness
     target[r] = force * dt * dt / stiffness
+
+
+@wp.kernel
+def mimic_combine_kernel(
+    rows: wp.array2d[wp.int32],
+    coeffs: wp.array2d[wp.float64],
+    offset: int,
+    with_offset: int,
+    # outputs
+    values: wp.array[wp.float64],
+):
+    """Combine the row values of each mimic pair, the follower's row at ``offset + rows[p, 0]`` and the leader's at
+    ``offset + rows[p, 1]``: the follower's takes ``-c1`` times the leader's (and ``-c0`` with ``with_offset``), the
+    pair's violation ``q_f - c0 - c1 q_l`` from the coordinates, and the leader's becomes 0."""
+    p = wp.tid()
+    a = offset + rows[p, 0]
+    b = offset + rows[p, 1]
+    value = values[a] - coeffs[p, 1] * values[b]
+    if with_offset != 0:
+        value -= coeffs[p, 0]
+    values[a] = value
+    values[b] = wp.float64(0.0)
+
+
+@wp.kernel
+def mimic_force_kernel(
+    rows: wp.array2d[wp.int32],
+    coeffs: wp.array2d[wp.float64],
+    offset: int,
+    # outputs
+    force: wp.array[wp.float64],
+):
+    """The leader's row of each mimic pair takes ``-c1`` times the follower's force, so that the pair applies the
+    combined row's force to both joints."""
+    p = wp.tid()
+    force[offset + rows[p, 1]] = -coeffs[p, 1] * force[offset + rows[p, 0]]
+
+
+@wp.kernel
+def mimic_matrix_rows_kernel(
+    block: wp.array[wp.int32],
+    local: wp.array2d[wp.int32],
+    coeffs: wp.array2d[wp.float64],
+    # outputs
+    W: wp.array3d[wp.float64],
+):
+    """The first step of ``T W Tᵀ`` for the mimic pairs: the follower's row of block ``block[p]`` takes ``-c1`` times
+    the leader's."""
+    p, j = wp.tid()
+    k = block[p]
+    W[k, local[p, 0], j] = W[k, local[p, 0], j] - coeffs[p, 1] * W[k, local[p, 1], j]
+
+
+@wp.kernel
+def mimic_matrix_columns_kernel(
+    block: wp.array[wp.int32],
+    local: wp.array2d[wp.int32],
+    coeffs: wp.array2d[wp.float64],
+    # outputs
+    W: wp.array3d[wp.float64],
+):
+    """The second step of ``T W Tᵀ``: the follower's column takes ``-c1`` times the leader's."""
+    p, i = wp.tid()
+    k = block[p]
+    W[k, i, local[p, 0]] = W[k, i, local[p, 0]] - coeffs[p, 1] * W[k, i, local[p, 1]]
+
+
+@wp.kernel
+def mimic_matrix_inert_kernel(
+    block: wp.array[wp.int32],
+    local: wp.array2d[wp.int32],
+    # outputs
+    W: wp.array3d[wp.float64],
+):
+    """The last step: the leader's row and column become those of the identity, an inert row."""
+    p, i = wp.tid()
+    k = block[p]
+    b = local[p, 1]
+    if i == b:
+        W[k, b, b] = wp.float64(1.0)
+    else:
+        W[k, b, i] = wp.float64(0.0)
+        W[k, i, b] = wp.float64(0.0)
+
+
+def combine_mimic_matrix(W: wp.array3d, block: wp.array, local: wp.array, coeffs: wp.array, device) -> None:
+    """``W <- T W Tᵀ`` for the mimic pairs in blocks ``block`` at the local rows ``local``, the leader's rows
+    inert."""
+    pairs, size = local.shape[0], W.shape[1]
+    if not pairs:
+        return
+    wp.launch(mimic_matrix_rows_kernel, (pairs, size), [block, local, coeffs], [W], device=device)
+    wp.launch(mimic_matrix_columns_kernel, (pairs, size), [block, local, coeffs], [W], device=device)
+    wp.launch(mimic_matrix_inert_kernel, (pairs, size), [block, local], [W], device=device)
 
 
 @wp.kernel
@@ -1122,9 +1278,18 @@ class BilateralSystem:
         # Each row's compliance for the step, zero on locked rows, set by joint_soft_row_kernel: an empty array
         # without soft rows.
         self.compliance = wp.zeros(R if bool(rows.row_soft.any()) else 0, dtype=wp.float64, device=device)
+        # The mimic pairs: their rows, coefficients, block and rows within it.
+        pairs = np.asarray(rows.mimic_rows, dtype=np.int32).reshape(-1, 2)
+        self.mimic_rows = wp.array(pairs, dtype=wp.int32, device=device)
+        self.mimic_coeffs = wp.array(np.asarray(rows.mimic_coeffs).reshape(-1, 2), dtype=wp.float64, device=device)
+        self.mimic_block = wp.array(row_block[pairs[:, 0]], dtype=wp.int32, device=device)
+        self.mimic_local = wp.array(
+            (pairs - rows.block_start[row_block[pairs]]).astype(np.int32), dtype=wp.int32, device=device
+        )
 
     def factor(self, row_slot: wp.array2d[wp.int32], row_jac: wp.array2d[wp.spatial_vectord]) -> None:
-        """Assemble and factor ``W`` for this step's Jacobian, the soft rows' compliance on its diagonal."""
+        """Assemble and factor ``W`` for this step's Jacobian, the soft rows' compliance on its diagonal and the
+        mimic pairs combined (:func:`combine_mimic_matrix`)."""
         wp.launch(
             bilateral_delassus_kernel,
             dim=self.W.shape,
@@ -1132,12 +1297,15 @@ class BilateralSystem:
             outputs=[self.W],
             device=self.device,
         )
+        combine_mimic_matrix(self.W, self.mimic_block, self.mimic_local, self.mimic_coeffs, self.device)
         wp.launch_tiled(
             _tile_kernels(self.tile)[0], dim=self.W.shape[0], inputs=[self.W, self.L], block_dim=64, device=self.device
         )
 
     def update(self, residual: wp.array[wp.float64], force: wp.array[wp.float64]) -> None:
-        """Newton step on the rows: ``force += W⁻¹ (-residual)``, the soft rows' term included."""
+        """Newton step on the rows: ``force += W⁻¹ (-residual)``, the soft rows' term included, from the residual with
+        its mimic pairs combined (:func:`mimic_combine_kernel`); the leaders' rows take ``-c1`` times their
+        followers' forces."""
         R = residual.shape[0]
         wp.launch(
             bilateral_rhs_kernel,
@@ -1160,6 +1328,9 @@ class BilateralSystem:
             outputs=[force],
             device=self.device,
         )
+        if self.mimic_rows.shape[0]:
+            inputs = [self.mimic_rows, self.mimic_coeffs, 0]
+            wp.launch(mimic_force_kernel, self.mimic_rows.shape[0], inputs, [force], device=self.device)
 
     def solve_rows(self, rows: wp.array[wp.int32], offset: int, v: wp.array, out: wp.array) -> None:
         """Block solve ``out = W⁻¹ v`` on joint rows ``rows`` placed at ``offset + k`` in both vectors.
