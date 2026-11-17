@@ -1,0 +1,1 @@
+Speed up the global solve of `SolverFBA`'s local-global iterations: the three components of the right-hand side go through the sparse inverse together, which reads its factors once instead of three times, to the same bits.

@@ -27,9 +27,7 @@ from ...geometry import ParticleFlags
 from ...sim import Model
 from .kernels import (
     apply_permutation_scalar_kernel,
-    extract_component_kernel,
     host_head,
-    insert_component_kernel,
     lite_row_dirs_kernel,
     lite_row_slots_kernel,
     scale_by_diag_kernel,
@@ -1243,6 +1241,44 @@ def factorize_and_sparse_inverse(
     return FactorizedSystem(S=S, Dinv=1.0 / d, perm_r=perm_r, invperm_r=order.astype(np.int32))
 
 
+@wp.kernel
+def gather_vec3d_kernel(src: wp.array[wp.vec3], perm: wp.array[wp.int32], dst: wp.array[wp.vec3d]):
+    """``dst[i] = src[perm[i]]`` in float64."""
+    i = wp.tid()
+    dst[i] = wp.vec3d(src[perm[i]])
+
+
+@wp.kernel
+def scatter_vec3_kernel(src: wp.array[wp.vec3d], perm: wp.array[wp.int32], dst: wp.array[wp.vec3]):
+    """``dst[i] = src[perm[i]]`` in float32."""
+    i = wp.tid()
+    dst[i] = wp.vec3(src[perm[i]])
+
+
+@wp.kernel
+def csr_mv_vec3_kernel(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    x: wp.array[wp.vec3d],
+    scale: wp.array[wp.float64],
+    y: wp.array[wp.vec3d],
+):
+    """``y[i] = scale[i] sum_k values[k] x[columns[k]]`` over row ``i`` of a CSR matrix of scalars, for three
+    right-hand sides at once, so that the matrix is read once for all three; ``scale`` empty for none. A block of
+    threads sums a row, each lane every ``block_dim``-th entry, as :func:`warp.sparse.bsr_mv` sums the long rows of
+    the sparse inverse with tiles."""
+    row, lane = wp.tid()
+    s = wp.vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
+    for k in range(offsets[row] + lane, offsets[row + 1], wp.block_dim()):
+        s += values[k] * x[columns[k]]
+    total = wp.tile_sum(wp.tile(s, preserve_type=True))[0]
+    if lane == 0:
+        if scale.shape[0] > 0:
+            total = scale[row] * total
+        y[row] = total
+
+
 def _csc_to_bsr_1x1(M: CscMatrix, device, transpose: bool = False):
     """Build a Warp 1x1 BSR matrix (float64) from a CSC matrix or its transpose.
 
@@ -1308,6 +1344,8 @@ class FBALinearSolver:
         self._DSb = wp.empty(n, dtype=wp.float64, device=self.device)
         self._SDSb = wp.empty(n, dtype=wp.float64, device=self.device)
         self._x_scalar = wp.empty(n, dtype=wp.float64, device=self.device)
+        self._b_vec, self._y_vec, self._z_vec = (wp.empty(n, dtype=wp.vec3d, device=self.device) for _ in range(3))
+        self._no_scale = wp.empty(0, dtype=wp.float64, device=self.device)
         self._factor_keys = tuple(self.__dict__)
 
     def schur_view(self) -> FBALinearSolver:
@@ -1319,7 +1357,8 @@ class FBALinearSolver:
         return view
 
     def solve(self, b: wp.array[wp.vec3], x: wp.array[wp.vec3]) -> None:
-        """Compute ``x[i] = A⁻¹ · b[i]`` component-wise.
+        """Compute ``x[i] = A⁻¹ · b[i]`` for the three components at once: the two products of the sparse inverse
+        read ``S`` and ``Sᵀ`` once each for all three, as :meth:`solve_scalar` does for one, to the same sums.
 
         Args:
             b: Input right-hand side, shape ``[n]``, dtype ``wp.vec3``.
@@ -1327,10 +1366,14 @@ class FBALinearSolver:
         """
         n = self.n
         dev = self.device
-        for c in range(3):
-            wp.launch(extract_component_kernel, dim=n, inputs=[b, c], outputs=[self._b_scalar], device=dev)
-            self.solve_scalar(self._b_scalar, self._x_scalar)
-            wp.launch(insert_component_kernel, dim=n, inputs=[self._x_scalar, c], outputs=[x], device=dev)
+        block = 64 if dev.is_cuda else 1
+        S, ST = self._S_bsr, self._ST_bsr
+        wp.launch(gather_vec3d_kernel, dim=n, inputs=[b, self._invperm], outputs=[self._b_vec], device=dev)
+        inputs = [S.offsets, S.columns, S.values, self._b_vec, self._Dinv]
+        wp.launch_tiled(csr_mv_vec3_kernel, dim=[n], inputs=inputs, outputs=[self._y_vec], block_dim=block, device=dev)
+        inputs = [ST.offsets, ST.columns, ST.values, self._y_vec, self._no_scale]
+        wp.launch_tiled(csr_mv_vec3_kernel, dim=[n], inputs=inputs, outputs=[self._z_vec], block_dim=block, device=dev)
+        wp.launch(scatter_vec3_kernel, dim=n, inputs=[self._z_vec, self._perm], outputs=[x], device=dev)
 
     def solve_scalar(self, b: wp.array[wp.float64], x: wp.array[wp.float64]) -> None:
         """Compute ``x = A⁻¹ · b`` for one scalar right-hand side.
