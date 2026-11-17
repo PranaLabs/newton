@@ -2331,6 +2331,52 @@ class TestGraphCapture(unittest.TestCase):
                 for eager, replayed in zip(*results, strict=True):
                     np.testing.assert_array_equal(eager, replayed)
 
+    @staticmethod
+    def _cloth_on_box(device=None):
+        """A lite cloth of 20 x 20 cells, its first particle held, over a box and the ground, and its contacts."""
+        builder = newton.ModelBuilder()
+        builder.add_shape_box(-1, xform=wp.transform((0.0, 0.0, 0.1), wp.quat_identity()), hx=0.15, hy=0.15, hz=0.1)
+        builder.add_ground_plane()
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.2, -0.2, 0.25), rot=wp.quat_identity(), vel=wp.vec3(0.0), dim_x=20, dim_y=20,
+            cell_x=0.02, cell_y=0.02, mass=0.01, tri_ke=1e3, tri_ka=1e3, edge_ke=1e-4, particle_radius=0.005,
+        )  # fmt: skip
+        builder.particle_mass[0] = 0.0
+        model = builder.finalize(device=device)
+        solver = SolverFBA(model, iterations=5, nsn_schur_mode="lite", nsn_linear_iterations=10)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.01)
+        return model, solver, pipeline, pipeline.contacts()
+
+    def test_lite_contacts_replay_from_a_graph(self):
+        """Record the collision and two steps of a lite cloth falling onto a box into a graph, after a step outside
+        it, and reach the same states, bit for bit, as the same steps taken eagerly."""
+        dt = 1.0 / 120.0
+        results = []
+        for graph in (False, True):
+            model, solver, pipeline, contacts = self._cloth_on_box()
+            s0, s1 = model.state(), model.state()
+            pipeline.collide(s0, contacts)
+            solver.step(s0, s1, None, contacts, dt)
+            s0, s1 = s1, s0
+
+            def two_steps(s0=s0, s1=s1, solver=solver, pipeline=pipeline, contacts=contacts):
+                pipeline.collide(s0, contacts)
+                solver.step(s0, s1, None, contacts, dt)
+                pipeline.collide(s1, contacts)
+                solver.step(s1, s0, None, contacts, dt)
+
+            if graph:
+                with wp.ScopedCapture() as capture:
+                    two_steps()
+                for _ in range(60):
+                    wp.capture_launch(capture.graph)
+            else:
+                for _ in range(60):
+                    two_steps()
+            results.append(s0.particle_q.numpy())
+        self.assertGreater(float(results[0][:, 2].max()), 0.0)
+        np.testing.assert_array_equal(results[0], results[1])
+
     def test_capture_names_what_blocks_it(self):
         """Refuse to record a step whose system is not set up for its dt, and one with contacts, naming why."""
         model = self._scene("cloth", ground=True)
@@ -2345,6 +2391,31 @@ class TestGraphCapture(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "contacts=None"):
             with wp.ScopedCapture():
                 solver.step(s1, s0, None, contacts, 0.01)
+
+
+class TestCapacityContacts(unittest.TestCase):
+    """The capacity path of the contacts, which steps recorded into a graph take, on every device."""
+
+    def test_capacity_path_matches_the_count_path(self):
+        """Step a lite cloth falling onto a box and the ground, a held particle among its contacts, through the
+        capacity path, every slot of the contact buffer a row, and through the stored contacts alone, bit for bit
+        alike."""
+        dt, results = 1.0 / 120.0, []
+        for capacity in (False, True):
+            model, solver, pipeline, contacts = TestGraphCapture._cloth_on_box()
+            s0, s1 = model.state(), model.state()
+            for k in range(80):
+                if capacity and k == 1:
+                    # The steps recorded into a graph take the capacity path; this takes it without a graph.
+                    solver._recording = lambda: True
+                pipeline.collide(s0, contacts)
+                solver.step(s0, s1, None, contacts, dt)
+                s0, s1 = s1, s0
+            if capacity:
+                self.assertEqual(solver._contact_count, contacts.soft_contact_particle.shape[0])
+                self.assertLess(int(contacts.soft_contact_count.numpy()[0]), solver._contact_count)
+            results.append(s0.particle_q.numpy())
+        np.testing.assert_array_equal(results[0], results[1])
 
 
 class TestStepContract(unittest.TestCase):

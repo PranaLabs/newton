@@ -614,6 +614,9 @@ class SolverFBA(TendonStateMixin, SolverBase):
         # rows, and whether the joints have damper rows.
         self._limits, self._rc_limits, self._limit_ws, self._joint_dampers = None, 0, None, False
         self._rc_mimic = None  # the mimic pairs among the rows of the step's rigid contact solve
+        # The capacity path of the contacts (_capacity_contacts_capable): whether the step takes it, the capacity its
+        # buffers are reserved for, and its sort's keys and values.
+        self._capacity_step, self._capacity_reserved, self._capacity_sort = False, None, None
         self._two_way_world_h = np.zeros(model.world_count, dtype=np.int32)
         self._two_way_world_d = wp.empty(0, dtype=wp.int32, device=model.device)
         # The rows of a step whose worlds split between the two-way and the deformable NSN, and the Schur rows of the
@@ -3115,6 +3118,10 @@ class SolverFBA(TendonStateMixin, SolverBase):
             # A split step that raises with rows of a world selection in place returns the solver's own.
             if self._swapped_rows is not None:
                 self._swap_rows(self._swapped_rows)
+            self._capacity_step = False
+        if not self._recording() and self._capacity_contacts_capable(contacts):
+            # A later step with these contacts may record into a graph: its buffers are allocated now.
+            self._reserve_capacity(contacts)
 
     def _recording(self) -> bool:
         """Whether launches are being recorded into a graph, the solver's own (``_outer_capture``) or the caller's:
@@ -3128,11 +3135,21 @@ class SolverFBA(TendonStateMixin, SolverBase):
         ``dt`` by an earlier step, and the step must have no contacts, contact or constraint rows and no joint
         limits, whose counts are read back to the host to size the step's work.
         """
-        model = self.model
-        if contacts is not None and (
-            contacts.soft_contact_particle.shape[0] or getattr(contacts, "rigid_contact_max", 0)
-        ):
-            return "steps with contacts read their contact counts back to the host; pass contacts=None"
+        if contacts is not None and self._integrates_bodies():
+            return "steps with contacts on the bodies that SolverFBA integrates read their counts back to the host"
+        if contacts is not None and contacts.soft_contact_particle.shape[0]:
+            if not self._capacity_contacts_capable(contacts):
+                return (
+                    "steps with contacts record into a graph only with nsn_schur_mode='lite', friction=True, one "
+                    "world and particle-shape contacts alone (no self, face or rod contacts, particle constraint "
+                    "rows, contact_warmstart, friction_anchors or nsn_lite_accumulate); otherwise pass contacts=None"
+                )
+            if self._capacity_reserved != contacts.soft_contact_particle.shape[0]:
+                return (
+                    "take a step with these contacts outside the graph first, which reserves their capacity's buffers"
+                )
+            if not wp.is_mempool_enabled(self._device):
+                return "the step's sort of the contacts needs the device's memory pool (wp.set_mempool_enabled)"
         if self._self_contact is not None or self._rod_contact is not None:
             return "self contacts and rod contacts are found on the host"
         if self._segment_query is not None or (self._face_query is not None and self.face_contact_gap is not None):
@@ -3142,7 +3159,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         particles_set_up = self._linear_solver is not None and self._dt_setup is not None
         if self.model.particle_count and not (particles_set_up and abs(self._dt_setup - dt) <= 1e-12):
             return f"the system is set up for dt={dt} by a step outside the graph; take one first"
-        if model.body_count and not self.integrate_with_external_rigid_solver:
+        if self._integrates_bodies():
             if self._rigid_dt is None or abs(self._rigid_dt - dt) > 1e-12:
                 return f"the bodies' system is set up for dt={dt} by a step outside the graph; take one first"
             if self._limits is not None:
@@ -3150,6 +3167,78 @@ class SolverFBA(TendonStateMixin, SolverBase):
             if self._model_tendon_groups is not None:
                 return "tendon rows are set up on the host at each step"
         return None
+
+    def _integrates_bodies(self) -> bool:
+        """Whether SolverFBA integrates any of the model's bodies, from the body slots of the rigid system when it is
+        set up, so that nothing is read back from the device."""
+        model = self.model
+        if not model.body_count or self.integrate_with_external_rigid_solver:
+            return False
+        slots = getattr(self, "_body_slot_h", None)
+        if slots is not None and self._rigid_dt is not None:
+            return bool((slots >= 0).any())
+        return bool((model.body_flags.numpy() & int(BodyFlags.DYNAMIC)).any())
+
+    def _capacity_contacts_capable(self, contacts: Contacts | None) -> bool:
+        """Whether a step's particle contacts can take the capacity path, which records into a graph: every slot of
+        the contact buffer becomes a contact row, the slots past the stored count and the contacts of held particles
+        inert rows, sorted after the others on the device, so that the step reads nothing back. It serves
+        particle-shape contacts alone, with the frictional lite operator in one world."""
+        if contacts is None or not contacts.soft_contact_particle.shape[0]:
+            return False
+        return (
+            self.nsn_schur_mode == "lite"
+            and self.friction
+            and self.model.world_count == 1
+            and self._self_contact is None
+            and self._rod_contact is None
+            and self._segment_query is None
+            and self._face_query is None
+            and self._constraint_rows is None
+            and self._warm_start is None
+            and not self.friction_anchors
+            and not self.nsn_lite_accumulate
+            and not self._integrates_bodies()
+        )
+
+    def _reserve_capacity(self, contacts: Contacts) -> None:
+        """Allocate the buffers of the capacity path for ``contacts``, so that a later step recorded into a graph
+        allocates nothing."""
+        C, device = contacts.soft_contact_particle.shape[0], self._device
+        self._ensure_contact_buffers(C)
+        if self._capacity_sort is None or self._capacity_sort[0].shape[0] < 2 * C:
+            self._capacity_sort = (
+                wp.empty(2 * C, dtype=wp.int64, device=device),
+                wp.empty(2 * C, dtype=wp.int32, device=device),
+            )
+        self._linear_solver.reserve_lite_rows_capacity(C)
+        self._ensure_nsn_inner_buffers(3 * C, alloc_2d=False)
+        persistent = getattr(self, "_lam_coulomb_persistent_d", None)
+        if persistent is None or persistent.size < 3 * C:
+            for name in ("lam_unilateral", "lam_coulomb", "omega_unilateral", "omega_coulomb"):
+                setattr(self, f"_{name}_persistent_d", wp.zeros(3 * C, dtype=wp.float64, device=device))
+        self._capacity_reserved = C
+
+    def _capacity_contacts(self, contacts: Contacts) -> int:
+        """The contact rows of the capacity path: sort the whole buffer of ``contacts`` on the device, the inert slots
+        last (:func:`kernels.capacity_contact_keys_kernel`), and lay out its rows. Returns the row count, the
+        buffer's capacity."""
+        from .kernels import capacity_contact_keys_kernel, capacity_contact_rows_kernel  # noqa: PLC0415
+
+        C, device = contacts.soft_contact_particle.shape[0], self._device
+        keys, order = self._capacity_sort
+        pinned = self._pinned_d if self._pinned_d is not None else wp.empty(0, dtype=wp.int32, device=device)
+        inputs = [contacts.soft_contact_count, contacts.soft_contact_particle, contacts.soft_contact_shape]
+        wp.launch(
+            capacity_contact_keys_kernel, C, [*inputs, self.model.shape_count, pinned], [keys, order], device=device
+        )
+        wp.utils.radix_sort_pairs(keys, order, C)
+        inputs = [keys, order, contacts.soft_contact_particle, contacts.soft_contact_shape]
+        inputs += [contacts.soft_contact_body_pos, contacts.soft_contact_normal]
+        outputs = [self._contact_particle_d, self._contact_normal_d, self._contact_alpha_d, self._contact_shape_d]
+        outputs += [self._contact_body_pos_d, self._contact_record_d]
+        wp.launch(capacity_contact_rows_kernel, C, inputs, outputs, device=device)
+        return C
 
     def _unaliased_input(self, state_in: State, state_out: State) -> State:
         """``state_in``, or a copy of its positions and velocities when ``state_out`` shares them: the step reads the
@@ -3233,6 +3322,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 wp.copy(self._tet_activation_d, activations)
 
         # Ingest the step's contacts once; with self contact on, a step without contacts still has self contacts.
+        self._capacity_step = self._recording() and self._capacity_contacts_capable(contacts)
         if contacts is not None or self._self_contact is not None or self._rod_contact is not None:
             self._ingest_contacts(contacts, state_in)
         else:
@@ -3438,7 +3528,20 @@ class SolverFBA(TendonStateMixin, SolverBase):
                         # is dead work; skipping it removes the dominant cost on
                         # large contact sets, where the download took ~70% of the
                         # Schur build.
-                        if use_lite_block_diag:
+                        if use_lite_block_diag and self._capacity_step:
+                            # The capacity path's rows, set up on the device: every particle takes the per-particle
+                            # Newton step.
+                            ls.setup_lite_rows_capacity(
+                                M,
+                                self._contact_particle_d,
+                                self._contact_normal_d,
+                                self._contact_alpha_d,
+                                self._contact_tangent1_d,
+                                self._contact_tangent2_d,
+                                self._contact_record_d,
+                            )
+                            self._lite_W = None
+                        elif use_lite_block_diag:
                             # LiteNSN block-diagonal-by-particle path: no dense
                             # W is materialized. The fused per-contact kernel
                             # below builds each ``3x3`` local W on-the-fly.
@@ -5235,7 +5338,10 @@ class SolverFBA(TendonStateMixin, SolverBase):
         other_contacts = other_contacts or self._self_contact is not None or self._rod_contact is not None
         other_contacts = other_contacts or self._segment_query is not None
         M_raw = 0
-        if contacts is not None:
+        if self._capacity_step:
+            # The whole buffer, sorted and laid out on the device; nothing is read back.
+            M_raw = M = shape_contacts = self._capacity_contacts(contacts)
+        elif contacts is not None:
             capacity = contacts.soft_contact_particle.shape[0]
             M_raw = stored_contact_count(contacts.soft_contact_count, capacity, "soft")
         if M_raw == 0 and not other_contacts:
@@ -5255,7 +5361,9 @@ class SolverFBA(TendonStateMixin, SolverBase):
         # host path.
         on_device = contacts is not None and self._face_query is None and self._rod_contact is None
         on_device = on_device and self._segment_query is None
-        if on_device and getattr(self._self_contact, "mode", None) == "vertex_face":
+        if self._capacity_step:
+            particle_h = normal_h = alpha_h = shape_h = body_pos_h = record_h = extra = None
+        elif on_device and getattr(self._self_contact, "mode", None) == "vertex_face":
             M, shape_contacts = self._assemble_contacts_on_device(contacts, state, M_raw)
             particle_h = normal_h = alpha_h = shape_h = body_pos_h = record_h = extra = None
         else:
@@ -5505,6 +5613,10 @@ class SolverFBA(TendonStateMixin, SolverBase):
             inputs += [self._contact_shape_d, model.particle_radius, model.shape_margin]
             inputs += [shape_radius, int(self._shape_radius_d is not None)]
             wp.launch(add_contact_thickness_kernel, shape_contacts, inputs, [self._contact_offset_d], device=device)
+        if self._capacity_step:
+            from .kernels import inert_contact_offset_kernel  # noqa: PLC0415
+
+            wp.launch(inert_contact_offset_kernel, M, [self._contact_record_d], [self._contact_offset_d], device=device)
 
         # Host mirrors of the basic contact fields, for the host paths that still read them.
         self._contact_particle_h = None if particle_h is None else particle_h.astype(np.int32)

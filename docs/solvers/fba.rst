@@ -195,9 +195,27 @@ when the time step changes or after
 elements) when those arrays changed, and other changes to them take effect
 only then. Edits of shapes alone, such as of their friction, keep the factor
 and the contact warm start, and edits of ``edge_rest_angle`` alone refresh the
-bending targets without factoring. A step reads its contacts back to
-the host, so it cannot be captured in a graph and raises if called during a
-capture; it captures and replays its own local-global iterations. FBA runs
+bending targets without factoring. A step records into the caller's CUDA
+graph (:class:`warp.ScopedCapture`), collision included, when it reads
+nothing back to the host and allocates nothing: after a step of the same
+``dt`` outside the graph, which sets up the system, a step without contacts,
+and a step with particle-shape contacts alone with the frictional lite
+operator in one world, after a step with the same contacts outside the graph,
+which reserves the buffers of their capacity. Such a step takes every slot of
+the contact buffer as a contact row, those past the stored count and those of
+held particles inert, sorted on the device, and gives every particle the
+per-particle Newton step; a particle with more than four contacts keeps its
+multipliers there. Self, face and rod contacts, particle constraint rows and
+particle-body attachments, ``contact_warmstart``, ``friction_anchors``,
+``nsn_lite_accumulate``, the full operator, several worlds, joint limits,
+tendons and contacts on the bodies FBA integrates keep a step out of graphs:
+during a capture it then raises ``RuntimeError``, naming the reason. A graph
+replays the launches of the steps it recorded: settings the solver keeps on
+the host, such as :meth:`~newton.solvers.SolverFBA.set_pin_targets`,
+:meth:`~newton.solvers.SolverFBA.set_particle_constraints` and
+:meth:`~newton.solvers.SolverFBA.notify_model_changed`, reach the graphs
+recorded after them. Outside a capture a step captures and replays its own
+local-global iterations. FBA runs
 on the CPU and on CUDA devices. A step may write its output into its input
 state.
 
