@@ -26,6 +26,8 @@ from ...core.types import MAXVAL
 from ...sim import JointType, Model
 from .rigid import ROW_FORCE_LANES, row_force_rhs_kernel, row_incidence, slot_coefficients
 
+wp.set_module_options({"enable_backward": False})
+
 _CONSTRAINT_JOINTS = (JointType.PRISMATIC, JointType.REVOLUTE, JointType.BALL, JointType.FIXED, JointType.D6)
 _AXIS_JOINTS = (JointType.PRISMATIC, JointType.REVOLUTE)
 

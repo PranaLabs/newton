@@ -36,6 +36,8 @@ from .kernels import (
 )
 from .sparse_ldlt import CscMatrix, CsrMatrix, factor_ldlt
 
+wp.set_module_options({"enable_backward": False})
+
 
 def dense_schur_capacity(required: int, current: int) -> int:
     """Rows of a square dense Schur buffer that holds ``required`` rows and replaces one of ``current`` rows.

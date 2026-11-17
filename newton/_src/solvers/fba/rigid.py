@@ -19,6 +19,8 @@ names the body slot ``row_slot[r, k]`` (-1 for none) and its coefficients
 import numpy as np
 import warp as wp
 
+wp.set_module_options({"enable_backward": False})
+
 # Stability clamp on the rotation per step, |omega| * dt <= 0.5 [rad].
 _MAX_STEP_ROTATION = wp.constant(wp.float64(0.5))
 # Step rotations with squared norm below this are treated as numerical noise.

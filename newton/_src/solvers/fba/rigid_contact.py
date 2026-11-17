@@ -28,6 +28,8 @@ from ..tendon_kernels import wrapped_arc_length
 from .kernels import host_head, stored_contact_count
 from .rigid import _rotation_vector, slot_coefficients
 
+wp.set_module_options({"enable_backward": False})
+
 
 @dataclass
 class RigidContacts:

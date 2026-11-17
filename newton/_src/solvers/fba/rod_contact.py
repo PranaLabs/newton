@@ -15,6 +15,8 @@ from ...sim import Model
 from .kernels import host_head
 from .self_contact import _in_ring, iota_kernel
 
+wp.set_module_options({"enable_backward": False})
+
 
 @wp.kernel
 def capsule_bounds_kernel(

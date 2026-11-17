@@ -71,6 +71,8 @@ from collections.abc import Callable
 import numpy as np
 import warp as wp
 
+wp.set_module_options({"enable_backward": False})
+
 
 def group_world_rows(worlds: np.ndarray, device) -> tuple:
     """Stable indexed segments of independent worlds, without reordering the system's rows."""

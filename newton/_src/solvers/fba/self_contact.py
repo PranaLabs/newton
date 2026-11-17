@@ -13,6 +13,8 @@ from ...geometry.kernels import compute_tri_aabbs, triangle_closest_point
 from ...sim import Model
 from .kernels import host_head, world_value
 
+wp.set_module_options({"enable_backward": False})
+
 # Threads that share the candidate triangles of one particle.
 _LANES = wp.constant(32)
 _INF = wp.constant(float("inf"))

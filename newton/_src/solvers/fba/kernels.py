@@ -10,6 +10,8 @@ import warp as wp
 from ...core.reset import reset_world_selected
 from ...exceptions import NewtonWarning
 
+wp.set_module_options({"enable_backward": False})
+
 # 3x2 matrix type: Warp has no ``wp.mat32``.
 mat32 = wp.types.matrix(shape=(3, 2), dtype=wp.float32)
 
