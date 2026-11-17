@@ -2255,6 +2255,97 @@ class TestDynamicPin(unittest.TestCase):
                 self.assertEqual(int((particles[:, 0] < 16).sum()), 0 if len(pinned) == 32 else 16)
 
 
+class TestGraphCapture(unittest.TestCase):
+    """Steps of SolverFBA recorded into the caller's CUDA graph and replayed."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not wp.is_cuda_available():
+            raise unittest.SkipTest("CUDA graph capture needs a CUDA device")
+
+    @staticmethod
+    def _scene(kind, ground=False):
+        """A contact-free scene: a pinned cloth, a pinned soft body, or a three-link arm with drives and damping, and
+        with ``ground`` a ground plane."""
+        builder = newton.ModelBuilder()
+        if ground:
+            builder.add_ground_plane()
+        if kind == "cloth":
+            builder.add_cloth_grid(
+                pos=wp.vec3(0.0, 0.0, 1.0), rot=wp.quat_identity(), vel=wp.vec3(0.0), dim_x=12, dim_y=12,
+                cell_x=0.02, cell_y=0.02, mass=0.01, tri_ke=1e3, tri_ka=1e3, edge_ke=1e-4, fix_left=True,
+            )  # fmt: skip
+        elif kind == "soft":
+            builder.add_soft_grid(
+                pos=wp.vec3(0.0, 0.0, 1.0), rot=wp.quat_identity(), vel=wp.vec3(0.0), dim_x=6, dim_y=3, dim_z=3,
+                cell_x=0.05, cell_y=0.05, cell_z=0.05, density=1000.0, k_mu=1e4, k_lambda=1e4, k_damp=0.0,
+                fix_left=True,
+            )  # fmt: skip
+        else:
+            links = [
+                builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.01), xform=wp.transform((0.0, 0.0, z)))
+                for z in (0.5, 0.7, 0.9)
+            ]
+            joints = [
+                builder.add_joint_revolute(
+                    -1, links[0], axis=(1.0, 0.0, 0.0), parent_xform=wp.transform((0.0, 0.0, 0.5)), target_ke=100.0,
+                    target_kd=10.0, target_pos=0.3,
+                )
+            ]  # fmt: skip
+            joints += [
+                builder.add_joint_revolute(
+                    links[k], links[k + 1], axis=(1.0, 0.0, 0.0), parent_xform=wp.transform((0.0, 0.0, 0.2)),
+                    damping=0.1, armature=0.01,
+                )
+                for k in range(2)
+            ]  # fmt: skip
+            builder.add_articulation(joints)
+        return builder.finalize()
+
+    def test_contact_free_steps_replay_from_a_graph(self):
+        """Record two steps of a contact-free scene into a graph after a step outside it, replay the graph, and
+        reach the same states, bit for bit, as the same steps taken eagerly."""
+        dt, pairs = 1.0 / 120.0, 20
+        for kind in ("cloth", "soft", "arm"):
+            with self.subTest(kind=kind):
+                results = []
+                for graph in (False, True):
+                    model = self._scene(kind)
+                    solver = SolverFBA(model, iterations=5)
+                    control = model.control()
+                    s0, s1 = model.state(), model.state()
+                    solver.step(s0, s1, control, None, dt)
+                    s0, s1 = s1, s0
+                    if graph:
+                        with wp.ScopedCapture() as capture:
+                            solver.step(s0, s1, control, None, dt)
+                            solver.step(s1, s0, control, None, dt)
+                        for _ in range(pairs):
+                            wp.capture_launch(capture.graph)
+                    else:
+                        for _ in range(pairs):
+                            solver.step(s0, s1, control, None, dt)
+                            solver.step(s1, s0, control, None, dt)
+                    results.append([a.numpy() for a in (s0.particle_q, s0.body_q) if a is not None])
+                for eager, replayed in zip(*results, strict=True):
+                    np.testing.assert_array_equal(eager, replayed)
+
+    def test_capture_names_what_blocks_it(self):
+        """Refuse to record a step whose system is not set up for its dt, and one with contacts, naming why."""
+        model = self._scene("cloth", ground=True)
+        solver = SolverFBA(model, iterations=5)
+        s0, s1 = model.state(), model.state()
+        with self.assertRaisesRegex(RuntimeError, "take one first"):
+            with wp.ScopedCapture():
+                solver.step(s0, s1, None, None, 0.01)
+        solver.step(s0, s1, None, None, 0.01)
+        contacts = newton.CollisionPipeline(model).contacts()
+        self.assertGreater(contacts.soft_contact_particle.shape[0], 0)
+        with self.assertRaisesRegex(RuntimeError, "contacts=None"):
+            with wp.ScopedCapture():
+                solver.step(s1, s0, None, contacts, 0.01)
+
+
 class TestStepContract(unittest.TestCase):
     """SolverFBA.step follows SolverBase.step's contract: aliased states, the model's control, and invalid input."""
 
@@ -2392,13 +2483,14 @@ class TestStepContract(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
     def test_refuses_graph_capture(self):
-        """Raise a clear error when a step is captured in a CUDA graph, and step normally afterwards."""
+        """Raise a clear error when a step that cannot be recorded, of a dt the system is not set up for, is captured
+        in a CUDA graph, and step normally afterwards."""
         model = self._cloth_and_pendulum("cuda:0")
         solver = SolverFBA(model, iterations=2)
         s0, s1 = model.state(), model.state()
         solver.step(s0, s1, None, None, 0.01)
-        with self.assertRaises(RuntimeError), wp.ScopedCapture(device="cuda:0"):
-            solver.step(s1, s0, None, None, 0.01)
+        with self.assertRaisesRegex(RuntimeError, "cannot be captured"), wp.ScopedCapture(device="cuda:0"):
+            solver.step(s1, s0, None, None, 0.02)
         solver.step(s1, s0, None, None, 0.01)
         self.assertTrue(np.isfinite(s0.particle_q.numpy()).all())
 

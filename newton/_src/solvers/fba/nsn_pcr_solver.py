@@ -1758,6 +1758,9 @@ class NSNPCRSolver:
         # matrix data pointer and strides: a reallocated buffer can return
         # at the same address with a different row pitch.
         key = (n, a_ptr, tuple(A.strides))
+        if wp.get_device(device).is_capturing:
+            # Inside another capture the iterations record into it; a capture here would fail and stick.
+            return None
         cached = self._pcr_graph_cache.get(key, "missing")
         if cached == "missing":
             # Capture lazily. Failures are sticky: we cache ``None`` so

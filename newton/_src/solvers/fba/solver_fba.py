@@ -2504,6 +2504,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         capturable = (
             self.rigid_iteration_graph
             and wp.get_device(self._device).is_cuda
+            and not self._recording()
             and self.nsn_sparse_storage
             and getattr(self, "_rc_padded", None) is None
             and not (self._rc_n_b and self._constraint_lengths)
@@ -3101,10 +3102,9 @@ class SolverFBA(TendonStateMixin, SolverBase):
         if not (math.isfinite(dt) and dt > 0.0):
             raise ValueError(f"SolverFBA.step needs a finite positive dt, got {dt}")
         if wp.get_device(self._device).is_capturing:
-            raise RuntimeError(
-                "SolverFBA.step cannot be captured in a graph: it reads its contact counts back to the host; it "
-                "captures and replays its own local-global iterations"
-            )
+            blocker = self._capture_blocker(contacts, dt)
+            if blocker is not None:
+                raise RuntimeError(f"SolverFBA.step cannot be captured in a graph here: {blocker}")
         if control is None:
             # As SolverBase specifies, a step without control takes the model's.
             control = self.model.control(clone_variables=False)
@@ -3115,6 +3115,41 @@ class SolverFBA(TendonStateMixin, SolverBase):
             # A split step that raises with rows of a world selection in place returns the solver's own.
             if self._swapped_rows is not None:
                 self._swap_rows(self._swapped_rows)
+
+    def _recording(self) -> bool:
+        """Whether launches are being recorded into a graph, the solver's own (``_outer_capture``) or the caller's:
+        the solver's graphs then run their launches eagerly, which records them."""
+        return self._outer_capture or wp.get_device(self._device).is_capturing
+
+    def _capture_blocker(self, contacts: Contacts | None, dt: float) -> str | None:
+        """Why a step of ``dt`` with ``contacts`` cannot be recorded into the caller's graph, or ``None``.
+
+        A step records into a graph when it neither reads the device nor allocates: the system must be set up for
+        ``dt`` by an earlier step, and the step must have no contacts, contact or constraint rows and no joint
+        limits, whose counts are read back to the host to size the step's work.
+        """
+        model = self.model
+        if contacts is not None and (
+            contacts.soft_contact_particle.shape[0] or getattr(contacts, "rigid_contact_max", 0)
+        ):
+            return "steps with contacts read their contact counts back to the host; pass contacts=None"
+        if self._self_contact is not None or self._rod_contact is not None:
+            return "self contacts and rod contacts are found on the host"
+        if self._segment_query is not None or (self._face_query is not None and self.face_contact_gap is not None):
+            return "rod shape contacts and face contacts with a gap are found on the host"
+        if self._constraint_rows is not None:
+            return "particle constraint rows and particle-body attachments are set up on the host at each step"
+        particles_set_up = self._linear_solver is not None and self._dt_setup is not None
+        if self.model.particle_count and not (particles_set_up and abs(self._dt_setup - dt) <= 1e-12):
+            return f"the system is set up for dt={dt} by a step outside the graph; take one first"
+        if model.body_count and not self.integrate_with_external_rigid_solver:
+            if self._rigid_dt is None or abs(self._rigid_dt - dt) > 1e-12:
+                return f"the bodies' system is set up for dt={dt} by a step outside the graph; take one first"
+            if self._limits is not None:
+                return "joint limits select their rows on the host"
+            if self._model_tendon_groups is not None:
+                return "tendon rows are set up on the host at each step"
+        return None
 
     def _unaliased_input(self, state_in: State, state_out: State) -> State:
         """``state_in``, or a copy of its positions and velocities when ``state_out`` shares them: the step reads the
@@ -3361,7 +3396,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         # Capture the PD local phase and linear solve into a CUDA graph once per step: all energies and pins
         # are fixed by ``_setup_pd_system`` and the buffers are stable, so one ``wp.capture_launch`` per PD
         # iteration replaces ~25-30 launches.
-        _use_lg_graph = wp.get_device(device).is_cuda
+        _use_lg_graph = wp.get_device(device).is_cuda and not self._recording()
         _lg_graph = self._get_or_build_lg_iter_graph(dt) if _use_lg_graph else None
 
         for _k in range(self.iterations):
@@ -5773,7 +5808,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         when the step has several iterations and its linear solve runs a fixed count of iterations without reading
         the device."""
         pcr = self._pcr_solver
-        if not (use_graph and self.iterations > 1 and pcr.max_iter <= pcr.check_every):
+        if not (use_graph and not self._recording() and self.iterations > 1 and pcr.max_iter <= pcr.check_every):
             self._lite_sparse_correction(M, n_b, dt)
             return
         if self._lite_iter_graph is None:
@@ -6297,8 +6332,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
             if tail[0] is not None:
                 tail[0]()
 
-        if self._outer_capture:
-            # The rigid iteration's graph is being captured: record this step's launches into it.
+        if self._recording():
+            # A graph is being captured, the rigid iteration's or the caller's: record this step's launches into it.
             run()
             return
         pcr = self._pcr_solver
