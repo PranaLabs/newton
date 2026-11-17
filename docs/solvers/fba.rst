@@ -422,12 +422,56 @@ Contacts
   iterations and models only their change, so that the iterations approach
   the forces whose exact motion closes the gaps and stacked layers keep their
   margin at longer steps.
+- ``nsn_linear_iterations`` caps the conjugate residual iterations of the
+  linear solve in each Newton step. ``None`` (default) solves to a relative
+  residual of ``1e-10``. A capped step is inexact, and the next local-global
+  iteration's Newton step continues from it; most examples cap it at 10. A
+  solve to the tolerance reads its residual back to the host every 25
+  iterations and runs up to ``max(1000, 2 n)`` of them, which can cost a step
+  many times a capped one's, above all with ``nsn_sparse_storage=True`` or the
+  lite operator's self contacts.
+- ``contact_regularization`` (default ``0.01``) is the relative
+  regularization ``gamma`` of the contact rows in the Newton steps that
+  involve bodies FBA integrates, face contacts or self contacts: such a step
+  solves with ``A_cc + gamma diag(A_cc)``. Contacts and joints that close a
+  loop, such as a hinged plank leaning on a box that rests on the ground,
+  make the Newton matrix nearly singular, and an unregularized step answers a
+  sub-micrometer inconsistency there with forces far above the bodies'
+  weights. The term bounds the gain along contact directions by
+  ``1 / gamma`` and leaves the complementarity conditions unchanged. Steps
+  with particle contacts alone are not regularized, nor is the sparse
+  self-contact solve of the lite operator.
 - ``face_contacts=True`` adds a contact at the deepest point of a triangle
   inside a shape, so shape edges and corners cannot pass between the
   particles of coarse cloth, and holds particles in concave corners of
-  meshes. It needs friction and the full operator.
+  meshes. It needs friction and the full operator. By default only the
+  triangles next to particle contacts are tested, which misses a shape's tip
+  or edge poking into a triangle whose particles all lie beyond the reach of
+  the particle contacts; ``face_contact_gap`` [m] tests every triangle within
+  that distance of a shape instead. ``face_contact_edge_radius`` [m]
+  (default 3 mm) rounds the edges of boxes and cylinders in the signed
+  distance that the face contacts minimize, at most half of the shape's
+  smallest half extent, so that a triangle point that sinks into an edge does
+  not flip its normal between the two faces; the segment contacts of
+  ``rod_shape_contacts`` take the same rounding. It is a length, not a
+  fraction of the shape, so scale it with the scene.
 - ``particle_enable_self_contact=True`` makes the triangles collide with each
-  other, through vertex-face or vertex-vertex contacts. Vertex-face contacts
+  other, through vertex-face or vertex-vertex contacts, as
+  ``particle_self_contact_mode`` selects: ``"vertex_face"`` (default) keeps
+  each particle ``particle_self_contact_margin`` [m] (default 2 mm) from its
+  nearest triangle, and ``"vertex_vertex"`` keeps the particles that far from
+  each other, which covers the surface only when the margin reaches the
+  longest edge and leaves a bumpy contact surface. The contacts are found
+  once per step, within the margin plus ``particle_self_contact_gap`` [m]
+  (by default the margin), which bounds the relative motion over a step that
+  cannot pass a contact. Particles within
+  ``particle_topological_contact_filter_threshold`` mesh edges of each other
+  (default 2) do not collide with each other or with the triangles that have
+  such a particle, and ``particle_rest_shape_contact_exclusion_radius`` [m]
+  excludes particles and triangles closer than that in ``model.particle_q``,
+  so that a fold closes only between parts that start apart; both mean what
+  :class:`~newton.solvers.SolverVBD`'s options of the same names mean.
+  Vertex-face contacts
   keep crossing edges apart when the margin reaches half of the longest edge;
   ``particle_self_contact_edge_edge=True`` adds edge-edge contacts at creases
   for thinner margins, ``particle_self_contact_edge_edge_ratio`` sets how near
@@ -514,7 +558,10 @@ Contacts
   bodies, from a CUDA graph captured at the step's first iteration, bit for
   bit the eager result with fewer launches from the host. Steps whose rigid
   rows keep their padded storage replay the contact step's own graph across
-  steps instead. It needs CUDA and ``nsn_sparse_storage=True``.
+  steps instead. It needs CUDA, ``nsn_sparse_storage=True`` and a capped
+  ``nsn_linear_iterations`` of at most 25, whose iterations read nothing back,
+  and leaves eager the steps with length rows of particle constraints, whose
+  directions are set on the host.
 - The friction coefficient of a particle contact is its shape's ``mu``,
   ``model.particle_mu`` for self contacts, and the mean of the two shapes'
   ``mu`` for rigid contacts, or the larger of the two with

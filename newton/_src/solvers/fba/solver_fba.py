@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 
 def _element_lame(materials: wp.array | None, count: int) -> tuple[np.ndarray, np.ndarray]:
-    """First and second Lamé parameters [Pa] of each element, from its material row."""
+    """The Lamé parameters ``(mu, lambda)`` [Pa] of each element, from its material row."""
     if count == 0:
         return np.zeros(0), np.zeros(0)
     rows = materials.numpy().astype(np.float64)
@@ -128,12 +128,12 @@ class SolverFBA(TendonStateMixin, SolverBase):
     - ``"corotational"`` (corotational linear elasticity) solves in closed
       form on the singular values of ``F``, 2x2 for cloth and 3x3 with
       Sherman-Morrison for tetrahedra. It takes each element's ``k_mu`` and
-      ``k_lambda``, the first and second Lamé parameters [Pa].
+      ``k_lambda``, the shear modulus and the first Lamé parameter [Pa].
     - ``"neohookean"`` (Neo-Hookean hyperelasticity) runs L-BFGS with an
       Armijo cubic backtracking line search (memory 8, ``c_1 = 1e-4``,
       tolerance ``1e-6``, at most 50 iterations) on the singular values of
-      ``F``. It takes each element's ``k_mu`` and ``k_lambda``, the first and
-      second Lamé parameters [Pa].
+      ``F``. It takes each element's ``k_mu`` and ``k_lambda``, the shear
+      modulus and the first Lamé parameter [Pa].
 
     Corotational and Neo-Hookean take the true Lamé parameters. Projective
     dynamics drops the dual variable of the local projection, so its fixed
