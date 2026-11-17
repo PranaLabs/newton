@@ -1,0 +1,1 @@
+Validate more `SolverFBA` options: fractional iteration counts, unknown `particle_self_contact_mode` values and negative contact distances raise `ValueError` also when their feature is off, and options set without the feature they configure, such as `face_contact_gap` without `face_contacts`, warn.

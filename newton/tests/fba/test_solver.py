@@ -2159,6 +2159,123 @@ class TestDynamicPin(unittest.TestCase):
                 self.assertEqual(int((particles[:, 0] < 16).sum()), 0 if len(pinned) == 32 else 16)
 
 
+class TestStepContract(unittest.TestCase):
+    """SolverFBA.step follows SolverBase.step's contract: aliased states, the model's control, and invalid input."""
+
+    @classmethod
+    def setUpClass(cls):
+        wp.init()
+        cls.devices = ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else [])
+
+    @staticmethod
+    def _cloth_and_pendulum(device):
+        builder = newton.ModelBuilder()
+        builder.add_cloth_grid(
+            pos=wp.vec3(0.0, 0.0, 1.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=3,
+            dim_y=3,
+            cell_x=0.1,
+            cell_y=0.1,
+            mass=0.01,
+            tri_ke=1.0e3,
+            edge_ke=1.0e-2,
+        )
+        link = builder.add_link(
+            mass=1.0, inertia=wp.mat33(np.eye(3)), lock_inertia=True, xform=wp.transform((1.0, 0.0, 2.0))
+        )
+        joint = builder.add_joint_revolute(-1, link, axis=(0.0, 1.0, 0.0), child_xform=wp.transform((-1.0, 0.0, 0.0)))
+        builder.add_articulation([joint])
+        return builder.finalize(device=device)
+
+    def test_output_may_be_the_input(self):
+        """Step a falling cloth and a pendulum into their input state as into a separate one."""
+        for device in self.devices:
+            with self.subTest(device=device):
+                finals = []
+                for aliased in (False, True):
+                    model = self._cloth_and_pendulum(device)
+                    solver = SolverFBA(model, iterations=5)
+                    s0, s1 = model.state(), model.state()
+                    for _ in range(10):
+                        if aliased:
+                            solver.step(s0, s0, None, None, 0.01)
+                        else:
+                            solver.step(s0, s1, None, None, 0.01)
+                            s0, s1 = s1, s0
+                    finals.append([s0.particle_q.numpy(), s0.particle_qd.numpy(), s0.body_q.numpy()])
+                for a, b in zip(*finals, strict=True):
+                    np.testing.assert_array_equal(a, b)
+                self.assertLess(finals[1][1][:, 2].mean(), -0.5)  # the cloth falls
+
+    def test_control_none_takes_the_model_control(self):
+        """Grow the tetrahedra by the model's activations when the step has no control."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        builder.add_soft_grid(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=2,
+            dim_y=2,
+            dim_z=2,
+            cell_x=0.05,
+            cell_y=0.05,
+            cell_z=0.05,
+            density=100.0,
+            k_mu=1.0e4,
+            k_lambda=1.0e4,
+            k_damp=0.0,
+        )
+        model = builder.finalize(device="cpu")
+        rest = model.control()
+        rest.tet_activations.zero_()
+        model.tet_activations.fill_(0.3)
+        extents = []
+        for control in (None, model.control(), rest):
+            solver = SolverFBA(model, iterations=10, tet_activation_directions=np.zeros((model.tet_count, 3)))
+            s0, s1 = model.state(), model.state()
+            for _ in range(20):
+                solver.step(s0, s1, control, None, 0.01)
+                s0, s1 = s1, s0
+            q = s0.particle_q.numpy()
+            extents.append(q.max(axis=0) - q.min(axis=0))
+        np.testing.assert_array_equal(extents[0], extents[1])
+        self.assertGreater(np.abs(extents[0] - extents[2]).max(), 1.0e-3)
+
+    def test_invalid_step_and_options(self):
+        """Refuse a nonpositive or non-finite dt, a fractional iteration count and an unknown self-contact mode, and
+        warn about options whose features are off."""
+        model = self._cloth_and_pendulum("cpu")
+        solver = SolverFBA(model, iterations=2)
+        s0, s1 = model.state(), model.state()
+        for dt in (0.0, -0.01, float("nan"), float("inf")):
+            with self.subTest(dt=dt), self.assertRaises(ValueError):
+                solver.step(s0, s1, None, None, dt)
+        with self.assertRaises(ValueError):
+            SolverFBA(model, iterations=2.7)
+        with self.assertRaises(ValueError):
+            SolverFBA(model, particle_self_contact_mode="vertex_edge")
+        with self.assertRaises(ValueError):
+            SolverFBA(model, rod_contact_gap=-1.0)
+        with self.assertWarns(newton.exceptions.NewtonWarning):
+            SolverFBA(model, particle_self_contact_edge_edge=True)
+        with self.assertWarns(newton.exceptions.NewtonWarning):
+            SolverFBA(model, face_contact_gap=0.01)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
+    def test_refuses_graph_capture(self):
+        """Raise a clear error when a step is captured in a CUDA graph, and step normally afterwards."""
+        model = self._cloth_and_pendulum("cuda:0")
+        solver = SolverFBA(model, iterations=2)
+        s0, s1 = model.state(), model.state()
+        solver.step(s0, s1, None, None, 0.01)
+        with self.assertRaises(RuntimeError), wp.ScopedCapture(device="cuda:0"):
+            solver.step(s1, s0, None, None, 0.01)
+        solver.step(s1, s0, None, None, 0.01)
+        self.assertTrue(np.isfinite(s0.particle_q.numpy()).all())
+
+
 class TestTetHessianAssembly(unittest.TestCase):
     """Verify tet Hessian block assembly in build_pd_system."""
 

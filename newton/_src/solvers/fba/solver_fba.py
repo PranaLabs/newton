@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import copy as cp
 import functools
+import math
+import warnings
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Literal
@@ -12,6 +15,7 @@ import numpy as np
 import warp as wp
 
 from ...core.reset import reset_state_array
+from ...exceptions import NewtonWarning
 from ...geometry import ParticleFlags
 from ...sim import BodyFlags, Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
 from ..solver import SolverBase
@@ -654,8 +658,51 @@ class SolverFBA(TendonStateMixin, SolverBase):
 
         if pin_stiffness <= 0:
             raise ValueError("pin_stiffness must be positive")
-        if iterations < 1:
-            raise ValueError("iterations must be >= 1")
+        for name, value in (("iterations", iterations), ("nsn_linear_iterations", nsn_linear_iterations)):
+            if value is not None and (isinstance(value, bool) or int(value) != value or value < 1):
+                raise ValueError(f"{name} must be an integer >= 1, got {value!r}")
+        if particle_self_contact_mode not in ("vertex_face", "vertex_vertex"):
+            raise ValueError(
+                f"particle_self_contact_mode must be 'vertex_face' or 'vertex_vertex', got {particle_self_contact_mode!r}"
+            )
+        for name, value in (
+            ("particle_self_contact_margin", particle_self_contact_margin),
+            ("particle_self_contact_gap", particle_self_contact_gap),
+            ("particle_rest_shape_contact_exclusion_radius", particle_rest_shape_contact_exclusion_radius),
+            ("rod_contact_gap", rod_contact_gap),
+            ("rod_shape_contact_gap", rod_shape_contact_gap),
+        ):
+            if value is not None and not (np.isfinite(value) and value >= 0.0):
+                raise ValueError(f"{name} must be >= 0 and finite, got {value}")
+        # Options that take effect only with a feature that is off.
+        unused = [
+            ("particle_self_contact_edge_edge", particle_self_contact_edge_edge, particle_enable_self_contact),
+            ("particle_self_contact_gap", particle_self_contact_gap is not None, particle_enable_self_contact),
+            ("face_contact_gap", face_contact_gap is not None, face_contacts),
+            ("rod_contact_gap", rod_contact_gap is not None, rod_contact),
+            ("rod_shape_contact_gap", rod_shape_contact_gap is not None, rod_shape_contacts),
+            (
+                "rigid_contact_time",
+                rigid_contact_time > 0.0,
+                model.body_count > 0 and not integrate_with_external_rigid_solver,
+            ),
+            (
+                "rigid_iteration_graph",
+                rigid_iteration_graph,
+                wp.get_device(model.device).is_cuda and nsn_sparse_storage,
+            ),
+        ]
+        unused = [name for name, given, used in unused if given and not used]
+        if unused:
+            warnings.warn(
+                f"SolverFBA options {unused} have no effect without the features they configure (see their docs)",
+                NewtonWarning,
+                stacklevel=2,
+            )
+        if particle_enable_self_contact and particle_self_contact_margin == 0.0 and not particle_self_contact_gap:
+            warnings.warn(
+                "SolverFBA self contacts with a zero margin and gap find no contacts", NewtonWarning, stacklevel=2
+            )
 
         self.iterations = int(iterations)
         self.pin_stiffness = float(pin_stiffness)
@@ -748,7 +795,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
             ("face_contact_gap", 0.0 if face_contact_gap is None else face_contact_gap),
         ):
             if not (np.isfinite(value) and value >= 0.0):
-                raise ValueError(f"{name} must be finite and >= 0, got {value}")
+                raise ValueError(f"{name} must be >= 0 and finite, got {value}")
         self.contact_regularization = float(contact_regularization)
         self.face_contacts = bool(face_contacts)
         self.face_contact_edge_radius = float(face_contact_edge_radius)
@@ -920,6 +967,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
         # The pin targets, which follow the input state until set_pin_targets sets them.
         self._x_ref = wp.clone(model.particle_q)
         self._pin_targets_set = False
+        # Copies of the input positions and velocities for steps whose output state shares them.
+        self._alias_state = None
         self._x_inertia = wp.empty(N, dtype=wp.vec3, device=device)
         self._x_cur = wp.empty(N, dtype=wp.vec3, device=device)
         self._rhs = wp.empty(N, dtype=wp.vec3, device=device)
@@ -2789,24 +2838,60 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 external forces [N] and torques [N·m].
             state_out: Output simulation state. Particle positions and
                 velocities are written, and those of the bodies unless another
-                solver integrates them; other fields are untouched.
+                solver integrates them; other fields are untouched. It may be
+                ``state_in`` itself.
             control: The step's ``tet_activations``, which grow or shrink the
-                tetrahedra (see the class notes), or ``None`` to step without
-                activations.
+                tetrahedra (see the class notes), or ``None`` for the model's
+                (:meth:`~newton.Model.control`).
             contacts: The step's contacts, detected on ``state_in``, or ``None``
                 to step without them. With self contact on, the step still
                 finds its self contacts.
-            dt: Time step [s]. The first step and a change of ``dt`` factor the
-                system again.
+            dt: Time step [s], finite and positive. The first step and a change
+                of ``dt`` factor the system again.
             observables: Optional observables from :meth:`observables`; see the
                 class notes for :attr:`~newton.solvers.SolverBase.ObservableKind.CONTACT_F`.
         """
+        if not (math.isfinite(dt) and dt > 0.0):
+            raise ValueError(f"SolverFBA.step needs a finite positive dt, got {dt}")
+        if wp.get_device(self._device).is_capturing:
+            raise RuntimeError(
+                "SolverFBA.step cannot be captured in a graph: it reads its contact counts back to the host; it "
+                "captures and replays its own local-global iterations"
+            )
+        if control is None:
+            # As SolverBase specifies, a step without control takes the model's.
+            control = self.model.control(clone_variables=False)
+        state_in = self._unaliased_input(state_in, state_out)
         try:
             self._step(state_in, state_out, control, contacts, dt, observables)
         finally:
             # A split step that raises with rows of a world selection in place returns the solver's own.
             if self._swapped_rows is not None:
                 self._swap_rows(self._swapped_rows)
+
+    def _unaliased_input(self, state_in: State, state_out: State) -> State:
+        """``state_in``, or a copy of its positions and velocities when ``state_out`` shares them: the step reads the
+        step-start state after it starts writing ``state_out``."""
+        names = ("particle_q", "particle_qd", "body_q", "body_qd")
+        shared = [
+            n
+            for n in names
+            if getattr(state_in, n, None) is not None
+            and getattr(state_out, n, None) is not None
+            and getattr(state_in, n).size
+            and getattr(state_in, n).ptr == getattr(state_out, n).ptr
+        ]
+        if not shared:
+            return state_in
+        copy = self._alias_state
+        if copy is None or copy[0] != shared:
+            copy = (shared, {n: wp.empty_like(getattr(state_in, n)) for n in shared})
+            self._alias_state = copy
+        state = cp.copy(state_in)
+        for n, a in copy[1].items():
+            wp.copy(a, getattr(state_in, n))
+            setattr(state, n, a)
+        return state
 
     def _step(
         self,

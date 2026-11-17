@@ -1,0 +1,1 @@
+Fix `SolverFBA.step(state, state, ...)`, which zeroed the particle velocities and retracted the bodies from overwritten poses, and `control=None`, which stepped without the model's `tet_activations`; a step raises a clear `RuntimeError` when called during a graph capture, and a `ValueError` for a non-finite or nonpositive `dt`.
