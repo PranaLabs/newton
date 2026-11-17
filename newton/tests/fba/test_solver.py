@@ -1974,6 +1974,144 @@ class TestDynamicPin(unittest.TestCase):
         np.testing.assert_array_equal(q[24], moved)
         np.testing.assert_array_equal(s0.particle_qd.numpy()[top], 0.0)
 
+    def test_pins_follow_the_input_state(self):
+        """Hold pinned particles where the input state has them, so that writing the state moves them, until
+        set_pin_targets sets their targets, and again after set_pin_targets(None); a pin ends each step at its target
+        and reports its motion over the step as its velocity."""
+        for device in ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else []):
+            with self.subTest(device=device):
+                builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+                builder.add_cloth_grid(
+                    pos=wp.vec3(0.0, 1.0, 0.0),
+                    rot=wp.quat_identity(),
+                    vel=wp.vec3(0.0),
+                    dim_x=4,
+                    dim_y=4,
+                    cell_x=0.1,
+                    cell_y=0.1,
+                    mass=0.01,
+                    tri_ke=5000.0,
+                    edge_ke=0.1,
+                    fix_left=True,
+                )
+                model = builder.finalize(device=device)
+                pins = np.flatnonzero(model.particle_inv_mass.numpy() == 0.0)
+                solver = SolverFBA(model, iterations=5)
+                s0, s1 = model.state(), model.state()
+                dt = 1.0 / 60.0
+                # A start state shifted from the model keeps its pins where it has them.
+                q = s0.particle_q.numpy()
+                q[:, 0] += 0.5
+                s0.particle_q.assign(q)
+                solver.step(s0, s1, None, None, dt)
+                np.testing.assert_array_equal(s1.particle_q.numpy()[pins], q[pins])
+                s0, s1 = s1, s0
+                # Writing the state moves them, 1 cm per step.
+                for _ in range(5):
+                    q = s0.particle_q.numpy()
+                    q[pins, 2] += 0.01
+                    s0.particle_q.assign(q)
+                    solver.step(s0, s1, None, None, dt)
+                    np.testing.assert_array_equal(s1.particle_q.numpy()[pins], q[pins])
+                    s0, s1 = s1, s0
+                # Set targets move them within each step, at the velocity of their motion.
+                start = s0.particle_q.numpy()
+                target = start.copy()
+                target[pins, 1] += 0.02
+                solver.set_pin_targets(target)
+                solver.step(s0, s1, None, None, dt)
+                np.testing.assert_array_equal(s1.particle_q.numpy()[pins], target[pins])
+                expected = (target[pins] - start[pins]) / dt
+                np.testing.assert_allclose(s1.particle_qd.numpy()[pins], expected, rtol=1e-4, atol=1e-4)
+                s0, s1 = s1, s0
+                # Writing the state no longer moves them, until the targets are released.
+                q = s0.particle_q.numpy()
+                q[pins, 2] += 0.01
+                s0.particle_q.assign(q)
+                solver.step(s0, s1, None, None, dt)
+                np.testing.assert_array_equal(s1.particle_q.numpy()[pins], target[pins])
+                s0, s1 = s1, s0
+                solver.set_pin_targets(None)
+                q = s0.particle_q.numpy()
+                q[pins, 2] += 0.01
+                s0.particle_q.assign(q)
+                solver.step(s0, s1, None, None, dt)
+                np.testing.assert_array_equal(s1.particle_q.numpy()[pins], q[pins])
+
+    def test_contacts_of_pins_carry_no_force(self):
+        """Keep a pinned particle within a box's contact distance at its target: its contact is dropped, so that the
+        lite operator stays finite and the full one does not press it off; with the full operator, the free particles
+        rest on the box (the lite one lets the pull of the pin press them in)."""
+        for device in ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else []):
+            for mode in ("lite", "full"):
+                with self.subTest(device=device, mode=mode):
+                    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+                    builder.add_shape_box(
+                        -1, xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()), hx=0.3, hy=0.3, hz=0.05
+                    )
+                    radius = 0.004
+                    builder.add_cloth_grid(
+                        pos=wp.vec3(-0.01, -0.01, radius - 0.002),
+                        rot=wp.quat_identity(),
+                        vel=wp.vec3(0.0),
+                        dim_x=2,
+                        dim_y=2,
+                        cell_x=0.01,
+                        cell_y=0.01,
+                        mass=0.01,
+                        tri_ke=5000.0,
+                        tri_ka=1.0e4,
+                        edge_ke=1.0e-4,
+                        particle_radius=radius,
+                    )
+                    builder.particle_mass[0] = 0.0
+                    model = builder.finalize(device=device)
+                    solver = SolverFBA(model, iterations=10, nsn_schur_mode=mode)
+                    pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.004)
+                    contacts = pipeline.contacts()
+                    s0, s1 = model.state(), model.state()
+                    target = s0.particle_q.numpy()[0].copy()
+                    for _ in range(10):
+                        pipeline.collide(s0, contacts)
+                        solver.step(s0, s1, None, contacts, 1.0 / 60.0)
+                        s0, s1 = s1, s0
+                    q = s0.particle_q.numpy()
+                    self.assertTrue(np.isfinite(q).all())
+                    np.testing.assert_array_equal(q[0], target)
+                    if mode == "full":
+                        self.assertTrue((np.abs(q[1:, 2] - radius) < 1.0e-3).all(), q[:, 2])
+
+    def test_self_contacts_between_pins_are_not_found(self):
+        """Find no self contact between two pinned layers, and find those of a free layer on a pinned one."""
+        builder = newton.ModelBuilder()
+        for z in (0.0, 0.003):
+            builder.add_cloth_grid(
+                pos=wp.vec3(0.0, 0.0, z),
+                rot=wp.quat_identity(),
+                vel=wp.vec3(0.0),
+                dim_x=3,
+                dim_y=3,
+                cell_x=0.01,
+                cell_y=0.01,
+                mass=0.01,
+                tri_ke=1.0e3,
+                particle_radius=0.0,
+            )
+        model = builder.finalize(device="cpu")
+        lower, upper = np.arange(16), np.arange(16, 32)
+        for pinned, expected in ((np.r_[lower, upper], 0), (lower, 16)):
+            with self.subTest(pinned=len(pinned)):
+                mass = model.particle_inv_mass.numpy()
+                mass[:] = 1.0
+                mass[pinned] = 0.0
+                model.particle_inv_mass.assign(mass)
+                solver = SolverFBA(model, particle_enable_self_contact=True, particle_self_contact_margin=0.005)
+                s0, s1 = model.state(), model.state()
+                solver.step(s0, s1, None, None, 1.0e-4)
+                particles, _, _ = solver._self_contact.detect(model.particle_q)
+                self.assertEqual(int((particles[:, 0] >= 16).sum()), expected)
+                self.assertEqual(int((particles[:, 0] < 16).sum()), 0 if len(pinned) == 32 else 16)
+
 
 class TestTetHessianAssembly(unittest.TestCase):
     """Verify tet Hessian block assembly in build_pd_system."""

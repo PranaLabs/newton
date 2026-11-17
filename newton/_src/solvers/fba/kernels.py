@@ -218,16 +218,12 @@ def copy_particles_kernel(
 def write_velocity_kernel(
     x_prev: wp.array[wp.vec3],
     x_new: wp.array[wp.vec3],
-    inv_mass: wp.array[wp.float32],
     dt: float,
     v_new: wp.array[wp.vec3],
 ):
-    """v_new = (x_new - x_prev) / dt for free particles; zero for pins."""
+    """``v_new = (x_new - x_prev) / dt``, also for held particles, which move with their targets."""
     tid = wp.tid()
-    if inv_mass[tid] == 0.0:
-        v_new[tid] = wp.vec3(0.0, 0.0, 0.0)
-    else:
-        v_new[tid] = (x_new[tid] - x_prev[tid]) / dt
+    v_new[tid] = (x_new[tid] - x_prev[tid]) / dt
 
 
 @wp.func
@@ -3065,13 +3061,21 @@ def soft_contact_keys_kernel(
     particle: wp.array[wp.int32],
     shape: wp.array[wp.int32],
     shape_count: int,
+    pinned: wp.array[wp.int32],  # 1 for each particle the solver holds, or empty
     # outputs
     keys: wp.array[wp.int64],
     values: wp.array[wp.int32],
+    held_count: wp.array[wp.int32],
 ):
-    """Keys that sort the particle-shape contacts by particle and then shape, and their indices."""
+    """Keys that sort the particle-shape contacts by particle and then shape, and their indices; the contacts of
+    held particles sort last, and ``held_count`` counts them."""
     i = wp.tid()
-    keys[i] = wp.int64(particle[i]) * wp.int64(shape_count) + wp.int64(shape[i])
+    p = particle[i]
+    keys[i] = wp.int64(p) * wp.int64(shape_count) + wp.int64(shape[i])
+    if pinned.shape[0] > 0:
+        if pinned[p] != 0:
+            keys[i] = wp.int64(9223372036854775807)
+            wp.atomic_add(held_count, 0, 1)
     values[i] = i
 
 

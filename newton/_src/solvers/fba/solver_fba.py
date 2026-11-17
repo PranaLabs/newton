@@ -912,7 +912,9 @@ class SolverFBA(TendonStateMixin, SolverBase):
             from .warm_start import ContactWarmStart  # noqa: PLC0415
 
             self._warm_start = ContactWarmStart(device)
-        self._x_ref = wp.clone(model.particle_q)  # the pin targets, which start at the model positions
+        # The pin targets, which follow the input state until set_pin_targets sets them.
+        self._x_ref = wp.clone(model.particle_q)
+        self._pin_targets_set = False
         self._x_inertia = wp.empty(N, dtype=wp.vec3, device=device)
         self._x_cur = wp.empty(N, dtype=wp.vec3, device=device)
         self._rhs = wp.empty(N, dtype=wp.vec3, device=device)
@@ -949,7 +951,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
         self._edge_quad_q_d = None
         self._edge_weight_d = None
         self._edge_norm_d = None
-        self._pin_indices_d = self._inactive_d = None
+        self._pin_indices_d = self._inactive_d = self._zero_mass_d = None
+        self._pinned_h = self._pinned_d = None
         # Springs, ADMM stretch elements (filled by _setup_pd_system): their particles, rest lengths, stiffnesses and
         # penalties, their duals, splits and last directions kept across steps, and the flag of a step's first local
         # step.
@@ -2537,8 +2540,19 @@ class SolverFBA(TendonStateMixin, SolverBase):
         self._mass_d = wp.array(mass.astype(np.float32), dtype=wp.float32, device=device)
         self._inv_mass_d = wp.array(inv_mass.astype(np.float32), dtype=wp.float32, device=device)
         inactive = (self.model.particle_flags.numpy() & int(ParticleFlags.ACTIVE)) == 0
-        inactive = np.flatnonzero(inactive & (self.model.particle_inv_mass.numpy() > 0.0))
+        zero_mass = self.model.particle_inv_mass.numpy() == 0.0
+        # The particles the solver holds: the pinned ones, which keep their pin targets, and the inactive ones.
+        held = inactive | zero_mass
+        self._pinned_h = held if held.any() else None
+        self._pinned_d = wp.array(held.astype(np.int32), dtype=wp.int32, device=device) if held.any() else None
+        inactive = np.flatnonzero(inactive & ~zero_mass)
         self._inactive_d = wp.array(inactive.astype(np.int32), dtype=wp.int32, device=device) if inactive.size else None
+        zero_mass = np.flatnonzero(zero_mass)
+        self._zero_mass_d = (
+            wp.array(zero_mass.astype(np.int32), dtype=wp.int32, device=device) if zero_mass.size else None
+        )
+        if self._self_contact is not None:
+            self._self_contact.set_pinned(self._pinned_d)
         # The lite NSN kernels and the dense lite Schur build read the inverse masses; convert them once here
         # rather than in every step. Mass-proportional damping adds alpha m / dt to the mass term
         # m / dt^2 of A, which the lite operator inverts.
@@ -2935,9 +2949,13 @@ class SolverFBA(TendonStateMixin, SolverBase):
         if mixed is not None:
             n_b = self._begin_mixed_rows()
 
-        if self._inactive_d is not None:
-            inputs = [self._inactive_d, state_in.particle_q]
-            wp.launch(copy_particles_kernel, self._inactive_d.shape[0], inputs, [self._x_ref], device=device)
+        # Inactive particles hold where the input state has them, and pinned ones too until the caller sets their
+        # targets, as Newton's integrators hold the particles they do not move.
+        followed = [self._inactive_d] + ([self._zero_mass_d] if not self._pin_targets_set else [])
+        for particles in followed:
+            if particles is not None:
+                inputs = [particles, state_in.particle_q]
+                wp.launch(copy_particles_kernel, particles.shape[0], inputs, [self._x_ref], device=device)
 
         # 1) Compute inertial prediction x_inertia.
         wp.launch(
@@ -3299,15 +3317,16 @@ class SolverFBA(TendonStateMixin, SolverBase):
         if self.friction_anchors:
             self._update_friction_anchors()
 
-        # 3) Write velocity and update state_out.
-        if self._inactive_d is not None:
-            inputs = [self._inactive_d, state_in.particle_q]
-            wp.launch(copy_particles_kernel, self._inactive_d.shape[0], inputs, [self._x_cur], device=device)
+        # 3) Write velocity and update state_out. The held particles end the step exactly at their targets, which
+        # their pin springs reach to within their force over the pin stiffness.
+        if self._pin_indices_d is not None:
+            inputs = [self._pin_indices_d, self._x_ref]
+            wp.launch(copy_particles_kernel, self._pin_indices_d.shape[0], inputs, [self._x_cur], device=device)
         wp.copy(state_out.particle_q, self._x_cur)
         wp.launch(
             write_velocity_kernel,
             dim=N,
-            inputs=[state_in.particle_q, self._x_cur, self._inv_mass_d, dt],
+            inputs=[state_in.particle_q, self._x_cur, dt],
             outputs=[state_out.particle_qd],
             device=device,
         )
@@ -3762,23 +3781,29 @@ class SolverFBA(TendonStateMixin, SolverBase):
             )
         return particles
 
-    def set_pin_targets(self, target_positions: wp.array | np.ndarray) -> None:
-        """Update reference positions for pinned particles (dynamic pin).
+    def set_pin_targets(self, target_positions: wp.array | np.ndarray | None) -> None:
+        """Set the targets of the pinned particles (``particle_inv_mass == 0``) for the following steps.
 
-        For pinned particles (``inv_mass == 0``), the soft Pin energy pulls them
-        toward ``target_positions[i]``; they start at their model positions.
-        Inactive particles with mass hold where the input state has them
-        instead. For free particles the value is unused but the array must
-        cover all particles.
+        Until it is called, a pinned particle holds where the input state of each step has it, as Newton's other
+        solvers hold the particles they do not move, so writing ``state.particle_q`` moves it. Afterwards the pin
+        energy pulls it to ``target_positions[i]`` within each step, which it ends at, and its velocity is its
+        motion over the step; the targets persist across :meth:`reset`. Inactive particles with mass always hold
+        where the input state has them. For free particles the value is unused but the array must cover all
+        particles.
 
         Args:
             target_positions: Target positions [m], shape ``[particle_count, 3]``:
-                a :class:`warp.array` of ``wp.vec3`` or a NumPy array.
+                a :class:`warp.array` of ``wp.vec3`` or a NumPy array, or ``None`` to have the pinned particles
+                follow the input states again.
         """
+        if target_positions is None:
+            self._pin_targets_set = False
+            return
         if isinstance(target_positions, wp.array):
             self._x_ref.assign(target_positions)
         else:
             self._x_ref.assign(np.asarray(target_positions, dtype=np.float32))
+        self._pin_targets_set = True
 
     def set_particle_self_contact(self, *, margin: float | ArrayLike, gap: float | ArrayLike | None = None) -> None:
         """Change the self-contact distance and detection gap for the following steps.
@@ -4912,6 +4937,21 @@ class SolverFBA(TendonStateMixin, SolverBase):
                     extra = [np.pad(extra[0], pad, constant_values=-1), np.pad(extra[1], pad)]
                 extra = [np.concatenate([extra[0], sp[:, 1:]]), np.concatenate([extra[1], sa[:, 1:]])]
                 M = len(particle_h)
+            # A row on held particles alone, such as a particle contact of a pinned particle, cannot move them: its
+            # Delassus entry is zero for the lite operator and the inverse pin stiffness for the full one, so its
+            # multiplier would grow until it moved a pinned particle off its target. Such rows are dropped.
+            if M and self._pinned_h is not None:
+                keep = (alpha_h != 0.0) & ~self._pinned_h[particle_h]
+                if extra is not None:
+                    free = (extra[0] >= 0) & (extra[1] != 0.0) & ~self._pinned_h[np.maximum(extra[0], 0)]
+                    keep |= free.any(axis=1)
+                if not keep.all():
+                    shape_contacts = int(keep[:shape_contacts].sum())
+                    particle_h, alpha_h, shape_h = particle_h[keep], alpha_h[keep], shape_h[keep]
+                    body_pos_h, normal_h, record_h = body_pos_h[keep], normal_h[keep], record_h[keep]
+                    if extra is not None:
+                        extra = [extra[0][keep], extra[1][keep]]
+                    M = len(particle_h)
         self._contact_extra_h = None
         if extra is not None:
             self._contact_extra = [wp.array(a, device=self._device) for a in extra]
@@ -5124,9 +5164,14 @@ class SolverFBA(TendonStateMixin, SolverBase):
         Ms = min(M_raw, contacts.soft_contact_particle.shape[0])
         keys = wp.empty(2 * Ms, dtype=wp.int64, device=device)
         order = wp.empty(2 * Ms, dtype=wp.int32, device=device)
-        inputs = [contacts.soft_contact_particle, contacts.soft_contact_shape, self.model.shape_count]
-        wp.launch(soft_contact_keys_kernel, Ms, inputs, [keys, order], device=device)
+        pinned = self._pinned_d if self._pinned_d is not None else wp.empty(0, dtype=wp.int32, device=device)
+        held = wp.zeros(1, dtype=wp.int32, device=device)
+        inputs = [contacts.soft_contact_particle, contacts.soft_contact_shape, self.model.shape_count, pinned]
+        wp.launch(soft_contact_keys_kernel, Ms, inputs, [keys, order, held], device=device)
         wp.utils.radix_sort_pairs(keys, order, Ms)
+        # The contacts of held particles, sorted last, are dropped: the host path explains why.
+        if self._pinned_d is not None:
+            Ms -= int(held.numpy()[0])
         M = Ms + sc.find((state if state is not None else self.model).particle_q)
         self._ensure_contact_buffers(M)
         extra = [wp.empty((M, 3), dtype=t, device=device) for t in (wp.int32, wp.float32)]

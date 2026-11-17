@@ -37,6 +37,14 @@ def _in_ring(ring_offsets: wp.array[wp.int32], ring: wp.array[wp.int32], v: wp.i
     return False
 
 
+@wp.func
+def _held(pinned: wp.array[wp.int32], p: wp.int32) -> bool:
+    """Whether the solver holds particle ``p``: ``pinned`` marks the held particles, or is empty."""
+    if pinned.shape[0] == 0:
+        return False
+    return pinned[p] != 0
+
+
 @wp.kernel
 def traversal_rank_kernel(bvh: wp.uint64, rank: wp.array[wp.int32]):
     """The place of each item in a query of the whole of ``bvh``. A query box only prunes the traversal, so these
@@ -123,6 +131,7 @@ def vertex_face_contacts_kernel(
     rest_radius: float,
     query_radius: float,
     world_radii: wp.array[wp.float32],
+    pinned: wp.array[wp.int32],
     groups: wp.array[wp.int32],
     group_margins: wp.array[wp.float32],
     margin: float,
@@ -137,7 +146,7 @@ def vertex_face_contacts_kernel(
 ):
     """The nearest triangle of each particle within ``query_radius``, outside its rings and ``rest_radius`` from it
     at rest, the first of equals among its candidates, or of least ``traversal_rank`` where given, in the particle's
-    slot; ``found`` marks the particles that have one. The threads of a block, ``_LANES`` on CUDA and one on the CPU, take the candidates
+    slot; ``found`` marks the particles that have one. A held particle skips the triangles of held particles alone. The threads of a block, ``_LANES`` on CUDA and one on the CPU, take the candidates
     of one particle in turn, and test the rings and rest distance of only those nearer than their nearest yet.
 
     With ``has_groups``, a particle and a triangle of two groups keep ``margin`` apart, and of one group the group's
@@ -159,6 +168,8 @@ def vertex_face_contacts_kernel(
         a = tri_indices[t, 0]
         b = tri_indices[t, 1]
         c = tri_indices[t, 2]
+        if _held(pinned, v) and _held(pinned, a) and _held(pinned, b) and _held(pinned, c):
+            continue
         point, bary, _feature = triangle_closest_point(q[a], q[b], q[c], p)
         d = wp.length(p - point)
         key = d
@@ -246,13 +257,14 @@ def vertex_vertex_contacts_kernel(
     rest_radius: float,
     query_radius: float,
     world_radii: wp.array[wp.float32],
+    pinned: wp.array[wp.int32],
     count: wp.array[wp.int32],
     particles: wp.array2d[wp.int32],
     alpha: wp.array2d[wp.float32],
     normal: wp.array[wp.vec3],
 ):
     """Each pair of particles within ``query_radius``, outside each other's rings and ``rest_radius`` apart at rest,
-    once."""
+    and not both held, once."""
     a = wp.tid()
     query_radius = world_value(world[a], world_radii, query_radius)
     p = q[a]
@@ -262,6 +274,8 @@ def vertex_vertex_contacts_kernel(
         if world[a] >= 0 and world[b] >= 0 and world[a] != world[b]:
             continue
         if b <= a or _in_ring(ring_offsets, ring, a, b) or wp.length(rest[a] - rest[b]) < rest_radius:
+            continue
+        if _held(pinned, a) and _held(pinned, b):
             continue
         d = wp.length(p - q[b])
         if d >= query_radius or d < 1.0e-6 * query_radius:
@@ -309,6 +323,7 @@ def edge_edge_contacts_kernel(
     rest_radius: float,
     query_radius: float,
     world_radii: wp.array[wp.float32],
+    pinned: wp.array[wp.int32],
     nearest_distance: wp.array[float],
     nearer: float,
     count: wp.array[wp.int32],
@@ -319,7 +334,7 @@ def edge_edge_contacts_kernel(
 ):
     """Each pair of edges within ``query_radius`` whose closest points lie inside both edges, nearer than ``nearer``
     times the nearest triangles of their particles, with no particles within each other's rings and ``rest_radius``
-    apart at rest, once: a contact on their four particles with the weights of the two closest points, keyed by the
+    apart at rest, and not all four held, once: a contact on their four particles with the weights of the two closest points, keyed by the
     pair. Closest points at a particle are the vertex-face contacts'."""
     ea = wp.tid()
     a0 = edges[ea][0]
@@ -343,6 +358,8 @@ def edge_edge_contacts_kernel(
         b0 = edges[eb][0]
         b1 = edges[eb][1]
         if world[a0] >= 0 and world[b0] >= 0 and world[a0] != world[b0]:
+            continue
+        if _held(pinned, a0) and _held(pinned, a1) and _held(pinned, b0) and _held(pinned, b1):
             continue
         pb0 = q[b0]
         pb1 = q[b1]
@@ -487,6 +504,7 @@ class SelfContact:
         self.world_margins = wp.empty(0, dtype=wp.float32, device=self.device)
         self.world_radii = wp.empty(0, dtype=wp.float32, device=self.device)
         self._world_margins_h = None
+        self.pinned = wp.empty(0, dtype=wp.int32, device=self.device)
         # Several worlds of local particles search their own world's trees, while the particles keep their worlds.
         self._world_h = self.world.numpy()
         grouped = mode == "vertex_face" and model.world_count > 1 and model.tri_count > 0
@@ -638,7 +656,7 @@ class SelfContact:
                 self.rest,
                 self.rest_radius,
             ]
-            inputs += [self.query_radius, self.world_radii, self.nearest_distance, self.edge_edge_ratio]
+            inputs += [self.query_radius, self.world_radii, self.pinned, self.nearest_distance, self.edge_edge_ratio]
             outputs = [self.edge_contact_count, self.edge_keys, self.edge_particles, self.edge_alpha, self.edge_normal]
             wp.launch(edge_edge_contacts_kernel, n_edges, inputs, outputs, device=self.device)
             n = int(self.edge_contact_count.numpy()[0])
@@ -660,6 +678,11 @@ class SelfContact:
         outputs = [self.found_particles, self.found_alpha, self.found_normal]
         wp.launch(gather_edge_contacts_kernel, n, inputs, outputs, device=self.device)
         return n
+
+    def set_pinned(self, pinned: wp.array | None) -> None:
+        """Mark the particles that the solver holds, one int32 per particle, 1 for held, or ``None`` for none:
+        contacts between held particles alone are not found."""
+        self.pinned = wp.empty(0, dtype=wp.int32, device=self.device) if pinned is None else pinned
 
     def detect(self, q: wp.array) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Particles and coefficients, shape ``(C, 4)`` with particle ``-1`` in unused slots, and normals,
@@ -690,6 +713,7 @@ class SelfContact:
             self.count.zero_()
             outputs = [self.count, self.particles, self.alpha, self.normal]
             filters = [self.ring_offsets, self.ring, self.rest, self.rest_radius, self.query_radius, self.world_radii]
+            filters.append(self.pinned)
             if self.mode == "vertex_face":
                 found = [self.candidates, self.candidate_count]
                 inputs = [q, self.world, self.tri_indices, self.query_mask, self.bvh.id, self.roots, self.world_changed]

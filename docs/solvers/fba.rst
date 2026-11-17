@@ -285,10 +285,15 @@ Model Inputs
   so a released cloth flap falls as fast as without damping and a chain of
   springs swings on while its stretch waves die out.
 - **Pins**: particles with zero inverse mass follow their pin targets through
-  a stiff spring of ``pin_stiffness`` [N/m]. The targets start at the model
-  positions and move with :meth:`~newton.solvers.SolverFBA.set_pin_targets`.
-  Particles without the ``ACTIVE`` flag that have a mass hold where the input
-  state has them.
+  a stiff spring of ``pin_stiffness`` [N/m] and end each step at them, with
+  their motion over the step as their velocity. The targets are where the
+  input state has the particles, as the other solvers hold the particles they
+  do not move, so writing ``state.particle_q`` moves them, until
+  :meth:`~newton.solvers.SolverFBA.set_pin_targets` sets them. Particles
+  without the ``ACTIVE`` flag that have a mass hold where the input state has
+  them. Contacts on held particles alone, such as a pinned particle's contact
+  with a shape, are dropped: they cannot move the particles, and pressing on
+  a pin would only move it off its target.
 - **Particle constraints**:
   :meth:`~newton.solvers.SolverFBA.set_particle_constraints` holds lengths or
   linear combinations of particle positions at targets, solved with the
