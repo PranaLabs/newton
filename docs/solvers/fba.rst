@@ -317,8 +317,11 @@ Model Inputs
   it, ``q(a0, q0) q(a1, q1)``: it holds the angle between ``a0`` in the
   parent's joint frame and ``a1`` in the child's, as a universal joint does.
   Joints hold a dynamic body to a kinematic one where the kinematic body's
-  prescribed velocity ``body_qd`` takes it by the step's end. A body turns by
-  at most 0.5 rad per step. FBA does not write ``State.joint_q`` and
+  prescribed velocity ``body_qd`` takes it by the step's end. A step is
+  linearized about a frame turned by at most 0.5 rad, and a body turns by at
+  most 3 rad per step. The gyroscopic torque is integrated implicitly, so a
+  tumbling body loses a little energy rather than gaining it. FBA does not
+  write ``State.joint_q`` and
   ``State.joint_qd``: :func:`~newton.eval_ik` computes them from the bodies.
 - **Joint limits and damping**: the free axis of a REVOLUTE or PRISMATIC joint
   takes its limits, :attr:`~newton.Model.joint_limit_lower` and

@@ -91,12 +91,13 @@ class TestFBARigidKernels(unittest.TestCase):
         inertia = _f32(INERTIA)
         w = Rp.T @ body["w0"]
         chi = Rp.T @ (x0 + DT * body["v0"] + DT**2 * (GRAVITY + body["f"] / MASS))
-        rho = DT * w + DT**2 * np.linalg.solve(inertia, -np.cross(w, inertia @ w) + Rp.T @ body["tau"])
+        w_free = Rp.T @ R0.apply(_gyroscopic_step(inertia, w))
+        rho = DT * w_free + DT**2 * np.linalg.solve(inertia, Rp.T @ body["tau"])
         np.testing.assert_allclose(b.numpy(), self._rigid_matrix() @ np.concatenate([chi, rho]), rtol=1e-10)
 
     def test_free_step_pose_and_velocity(self):
-        """Retract a free rigid step to the pose and velocity of a semi-implicit step with explicit gyroscopic torque in
-        the pinned frame."""
+        """Retract a free rigid step to the pose and velocity of a semi-implicit step with an implicit gyroscopic step
+        in the pinned frame."""
         body = self._body()
         bodies, body_q, q_pin, x_prev, b = self._prepare(body)
         u = wp.array(np.linalg.solve(self._rigid_matrix(), b.numpy()), dtype=wp.float64, device=self.device)
@@ -116,7 +117,7 @@ class TestFBARigidKernels(unittest.TestCase):
             device=self.device,
         )
 
-        # Reference: semi-implicit step with explicit gyroscopic torque in the
+        # Reference: semi-implicit step with an implicit gyroscopic step in the
         # pinned frame, retracted from the step-start orientation.
         R0 = self.Rotation.from_quat(body["q0"])
         Rp = (self.Rotation.from_rotvec(body["w0"] * DT) * R0).as_matrix()
@@ -124,7 +125,8 @@ class TestFBARigidKernels(unittest.TestCase):
         w = Rp.T @ body["w0"]
         x0 = body["p0"] + R0.apply(body["com"])
         v = body["v0"] + DT * (GRAVITY + body["f"] / MASS)
-        omega = Rp @ (w + DT * np.linalg.solve(inertia, -np.cross(w, inertia @ w) + Rp.T @ body["tau"]))
+        w_free = Rp.T @ R0.apply(_gyroscopic_step(inertia, w))
+        omega = Rp @ (w_free + DT * np.linalg.solve(inertia, Rp.T @ body["tau"]))
         R_new = self.Rotation.from_rotvec(omega * DT) * R0
         origin = x0 + DT * v - R_new.apply(body["com"])
 
@@ -147,6 +149,18 @@ class TestFBARigidKernels(unittest.TestCase):
         body = self._body(w0=(1.0e-13, 0.0, 0.0))
         _, _, q_pin, _, _ = self._prepare(body)
         np.testing.assert_allclose(q_pin.numpy()[0], body["q0"] / np.linalg.norm(body["q0"]), rtol=0.0, atol=1e-15)
+
+
+def _gyroscopic_step(inertia, w):
+    """Body-frame angular velocity after one Newton step of the implicit gyroscopic update
+    ``I (w' - w) + dt w' x I w' = 0`` from ``w``."""
+
+    def skew(v):
+        return np.array([[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]])
+
+    iw = inertia @ w
+    jacobian = inertia + DT * (skew(w) @ inertia - skew(iw))
+    return w - np.linalg.solve(jacobian, DT * np.cross(w, iw))
 
 
 def _dense_jacobian(row_slot, row_jac, slot_count):
@@ -494,6 +508,24 @@ class TestSolverFBARigidStep(unittest.TestCase):
         L0, L = inertia @ w0, R @ inertia @ R.T @ w
         self.assertLess(np.linalg.norm(L - L0) / np.linalg.norm(L0), 5e-3)
         self.assertLess(abs(w @ R @ inertia @ R.T @ w / (w0 @ inertia @ w0) - 1.0), 5e-3)
+
+    def test_tumbling_keeps_its_energy_bounded(self):
+        """Keep the kinetic energy of a torque-free body tumbling about its unstable intermediate axis from growing
+        over 5 s: an explicit gyroscopic torque gains 80% at this step, the implicit step loses about 5%."""
+        inertia = np.diag([1.0, 2.0, 3.0])
+        w0 = np.array([0.05, 5.0, 0.05])
+        state = self._run(self._model(inertia, gravity=0.0), (0.0, 0.0, 0.0, *w0), 500)
+        R = self.Rotation.from_quat(state.body_q.numpy()[0, 3:]).as_matrix()
+        w = state.body_qd.numpy()[0, 3:].astype(np.float64)
+        ratio = (w @ R @ inertia @ R.T @ w) / (w0 @ inertia @ w0)
+        self.assertLessEqual(ratio, 1.0 + 1e-6)
+        self.assertGreater(ratio, 0.85)
+
+    def test_fast_spin_keeps_its_rate(self):
+        """Keep a free body spinning at 1 rad per step, which a step's linearization frame turns by 0.5 rad of."""
+        w0 = np.array([0.0, 0.0, 1.0 / DT])
+        state = self._run(self._model(np.eye(3) * 0.1, gravity=0.0), (0.0, 0.0, 0.0, *w0), 10)
+        np.testing.assert_allclose(state.body_qd.numpy()[0, 3:], w0, rtol=1e-5)
 
     def test_mass_change_refactors_the_rigid_system(self):
         """Fall freely after the body's mass and inertia double, once ``notify_model_changed`` reports them."""
