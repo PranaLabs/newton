@@ -455,8 +455,8 @@ def project_corotational_sigma3d_d(sigma: wp.vec3d, mu: wp.float64, lam: wp.floa
 
     Args:
         sigma: Singular values from ``wp.svd3(F)``, in descending order.
-        mu: First Lame parameter (shear modulus) [Pa].
-        lam: Second Lame parameter [Pa].
+        mu: Second Lamé parameter (shear modulus) [Pa].
+        lam: First Lamé parameter [Pa].
 
     Returns:
         Projected singular-value triple ``(s_proj_0, s_proj_1, s_proj_2)``.
@@ -511,7 +511,7 @@ def project_stretching_corotational_tet_kernel(
         tet_activation: Per-tet activation [dimensionless], shape ``[tet_count]``.
         tet_activation_direction: Per-tet growth direction in the rest frame, a zero vector to grow
             isotropically, shape ``[tet_count]``.
-        lame: First and second Lamé parameters of each element [Pa].
+        lame: Lamé parameters ``(mu, lambda)`` of each element [Pa].
         contributions: Output ``(tet_count, 4)`` per-local-vertex contribution.
     """
     t = wp.tid()
@@ -1463,7 +1463,7 @@ def project_stretching_corotational_kernel(
         tri_indices: Flat triangle indices, shape ``[3 * tri_count]``.
         tri_rest_inv: Per-triangle 2x2 rest-pose inverse (``Dm_inv``).
         tri_weight: Per-triangle stretching weight (``2 * k_mu * area``).
-        lame: First and second Lamé parameters of each element [Pa].
+        lame: Lamé parameters ``(mu, lambda)`` of each element [Pa].
         contributions: Output ``(tri_count, 3)`` per-local-vertex contribution.
     """
     t = wp.tid()
