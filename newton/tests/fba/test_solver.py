@@ -4088,18 +4088,6 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "SolverFBA does not support full-surface"):
             solver.step(s0, s1, None, contacts, 1.0 / 60.0)
 
-    def test_lambda_cap_default_is_none(self) -> None:
-        """Default ``lambda_cap`` to ``None``, no clamp."""
-        model = self._tiny_cloth_model()
-        solver = SolverFBA(model)
-        self.assertIsNone(solver.lambda_cap)
-
-    def test_lambda_cap_settable(self) -> None:
-        """Keep the ``lambda_cap`` the constructor is given."""
-        model = self._tiny_cloth_model()
-        solver = SolverFBA(model, lambda_cap=100.0)
-        self.assertEqual(solver.lambda_cap, 100.0)
-
 
 class TestContactForceObservable(unittest.TestCase):
     """CONTACT_F rows of a cloth resting on the ground."""

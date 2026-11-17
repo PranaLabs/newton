@@ -1,0 +1,1 @@
+Remove the `lambda_cap` option of `SolverFBA`, a clamp on the force of each contact row that only two cloth examples set, both of which pass their checks without it; with sparse storage it also left friction outside the capped normal force's cone.

@@ -250,7 +250,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
         stretching_model: Literal["arap", "corotational", "neohookean"] = "arap",
         friction: bool = True,
         friction_anchors: bool = False,
-        lambda_cap: float | None = None,
         shape_angular_velocity: dict[int, float] | None = None,
         shape_particle_radius_override: dict[int, float] | None = None,
         nsn_schur_mode: Literal["full", "lite"] = "full",
@@ -321,14 +320,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 bodies, face contacts, and the contacts of a step in which one
                 touches a body that FBA integrates keep the step's point.
                 Needs ``friction=True``.
-            lambda_cap: Optional clamp on the magnitude of each contact
-                row's multiplier, in force units [N]. The multipliers are
-                forces divided by ``dt²``, so the clamp is divided by ``dt²``
-                at each NSN solve, and the tangent multipliers are clamped
-                again into the cone of the capped normal one. A row applies
-                its multiplier weighted by its Fischer-Burmeister weight in
-                [0, 2], so its force can reach twice the cap. ``None``
-                disables clamping.
             shape_angular_velocity: Optional ``{shape_index: ω}`` mapping of
                 angular speeds [rad/s], right-handed about each listed shape's
                 local +Z axis (Newton's cylinder primitive axis). The surface
@@ -807,9 +798,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
         # nsn_lite_accumulate: the displacement of the contact forces applied so far, the contact-free iterate, and
         # the weighted multipliers with their lite motion, allocated at the first step that needs them.
         self._acc_d = self._acc_free = self._acc_omega_lam = self._acc_w = None
-        if lambda_cap is not None and not lambda_cap > 0.0:
-            raise ValueError(f"lambda_cap must be > 0 or None, got {lambda_cap}")
-        self.lambda_cap = lambda_cap
         self.integrate_with_external_rigid_solver = bool(integrate_with_external_rigid_solver)
         for name, value in (
             ("contact_regularization", contact_regularization),
@@ -3267,13 +3255,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
                         # (same convention as the dense path).
                         wp.copy(self._nsn_omega_d, self._omega_coulomb_persistent_d, count=3 * M + n_b)
                         wp.copy(self._nsn_lam_d, self._lam_coulomb_persistent_d, count=3 * M + n_b)
-                        # Lambda cap (folded into both per-contact and per-particle kernels).
-                        if self.lambda_cap is not None:
-                            cap_internal = float(self.lambda_cap) / (dt * dt)
-                            use_cap = 1
-                        else:
-                            cap_internal = 0.0
-                            use_cap = 0
                         # Dispatch: the per-particle kernel whenever any
                         # particle has more than 3 contact rows (i.e. >1
                         # frictional contact, since each contact owns 3 rows).
@@ -3287,8 +3268,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
                                 ls,
                                 M,
                                 dt,
-                                cap_internal,
-                                use_cap,
                                 self._nsn_r_d,
                                 self._nsn_pene0_d,
                                 self._nsn_lam_d,
@@ -3311,8 +3290,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
                                     self._nsn_pene0_d,
                                     ls._inv_mass_d,
                                     wp.float64(dt),
-                                    wp.float64(cap_internal),
-                                    wp.int32(use_cap),
                                     wp.int32(3 * M),
                                 ],
                                 outputs=[
@@ -3338,8 +3315,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
                                     self._nsn_pene0_d,
                                     ls._inv_mass_d,
                                     wp.float64(dt),
-                                    wp.float64(cap_internal),
-                                    wp.int32(use_cap),
                                 ],
                                 outputs=[
                                     self._nsn_lam_d,
@@ -4473,7 +4448,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
                     zeros=wp.zeros(len(rows), dtype=wp.float64, device=device),
                 )
 
-    def _launch_lite_worlds(self, ls, M, dt, cap_internal, use_cap, r, pene0, lam, omega, lam_apply) -> None:
+    def _launch_lite_worlds(self, ls, M, dt, r, pene0, lam, omega, lam_apply) -> None:
         """Advance the direct subsets once with their original single-world kernels."""
         from . import kernels as K  # noqa: PLC0415
 
@@ -4481,7 +4456,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         if direct is None:
             return
         outputs = [lam, omega, lam_apply]
-        tail = [ls._inv_mass_d, wp.float64(dt), wp.float64(cap_internal), int(use_cap)]
+        tail = [ls._inv_mass_d, wp.float64(dt)]
         if direct.particles.shape[0]:
             inputs = [direct.particles, ls._isodof_row_offsets_d, ls._isodof_row_indices_d]
             inputs += [ls._row_particle_d, ls._row_dir_d, ls._row_alpha_d, self._contact_mu_d, r, pene0]
@@ -5406,8 +5381,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
         omega_out_d: wp.array,
         lam_apply_out_d: wp.array,
         dt: float,
-        cap_internal: float,
-        use_cap: bool,
         W_bsr,
         n_bilateral: int = 0,
         held_d: wp.array | None = None,
@@ -5522,15 +5495,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
             device=device,
         )
 
-        # Capping a normal multiplier shrinks its friction cone: clamp the tangent multipliers after it.
-        if use_cap:
-            wp.launch(
-                K.lambda_cap_clip_kernel,
-                dim=3 * int(M_total),
-                inputs=[wp.float64(cap_internal)],
-                outputs=[lam_v],
-                device=device,
-            )
         wp.launch(
             K.coulomb_box_clamp_kernel,
             dim=int(M_total),
@@ -5556,9 +5520,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 [lam_out_d, omega_out_d],
                 device=device,
             )
-            self._launch_lite_worlds(
-                ls, M_total, dt, cap_internal, use_cap, r_d, pene0_d, lam_out_d, omega_out_d, lam_apply_out_d
-            )
+            self._launch_lite_worlds(ls, M_total, dt, r_d, pene0_d, lam_out_d, omega_out_d, lam_apply_out_d)
 
     def _ensure_lite_bsr_buffers(self, n_rows: int) -> None:
         """Size the PCR solver and the per-row scratch of the sparse lite NSN for ``n_rows`` rows, with headroom,
@@ -5630,8 +5592,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
             omega_out_d=self._nsn_omega_d,
             lam_apply_out_d=self._nsn_lam_apply_d,
             dt=dt,
-            cap_internal=0.0 if self.lambda_cap is None else float(self.lambda_cap) / (dt * dt),
-            use_cap=self.lambda_cap is not None,
             W_bsr=W_bsr,
             n_bilateral=n_b,
             held_d=held_d,
@@ -5818,8 +5778,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
             5. ``dλ = A_schur⁻¹·rhs`` via :class:`NSNPCRSolver`
             6. ``λ += dλ``
 
-        After the loop, applies the optional ``lambda_cap / dt²``
-        symmetric clip and returns ``lam_apply = dt²·ω·λ``.
+        After the loop, returns ``lam_apply = dt²·ω·λ``.
 
         Args:
             W: ``(M, M)`` Schur complement (host fp64). May be ``None`` when
@@ -6040,17 +5999,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 device=device,
             )
 
-        # Optional lambda_cap (in internal units = physical / dt²).
-        if self.lambda_cap is not None:
-            cap_internal = float(self.lambda_cap) / (dt * dt)
-            wp.launch(
-                K.lambda_cap_clip_kernel,
-                dim=M,
-                inputs=[wp.float64(cap_internal)],
-                outputs=[self._nsn_lam_d],
-                device=device,
-            )
-
         # lam_apply = dt² · ω · lam.
         wp.launch(
             K.compute_lam_apply_kernel,
@@ -6111,9 +6059,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
                     dst[n_rows:cap].zero_()
             args = (W_sparse, r_d, pene0_d, mu_d, M, n_rows, n_bilateral, dt, max_iters)
             self._nsn_coulomb_sparse_steps(*args, block_precond, regularization)
-            if self.lambda_cap is not None:
-                limit = wp.float64(float(self.lambda_cap) / (dt * dt))
-                wp.launch(K.lambda_cap_clip_kernel, 3 * M, inputs=[limit], outputs=[self._nsn_lam_d], device=device)
             inputs = [self._nsn_lam_d, self._nsn_omega_d, wp.float64(dt)]
             wp.launch(K.compute_lam_apply_kernel, n_rows, inputs=inputs, outputs=[self._nsn_lam_apply_d], device=device)
             if tail[0] is not None:
@@ -6373,7 +6318,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
             n_bilateral: Number of bilateral rows after the ``3M`` contact
                 rows; all row arrays then hold ``3M + n_bilateral`` rows.
                 They follow the identity law of :func:`bilateral_law_kernel`
-                and skip the cone clamp and ``lambda_cap``.
+                and skip the cone clamp.
             block_precond: Optional block preconditioner of the bilateral
                 rows, passed to :meth:`NSNPCRSolver.solve`.
             contact_regularization: Relative regularization ``gamma`` of the
@@ -6615,18 +6560,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
                     outputs=[self._nsn_lam_d],
                     device=device,
                 )
-
-        if self.lambda_cap is not None:
-            # Capping a normal multiplier shrinks its friction cone: clamp the tangent multipliers again after it.
-            cap_internal = float(self.lambda_cap) / (dt * dt)
-            wp.launch(
-                K.lambda_cap_clip_kernel,
-                dim=3 * M,
-                inputs=[wp.float64(cap_internal)],
-                outputs=[self._nsn_lam_d],
-                device=device,
-            )
-            wp.launch(K.coulomb_box_clamp_kernel, dim=M, inputs=[mu_d], outputs=[self._nsn_lam_d], device=device)
 
         wp.launch(
             K.compute_lam_apply_kernel,

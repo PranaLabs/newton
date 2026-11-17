@@ -7,7 +7,7 @@ Verifies that
 :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA._solve_nsn_unilateral_gpu`
 and :meth:`~newton._src.solvers.fba.solver_fba.SolverFBA._solve_nsn_coulomb_gpu`
 reproduce the corresponding CPU/numpy drivers, plus a handful of edge cases
-(lambda_cap, Coulomb box clamp, M=0).
+(Coulomb box clamp, M=0).
 
 Tolerance notes:
     The host reference solves ``A_schur · dlam = rhs`` with
@@ -56,7 +56,7 @@ def _make_coulomb_inputs(M: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.
     return W.astype(np.float64), r.astype(np.float64), pene0.astype(np.float64), mu.astype(np.float64)
 
 
-def _build_minimal_solver(friction: bool, lambda_cap: float | None = None, **solver_args) -> SolverFBA:
+def _build_minimal_solver(friction: bool, **solver_args) -> SolverFBA:
     """Construct a 2x2 cloth model so :class:`SolverFBA` initialises.
 
     The GPU NSN drivers operate purely on host-supplied ``W`` / ``r`` /
@@ -81,7 +81,7 @@ def _build_minimal_solver(friction: bool, lambda_cap: float | None = None, **sol
         edge_kd=0.0,
     )
     model = builder.finalize()
-    return SolverFBA(model, iterations=1, friction=friction, lambda_cap=lambda_cap, **solver_args)
+    return SolverFBA(model, iterations=1, friction=friction, **solver_args)
 
 
 class TestNSNUnilateralGpuDriver(unittest.TestCase):
@@ -99,9 +99,7 @@ class TestNSNUnilateralGpuDriver(unittest.TestCase):
         W, r, pene0 = _make_unilateral_inputs(M=1, seed=1)
         dt = 0.01
 
-        lam_cpu, omega_cpu, lam_apply_cpu = solve_nsn_unilateral(
-            W, r, pene0, max_iters=3, dt=dt, lambda_cap=solver.lambda_cap
-        )
+        lam_cpu, omega_cpu, lam_apply_cpu = solve_nsn_unilateral(W, r, pene0, max_iters=3, dt=dt)
         self.assertGreater(lam_cpu[0], 1.0)  # the contact pushes
         lam_gpu, omega_gpu, lam_apply_gpu = solver._solve_nsn_unilateral_gpu(W, r, pene0, max_iters=3, dt=dt)
 
@@ -116,9 +114,7 @@ class TestNSNUnilateralGpuDriver(unittest.TestCase):
         W, r, pene0 = _make_unilateral_inputs(M=50, seed=7)
         dt = 0.01
 
-        lam_cpu, omega_cpu, lam_apply_cpu = solve_nsn_unilateral(
-            W, r, pene0, max_iters=1, dt=dt, lambda_cap=solver.lambda_cap
-        )
+        lam_cpu, omega_cpu, lam_apply_cpu = solve_nsn_unilateral(W, r, pene0, max_iters=1, dt=dt)
         lam_gpu, omega_gpu, lam_apply_gpu = solver._solve_nsn_unilateral_gpu(W, r, pene0, max_iters=1, dt=dt)
 
         np.testing.assert_allclose(lam_gpu, lam_cpu, rtol=0, atol=1.0e-10)
@@ -131,7 +127,7 @@ class TestNSNUnilateralGpuDriver(unittest.TestCase):
         solver = _build_minimal_solver(friction=False)
         W, r, pene0 = _make_unilateral_inputs(M=50, seed=7)
         dt = 0.01
-        expected = solve_nsn_unilateral(W, r, pene0, max_iters=1, dt=dt, lambda_cap=solver.lambda_cap)
+        expected = solve_nsn_unilateral(W, r, pene0, max_iters=1, dt=dt)
         W_device = wp.array(W, dtype=wp.float64, device=solver._device)
         upload = None
         for path in ("device", "host", "device"):
@@ -190,7 +186,7 @@ class TestNSNUnilateralGpuDriver(unittest.TestCase):
         W, r, pene0 = _make_unilateral_inputs(M=1, seed=6)
         dt = 0.01
 
-        lam_cpu, omega_cpu, _ = solve_nsn_unilateral(W, r, pene0, max_iters=1, dt=dt, lambda_cap=solver.lambda_cap)
+        lam_cpu, omega_cpu, _ = solve_nsn_unilateral(W, r, pene0, max_iters=1, dt=dt)
         self.assertGreater(lam_cpu[0], 1.0)  # the contact pushes
         lam_gpu, omega_gpu, _ = solver._solve_nsn_unilateral_gpu(W, r, pene0, max_iters=1, dt=dt)
         np.testing.assert_allclose(lam_gpu, lam_cpu, rtol=0, atol=1.0e-8)
@@ -205,45 +201,12 @@ class TestNSNUnilateralGpuDriver(unittest.TestCase):
             lam_init=lam_cpu,
             omega_init=omega_cpu,
             dt=dt,
-            lambda_cap=solver.lambda_cap,
         )
         lam2_gpu, omega2_gpu, _ = solver._solve_nsn_unilateral_gpu(
             W, r, pene0, max_iters=1, lam_init=lam_gpu, omega_init=omega_gpu, dt=dt
         )
         np.testing.assert_allclose(lam2_gpu, lam2_cpu, rtol=0, atol=1.0e-8)
         np.testing.assert_allclose(omega2_gpu, omega2_cpu, rtol=0, atol=1.0e-8)
-
-    def test_lambda_cap_internal_dt2_gpu(self):
-        """Divide ``lambda_cap`` [N] by ``dt²`` before the symmetric clip on the device, as the host reference does.
-
-        One contact makes PCR exact, so only the clip could make the device and the host differ. The seed makes the
-        unconstrained multiplier large enough for the cap to engage.
-        """
-        lambda_cap = 1.0e-4  # cap_internal = 1.0
-        solver = _build_minimal_solver(friction=False, lambda_cap=lambda_cap)
-        # Use a problem where r > 0 (penetration) so the FB-Newton step
-        # produces a non-zero lambda. ``seed=11`` gives unclipped |lam| ~ 9.
-        rng = np.random.default_rng(11)
-        M = 1
-        aux = rng.standard_normal((M, M))
-        W = (aux @ aux.T) / float(M) + np.eye(M)
-        r = np.abs(rng.standard_normal(M)) * 1.0e-3  # positive penetration
-        pene0 = rng.standard_normal(M) * 1.0e-3
-        dt = 0.01
-
-        lam_cpu, omega_cpu, lam_apply_cpu = solve_nsn_unilateral(
-            W, r, pene0, max_iters=2, dt=dt, lambda_cap=solver.lambda_cap
-        )
-        lam_gpu, omega_gpu, lam_apply_gpu = solver._solve_nsn_unilateral_gpu(W, r, pene0, max_iters=2, dt=dt)
-
-        cap_internal = lambda_cap / (dt * dt)
-        # Cap engaged: max(|lam|) saturates at cap_internal.
-        self.assertLessEqual(np.max(np.abs(lam_gpu)), cap_internal + 1.0e-9)
-        self.assertAlmostEqual(np.max(np.abs(lam_gpu)), cap_internal, delta=1.0e-9)
-        # And matches CPU at fp64 noise (M=1: PCR exact in 1 iter).
-        np.testing.assert_allclose(lam_gpu, lam_cpu, rtol=0, atol=1.0e-8)
-        np.testing.assert_allclose(omega_gpu, omega_cpu, rtol=0, atol=1.0e-8)
-        np.testing.assert_allclose(lam_apply_gpu, lam_apply_cpu, rtol=0, atol=1.0e-8)
 
     def test_gpu_path_unilateral_no_contacts(self):
         """Return three empty fp64 arrays from the unilateral driver for ``M=0``."""
@@ -272,9 +235,7 @@ class TestNSNCoulombGpuDriver(unittest.TestCase):
         W, r, pene0, mu = _make_coulomb_inputs(M=3, seed=11)
         dt = 0.01
 
-        lam_cpu, omega_cpu, lam_apply_cpu = solve_nsn_coulomb(
-            W, r, mu, pene0, max_iters=1, dt=dt, lambda_cap=solver.lambda_cap
-        )
+        lam_cpu, omega_cpu, lam_apply_cpu = solve_nsn_coulomb(W, r, mu, pene0, max_iters=1, dt=dt)
         lam_gpu, omega_gpu, lam_apply_gpu = solver._solve_nsn_coulomb_gpu(W, r, mu, pene0, max_iters=1, dt=dt)
 
         np.testing.assert_allclose(lam_gpu, lam_cpu, rtol=0, atol=1.0e-10)
@@ -287,9 +248,7 @@ class TestNSNCoulombGpuDriver(unittest.TestCase):
         W, r, pene0, mu = _make_coulomb_inputs(M=20, seed=11)
         dt = 0.01
 
-        lam_cpu, omega_cpu, lam_apply_cpu = solve_nsn_coulomb(
-            W, r, mu, pene0, max_iters=1, dt=dt, lambda_cap=solver.lambda_cap
-        )
+        lam_cpu, omega_cpu, lam_apply_cpu = solve_nsn_coulomb(W, r, mu, pene0, max_iters=1, dt=dt)
         lam_gpu, omega_gpu, lam_apply_gpu = solver._solve_nsn_coulomb_gpu(W, r, mu, pene0, max_iters=1, dt=dt)
 
         np.testing.assert_allclose(lam_gpu, lam_cpu, rtol=0, atol=1.0e-10)
@@ -314,34 +273,6 @@ class TestNSNCoulombGpuDriver(unittest.TestCase):
             self.assertLessEqual(abs(lam_gpu[3 * c + 1]), bound + 1.0e-9)
             self.assertLessEqual(abs(lam_gpu[3 * c + 2]), bound + 1.0e-9)
 
-    def test_lambda_cap_keeps_the_friction_cone_gpu(self):
-        """Clamp the tangent multipliers into the cone of the capped normal multiplier, as the host reference does.
-
-        The warm start makes the first two contacts slide, on the boundaries of their cones, with normal multipliers
-        near 4.6 that the cap of 2 (in internal units) halves.
-        """
-        W, r, pene0, mu = _make_coulomb_inputs(M=3, seed=11)
-        dt = 0.01
-        lam_init = np.zeros(9)
-        lam_init[0::3] = 5.0
-        solver = _build_minimal_solver(friction=True, lambda_cap=2.0 * dt * dt)
-
-        lam_cpu, omega_cpu, lam_apply_cpu = solve_nsn_coulomb(
-            W, r, mu, pene0, max_iters=1, lam_init=lam_init, dt=dt, lambda_cap=solver.lambda_cap
-        )
-        lam_gpu, omega_gpu, lam_apply_gpu = solver._solve_nsn_coulomb_gpu(
-            W, r, mu, pene0, max_iters=1, lam_init=lam_init, dt=dt
-        )
-
-        np.testing.assert_allclose(lam_gpu, lam_cpu, rtol=0, atol=1.0e-10)
-        np.testing.assert_allclose(omega_gpu, omega_cpu, rtol=0, atol=1.0e-8)
-        np.testing.assert_allclose(lam_apply_gpu, lam_apply_cpu, rtol=0, atol=1.0e-8)
-        np.testing.assert_allclose(lam_gpu[[0, 3]], 2.0, rtol=0, atol=1.0e-9)
-        for c in range(3):
-            bound = mu[c] * max(lam_gpu[3 * c], 0.0)
-            self.assertLessEqual(abs(lam_gpu[3 * c + 1]), bound + 1.0e-9)
-            self.assertLessEqual(abs(lam_gpu[3 * c + 2]), bound + 1.0e-9)
-
     def test_bilateral_rows_take_newton_step(self):
         """Solve bilateral rows after the contact rows by the identity law in the same Schur solve."""
         M, R, dt = 20, 6, 0.01
@@ -350,7 +281,7 @@ class TestNSNCoulombGpuDriver(unittest.TestCase):
         aux = rng.standard_normal((n, n))
         W = aux @ aux.T / n + np.eye(n)
         r, pene0, mu = rng.standard_normal(n) * 1.0e-3, np.zeros(n), 0.3 + 0.2 * rng.random(M)
-        solver = _build_minimal_solver(friction=True, lambda_cap=1.0e-7)
+        solver = _build_minimal_solver(friction=True)
         lam_gpu, omega_gpu, lam_apply_gpu = solver._solve_nsn_coulomb_gpu(W, r, mu, pene0, dt=dt, n_bilateral=R)
 
         # One FB-Newton step from lam = 0, with the identity law on the last R rows.
@@ -366,17 +297,15 @@ class TestNSNCoulombGpuDriver(unittest.TestCase):
 
         np.testing.assert_allclose(omega_gpu, omega, rtol=0, atol=1.0e-12)
         np.testing.assert_allclose(lam_gpu[3 * M :], lam[3 * M :], rtol=1.0e-6)
-        # The step zeroes the bilateral violation; lambda_cap only clips contact rows.
+        # The step zeroes the bilateral violation.
         np.testing.assert_allclose((-r + W @ (dt * dt * omega * lam))[3 * M :], 0.0, atol=1.0e-12)
-        self.assertGreater(np.abs(lam_gpu[3 * M :]).max(), 1.0e-7 / (dt * dt))
-        self.assertLessEqual(np.abs(lam_gpu[: 3 * M]).max(), 1.0e-7 / (dt * dt) * (1.0 + 1.0e-12))
         np.testing.assert_allclose(lam_apply_gpu, dt * dt * omega_gpu * lam_gpu, rtol=1.0e-12)
 
     def test_sparse_storage_matches_dense(self):
         """Take the dense path's Newton steps on a ``W`` of two blocks, the second with bilateral rows, from its CSR
         form without the zero blocks."""
-        dense = _build_minimal_solver(friction=True, lambda_cap=1.0e-5)
-        sparse = _build_minimal_solver(friction=True, lambda_cap=1.0e-5, nsn_sparse_storage=True)
+        dense = _build_minimal_solver(friction=True)
+        sparse = _build_minimal_solver(friction=True, nsn_sparse_storage=True)
         rng = np.random.default_rng(37)
         m, bilateral = 4, 3
         n = 3 * m + bilateral

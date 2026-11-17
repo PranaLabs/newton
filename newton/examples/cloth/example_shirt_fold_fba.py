@@ -378,8 +378,6 @@ class Example:
             # apart, rather than those that the particles' masses alone predict would.
             nsn_lite_accumulate=True,
             integrate_with_external_rigid_solver=True,
-            # Bounds a contact row at 200 N: two self contacts of the landing layers reach it for a step.
-            lambda_cap=200.0,
             # Stiffness damping [s] settles the few-hertz ringing of the heavy, soft shirt after its landing and each
             # release; it leaves translations, and so the fall, undamped.
             rayleigh_beta=3.0e-3,
@@ -412,7 +410,6 @@ class Example:
             # the dense operator of the landing shirt's contacts takes several gigabytes
             nsn_sparse_storage=True,
             nsn_linear_iterations=10,
-            lambda_cap=200.0,
             rayleigh_beta=3.0e-3,
             rayleigh_corotated=True,
             friction_anchors=True,

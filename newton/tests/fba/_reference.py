@@ -158,7 +158,6 @@ def solve_nsn_unilateral(
     lam_init: np.ndarray | None = None,
     omega_init: np.ndarray | None = None,
     dt: float = 0.01,
-    lambda_cap: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Host NSN driver for unilateral (frictionless) rows, the reference of the GPU driver.
 
@@ -230,9 +229,6 @@ def solve_nsn_unilateral(
         # np.maximum(lam, 0.0) clamp would turn the Newton iteration into a
         # projected one.
 
-    if lambda_cap is not None:
-        cap_internal = lambda_cap / (dt * dt)
-        np.clip(lam, -cap_internal, cap_internal, out=lam)
     lam_apply = (dt * dt) * omega * lam
     return lam, omega, lam_apply
 
@@ -266,7 +262,6 @@ def solve_nsn_coulomb(
     lam_init: np.ndarray | None = None,
     omega_init: np.ndarray | None = None,
     dt: float = 0.01,
-    lambda_cap: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Host NSN driver for frictional (Coulomb) rows, the reference of the GPU driver.
 
@@ -386,9 +381,5 @@ def solve_nsn_coulomb(
         # only bounds the tangent multipliers, as the GPU kernel does.
         coulomb_box_clamp(lam, mu)
 
-    if lambda_cap is not None:
-        cap_internal = lambda_cap / (dt * dt)
-        np.clip(lam, -cap_internal, cap_internal, out=lam)
-        coulomb_box_clamp(lam, mu)
     lam_apply = (dt * dt) * omega * lam
     return lam, omega, lam_apply
