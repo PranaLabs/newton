@@ -2629,7 +2629,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
             spring_corotated=self.rayleigh_corotated,
         )
         worlds = self._particle_world_h if self.model.world_count > 1 else None
-        fs = factorize_and_sparse_inverse(A, self.model.particle_q.numpy(), worlds)
+        fs = factorize_and_sparse_inverse(A, self.model.particle_q.numpy(), worlds, device=self._device)
         self._linear_solver = FBALinearSolver(fs, device=self._device)
         # The two-way Schur rows of the previous factor go with it.
         self._two_way_ls = None
