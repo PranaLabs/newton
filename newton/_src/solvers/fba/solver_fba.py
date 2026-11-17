@@ -977,6 +977,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
         # invalidate it. ``True`` once the device-resident ``W`` is current. No host copy of ``W`` is kept: the
         # NSN driver reads it on the device through :meth:`FBALinearSolver.W_device_view`.
         self._cached_W = False
+        # Whether the frictionless lite contacts of the step take the per-particle Newton step.
+        self._lite_unilateral = False
 
         # λ persists across the PD outer iterations of a step: it starts at zero in every step, and λ += dλ
         # accumulates over the iterations. The host mirrors read the last step's values when first read, as their
@@ -3360,17 +3362,34 @@ class SolverFBA(TendonStateMixin, SolverBase):
                         self._step_held_rows(ls, M, dt)
                 else:
                     # Frictionless contacts: M Schur complement, unilateral (λ ≥ 0) only.
+                    from . import kernels as K_step  # noqa: PLC0415
+
                     if not self._cached_W:
                         # ``download=False``: see the frictional branch above; the
                         # GPU NSN driver reads ``W`` from device via
                         # :meth:`FBALinearSolver.W_device_view`.
+                        self._lite_unilateral = False
                         if self.nsn_schur_mode == "lite":
-                            ls.build_schur_lite_dense(
+                            # W_lite is block diagonal by particle: each particle's contacts take their own Newton
+                            # step from the rows' metadata, without a dense W, unless a particle has more contacts
+                            # than the step holds.
+                            ls.setup_lite_row_meta(
                                 M,
                                 self._contact_particle_d,
                                 self._contact_normal_d,
                                 self._contact_alpha_d,
+                                host=None
+                                if self._contact_particle_h is None
+                                else (self._contact_particle_h, self._contact_alpha_h),
                             )
+                            self._lite_unilateral = ls._isodof_max_rows <= K_step._MAX_ROWS_PER_PARTICLE
+                            if not self._lite_unilateral:
+                                ls.build_schur_lite_dense(
+                                    M,
+                                    self._contact_particle_d,
+                                    self._contact_normal_d,
+                                    self._contact_alpha_d,
+                                )
                         else:
                             ls.build_schur_complement(
                                 M,
@@ -3381,8 +3400,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
                             )
                         self._cached_W = True
                     # Residual + pene0 + warm-start all device-resident.
-                    self._ensure_nsn_inner_buffers(M)
-                    from . import kernels as K_step  # noqa: PLC0415
+                    lite = self._lite_unilateral
+                    self._ensure_nsn_inner_buffers(M, alloc_2d=not lite)
 
                     wp.launch(
                         K_step.compute_contact_residual_unilateral_kernel,
@@ -3399,20 +3418,35 @@ class SolverFBA(TendonStateMixin, SolverBase):
                     )
                     # Frictionless pene0 == contact_offset (no kinematic shift).
                     # Reuse the device buffer directly.
-                    self._solve_nsn_unilateral_gpu(
-                        None,
-                        None,
-                        None,
-                        max_iters=1,
-                        dt=dt,
-                        W_device=ls.W_device_view(),
-                        r_device=self._nsn_r_d,
-                        pene0_device=self._contact_offset_d,
-                        lam_init_device=self._lam_unilateral_persistent_d,
-                        omega_init_device=self._omega_unilateral_persistent_d,
-                        skip_download=True,
-                        m_rows=M,
-                    )
+                    if lite:
+                        wp.copy(self._nsn_lam_d, self._lam_unilateral_persistent_d, count=M)
+                        wp.copy(self._nsn_omega_d, self._omega_unilateral_persistent_d, count=M)
+                        wp.launch(
+                            K_step.fb_newton_lite_unilateral_kernel,
+                            dim=ls._n_isodofs,
+                            inputs=[
+                                *(ls._isodof_unique_d, ls._isodof_row_offsets_d, ls._isodof_row_indices_d),
+                                *(ls._row_dir_d, ls._row_alpha_d, self._nsn_r_d, self._contact_offset_d),
+                                *(ls._inv_mass_d, wp.float64(dt)),
+                            ],
+                            outputs=[self._nsn_lam_d, self._nsn_omega_d, self._nsn_lam_apply_d],
+                            device=device,
+                        )
+                    else:
+                        self._solve_nsn_unilateral_gpu(
+                            None,
+                            None,
+                            None,
+                            max_iters=1,
+                            dt=dt,
+                            W_device=ls.W_device_view(),
+                            r_device=self._nsn_r_d,
+                            pene0_device=self._contact_offset_d,
+                            lam_init_device=self._lam_unilateral_persistent_d,
+                            omega_init_device=self._omega_unilateral_persistent_d,
+                            skip_download=True,
+                            m_rows=M,
+                        )
                     wp.copy(self._lam_unilateral_persistent_d, self._nsn_lam_d, count=M)
                     wp.copy(self._omega_unilateral_persistent_d, self._nsn_omega_d, count=M)
                     # Apply the contact forces in combined form, as the frictional branch above does.

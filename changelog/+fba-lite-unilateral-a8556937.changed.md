@@ -1,0 +1,1 @@
+Speed up frictionless `SolverFBA` contacts with `nsn_schur_mode="lite"`: each particle's contacts take their Newton step on their own, without a dense contact operator of the whole step, which cut a step of a 40 x 40 cloth resting on the ground on the CPU from 1089 to 60 ms.

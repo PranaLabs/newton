@@ -4271,6 +4271,128 @@ def fb_newton_lite_coulomb_per_particle_kernel(
 
 
 @wp.kernel
+def fb_newton_lite_unilateral_kernel(
+    isodof_unique: wp.array[wp.int32],  # (K,) contacted particles
+    isodof_row_offsets: wp.array[wp.int32],  # (N+1,) CSR over all particles
+    isodof_row_indices: wp.array[wp.int32],  # (M,) rows sorted by particle
+    row_dir: wp.array[wp.vec3],  # (M,) contact normals
+    row_alpha: wp.array[wp.float32],  # (M,) Jacobian coefficients
+    r: wp.array[wp.float64],  # (M,)
+    pene0: wp.array[wp.float64],  # (M,)
+    inv_mass: wp.array[wp.float64],  # (N,)
+    dt: wp.float64,
+    lam: wp.array[wp.float64],  # (M,) inout
+    omega: wp.array[wp.float64],  # (M,) inout
+    lam_apply: wp.array[wp.float64],  # (M,) output
+):
+    """One FB-Newton step of the frictionless LiteNSN for the normal rows of one contacted particle per thread.
+
+    ``W_lite`` is block diagonal by particle, so the step of the dense driver ``_solve_nsn_unilateral_gpu`` on it,
+    with the same preconditioner, Fischer-Burmeister rows and right-hand side, splits into one ``k x k`` system per
+    particle with ``k`` contacts, solved here by Cholesky instead of the capped conjugate residual iterations. The
+    rows of a particle with more than ``_MAX_ROWS_PER_PARTICLE`` contacts keep their multipliers.
+    """
+    iso = wp.tid()
+    p = isodof_unique[iso]
+    row_start = isodof_row_offsets[p]
+    k_total = isodof_row_offsets[p + 1] - row_start
+    if k_total <= 0:
+        return
+    inv_m = inv_mass[p]
+    dt2 = dt * dt
+    if k_total > _MAX_ROWS_PER_PARTICLE:
+        for ai in range(k_total):
+            ra = isodof_row_indices[row_start + ai]
+            lam_apply[ra] = dt2 * omega[ra] * lam[ra]
+        return
+
+    W = _MAT12_F64(wp.float64(0.0))
+    lam_l = _VEC12_F64(wp.float64(0.0))
+    om_l = _VEC12_F64(wp.float64(0.0))
+    r_l = _VEC12_F64(wp.float64(0.0))
+    pene0_l = _VEC12_F64(wp.float64(0.0))
+    for ai in range(k_total):
+        ra = isodof_row_indices[row_start + ai]
+        for bi in range(k_total):
+            rb = isodof_row_indices[row_start + bi]
+            alpha = wp.float64(row_alpha[ra]) * wp.float64(row_alpha[rb])
+            W[ai, bi] = alpha * wp.float64(wp.dot(row_dir[ra], row_dir[rb])) * dt2 * inv_m
+        lam_l[ai] = lam[ra]
+        om_l[ai] = omega[ra]
+        r_l[ai] = r[ra]
+        pene0_l[ai] = pene0[ra]
+
+    # penetration = -r + dt^2 W (omega lam), the FB rows with the dense driver's preconditioner, then
+    # A = (omega omega^T) * W + diag(c) and rhs = (h - omega J x) / dt^2 under the updated weights.
+    pen_l = _VEC12_F64(wp.float64(0.0))
+    for ai in range(k_total):
+        acc = wp.float64(0.0)
+        for bi in range(k_total):
+            acc = acc + W[ai, bi] * om_l[bi] * lam_l[bi]
+        pen_l[ai] = -r_l[ai] + dt2 * acc
+    c_l = _VEC12_F64(wp.float64(0.0))
+    h_l = _VEC12_F64(wp.float64(0.0))
+    for ai in range(k_total):
+        d = W[ai, ai]
+        precond = dt2
+        if wp.abs(d) > wp.float64(1.0e-12):
+            precond = dt2 * wp.max(d, wp.float64(1.0e-12))
+        out = fb_unilateral_row_wp(pen_l[ai], lam_l[ai], precond, dt, pene0_l[ai])
+        om_l[ai] = out[0]
+        c_l[ai] = out[1]
+        h_l[ai] = out[2]
+    A = _MAT12_F64(wp.float64(0.0))
+    rhs_l = _VEC12_F64(wp.float64(0.0))
+    for ai in range(k_total):
+        acc = wp.float64(0.0)
+        for bi in range(k_total):
+            A[ai, bi] = om_l[ai] * om_l[bi] * W[ai, bi]
+            acc = acc + W[ai, bi] * om_l[bi] * lam_l[bi]
+        A[ai, ai] = A[ai, ai] + c_l[ai]
+        rhs_l[ai] = (h_l[ai] - om_l[ai] * (pene0_l[ai] - r_l[ai] + dt2 * acc)) / dt2
+
+    # Cholesky, A = L L^T in the lower triangle; a vanishing pivot leaves the multipliers unchanged.
+    eps = wp.float64(1.0e-12)
+    ok = wp.int32(1)
+    for j in range(k_total):
+        s = A[j, j]
+        for kk in range(j):
+            s = s - A[j, kk] * A[j, kk]
+        if s < eps:
+            ok = wp.int32(0)
+            A[j, j] = wp.float64(1.0)
+            continue
+        ljj = wp.sqrt(s)
+        A[j, j] = ljj
+        for ii in range(j + 1, k_total):
+            t = A[ii, j]
+            for kk in range(j):
+                t = t - A[ii, kk] * A[j, kk]
+            A[ii, j] = t / ljj
+    y_l = _VEC12_F64(wp.float64(0.0))
+    for ii in range(k_total):
+        t = rhs_l[ii]
+        for kk in range(ii):
+            t = t - A[ii, kk] * y_l[kk]
+        y_l[ii] = t / A[ii, ii]
+    dlam_l = _VEC12_F64(wp.float64(0.0))
+    for ii_rev in range(k_total):
+        ii = k_total - 1 - ii_rev
+        t = y_l[ii]
+        for kk in range(ii + 1, k_total):
+            t = t - A[kk, ii] * dlam_l[kk]
+        dlam_l[ii] = t / A[ii, ii]
+
+    for ai in range(k_total):
+        ra = isodof_row_indices[row_start + ai]
+        if ok == wp.int32(1):
+            lam_l[ai] = lam_l[ai] + dlam_l[ai]
+        lam[ra] = lam_l[ai]
+        omega[ra] = om_l[ai]
+        lam_apply[ra] = dt2 * om_l[ai] * lam_l[ai]
+
+
+@wp.kernel
 def axpy_lambda_kernel(
     dlam: wp.array[wp.float64],
     lam: wp.array[wp.float64],  # inout

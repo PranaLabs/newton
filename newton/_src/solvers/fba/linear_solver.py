@@ -2009,9 +2009,9 @@ class FBALinearSolver:
     ) -> int:
         """Populate per-row metadata for LiteNSN paths without building ``W``.
 
-        The fused-block-diagonal lite kernel
-        (:func:`kernels.fb_newton_lite_coulomb_kernel`) doesn't need an
-        explicit ``W`` buffer at all, but
+        The fused block-diagonal lite kernels
+        (:func:`kernels.fb_newton_lite_coulomb_kernel` and the per-particle
+        ones) don't need an explicit ``W`` buffer at all, but
         :meth:`apply_lambda_correction_combined` still depends on
         ``_row_particle_d`` / ``_row_dir_d`` / ``_row_alpha_d`` /
         ``_isodof_row_*_d`` to gather ``Jᵀ·λ``.  This helper sets those up so
@@ -2214,7 +2214,8 @@ class FBALinearSolver:
         approximation.
 
         The dense ``W_lite`` slots into the dense-PCR NSN inner solve of
-        ``SolverFBA(nsn_schur_mode="lite")`` for frictionless contacts.
+        ``SolverFBA(nsn_schur_mode="lite")`` for frictionless contacts with
+        more contacts on a particle than the per-particle Newton step holds.
 
         Side effects: populates ``_W_device_d[:total_rows, :total_rows]`` and
         ``_W_device_active_rows`` so subsequent :meth:`W_device_view` calls
