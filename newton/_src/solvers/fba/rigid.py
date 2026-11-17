@@ -21,8 +21,10 @@ import warp as wp
 
 wp.set_module_options({"enable_backward": False})
 
-# Stability clamp on the rotation per step, |omega| * dt <= 0.5 [rad].
+# Bound on the turn of the frame a step is linearized about, |omega| * dt <= 0.5 [rad].
 _MAX_STEP_ROTATION = wp.constant(wp.float64(0.5))
+# Bound on a body's turn over a step [rad], below pi, so that the turn since the step start stays unique.
+_MAX_STEP_TURN = wp.constant(wp.float64(3.0))
 # Step rotations with squared norm below this are treated as numerical noise.
 _ROTATION_NOISE_SQ = wp.constant(wp.float64(1.0e-28))
 
@@ -42,10 +44,10 @@ def _rotation_vector(q: wp.quatd) -> wp.vec3d:
 
 
 @wp.func
-def _clamp_step_rotation(omega: wp.vec3d, dt: wp.float64) -> wp.vec3d:
+def _clamp_step_rotation(omega: wp.vec3d, dt: wp.float64, bound: wp.float64) -> wp.vec3d:
     n = wp.length(omega)
-    if n * dt > _MAX_STEP_ROTATION:
-        return omega * (_MAX_STEP_ROTATION / (n * dt))
+    if n * dt > bound:
+        return omega * (bound / (n * dt))
     return omega
 
 
@@ -84,8 +86,13 @@ def prepare_rigid_step_kernel(
 
     ``b`` is ``A_rigid · u_free`` for the free-flight step ``u_free``:
     ``b_trans = R_pinᵀ (m (x + dt v + dt² g) / dt² + f)`` and
-    ``b_rot = I w / dt - cross(w, I w) + R_pinᵀ τ`` with ``w = R_pinᵀ ω`` in
-    the body frame, where ``-cross(w, I w)`` is the explicit gyroscopic torque.
+    ``b_rot = I R_pinᵀ R_0 w' / dt + R_pinᵀ τ``, with ``w'`` the body-frame
+    angular velocity ``w = R_pinᵀ ω = R_0ᵀ ω`` after an implicit gyroscopic
+    step, ``I (w' - w) + dt w' x I w' = 0``, taken as one Newton step from
+    ``w`` and turned back to the world with the step-start orientation
+    ``R_0``. An explicit gyroscopic torque ``-w x I w`` pumps energy into a
+    tumbling body, and so does the implicit step turned back with ``R_pin``;
+    turned back with ``R_0`` it loses a little instead.
     """
     k = wp.tid()
     i = bodies[k]
@@ -95,7 +102,7 @@ def prepare_rigid_step_kernel(
     v0 = wp.vec3d(wp.spatial_top(body_qd[i]))
     w0 = wp.vec3d(wp.spatial_bottom(body_qd[i]))
 
-    w_pin = _clamp_step_rotation(w0, dt)
+    w_pin = _clamp_step_rotation(w0, dt, _MAX_STEP_ROTATION)
     qp = q0
     if dt * dt * wp.length_sq(w_pin) >= _ROTATION_NOISE_SQ:
         qp = _rotate_by(w_pin, dt, q0)
@@ -110,7 +117,11 @@ def prepare_rigid_step_kernel(
 
     b_trans = wp.quat_rotate_inv(qp, m / (dt * dt) * (x0 + dt * v0 + dt * dt * g) + f)
     w = wp.quat_rotate_inv(qp, w0)
-    b_rot = inertia * w / dt - wp.cross(w, inertia * w) + wp.quat_rotate_inv(qp, tau)
+    iw = inertia * w
+    jacobian = inertia + dt * (wp.skew(w) * inertia - wp.skew(iw))
+    w = w - wp.inverse(jacobian) * (dt * wp.cross(w, iw))
+    w = wp.quat_rotate_inv(qp, wp.quat_rotate(q0, w))
+    b_rot = inertia * w / dt + wp.quat_rotate_inv(qp, tau)
     for c in range(3):
         b[6 * k + c] = b_trans[c]
         b[6 * k + 3 + c] = b_rot[c]
@@ -135,8 +146,8 @@ def retract_rigid_kernel(
     """Map the solved DOFs back to body poses and velocities.
 
     The COM moves to ``R_pin chi``; the orientation is retracted from the
-    step-start one, ``q = exp(R_pin rho) q_prev``, with the rotation clamped
-    like the pinned frame. Velocities are ``v = (x - x_prev) / dt`` and
+    step-start one, ``q = exp(R_pin rho) q_prev``, with the turn clamped below
+    pi. Velocities are ``v = (x - x_prev) / dt`` and
     ``ω = R_pin rho / dt``. The COM pose is also kept in float64 per slot, with
     the turn ``q q_prevˉ¹`` since the step start as a rotation vector, which moves
     the anchors of the slot's rows.
@@ -152,7 +163,7 @@ def retract_rigid_kernel(
     q = q0
     omega = wp.vec3d(0.0, 0.0, 0.0)
     if wp.length_sq(rho) >= _ROTATION_NOISE_SQ:
-        omega = wp.quat_rotate(qp, _clamp_step_rotation(rho / dt, dt))
+        omega = wp.quat_rotate(qp, _clamp_step_rotation(rho / dt, dt, _MAX_STEP_TURN))
         q = _rotate_by(omega, dt, q)
 
     v = (x - x_prev[k]) / dt
