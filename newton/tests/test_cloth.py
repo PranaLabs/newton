@@ -871,7 +871,8 @@ class ClothSim:
                 iterations=self.iterations,
                 particle_enable_self_contact=particle_enable_self_contact,
                 particle_self_contact_margin=self.particle_self_contact_margin,
-                particle_self_contact_gap=self.particle_self_contact_gap,
+                # The gap configures self contacts alone: SolverFBA warns about it without them.
+                particle_self_contact_gap=self.particle_self_contact_gap if particle_enable_self_contact else None,
             )
         else:
             raise ValueError("Unsupported solver type: " + self.solver_name)
