@@ -1183,6 +1183,36 @@ def attachment_body_jacobian_kernel(
 
 
 @wp.kernel
+def attachment_soft_row_kernel(
+    particle: wp.array[wp.int32],
+    body: wp.array[wp.int32],
+    point: wp.array[wp.vec3],
+    direction: wp.array[wp.vec3],
+    stiffness: wp.array[wp.float64],
+    damping: wp.array[wp.float64],
+    particle_q: wp.array[wp.vec3],
+    body_q: wp.array[wp.transform],
+    dt: wp.float64,
+    row_offset: wp.int32,
+    # outputs
+    target: wp.array[wp.float64],
+    compliance: wp.array[wp.float64],
+):
+    """The compliance and target of the rows of the model's particle-body attachments, from row ``row_offset`` on,
+    for a step of ``dt`` from the step-start positions: a row's spring ``k`` and damper ``c`` on its offset
+    ``g = d · (x - X_b p)`` give the force ``f = -k g - c (g - g0) / dt`` at the step's end, which the row holds as
+    ``g - g* + e f = 0`` with ``e = dt / (k dt + c)`` and ``g* = c g0 / (k dt + c)``, the backward Euler step of the
+    spring and the damper."""
+    k = wp.tid()
+    r = row_offset + k
+    d = wp.vec3d(direction[r])
+    g0 = wp.dot(d, wp.vec3d(particle_q[particle[k]]) - wp.vec3d(wp.transform_point(body_q[body[k]], point[k])))
+    denominator = stiffness[k] * dt + damping[k]
+    compliance[r] = dt / denominator
+    target[r] = damping[k] * g0 / denominator
+
+
+@wp.kernel
 def attachment_body_residual_kernel(
     row_body: wp.array[wp.int32],
     row_point: wp.array[wp.vec3],

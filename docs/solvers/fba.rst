@@ -318,6 +318,18 @@ Model Inputs
   row's force: three rows along independent directions with target zero tie a
   particle to that point, as a rope is tied to a rigid part. Such rows need
   ``directions``, the full operator and one world.
+- **Particle-body attachments**: the model's attachments
+  (:meth:`~newton.ModelBuilder.add_attachment_particle_body`) join these rows,
+  three per attachment along the world axes after the rows of
+  ``set_particle_constraints``, as soft rows: each holds the backward Euler
+  step of its spring ``stiffness`` and damper ``damping`` on the particle's
+  offset from the body point, ``f = -k g - c (g - g0) / dt``, solved with the
+  body's contacts and joints, so that the forces are equal and opposite. They
+  need dynamic bodies that FBA integrates, ``friction=True``, the full
+  operator and one world; as :class:`~newton.solvers.SolverVBD` does, FBA
+  rejects them with ``integrate_with_external_rigid_solver=True``. Disabled
+  attachments and those of zero stiffness and damping take no rows, and
+  ``ModelFlags.CONSTRAINT_PROPERTIES`` takes edits of the three.
 - **Rigid bodies**: FBA integrates the dynamic bodies and passes kinematic
   bodies through, or leaves every body to another solver with
   ``integrate_with_external_rigid_solver=True``. PRISMATIC, REVOLUTE, BALL,
@@ -411,9 +423,7 @@ Model Inputs
   :meth:`~newton.solvers.SolverFBA.register_custom_attributes` registers these
   attributes. Tendons need the full operator and one world.
 
-FBA does not simulate equality constraints, mimic joints, the model's
-particle-body attachments (tie particles to bodies with
-:meth:`~newton.solvers.SolverFBA.set_particle_constraints` instead), the
+FBA does not simulate equality constraints, mimic joints, the
 limits of BALL and D6 joints, the limit stiffness and damping
 ``joint_limit_ke`` and ``joint_limit_kd`` (its limits are hard), the effort
 and velocity limits and the friction of joint DOFs, or the inputs of

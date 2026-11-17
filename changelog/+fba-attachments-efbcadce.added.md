@@ -1,0 +1,1 @@
+Add the model's particle-body attachments (`ModelBuilder.add_attachment_particle_body`) to `SolverFBA`: each attachment to a dynamic body it integrates becomes three soft rows, the backward Euler step of its spring and damper, solved with the body's contacts and joints after the rows of `SolverFBA.set_particle_constraints`.

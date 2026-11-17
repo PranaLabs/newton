@@ -809,6 +809,9 @@ class SolverFBA(TendonStateMixin, SolverBase):
         self._face_query, self._contact_extra, self._mesh_shapes = None, None, False
         self._constraint_rows = None  # set_particle_constraints: particles, coefficients, directions, targets
         self._constraint_lengths = False  # the rows hold |sum_k c_k x_k|, along its direction at each iteration
+        # The arguments of the last set_particle_constraints call, the rows of the model's particle-body attachments,
+        # which follow them from row _attachment_offset, and the rows' compliance [m/N] (zero for rigid rows).
+        self._user_constraints = self._attachments = self._attachment_offset = self._constraint_compliance_d = None
         # set_particle_constraints(bodies=...): the body of each row (-1 for none) and its point in the body frame.
         self._constraint_body_h = self._constraint_body_d = self._constraint_point_d = None
         # The tendon rows of the model's tendons, one per group: the step's (body, point, target, middle, rest,
@@ -1067,6 +1070,90 @@ class SolverFBA(TendonStateMixin, SolverBase):
         self._k_tri_nh = _K.project_stretching_neohookean_kernel
         self._k_tet_nh = _K.project_stretching_neohookean_tet_kernel
         self._init_model_tendons()
+        self._setup_model_attachments()
+
+    def _setup_model_attachments(self) -> None:
+        """Take the model's enabled particle-body attachments as soft rows, three per attachment along the world
+        axes, after the rows of :meth:`set_particle_constraints`."""
+        model = self.model
+        self._attachments = None
+        if getattr(model, "attachment_particle_body_count", 0):
+            stiffness = model.attachment_particle_body_stiffness.numpy().astype(np.float64)
+            damping = model.attachment_particle_body_damping.numpy().astype(np.float64)
+            keep = model.attachment_particle_body_enabled.numpy().astype(bool) & ((stiffness > 0.0) | (damping > 0.0))
+            if keep.any():
+                if self.integrate_with_external_rigid_solver:
+                    raise ValueError(
+                        "SolverFBA applies the model's particle-body attachments to the bodies it integrates, not with "
+                        "integrate_with_external_rigid_solver=True"
+                    )
+                if not self.friction or self.nsn_schur_mode != "full" or model.world_count > 1:
+                    raise NotImplementedError(
+                        "SolverFBA's particle-body attachments need friction=True, nsn_schur_mode='full' and one world"
+                    )
+                body = model.attachment_particle_body_body.numpy()[keep].astype(np.int32)
+                if not (model.body_flags.numpy()[body] & int(BodyFlags.DYNAMIC)).all():
+                    raise NotImplementedError("SolverFBA attaches particles to dynamic bodies only")
+                particle = model.attachment_particle_body_particle.numpy()[keep].astype(np.int32)
+                point = model.attachment_particle_body_body_point.numpy()[keep].astype(np.float32)
+                device = self._device
+                self._attachments = SimpleNamespace(
+                    particle=np.repeat(particle, 3),
+                    body=np.repeat(body, 3),
+                    point=np.repeat(point, 3, axis=0),
+                    direction=np.tile(np.eye(3, dtype=np.float32), (len(body), 1)),
+                    stiffness=wp.array(np.repeat(stiffness[keep], 3), dtype=wp.float64, device=device),
+                    damping=wp.array(np.repeat(damping[keep], 3), dtype=wp.float64, device=device),
+                )
+                for name in ("particle", "body", "point"):
+                    values = getattr(self._attachments, name)
+                    dtype = wp.vec3 if name == "point" else wp.int32
+                    setattr(self._attachments, f"{name}_d", wp.array(values, dtype=dtype, device=device))
+        self._refresh_particle_constraints()
+
+    def _refresh_particle_constraints(self) -> None:
+        """Install the rows of :meth:`set_particle_constraints` followed by those of the model's attachments."""
+        user, att = self._user_constraints, self._attachments
+        self._attachment_offset = None
+        if att is None:
+            args = user if user is not None else (None, None, None, None, False, None, None)
+        else:
+            n_a = len(att.particle)
+            if user is None:
+                user = (np.zeros((0, 1), np.int32), np.zeros((0, 1), np.float32), np.zeros(0), np.zeros((0, 3)))
+                user += (False, None, None)
+            particles, coefficients, targets, directions, exact, bodies, points = user
+            if directions is None:
+                raise NotImplementedError(
+                    "SolverFBA combines the model's particle-body attachments only with particle constraint rows "
+                    "that have directions"
+                )
+            particles = np.asarray(particles, dtype=np.int32)
+            m, K = particles.shape
+            attached = np.full((n_a, K), -1, dtype=np.int32)
+            attached[:, 0] = att.particle
+            weights = np.zeros((n_a, K), dtype=np.float32)
+            weights[:, 0] = 1.0
+            bodies = np.full(m, -1, dtype=np.int32) if bodies is None else np.asarray(bodies, np.int32).reshape(-1)
+            points = np.zeros((m, 3), np.float32) if points is None else np.asarray(points, np.float32)
+            args = (
+                np.concatenate([particles, attached]),
+                np.concatenate([np.asarray(coefficients, dtype=np.float32), weights]),
+                np.concatenate([np.asarray(targets, dtype=np.float64), np.zeros(n_a)]),
+                np.concatenate([np.asarray(directions, dtype=np.float32).reshape(m, 3), att.direction]),
+                exact,
+                np.concatenate([bodies, att.body]),
+                np.concatenate([points.reshape(m, 3), att.point]),
+            )
+            self._attachment_offset = m
+        particles, coefficients, targets, directions, exact, bodies, points = args
+        self._install_particle_constraints(
+            particles, coefficients, targets, directions=directions, exact=exact, bodies=bodies, body_points=points
+        )
+        self._constraint_compliance_d = None
+        if att is not None:
+            R = self._constraint_rows[0].shape[0]
+            self._constraint_compliance_d = wp.zeros(R, dtype=wp.float64, device=self._device)
 
     @property
     def _contact_v_anchor_h(self) -> np.ndarray:
@@ -1472,7 +1559,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 storage.soft if self.rigid_contact_time > 0.0 or self._tendon_soft_any else self._nsn_soft_off
             )
         self._rc_lam_soft_d = wp.empty(n_s + n_b, dtype=wp.float64, device=device) if n_b else None
-        # The joint rows' compliance in the NSN's bilateral rows: the damper rows' dt / c.
+        # The joint rows' compliance in the NSN's bilateral rows, their soft rows' (joint_soft_row_kernel), and the
+        # particle constraint rows', the attachments' (attachment_soft_row_kernel).
         self._rc_bilateral_compliance = None
         if self._joint_dampers and joint_rows.size:
             from .joints import gather_values_kernel  # noqa: PLC0415
@@ -1489,6 +1577,25 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 device=device,
             )
             self._rc_bilateral_compliance = compliance
+        if n_b and self._constraint_compliance_d is not None:
+            from .rigid_contact import attachment_soft_row_kernel  # noqa: PLC0415
+
+            att = self._attachments
+            wp.launch(
+                attachment_soft_row_kernel,
+                dim=len(att.particle),
+                inputs=[
+                    *(att.particle_d, att.body_d, att.point_d, self._constraint_rows[2], att.stiffness, att.damping),
+                    *(state_in.particle_q, state_in.body_q, wp.float64(dt), wp.int32(self._attachment_offset)),
+                ],
+                outputs=[self._constraint_rows[3], self._constraint_compliance_d],
+                device=device,
+            )
+            if self._rc_bilateral_compliance is None:
+                self._rc_bilateral_compliance = wp.zeros(n - (n_s + n_c), dtype=wp.float64, device=device)
+            wp.copy(
+                self._rc_bilateral_compliance, self._constraint_compliance_d, dest_offset=joint_rows.size, count=n_b
+            )
         if m_s or attach:
             from .rigid_contact import particle_contact_body_jacobian_kernel  # noqa: PLC0415
 
@@ -4276,7 +4383,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
         the forces that hold them. A length row acts along the direction of ``v_r`` at every iteration, so
         at tension ``T`` it keeps the transverse stiffness ``T / |v_r|`` of a taut segment; a direction
         fixed for the step drops it, and a body that chained rows compress beyond its buckling load then
-        flutters. Unused slots have particle ``-1``; slot 0 must be used. ``None`` removes the rows.
+        flutters. Unused slots have particle ``-1``; slot 0 must be used. ``None`` removes the rows. The rows of the
+        model's particle-body attachments follow these rows and stay.
 
         With ``nsn_schur_mode="lite"`` every row needs a direction and one particle. Three rows along
         independent directions hold a particle at a point, and its contacts then carry no force. These rows
@@ -4304,6 +4412,16 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 NSN and one world.
             body_points: The rows' points in their bodies' frames [m], shape ``(R, 3)``.
         """
+        removed = particles is None or len(particles) == 0
+        self._user_constraints = (
+            None if removed else (particles, coefficients, targets, directions, exact, bodies, body_points)
+        )
+        self._refresh_particle_constraints()
+
+    def _install_particle_constraints(
+        self, particles, coefficients, targets, *, directions=None, exact=False, bodies=None, body_points=None
+    ) -> None:
+        """Install the particle constraint rows of :meth:`set_particle_constraints`, with the model's attachments."""
         self._invalidate_schur_cache()
         self._constraint_body_h = self._constraint_body_d = self._constraint_point_d = None
         if particles is None or len(particles) == 0:
@@ -4768,7 +4886,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
         ``JOINT_DOF_FORCE_PROPERTIES`` (joint damping and limits) rebuild the system of the integrated bodies and their
         joint rows, and so does ``BODY_PROPERTIES`` when it changes which bodies are dynamic; body poses and
         velocities are read at every step. ``TENDON_PROPERTIES`` refreshes the tendons' compliance, damping and FBA
-        attributes; their rest lengths take effect at the next :meth:`reset`.
+        attributes; their rest lengths take effect at the next :meth:`reset`. ``CONSTRAINT_PROPERTIES`` takes the
+        particle-body attachments' stiffness, damping and enabled flags.
         """
         if flags & ModelFlags.SHAPE_PROPERTIES and self._linear_solver is not None:
             system, rest = self._particle_system_key()
@@ -4788,6 +4907,9 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 self._rigid_dt = None
         if flags & rigid:
             self._rigid_dt = None
+        if flags & ModelFlags.CONSTRAINT_PROPERTIES:
+            # The attachments' stiffness, damping and enabled flags.
+            self._setup_model_attachments()
         if flags & ModelFlags.TENDON_PROPERTIES and self._model_tendon_groups is not None:
             # Compliance, damping and the FBA tendon attributes take effect at the next step; rest-length edits,
             # as in Newton's routing, at the next reset.

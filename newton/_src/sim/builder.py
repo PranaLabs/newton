@@ -10898,7 +10898,7 @@ class ModelBuilder:
 
         The compliant attachment pulls the particle toward a body-local anchor and
         transfers equal-and-opposite forces between both endpoints in
-        :class:`~newton.solvers.SolverVBD`. The constraint is translational;
+        :class:`~newton.solvers.SolverVBD` and :class:`~newton.solvers.SolverFBA`. The constraint is translational;
         a single particle does not define an orientation. When the endpoints are
         owned by different solvers of a coupled simulation, the attachment is
         coupled by
