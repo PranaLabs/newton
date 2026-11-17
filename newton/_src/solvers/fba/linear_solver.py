@@ -796,7 +796,9 @@ def _lower_inverse_column_kernel(
     S_outerPtr: wp.array[wp.int32],
     S_innerInd: wp.array[wp.int32],
     perm: wp.array[wp.int32],
-    aL: wp.array[wp.float64],
+    nz_ptr: wp.array[wp.int32],
+    nz_offset: wp.array[wp.int32],
+    nz_value: wp.array[wp.float64],
     S_values: wp.array[wp.float64],
 ):
     """One thread per CSC column of S.
@@ -810,6 +812,12 @@ def _lower_inverse_column_kernel(
 
     There is NO cross-column ``S_values`` read, so columns are fully
     independent and can be processed in parallel without level scheduling.
+
+    The update of entry ``i`` walks the nonzeros of ``L``'s column ``col``
+    alone, ``nz_ptr[col]:nz_ptr[col + 1]``, at their offsets ``nz_offset``
+    past the head of ``S``'s column ``col``, which aligns with the rest of
+    this column; the entries of the elimination-tree path where ``L`` is zero
+    would only subtract zeros.
     """
     index = wp.tid()
     start = S_outerPtr[index]
@@ -820,15 +828,11 @@ def _lower_inverse_column_kernel(
     for i in range(start + 1, end):
         row = S_innerInd[i - 1]
         col = perm[row]
-        k_start = S_outerPtr[col] + 1
-        k_end = S_outerPtr[col + 1]
         prev = S_values[i - 1]
-        j = i
-        k = k_start
-        while j < end and k < k_end:
-            S_values[j] = S_values[j] - aL[k] * prev
-            j = j + 1
-            k = k + 1
+        for t in range(nz_ptr[col], nz_ptr[col + 1]):
+            j = i + nz_offset[t]
+            if j < end:
+                S_values[j] = S_values[j] - nz_value[t] * prev
 
 
 def _aligned_lower_vectorized(
@@ -842,40 +846,34 @@ def _aligned_lower_vectorized(
 ) -> np.ndarray:
     """Step 3 of :func:`compute_lower_inverse`, vectorized: the values of ``L`` aligned with the pattern of ``S``.
 
-    For each row ``r`` we scan L's column ``invperm[r]`` and place each
-    nonzero into the matching slot in S's column ``r`` (matched by row
-    index). The vectorization uses ``np.searchsorted`` per column,
-    correct because both ``S_innerInd[slice]`` and ``L_indices[slice]``
-    enumerate the elimination-tree path of ``invperm[r]`` (the former in
-    elim-tree order, the latter in sorted row-index order, both restricted
-    to the same set when L is the unit lower-triangular factor of LDLᵀ).
+    Each nonzero of L's column ``invperm[r]`` lands in the slot of S's column ``r`` of the same row, which one
+    search over the keys ``column * n + row`` of all of S's slots finds: both enumerate the elimination-tree path of
+    ``invperm[r]``, S's slots in ascending row order within each column. Nonzeros of L off that path, which a unit
+    lower-triangular factor of an LDLᵀ does not have, are left out.
     """
     aL = np.zeros(S_outerPtr[n], dtype=np.float64)
-    # Sort S_innerInd within each column once so np.searchsorted is valid.
-    # The pattern construction above stores them in elim-tree-path order
-    # (monotonically increasing in original row index, since parent[j] > j).
-    # That happens to be the same as sorted ascending, so we can search
-    # directly without per-row sorting.
-    for r in range(n):
-        invr = invperm[r]
-        l_start = L_indptr[invr]
-        l_end = L_indptr[invr + 1]
-        if l_end == l_start:
-            continue
-        s_start = S_outerPtr[r]
-        s_end = S_outerPtr[r + 1]
-        # Subset of L's column-`invr` indices that lie in S's column-`r` pattern.
-        l_rows = L_indices[l_start:l_end]
-        s_rows = S_innerInd[s_start:s_end]
-        # Place each L_data[ptrL] into aL at the slot matching L_indices[ptrL].
-        # np.searchsorted is O((l + s) log s) per column; total O(S_nnz log).
-        pos = np.searchsorted(s_rows, l_rows)
-        # Only keep matches (S's pattern may be a subset of L's column).
-        # Note: the elim-tree property guarantees s_rows ⊆ l_rows, but in
-        # general L may have entries below the elim-tree path; mask them.
-        valid = (pos < s_rows.size) & (s_rows[np.clip(pos, 0, s_rows.size - 1)] == l_rows)
-        aL[s_start + pos[valid]] = L_data[l_start:l_end][valid]
+    s_column = np.repeat(np.arange(n, dtype=np.int64), np.diff(S_outerPtr))
+    s_keys = s_column * n + S_innerInd.astype(np.int64)
+    r_of_column = np.empty(n, dtype=np.int64)
+    r_of_column[np.asarray(invperm, dtype=np.int64)] = np.arange(n, dtype=np.int64)
+    l_column = np.repeat(np.arange(n, dtype=np.int64), np.diff(L_indptr))
+    l_keys = r_of_column[l_column] * n + L_indices.astype(np.int64)
+    pos = np.minimum(np.searchsorted(s_keys, l_keys), max(s_keys.size - 1, 0))
+    valid = s_keys[pos] == l_keys if s_keys.size else np.zeros(l_keys.size, dtype=bool)
+    aL[pos[valid]] = L_data[valid]
     return aL
+
+
+def _lower_nonzeros(S_outerPtr: np.ndarray, aL: np.ndarray, n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The nonzeros of the aligned ``L`` past the head of each of S's columns, as a CSR: per column, the offsets of
+    the nonzeros from the slot after the head and their values."""
+    k = np.arange(S_outerPtr[n], dtype=np.int64)
+    column = np.repeat(np.arange(n, dtype=np.int64), np.diff(S_outerPtr))
+    head = S_outerPtr[:-1].astype(np.int64)[column]
+    keep = (k > head) & (aL != 0.0)
+    nz_ptr = np.zeros(n + 1, dtype=np.int32)
+    np.cumsum(np.bincount(column[keep], minlength=n), out=nz_ptr[1:])
+    return nz_ptr, (k - head - 1)[keep].astype(np.int32), aL[keep]
 
 
 def compute_lower_inverse(
@@ -1029,13 +1027,14 @@ def _compute_lower_inverse_column_warp(
     S_outerPtr_d = wp.array(np.ascontiguousarray(S_outerPtr, dtype=np.int32), dtype=wp.int32, device=wp_device)
     S_innerInd_d = wp.array(np.ascontiguousarray(S_innerInd, dtype=np.int32), dtype=wp.int32, device=wp_device)
     perm_d = wp.array(np.ascontiguousarray(perm, dtype=np.int32), dtype=wp.int32, device=wp_device)
-    aL_d = wp.array(np.ascontiguousarray(aL, dtype=np.float64), dtype=wp.float64, device=wp_device)
+    nonzeros = _lower_nonzeros(S_outerPtr, aL, n)
+    nonzeros_d = [wp.array(a, device=wp_device) for a in nonzeros]
     S_values_d = wp.zeros(S_nnz, dtype=wp.float64, device=wp_device)
 
     wp.launch(
         _lower_inverse_column_kernel,
         dim=n,
-        inputs=[S_outerPtr_d, S_innerInd_d, perm_d, aL_d, S_values_d],
+        inputs=[S_outerPtr_d, S_innerInd_d, perm_d, *nonzeros_d, S_values_d],
         device=wp_device,
     )
 
@@ -1211,7 +1210,7 @@ def _factor_components(
 
 
 def factorize_and_sparse_inverse(
-    A, positions: np.ndarray | None = None, worlds: np.ndarray | None = None
+    A, positions: np.ndarray | None = None, worlds: np.ndarray | None = None, device: Any = None
 ) -> FactorizedSystem:
     """Factor an SPD matrix as ``P A Pᵀ = L D Lᵀ`` and compute ``S = L⁻¹``.
 
@@ -1223,6 +1222,8 @@ def factorize_and_sparse_inverse(
             joins factor one world at a time, each world's as its own matrix with all of its components, and take
             consecutive places of the order in ascending world order, so the factor is block diagonal. Without
             them, with one world, or with an entry that joins two worlds, the matrix factors as a whole.
+        device: Warp device of the sparse inverse's column kernel, the model's; ``None`` takes the current CUDA
+            device when there is one.
 
     Returns:
         FactorizedSystem with all data needed to construct an FBALinearSolver.
@@ -1236,7 +1237,7 @@ def factorize_and_sparse_inverse(
         order, L, d = _factor_components(matrix, positions, component, counts)
     else:
         order, L, d = factor_ldlt(matrix, positions)
-    S = compute_lower_inverse(L, parent=_elimination_tree(L))
+    S = compute_lower_inverse(L, parent=_elimination_tree(L), device=device)
     perm_r = np.argsort(order).astype(np.int32)
     return FactorizedSystem(S=S, Dinv=1.0 / d, perm_r=perm_r, invperm_r=order.astype(np.int32))
 
