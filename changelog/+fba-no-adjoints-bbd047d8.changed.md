@@ -1,0 +1,1 @@
+Compile the `SolverFBA` kernels without the adjoints that FBA never runs: their first compilation for CUDA takes about a fifth of the time (73 s -> 16 s on an RTX 5090) and for the CPU less than half.

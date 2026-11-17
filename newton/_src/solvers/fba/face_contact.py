@@ -21,6 +21,8 @@ from ...geometry.flags import MeshSignMethod, ShapeFlags
 from ...geometry.types import Axis, GeoType
 from .kernels import host_head
 
+wp.set_module_options({"enable_backward": False})
+
 
 @wp.func
 def shape_sdf(geo_type: int, scale: wp.vec3, mesh: wp.uint64, x: wp.vec3, edge_radius: float) -> wp.vec4:

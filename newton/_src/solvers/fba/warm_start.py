@@ -20,6 +20,8 @@ import warp as wp
 
 from ...core.reset import reset_world_selected
 
+wp.set_module_options({"enable_backward": False})
+
 # Key of a row without identity; it sorts after every other key.
 _NO_KEY = wp.constant(wp.int64(9223372036854775807))
 
