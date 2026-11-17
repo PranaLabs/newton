@@ -1,0 +1,1 @@
+Allow recording `SolverFBA` steps without contacts into the caller's CUDA graphs (`wp.ScopedCapture`) after a step of the same `dt` outside the graph; steps that cannot record raise `RuntimeError` naming why.
