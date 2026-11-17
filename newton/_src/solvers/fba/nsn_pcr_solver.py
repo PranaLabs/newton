@@ -1163,7 +1163,7 @@ class NSNPCRSolver:
         b: wp.array[wp.float64],
         x_out: wp.array[wp.float64],
         block_precond: Callable[[wp.array, wp.array], None] | None = None,
-    ) -> tuple[int, float]:
+    ) -> tuple[int, float | None]:
         """Solve ``A @ x = b`` with Jacobi-preconditioned conjugate residual.
 
         Args:
@@ -1182,6 +1182,9 @@ class NSNPCRSolver:
             counts the number of inner PCR iterations executed and
             ``final_rho`` is the last value of the preconditioned residual
             scalar ``rho = <z, A z>`` with ``z = P r`` (>= 0 for an SPD ``A``).
+            A solve of at most ``check_every`` iterations runs them all without
+            reading anything back to the host, and returns ``None`` for
+            ``final_rho``.
 
         Raises:
             ValueError: if ``A``/``b``/``x_out`` shapes are inconsistent or
@@ -1199,10 +1202,15 @@ class NSNPCRSolver:
 
         if self.world_rows is not None:
             iterations = self._solve_worlds(A, b, x_out, block_precond, sparse=False)
+            if min(self.max_iter, n) <= self.check_every:
+                return iterations, None
             return iterations, float(self._world_scalars[0][: self.world_rows[1].shape[0] - 1].numpy().sum())
 
         device = self.device
         max_iter = min(self.max_iter, n)
+        # A capped solve of at most one check block runs its iterations without reading back: the iterations past
+        # convergence, and those of a zero right-hand side, leave the iterate unchanged.
+        unchecked = max_iter <= self.check_every
         tile_k = int(_PCR_TILE_K)
         n_pad = ((n + tile_k - 1) // tile_k) * tile_k
 
@@ -1213,10 +1221,12 @@ class NSNPCRSolver:
         # With b == 0, x = 0 is the exact solution.  ``array_inner`` is a
         # CUB-style parallel reduction, far cheaper than a single-thread
         # accumulator at the typical n ~ 600..1500 sizes.
-        dot_b = float(wp.utils.array_inner(b, b, count=n))
-        if dot_b == 0.0:
-            wp.copy(x_out, self._x, count=n)
-            return (0, 0.0)
+        dot_b = 0.0
+        if not unchecked:
+            dot_b = float(wp.utils.array_inner(b, b, count=n))
+            if dot_b == 0.0:
+                wp.copy(x_out, self._x, count=n)
+                return (0, 0.0)
 
         # ----- Jacobi preconditioner: precond[i] = 1/A[i,i] -------------
         wp.launch(
@@ -1264,6 +1274,15 @@ class NSNPCRSolver:
         # ``wp.launch`` dispatches, so the Python+driver per-launch overhead
         # drops from ~30-50 us/iter to ~2 us/iter at n ~ 600..1500.
         graph = None if block_precond is not None else self._get_or_build_pcr_iter_graph(A, n, n_pad, device)
+
+        if unchecked:
+            for _ in range(max_iter):
+                if graph is not None:
+                    wp.capture_launch(graph)
+                else:
+                    self._pcr_iter_eager(A, n, n_pad, device)
+            wp.copy(x_out, self._x, count=n)
+            return (max_iter, None)
 
         nb_iter = 0
         check_every = self.check_every

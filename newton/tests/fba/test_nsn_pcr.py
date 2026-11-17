@@ -12,7 +12,9 @@ redundant rows, or add an ill-conditioned block.
 
 from __future__ import annotations
 
+import contextlib
 import unittest
+import unittest.mock
 
 import numpy as np
 import warp as wp
@@ -170,6 +172,31 @@ class TestPCRDiagnostics(_PCRTestCase):
         np.testing.assert_array_equal(x, np.zeros(n))
         self.assertEqual(iters, 0)
         self.assertEqual(rho, 0.0)
+
+    def test_capped_solve_reads_nothing_back(self):
+        """Run a capped solve of at most one check block without reading back, to the iterate of a solve that checks
+        its residual at every iteration, and leave a zero right-hand side's solution at zero."""
+        n = 64
+        A = wp.array2d(_make_spd(n, seed=5), dtype=wp.float64, device=self.device)
+        b = wp.array(np.random.default_rng(6).standard_normal(n), dtype=wp.float64, device=self.device)
+        results = []
+        for check_every in (25, 1):
+            solver = NSNPCRSolver(max_n=n, device=self.device, max_iter=10, check_every=check_every)
+            x = wp.zeros(n, dtype=wp.float64, device=self.device)
+            with (
+                unittest.mock.patch.object(wp.array, "numpy", side_effect=AssertionError)
+                if check_every == 25
+                else (contextlib.nullcontext())
+            ):
+                iters, rho = solver.solve(A, b, x)
+            self.assertEqual(iters, 10)
+            self.assertEqual(rho is None, check_every == 25)
+            results.append(x.numpy())
+        np.testing.assert_allclose(results[0], results[1], rtol=1e-12, atol=1e-14)
+        solver = NSNPCRSolver(max_n=n, device=self.device, max_iter=10)
+        x = wp.full(n, 1.0, dtype=wp.float64, device=self.device)
+        solver.solve(A, wp.zeros(n, dtype=wp.float64, device=self.device), x)
+        np.testing.assert_array_equal(x.numpy(), 0.0)
 
 
 class TestPCRScaledAndSingular(_PCRTestCase):

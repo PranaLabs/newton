@@ -1,0 +1,1 @@
+Speed up `SolverFBA` steps with a capped `nsn_linear_iterations` of at most 25 on the dense contact operator: their conjugate residual solves no longer read the right-hand side, the residual, the stop flag and an unused curvature back to the host at every local-global iteration.
