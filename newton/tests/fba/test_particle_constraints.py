@@ -14,11 +14,6 @@ CORNERS = [0, 4, 20, 24]
 class TestParticleConstraints(unittest.TestCase):
     """Bilateral rows on the particles of a 0.4 m cloth, solved with its contacts on a sphere below."""
 
-    @classmethod
-    def setUpClass(cls):
-        if not wp.is_cuda_available():
-            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
-
     def _model(self):
         builder = newton.ModelBuilder()
         builder.add_shape_sphere(-1, xform=wp.transform((0.2, 0.2, 0.92), wp.quat_identity()), radius=0.05)

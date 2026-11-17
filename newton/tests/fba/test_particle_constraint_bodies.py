@@ -49,11 +49,6 @@ def _rod(builder, start, masses):
 
 
 class TestBodyRows(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        if not wp.is_cuda_available():
-            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
-
     def _step(self, solver, s0, s1, steps, dt):
         for _ in range(steps):
             solver.step(s0, s1, None, None, dt)

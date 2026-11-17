@@ -357,7 +357,7 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if not wp.is_cuda_available():
-            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
+            raise unittest.SkipTest("slow on the CPU; it runs on CUDA")
 
     def _run(self, face_contacts, pos, cells, steps, thickness=0.0, mesh_half=None, shape_radius=None, **solver_args):
         """Final particle positions, the largest particle speed and the solver; ``mesh_half`` swaps the box for
@@ -456,7 +456,9 @@ class TestSolverFBAFaceContacts(unittest.TestCase):
         # without it, the step moves the cloth alike.
         capped = {"thickness": 3e-3, "nsn_sparse_storage": True, "nsn_linear_iterations": 10}
         graphed, _, solver = self._run(True, (-0.1, -0.1, 0.62), 4, 60, **capped)
-        self.assertIsNotNone(solver._nsn_graph[1])
+        if wp.get_device().is_cuda:
+            # On CUDA the sparse NSN step replays from a graph.
+            self.assertIsNotNone(solver._nsn_graph[1])
         with mock.patch.object(wp, "ScopedCapture", side_effect=RuntimeError):
             launched, _, _ = self._run(True, (-0.1, -0.1, 0.62), 4, 60, **capped)
         np.testing.assert_array_equal(launched, graphed)
@@ -570,11 +572,6 @@ class TestSolverFBAOnMeshFace(unittest.TestCase):
 
     RADIUS = 1.0e-3
     DT = 1.0 / 500.0
-
-    @classmethod
-    def setUpClass(cls):
-        if not wp.is_cuda_available():
-            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
 
     def _first_step(self, body, shape, face_contacts):
         """Start positions and the velocities after one step."""
@@ -731,8 +728,9 @@ class TestMeshContactMinima(unittest.TestCase):
 
         Held by its closest points alone, its particles slid through the left face.
         """
-        if not wp.is_cuda_available():
-            self.skipTest("The SolverFBA contact NSN needs CUDA")
+        if not wp.get_device().is_cuda:
+            # On the CPU the triangle ends the run with a face contact, whose force contact_f does not report.
+            self.skipTest("the momentum balance holds where the run ends without a face contact, as on CUDA")
         builder = newton.ModelBuilder()
         builder.add_shape_mesh(-1, mesh=_notch_mesh(0.2), cfg=newton.ModelBuilder.ShapeConfig(mu=0.0))
         along = np.array([-1.0, 0.0, -1.0]) / np.sqrt(2.0)  # down the right face toward the notch

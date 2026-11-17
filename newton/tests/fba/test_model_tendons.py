@@ -116,11 +116,6 @@ def _acceleration(trace, b1, b2, dt):
 
 
 class TestModelTendons(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        if not wp.is_cuda_available():
-            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
-
     def test_atwood_machine(self):
         """Boxes of 20 g and 30 g on one string over two pinholes or over a roller accelerate at
         (m2 - m1) g / (m1 + m2), the string's routed length kept at its rest length."""

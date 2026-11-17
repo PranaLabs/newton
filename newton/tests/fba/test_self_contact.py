@@ -397,11 +397,6 @@ class TestLiteDelassus(unittest.TestCase):
     """The sparse lite Delassus matrix ``W = H (dt^2 M^-1) H^T`` of rows on several particles, which
     ``FBALinearSolver.build_schur_lite_triplets`` merges from the slots of ``H`` sorted by particle."""
 
-    @classmethod
-    def setUpClass(cls):
-        if not wp.is_cuda_available():
-            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
-
     def test_matches_the_dense_product(self):
         """Match the dense product for 300 rows of four slots over 49 particles, with unused slots, rows that take a
         particle twice, and pinned particles: each row keeps exactly the rows that share a particle with it, in
@@ -455,7 +450,7 @@ class TestSelfContactSolve(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if not wp.is_cuda_available():
-            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
+            raise unittest.SkipTest("slow on the CPU; it runs on CUDA")
 
     def _drop(self, start_gap, cells=10, fps=60, steps=60, mu=None, **solver_args):
         """Largest number of intersecting triangle pairs over the steps, then the gap between the sheets [m]."""

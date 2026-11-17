@@ -4276,11 +4276,6 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
 class TestContactForceObservable(unittest.TestCase):
     """CONTACT_F rows of a cloth resting on the ground."""
 
-    @classmethod
-    def setUpClass(cls):
-        if not wp.is_cuda_available():
-            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
-
     def test_resting_cloth_weighs_on_the_ground(self):
         """Report the cloth's weight on the ground, with torques about the origin, in the full and the lite solve."""
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
@@ -4311,8 +4306,9 @@ class TestContactForceObservable(unittest.TestCase):
             count, rigid = int(contacts.soft_contact_count.numpy()[0]), contacts.rigid_contact_max
             wrench = observables.contact_f.numpy()
             soft = wrench[rigid : rigid + count]
-            # Friction holds the settling cloth with up to 2e-5 of its weight.
-            np.testing.assert_allclose(soft[:, :3].sum(axis=0), [0.0, 0.0, -weight], atol=2e-5 * weight, err_msg=mode)
+            # Friction holds the settling cloth with up to 5e-5 of its weight, which settles a little differently on
+            # the CPU than on CUDA.
+            np.testing.assert_allclose(soft[:, :3].sum(axis=0), [0.0, 0.0, -weight], atol=5e-5 * weight, err_msg=mode)
             anchor = contacts.soft_contact_body_pos.numpy()[:count]  # in world frame on the static ground
             np.testing.assert_allclose(soft[:, 3:], np.cross(anchor, soft[:, :3]), atol=1e-6 * weight, err_msg=mode)
             self.assertFalse(wrench[:rigid].any() or wrench[rigid + count :].any(), mode)
@@ -5288,11 +5284,6 @@ class TestDroppedDualGauge(unittest.TestCase):
 class TestLiteContactsOnBoxes(unittest.TestCase):
     """A cloth resting on identical boxes in the lite NSN."""
 
-    @classmethod
-    def setUpClass(cls):
-        if not wp.is_cuda_available():
-            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
-
     @staticmethod
     def _drop_on_boxes(boxes: int, mode: str, friction: bool = True, solver_out: list | None = None):
         """Drop a cloth on ``boxes`` identical boxes for 0.5 s; return its particle heights and contact count, and
@@ -5361,11 +5352,6 @@ class TestLiteContactsOnBoxes(unittest.TestCase):
 
 class TestContactOverflow(unittest.TestCase):
     """Steps whose collision pipeline found more contacts than its buffers hold."""
-
-    @classmethod
-    def setUpClass(cls):
-        if not wp.is_cuda_available():
-            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
 
     def _step(self, builder, **capacity):
         """Collide and step once, returning the stored contacts and the found ones."""

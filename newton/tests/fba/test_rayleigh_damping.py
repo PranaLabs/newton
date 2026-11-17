@@ -202,11 +202,6 @@ class TestRayleighDampingContacts(unittest.TestCase):
     """Mass damping with the lite contact operator, which takes the mass term of the system matrix, damping
     included, for a particle's response."""
 
-    @classmethod
-    def setUpClass(cls):
-        if not wp.is_cuda_available():
-            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
-
     def test_lite_contacts_hold_their_distance_with_mass_damping(self):
         """Rest a cloth on a box at the contact distance with strong mass damping and the lite contact operator.
 

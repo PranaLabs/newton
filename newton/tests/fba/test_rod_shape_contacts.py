@@ -57,11 +57,6 @@ class TestRodOverThinBar(unittest.TestCase):
     one end and 15 g on the other: without segment contacts the bar passes between two particles and the string
     drops off; with them it slides over the bar and stays on."""
 
-    @classmethod
-    def setUpClass(cls):
-        if not wp.is_cuda_available():
-            raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
-
     def _run(self, segments, **options):
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
