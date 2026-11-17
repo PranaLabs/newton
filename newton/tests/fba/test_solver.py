@@ -5202,8 +5202,9 @@ class TestLiteContactsOnBoxes(unittest.TestCase):
             raise unittest.SkipTest("The SolverFBA contact NSN needs CUDA")
 
     @staticmethod
-    def _drop_on_boxes(boxes: int, mode: str, friction: bool = True) -> tuple[np.ndarray, int]:
-        """Drop a cloth on ``boxes`` identical boxes for 0.5 s; return its particle heights and contact count."""
+    def _drop_on_boxes(boxes: int, mode: str, friction: bool = True, solver_out: list | None = None):
+        """Drop a cloth on ``boxes`` identical boxes for 0.5 s; return its particle heights and contact count, and
+        append the solver to ``solver_out``."""
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
         for _ in range(boxes):
             builder.add_shape_box(body=-1, hx=0.5, hy=0.5, hz=0.05)
@@ -5231,6 +5232,8 @@ class TestLiteContactsOnBoxes(unittest.TestCase):
             pipeline.collide(s0, contacts)
             solver.step(s0, s1, None, contacts, 1.0 / 60.0)
             s0, s1 = s1, s0
+        if solver_out is not None:
+            solver_out.append(solver)
         return s0.particle_q.numpy()[:, 2], int(contacts.soft_contact_count.numpy()[0])
 
     def test_rests_at_the_contact_distance(self):
@@ -5242,10 +5245,26 @@ class TestLiteContactsOnBoxes(unittest.TestCase):
                 np.testing.assert_allclose(heights, 0.055, rtol=0.0, atol=1.0e-5)
 
     def test_five_contacts_on_a_particle_hold(self):
-        """Rest a cloth on five identical boxes in the lite NSN, five contacts on each particle, as on one box."""
-        heights, count = self._drop_on_boxes(5, "lite")
-        self.assertEqual(count, 5 * 25)
-        np.testing.assert_allclose(heights, self._drop_on_boxes(1, "lite")[0], rtol=0.0, atol=1.0e-4)
+        """Rest a cloth on five identical boxes in the lite NSN, five contacts on each particle, as on one box, with
+        and without friction; the frictionless lite NSN steps each particle's contacts on their own and holds no
+        dense operator."""
+        for friction in (True, False):
+            with self.subTest(friction=friction):
+                solvers = []
+                heights, count = self._drop_on_boxes(5, "lite", friction, solvers)
+                self.assertEqual(count, 5 * 25)
+                np.testing.assert_allclose(heights, self._drop_on_boxes(1, "lite", friction)[0], rtol=0.0, atol=1.0e-4)
+                self.assertIsNone(solvers[0]._nsn_a_schur_d)
+                self.assertFalse(hasattr(solvers[0]._linear_solver, "_W_device_d"))
+
+    def test_thirteen_frictionless_contacts_on_a_particle_hold(self):
+        """Rest a cloth on thirteen identical boxes without friction, more contacts on each particle than the
+        per-particle Newton step holds, which take the dense lite operator, as on one box."""
+        solvers = []
+        heights, count = self._drop_on_boxes(13, "lite", False, solvers)
+        self.assertEqual(count, 13 * 25)
+        np.testing.assert_allclose(heights, self._drop_on_boxes(1, "lite", False)[0], rtol=0.0, atol=1.0e-4)
+        self.assertIsNotNone(solvers[0]._nsn_a_schur_d)
 
 
 class TestContactOverflow(unittest.TestCase):

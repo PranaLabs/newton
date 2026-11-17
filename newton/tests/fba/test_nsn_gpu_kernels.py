@@ -8,8 +8,9 @@ Verifies
 :func:`~newton._src.solvers.fba.kernels.fb_frictional_row_wp`,
 :func:`~newton._src.solvers.fba.kernels.build_a_schur_kernel` and
 :func:`~newton._src.solvers.fba.kernels.coulomb_box_clamp_kernel` against
-their CPU numpy/Python references, and
-:func:`~newton._src.solvers.fba.kernels.fb_newton_lite_coulomb_kernel`
+their CPU numpy/Python references, ,
+:func:`~newton._src.solvers.fba.kernels.fb_newton_lite_coulomb_kernel` and
+:func:`~newton._src.solvers.fba.kernels.fb_newton_lite_unilateral_kernel`
 against the host NSN step with the lite mass operator.
 """
 
@@ -19,7 +20,13 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.fba import kernels as K
-from newton.tests.fba._reference import coulomb_box_clamp, fb_frictional_row, fb_unilateral_row, solve_nsn_coulomb
+from newton.tests.fba._reference import (
+    coulomb_box_clamp,
+    fb_frictional_row,
+    fb_unilateral_row,
+    solve_nsn_coulomb,
+    solve_nsn_unilateral,
+)
 
 
 @wp.kernel
@@ -388,6 +395,75 @@ class TestLiteCoulombKernel(unittest.TestCase):
         np.testing.assert_allclose(
             lam_apply.numpy(), lam_apply_ref, rtol=0.0, atol=1.0e-6 * np.abs(lam_apply_ref).max()
         )
+
+
+class TestLiteUnilateralKernel(unittest.TestCase):
+    """The per-particle frictionless lite FB-Newton kernel against the host NSN step."""
+
+    def test_per_particle_kernel_matches_the_host_step(self):
+        """Take one warm-started frictionless lite Newton step on particles with one, two and three contacts, in
+        the rows' order of the solver, interleaved across particles, as the host NSN step does on the block-diagonal
+        lite operator; a particle with more contacts than the kernel holds keeps its multipliers."""
+        rng = np.random.default_rng(1)
+        dt, N = 0.01, 6
+        particle = np.array([3, 0, 1, 3, 1, 4, 3, 2, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5], dtype=np.int32)
+        M = len(particle)
+        normal = rng.normal(size=(M, 3))
+        normal /= np.linalg.norm(normal, axis=1, keepdims=True)
+        alpha = rng.uniform(0.5, 1.0, M).astype(np.float32)
+        inv_mass = rng.uniform(0.5, 2.0, N)
+        r = rng.normal(scale=1.0e-3, size=M)
+        pene0 = rng.normal(scale=1.0e-3, size=M)
+        lam0 = np.abs(rng.normal(scale=10.0, size=M))
+        omega0 = rng.uniform(0.2, 1.0, M)
+        W = np.where(
+            particle[:, None] == particle[None, :],
+            np.outer(alpha, alpha) * (normal @ normal.T) * dt * dt * inv_mass[particle][:, None],
+            0.0,
+        )
+        held = particle == 5  # 13 contacts, more than the kernel holds
+        keep = ~held
+        lam_ref, omega_ref, lam_apply_ref = solve_nsn_unilateral(
+            W[np.ix_(keep, keep)],
+            r[keep],
+            pene0[keep],
+            max_iters=1,
+            lam_init=lam0[keep],
+            omega_init=omega0[keep],
+            dt=dt,
+        )
+
+        order = np.argsort(particle, kind="stable").astype(np.int32)
+        offsets = np.zeros(N + 1, dtype=np.int32)
+        offsets[1:] = np.cumsum(np.bincount(particle, minlength=N))
+        unique = np.unique(particle).astype(np.int32)
+        lam = wp.array(lam0, dtype=wp.float64)
+        omega = wp.array(omega0, dtype=wp.float64)
+        lam_apply = wp.zeros(M, dtype=wp.float64)
+        wp.launch(
+            K.fb_newton_lite_unilateral_kernel,
+            dim=len(unique),
+            inputs=[
+                wp.array(unique, dtype=wp.int32),
+                wp.array(offsets, dtype=wp.int32),
+                wp.array(order, dtype=wp.int32),
+                wp.array(normal.astype(np.float32), dtype=wp.vec3),
+                wp.array(alpha, dtype=wp.float32),
+                wp.array(r, dtype=wp.float64),
+                wp.array(pene0, dtype=wp.float64),
+                wp.array(inv_mass, dtype=wp.float64),
+                wp.float64(dt),
+            ],
+            outputs=[lam, omega, lam_apply],
+        )
+        lam, omega, lam_apply = lam.numpy(), omega.numpy(), lam_apply.numpy()
+        # The kernel takes float32 directions; the multipliers still agree to rounding.
+        np.testing.assert_allclose(lam[keep], lam_ref, rtol=0.0, atol=1.0e-6 * np.abs(lam_ref).max())
+        np.testing.assert_allclose(omega[keep], omega_ref, rtol=0.0, atol=1.0e-6)
+        np.testing.assert_allclose(lam_apply[keep], lam_apply_ref, rtol=0.0, atol=1.0e-6 * np.abs(lam_apply_ref).max())
+        np.testing.assert_array_equal(lam[held], lam0[held])
+        np.testing.assert_array_equal(omega[held], omega0[held])
+        np.testing.assert_allclose(lam_apply[held], dt * dt * omega0[held] * lam0[held], rtol=1.0e-15)
 
 
 if __name__ == "__main__":
