@@ -1743,7 +1743,8 @@ class TestCorotationalProjection(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(q)), "non-finite values in corotational simulation")
 
     def test_solver_init_requires_lame_for_corot(self):
-        """Refuse triangles without a positive k_lambda with ``stretching_model='corotational'``."""
+        """Refuse triangles of a negative bulk modulus, k_lambda <= -k_mu, with ``stretching_model='corotational'``,
+        and take those of Poisson's ratio 0, k_lambda = 0, which hang without blowing up."""
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
@@ -1765,8 +1766,19 @@ class TestCorotationalProjection(unittest.TestCase):
         )
         model = builder.finalize()
 
+        solver = SolverFBA(model, stretching_model="corotational")  # k_lambda = tri_ka = 0
+        s0, s1 = model.state(), model.state()
+        for _ in range(60):
+            solver.step(s0, s1, None, None, 1.0 / 60.0)
+            s0, s1 = s1, s0
+        q = s0.particle_q.numpy()
+        self.assertTrue(np.isfinite(q).all())
+        self.assertLess(np.ptp(q[:, 1]), 0.5)  # hangs from its pinned edge without running off
+        materials = model.tri_materials.numpy()
+        materials[:, 1] = -1.5 * materials[:, 0]
+        model.tri_materials.assign(materials)
         with self.assertRaises(ValueError):
-            SolverFBA(model, stretching_model="corotational")  # k_lambda = tri_ka = 0
+            SolverFBA(model, stretching_model="corotational")
 
     def test_lame_parameters_come_from_each_element(self):
         """Project each triangle with its own k_mu and k_lambda, scaled by its own gauge."""
@@ -1915,7 +1927,8 @@ class TestNeoHookeanProjection(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(q)), "non-finite values in neohookean simulation")
 
     def test_solver_init_requires_lame_for_neohookean(self):
-        """Refuse triangles without a positive k_lambda with ``stretching_model='neohookean'``."""
+        """Take triangles of Poisson's ratio 0, k_lambda = 0, with ``stretching_model='neohookean'``, and refuse those of
+        a negative bulk modulus."""
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
@@ -1937,8 +1950,17 @@ class TestNeoHookeanProjection(unittest.TestCase):
         )
         model = builder.finalize()
 
+        solver = SolverFBA(model, stretching_model="neohookean")  # k_lambda = tri_ka = 0
+        s0, s1 = model.state(), model.state()
+        for _ in range(60):
+            solver.step(s0, s1, None, None, 1.0 / 60.0)
+            s0, s1 = s1, s0
+        self.assertTrue(np.isfinite(s0.particle_q.numpy()).all())
+        materials = model.tri_materials.numpy()
+        materials[:, 1] = -1.5 * materials[:, 0]
+        model.tri_materials.assign(materials)
         with self.assertRaises(ValueError):
-            SolverFBA(model, stretching_model="neohookean")  # k_lambda = tri_ka = 0
+            SolverFBA(model, stretching_model="neohookean")
 
 
 class TestDynamicPin(unittest.TestCase):
@@ -2295,6 +2317,37 @@ class TestStepContract(unittest.TestCase):
             SolverFBA(model, particle_self_contact_edge_edge=True)
         with self.assertWarns(newton.exceptions.NewtonWarning):
             SolverFBA(model, face_contact_gap=0.01)
+
+    def test_particles_without_elements(self):
+        """Drop a grid of particles without elements onto the ground, where they come to rest."""
+        for device in self.devices:
+            with self.subTest(device=device):
+                builder = newton.ModelBuilder()
+                builder.add_particle_grid(
+                    pos=wp.vec3(0.0, 0.0, 0.1),
+                    rot=wp.quat_identity(),
+                    vel=wp.vec3(0.0),
+                    dim_x=3,
+                    dim_y=3,
+                    dim_z=1,
+                    cell_x=0.05,
+                    cell_y=0.05,
+                    cell_z=0.05,
+                    mass=0.01,
+                    jitter=0.0,
+                    radius_mean=0.01,
+                )
+                builder.add_ground_plane()
+                model = builder.finalize(device=device)
+                solver = SolverFBA(model, iterations=5)
+                pipeline = newton.CollisionPipeline(model)
+                contacts = pipeline.contacts()
+                s0, s1 = model.state(), model.state()
+                for _ in range(60):
+                    pipeline.collide(s0, contacts)
+                    solver.step(s0, s1, None, contacts, 1.0 / 60.0)
+                    s0, s1 = s1, s0
+                np.testing.assert_allclose(s0.particle_q.numpy()[:, 2], 0.01, atol=1.0e-3)
 
     @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
     def test_refuses_graph_capture(self):
@@ -4033,14 +4086,12 @@ class SolverFBAConstructorOptionsTests(unittest.TestCase):
         )
         return builder.finalize()
 
-    def test_solver_init_rejects_no_geometry(self):
-        """Refuse a model without triangles or tetrahedra."""
+    def test_solver_init_rejects_an_empty_model(self):
+        """Refuse a model without particles or bodies."""
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
-        builder = newton.ModelBuilder()
-        builder.add_particle(pos=wp.vec3(0.0, 0.0, 0.0), vel=wp.vec3(0.0, 0.0, 0.0), mass=1.0)
-        model = builder.finalize()
-        with self.assertRaises(ValueError):
+        model = newton.ModelBuilder().finalize()
+        with self.assertRaisesRegex(ValueError, "deformable elements or rigid bodies"):
             SolverFBA(model, iterations=1)
 
     def test_several_worlds_are_supported(self) -> None:
