@@ -1,0 +1,1 @@
+Accept models of particles without elements in `SolverFBA`, which the solver feature matrix lists and which raised `ValueError`, and corotational and Neo-Hookean materials of Poisson's ratio 0 or below that keep a positive bulk modulus, which also raised.

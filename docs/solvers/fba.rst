@@ -219,6 +219,10 @@ Model Inputs
   same ``edge_ke`` bends an FBA cloth more stiffly than a
   :class:`~newton.solvers.SolverVBD` one, which scales it by the edge length.
 - **Soft bodies**: tetrahedra with the same stretching models.
+  ``"corotational"`` and ``"neohookean"`` need a stable material, of positive
+  bulk modulus (``k_lambda > -k_mu`` for triangles, ``k_lambda > -2 k_mu / 3``
+  for tetrahedra); a Poisson's ratio of 0, ``k_lambda = 0``, is fine.
+- **Particles** without elements fall, collide and rest on their own.
 - **Springs**: each spring of the model is a stretch element of energy
   ``spring_stiffness / 2 (|x_b - x_a| - spring_rest_length)^2``. Its local
   step is an ADMM step: a scaled dual, kept from step to step, corrects the

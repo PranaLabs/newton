@@ -652,8 +652,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
         # ---- Validate ----
         if model.particle_count == 0 and model.body_count == 0:
             raise ValueError("SolverFBA requires deformable elements or rigid bodies")
-        if model.particle_count > 0 and model.tri_count == 0 and model.tet_count == 0 and model.spring_count == 0:
-            raise ValueError("SolverFBA requires at least one cloth triangle, tetrahedral element or spring")
         if stretching_model not in ("arap", "corotational", "neohookean"):
             raise ValueError(
                 f"stretching_model={stretching_model!r} not supported; choose 'arap', 'corotational' or 'neohookean'"
@@ -2457,9 +2455,15 @@ class SolverFBA(TendonStateMixin, SolverBase):
             tri_mu, tri_lam = _element_lame(model.tri_materials, model.tri_count)
             tet_mu, tet_lam = _element_lame(model.tet_materials, model.tet_count)
             # Elements with k_mu = 0, such as the surface triangles of a soft body, carry no stretching.
-            mu, lam = np.concatenate([tri_mu, tet_mu]), np.concatenate([tri_lam, tet_lam])
-            if (mu < 0).any() or (lam[mu > 0] <= 0).any():
-                raise ValueError(f"stretching_model={stretching_model!r} needs k_lambda > 0 wherever k_mu > 0")
+            mu = np.concatenate([tri_mu, tet_mu])
+            # The materials must be stable: a positive bulk modulus, lambda + 2 mu / 3 for tetrahedra and lambda + mu
+            # for triangles, which also keeps the gauges finite and positive. Poisson's ratio 0, lambda = 0, is fine.
+            stable = np.concatenate([tri_lam > -tri_mu, tet_lam > -2.0 * tet_mu / 3.0])
+            if (mu < 0).any() or not stable[mu > 0].all():
+                raise ValueError(
+                    f"stretching_model={stretching_model!r} needs k_mu >= 0 and a positive bulk modulus, k_lambda > "
+                    "-k_mu for triangles and k_lambda > -2 k_mu / 3 for tetrahedra"
+                )
             with np.errstate(divide="ignore", invalid="ignore"):
                 self._tri_gauge = np.where(tri_mu > 0, (4.0 * tri_mu + 3.0 * tri_lam) / (2.0 * tri_mu + tri_lam), 1.0)
                 self._tet_gauge = np.where(tet_mu > 0, 2.0 + tet_lam / (2.0 * (tet_lam + tet_mu)), 1.0)
