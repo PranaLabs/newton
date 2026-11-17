@@ -242,7 +242,7 @@ enforce joints as pairwise body constraints but do not use the articulation kine
 :class:`~newton.solvers.SolverVBD` supports a subset of joint types through maximal-coordinate
 constraints, with unified compliant ALM by default and a deprecated legacy AVBD path.
 :class:`~newton.solvers.SolverFBA` enforces joints as bilateral maximal-coordinate constraints, the limits of
-revolute and prismatic joints as unilateral rows, without drives.
+revolute and prismatic joints as unilateral rows, and the drives, damping and armature of free axes as soft rows.
 :class:`~newton.solvers.SolverStyle3D` and :class:`~newton.solvers.SolverImplicitMPM` do not support joints.
 
 **Joint types**
@@ -369,7 +369,7 @@ revolute and prismatic joints as unilateral rows, without drives.
      - |yes|
      - |no|
      - |yes|
-     - |no|
+     - |yes|
    * - :attr:`~newton.Model.joint_friction`
      - |no|
      - |no|
@@ -444,7 +444,7 @@ revolute and prismatic joints as unilateral rows, without drives.
      - |yes|
      - |yes| :sup:`7`
      - |yes|
-     - |no|
+     - |yes| :sup:`15`
    * - :attr:`~newton.Model.joint_target_mode`
      - |no|
      - |no|
@@ -462,7 +462,7 @@ revolute and prismatic joints as unilateral rows, without drives.
      - |yes|
      - |yes|
      - |yes|
-     - |no|
+     - |yes|
 
 **Constraints**
 
@@ -520,6 +520,9 @@ revolute and prismatic joints as unilateral rows, without drives.
 | :sup:`12` With ``solve_mode="matrix_free"``, Steel enforces each mimic relationship within one articulation as one bilateral constraint row per follower coordinate; mimics of BALL, FREE, and DISTANCE joints and mimics across articulations are rejected. It also enforces loop-closing BALL joints as point constraints. ``solve_mode="split"`` rejects mimic relationships and loop-closing joints; the propagation contact responses (``articulated_contact_response``) reject loop-closing joints and solve mimic rows iteratively.
 | :sup:`13` See :ref:`Particle-body attachments` for authoring and semantics. Attachments spanning two
   solvers are coupled by :class:`~newton.solvers.experimental.coupled.SolverCoupledADMM` instead.
+| :sup:`15` FBA takes the backward Euler step of each drive with the axis's damping and armature. Position drives
+  need a linear axis or the angular axis of a joint with one; drive forces are not limited to
+  ``joint_effort_limit``.
 
 .. _Particle-body attachments:
 

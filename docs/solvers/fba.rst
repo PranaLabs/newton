@@ -38,9 +38,10 @@ held by other objects:
   solve, or rigid bodies come from another solver, such as an arm that
   :class:`~newton.solvers.SolverFeatherstone` integrates.
 
-Choose another solver for differentiable simulation and for articulations that need drives or actuators: FBA
-treats joints as bilateral constraints, with the limits of revolute and prismatic joints and passive damping, so
-integrate such an articulation with another solver and pass
+Choose another solver for differentiable simulation and for articulations whose drives need effort limits, joint
+friction or actuators other than PD drives: FBA treats joints as bilateral constraints, with the limits of
+revolute and prismatic joints, passive damping, PD drives and armature, so integrate such an articulation with
+another solver and pass
 ``integrate_with_external_rigid_solver=True``. See the :ref:`Supported
 Features` matrix and the :ref:`Joint feature support` tables for a comparison
 with the other solvers. The solver builds on projective dynamics and a
@@ -334,7 +335,7 @@ Model Inputs
   tumbling body loses a little energy rather than gaining it. FBA does not
   write ``State.joint_q`` and
   ``State.joint_qd``: :func:`~newton.eval_ik` computes them from the bodies.
-- **Joint limits and damping**: the free axis of a REVOLUTE or PRISMATIC joint
+- **Joint limits, damping and drives**: the free axis of a REVOLUTE or PRISMATIC joint
   takes its limits, :attr:`~newton.Model.joint_limit_lower` and
   :attr:`~newton.Model.joint_limit_upper`, as hard unilateral rows, solved with
   the rigid contacts: a limit's row joins a step when the axis starts it, or
@@ -352,8 +353,30 @@ Model Inputs
   for an axis of effective inertia ``I``. An angular axis's rate is the
   relative angular velocity along it in the parent's joint frame, or the
   child's for the second axis of a D6 joint with two angular axes, and its
-  motion over a step that of the relative rotation's increment. Joints at the
-  default infinite limits and zero damping take no such rows. Limits need the
+  motion over a step that of the relative rotation's increment. A free axis
+  with a drive, :attr:`~newton.Model.joint_target_ke` or
+  :attr:`~newton.Model.joint_target_kd`, or with armature,
+  :attr:`~newton.Model.joint_armature`, takes them into the same soft row:
+  the backward Euler step of the force
+  ``ke (q* - q) + kd (q_dot* - q_dot) - c q_dot - I_a q_ddot`` at the step's
+  end, toward the control's :attr:`~newton.Control.joint_target_q` and
+  :attr:`~newton.Control.joint_target_qd` (the model's without a control). As
+  in :class:`~newton.solvers.SolverFeatherstone`, the gains act whatever the
+  DOF's :attr:`~newton.Model.joint_target_mode`. A position drive needs an
+  axis with one coordinate: a linear axis, or the angular axis of a joint with
+  one, whose angle FBA measures in ``(-pi, pi]`` as
+  :class:`~newton.solvers.SolverSemiImplicit` does; a position gain on a BALL
+  joint or on the angular axes of a D6 joint with several raises
+  ``NotImplementedError`` at the first step, while velocity drives, damping and
+  armature act on every free axis. :attr:`~newton.Control.joint_f` adds each
+  DOF's generalized force to the bodies as
+  :class:`~newton.solvers.SolverSemiImplicit` applies it, and a FREE joint's
+  wrench to its child. FBA does not limit the drive forces to
+  :attr:`~newton.Model.joint_effort_limit` and ignores
+  :attr:`~newton.Model.joint_friction` and
+  :attr:`~newton.Model.joint_velocity_limit`, with a warning where an
+  articulation it integrates sets them. Joints at the default infinite limits,
+  zero damping and armature and no drive take no such rows. Limits need the
   full operator.
 - **Tendons**: FBA simulates the model's tendons
   (:meth:`~newton.ModelBuilder.add_tendon`) and routes them itself with
@@ -392,9 +415,10 @@ FBA does not simulate equality constraints, mimic joints, the model's
 particle-body attachments (tie particles to bodies with
 :meth:`~newton.solvers.SolverFBA.set_particle_constraints` instead), the
 limits of BALL and D6 joints, the limit stiffness and damping
-``joint_limit_ke`` and ``joint_limit_kd`` (its limits are hard), drives,
-armature, or joint friction, or
-the inputs of :class:`~newton.Control` other than ``tet_activations``, and it
+``joint_limit_ke`` and ``joint_limit_kd`` (its limits are hard), the effort
+and velocity limits and the friction of joint DOFs, or the inputs of
+:class:`~newton.Control` other than ``tet_activations``, ``joint_f``,
+``joint_target_q`` and ``joint_target_qd``, and it
 does not read the damping coefficients ``tri_kd``, ``edge_kd`` and ``k_damp``
 of the elements.
 

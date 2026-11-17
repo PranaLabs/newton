@@ -5,6 +5,7 @@
 
 import itertools
 import unittest
+import warnings
 
 import numpy as np
 import warp as wp
@@ -184,6 +185,7 @@ class TestFBAJointKernels(unittest.TestCase):
             inputs=[
                 *(*args, *empty, model.body_q, model.body_com),
                 *(wp.zeros(R, dtype=wp.float64, device="cpu"), wp.zeros(R, dtype=wp.quatd, device="cpu")),
+                wp.zeros(R, dtype=wp.float64, device="cpu"),
             ],
             outputs=[res],
             device="cpu",
@@ -280,6 +282,7 @@ class TestFBAJointKernels(unittest.TestCase):
                     model.body_com,
                     wp.zeros(R, dtype=wp.float64, device="cpu"),
                     wp.zeros(R, dtype=wp.quatd, device="cpu"),
+                    wp.zeros(R, dtype=wp.float64, device="cpu"),
                 ],
                 outputs=[res],
                 device="cpu",
@@ -798,6 +801,200 @@ class TestSolverFBAJointState(unittest.TestCase):
                 s0, s1 = s1, s0
             finals.append(s0.body_q.numpy())
         np.testing.assert_array_equal(finals[0], finals[1])
+
+
+def _implicit_euler(n, dt, inertia, ke=0.0, kd=0.0, c=0.0, armature=0.0, q_target=0.0, qd_target=0.0, force=0.0):
+    """Coordinates and rates of an axis of ``inertia`` from rest at 0 over ``n`` backward Euler steps of its drive
+    ``ke (q* - q) + kd (q_dot* - q_dot)``, damping ``-c q_dot``, armature and constant generalized ``force``."""
+    q = v = 0.0
+    m = inertia + armature
+    out = []
+    for _ in range(n):
+        v = (m * v / dt + ke * (q_target - q) + kd * qd_target + force) / (m / dt + ke * dt + kd + c)
+        q += dt * v
+        out.append((q, v))
+    return np.array(out)
+
+
+class TestSolverFBAJointDrives(unittest.TestCase):
+    """SolverFBA's joint drives, armature and generalized joint forces (``Control.joint_f``)."""
+
+    @staticmethod
+    def _axis_model(kind, lower=-1.0e10, upper=1.0e10, **dof):
+        """A unit body on a revolute joint about z through its COM or a prismatic joint along z, without gravity, its
+        DOF's ``target_ke``, ``target_kd``, ``damping`` and ``armature`` set from ``dof``."""
+        builder = newton.ModelBuilder()
+        link = _link(builder)
+        add = builder.add_joint_revolute if kind == "revolute" else builder.add_joint_prismatic
+        builder.add_articulation([add(-1, link, axis=(0.0, 0.0, 1.0), limit_lower=lower, limit_upper=upper)])
+        model = builder.finalize()
+        model.gravity.assign([wp.vec3(0.0, 0.0, 0.0)])
+        for name in ("target_ke", "target_kd", "damping", "armature"):
+            getattr(model, f"joint_{name}").assign([dof.get(name, 0.0)])
+        return model
+
+    @staticmethod
+    def _run(model, dt, n, targets=None, joint_f=None):
+        """Each step's body poses and velocities, ``[step, 7 or 6]`` of body 0, with ``targets`` as
+        ``{step: (q*, q_dot*)}`` set on the control from that step on, and a constant ``joint_f``."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        solver = SolverFBA(model, iterations=5)
+        control = model.control()
+        if joint_f is not None:
+            control.joint_f.assign(np.asarray(joint_f, dtype=np.float32))
+        s0, s1 = model.state(), model.state()
+        q, qd = [], []
+        for k in range(n):
+            if targets and k in targets:
+                control.joint_target_q.assign(np.atleast_1d(np.float32(targets[k][0])))
+                control.joint_target_qd.assign(np.atleast_1d(np.float32(targets[k][1])))
+            solver.step(s0, s1, control, None, dt)
+            s0, s1 = s1, s0
+            q.append(s0.body_q.numpy()[0].astype(np.float64))
+            qd.append(s0.body_qd.numpy()[0].astype(np.float64))
+        return np.array(q), np.array(qd)
+
+    @staticmethod
+    def _coordinate(kind, q, qd):
+        """The axis coordinate and rate of :meth:`_axis_model` from its body's poses and velocities."""
+        if kind == "revolute":
+            return 2.0 * np.arctan2(q[:, 5], q[:, 6]), qd[:, 5]
+        return q[:, 2], qd[:, 2]
+
+    def test_drives_match_implicit_euler(self):
+        """Drive an axis of unit inertia by position and velocity targets, with damping and armature, step for step
+        as the backward Euler step of its forces does, alone in the joint system and, next to a limit, with the
+        joint rows in the contact solve."""
+        dt, n = 0.01, 100
+        cases = (
+            ("revolute", {}, {"target_ke": 50.0}, (0.5, 0.0)),
+            ("revolute", {}, {"target_ke": 50.0, "target_kd": 5.0}, (0.5, 0.0)),
+            ("revolute", {}, {"target_kd": 4.0}, (0.0, 2.0)),
+            ("revolute", {}, {"target_ke": 50.0, "target_kd": 5.0, "damping": 1.0, "armature": 0.5}, (-0.4, 0.0)),
+            ("revolute", {"lower": -0.01, "upper": 2.0}, {"target_ke": 50.0, "target_kd": 5.0}, (0.5, 0.0)),
+            ("prismatic", {}, {"target_ke": 100.0, "target_kd": 10.0, "armature": 0.3}, (0.2, 0.0)),
+            ("prismatic", {}, {"target_kd": 3.0}, (0.0, -0.5)),
+        )
+        for kind, limits, dof, target in cases:
+            with self.subTest(kind=kind, limits=limits, **dof):
+                model = self._axis_model(kind, **limits, **dof)
+                q, qd = self._run(model, dt, n, targets={0: target})
+                coordinate, rate = self._coordinate(kind, q, qd)
+                gains = {"ke": "target_ke", "kd": "target_kd", "c": "damping", "armature": "armature"}
+                expected = _implicit_euler(
+                    n,
+                    dt,
+                    1.0,
+                    **{k: dof.get(v, 0.0) for k, v in gains.items()},
+                    q_target=target[0],
+                    qd_target=target[1],
+                )
+                np.testing.assert_allclose(coordinate, expected[:, 0], rtol=1e-4, atol=1e-6)
+                np.testing.assert_allclose(rate, expected[:, 1], rtol=1e-4, atol=1e-6)
+
+    def test_joint_forces_accelerate_the_axes(self):
+        """Accelerate an axis of unit inertia with armature 0.5 by a constant generalized force, as the backward
+        Euler step does, and a body on a FREE joint by the joint's world wrench."""
+        dt, n = 0.01, 50
+        for kind in ("revolute", "prismatic"):
+            with self.subTest(kind=kind):
+                model = self._axis_model(kind, armature=0.5)
+                q, qd = self._run(model, dt, n, joint_f=[2.0])
+                coordinate, rate = self._coordinate(kind, q, qd)
+                expected = _implicit_euler(n, dt, 1.0, armature=0.5, force=2.0)
+                np.testing.assert_allclose(coordinate, expected[:, 0], rtol=1e-4, atol=1e-6)
+                np.testing.assert_allclose(rate, expected[:, 1], rtol=1e-4, atol=1e-6)
+        with self.subTest(kind="free"):
+            builder = newton.ModelBuilder()
+            link = _link(builder)
+            builder.add_articulation([builder.add_joint_free(link)])
+            model = builder.finalize()
+            model.gravity.assign([wp.vec3(0.0, 0.0, 0.0)])
+            wrench = [1.0, -2.0, 0.5, 0.3, 0.0, -0.6]
+            _q, qd = self._run(model, dt, n, joint_f=wrench)
+            np.testing.assert_allclose(qd[-1], n * dt * np.array(wrench), rtol=1e-5, atol=1e-9)
+
+    def test_position_drive_holds_a_pendulum_against_gravity(self):
+        """Settle a pendulum of 1 kg at 1 m whose drive holds it at 0 rad against gravity where the drive's torque
+        balances gravity's, ``ke (0 - q) = m g l cos(q)``."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        TestSolverFBAJointLimits._pendulum(builder, -1.0e10, 1.0e10)
+        model = builder.finalize()
+        ke, kd = 2000.0, 60.0
+        model.joint_target_ke.assign([ke])
+        model.joint_target_kd.assign([kd])
+        q, _qd = self._run(model, 0.005, 400)
+        angle = np.arctan2(q[-1, 1], q[-1, 0])
+        expected = 0.0
+        for _ in range(20):
+            expected = -9.81 * np.cos(expected) / ke
+        self.assertAlmostEqual(angle, expected, delta=1e-5)
+
+    def test_drives_follow_the_control_targets(self):
+        """Move a driven axis to the control's position target and then to a new one set during the run."""
+        model = self._axis_model("revolute", target_ke=200.0, target_kd=30.0)
+        q, qd = self._run(model, 0.01, 300, targets={0: (0.3, 0.0), 150: (-0.2, 0.0)})
+        coordinate, _rate = self._coordinate("revolute", q, qd)
+        self.assertAlmostEqual(coordinate[149], 0.3, delta=1e-3)
+        self.assertAlmostEqual(coordinate[-1], -0.2, delta=1e-3)
+
+    def test_unapplied_dof_properties_warn(self):
+        """Warn at the first step about the effort limit of a driven DOF, joint friction and velocity limits, which
+        FBA does not apply, and not about the defaults or the effort limit of an undriven DOF."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        cases = (
+            ({}, None),
+            ({"effort_limit": 50.0}, None),
+            ({"effort_limit": 50.0, "target_ke": 10.0}, "joint_effort_limit"),
+            ({"friction": 0.2}, "joint_friction"),
+            ({"velocity_limit": 3.0}, "joint_velocity_limit"),
+        )
+        for dof, name in cases:
+            with self.subTest(**dof):
+                builder = newton.ModelBuilder()
+                link = _link(builder)
+                builder.add_articulation([builder.add_joint_revolute(-1, link, damping=1.0, **dof)])
+                model = builder.finalize()
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    SolverFBA(model).step(model.state(), model.state(), None, None, 0.01)
+                messages = [str(w.message) for w in caught if "does not apply" in str(w.message)]
+                if name is None:
+                    self.assertEqual(messages, [])
+                else:
+                    self.assertEqual(len(messages), 1)
+                    self.assertIn(name, messages[0])
+
+    def test_position_drives_of_several_angular_axes_raise(self):
+        """Refuse position drives on the angular axes of ball joints and of D6 joints with two angular axes, which
+        have no single angle, at the first step; accept velocity drives on them."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        def step(model):
+            SolverFBA(model).step(model.state(), model.state(), None, None, 0.01)
+
+        for kind in ("ball", "d6"):
+            for gain in ("target_ke", "target_kd"):
+                with self.subTest(kind=kind, gain=gain):
+                    builder = newton.ModelBuilder()
+                    link = _link(builder)
+                    if kind == "ball":
+                        joint = builder.add_joint_ball(-1, link)
+                    else:
+                        axes = [Dof(axis=(1.0, 0.0, 0.0)), Dof(axis=(0.0, 1.0, 0.0))]
+                        joint = builder.add_joint_d6(-1, link, angular_axes=axes)
+                    builder.add_articulation([joint])
+                    model = builder.finalize()
+                    gains = getattr(model, f"joint_{gain}").numpy()
+                    gains[0] = 10.0
+                    getattr(model, f"joint_{gain}").assign(gains)
+                    if gain == "target_ke":
+                        with self.assertRaisesRegex(NotImplementedError, "one free angular axis"):
+                            step(model)
+                    else:
+                        step(model)
 
 
 if __name__ == "__main__":
