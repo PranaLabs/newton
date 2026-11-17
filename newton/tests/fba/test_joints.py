@@ -30,7 +30,7 @@ def _rows(model, device="cpu"):
 
 def _row_args(rows, slot):
     return [
-        *(rows.row_joint, rows.row_angular, rows.row_kind, rows.row_dir),
+        *(rows.row_joint, rows.row_angular, rows.row_kind, rows.row_dir, rows.row_axis2),
         *(rows.parent, rows.child, rows.X_pj, rows.X_cj, slot),
     ]
 
@@ -208,7 +208,38 @@ class TestFBAJointKernels(unittest.TestCase):
         """Match the joint row Jacobian with finite differences of the residuals under the rigid retraction."""
         builder = newton.ModelBuilder()
         _add_satisfied_chain(builder)
+        self._assert_jacobian_matches_finite_differences(builder.finalize(device="cpu"))
+
+    def test_jacobian_matches_finite_differences_off_the_anchors(self):
+        """Match the Jacobian of a prismatic joint slid 0.3 m along a turned parent, whose locked rows turn with the
+        parent away from the child's anchor, and of a D6 joint with two angular axes turned to (0.6, -0.4), whose
+        Hooke row holds the angle between the parent's first axis and the child's second."""
+        builder = newton.ModelBuilder()
+        links = [_link(builder) for _ in range(3)]
+        joints = [
+            builder.add_joint_revolute(-1, links[0], axis=(0.0, 0.0, 1.0), child_xform=wp.transform((0.2, 0.0, 0.0))),
+            builder.add_joint_prismatic(
+                links[0], links[1], axis=(1.0, 0.0, 0.0), child_xform=wp.transform((0.0, 0.1, 0.0))
+            ),
+            builder.add_joint_d6(
+                links[1],
+                links[2],
+                angular_axes=[Dof(axis=(1.0, 0.0, 0.0)), Dof(axis=(0.0, 1.0, 0.0))],
+                parent_xform=wp.transform((0.0, 0.0, 0.3)),
+                child_xform=wp.transform((0.1, 0.0, -0.2)),
+            ),
+        ]
+        builder.add_articulation(joints)
         model = builder.finalize(device="cpu")
+        model.joint_q.assign(np.array([0.7, 0.3, 0.6, -0.4], dtype=np.float32))
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+        model.body_q.assign(state.body_q)
+        kinds = _rows(model).row_kind.numpy()
+        self.assertEqual(int(np.count_nonzero(kinds == int(J.ROW_HOOKE))), 1)
+        self._assert_jacobian_matches_finite_differences(model)
+
+    def _assert_jacobian_matches_finite_differences(self, model):
         rows, slot = _rows(model), wp.array(np.arange(3), dtype=wp.int32, device="cpu")
         R = rows.row_joint.shape[0]
         x0, q0 = _com_poses(model)
@@ -329,6 +360,59 @@ class TestSolverFBAJoints(unittest.TestCase):
         model.gravity.assign([wp.vec3(1.0, -9.81, 0.5)])
         h, n = 0.01, 20
         np.testing.assert_allclose(self._run(model, h, n), [h * h * n * (n + 1) / 2, 0, 0, 0, 0, 0, 1], atol=1e-6)
+
+    def test_two_axis_d6_keeps_its_pose(self):
+        """Hold a body on a D6 joint with two angular axes at rest where the joint's coordinates (0.8, 0.8) put it,
+        as Newton composes the rotation ``q(a0, q0) q(a1, q1)``, without gravity."""
+        builder = newton.ModelBuilder()
+        link = _link(builder)
+        axes = [Dof(axis=(1.0, 0.0, 0.0)), Dof(axis=(0.0, 1.0, 0.0))]
+        joint = builder.add_joint_d6(-1, link, angular_axes=axes, child_xform=wp.transform((0.0, 0.0, 0.5)))
+        builder.add_articulation([joint])
+        model = builder.finalize()
+        model.gravity.assign([wp.vec3(0.0, 0.0, 0.0)])
+        model.joint_q.assign(np.array([0.8, 0.8], dtype=np.float32))
+        start = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, start)
+        model.body_q.assign(start.body_q)
+        tf = self._run(model, 0.01, 10)
+        np.testing.assert_allclose(tf, start.body_q.numpy()[0], atol=1e-5)
+
+    def test_prismatic_child_conserves_angular_momentum(self):
+        """Keep the angular momentum of a free body and a child on a prismatic joint spinning without gravity, while
+        the child slides out along the axis."""
+        inertia_p, inertia_c = 0.1, 0.01
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        parent = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * inertia_p), lock_inertia=True)
+        child = builder.add_link(
+            mass=1.0, inertia=wp.mat33(np.eye(3) * inertia_c), lock_inertia=True, xform=wp.transform((0.5, 0.0, 0.0))
+        )
+        builder.add_articulation([builder.add_joint_free(parent), builder.add_joint_prismatic(parent, child)])
+        model = builder.finalize()
+        omega = np.array([0.0, 2.0, 0.0])
+        x = np.array([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]])
+        com = x.mean(axis=0)
+        model.body_qd.assign(np.array([[*np.cross(omega, p - com), *omega] for p in x], dtype=np.float32))
+
+        def momentum(q, qd):
+            q, qd = q.astype(np.float64), qd.astype(np.float64)
+            center = q[:, :3].mean(axis=0)
+            return sum(
+                np.cross(q[k, :3] - center, qd[k, :3]) + i * qd[k, 3:] for k, i in enumerate((inertia_p, inertia_c))
+            )
+
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        solver = SolverFBA(model, iterations=10)
+        s0, s1 = model.state(), model.state()
+        start = momentum(s0.body_q.numpy(), s0.body_qd.numpy())
+        for _ in range(100):
+            solver.step(s0, s1, None, None, 0.01)
+            s0, s1 = s1, s0
+        q = s0.body_q.numpy().astype(np.float64)
+        offset = wp.quat_rotate_inv(wp.quatd(*q[0, 3:]), wp.vec3d(*(q[1, :3] - q[0, :3])))
+        self.assertGreater(offset[0], 0.6)  # the child slid out
+        np.testing.assert_allclose(momentum(q, s0.body_qd.numpy()), start, atol=2e-3 * np.linalg.norm(start))
 
     def test_rejects_articulations_beyond_one_tile(self):
         """Refuse a chain of thirteen revolute joints, whose 65 rows exceed what one tile Cholesky factors."""
@@ -485,6 +569,30 @@ class TestSolverFBAJointLimits(unittest.TestCase):
                     expected = qd0[lane] * (1.0 / (1.0 + c * dt)) ** np.arange(1, n + 1)
                     np.testing.assert_allclose(qd[:, 0, lane], expected, rtol=1e-5, atol=1e-7, err_msg=f"lane {lane}")
 
+    def test_second_axis_of_a_two_axis_d6_damps_about_the_child_axis(self):
+        """Damp the spin of a body of unit inertia on a D6 joint with two angular axes, turned by 0.8 rad about the
+        first, about the second axis as the child carries it: damping on the second axis slows it by
+        ``1 / (1 + c dt)`` per step, and damping on the first leaves it."""
+        dt, n, c = 0.01, 30, 5.0
+        axis = np.array(wp.quat_rotate(wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.8), wp.vec3(0.0, 1.0, 0.0)))
+        for damped in (0, 1):
+            with self.subTest(damped=damped):
+                builder = newton.ModelBuilder()
+                link = _link(builder)
+                damping = [c if k == damped else 0.0 for k in (0, 1)]
+                axes = [Dof(axis=(1.0, 0.0, 0.0), damping=damping[0]), Dof(axis=(0.0, 1.0, 0.0), damping=damping[1])]
+                builder.add_articulation([builder.add_joint_d6(-1, link, angular_axes=axes)])
+                model = builder.finalize()
+                model.gravity.assign([wp.vec3(0.0, 0.0, 0.0)])
+                model.joint_q.assign(np.array([0.8, 0.0], dtype=np.float32))
+                state = model.state()
+                newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+                model.body_q.assign(state.body_q)
+                model.body_qd.assign(np.array([[0.0, 0.0, 0.0, *(2.0 * axis)]], dtype=np.float32))
+                _q, qd, _ = self._run(model, dt, n)
+                rate = 2.0 * (1.0 / (1.0 + c * dt)) ** np.arange(1, n + 1) if damped == 1 else np.full(n, 2.0)
+                np.testing.assert_allclose(qd[:, 0, 3:], rate[:, None] * axis, rtol=1e-4, atol=1e-5)
+
     def test_limits_in_several_worlds(self):
         """Stop the pendulums of two worlds at their own lower limits."""
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
@@ -510,13 +618,186 @@ class TestSolverFBAJointLimits(unittest.TestCase):
         self.assertEqual(solver._joint_system.compliance.shape[0], 0)
 
     def test_refuses_revolute_limits_known_up_to_turns(self):
-        """Refuse a revolute axis with one finite limit, or with limits 2 pi or more apart."""
-        for lower, upper in ((-0.5, 1.0e10), (-1.0e10, 0.5), (-3.2, 3.2)):
+        """Refuse a revolute axis with one finite limit."""
+        for lower, upper in ((-0.5, 1.0e10), (-1.0e10, 0.5)):
             with self.subTest(lower=lower, upper=upper):
                 builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
                 self._pendulum(builder, lower, upper)
                 with self.assertRaises(NotImplementedError):
                     self._run(builder.finalize(), 0.01, 1)
+
+
+class TestSolverFBAJointState(unittest.TestCase):
+    """SolverFBA's joints with kinematic parents, model edits and resets."""
+
+    def test_damper_on_a_kinematic_parent_damps_the_relative_motion(self):
+        """Spin a disc on a damped revolute joint up with the kinematic turntable it sits on, which turns at its
+        prescribed velocity: implicit Euler of ``I dw/dt = c (w_table - w)`` from rest."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        rate, c, dt, n = 2.0, 1.0, 0.01, 200
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        table = builder.add_link(mass=10.0, inertia=wp.mat33(np.eye(3) * 10.0), lock_inertia=True, is_kinematic=True)
+        disc = _link(builder, xform=wp.transform((0.0, 0.0, 0.5)))
+        free = builder.add_joint_free(table)
+        hinge = builder.add_joint_revolute(
+            table, disc, axis=(0.0, 0.0, 1.0), parent_xform=wp.transform((0.0, 0.0, 0.5)), damping=c
+        )
+        builder.add_articulation([free, hinge])
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=5)
+        s0, s1 = model.state(), model.state()
+        for k in range(n):
+            q, qd = s0.body_q.numpy(), s0.body_qd.numpy()
+            q[0, 3:] = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), rate * k * dt)
+            qd[0] = (0.0, 0.0, 0.0, 0.0, 0.0, rate)
+            s0.body_q.assign(q)
+            s0.body_qd.assign(qd)
+            solver.step(s0, s1, None, None, dt)
+            s0, s1 = s1, s0
+        expected = rate * (1.0 - (1.0 / (1.0 + c * dt)) ** n)
+        self.assertAlmostEqual(float(s0.body_qd.numpy()[1, 5]), expected, delta=1e-3 * rate)
+
+    def test_reset_clears_the_limit_warm_start(self):
+        """Step a pendulum resting on its lower limit with the contact warm start, reset it, and step it as a fresh
+        solver does."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        angle = -0.5
+        link = _link(
+            builder,
+            xform=wp.transform((np.cos(angle), np.sin(angle), 0.0), wp.quat_from_axis_angle(wp.vec3(0, 0, 1), angle)),
+        )
+        joint = builder.add_joint_revolute(
+            -1,
+            link,
+            axis=(0.0, 0.0, 1.0),
+            child_xform=wp.transform((-1.0, 0.0, 0.0)),
+            limit_lower=-0.5,
+            limit_upper=0.5,
+        )
+        builder.add_articulation([joint])
+        model = builder.finalize()
+
+        def first_step(solver):
+            s0, s1 = model.state(), model.state()
+            solver.step(s0, s1, None, None, 0.01)
+            return s1.body_qd.numpy()
+
+        fresh = first_step(SolverFBA(model, iterations=1, contact_warmstart=True))
+        solver = SolverFBA(model, iterations=1, contact_warmstart=True)
+        s0, s1 = model.state(), model.state()
+        for _ in range(100):
+            solver.step(s0, s1, None, None, 0.01)
+            s0, s1 = s1, s0
+        solver.reset(s0)
+        np.testing.assert_array_equal(first_step(solver), fresh)
+
+    def test_joint_dof_flags_take_damping_and_limits(self):
+        """Apply damping and limits edited after the first step once notify_model_changed names them with the joint
+        DOF flags; without a notification the solver keeps the old ones."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        for flag in (None, newton.ModelFlags.JOINT_DOF_PROPERTIES, newton.ModelFlags.JOINT_DOF_FORCE_PROPERTIES):
+            with self.subTest(flag=flag):
+                builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+                link = _link(builder, xform=wp.transform((1.0, 0.0, 0.0)))
+                joint = builder.add_joint_revolute(
+                    -1, link, axis=(0.0, 0.0, 1.0), child_xform=wp.transform((-1.0, 0.0, 0.0))
+                )
+                builder.add_articulation([joint])
+                model = builder.finalize()
+                solver = SolverFBA(model, iterations=5)
+                s0, s1 = model.state(), model.state()
+                solver.step(s0, s1, None, None, 0.005)
+                s0, s1 = s1, s0
+                model.joint_limit_lower.assign([-0.3])
+                model.joint_limit_upper.assign([0.3])
+                if flag is not None:
+                    solver.notify_model_changed(flag)
+                for _ in range(200):
+                    solver.step(s0, s1, None, None, 0.005)
+                    s0, s1 = s1, s0
+                q = s0.body_q.numpy()[0]
+                angle = float(np.arctan2(q[1], q[0]))
+                if flag is None:
+                    self.assertLess(angle, -0.5)
+                else:
+                    self.assertAlmostEqual(angle, -0.3, delta=1e-3)
+
+    def test_body_properties_keep_the_warm_start(self):
+        """Step a pile of two boxes alike whether or not each step notifies BODY_PROPERTIES, which leaves the body
+        flags alone and so rebuilds nothing."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        finals = []
+        for notify in (False, True):
+            builder = newton.ModelBuilder()
+            builder.add_ground_plane()
+            for z in (0.05, 0.151):
+                body = builder.add_body(xform=wp.transform((0.0, 0.0, z)))
+                builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
+            model = builder.finalize()
+            solver = SolverFBA(model, iterations=5, contact_warmstart=True)
+            pipeline = newton.CollisionPipeline(model)
+            contacts = pipeline.contacts()
+            s0, s1 = model.state(), model.state()
+            for _ in range(30):
+                pipeline.collide(s0, contacts)
+                if notify:
+                    solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+                solver.step(s0, s1, None, contacts, 0.01)
+                s0, s1 = s1, s0
+            finals.append(s0.body_q.numpy())
+        np.testing.assert_array_equal(finals[1], finals[0])
+
+    def test_failed_setup_raises_again(self):
+        """Raise for a revolute joint with a single finite limit again at the next step rather than stepping without
+        the bodies."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        link = _link(builder, xform=wp.transform((1.0, 0.0, 0.0)))
+        joint = builder.add_joint_revolute(
+            -1, link, axis=(0.0, 0.0, 1.0), child_xform=wp.transform((-1.0, 0.0, 0.0)), limit_lower=-0.5
+        )
+        builder.add_articulation([joint])
+        model = builder.finalize()
+        solver = SolverFBA(model, iterations=5)
+        s0, s1 = model.state(), model.state()
+        for _ in range(2):
+            with self.assertRaises(NotImplementedError):
+                solver.step(s0, s1, None, None, 0.01)
+
+    def test_full_turn_limits_are_left_out(self):
+        """Warn about revolute limits whose range spans a full turn, as many arm descriptions give, and swing the
+        pendulum through them as without limits."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        finals = []
+        for limits in ((-2.0 * np.pi, 2.0 * np.pi), None):
+            builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+            link = _link(builder, xform=wp.transform((1.0, 0.0, 0.0)))
+            extra = {} if limits is None else {"limit_lower": limits[0], "limit_upper": limits[1]}
+            joint = builder.add_joint_revolute(
+                -1, link, axis=(0.0, 0.0, 1.0), child_xform=wp.transform((-1.0, 0.0, 0.0)), **extra
+            )
+            builder.add_articulation([joint])
+            model = builder.finalize()
+            solver = SolverFBA(model, iterations=5)
+            s0, s1 = model.state(), model.state()
+            if limits is None:
+                solver.step(s0, s1, None, None, 0.01)
+            else:
+                with self.assertWarns(newton.exceptions.NewtonWarning):
+                    solver.step(s0, s1, None, None, 0.01)
+            s0, s1 = s1, s0
+            for _ in range(50):
+                solver.step(s0, s1, None, None, 0.01)
+                s0, s1 = s1, s0
+            finals.append(s0.body_q.numpy())
+        np.testing.assert_array_equal(finals[0], finals[1])
 
 
 if __name__ == "__main__":
