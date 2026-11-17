@@ -653,31 +653,26 @@ class TestBendingProjection(unittest.TestCase):
 
 
 class SolverFBABendingCurvedRestTests(unittest.TestCase):
-    """The bending local step restores the curvature *magnitude*, not its
-    direction, on curved rest cloth.
+    """The bending local step restores the signed rest curvature of a hinge along its current normals.
 
-    Restoring the *rest curvature vector*, ``w · q · (q · x_ref)``, the
-    gradient of ``‖(q·x_cur) - (q·x_ref)‖²``, would penalise any deviation
-    from it, including curvature flips (e.g. cloth bent against its rest
-    direction). The local projection instead contributes
-    ``w · q · ê · ‖q·x_rest‖`` where ``ê = (q·x_cur) / ‖q·x_cur‖``: the
-    direction follows ``x_cur`` and only the magnitude is restored.
-
-    The two formulas agree on flat rest (where ``‖q·x_rest‖ = 0``); they
-    diverge on curved rest and disagree in sign whenever ``q·x_cur`` and
-    ``q·x_rest`` point in opposite directions.
+    The curvature vector ``q·x`` of a hinge lies along the sum of its triangles' normals, pointing one way for a
+    positive dihedral angle and the other for a negative one. The local projection contributes
+    ``w · q · n̂ · edge_norm``, with ``n̂`` the unit sum of the current normals and ``edge_norm`` the rest magnitude
+    signed by the rest angle: a hinge folded to its rest side keeps the direction of ``q·x_cur``, and one folded to the
+    other side, or flat, bends back toward its rest side. Restoring the rest curvature vector ``q·x_rest`` itself
+    would instead hold its direction fixed in space and resist the cloth's rotation. A hinge whose normals vanish
+    falls back to the direction of ``q·x_cur``.
     """
 
     @classmethod
     def setUpClass(cls):
         wp.init()
 
-    def test_scatter_follows_x_cur_not_x_rest(self) -> None:
-        """Contribute along the current curvature direction (+z) of a stencil whose rest curvature points along -z.
+    def test_degenerate_hinge_follows_the_current_curvature(self) -> None:
+        """Contribute along the current curvature direction (+z) of a stencil of degenerate triangles, which have no
+        normals.
 
-        The contributions must be ``w · q · (0, 0, +norm_rest)`` (sign of
-        ``q·x_cur``). Restoring the rest curvature vector would contribute
-        ``w · q · (q·x_ref)`` ~ ``w · q · (0, 0, -norm_rest)``, the opposite sign.
+        The contributions must be ``w · q · (0, 0, +norm_rest)`` (sign of ``q·x_cur``).
         """
         from newton._src.solvers.fba.kernels import project_bending_kernel  # noqa: PLC0415
 
@@ -692,8 +687,7 @@ class SolverFBABendingCurvedRestTests(unittest.TestCase):
         edge_indices = wp.array([[0, 1, 2, 3]], dtype=wp.int32, device=device)
         edge_quad_q = wp.array([wp.vec4(1.0, 1.0, -1.0, -1.0)], dtype=wp.vec4, device=device)
         weight = wp.array([2.0], dtype=wp.float32, device=device)
-        # Rest curvature magnitude = 0.5; the rest direction is irrelevant:
-        # the kernel only uses the magnitude.
+        # Rest curvature magnitude = 0.5; without normals, the kernel uses the magnitude along q·x_cur.
         edge_norm = wp.array([0.5], dtype=wp.float32, device=device)
 
         rhs = _projection_rhs(project_bending_kernel, [positions, edge_indices, edge_quad_q, weight, edge_norm], 4)
@@ -710,11 +704,63 @@ class SolverFBABendingCurvedRestTests(unittest.TestCase):
         )
         np.testing.assert_allclose(rhs, expected, atol=1e-6)
 
-        # Restoring the rest curvature vector would contribute
-        # ``w · q · (q · x_ref)`` with ``q · x_ref = (0, 0, -0.5)``, along -z;
-        # the kernel restores only the magnitude, along +z.
         self.assertGreater(rhs[0, 2], 0.0)
         self.assertLess(rhs[2, 2], 0.0)
+
+    @staticmethod
+    def _hinge(fold_deg):
+        """Two equilateral triangles on the edge (0, 1), the second turned by ``fold_deg`` about it."""
+        h, fold = np.sqrt(3.0) / 2.0, np.radians(fold_deg)
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        builder.add_cloth_mesh(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=wp.vec3(0.0),
+            vertices=[
+                wp.vec3(0.0, 0.0, 0.0),
+                wp.vec3(1.0, 0.0, 0.0),
+                wp.vec3(0.5, h, 0.0),
+                wp.vec3(0.5, -h * np.cos(fold), -h * np.sin(fold)),
+            ],
+            indices=[0, 1, 2, 1, 0, 3],
+            density=1.0,
+            tri_ke=500.0,
+            tri_ka=1.0e3,
+            edge_ke=1.0,
+            edge_kd=0.0,
+        )
+        return builder.finalize(device="cpu")
+
+    @staticmethod
+    def _signed_angle(x):
+        """The hinge's dihedral angle [deg] as ModelBuilder.add_edges measures edge_rest_angle."""
+
+        def unit(a):
+            return a / np.linalg.norm(a)
+
+        x1, x2, x3, x4 = x[2], x[3], x[0], x[1]
+        n1, n2, e = unit(np.cross(x3 - x1, x4 - x1)), unit(np.cross(x4 - x2, x3 - x2)), unit(x4 - x3)
+        return float(np.degrees(np.arctan2(np.dot(np.cross(n1, n2), e), np.clip(np.dot(n1, n2), -1.0, 1.0))))
+
+    def test_hinge_bends_back_to_its_rest_side(self) -> None:
+        """Bend a hinge at rest at +60 degrees back to the positive side from the mirror fold at -60 degrees, and from
+        flat, without gravity: the rest angle's sign, not only its magnitude, sets the rest shape."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        model = self._hinge(60.0)
+        self.assertAlmostEqual(float(np.degrees(model.edge_rest_angle.numpy()[0])), 60.0, places=3)
+        for start in (-60.0, 0.0):
+            with self.subTest(start=start):
+                solver = SolverFBA(model, iterations=10)
+                s0, s1 = model.state(), model.state()
+                s0.particle_q.assign(self._hinge(start).particle_q)
+                angles = []
+                for _ in range(60):
+                    solver.step(s0, s1, None, None, 1.0 / 60.0)
+                    s0, s1 = s1, s0
+                    angles.append(self._signed_angle(s0.particle_q.numpy()))
+                self.assertGreater(max(angles), 30.0)
 
     def test_zero_curvature_x_cur_skips_scatter(self) -> None:
         """Contribute nothing when ``‖q·x_cur‖ ≈ 0``, without dividing by zero, whatever ``edge_norm`` is."""

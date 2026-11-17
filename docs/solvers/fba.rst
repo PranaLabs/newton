@@ -203,7 +203,9 @@ Model Inputs
   ``"neohookean"`` take the elements' Lamé parameters; the
   :class:`~newton.solvers.SolverFBA` reference states how projective dynamics
   scales them. Interior edges add the isometric bending energy of Bergou et
-  al., with ``edge_rest_angle`` as the rest angle. On equilateral triangles
+  al., with ``edge_rest_angle`` as the rest angle, its sign included: a hinge
+  bent to the other side of its rest fold, or flat, bends back toward it. On
+  equilateral triangles
   it is the energy of an isotropic plate of bending stiffness
   ``3 * edge_ke`` [N·m] and Poisson's ratio ``-1/3``, so a plate of
   stiffness ``D`` that bends mostly about one axis takes ``edge_ke = D / 3``;

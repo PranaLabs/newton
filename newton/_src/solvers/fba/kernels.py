@@ -1631,21 +1631,26 @@ def project_bending_kernel(
     edge_indices: wp.array2d[wp.int32],  # shape (E, 4)
     edge_quad_q: wp.array[wp.vec4],  # length-4 vector q per edge; Q = q*q^T
     edge_weight: wp.array[wp.float32],
-    edge_norm: wp.array[wp.float32],  # rest curvature magnitude, from the edge's rest angle
+    edge_norm: wp.array[wp.float32],  # signed rest curvature, from the edge's rest angle
     # output (per-edge, per-local-vertex contributions)
     contributions: wp.array2d[wp.vec3],  # (E, 4)
 ):
     """Compute per-edge bending contribution to each of its 4 stencil vertices.
 
-    The local step projects the current curvature vector ``q*x_cur`` onto the
-    sphere of radius ``||q*x_rest||``: it restores the curvature *magnitude* of
-    the rest shape and lets the direction follow ``x_cur``, which holds on flat
-    and curved rest cloth alike. The contribution at local vertex ``a`` is
-    ``w * q[a] * target`` with ``target = (q*x_cur).normalized() * ||q*x_rest||``.
-    When the weight, the rest curvature or the current curvature (below
-    ``1e-12``) vanishes, the contributions are zero. The matching Hessian term
-    ``w * q*q^T`` is part of the prefactored system matrix and does not depend
-    on ``x_cur``.
+    The curvature vector ``q*x`` of a hinge lies along the sum ``n1 + n2`` of its
+    two triangles' unit normals, ``n1 = (x0 - x2) x (x1 - x2)`` and
+    ``n2 = (x1 - x3) x (x0 - x3)`` normalized, pointing along it for a
+    positive dihedral angle as Newton measures ``edge_rest_angle`` and against
+    it for a negative one. The local step projects it to the rest curvature
+    along the current ``n1 + n2``: ``target = edge_norm * (n1 + n2).normalized()``
+    with ``edge_norm`` the rest magnitude signed by the rest angle, so that a
+    hinge folded to the wrong side, or flat, bends back toward its rest side,
+    and one folded to its rest side keeps the direction of ``q*x_cur``. Where
+    ``n1 + n2`` vanishes, the hinge folded flat onto itself, the target follows
+    ``q*x_cur`` with the rest magnitude. The contribution at local vertex ``a``
+    is ``w * q[a] * target``; it is zero when the weight or the rest curvature
+    vanishes. The matching Hessian term ``w * q*q^T`` is part of the
+    prefactored system matrix and does not depend on ``x_cur``.
     Writes into a pre-allocated ``(E, 4)`` scratch buffer; :func:`gather_per_particle_kernel`
     sums the contributions per particle in a fixed order, so the right-hand side is deterministic.
 
@@ -1655,7 +1660,7 @@ def project_bending_kernel(
         edge_quad_q: Per-edge length-4 cotangent vector ``q``.
         edge_weight: Per-edge bending stiffness ``w`` (already scaled by
             ``3 / (A0 + A1)``).
-        edge_norm: Per-edge rest curvature magnitude, from its ``edge_rest_angle``.
+        edge_norm: Per-edge rest curvature magnitude signed by its ``edge_rest_angle``.
         contributions: Output ``(edge_count, 4)`` per-local-vertex contribution.
     """
     e = wp.tid()
@@ -1681,18 +1686,32 @@ def project_bending_kernel(
     i2 = edge_indices[e, 2]
     i3 = edge_indices[e, 3]
 
-    # Compute q^T * x_cur (a vec3 because positions are vec3).
-    qTxcur = positions[i0] * q[0] + positions[i1] * q[1] + positions[i2] * q[2] + positions[i3] * q[3]
-    norm_cur = wp.length(qTxcur)
-    if norm_cur < 1.0e-12:
-        contributions[e, 0] = zero
-        contributions[e, 1] = zero
-        contributions[e, 2] = zero
-        contributions[e, 3] = zero
-        return
-
-    # Target curvature: unit direction of q*x_cur, scaled to rest magnitude.
-    target = qTxcur * (norm_rest / norm_cur)
+    p0 = positions[i0]
+    p1 = positions[i1]
+    p2 = positions[i2]
+    p3 = positions[i3]
+    n1 = wp.cross(p0 - p2, p1 - p2)
+    n2 = wp.cross(p1 - p3, p0 - p3)
+    l1 = wp.length(n1)
+    l2 = wp.length(n2)
+    side = zero
+    if l1 > 0.0 and l2 > 0.0:
+        side = n1 / l1 + n2 / l2
+    side_len = wp.length(side)
+    if side_len > 1.0e-6:
+        # Target curvature: the signed rest curvature along the hinge's normal sum.
+        target = side * (norm_rest / side_len)
+    else:
+        # Folded flat onto itself: the direction of q*x_cur, scaled to the rest magnitude.
+        qTxcur = p0 * q[0] + p1 * q[1] + p2 * q[2] + p3 * q[3]
+        norm_cur = wp.length(qTxcur)
+        if norm_cur < 1.0e-12:
+            contributions[e, 0] = zero
+            contributions[e, 1] = zero
+            contributions[e, 2] = zero
+            contributions[e, 3] = zero
+            return
+        target = qTxcur * (wp.abs(norm_rest) / norm_cur)
 
     # Per-local-vertex contribution: w * q[a] * target.
     contributions[e, 0] = w * q[0] * target
