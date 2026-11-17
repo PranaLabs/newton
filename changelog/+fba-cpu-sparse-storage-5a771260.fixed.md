@@ -1,0 +1,1 @@
+Fix `SolverFBA` steps with `nsn_sparse_storage=True` on the CPU, which multiplied the long rows of the contact operator with Warp's tiled sparse product, wrong on the CPU, so that a cloth resting on the ground lifted off.
