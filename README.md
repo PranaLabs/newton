@@ -105,7 +105,8 @@ The first step factors the system matrix on the CPU and takes longer than the ot
 
 Each example below runs with `python -m newton.examples <name>`, or with
 `uv run --extra examples -m newton.examples <name>` from a uv checkout. The examples that come with upstream Newton
-are still in the package; `python -m newton.examples --list` lists them all.
+are still in the package; `python -m newton.examples --list` lists them all. The clips are rendered with Newton's
+OpenGL viewer; they play at real time or faster, the longer examples sped up to at most 10 seconds per clip.
 
 <table>
   <tr>
@@ -114,17 +115,17 @@ are still in the package; `python -m newton.examples --list` lists them all.
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/cloth/example_cloth_dual_franka_fba.py">
-        <img width="320" src="docs/images/examples/example_cloth_dual_franka_fba.jpg" alt="Cloth Dual Franka FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/cloth_dual_franka_fba.webp" alt="Cloth Dual Franka FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/cloth/example_shirt_fold_fba.py">
-        <img width="320" src="docs/images/examples/example_shirt_fold_fba.jpg" alt="Shirt Fold FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/shirt_fold_fba.webp" alt="Shirt Fold FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/softbody/example_softbody_franka_fba.py">
-        <img width="320" src="docs/images/examples/example_softbody_franka_fba.jpg" alt="Softbody Franka FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/softbody_franka_fba.webp" alt="Softbody Franka FBA">
       </a>
     </td>
   </tr>
@@ -145,17 +146,17 @@ are still in the package; `python -m newton.examples --list` lists them all.
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/softbody/example_pneunet_gripper_fba.py">
-        <img width="320" src="docs/images/examples/example_pneunet_gripper_fba.jpg" alt="PneuNet Gripper FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/pneunet_gripper_fba.webp" alt="PneuNet Gripper FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/softbody/example_cable_gripper_fba.py">
-        <img width="320" src="docs/images/examples/example_cable_gripper_fba.jpg" alt="Cable Gripper FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/cable_gripper_fba.webp" alt="Cable Gripper FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/softbody/example_claw_machine_fba.py">
-        <img width="320" src="docs/images/examples/example_claw_machine_fba.jpg" alt="Claw Machine FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/claw_machine_fba.webp" alt="Claw Machine FBA">
       </a>
     </td>
   </tr>
@@ -179,17 +180,17 @@ are still in the package; `python -m newton.examples --list` lists them all.
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/cloth/example_stretching_cloth_fba.py">
-        <img width="320" src="docs/images/examples/example_stretching_cloth_fba.jpg" alt="Stretching Cloth FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/stretching_cloth_fba.webp" alt="Stretching Cloth FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/cloth/example_shirt_pins_fba.py">
-        <img width="320" src="docs/images/examples/example_shirt_pins_fba.jpg" alt="Shirt Pins FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/shirt_pins_fba.webp" alt="Shirt Pins FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/multiphysics/example_cloth_on_knives_fba.py">
-        <img width="320" src="docs/images/examples/example_cloth_on_knives_fba.jpg" alt="Cloth on Knives FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/cloth_on_knives_fba.webp" alt="Cloth on Knives FBA">
       </a>
     </td>
   </tr>
@@ -210,7 +211,7 @@ are still in the package; `python -m newton.examples --list` lists them all.
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/multiphysics/example_cloth_on_boxes_fba.py">
-        <img width="320" src="docs/images/examples/example_cloth_on_boxes_fba.jpg" alt="Cloth on Boxes FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/cloth_on_boxes_fba.webp" alt="Cloth on Boxes FBA">
       </a>
     </td>
     <td align="center" width="33%">
@@ -234,17 +235,17 @@ are still in the package; `python -m newton.examples --list` lists them all.
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/contacts/example_convex_pile_fba.py">
-        <img width="320" src="docs/images/examples/example_convex_pile_fba.jpg" alt="Convex Pile FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/convex_pile_fba.webp" alt="Convex Pile FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/contacts/example_convex_hulls_fba.py">
-        <img width="320" src="docs/images/examples/example_convex_hulls_fba.jpg" alt="Convex Hulls FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/convex_hulls_fba.webp" alt="Convex Hulls FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/contacts/example_nonconvex_pile_fba.py">
-        <img width="320" src="docs/images/examples/example_nonconvex_pile_fba.jpg" alt="Nonconvex Pile FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/nonconvex_pile_fba.webp" alt="Nonconvex Pile FBA">
       </a>
     </td>
   </tr>
@@ -265,7 +266,7 @@ are still in the package; `python -m newton.examples --list` lists them all.
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/contacts/example_chain_net_fba.py">
-        <img width="320" src="docs/images/examples/example_chain_net_fba.jpg" alt="Chain Net FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/chain_net_fba.webp" alt="Chain Net FBA">
       </a>
     </td>
     <td align="center" width="33%">
@@ -289,17 +290,17 @@ are still in the package; `python -m newton.examples --list` lists them all.
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/softbody/example_twisting_bar_fba.py">
-        <img width="320" src="docs/images/examples/example_twisting_bar_fba.jpg" alt="Twisting Bar FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/twisting_bar_fba.webp" alt="Twisting Bar FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/softbody/example_squeezing_ball_fba.py">
-        <img width="320" src="docs/images/examples/example_squeezing_ball_fba.jpg" alt="Squeezing Ball FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/squeezing_ball_fba.webp" alt="Squeezing Ball FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/softbody/example_softbody_cantilever_fba.py">
-        <img width="320" src="docs/images/examples/example_softbody_cantilever_fba.jpg" alt="Softbody Cantilever FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/softbody_cantilever_fba.webp" alt="Softbody Cantilever FBA">
       </a>
     </td>
   </tr>
@@ -320,17 +321,17 @@ are still in the package; `python -m newton.examples --list` lists them all.
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/softbody/example_bunny_ears_fba.py">
-        <img width="320" src="docs/images/examples/example_bunny_ears_fba.jpg" alt="Bunny Ears FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/bunny_ears_fba.webp" alt="Bunny Ears FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/cable/example_particle_rods_fba.py">
-        <img width="320" src="docs/images/examples/example_particle_rods_fba.jpg" alt="Particle Rods FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/particle_rods_fba.webp" alt="Particle Rods FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/cable/example_hemp_rope_fba.py">
-        <img width="320" src="docs/images/examples/example_hemp_rope_fba.jpg" alt="Hemp Rope FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/hemp_rope_fba.webp" alt="Hemp Rope FBA">
       </a>
     </td>
   </tr>
@@ -351,17 +352,17 @@ are still in the package; `python -m newton.examples --list` lists them all.
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/cable/example_desk_cables_fba.py">
-        <img width="320" src="docs/images/examples/example_desk_cables_fba.jpg" alt="Desk Cables FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/desk_cables_fba.webp" alt="Desk Cables FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/cable/example_elastic_cords_fba.py">
-        <img width="320" src="docs/images/examples/example_elastic_cords_fba.jpg" alt="Elastic Cords FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/elastic_cords_fba.webp" alt="Elastic Cords FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/cable/example_rod_gripper_fba.py">
-        <img width="320" src="docs/images/examples/example_rod_gripper_fba.jpg" alt="Rod Gripper FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/rod_gripper_fba.webp" alt="Rod Gripper FBA">
       </a>
     </td>
   </tr>
@@ -382,7 +383,7 @@ are still in the package; `python -m newton.examples --list` lists them all.
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/cable/example_rope_on_knives_fba.py">
-        <img width="320" src="docs/images/examples/example_rope_on_knives_fba.jpg" alt="Rope on Knives FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/rope_on_knives_fba.webp" alt="Rope on Knives FBA">
       </a>
     </td>
     <td align="center" width="33%">
@@ -406,17 +407,17 @@ are still in the package; `python -m newton.examples --list` lists them all.
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/multiphysics/example_shishi_odoshi_fba.py">
-        <img width="320" src="docs/images/examples/example_shishi_odoshi_fba.jpg" alt="Shishi-odoshi FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/shishi_odoshi_fba.webp" alt="Shishi-odoshi FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/multiphysics/example_water_wheel_fba.py">
-        <img width="320" src="docs/images/examples/example_water_wheel_fba.jpg" alt="Water Wheel FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/water_wheel_fba.webp" alt="Water Wheel FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/multiphysics/example_sand_castle_fba.py">
-        <img width="320" src="docs/images/examples/example_sand_castle_fba.jpg" alt="Sand Castle FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/sand_castle_fba.webp" alt="Sand Castle FBA">
       </a>
     </td>
   </tr>
@@ -437,12 +438,12 @@ are still in the package; `python -m newton.examples --list` lists them all.
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/multiphysics/example_batter_mixer_fba.py">
-        <img width="320" src="docs/images/examples/example_batter_mixer_fba.jpg" alt="Batter Mixer FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/batter_mixer_fba.webp" alt="Batter Mixer FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/multiphysics/example_meat_cutter_fba.py">
-        <img width="320" src="docs/images/examples/example_meat_cutter_fba.jpg" alt="Meat Cutter FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/meat_cutter_fba.webp" alt="Meat Cutter FBA">
       </a>
     </td>
     <td align="center" width="33%">
