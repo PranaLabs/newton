@@ -29,9 +29,21 @@ if TYPE_CHECKING:
     from numpy.typing import ArrayLike
 
 
-_PEAK_KINDS = ("soft",)
-"""The kinds of contacts whose most per step :meth:`SolverFBA.dropped_contacts` reports, by slot."""
+_PCR_CHECK_EVERY = 25
+"""The PCR solver's iterations per convergence check: a solve of at most this many fixed iterations reads nothing
+back."""
+
+_PEAK_KINDS = ("soft", "full")
+"""The kinds of contacts whose most per step :meth:`SolverFBA.dropped_contacts` reports, by slot: those of the contact
+buffer, and the active ones of a full-operator step recorded into a graph, which takes at most
+:data:`_CAPACITY_LARGEST` of them."""
 _PEAK_SOFT = 0
+_PEAK_FULL = 1
+_CAPACITY_SIZES = (64, 256, 1024)
+"""The sizes below the largest of the buckets of a full-operator step recorded into a graph: a dense ``W`` of three rows
+per contact for each, of which the step takes the smallest that holds its active contacts."""
+_CAPACITY_LARGEST = 2048
+"""The most active contacts a full-operator step recorded into a graph takes: a dense ``W`` of 6144 rows, 302 MB."""
 
 
 def _element_lame(materials: wp.array | None, count: int) -> tuple[np.ndarray, np.ndarray]:
@@ -3061,9 +3073,10 @@ class SolverFBA(TendonStateMixin, SolverBase):
         if contacts is not None and contacts.soft_contact_particle.shape[0]:
             if not self._capacity_contacts_capable(contacts):
                 return (
-                    "steps with contacts record into a graph only with nsn_schur_mode='lite', friction=True, one "
-                    "world and particle-shape contacts alone (no self, face or rod contacts, particle constraint "
-                    "rows, contact_warmstart, friction_anchors or nsn_lite_accumulate); otherwise pass contacts=None"
+                    "steps with contacts record into a graph only with friction=True, one world, particle-shape "
+                    "contacts alone (no self, face or rod contacts, particle constraint rows, contact_warmstart, "
+                    "friction_anchors or nsn_lite_accumulate) and nsn_schur_mode='lite', or 'full' with a dense W "
+                    "(nsn_sparse_storage=False) and nsn_linear_iterations at most 25; otherwise pass contacts=None"
                 )
             if self._capacity_reserved != contacts.soft_contact_particle.shape[0]:
                 return (
@@ -3107,11 +3120,23 @@ class SolverFBA(TendonStateMixin, SolverBase):
         """Whether a step's particle contacts can take the capacity path, which records into a graph: every slot of
         the contact buffer becomes a contact row, the slots past the stored count and the contacts of held particles
         inert rows, sorted after the others on the device, so that the step reads nothing back. It serves
-        particle-shape contacts alone, with the frictional lite operator in one world."""
+        particle-shape contacts alone, with friction in one world: the lite operator, or the full operator with a
+        dense ``W`` of the capacity's rows (:meth:`FBALinearSolver.build_schur_capacity`)."""
         if contacts is None or not contacts.soft_contact_particle.shape[0]:
             return False
+        ls = self._linear_solver
+        # The full operator's NSN step reads nothing back with a fixed count of PCR iterations, at most a check block.
+        full = (
+            self.nsn_schur_mode == "full"
+            and not self.nsn_sparse_storage
+            and ls is not None
+            and not ls.exact_inverse_entries
+            and not ls.sparse_W
+            and self.nsn_linear_iterations is not None
+            and self.nsn_linear_iterations <= _PCR_CHECK_EVERY
+        )
         return (
-            self.nsn_schur_mode == "lite"
+            (self.nsn_schur_mode == "lite" or full)
             and self.friction
             and self.model.world_count == 1
             and self._self_contact is None
@@ -3135,8 +3160,23 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 wp.empty(2 * C, dtype=wp.int64, device=device),
                 wp.empty(2 * C, dtype=wp.int32, device=device),
             )
-        self._linear_solver.reserve_lite_rows_capacity(C)
-        self._ensure_nsn_inner_buffers(3 * C, alloc_2d=False)
+        if self.nsn_schur_mode == "full":
+            # The buckets of the full operator: a dense W of each size's rows, and the NSN step's matrices and the PCR
+            # solver for the largest.
+            sizes = sorted({min(size, C, _CAPACITY_LARGEST) for size in (*_CAPACITY_SIZES, C)})
+            self._linear_solver.reserve_schur_capacity(C, sizes)
+            self._capacity_sizes = sizes
+            self._capacity_sizes_d = wp.array(sizes, dtype=wp.int32, device=device)
+            self._capacity_take_d = wp.zeros(len(sizes), dtype=wp.int32, device=device)
+            self._capacity_active_d = wp.zeros(1, dtype=wp.int32, device=device)
+            self._ensure_pcr_solver(3 * sizes[-1])
+            if getattr(self, "_nsn_mu_d", None) is None or self._nsn_mu_d.size < max(C, 16):
+                self._nsn_mu_d = wp.zeros(max(C, 16), dtype=wp.float64, device=device)
+            self._ensure_nsn_inner_buffers(3 * sizes[-1], alloc_2d=True)
+            self._contact_peak_capacity[_PEAK_FULL] = sizes[-1]
+        else:
+            self._linear_solver.reserve_lite_rows_capacity(C)
+            self._ensure_nsn_inner_buffers(3 * C, alloc_2d=False)
         if self._contact_peak_d is None:
             self._contact_peak_d = wp.zeros(len(_PEAK_KINDS), dtype=wp.int32, device=device)
         self._contact_peak_capacity[_PEAK_SOFT] = C
@@ -3173,7 +3213,65 @@ class SolverFBA(TendonStateMixin, SolverBase):
         outputs = [self._contact_particle_d, self._contact_normal_d, self._contact_alpha_d, self._contact_shape_d]
         outputs += [self._contact_body_pos_d, self._contact_record_d]
         wp.launch(capacity_contact_rows_kernel, C, inputs, outputs, device=device)
+        if self.nsn_schur_mode == "full":
+            # The active contacts' count picks the bucket of the step (_full_capacity_correction).
+            from .kernels import capacity_active_count_kernel, capacity_bucket_kernel  # noqa: PLC0415
+
+            record = self._contact_record_d[:C]
+            wp.launch(capacity_active_count_kernel, C, [record], [self._capacity_active_d], device=device)
+            inputs = [self._capacity_active_d, self._capacity_sizes_d]
+            wp.launch(capacity_bucket_kernel, len(self._capacity_sizes), inputs, [self._capacity_take_d], device=device)
+            outputs = [self._contact_peak_d]
+            wp.launch(contact_peak_kernel, 1, [self._capacity_active_d, _PEAK_FULL], outputs, device=device)
         return C
+
+    def _full_capacity_correction(self, first: bool, dt: float) -> None:
+        """A local-global iteration's contact correction of a full-operator step on the capacity path: the bucket
+        whose size holds the step's active contacts, picked on the device (``wp.capture_if``, a conditional node of
+        a recorded graph), builds its ``W`` at the step's first iteration and takes the NSN step on its rows."""
+        if first:
+            # The rows, their particle CSR and the contacted particles' ranks hold for every bucket; their scans
+            # allocate, which a conditional node does not take.
+            rows = [self._contact_particle_d, self._contact_normal_d, self._contact_alpha_d]
+            rows += [self._contact_tangent1_d, self._contact_tangent2_d, self._contact_record_d]
+            self._linear_solver.prepare_schur_capacity(self._contact_count, self._capacity_sizes[-1], *rows)
+        for b, size in enumerate(self._capacity_sizes):
+            branch = functools.partial(self._full_bucket_correction, size, first, dt)
+            wp.capture_if(self._capacity_take_d[b : b + 1], on_true=branch)
+
+    def _full_bucket_correction(self, size: int, first: bool, dt: float) -> None:
+        """The contact correction of :meth:`_full_capacity_correction` on the first ``size`` slots of the contact
+        buffer, which hold its active contacts."""
+        ls, count = self._linear_solver, self._contact_count
+        self._contact_count = size
+        try:
+            if first:
+                ls.build_schur_capacity(size, self._contact_record_d)
+            else:
+                ls.use_schur_capacity(size)
+            self._launch_contact_residual(self._nsn_r_d)
+            self._launch_contact_pene0(self._nsn_pene0_d)
+            self._solve_nsn_coulomb_gpu(
+                None,
+                None,
+                None,
+                None,
+                max_iters=1,
+                dt=dt,
+                W_device=ls.W_device_view(),
+                r_device=self._nsn_r_d,
+                pene0_device=self._nsn_pene0_d,
+                mu_device=self._contact_mu_d,
+                lam_init_device=self._lam_coulomb_persistent_d,
+                omega_init_device=self._omega_coulomb_persistent_d,
+                skip_download=True,
+                m_contacts=size,
+                n_bilateral=0,
+                contact_regularization=0.0,
+            )
+            self._deformable_contact_tail(ls, 3 * size)
+        finally:
+            self._contact_count = count
 
     def dropped_contacts(self) -> int:
         """The most contacts that the collision pipeline found beyond its buffers in a step recorded into a CUDA
@@ -3192,14 +3290,20 @@ class SolverFBA(TendonStateMixin, SolverBase):
         peak = self._contact_peak_d.numpy()
         self._contact_peak_d.zero_()
         dropped = 0
-        for kind, name in enumerate(_PEAK_KINDS):
-            excess = int(peak[kind]) - self._contact_peak_capacity[kind]
-            if excess > 0:
+        for kind in range(len(_PEAK_KINDS)):
+            capacity = self._contact_peak_capacity[kind]
+            excess = int(peak[kind]) - capacity
+            if excess > 0 and capacity > 0:
                 dropped = max(dropped, excess)
+                if kind == _PEAK_SOFT:
+                    reason = (
+                        "that the collision pipeline found beyond its buffers; construct the CollisionPipeline with a "
+                        "larger soft_contact_max"
+                    )
+                else:
+                    reason = f"beyond the {capacity} that a step with the full operator takes"
                 warnings.warn(
-                    f"SolverFBA: steps recorded into a graph dropped up to {excess} {name} contacts that the "
-                    f"collision pipeline found beyond its buffers; construct the CollisionPipeline with a larger "
-                    f"{name}_contact_max.",
+                    f"SolverFBA: steps recorded into a graph dropped up to {excess} soft contacts {reason}.",
                     NewtonWarning,
                     stacklevel=2,
                 )
@@ -3465,7 +3569,10 @@ class SolverFBA(TendonStateMixin, SolverBase):
             else:
                 self._run_pd_local_phase_eager(N, dt)
 
-            if (has_contacts or n_b) and (not self._two_way or mixed is not None):
+            if has_contacts and self._capacity_step and self.nsn_schur_mode == "full":
+                # The full operator's capacity path: the bucket of the step's active contacts, picked on the device.
+                self._full_capacity_correction(_k == 0, dt)
+            elif (has_contacts or n_b) and (not self._two_way or mixed is not None):
                 # --- Schur-complement NSN contact correction ---
                 if mixed is not None:
                     # The rows of the worlds without two-way contacts.
@@ -6940,7 +7047,10 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 a_view = self._nsn_a_schur_d[:n_rows, :n_rows]
                 rhs_view = self._nsn_rhs_d[:n_rows]
                 dlam_view = self._nsn_dlam_d[:n_rows]
-                self._pcr_solver.solve(a_view, rhs_view, dlam_view, block_precond=block_precond)
+                # The capacity path's dot products allocate nothing: they run in a graph's conditional nodes.
+                self._pcr_solver.solve(
+                    a_view, rhs_view, dlam_view, block_precond=block_precond, fixed_sums=self._capacity_step
+                )
 
                 wp.launch(
                     K.axpy_lambda_kernel,
