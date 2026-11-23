@@ -452,6 +452,47 @@ def rigid_delassus_kernel(
     W[i, j] = w
 
 
+@wp.kernel
+def two_way_delassus_capacity_kernel(
+    W_soft: wp.array2d[wp.float64],
+    first: wp.array[wp.int32],
+    active: wp.array[wp.int32],
+    contact_rows: int,
+    joint_select: wp.array[wp.int32],
+    row_slot: wp.array2d[wp.int32],
+    row_jac: wp.array2d[wp.spatial_vectord],
+    slot_inv_mass: wp.array[wp.spatial_matrixd],
+    # outputs
+    W: wp.array2d[wp.float64],
+):
+    """:func:`rigid_delassus_kernel` for the rows of a two-way step on the capacity path: the deformable block on the
+    rows of the first ``first[0]`` contacts, the contact rows up to ``active[0]`` contacts, then from
+    ``contact_rows`` on the joint rows ``joint_select``; the rows of the slots past the contacts and of the joint
+    rows of -1 take those of the identity, so that they couple to nothing."""
+    i, j = wp.tid()
+    n_a = 3 * active[0]
+    inert_i = i >= n_a and i < contact_rows
+    inert_j = j >= n_a and j < contact_rows
+    if i >= contact_rows:
+        inert_i = joint_select[i - contact_rows] < 0
+    if j >= contact_rows:
+        inert_j = joint_select[j - contact_rows] < 0
+    if inert_i or inert_j:
+        W[i, j] = wp.where(i == j, wp.float64(1.0), wp.float64(0.0))
+        return
+    n_s = 3 * first[0]
+    w = wp.float64(0.0)
+    if i < n_s and j < n_s:
+        w = W_soft[i, j]
+    for x in range(2):
+        s = row_slot[i, x]
+        if s >= 0:
+            for y in range(2):
+                if row_slot[j, y] == s:
+                    w += wp.dot(row_jac[i, x], slot_inv_mass[s] * row_jac[j, y])
+    W[i, j] = w
+
+
 # Lanes of :func:`rigid_delassus_rows_kernel` per row.
 DELASSUS_LANES = 32
 

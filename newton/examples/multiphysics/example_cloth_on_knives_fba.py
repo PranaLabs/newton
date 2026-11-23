@@ -136,7 +136,8 @@ class Example:
         self.viewer.set_camera(pos=wp.vec3(-7.5, -11.0, 8.5), pitch=-21.0, yaw=54.0)
 
     def simulate(self):
-        # SolverFBA reads contacts back to the host every step, so the loop is not graph-captured.
+        # The steps are bound by the device, most of it the search of the face contacts, so the loop is not
+        # graph-captured: a graph saves host work and adds the device work of its inert contact rows.
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)

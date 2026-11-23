@@ -2311,6 +2311,38 @@ class TestGraphCapture(unittest.TestCase):
                 builder.joint_limit_lower[2], builder.joint_limit_upper[2] = -0.2, 0.2
         return builder.finalize()
 
+    @staticmethod
+    def _two_way_scene(device=None, face=True):
+        """A cloth of 8 x 8 cells over two stacked boxes, with a plank hinged beside them that tips over onto the
+        stack, all integrated by SolverFBA with the full operator and a dense W: deformable contacts on bodies, rigid
+        contacts and a joint's rows in one NSN, the face contacts of the box edges with ``face``."""
+        builder = newton.ModelBuilder()
+        cfg = newton.ModelBuilder.ShapeConfig(mu=0.6)
+        builder.add_ground_plane(cfg=cfg)
+        lower = builder.add_body(xform=wp.transform((0.0, 0.0, 0.25), wp.quat_identity()))
+        builder.add_shape_box(lower, hx=0.4, hy=0.4, hz=0.25, cfg=cfg)
+        turn = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), 0.4)
+        upper = builder.add_body(xform=wp.transform((0.0, 0.0, 0.65), turn))
+        builder.add_shape_box(upper, hx=0.25, hy=0.25, hz=0.15, cfg=cfg)
+        hinge_at, half = wp.vec3(1.1, 0.0, 0.05), wp.vec3(0.04, 0.3, 0.6)
+        lean = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), -0.15)
+        plank = builder.add_link(xform=wp.transform(hinge_at + wp.quat_rotate(lean, wp.vec3(0.0, 0.0, half[2])), lean))
+        builder.add_shape_box(plank, hx=half[0], hy=half[1], hz=half[2], cfg=cfg)
+        hinge = builder.add_joint_revolute(
+            -1, plank, axis=(0.0, 1.0, 0.0), parent_xform=wp.transform(hinge_at, wp.quat_identity()),
+            child_xform=wp.transform((0.0, 0.0, -half[2]), wp.quat_identity()),
+        )  # fmt: skip
+        builder.add_articulation([hinge])
+        builder.add_cloth_grid(
+            pos=wp.vec3(-0.5, -0.5, 1.1), rot=wp.quat_identity(), vel=wp.vec3(0.0), dim_x=8, dim_y=8,
+            cell_x=1.0 / 8.0, cell_y=1.0 / 8.0, mass=0.002, tri_ke=2500.0, tri_ka=5.0e3, edge_ke=0.1,
+            particle_radius=3.0e-3,
+        )  # fmt: skip
+        model = builder.finalize(device=device)
+        solver = SolverFBA(model, iterations=5, face_contacts=face, nsn_linear_iterations=10)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.147)
+        return model, solver, pipeline, pipeline.contacts()
+
     def test_contact_free_steps_replay_from_a_graph(self):
         """Record two steps of a contact-free scene into a graph after a step outside it, replay the graph, and
         reach the same states, bit for bit, as the same steps taken eagerly."""
@@ -2340,9 +2372,9 @@ class TestGraphCapture(unittest.TestCase):
                     np.testing.assert_array_equal(eager, replayed)
 
     @staticmethod
-    def _cloth_on_box(device=None, mode="lite", **pipeline_args):
+    def _cloth_on_box(device=None, mode="lite", face=False, **pipeline_args):
         """A cloth of 20 x 20 cells, its first particle held, over a box and the ground, and its contacts, with the
-        lite operator or, with ``mode="full"``, the full one."""
+        lite operator or, with ``mode="full"``, the full one, and with ``face`` the face contacts of the box edges."""
         builder = newton.ModelBuilder()
         builder.add_shape_box(-1, xform=wp.transform((0.0, 0.0, 0.1), wp.quat_identity()), hx=0.15, hy=0.15, hz=0.1)
         builder.add_ground_plane()
@@ -2352,9 +2384,42 @@ class TestGraphCapture(unittest.TestCase):
         )  # fmt: skip
         builder.particle_mass[0] = 0.0
         model = builder.finalize(device=device)
-        solver = SolverFBA(model, iterations=5, nsn_schur_mode=mode, nsn_linear_iterations=10)
+        solver = SolverFBA(model, iterations=5, nsn_schur_mode=mode, nsn_linear_iterations=10, face_contacts=face)
         pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.01, **pipeline_args)
         return model, solver, pipeline, pipeline.contacts()
+
+    @staticmethod
+    def _face_scene(kind, device=None):
+        """A scene of face contacts with the full operator, its solver, pipeline, contacts and step: the cloth of
+        :meth:`_cloth_on_box` with the face contacts of the box edges (``"box"``), a triangle that slides into a V
+        notch of a mesh, held against both of its faces by the mesh minima within a face contact gap (``"notch"``), or
+        a triangle on a pyramid tip under its middle, which only the face contact gap finds (``"tip"``)."""
+        from newton.tests.fba.test_face_contact import (  # noqa: PLC0415
+            _add_triangle_over_tip,
+            _notch_mesh,
+            _pyramid_mesh,
+        )
+
+        if kind == "box":
+            scene = TestGraphCapture._cloth_on_box(device, mode="full", face=True, soft_contact_max=400)
+            return (*scene, 1.0 / 120.0)
+        builder = newton.ModelBuilder()
+        if kind == "notch":
+            builder.add_shape_mesh(-1, mesh=_notch_mesh(0.2), cfg=newton.ModelBuilder.ShapeConfig(mu=0.0))
+            along = np.array([-1.0, 0.0, -1.0]) / np.sqrt(2.0)  # down the right face toward the notch
+            center = np.array([0.0, 0.0, 0.5]) - 0.3 * along + 0.006 * np.array([-1.0, 0.0, 1.0]) / np.sqrt(2.0)
+            for offset in (0.02 * along, -0.01 * along + [0.0, 0.02, 0.0], -0.01 * along - [0.0, 0.02, 0.0]):
+                builder.add_particle(wp.vec3(*(center + offset)), wp.vec3(0.0), 0.01, radius=0.005)
+            builder.add_triangle(0, 1, 2, tri_ke=50.0)
+            gap, soft_gap, dt = 0.02, 0.02, 0.005
+        else:
+            builder.add_shape_mesh(-1, mesh=_pyramid_mesh(), cfg=newton.ModelBuilder.ShapeConfig(mu=0.6))
+            _add_triangle_over_tip(builder, radius=3e-3)
+            gap, soft_gap, dt = 0.01, 0.009, 1.0 / 120.0
+        model = builder.finalize(device=device)
+        solver = SolverFBA(model, iterations=10, face_contacts=True, face_contact_gap=gap, nsn_linear_iterations=10)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=soft_gap)
+        return model, solver, pipeline, pipeline.contacts(), dt
 
     def test_lite_contacts_replay_from_a_graph(self):
         """Record the collision and two steps of a lite cloth falling onto a box into a graph, after a step outside
@@ -2461,6 +2526,79 @@ class TestGraphCapture(unittest.TestCase):
         np.testing.assert_array_equal(results[1], results[2])
         np.testing.assert_allclose(results[0], results[2], rtol=0.0, atol=1.0e-6)
 
+    def test_face_contacts_replay_from_a_graph(self):
+        """Record the collision and two steps with face contacts, found on the device, into a graph after a step
+        outside it, and reach the same states, bit for bit, as the same steps taken eagerly through the capacity
+        path: a cloth on a box, whose edges poke into its triangles, and a triangle in a V notch, held against both of
+        its faces by the mesh minima. The triangle also ends where the steps through the host's face contacts end it,
+        to rounding; the cloth draping over the box edges turns rounding into chaos
+        (TestCapacityContacts.test_face_capacity_path_matches_the_count_path compares single steps)."""
+        for kind, pairs in (("box", 40), ("notch", 100)):
+            with self.subTest(kind=kind):
+                results = []
+                for run in ("count", "capacity", "graph"):
+                    model, solver, pipeline, contacts, dt = self._face_scene(kind)
+                    s0, s1 = model.state(), model.state()
+                    pipeline.collide(s0, contacts)
+                    solver.step(s0, s1, None, contacts, dt)
+                    s0, s1 = s1, s0
+                    if run == "capacity":
+                        solver._recording = lambda: True
+
+                    def two_steps(s0=s0, s1=s1, solver=solver, pipeline=pipeline, contacts=contacts, dt=dt):
+                        pipeline.collide(s0, contacts)
+                        solver.step(s0, s1, None, contacts, dt)
+                        pipeline.collide(s1, contacts)
+                        solver.step(s1, s0, None, contacts, dt)
+
+                    if run == "graph":
+                        with wp.ScopedCapture() as capture:
+                            two_steps()
+                        for _ in range(pairs):
+                            wp.capture_launch(capture.graph)
+                    else:
+                        for _ in range(pairs):
+                            two_steps()
+                    results.append(s0.particle_q.numpy())
+                np.testing.assert_array_equal(results[1], results[2])
+                if kind == "notch":
+                    np.testing.assert_allclose(results[0], results[2], rtol=0.0, atol=1.0e-6)
+
+    def test_two_way_contacts_replay_from_a_graph(self):
+        """Record the collision and two steps of a cloth on stacked boxes beside a hinged plank, deformable contacts on
+        the bodies, rigid contacts and the hinge's rows in one NSN, into a graph after steps outside it, and reach the
+        same states, bit for bit, as the same steps taken eagerly through the two-way capacity path."""
+        dt, results = 1.0 / 120.0, []
+        for run in ("capacity", "graph"):
+            model, solver, pipeline, contacts = self._two_way_scene()
+            s0, s1 = model.state(), model.state()
+            for _ in range(40):
+                pipeline.collide(s0, contacts)
+                solver.step(s0, s1, None, contacts, dt)
+                s0, s1 = s1, s0
+            if run == "capacity":
+                solver._recording = lambda: True
+
+            def two_steps(s0=s0, s1=s1, solver=solver, pipeline=pipeline, contacts=contacts):
+                pipeline.collide(s0, contacts)
+                solver.step(s0, s1, None, contacts, dt)
+                pipeline.collide(s1, contacts)
+                solver.step(s1, s0, None, contacts, dt)
+
+            if run == "graph":
+                with wp.ScopedCapture() as capture:
+                    two_steps()
+                for _ in range(30):
+                    wp.capture_launch(capture.graph)
+            else:
+                for _ in range(30):
+                    two_steps()
+            self.assertTrue(solver._tw_active)
+            results.append([a.numpy() for a in (s0.particle_q, s0.body_q)])
+        for eager, replayed in zip(*results, strict=True):
+            np.testing.assert_array_equal(eager, replayed)
+        self.assertEqual(solver.dropped_contacts(), 0)
+
     def test_full_contacts_past_the_largest_size_are_reported(self):
         """Report the active contacts that steps with the full operator recorded into a graph drop past their largest
         size, here 128 of the cloth's contacts on the box."""
@@ -2474,7 +2612,7 @@ class TestGraphCapture(unittest.TestCase):
                 pipeline.collide(s0, contacts)
                 solver.step(s0, s1, None, contacts, dt)
                 s0, s1 = s1, s0
-            self.assertEqual(solver._capacity_sizes, [64, 128])
+            self.assertEqual(solver._capacity_sizes, [64, 96, 128])
             with wp.ScopedCapture() as capture:
                 pipeline.collide(s0, contacts)
                 solver.step(s0, s1, None, contacts, dt)
@@ -2760,6 +2898,77 @@ class TestCapacityContacts(unittest.TestCase):
             results.append(s0.particle_q.numpy())
         self.assertGreater(float(results[0][:, 2].max()), 0.0)
         np.testing.assert_allclose(results[0], results[1], rtol=0.0, atol=1.0e-6)
+
+    def test_face_capacity_path_matches_the_count_path(self):
+        """Step face contacts from the same states through the capacity path, found on the device (the candidates
+        flagged and ranked by a scan, the deepest of each edge kept, the mesh minima sorted with their particle
+        contacts), and through the host's face contacts, with the same contacts and alike to rounding: a cloth on a
+        box, a triangle in a V notch and a triangle on a pyramid tip that only the face contact gap finds. Each
+        comparison takes one step from the same state: a cloth draping over box edges turns rounding into chaos."""
+        for kind, steps in (("box", 80), ("notch", 200), ("tip", 30)):
+            with self.subTest(kind=kind):
+                model, solver, pipeline, contacts, dt = TestGraphCapture._face_scene(kind)
+                s0, s1 = model.state(), model.state()
+                faces = 0
+                for k in range(steps):
+                    pipeline.collide(s0, contacts)
+                    if k % 5 == 4:
+                        start = [wp.clone(a) for a in (s0.particle_q, s0.particle_qd)]
+                        solver.step(s0, s1, None, contacts, dt)
+                        host = (solver._contact_count, s1.particle_q.numpy())
+                        extra = solver._contact_extra_h
+                        host_faces = 0 if extra is None else int((extra[0][:, 0] >= 0).sum())
+                        wp.copy(s0.particle_q, start[0])
+                        wp.copy(s0.particle_qd, start[1])
+                        # The steps recorded into a graph take the capacity path; this takes it without a graph.
+                        solver._recording = lambda: True
+                        solver.step(s0, s1, None, contacts, dt)
+                        del solver._recording
+                        active = int(solver._capacity_active_d.numpy()[0])
+                        self.assertEqual(active, host[0])
+                        self.assertEqual(active - int(solver._capacity_face.first.numpy()[0]), host_faces)
+                        np.testing.assert_allclose(s1.particle_q.numpy(), host[1], rtol=0.0, atol=1.0e-6)
+                        faces += host_faces
+                    else:
+                        solver.step(s0, s1, None, contacts, dt)
+                    s0, s1 = s1, s0
+                self.assertGreater(faces, 0)
+
+    def test_two_way_capacity_path_matches_the_count_path(self):
+        """Step a cloth on stacked boxes beside a hinged plank from the same states through the two-way capacity path
+        (the deformable contacts, then the rigid contacts from a count on the device, then the joint rows of the
+        touched articulations, in one dense W of a bucket's rows) and through the host's rows, with and without face
+        contacts, with the same rows and alike to rounding."""
+        dt = 1.0 / 120.0
+        for face in (False, True):
+            with self.subTest(face=face):
+                model, solver, pipeline, contacts = TestGraphCapture._two_way_scene(face=face)
+                states = [model.state(), model.state()]
+                compared = 0
+                for k in range(120):
+                    s0, s1 = states[k % 2], states[(k + 1) % 2]
+                    pipeline.collide(s0, contacts)
+                    if k % 10 == 9:
+                        names = ("particle_q", "particle_qd", "body_q", "body_qd")
+                        start = [wp.clone(getattr(s0, name)) for name in names]
+                        solver.step(s0, s1, None, contacts, dt)
+                        host = (solver._rc_n, [s1.particle_q.numpy(), s1.body_q.numpy()])
+                        for name, a in zip(names, start, strict=True):
+                            wp.copy(getattr(s0, name), a)
+                        # The steps recorded into a graph take the capacity path; this takes it without a graph.
+                        solver._recording = lambda: True
+                        solver.step(s0, s1, None, contacts, dt)
+                        del solver._recording
+                        self.assertTrue(solver._tw_active)
+                        active = int(solver._tw.active.numpy()[0])
+                        joints = int((solver._tw.joint_select.numpy()[: solver._tw.joint_rows] >= 0).sum())
+                        self.assertEqual(3 * active + joints, host[0])
+                        for a, b in zip((s1.particle_q.numpy(), s1.body_q.numpy()), host[1], strict=True):
+                            np.testing.assert_allclose(a, b, rtol=0.0, atol=1.0e-5)
+                        compared += int(solver._tw.first.numpy()[0]) > 0
+                    else:
+                        solver.step(s0, s1, None, contacts, dt)
+                self.assertGreater(compared, 3)
 
     def test_capacity_path_matches_the_count_path(self):
         """Step a lite cloth falling onto a box and the ground, a held particle among its contacts, through the

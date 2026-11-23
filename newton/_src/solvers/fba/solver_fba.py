@@ -45,9 +45,11 @@ _PEAK_RIGID_ROWS = 3
 _RIGID_PATTERN_BLOCKS = 32
 """The 3x3 blocks of ``W`` per slot of the rigid contact buffer that a step of rigid contacts recorded into a graph
 holds, beside those of its joint rows: a contact's block row holds a block for each contact on its bodies."""
-_CAPACITY_SIZES = (64, 256, 1024)
+_CAPACITY_SIZES = (64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536)
 """The sizes below the largest of the buckets of a full-operator step recorded into a graph: a dense ``W`` of three rows
-per contact for each, of which the step takes the smallest that holds its active contacts."""
+per contact for each, views of one buffer, of which the step takes the smallest that holds its active contacts. Their
+ratio, at most 1.5, bounds the entries of ``W`` that its inert rows add to a step's dense solve to 1.25 times its
+own."""
 _CAPACITY_LARGEST = 2048
 """The most active contacts a full-operator step recorded into a graph takes: a dense ``W`` of 6144 rows, 302 MB."""
 
@@ -642,6 +644,9 @@ class SolverFBA(TendonStateMixin, SolverBase):
         # The capacity path of the contacts (_capacity_contacts_capable): whether the step takes it, the capacity its
         # buffers are reserved for, and its sort's keys and values.
         self._capacity_step, self._capacity_reserved, self._capacity_sort = False, None, None
+        self._capacity_face = self._capacity_minima = None
+        self._tw, self._tw_active = None, False
+        self._capacity_rows = 0
         # The most contacts that the collision pipeline found in a step recorded into a graph since the last
         # dropped_contacts(), per kind (_PEAK_SOFT), and the buffers' capacity, which the excess dropped.
         self._contact_peak_d, self._contact_peak_capacity = None, [0] * len(_PEAK_KINDS)
@@ -1459,6 +1464,9 @@ class SolverFBA(TendonStateMixin, SolverBase):
             from .rigid_contact import RigidContactGather  # noqa: PLC0415
 
             self._rc_gather = RigidContactGather(device)
+        if self.model.particle_count and self._capacity_step and self._two_way_capacity_capable(contacts):
+            self._begin_two_way_capacity(contacts, state_in, dt)
+            return
         if self._rigid_capacity_capable(contacts):
             if self._rcc is None or self._rcc.C != contacts.rigid_contact_shape0.shape[0]:
                 # A later step with these contacts may record into a graph: the capacity path's buffers are
@@ -1836,6 +1844,310 @@ class SolverFBA(TendonStateMixin, SolverBase):
             and self._model_tendon_groups is None
             and (self._joint_rows is None or not len(self._joint_rows.mimic_rows))
         )
+
+    def _two_way_capacity_capable(self, contacts: Contacts | None) -> bool:
+        """Whether a step's contacts in a model with particles and integrated bodies can take the two-way capacity
+        path, which records into a graph: the deformable contacts of the capacity path (:meth:`_capacity_contacts`)
+        and the rigid contacts of the capacity form of :func:`rigid_contact.gather_rigid_contacts` join one dense
+        ``W`` of each bucket's rows with the joint rows of the articulations they touch, found on the device. It
+        serves one world, the full operator with a dense ``W`` (``nsn_sparse_storage=False``), fixed
+        ``nsn_linear_iterations`` (at most a check block), hard rigid contacts, no tendons, no mimic joints, no
+        particle constraint rows, no warm start and no friction anchors."""
+        if contacts is None or not self.model.particle_count or not self._integrates_bodies():
+            return False
+        ls = self._linear_solver
+        return (
+            contacts.soft_contact_particle.shape[0] > 0
+            and contacts.rigid_contact_shape0.shape[0] > 0
+            and self.model.world_count == 1
+            and self.friction
+            and self.nsn_schur_mode == "full"
+            and not self.nsn_sparse_storage
+            and ls is not None
+            and not ls.exact_inverse_entries
+            and not ls.sparse_W
+            and self.nsn_linear_iterations is not None
+            and self.nsn_linear_iterations <= _PCR_CHECK_EVERY
+            and self.rigid_contact_time == 0.0
+            and self._tendon_count == 0
+            and self._model_tendon_groups is None
+            and (self._joint_rows is None or not len(self._joint_rows.mimic_rows))
+            and self._self_contact is None
+            and self._rod_contact is None
+            and self._segment_query is None
+            and self._constraint_rows is None
+            and self._warm_start is None
+            and not self.friction_anchors
+            and not self.nsn_lite_accumulate
+        )
+
+    def _reserve_two_way_capacity(self, contacts: Contacts) -> None:
+        """Allocate the buffers of the two-way capacity path for ``contacts`` (:meth:`_two_way_capacity_capable`)
+        beside those of the deformable contacts' (:meth:`_reserve_capacity`), so that a later step recorded into a
+        graph allocates nothing: the rigid contacts' own rows, the rows of the largest bucket, contacts and joint rows,
+        and the dense ``W`` of each bucket, views of one buffer."""
+        from .rigid import entry_buffers  # noqa: PLC0415
+        from .rigid_contact import RigidContactGather  # noqa: PLC0415
+
+        C, device = contacts.rigid_contact_shape0.shape[0], self._device
+        sizes = self._capacity_sizes
+        R = 0 if self._joint_rows is None else int(self._joint_rows.block_start[-1])
+        key = (C, tuple(sizes), R, id(self._linear_solver))
+        if getattr(self, "_tw", None) is not None and self._tw.key == key:
+            return
+        if getattr(self, "_rc_gather", None) is None:
+            self._rc_gather = RigidContactGather(device)
+        self._rc_gather.reserve(C)
+        L = sizes[-1]
+        n = 3 * L + R
+        self._ensure_pcr_solver(n)
+        self._ensure_nsn_inner_buffers(n, alloc_2d=True)
+        W_buffer = wp.zeros(n * n, dtype=wp.float64, device=device)
+
+        def view(rows):
+            return wp.array(ptr=W_buffer.ptr, dtype=wp.float64, shape=(rows, rows), device=device)
+
+        def floats(count):
+            return wp.zeros(max(count, 1), dtype=wp.float64, device=device)
+
+        def ints(count, value=0):
+            return wp.full(max(count, 1), value, dtype=wp.int32, device=device)
+
+        blocks = 0 if self._joint_rows is None else len(self._joint_rows.block_start) - 1
+        self._tw = SimpleNamespace(
+            key=key,
+            joint_rows=R,
+            W_buffer=W_buffer,
+            W={size: view(3 * size + R) for size in sizes},
+            first=ints(1),
+            active=ints(1),
+            total=ints(1),
+            take=ints(len(sizes)),
+            rigid_slot=wp.empty((3 * C, 2), dtype=wp.int32, device=device),
+            rigid_jac=wp.empty((3 * C, 2), dtype=wp.spatial_vectord, device=device),
+            rigid_value=floats(3 * C),
+            rigid_r=floats(3 * C),
+            anchors=tuple(wp.empty((C, 2), dtype=wp.vec3d, device=device) for _ in range(4)),
+            row_slot=wp.full((n, 2), -1, dtype=wp.int32, device=device),
+            row_jac=wp.zeros((n, 2), dtype=wp.spatial_vectord, device=device),
+            mu=floats(L),
+            pene0=floats(n),
+            value=floats(n),
+            r=floats(n),
+            lam=floats(n),
+            omega=floats(n),
+            compliance=floats(R),
+            incidence=entry_buffers(self._rigid_bodies_d.shape[0], 6 * L, device),
+            touched=ints(blocks),
+            flags=ints(R),
+            position=ints(R),
+            joint_select=ints(R, -1),
+            slot_block=None,
+            row_block=None,
+        )
+        if R:
+            self._tw.slot_block = wp.array(self._slot_block.astype(np.int32), dtype=wp.int32, device=device)
+            self._tw.row_block = wp.array(self._joint_row_block.astype(np.int32), dtype=wp.int32, device=device)
+        if self._contact_peak_d is None:
+            self._contact_peak_d = wp.zeros(len(_PEAK_KINDS), dtype=wp.int32, device=device)
+        self._contact_peak_capacity[_PEAK_RIGID] = C
+
+    def _begin_two_way_capacity(self, contacts: Contacts, state_in: State, dt: float) -> None:
+        """:meth:`_begin_rigid_contacts` on the two-way capacity path (:meth:`_two_way_capacity_capable`): the
+        deformable contacts of the step lead, as the capacity path laid them out, the rigid contacts follow them from
+        a count on the device, and the joint rows of the articulations that they touch are selected on the device, so
+        that the step reads nothing back. The parts that hold for every bucket are formed here; each bucket's ``W``
+        at the step's first iteration (:meth:`_two_way_bucket`)."""
+        from .kernels import capacity_bucket_kernel, contact_peak_kernel  # noqa: PLC0415
+        from .rigid import slot_entries  # noqa: PLC0415
+        from .rigid_contact import (  # noqa: PLC0415
+            gather_rigid_contacts,
+            joint_row_flags_kernel,
+            particle_contact_body_jacobian_kernel,
+            place_rigid_rows_kernel,
+            rigid_contact_anchor_kernel,
+            rigid_contact_jacobian_kernel,
+            select_flagged_kernel,
+            soft_touched_blocks_kernel,
+            touched_blocks_kernel,
+            two_way_contact_values_kernel,
+            two_way_count_kernel,
+        )
+
+        model, device, tw = self.model, self._device, self._tw
+        rc = gather_rigid_contacts(
+            model,
+            contacts,
+            self._body_slot_d,
+            device,
+            self._rc_gather,
+            self.rigid_contact_friction == "max",
+            bin_size=self.rigid_contact_bin,
+            body_q=state_in.body_q,
+            capacity=True,
+        )
+        C, sizes = rc.capacity, self._capacity_sizes
+        L, R = sizes[-1], tw.joint_rows
+        self._rigid_contacts = rc
+        # The pipeline's count, which passes C when its buffers dropped contacts, and the step's contacts past the
+        # largest bucket: dropped_contacts() reports them.
+        outputs = [self._contact_peak_d]
+        wp.launch(contact_peak_kernel, 1, [contacts.rigid_contact_count, _PEAK_RIGID], outputs, device=device)
+        inputs = [self._capacity_active_d, rc.table, L]
+        wp.launch(two_way_count_kernel, 1, inputs, [tw.first, tw.active, tw.total], device=device)
+        wp.launch(contact_peak_kernel, 1, [tw.total, _PEAK_FULL], [self._contact_peak_d], device=device)
+        inputs = [tw.active, self._capacity_sizes_d]
+        wp.launch(capacity_bucket_kernel, len(sizes), inputs, [tw.take], device=device)
+        # The rigid contacts' rows in their own order, then the deformable rows' body sides and the rigid rows after
+        # them.
+        inputs = [rc.body, rc.anchor, rc.normal, self._body_slot_d, self._rigid_q_pin_d, 0, state_in.body_q]
+        wp.launch(rigid_contact_jacobian_kernel, (C, 3), inputs, [tw.rigid_slot, tw.rigid_jac], device=device)
+        inputs = [*self._particle_contact_args(), self._body_slot_d, model.body_com, self._rigid_q_pin_d]
+        inputs += [state_in.body_q]
+        wp.launch(particle_contact_body_jacobian_kernel, (L, 3), inputs, [tw.row_slot, tw.row_jac], device=device)
+        inputs = [tw.first, tw.active, tw.rigid_slot, tw.rigid_jac]
+        wp.launch(place_rigid_rows_kernel, 3 * L, inputs, [tw.row_slot, tw.row_jac], device=device)
+        inputs = [tw.first, tw.active, self._contact_mu_d, rc.mu, *self._contact_offsets()]
+        wp.launch(two_way_contact_values_kernel, L, inputs, [tw.mu, tw.pene0], device=device)
+        if R:
+            # The joint rows of the articulations that the contacts touch, in their order.
+            tw.touched.zero_()
+            wp.launch(touched_blocks_kernel, C, [rc.table, tw.slot_block], [tw.touched], device=device)
+            inputs = [tw.first, self._contact_shape_d, model.shape_body, self._body_slot_d, tw.slot_block]
+            wp.launch(soft_touched_blocks_kernel, L, inputs, [tw.touched], device=device)
+            wp.launch(joint_row_flags_kernel, R, [tw.row_block, tw.touched], [tw.flags], device=device)
+            wp.utils.array_scan(tw.flags[:R], tw.position[:R], inclusive=False)
+            tw.joint_select.fill_(-1)
+            wp.launch(select_flagged_kernel, R, [tw.flags, tw.position], [tw.joint_select], device=device)
+        wp.launch(
+            rigid_contact_anchor_kernel,
+            dim=C,
+            inputs=[
+                *(rc.body, rc.anchor, rc.normal, self._body_slot_d, self._rigid_x_prev_d, state_in.body_q),
+                *(state_in.body_qd, model.body_com, wp.float64(dt)),
+            ],
+            outputs=list(tw.anchors),
+            device=device,
+        )
+        # The contact rows' sides on each body slot, for the bodies' share of the forces.
+        slots = self._rigid_bodies_d.shape[0]
+        self._rc_incidence = list(slot_entries(tw.row_slot, 3 * L, slots, buffers=tw.incidence))
+        # The deformable rows' parts of W that hold for every bucket; their scans and sorts allocate.
+        rows = [self._contact_particle_d, self._contact_normal_d, self._contact_alpha_d]
+        rows += [self._contact_tangent1_d, self._contact_tangent2_d, self._capacity_active_d]
+        self._linear_solver.prepare_schur_capacity(self._contact_count, L, *rows, **self._contact_extra_args())
+        tw.lam.zero_()
+        tw.omega.zero_()
+        self._tw_active, self._two_way, self._rc_n = True, True, 3 * L + R
+        self._rc_row_jac_d, self._rc_counts, self._rc_n_b, self._rc_tendons = tw.row_jac, (L, 0), 0, 0
+        self._rc_mimic = None
+
+    def _solve_two_way_capacity(self, state_in: State, dt: float) -> wp.array[wp.float64]:
+        """:meth:`_solve_rigid_contacts` on the two-way capacity path: the rigid rows' residual in their own order,
+        then the NSN step of the bucket whose size holds the step's contacts, picked on the device
+        (``wp.capture_if``); returns the row forces [N]."""
+        from .joints import gather_values_kernel  # noqa: PLC0415
+        from .rigid import rigid_row_residual_kernel  # noqa: PLC0415
+        from .rigid_contact import rigid_contact_gap_kernel  # noqa: PLC0415
+
+        tw, rc, device = self._tw, self._rigid_contacts, self._device
+        C = rc.capacity
+        if tw.joint_rows and self._joint_dampers:
+            # The joint rows' compliance of this Newton step, which the box rows' laws set.
+            inputs = [self._joint_system.compliance, tw.joint_select, 0]
+            wp.launch(gather_values_kernel, tw.joint_rows, inputs, [tw.compliance], device=device)
+        inputs = [rc.body, rc.normal, *tw.anchors, self._body_slot_d, self._rigid_x_live_d, self._rigid_turn_d, 0]
+        wp.launch(rigid_contact_gap_kernel, C, inputs, [tw.rigid_value], device=device)
+        inputs = [tw.rigid_value, tw.rigid_slot, tw.rigid_jac, self._rigid_u_d, self._rigid_u_free_d]
+        wp.launch(rigid_row_residual_kernel, 3 * C, inputs, [tw.rigid_r], device=device)
+        first = self._rigid_iter_count == 0
+        for b, size in enumerate(self._capacity_sizes):
+            branch = functools.partial(self._two_way_bucket, size, first, state_in, dt)
+            wp.capture_if(tw.take[b : b + 1], on_true=branch)
+        return self._nsn_lam_apply_d
+
+    def _two_way_bucket(self, size: int, first: bool, state_in: State, dt: float) -> None:
+        """The two-way NSN step of :meth:`_solve_two_way_capacity` on the first ``size`` contacts, which hold the
+        step's, and the joint rows after them: at the step's first iteration, the deformable rows' ``W`` and the
+        dense ``W`` of all rows; then the rows' residual at the live pose, the NSN step, and its tail."""
+        from .joints import gather_values_kernel, scatter_values_kernel  # noqa: PLC0415
+        from .rigid import rigid_row_residual_kernel, two_way_delassus_capacity_kernel  # noqa: PLC0415
+        from .rigid_contact import (  # noqa: PLC0415
+            particle_contact_body_residual_kernel,
+            place_joint_rows_kernel,
+            place_rigid_values_kernel,
+        )
+
+        tw, ls, device = self._tw, self._linear_solver, self._device
+        R, contact_rows = tw.joint_rows, 3 * size
+        n = contact_rows + R
+        if first:
+            ls.build_schur_capacity(size, self._capacity_active_d)
+            if R:
+                inputs = [tw.joint_select, self._joint_row_slot_d, self._joint_row_jac_d, contact_rows]
+                wp.launch(place_joint_rows_kernel, R, inputs, [tw.row_slot, tw.row_jac], device=device)
+                tw.pene0[contact_rows:n].zero_()
+            inputs = [ls.W_device_view(), tw.first, tw.active, contact_rows, tw.joint_select]
+            inputs += [tw.row_slot, tw.row_jac, self._slot_inv_mass_d]
+            wp.launch(two_way_delassus_capacity_kernel, (n, n), inputs, [tw.W[size]], device=device)
+        else:
+            ls.use_schur_capacity(size)
+        # The deformable rows' residual, on the contacts' bodies too, then the rigid rows and the joint rows.
+        count = self._contact_count
+        self._contact_count = size
+        try:
+            self._launch_contact_residual(tw.r)
+        finally:
+            self._contact_count = count
+        live = [self._rigid_x_live_d, self._rigid_q_live_d]
+        wp.launch(
+            particle_contact_body_residual_kernel,
+            dim=(size, 3),
+            inputs=[
+                *self._particle_contact_args()[:5],
+                *(self._contact_world_anchor_d, self._contact_v_anchor_d, self.model.shape_body),
+                *(self._body_slot_d, self.model.body_com, *live, state_in.body_q, tw.row_jac),
+                *(self._rigid_u_d, self._rigid_u_free_d, wp.float64(dt)),
+            ],
+            outputs=[tw.r],
+            device=device,
+        )
+        wp.launch(place_rigid_values_kernel, contact_rows, [tw.first, tw.active, tw.rigid_r], [tw.r], device=device)
+        if R:
+            inputs = [self._joint_residual_d, tw.joint_select, contact_rows]
+            wp.launch(gather_values_kernel, R, inputs, [tw.value], device=device)
+            inputs = [tw.value[contact_rows:], tw.row_slot[contact_rows:], tw.row_jac[contact_rows:]]
+            inputs += [self._rigid_u_d, self._rigid_u_free_d]
+            wp.launch(rigid_row_residual_kernel, R, inputs, [tw.r[contact_rows:]], device=device)
+        self._solve_nsn_coulomb_gpu(
+            None,
+            None,
+            None,
+            None,
+            max_iters=1,
+            dt=dt,
+            W_device=tw.W[size],
+            r_device=tw.r,
+            pene0_device=tw.pene0,
+            mu_device=tw.mu,
+            lam_init_device=tw.lam,
+            omega_init_device=tw.omega,
+            skip_download=True,
+            m_contacts=size,
+            n_bilateral=R,
+            block_precond=functools.partial(self._joint_system.solve_rows, tw.joint_select, contact_rows)
+            if R
+            else None,
+            contact_regularization=self.contact_regularization,
+            bilateral_compliance=tw.compliance if R and self._joint_dampers else None,
+        )
+        wp.copy(tw.lam, self._nsn_lam_d, count=n)
+        wp.copy(tw.omega, self._nsn_omega_d, count=n)
+        # The deformable rows correct the particle positions; the joint rows' forces go to the joint system.
+        ls.apply_lambda_correction_combined(self._nsn_lam_apply_d, self._rhs, self._x_cur)
+        if R:
+            inputs = [self._nsn_lam_apply_d, contact_rows, tw.joint_select]
+            wp.launch(scatter_values_kernel, R, inputs, [self._joint_force_d], device=device)
 
     def _joint_row_entries(self) -> int:
         """The entries of the pattern of every joint row, rows that share a body slot coupled: a bound of the entries
@@ -2528,6 +2840,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
         from .rigid import rigid_row_residual_kernel  # noqa: PLC0415
         from .rigid_contact import rigid_contact_gap_kernel  # noqa: PLC0415
 
+        if self._tw_active:
+            return self._solve_two_way_capacity(state_in, dt)
         rc, device, n, n_pad = self._rigid_contacts, self._device, self._rc_n, self._rc_n_pad
         (m_s, m_r), joint_rows, n_b = self._rc_counts, self._rc_joint_rows_d, self._rc_n_b
         m_t = self._rc_tendons
@@ -3385,6 +3699,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
             if not self._recording() and self._capacity_contacts_capable(contacts):
                 # A later step with these contacts may record into a graph: its buffers are allocated now.
                 self._reserve_capacity(contacts)
+                if self._two_way_capacity_capable(contacts):
+                    self._reserve_two_way_capacity(contacts)
 
     def _recording(self) -> bool:
         """Whether launches are being recorded into a graph, the solver's own (``_outer_capture``) or the caller's:
@@ -3398,13 +3714,21 @@ class SolverFBA(TendonStateMixin, SolverBase):
         ``dt`` by an earlier step, and the step must not read its contacts' counts back to the host to size its work.
         """
         if contacts is not None and self._integrates_bodies() and contacts.rigid_contact_shape0.shape[0]:
-            if not self._rigid_capacity_capable(contacts):
+            if self.model.particle_count and self._two_way_capacity_capable(contacts):
+                if self._tw is None or self._tw.key[0] != contacts.rigid_contact_shape0.shape[0]:
+                    return (
+                        "take a step with these contacts outside the graph first, which reserves their capacity's "
+                        "buffers"
+                    )
+            elif not self._rigid_capacity_capable(contacts):
                 return (
-                    "steps with contacts on the bodies that SolverFBA integrates record into a graph only in a model "
-                    "without particles, in one world, with nsn_sparse_storage=True, nsn_linear_iterations at most "
-                    f"{_PCR_CHECK_EVERY}, no tendons and no mimic joints; otherwise pass contacts=None"
+                    "steps with contacts on the bodies that SolverFBA integrates record into a graph only in one "
+                    f"world with nsn_linear_iterations at most {_PCR_CHECK_EVERY}, no tendons and no mimic joints: "
+                    "in a model without particles with nsn_sparse_storage=True, or in one with particles with "
+                    "nsn_sparse_storage=False, hard rigid contacts (rigid_contact_time=0) and no particle constraint "
+                    "rows, contact_warmstart or friction_anchors; otherwise pass contacts=None"
                 )
-            if self._rcc is None or self._rcc.C != contacts.rigid_contact_shape0.shape[0]:
+            elif self._rcc is None or self._rcc.C != contacts.rigid_contact_shape0.shape[0]:
                 return (
                     "take a step with these contacts outside the graph first, which reserves their capacity's buffers"
                 )
@@ -3413,10 +3737,11 @@ class SolverFBA(TendonStateMixin, SolverBase):
         if contacts is not None and self.model.particle_count and contacts.soft_contact_particle.shape[0]:
             if not self._capacity_contacts_capable(contacts):
                 return (
-                    "steps with contacts record into a graph only with friction=True, one world, particle-shape "
-                    "contacts alone (no self, face or rod contacts, particle constraint rows, contact_warmstart, "
-                    "friction_anchors or nsn_lite_accumulate) and nsn_schur_mode='lite', or 'full' with a dense W "
-                    "(nsn_sparse_storage=False) and nsn_linear_iterations at most 25; otherwise pass contacts=None"
+                    "steps with contacts record into a graph only with friction=True, one world, particle-shape and "
+                    "face contacts alone (no self, rod or rod shape contacts, particle constraint rows, "
+                    "contact_warmstart, friction_anchors or nsn_lite_accumulate) and nsn_schur_mode='lite' without "
+                    "face contacts, or 'full' with a dense W (nsn_sparse_storage=False) and nsn_linear_iterations at "
+                    "most 25; otherwise pass contacts=None"
                 )
             if self._capacity_reserved != contacts.soft_contact_particle.shape[0]:
                 return (
@@ -3426,8 +3751,11 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 return "the step's sort of the contacts needs the device's memory pool (wp.set_mempool_enabled)"
         if self._self_contact is not None or self._rod_contact is not None:
             return "self contacts and rod contacts are found on the host"
-        if self._segment_query is not None or (self._face_query is not None and self.face_contact_gap is not None):
-            return "rod shape contacts and face contacts with a gap are found on the host"
+        if self._segment_query is not None:
+            return "rod shape contacts are found on the host"
+        if self._face_query is not None and self.face_contact_gap is not None:
+            if not self._capacity_contacts_capable(contacts):
+                return "face contacts with a gap record into a graph only beside a buffer of particle contacts"
         if self._constraint_rows is not None:
             if self._attachments is not None or self._constraint_body_h is not None:
                 return "particle-body attachments and particle constraint rows on bodies are set up on the host"
@@ -3460,8 +3788,9 @@ class SolverFBA(TendonStateMixin, SolverBase):
         """Whether a step's particle contacts can take the capacity path, which records into a graph: every slot of
         the contact buffer becomes a contact row, the slots past the stored count and the contacts of held particles
         inert rows, sorted after the others on the device, so that the step reads nothing back. It serves
-        particle-shape contacts alone, with friction in one world: the lite operator, or the full operator with a
-        dense ``W`` of the capacity's rows (:meth:`FBALinearSolver.build_schur_capacity`)."""
+        particle-shape contacts, with friction in one world: the lite operator, or the full operator with a dense
+        ``W`` of the capacity's rows (:meth:`FBALinearSolver.build_schur_capacity`), which also takes the face
+        contacts and the mesh minima, found on the device (:meth:`FaceContactQuery.capacity_contacts`)."""
         if contacts is None or not contacts.soft_contact_particle.shape[0]:
             return False
         ls = self._linear_solver
@@ -3482,38 +3811,77 @@ class SolverFBA(TendonStateMixin, SolverBase):
             and self._self_contact is None
             and self._rod_contact is None
             and self._segment_query is None
-            and self._face_query is None
+            and (self._face_query is None or full)
             and self._constraint_rows is None
             and self._warm_start is None
             and not self.friction_anchors
             and not self.nsn_lite_accumulate
-            and not self._integrates_bodies()
+            and (not self._integrates_bodies() or self._two_way_capacity_capable(contacts))
         )
 
     def _reserve_capacity(self, contacts: Contacts) -> None:
         """Allocate the buffers of the capacity path for ``contacts``, so that a later step recorded into a graph
         allocates nothing."""
         C, device = contacts.soft_contact_particle.shape[0], self._device
-        self._ensure_contact_buffers(C)
-        if self._capacity_sort is None or self._capacity_sort[0].shape[0] < 2 * C:
+        full = self.nsn_schur_mode == "full"
+        face = full and self._face_query is not None
+        # The sort takes the contact slots and, beside a mesh, three mesh minima per slot after them; the face
+        # contacts follow, at most one per pair of a shape and a triangle. The rows hold the largest bucket's.
+        minima = face and self._mesh_shapes
+        keys = 4 * C if minima else C
+        most = keys + (self.model.shape_count * self.model.tri_count if face else 0)
+        if self._two_way_capacity_capable(contacts):
+            # The rigid contacts follow the deformable ones in the two-way steps' buckets.
+            most += contacts.rigid_contact_shape0.shape[0]
+        sizes = sorted({min(size, most, _CAPACITY_LARGEST) for size in (*_CAPACITY_SIZES, most)}) if full else [C]
+        rows = max(C, sizes[-1])
+        # Steps outside a graph reserve at every step; the buffers of the same capacity stay those of the graphs that
+        # recorded them.
+        key = (C, rows, tuple(sizes), face, minima, id(self._linear_solver))
+        if getattr(self, "_capacity_key", None) == key:
+            return
+        self._capacity_key = key
+        self._capacity_rows = rows
+        self._ensure_contact_buffers(rows)
+        if self._capacity_sort is None or self._capacity_sort[0].shape[0] < 2 * keys:
             self._capacity_sort = (
-                wp.empty(2 * C, dtype=wp.int64, device=device),
-                wp.empty(2 * C, dtype=wp.int32, device=device),
+                wp.empty(2 * keys, dtype=wp.int64, device=device),
+                wp.empty(2 * keys, dtype=wp.int32, device=device),
             )
-        if self.nsn_schur_mode == "full":
+        self._capacity_active_d = wp.zeros(1, dtype=wp.int32, device=device)
+        self._capacity_minima = None
+        if minima:
+            self._capacity_minima = (
+                wp.zeros((C, 3), dtype=wp.int32, device=device),
+                wp.zeros((C, 3), dtype=wp.vec3, device=device),
+                wp.zeros((C, 3), dtype=wp.vec3, device=device),
+            )
+        if full:
             # The buckets of the full operator: a dense W of each size's rows, and the NSN step's matrices and the PCR
             # solver for the largest.
-            sizes = sorted({min(size, C, _CAPACITY_LARGEST) for size in (*_CAPACITY_SIZES, C)})
-            self._linear_solver.reserve_schur_capacity(C, sizes)
+            self._linear_solver.reserve_schur_capacity(rows, sizes, extra_width=2 if face else 0)
             self._capacity_sizes = sizes
             self._capacity_sizes_d = wp.array(sizes, dtype=wp.int32, device=device)
             self._capacity_take_d = wp.zeros(len(sizes), dtype=wp.int32, device=device)
-            self._capacity_active_d = wp.zeros(1, dtype=wp.int32, device=device)
             self._ensure_pcr_solver(3 * sizes[-1])
-            if getattr(self, "_nsn_mu_d", None) is None or self._nsn_mu_d.size < max(C, 16):
-                self._nsn_mu_d = wp.zeros(max(C, 16), dtype=wp.float64, device=device)
+            if getattr(self, "_nsn_mu_d", None) is None or self._nsn_mu_d.size < max(rows, 16):
+                self._nsn_mu_d = wp.zeros(max(rows, 16), dtype=wp.float64, device=device)
             self._ensure_nsn_inner_buffers(3 * sizes[-1], alloc_2d=True)
             self._contact_peak_capacity[_PEAK_FULL] = sizes[-1]
+            self._capacity_face = None
+            if face:
+                # The face contacts' further particles and weights, the active particle contacts that they follow,
+                # and each contact's gain of its rows' diagonal, the contact regularization of steps with face
+                # contacts.
+                self._face_query.reserve_capacity(self.model)
+                self._capacity_face = SimpleNamespace(
+                    extra=[
+                        wp.full((rows, 2), -1, dtype=wp.int32, device=device),
+                        wp.zeros((rows, 2), dtype=wp.float32, device=device),
+                    ],
+                    first=wp.zeros(1, dtype=wp.int32, device=device),
+                    gain=wp.ones(sizes[-1], dtype=wp.float64, device=device),
+                )
         else:
             self._linear_solver.reserve_lite_rows_capacity(C)
             self._ensure_nsn_inner_buffers(3 * C, alloc_2d=False)
@@ -3521,22 +3889,28 @@ class SolverFBA(TendonStateMixin, SolverBase):
             self._contact_peak_d = wp.zeros(len(_PEAK_KINDS), dtype=wp.int32, device=device)
         self._contact_peak_capacity[_PEAK_SOFT] = C
         persistent = getattr(self, "_lam_coulomb_persistent_d", None)
-        if persistent is None or persistent.size < 3 * C:
+        if persistent is None or persistent.size < 3 * rows:
             for name in ("lam_unilateral", "lam_coulomb", "omega_unilateral", "omega_coulomb"):
-                setattr(self, f"_{name}_persistent_d", wp.zeros(3 * C, dtype=wp.float64, device=device))
+                setattr(self, f"_{name}_persistent_d", wp.zeros(3 * rows, dtype=wp.float64, device=device))
         self._capacity_reserved = C
 
-    def _capacity_contacts(self, contacts: Contacts) -> int:
+    def _capacity_contacts(self, contacts: Contacts, state: State | None) -> int:
         """The contact rows of the capacity path: sort the whole buffer of ``contacts`` on the device, the inert slots
-        last (:func:`kernels.capacity_contact_keys_kernel`), and lay out its rows. Returns the row count, the
-        buffer's capacity."""
+        last (:func:`kernels.capacity_contact_keys_kernel`), with their mesh minima, and lay out its rows, the face
+        contacts after the particle contacts; ``_capacity_active_d`` takes the count of active rows. Returns the count
+        of rows, the buffer's capacity or, with face contacts, the largest bucket's if more."""
         from .kernels import (  # noqa: PLC0415
             capacity_contact_keys_kernel,
             capacity_contact_rows_kernel,
+            capacity_contact_ties_kernel,
+            capacity_key_count_kernel,
+            capacity_minima_keys_kernel,
+            capacity_minima_rows_kernel,
             contact_peak_kernel,
         )
 
-        C, device = contacts.soft_contact_particle.shape[0], self._device
+        C, device, model = contacts.soft_contact_particle.shape[0], self._device, self.model
+        src = state if state is not None else model
         keys, order = self._capacity_sort
         # The pipeline's count, which passes C when its buffers dropped contacts: dropped_contacts() reports it.
         wp.launch(
@@ -3544,37 +3918,78 @@ class SolverFBA(TendonStateMixin, SolverBase):
         )
         pinned = self._pinned_d if self._pinned_d is not None else wp.empty(0, dtype=wp.int32, device=device)
         inputs = [contacts.soft_contact_count, contacts.soft_contact_particle, contacts.soft_contact_shape]
-        wp.launch(
-            capacity_contact_keys_kernel, C, [*inputs, self.model.shape_count, pinned], [keys, order], device=device
-        )
-        wp.utils.radix_sort_pairs(keys, order, C)
-        inputs = [keys, order, contacts.soft_contact_particle, contacts.soft_contact_shape]
-        inputs += [contacts.soft_contact_body_pos, contacts.soft_contact_normal]
+        wp.launch(capacity_contact_keys_kernel, C, [*inputs, model.shape_count, pinned], [keys, order], device=device)
+        count = C
+        minima = self._capacity_minima
+        if minima is not None:
+            # A particle in a concave corner of a mesh touches every face of the corner: its other minima sort with
+            # its contact, by normal and anchor among them, as the host path orders them.
+            alarm = 0.0 if self.face_contact_gap is None else self.face_contact_gap
+            self._face_query.capacity_minima(model, src.particle_q, src.body_q, contacts, alarm, *minima)
+            inputs += [model.shape_count, pinned, minima[0]]
+            wp.launch(capacity_minima_keys_kernel, 3 * C, inputs, [keys, order], device=device)
+            count = 4 * C
+        wp.utils.radix_sort_pairs(keys, order, count)
+        sorted_keys = keys[:count]
         outputs = [self._contact_particle_d, self._contact_normal_d, self._contact_alpha_d, self._contact_shape_d]
         outputs += [self._contact_body_pos_d, self._contact_record_d]
-        wp.launch(capacity_contact_rows_kernel, C, inputs, outputs, device=device)
+        if minima is not None:
+            inputs = [sorted_keys, contacts.soft_contact_normal, contacts.soft_contact_body_pos, minima[2], minima[1]]
+            wp.launch(capacity_contact_ties_kernel, count, inputs, [order], device=device)
+            inputs = [keys, order, count, contacts.soft_contact_particle, contacts.soft_contact_shape]
+            inputs += [contacts.soft_contact_body_pos, contacts.soft_contact_normal, minima[1], minima[2]]
+            wp.launch(capacity_minima_rows_kernel, self._capacity_rows, inputs, outputs, device=device)
+        else:
+            inputs = [keys, order, count, contacts.soft_contact_particle, contacts.soft_contact_shape]
+            inputs += [contacts.soft_contact_body_pos, contacts.soft_contact_normal]
+            wp.launch(capacity_contact_rows_kernel, self._capacity_rows, inputs, outputs, device=device)
+        face = getattr(self, "_capacity_face", None) if self.nsn_schur_mode == "full" else None
+        active = self._capacity_active_d if face is None else face.first
+        wp.launch(capacity_key_count_kernel, count, [sorted_keys], [active], device=device)
+        self._contact_extra = None
+        if face is not None:
+            # The face contacts follow the particle contacts, as the host path orders them.
+            face.extra[0].fill_(-1)
+            face.extra[1].zero_()
+            self._face_query.capacity_contacts(
+                model,
+                src.particle_q,
+                src.body_q,
+                contacts,
+                pinned,
+                self.face_contact_edge_radius,
+                self.face_contact_gap,
+                face.first,
+                self._capacity_sizes[-1],
+                outputs,
+                face.extra,
+                self._capacity_active_d,
+                1.0 + self.contact_regularization,
+                face.gain,
+            )
+            self._contact_extra = face.extra
         if self.nsn_schur_mode == "full":
             # The active contacts' count picks the bucket of the step (_full_capacity_correction).
-            from .kernels import capacity_active_count_kernel, capacity_bucket_kernel  # noqa: PLC0415
+            from .kernels import capacity_bucket_kernel  # noqa: PLC0415
 
-            record = self._contact_record_d[:C]
-            wp.launch(capacity_active_count_kernel, C, [record], [self._capacity_active_d], device=device)
             inputs = [self._capacity_active_d, self._capacity_sizes_d]
             wp.launch(capacity_bucket_kernel, len(self._capacity_sizes), inputs, [self._capacity_take_d], device=device)
             outputs = [self._contact_peak_d]
             wp.launch(contact_peak_kernel, 1, [self._capacity_active_d, _PEAK_FULL], outputs, device=device)
-        return C
+        return self._capacity_rows
 
     def _full_capacity_correction(self, first: bool, dt: float) -> None:
         """A local-global iteration's contact correction of a full-operator step on the capacity path: the bucket
         whose size holds the step's active contacts, picked on the device (``wp.capture_if``, a conditional node of
         a recorded graph), builds its ``W`` at the step's first iteration and takes the NSN step on its rows."""
         if first:
-            # The rows, their particle CSR and the contacted particles' ranks hold for every bucket; their scans
-            # allocate, which a conditional node does not take.
+            # The rows, their particle CSR and the contacted particles' ranks hold for every bucket; their scans and
+            # sorts allocate, which a conditional node does not take.
             rows = [self._contact_particle_d, self._contact_normal_d, self._contact_alpha_d]
-            rows += [self._contact_tangent1_d, self._contact_tangent2_d, self._contact_record_d]
-            self._linear_solver.prepare_schur_capacity(self._contact_count, self._capacity_sizes[-1], *rows)
+            rows += [self._contact_tangent1_d, self._contact_tangent2_d, self._capacity_active_d]
+            self._linear_solver.prepare_schur_capacity(
+                self._contact_count, self._capacity_sizes[-1], *rows, **self._contact_extra_args()
+            )
         for b, size in enumerate(self._capacity_sizes):
             branch = functools.partial(self._full_bucket_correction, size, first, dt)
             wp.capture_if(self._capacity_take_d[b : b + 1], on_true=branch)
@@ -3586,11 +4001,14 @@ class SolverFBA(TendonStateMixin, SolverBase):
         self._contact_count = size
         try:
             if first:
-                ls.build_schur_capacity(size, self._contact_record_d)
+                ls.build_schur_capacity(size, self._capacity_active_d)
             else:
                 ls.use_schur_capacity(size)
             self._launch_contact_residual(self._nsn_r_d)
             self._launch_contact_pene0(self._nsn_pene0_d)
+            # Face contacts act on particles that also carry particle contacts: steps that find them regularize the
+            # rows, as the host path does, each contact's gain set on the device.
+            face = self._capacity_face
             self._solve_nsn_coulomb_gpu(
                 None,
                 None,
@@ -3607,7 +4025,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 skip_download=True,
                 m_contacts=size,
                 n_bilateral=0,
-                contact_regularization=0.0,
+                contact_scale=None if face is None else face.gain,
+                contact_regularization=0.0 if face is None else self.contact_regularization,
             )
             self._deformable_contact_tail(ls, 3 * size)
         finally:
@@ -3704,6 +4123,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         if observables is not None and observables.is_requested(SolverBase.ObservableKind.CONTACT_F):
             contact_f = observables.contact_f
         self._two_way, self._rc_n, self._mixed, self._rc_capacity_active = False, 0, None, False
+        self._tw_active = False
         self._two_way_world_h.fill(0)
         rigid = self.model.body_count > 0 and not self.integrate_with_external_rigid_solver
         rigid = rigid and self._begin_rigid_step(state_in, state_out, dt, control)
@@ -3919,7 +4339,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
             else:
                 self._run_pd_local_phase_eager(N, dt)
 
-            if has_contacts and self._capacity_step and self.nsn_schur_mode == "full":
+            if has_contacts and self._capacity_step and self.nsn_schur_mode == "full" and not self._tw_active:
                 # The full operator's capacity path: the bucket of the step's active contacts, picked on the device.
                 self._full_capacity_correction(_k == 0, dt)
             elif (has_contacts or n_b) and (not self._two_way or mixed is not None):
@@ -5824,7 +6244,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         M_raw = 0
         if self._capacity_step:
             # The whole buffer, sorted and laid out on the device; nothing is read back.
-            M_raw = M = shape_contacts = self._capacity_contacts(contacts)
+            M_raw = M = shape_contacts = self._capacity_contacts(contacts, state)
         elif contacts is not None:
             capacity = contacts.soft_contact_particle.shape[0]
             M_raw = stored_contact_count(contacts.soft_contact_count, capacity, "soft")
@@ -6100,7 +6520,9 @@ class SolverFBA(TendonStateMixin, SolverBase):
         if self._capacity_step:
             from .kernels import inert_contact_offset_kernel  # noqa: PLC0415
 
-            wp.launch(inert_contact_offset_kernel, M, [self._contact_record_d], [self._contact_offset_d], device=device)
+            wp.launch(
+                inert_contact_offset_kernel, M, [self._capacity_active_d], [self._contact_offset_d], device=device
+            )
 
         # Host mirrors of the basic contact fields, for the host paths that still read them.
         self._contact_particle_h = None if particle_h is None else particle_h.astype(np.int32)
