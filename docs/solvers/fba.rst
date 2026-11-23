@@ -215,7 +215,9 @@ the host, such as :meth:`~newton.solvers.SolverFBA.set_pin_targets`,
 :meth:`~newton.solvers.SolverFBA.set_particle_constraints` and
 :meth:`~newton.solvers.SolverFBA.notify_model_changed`, reach the graphs
 recorded after them. Outside a capture a step captures and replays its own
-local-global iterations. FBA runs
+local-global iterations. A step recorded into a graph, and the solver's own
+captures, run with Python's garbage collector paused, so that no collection
+frees arrays of unreachable reference cycles inside the capture. FBA runs
 on the CPU and on CUDA devices. A step may write its output into its input
 state.
 

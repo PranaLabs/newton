@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
 import math
 import sys
 import unittest
@@ -2376,6 +2377,46 @@ class TestGraphCapture(unittest.TestCase):
             results.append(s0.particle_q.numpy())
         self.assertGreater(float(results[0][:, 2].max()), 0.0)
         np.testing.assert_array_equal(results[0], results[1])
+
+    def test_no_collection_runs_inside_a_capture(self):
+        """Run no garbage collection while a step captures the solver's own graphs or records into the caller's
+        capture, with the collector set to run at nearly every allocation: a collection there would free unreachable
+        arrays inside the capture, which breaks it or frees them again at each replay. The collector runs again
+        after the step."""
+        model = self._scene("cloth")
+        solver = SolverFBA(model, iterations=5)
+        s0, s1 = model.state(), model.state()
+        inside, stepping, body = [], [False], solver._step
+
+        def collected(phase, info):
+            if phase == "start" and stepping[0] and wp.get_device().is_capturing:
+                inside.append(info["generation"])
+
+        def step_body(*args):
+            stepping[0] = True
+            try:
+                body(*args)
+            finally:
+                stepping[0] = False
+
+        solver._step = step_body
+
+        threshold = gc.get_threshold()
+        gc.callbacks.append(collected)
+        gc.set_threshold(1, 1000, 1000)
+        try:
+            # The first step captures the graph of its local-global iterations.
+            solver.step(s0, s1, None, None, 0.01)
+            with wp.ScopedCapture() as capture:
+                solver.step(s1, s0, None, None, 0.01)
+        finally:
+            gc.set_threshold(*threshold)
+            gc.callbacks.remove(collected)
+        wp.capture_launch(capture.graph)
+        self.assertIsInstance(solver._lg_iter_graph, wp.Graph)
+        self.assertEqual(inside, [])
+        self.assertTrue(gc.isenabled())
+        self.assertTrue(np.isfinite(s0.particle_q.numpy()).all())
 
     def test_capture_names_what_blocks_it(self):
         """Refuse to record a step whose system is not set up for its dt, and one with contacts, naming why."""
