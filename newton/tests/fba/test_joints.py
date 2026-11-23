@@ -499,6 +499,26 @@ class TestSolverFBAJointLimits(unittest.TestCase):
         # Released at 0.5 rad from either limit, it starts without limit rows; it ends with the lower one.
         self.assertEqual((limit_rows[0], limit_rows[-1]), (0, 1))
 
+    def test_friction_holds_the_pendulum_at_its_limit(self):
+        """Hold a pendulum that gravity pushes into its lower limit there, with joint friction on the axis of the
+        limit's row, below and above gravity's torque; and with friction above gravity's torque alone, hold it where
+        it is released."""
+        for friction, lower, start in ((2.0, -0.5, -0.5), (20.0, -0.5, -0.5), (20.0, -1.0e10, -0.3)):
+            with self.subTest(friction=friction, lower=lower):
+                builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+                self._pendulum(builder, lower, 0.5 if lower > -1.0e10 else 1.0e10)
+                builder.joint_friction[0] = friction
+                builder.joint_q[0] = start
+                model = builder.finalize()
+                state = model.state()
+                newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+                model.body_q.assign(state.body_q)
+                q, qd, _ = self._run(model, 0.005, 200)
+                angle = np.arctan2(q[:, 0, 1], q[:, 0, 0])
+                self.assertTrue(np.isfinite(q).all())
+                np.testing.assert_allclose(angle, start, atol=1e-4)
+                self.assertLess(np.abs(qd[:, 0, 5]).max(), 1e-3)
+
     def test_prismatic_limit_holds_the_slider(self):
         """Hold a slider that gravity pulls along its axis at its lower limit."""
         builder = newton.ModelBuilder()
@@ -816,21 +836,55 @@ def _implicit_euler(n, dt, inertia, ke=0.0, kd=0.0, c=0.0, armature=0.0, q_targe
     return np.array(out)
 
 
+def _box_euler(n, dt, inertia, ke=0.0, kd=0.0, c=0.0, armature=0.0, q_target=0.0, qd_target=0.0, force=0.0, **box):
+    """Coordinates and rates of an axis as :func:`_implicit_euler`, its drive's force bounded by ``box["effort"]`` and
+    a dry friction of ``box["friction"]`` on it: each step's end rate ``w`` holds ``h(w) + f = 0`` for the axis's
+    other forces ``h`` less its inertial force and a friction force ``f`` within ``[-F, F]`` that opposes ``w``."""
+    effort, friction = box.get("effort", np.inf), box.get("friction", 0.0)
+    q = v = 0.0
+    m = inertia + armature
+    out = []
+    for _ in range(n):
+
+        def h(w, q=q, v=v):
+            drive = ke * (q_target - q - dt * w) + kd * (qd_target - w)
+            return np.clip(drive, -effort, effort) - c * w + force - m * (w - v) / dt
+
+        w = 0.0
+        if abs(h(0.0)) > friction:
+            # h decreases with w: bisect h(w) = s F on the side of the motion.
+            s = np.sign(h(0.0))
+            lo, hi = (0.0, 1.0e3) if s > 0 else (-1.0e3, 0.0)
+            for _ in range(200):
+                mid = 0.5 * (lo + hi)
+                if (h(mid) - s * friction > 0.0) == (s > 0):
+                    lo, hi = (mid, hi) if s > 0 else (lo, mid)
+                else:
+                    lo, hi = (lo, mid) if s > 0 else (mid, hi)
+            w = 0.5 * (lo + hi)
+        v = w
+        q += dt * v
+        out.append((q, v))
+    return np.array(out)
+
+
 class TestSolverFBAJointDrives(unittest.TestCase):
     """SolverFBA's joint drives, armature and generalized joint forces (``Control.joint_f``)."""
 
     @staticmethod
     def _axis_model(kind, lower=-1.0e10, upper=1.0e10, **dof):
         """A unit body on a revolute joint about z through its COM or a prismatic joint along z, without gravity, its
-        DOF's ``target_ke``, ``target_kd``, ``damping`` and ``armature`` set from ``dof``."""
+        DOF's ``target_ke``, ``target_kd``, ``damping``, ``armature``, ``friction`` and ``effort_limit`` set from
+        ``dof``."""
         builder = newton.ModelBuilder()
         link = _link(builder)
         add = builder.add_joint_revolute if kind == "revolute" else builder.add_joint_prismatic
         builder.add_articulation([add(-1, link, axis=(0.0, 0.0, 1.0), limit_lower=lower, limit_upper=upper)])
         model = builder.finalize()
         model.gravity.assign([wp.vec3(0.0, 0.0, 0.0)])
-        for name in ("target_ke", "target_kd", "damping", "armature"):
+        for name in ("target_ke", "target_kd", "damping", "armature", "friction"):
             getattr(model, f"joint_{name}").assign([dof.get(name, 0.0)])
+        model.joint_effort_limit.assign([dof.get("effort_limit", 1.0e6)])
         return model
 
     @staticmethod
@@ -893,6 +947,73 @@ class TestSolverFBAJointDrives(unittest.TestCase):
                 np.testing.assert_allclose(coordinate, expected[:, 0], rtol=1e-4, atol=1e-6)
                 np.testing.assert_allclose(rate, expected[:, 1], rtol=1e-4, atol=1e-6)
 
+    def test_effort_limits_bound_the_drives(self):
+        """Bound the drive force of an axis of unit inertia by its effort limit, its damping and armature unbounded,
+        step for step as the backward Euler step with the drive's force clamped: a position drive that saturates
+        on its way to a far target and on its way back from the overshoot, a velocity drive that saturates until
+        it nears its target rate, alone in the joint system and, next to a limit, with the joint rows in the
+        contact solve; the default effort limit leaves the drive unbounded."""
+        dt, n = 0.01, 300
+        cases = (
+            ("revolute", {}, {"target_ke": 50.0, "target_kd": 5.0, "effort_limit": 2.0}, (1.0, 0.0)),
+            ("revolute", {}, {"target_ke": 50.0, "target_kd": 5.0, "damping": 1.0, "armature": 0.5,
+                              "effort_limit": 2.0}, (1.0, 0.0)),
+            ("prismatic", {}, {"target_kd": 10.0, "effort_limit": 1.0}, (0.0, 2.0)),
+            ("revolute", {"lower": -0.01, "upper": 2.0}, {"target_ke": 50.0, "target_kd": 5.0, "effort_limit": 2.0},
+             (1.0, 0.0)),
+            ("revolute", {}, {"target_ke": 50.0, "target_kd": 5.0, "effort_limit": 1.0e6}, (1.0, 0.0)),
+        )  # fmt: skip
+        for kind, limits, dof, target in cases:
+            with self.subTest(kind=kind, limits=limits, **dof):
+                model = self._axis_model(kind, **limits, **dof)
+                q, qd = self._run(model, dt, n, targets={0: target})
+                coordinate, rate = self._coordinate(kind, q, qd)
+                gains = {"ke": "target_ke", "kd": "target_kd", "c": "damping", "armature": "armature"}
+                expected = _box_euler(
+                    n,
+                    dt,
+                    1.0,
+                    **{k: dof.get(v, 0.0) for k, v in gains.items()},
+                    q_target=target[0],
+                    qd_target=target[1],
+                    effort=dof["effort_limit"],
+                )
+                np.testing.assert_allclose(coordinate, expected[:, 0], rtol=1e-4, atol=1e-6)
+                np.testing.assert_allclose(rate, expected[:, 1], rtol=1e-4, atol=1e-6)
+
+    def test_joint_friction_holds_and_slides(self):
+        """Hold an axis of unit inertia still against a generalized force below its joint friction and slide it
+        under one above, then hold a driven axis short of its target where the drive's force falls below the
+        friction, each step for step as the backward Euler step with dry friction, alone in the joint system and,
+        next to a limit, with the joint rows in the contact solve."""
+        dt, n = 0.01, 200
+        cases = (
+            ("revolute", {}, {"friction": 1.0}, None, 0.5),
+            ("revolute", {}, {"friction": 0.2}, None, 0.5),
+            ("prismatic", {}, {"friction": 0.3, "damping": 2.0}, None, -1.0),
+            ("revolute", {}, {"friction": 1.0, "target_ke": 20.0, "target_kd": 4.0}, (0.6, 0.0), 0.0),
+            ("revolute", {"lower": -0.01, "upper": 2.0}, {"friction": 0.2}, None, 0.5),
+            ("revolute", {"lower": -0.01, "upper": 2.0}, {"friction": 1.0, "target_ke": 20.0, "target_kd": 4.0},
+             (0.6, 0.0), 0.0),
+        )  # fmt: skip
+        for kind, limits, dof, target, force in cases:
+            with self.subTest(kind=kind, limits=limits, force=force, **dof):
+                model = self._axis_model(kind, **limits, **dof)
+                q, qd = self._run(model, dt, n, targets=None if target is None else {0: target}, joint_f=[force])
+                coordinate, rate = self._coordinate(kind, q, qd)
+                gains = {"ke": "target_ke", "kd": "target_kd", "c": "damping", "armature": "armature"}
+                expected = _box_euler(
+                    n,
+                    dt,
+                    1.0,
+                    **{k: dof.get(v, 0.0) for k, v in gains.items()},
+                    q_target=0.0 if target is None else target[0],
+                    force=force,
+                    friction=dof["friction"],
+                )
+                np.testing.assert_allclose(coordinate, expected[:, 0], rtol=1e-4, atol=1e-6)
+                np.testing.assert_allclose(rate, expected[:, 1], rtol=1e-4, atol=1e-6)
+
     def test_joint_forces_accelerate_the_axes(self):
         """Accelerate an axis of unit inertia with armature 0.5 by a constant generalized force, as the backward
         Euler step does, and a body on a FREE joint by the joint's world wrench."""
@@ -940,15 +1061,15 @@ class TestSolverFBAJointDrives(unittest.TestCase):
         self.assertAlmostEqual(coordinate[-1], -0.2, delta=1e-3)
 
     def test_unapplied_dof_properties_warn(self):
-        """Warn at the first step about the effort limit of a driven DOF, joint friction and velocity limits, which
-        FBA does not apply, and not about the defaults or the effort limit of an undriven DOF."""
+        """Warn at the first step about velocity limits, which FBA does not apply, and not about the defaults, effort
+        limits or joint friction."""
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
         cases = (
             ({}, None),
             ({"effort_limit": 50.0}, None),
-            ({"effort_limit": 50.0, "target_ke": 10.0}, "joint_effort_limit"),
-            ({"friction": 0.2}, "joint_friction"),
+            ({"effort_limit": 50.0, "target_ke": 10.0}, None),
+            ({"friction": 0.2}, None),
             ({"velocity_limit": 3.0}, "joint_velocity_limit"),
         )
         for dof, name in cases:

@@ -1,0 +1,1 @@
+Bound the drive forces of `SolverFBA`'s joints by `Model.joint_effort_limit` (below `1e6`), their damping and armature unbounded, and apply `Model.joint_friction` as a row on each free axis whose force the friction bounds, both by a box law in each Newton step of the joint rows; only `joint_velocity_limit` still warns.

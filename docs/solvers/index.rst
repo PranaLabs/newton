@@ -242,7 +242,8 @@ enforce joints as pairwise body constraints but do not use the articulation kine
 :class:`~newton.solvers.SolverVBD` supports a subset of joint types through maximal-coordinate
 constraints, with unified compliant ALM by default and a deprecated legacy AVBD path.
 :class:`~newton.solvers.SolverFBA` enforces joints as bilateral maximal-coordinate constraints, the limits of
-revolute and prismatic joints as unilateral rows, and the drives, damping and armature of free axes as soft rows.
+revolute and prismatic joints as unilateral rows, the drives, damping and armature of free axes as soft rows, and
+the effort limits of drives and joint friction as rows whose force a box bounds.
 :class:`~newton.solvers.SolverStyle3D` and :class:`~newton.solvers.SolverImplicitMPM` do not support joints.
 
 **Joint types**
@@ -378,7 +379,7 @@ revolute and prismatic joints as unilateral rows, and the drives, damping and ar
      - |yes|
      - |no|
      - |yes|
-     - |no|
+     - |yes| :sup:`18`
    * - :attr:`~newton.Model.joint_limit_lower` / :attr:`~newton.Model.joint_limit_upper`
      - |yes|
      - |yes| :sup:`9`
@@ -405,7 +406,7 @@ revolute and prismatic joints as unilateral rows, and the drives, damping and ar
      - |yes|
      - |no|
      - |yes|
-     - |no|
+     - |yes| :sup:`18`
    * - :attr:`~newton.Model.joint_velocity_limit`
      - |no|
      - |yes| :sup:`11`
@@ -419,6 +420,9 @@ revolute and prismatic joints as unilateral rows, and the drives, damping and ar
 | :sup:`2` Not enforced for BALL joints in SemiImplicit.
 | :sup:`14` FBA enforces the limits of REVOLUTE and PRISMATIC joints as hard unilateral rows (a revolute joint
   needs both limits; it leaves out a range of a full turn or more) and ignores those of BALL and D6 joints.
+| :sup:`18` FBA bounds a drive's force ``ke (q* - q) + kd (q_dot* - q_dot)``, not its damping or armature, by an
+  effort limit below ``1e6``, and holds each free axis with joint friction by a row whose force the friction bounds,
+  both by a box law in each Newton step of the joint rows.
 
 **Actuation and control**
 
@@ -521,8 +525,7 @@ revolute and prismatic joints as unilateral rows, and the drives, damping and ar
 | :sup:`13` See :ref:`Particle-body attachments` for authoring and semantics. Attachments spanning two
   solvers are coupled by :class:`~newton.solvers.experimental.coupled.SolverCoupledADMM` instead.
 | :sup:`15` FBA takes the backward Euler step of each drive with the axis's damping and armature. Position drives
-  need a linear axis or the angular axis of a joint with one; drive forces are not limited to
-  ``joint_effort_limit``.
+  need a linear axis or the angular axis of a joint with one; an effort limit below ``1e6`` bounds the drive's force.
 | :sup:`16` FBA solves attachments to the dynamic bodies it integrates as soft rows with the bodies' contacts and
   joints, with the full contact operator in one world.
 | :sup:`17` FBA holds each follower coordinate by a hard row combined from rows on both joints' axes, for PRISMATIC,
