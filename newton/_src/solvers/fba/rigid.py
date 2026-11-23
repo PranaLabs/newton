@@ -273,26 +273,39 @@ def _split_entries_kernel(
     entry_side[i] = values[i] - 2 * row
 
 
+def entry_buffers(slot_count: int, count: int, device) -> tuple[wp.array, ...]:
+    """Buffers of :func:`slot_entries` (of ``count`` = 2 rows entries) or :func:`group_entries` (of ``count`` = rows
+    times groups entries) on ``slot_count`` slots, to keep across calls: ``(start, entries, sides, keys, values)``."""
+    start = wp.zeros(slot_count + 1, dtype=wp.int32, device=device)
+    entries = wp.empty(max(count, 1), dtype=wp.int32, device=device)
+    sides = wp.empty(max(count, 1), dtype=wp.int32, device=device)
+    # radix_sort_pairs sorts in place in arrays twice the sorted length.
+    keys = wp.empty(max(2 * count, 1), dtype=wp.int32, device=device)
+    values = wp.empty(max(2 * count, 1), dtype=wp.int32, device=device)
+    return start, entries, sides, keys, values
+
+
 def slot_entries(
-    row_slot: wp.array2d[wp.int32], rows: int, slot_count: int, distinct: bool = False
+    row_slot: wp.array2d[wp.int32],
+    rows: int,
+    slot_count: int,
+    distinct: bool = False,
+    buffers: tuple[wp.array, ...] | None = None,
 ) -> tuple[wp.array, wp.array, wp.array]:
     """:func:`row_incidence` of the first ``rows`` rows of a device ``row_slot``, computed on its device.
 
     The entries of slot ``k`` are ``start[k]:start[k + 1]``, ascending by row and then side, as
     :func:`row_incidence` orders them; ``entry_row`` and ``entry_side`` hold ``2 * rows`` entries, of which those from
     ``start[slot_count]`` on belong to no slot. With ``distinct``, a row enters each slot's entries once, as the
-    rows of a group do.
+    rows of a group do. ``buffers`` from :func:`entry_buffers` hold the results and the sort, allocating nothing.
     """
     device = row_slot.device
-    start = wp.zeros(slot_count + 1, dtype=wp.int32, device=device)
     count = 2 * rows
-    entry_row = wp.empty(max(count, 1), dtype=wp.int32, device=device)
-    entry_side = wp.empty(max(count, 1), dtype=wp.int32, device=device)
+    if buffers is None:
+        buffers = entry_buffers(slot_count, count, device)
+    start, entry_row, entry_side, keys, values = buffers
     if count == 0:
         return start, entry_row, entry_side
-    # radix_sort_pairs sorts in place in arrays twice the sorted length.
-    keys = wp.empty(2 * count, dtype=wp.int32, device=device)
-    values = wp.empty(2 * count, dtype=wp.int32, device=device)
     inputs = [row_slot, slot_count, int(distinct)]
     wp.launch(_slot_entries_kernel, count, inputs=inputs, outputs=[keys, values], device=device)
     wp.utils.radix_sort_pairs(keys, values, count)
@@ -358,19 +371,20 @@ def _entry_rows_kernel(values: wp.array[wp.int32], width: int, rows: wp.array[wp
     rows[i] = values[i] // width
 
 
-def group_entries(groups: wp.array2d[wp.int32], slot_count: int) -> tuple[wp.array, wp.array]:
+def group_entries(
+    groups: wp.array2d[wp.int32], slot_count: int, buffers: tuple[wp.array, ...] | None = None
+) -> tuple[wp.array, wp.array]:
     """The rows of each group of ``groups``, ``(rows, G)`` with each row's groups distinct and -1 where unused,
     computed on its device: ``(start, rows)``, the rows of group ``k`` ascending in ``rows[start[k]:start[k + 1]]``,
-    as :func:`slot_entries` gives them for rows of two sides."""
+    as :func:`slot_entries` gives them for rows of two sides. ``buffers`` from :func:`entry_buffers` hold the results
+    and the sort, allocating nothing."""
     device = groups.device
     count = groups.shape[0] * groups.shape[1]
-    start = wp.zeros(slot_count + 1, dtype=wp.int32, device=device)
-    rows = wp.empty(max(count, 1), dtype=wp.int32, device=device)
+    if buffers is None:
+        buffers = entry_buffers(slot_count, count, device)
+    start, rows, _sides, keys, values = buffers
     if count == 0:
         return start, rows
-    # radix_sort_pairs sorts in place in arrays twice the sorted length.
-    keys = wp.empty(2 * count, dtype=wp.int32, device=device)
-    values = wp.empty(2 * count, dtype=wp.int32, device=device)
     wp.launch(_group_entries_kernel, count, inputs=[groups, slot_count], outputs=[keys, values], device=device)
     wp.utils.radix_sort_pairs(keys, values, count)
     wp.launch(_slot_starts_kernel, slot_count + 1, inputs=[keys, count], outputs=[start], device=device)

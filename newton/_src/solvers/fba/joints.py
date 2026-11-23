@@ -1487,8 +1487,10 @@ def select_rows_kernel(
     dst_slot: wp.array2d[wp.int32],
     dst_jac: wp.array2d[wp.spatial_vectord],
 ):
-    """Copy rows ``index`` of one row set to rows ``offset + k`` of another."""
+    """Copy rows ``index`` of one row set to rows ``offset + k`` of another, none where ``index[k]`` is -1."""
     k = wp.tid()
+    if index[k] < 0:
+        return
     for side in range(2):
         dst_slot[offset + k, side] = src_slot[index[k], side]
         dst_jac[offset + k, side] = src_jac[index[k], side]

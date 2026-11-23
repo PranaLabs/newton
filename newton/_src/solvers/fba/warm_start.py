@@ -211,6 +211,60 @@ def _find(sorted_keys: wp.array[wp.int64], count: int, key: wp.int64) -> int:
 
 
 @wp.kernel
+def capacity_pair_keys_kernel(
+    table: wp.array[wp.int32],
+    shape_count: int,
+    # outputs
+    pairs: wp.array[wp.int64],
+):
+    """The shape pair of each rigid contact of the capacity form (:attr:`RigidContacts.table`), :data:`_NO_KEY` for
+    an inert one."""
+    i = wp.tid()
+    s0 = table[3 + 4 * i]
+    s1 = table[4 + 4 * i]
+    pair = _NO_KEY
+    if s0 >= 0 and s1 >= 0:
+        pair = wp.int64(s0) * wp.int64(shape_count) + wp.int64(s1)
+    pairs[i] = pair
+
+
+@wp.kernel
+def capacity_rigid_keys_kernel(
+    pairs: wp.array[wp.int64],
+    count: int,
+    # outputs
+    keys: wp.array[wp.int64],
+    order: wp.array[wp.int32],
+):
+    """The keys of :func:`rigid_contact_keys` from the contacts' ascending ``pairs``: the pair and the contact's rank
+    among the pair's contacts, :data:`_NO_KEY` for an inert contact; numbers their owners."""
+    i = wp.tid()
+    order[i] = i
+    pair = pairs[i]
+    if pair == _NO_KEY:
+        keys[i] = _NO_KEY
+        return
+    rank = i - _lower_bound(pairs, count, pair)
+    keys[i] = (pair << wp.int64(_RANK_BITS)) + wp.int64(rank)
+
+
+@wp.kernel
+def select_keys_kernel(
+    select: wp.array[wp.int32],
+    # outputs
+    keys: wp.array[wp.int64],
+    order: wp.array[wp.int32],
+):
+    """Each selected row's index as its key, :data:`_NO_KEY` past the selection (-1); numbers their owners."""
+    i = wp.tid()
+    order[i] = i
+    key = _NO_KEY
+    if select[i] >= 0:
+        key = wp.int64(select[i])
+    keys[i] = key
+
+
+@wp.kernel
 def restore_contact_rows_kernel(
     keys: wp.array[wp.int64],
     unique: wp.array[wp.int32],
@@ -311,6 +365,8 @@ def match_rigid_contacts_kernel(
     contact, so that the nearest of the contacts that find the same previous one wins it."""
     c = wp.tid()
     match[c] = -1
+    if keys[c] == _NO_KEY:
+        return
     pair = keys[c] >> wp.int64(_RANK_BITS)
     end = (pair + wp.int64(1)) << wp.int64(_RANK_BITS)
     k = _lower_bound(prev_keys, prev_count, pair << wp.int64(_RANK_BITS))
@@ -447,9 +503,60 @@ class RowGroup:
         self.prev_count = 0
         self.prev_sorted = self.prev_order = self.prev_lam = self.prev_omega = None
         self.prev_tangent1 = self.prev_tangent2 = None
+        # Whether the group holds a fixed count of keys in arrays that stay (fix()).
+        self.fixed = False
+
+    def fix(self, count: int) -> None:
+        """Hold ``count`` keys at every step, in arrays that stay from step to step, as a step recorded into a graph
+        needs: rows without identity take :data:`_NO_KEY`, which continues no row, and the step's sorted keys are
+        copied for the next step rather than traded."""
+        device = self.device
+        self.fixed = True
+        self.count = self.prev_count = count
+        self.keys = wp.empty(count, dtype=wp.int64, device=device)
+        self.sorted = wp.empty(2 * count, dtype=wp.int64, device=device)
+        self.order = wp.empty(2 * count, dtype=wp.int32, device=device)
+        self.unique = wp.empty(count, dtype=wp.int32, device=device)
+        self.prev_sorted = wp.empty(count, dtype=wp.int64, device=device)
+        self.prev_order = wp.zeros(count, dtype=wp.int32, device=device)
+        self.prev_lam = wp.zeros(self.rows * count, dtype=wp.float64, device=device)
+        self.prev_omega = wp.zeros(self.rows * count, dtype=wp.float64, device=device)
+        if self.rows == 3:
+            self.prev_tangent1 = wp.zeros(count, dtype=wp.vec3, device=device)
+            self.prev_tangent2 = wp.zeros(count, dtype=wp.vec3, device=device)
+        self.forget()
+
+    def continue_from(self, group: "RowGroup") -> None:
+        """Take the previous step's rows that ``group``, which holds a step's count of keys, kept, so that a fixed
+        group (:meth:`fix`) continues from a step of the other form."""
+        count = group.prev_count
+        if count == 0 or count > self.count:
+            self.forget()
+            return
+        wp.copy(self.prev_sorted, group.prev_sorted, count=count)
+        if count < self.count:
+            self.prev_sorted[count:].fill_(_NO_KEY)
+        wp.copy(self.prev_order, group.prev_order, count=count)
+        wp.copy(self.prev_lam, group.prev_lam, count=self.rows * count)
+        wp.copy(self.prev_omega, group.prev_omega, count=self.rows * count)
+        if self.rows == 3:
+            wp.copy(self.prev_tangent1, group.prev_tangent1, count=count)
+            wp.copy(self.prev_tangent2, group.prev_tangent2, count=count)
+
+    def forget(self) -> None:
+        """Forget the previous step's rows, so that the next step starts from zero."""
+        if self.fixed:
+            self.prev_sorted.fill_(_NO_KEY)
+        else:
+            self.prev_count = 0
 
     def begin(self, count: int, write_keys) -> None:
-        """Take this step's ``count`` keys, written by ``write_keys(keys, order)``, and sort a copy of them."""
+        """Take this step's ``count`` keys, written by ``write_keys(keys, order)``, and sort a copy of them; a fixed
+        group (:meth:`fix`) takes its count."""
+        if self.fixed:
+            write_keys(self.keys, self.order)
+            self._sort()
+            return
         self.count = count
         if count == 0:
             return
@@ -459,6 +566,10 @@ class RowGroup:
         self.order = _grow(self.order, 2 * count, wp.int32, device)
         self.unique = _grow(self.unique, count, wp.int32, device)
         write_keys(self.keys, self.order)
+        self._sort()
+
+    def _sort(self) -> None:
+        count, device = self.count, self.device
         wp.copy(self.sorted, self.keys, count=count)
         wp.utils.radix_sort_pairs(self.sorted, self.order, count)
         wp.launch(unique_keys_kernel, count, [self.sorted, self.order, count], [self.unique], device=device)
@@ -491,6 +602,10 @@ class RowGroup:
             self.prev_tangent2 = _grow(self.prev_tangent2, count, wp.vec3, device)
             wp.copy(self.prev_tangent1, tangents[0], count=count)
             wp.copy(self.prev_tangent2, tangents[1], count=count)
+        if self.fixed:
+            wp.copy(self.prev_sorted, self.sorted, count=count)
+            wp.copy(self.prev_order, self.order, count=count)
+            return
         # This step's sorted keys become the previous step's; their arrays trade places.
         self.prev_sorted, self.sorted = self.sorted, self.prev_sorted
         self.prev_order, self.order = self.order, self.prev_order
@@ -511,6 +626,22 @@ class RigidContactGroup(RowGroup):
         super().__init__(3, device)
         self.prev_anchor = self.prev_normal = None
         self.match = self.packed = self.claim = None
+
+    def continue_from(self, group: "RowGroup") -> None:
+        super().continue_from(group)
+        count = group.prev_count
+        if 0 < count <= self.count:
+            wp.copy(self.prev_anchor, group.prev_anchor, count=2 * count)
+            wp.copy(self.prev_normal, group.prev_normal, count=count)
+
+    def fix(self, count: int) -> None:
+        super().fix(count)
+        device = self.device
+        self.prev_anchor = wp.zeros((count, 2), dtype=wp.vec3, device=device)
+        self.prev_normal = wp.zeros(count, dtype=wp.vec3, device=device)
+        self.match = wp.empty(count, dtype=wp.int32, device=device)
+        self.packed = wp.empty(count, dtype=wp.int64, device=device)
+        self.claim = wp.empty(count, dtype=wp.int64, device=device)
 
     def restore(self, lam, omega, row_offset, tangents=None, anchor=None, normal=None) -> None:
         """Start this step's rows in ``lam`` and ``omega`` from ``row_offset`` on from the previous step's, with the
@@ -561,7 +692,7 @@ class ContactWarmStart:
     def clear(self) -> None:
         """Forget the previous step's rows, so that the next step starts from zero."""
         for group in (self.particle, self.rigid, self.joint):
-            group.prev_count = 0
+            group.forget()
         self.bilateral_count = 0
 
     def restore_bilateral(self, lam: wp.array, omega: wp.array, row_offset: int, count: int) -> None:
