@@ -29,6 +29,11 @@ if TYPE_CHECKING:
     from numpy.typing import ArrayLike
 
 
+_PEAK_KINDS = ("soft",)
+"""The kinds of contacts whose most per step :meth:`SolverFBA.dropped_contacts` reports, by slot."""
+_PEAK_SOFT = 0
+
+
 def _element_lame(materials: wp.array | None, count: int) -> tuple[np.ndarray, np.ndarray]:
     """The Lamé parameters ``(mu, lambda)`` [Pa] of each element, from its material row."""
     if count == 0:
@@ -623,6 +628,9 @@ class SolverFBA(TendonStateMixin, SolverBase):
         # The capacity path of the contacts (_capacity_contacts_capable): whether the step takes it, the capacity its
         # buffers are reserved for, and its sort's keys and values.
         self._capacity_step, self._capacity_reserved, self._capacity_sort = False, None, None
+        # The most contacts that the collision pipeline found in a step recorded into a graph since the last
+        # dropped_contacts(), per kind (_PEAK_SOFT), and the buffers' capacity, which the excess dropped.
+        self._contact_peak_d, self._contact_peak_capacity = None, [0] * len(_PEAK_KINDS)
         self._two_way_world_h = np.zeros(model.world_count, dtype=np.int32)
         self._two_way_world_d = wp.empty(0, dtype=wp.int32, device=model.device)
         # The rows of a step whose worlds split between the two-way and the deformable NSN, and the Schur rows of the
@@ -3218,6 +3226,9 @@ class SolverFBA(TendonStateMixin, SolverBase):
             )
         self._linear_solver.reserve_lite_rows_capacity(C)
         self._ensure_nsn_inner_buffers(3 * C, alloc_2d=False)
+        if self._contact_peak_d is None:
+            self._contact_peak_d = wp.zeros(len(_PEAK_KINDS), dtype=wp.int32, device=device)
+        self._contact_peak_capacity[_PEAK_SOFT] = C
         persistent = getattr(self, "_lam_coulomb_persistent_d", None)
         if persistent is None or persistent.size < 3 * C:
             for name in ("lam_unilateral", "lam_coulomb", "omega_unilateral", "omega_coulomb"):
@@ -3228,10 +3239,18 @@ class SolverFBA(TendonStateMixin, SolverBase):
         """The contact rows of the capacity path: sort the whole buffer of ``contacts`` on the device, the inert slots
         last (:func:`kernels.capacity_contact_keys_kernel`), and lay out its rows. Returns the row count, the
         buffer's capacity."""
-        from .kernels import capacity_contact_keys_kernel, capacity_contact_rows_kernel  # noqa: PLC0415
+        from .kernels import (  # noqa: PLC0415
+            capacity_contact_keys_kernel,
+            capacity_contact_rows_kernel,
+            contact_peak_kernel,
+        )
 
         C, device = contacts.soft_contact_particle.shape[0], self._device
         keys, order = self._capacity_sort
+        # The pipeline's count, which passes C when its buffers dropped contacts: dropped_contacts() reports it.
+        wp.launch(
+            contact_peak_kernel, 1, [contacts.soft_contact_count, _PEAK_SOFT], [self._contact_peak_d], device=device
+        )
         pinned = self._pinned_d if self._pinned_d is not None else wp.empty(0, dtype=wp.int32, device=device)
         inputs = [contacts.soft_contact_count, contacts.soft_contact_particle, contacts.soft_contact_shape]
         wp.launch(
@@ -3244,6 +3263,36 @@ class SolverFBA(TendonStateMixin, SolverBase):
         outputs += [self._contact_body_pos_d, self._contact_record_d]
         wp.launch(capacity_contact_rows_kernel, C, inputs, outputs, device=device)
         return C
+
+    def dropped_contacts(self) -> int:
+        """The most contacts that the collision pipeline found beyond its buffers in a step recorded into a CUDA
+        graph since the last call, 0 for none, with a warning when there were any.
+
+        A step recorded into a graph takes every slot of the contact buffers and reads nothing back, so a pipeline
+        whose buffers fill drops the contacts past them silently there; each recorded step keeps on the device the
+        most contacts its pipeline found, which this method reads, waiting for the device, and clears. Call it outside
+        the graph, such as once per frame. A step outside a graph warns at once about the contacts it drops.
+
+        Returns:
+            The most contacts dropped in one step.
+        """
+        if self._contact_peak_d is None:
+            return 0
+        peak = self._contact_peak_d.numpy()
+        self._contact_peak_d.zero_()
+        dropped = 0
+        for kind, name in enumerate(_PEAK_KINDS):
+            excess = int(peak[kind]) - self._contact_peak_capacity[kind]
+            if excess > 0:
+                dropped = max(dropped, excess)
+                warnings.warn(
+                    f"SolverFBA: steps recorded into a graph dropped up to {excess} {name} contacts that the "
+                    f"collision pipeline found beyond its buffers; construct the CollisionPipeline with a larger "
+                    f"{name}_contact_max.",
+                    NewtonWarning,
+                    stacklevel=2,
+                )
+        return dropped
 
     def _unaliased_input(self, state_in: State, state_out: State) -> State:
         """``state_in``, or a copy of its positions and velocities when ``state_out`` shares them: the step reads the

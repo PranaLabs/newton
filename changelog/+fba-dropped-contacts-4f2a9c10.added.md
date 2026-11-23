@@ -1,0 +1,1 @@
+Add `SolverFBA.dropped_contacts`, which reports, outside the graph, the most contacts that the collision pipeline found beyond its buffers in a `SolverFBA` step recorded into a CUDA graph; such steps drop them without reading the count back.
