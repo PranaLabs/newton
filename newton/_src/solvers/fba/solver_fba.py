@@ -1133,6 +1133,9 @@ class SolverFBA(TendonStateMixin, SolverBase):
     def _refresh_particle_constraints(self) -> None:
         """Install the rows of :meth:`set_particle_constraints` followed by those of the model's attachments."""
         user, att = self._user_constraints, self._attachments
+        if user is not None and isinstance(user[2], wp.array):
+            # Targets last set on the device.
+            user = self._user_constraints = (user[0], user[1], user[2].numpy(), *user[3:])
         self._attachment_offset = None
         if att is None:
             args = user if user is not None else (None, None, None, None, False, None, None)
@@ -3168,7 +3171,12 @@ class SolverFBA(TendonStateMixin, SolverBase):
         if self._segment_query is not None or (self._face_query is not None and self.face_contact_gap is not None):
             return "rod shape contacts and face contacts with a gap are found on the host"
         if self._constraint_rows is not None:
-            return "particle constraint rows and particle-body attachments are set up on the host at each step"
+            if self._attachments is not None or self._constraint_body_h is not None:
+                return "particle-body attachments and particle constraint rows on bodies are set up on the host"
+            if contacts is not None:
+                return "steps with particle constraint rows and contacts set their rows up on the host"
+            if not self._cached_W or self._contact_count:
+                return "take a step without contacts outside the graph first, which sets up the constraint rows"
         particles_set_up = self._linear_solver is not None and self._dt_setup is not None
         if self.model.particle_count and not (particles_set_up and abs(self._dt_setup - dt) <= 1e-12):
             return f"the system is set up for dt={dt} by a step outside the graph; take one first"
@@ -3380,9 +3388,11 @@ class SolverFBA(TendonStateMixin, SolverBase):
         if contacts is not None or self._self_contact is not None or self._rod_contact is not None:
             self._ingest_contacts(contacts, state_in)
         else:
-            # Drop the previous step's contacts.
+            # Drop the previous step's contacts. A W of the particle constraint rows alone, built by a step without
+            # contacts, holds while the rows and the factor do.
+            if self._contact_count:
+                self._invalidate_schur_cache()
             self._contact_count = 0
-            self._invalidate_schur_cache()
 
         has_contacts = self._contact_count > 0
         if self.model.world_count > 1:
@@ -4632,10 +4642,14 @@ class SolverFBA(TendonStateMixin, SolverBase):
         alone, ``dt^2 / m`` in place of its block of ``A^-1``, and lag their targets by the share of the stiffness
         in that block.
 
+        A call with the rows in place, the same particles, coefficients, directions and bodies, writes the new
+        targets into them alone, which keeps the rows' ``W`` and their warm start; with ``targets`` a
+        :class:`warp.array` on the solver's device it does so by a launch, which a CUDA graph capture records.
+
         Args:
             particles: Particle indices, shape ``(R, K)``.
             coefficients: Their coefficients, shape ``(R, K)``.
-            targets: Row values [m], shape ``(R,)``.
+            targets: Row values [m], shape ``(R,)``, also a :class:`warp.array`.
             directions: Row directions, shape ``(R, 3)``, or ``None`` for length rows.
             exact: With ``nsn_schur_mode="lite"``, give every row the exact step of the rows that hold particles at
                 points, also rows that hold a particle along one or two directions, whose contacts keep their
@@ -4651,10 +4665,65 @@ class SolverFBA(TendonStateMixin, SolverBase):
             body_points: The rows' points in their bodies' frames [m], shape ``(R, 3)``.
         """
         removed = particles is None or len(particles) == 0
-        self._user_constraints = (
-            None if removed else (particles, coefficients, targets, directions, exact, bodies, body_points)
-        )
+        if not removed and self._same_constraint_rows(particles, coefficients, directions, exact, bodies, body_points):
+            # The rows hold; their targets change in place, with ``W`` and the warm start kept.
+            self._set_constraint_targets(targets)
+            return
+        if isinstance(targets, wp.array):
+            targets = targets.numpy()
+
+        def kept(a):
+            # A copy, so that a later call with the caller's array edited in place sees the edit.
+            return None if a is None else np.array(a, copy=True)
+
+        rows = (kept(particles), kept(coefficients), targets, kept(directions), exact, kept(bodies), kept(body_points))
+        self._user_constraints = None if removed else rows
         self._refresh_particle_constraints()
+
+    def _same_constraint_rows(self, particles, coefficients, directions, exact, bodies, body_points) -> bool:
+        """Whether the rows of :meth:`set_particle_constraints` other than their targets are the installed ones."""
+        user = self._user_constraints
+        if user is None or self._constraint_rows is None or bool(exact) != bool(user[4]):
+            return False
+        pairs = ((particles, user[0]), (coefficients, user[1]), (directions, user[3]), (bodies, user[5]))
+        pairs += ((body_points, user[6]),)
+        for new, old in pairs:
+            if (new is None) != (old is None):
+                return False
+            if new is not None and not np.array_equal(np.asarray(new), np.asarray(old)):
+                return False
+        return True
+
+    def _set_constraint_targets(self, targets) -> None:
+        """Write the targets of the installed rows of :meth:`set_particle_constraints` in place: from a
+        :class:`warp.array` on the solver's device by a launch, which a graph capture records, else from the host."""
+        rows = self._constraint_rows[3]
+        m = len(self._user_constraints[2])
+        device_targets = isinstance(targets, wp.array) and targets.device == wp.get_device(self._device)
+        if device_targets and targets.dtype in (wp.float32, wp.float64):
+            if targets.shape != (m,):
+                raise ValueError(f"targets need shape ({m},), got {targets.shape}")
+            if targets.dtype == wp.float64:
+                wp.copy(rows, targets, count=m)
+            else:
+                from .kernels import copy_to_float64_kernel  # noqa: PLC0415
+
+                wp.launch(copy_to_float64_kernel, m, [targets], [rows], device=self._device)
+        elif wp.get_device(self._device).is_capturing:
+            raise RuntimeError(
+                "SolverFBA.set_particle_constraints takes its targets during a graph capture as a warp.array of "
+                "float32 or float64 on the solver's device"
+            )
+        else:
+            if isinstance(targets, wp.array):
+                targets = targets.numpy()
+            values = np.asarray(targets, dtype=np.float64).reshape(-1)
+            if values.shape != (m,):
+                raise ValueError(f"targets need shape ({m},), got {values.shape}")
+            wp.copy(rows, wp.array(values, dtype=wp.float64, device="cpu"), count=m)
+            targets = values
+        user = self._user_constraints
+        self._user_constraints = (user[0], user[1], targets, *user[3:])
 
     def _install_particle_constraints(
         self, particles, coefficients, targets, *, directions=None, exact=False, bodies=None, body_points=None

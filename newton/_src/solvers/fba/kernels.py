@@ -3102,6 +3102,13 @@ _INERT_KEY = wp.constant(wp.int64(9223372036854775807))
 
 
 @wp.kernel
+def copy_to_float64_kernel(src: wp.array[wp.float32], dst: wp.array[wp.float64]):
+    """``dst[i] = src[i]`` in float64."""
+    i = wp.tid()
+    dst[i] = wp.float64(src[i])
+
+
+@wp.kernel
 def contact_peak_kernel(count: wp.array[wp.int32], slot: int, peak: wp.array[wp.int32]):
     """``peak[slot] = max(peak[slot], count[0])``: the most contacts a collision pipeline found in a step."""
     wp.atomic_max(peak, slot, count[0])

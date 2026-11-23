@@ -199,7 +199,8 @@ bending targets without factoring. A step records into the caller's CUDA
 graph (:class:`warp.ScopedCapture`), collision included, when it reads
 nothing back to the host and allocates nothing: after a step of the same
 ``dt`` outside the graph, which sets up the system, a step without contacts,
-and a step with particle-shape contacts alone with the frictional lite
+also with particle constraint rows after a step with the same rows outside
+the graph, which sets up their ``W``, and a step with particle-shape contacts alone with the frictional lite
 operator in one world, after a step with the same contacts outside the graph,
 which reserves the buffers of their capacity. Such a step takes every slot of
 the contact buffer as a contact row, those past the stored count and those of
@@ -208,8 +209,8 @@ per-particle Newton step; a particle with more than four contacts keeps its
 multipliers there. A full contact buffer drops the contacts past it silently
 in such a step, which reads nothing back:
 :meth:`~newton.solvers.SolverFBA.dropped_contacts`, called outside the graph,
-reports the most contacts a recorded step dropped since its last call. Self, face and rod contacts, particle constraint rows and
-particle-body attachments, ``contact_warmstart``, ``friction_anchors``,
+reports the most contacts a recorded step dropped since its last call. Self, face and rod contacts, particle constraint rows with
+contacts, particle-body attachments, ``contact_warmstart``, ``friction_anchors``,
 ``nsn_lite_accumulate``, the full operator, several worlds, joint limits,
 tendons and contacts on the bodies FBA integrates keep a step out of graphs:
 during a capture it then raises ``RuntimeError``, naming the reason. A graph
@@ -217,7 +218,11 @@ replays the launches of the steps it recorded: settings the solver keeps on
 the host, such as :meth:`~newton.solvers.SolverFBA.set_pin_targets`,
 :meth:`~newton.solvers.SolverFBA.set_particle_constraints` and
 :meth:`~newton.solvers.SolverFBA.notify_model_changed`, reach the graphs
-recorded after them. Outside a capture a step captures and replays its own
+recorded after them; called inside the capture with targets in a
+:class:`warp.array` on the solver's device, ``set_pin_targets`` and
+``set_particle_constraints`` with the rows already set record the copies of
+their targets, so that a graph's steps follow targets the caller writes to that
+array between its launches. Outside a capture a step captures and replays its own
 local-global iterations. A step recorded into a graph, and the solver's own
 captures, run with Python's garbage collector paused, so that no collection
 frees arrays of unreachable reference cycles inside the capture. FBA runs

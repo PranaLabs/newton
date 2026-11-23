@@ -1,0 +1,1 @@
+Record `SolverFBA` steps with particle constraint rows and without contacts into CUDA graphs: `set_particle_constraints` with the rows in place writes only their targets, also from a `warp.array` on the device inside a capture, and the rows' `W` holds across steps without contacts. The `bunny_ears_fba` example replays its frames from a graph.
