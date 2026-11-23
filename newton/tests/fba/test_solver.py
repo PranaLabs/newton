@@ -21,6 +21,7 @@ from newton._src.solvers.fba.linear_solver import (
     build_rigid_system,
     factorize_and_sparse_inverse,
 )
+from newton._src.solvers.fba.nsn_pcr_solver import NSNPCRSolver
 
 
 def _projection_rhs(kernel, inputs, arity):
@@ -2710,10 +2711,10 @@ class TestGraphCapture(unittest.TestCase):
                 self.assertEqual(solver.dropped_contacts(), 0)
 
     @staticmethod
-    def _rigid_scene(device=None, hinged=True, **solver_args):
+    def _rigid_scene(device=None, hinged=True, rigid_contact_max=None, **solver_args):
         """Two chains of three hinged links on the ground and a box dropped on them, or without ``hinged`` four boxes
         dropped on each other: rigid contacts alone, with the sparse storage, ten fixed PCR iterations and the warm
-        start; and their contacts."""
+        start; and their contacts, a buffer of ``rigid_contact_max`` or the pipeline's default."""
         cfg = newton.ModelBuilder.ShapeConfig(mu=0.5)
         builder = newton.ModelBuilder()
         builder.add_ground_plane(cfg=cfg)
@@ -2743,16 +2744,16 @@ class TestGraphCapture(unittest.TestCase):
         model = builder.finalize(device=device)
         args = {"iterations": 5, "nsn_sparse_storage": True, "nsn_linear_iterations": 10, "contact_warmstart": True}
         solver = SolverFBA(model, **{**args, **solver_args})
-        pipeline = newton.CollisionPipeline(model)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=rigid_contact_max)
         return model, solver, pipeline, pipeline.contacts()
 
-    def _rigid_runs(self, runs, steps=20):
-        """The body poses after a step outside a graph and ``steps`` pairs of steps of :meth:`_rigid_scene`, for each
-        run of ``runs``: ``"count"`` eager, ``"capacity"`` eager through the capacity path, ``"graph"`` recorded, and
-        ``"capacity graph"`` recorded after a first step through the capacity path."""
+    def _rigid_runs(self, runs, steps=20, **scene_args):
+        """The body poses after a step outside a graph and ``steps`` pairs of steps of :meth:`_rigid_scene` with
+        ``scene_args``, for each run of ``runs``: ``"count"`` eager, ``"capacity"`` eager through the capacity path,
+        ``"graph"`` recorded, and ``"capacity graph"`` recorded after a first step through the capacity path."""
         dt, results = 0.01, []
         for run in runs:
-            model, solver, pipeline, contacts = self._rigid_scene()
+            model, solver, pipeline, contacts = self._rigid_scene(**scene_args)
             solver._force_rigid_capacity = run in ("capacity", "capacity graph")
             s0, s1 = model.state(), model.state()
             pipeline.collide(s0, contacts)
@@ -2780,12 +2781,44 @@ class TestGraphCapture(unittest.TestCase):
         """Record the collision and two steps of hinged chains and a box with rigid contacts alone into a graph,
         after a step outside it, and reach the same poses, bit for bit, as the same steps taken eagerly through the
         stored contacts or through the capacity path that the graph takes: the contacts' and the joint rows' warm
-        start carries over from the step outside the graph and from step to step."""
-        solver, (count, capacity, graph) = self._rigid_runs(("count", "capacity", "graph"))
+        start carries over from the step outside the graph and from step to step. The stored contacts pad fewer rows
+        than the capacity: both take the PCR iteration of several launches, whose sums stay alike for any padding.
+        A buffer of 100 contacts takes the single-block iteration (:meth:`NSNPCRSolver._small_single`) instead, in
+        the graph as eagerly."""
+        with mock.patch.object(NSNPCRSolver, "small_single", False):
+            solver, (count, capacity, graph) = self._rigid_runs(("count", "capacity", "graph"))
         np.testing.assert_array_equal(count, capacity)
         np.testing.assert_array_equal(capacity, graph)
         self.assertGreater(float(graph[-1, 2]), 0.075)
         self.assertEqual(solver.dropped_contacts(), 0)
+        original = NSNPCRSolver._small_single
+        with mock.patch.object(NSNPCRSolver, "_small_single", autospec=True, side_effect=original) as small:
+            solver, (capacity, graph) = self._rigid_runs(("capacity", "capacity graph"), rigid_contact_max=100)
+        self.assertGreater(small.call_count, 0)
+        np.testing.assert_array_equal(capacity, graph)
+        self.assertGreater(float(graph[-1, 2]), 0.075)
+        self.assertEqual(solver.dropped_contacts(), 0)
+
+    def test_single_block_pcr_matches_the_launches(self):
+        """Step hinged chains on the ground with rigid contacts alone, whose few NSN rows take the PCR iteration in
+        one block of threads with the joint rows' block solves (:meth:`NSNPCRSolver._small_single`), as through the
+        iteration of several launches, to rounding."""
+        original, results = NSNPCRSolver._small_single, []
+        for single in (False, True):
+            with (
+                mock.patch.object(NSNPCRSolver, "small_single", single),
+                mock.patch.object(NSNPCRSolver, "_small_single", autospec=True, side_effect=original) as small,
+            ):
+                model, solver, pipeline, contacts = self._rigid_scene()
+                s0, s1 = model.state(), model.state()
+                for _ in range(5):
+                    pipeline.collide(s0, contacts)
+                    solver.step(s0, s1, None, contacts, 0.01)
+                    s0, s1 = s1, s0
+            self.assertEqual(small.call_count > 0, single)
+            self.assertGreater(solver._joint_system.L.shape[0], 0)
+            results.append(s0.body_q.numpy())
+        np.testing.assert_allclose(results[1], results[0], rtol=0.0, atol=1.0e-12)
 
     def test_rigid_contacts_past_the_storage_are_reported(self):
         """Cut the rigid contacts whose rows' entries of W outgrow the storage that steps recorded into a graph hold,
@@ -2857,10 +2890,14 @@ class TestCapacityContacts(unittest.TestCase):
         """Step four boxes dropped on each other, and hinged chains with a box dropped on them, with rigid contacts
         alone, through the capacity path (every slot of the rigid contact buffer three rows, the joint rows of the
         articulations that contacts touch selected on the device) and through the stored contacts, with and without
-        the reduction by bins, alike bit for bit."""
+        the reduction by bins, alike bit for bit. Both take the PCR iteration of several launches, whose sums stay
+        alike for the capacity's padding (:attr:`NSNPCRSolver.small_single`)."""
         dt = 0.01
         for hinged, size in ((False, 0.0), (True, 0.0), (True, 0.05)):
-            with self.subTest(hinged=hinged, rigid_contact_bin=size):
+            with (
+                self.subTest(hinged=hinged, rigid_contact_bin=size),
+                mock.patch.object(NSNPCRSolver, "small_single", False),
+            ):
                 results = []
                 for capacity in (False, True):
                     model, solver, pipeline, contacts = TestGraphCapture._rigid_scene(
