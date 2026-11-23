@@ -211,7 +211,7 @@ in such a step, which reads nothing back:
 :meth:`~newton.solvers.SolverFBA.dropped_contacts`, called outside the graph,
 reports the most contacts a recorded step dropped since its last call. Self, face and rod contacts, particle constraint rows with
 contacts, particle-body attachments, ``contact_warmstart``, ``friction_anchors``,
-``nsn_lite_accumulate``, the full operator, several worlds, joint limits,
+``nsn_lite_accumulate``, the full operator, several worlds,
 tendons and contacts on the bodies FBA integrates keep a step out of graphs:
 during a capture it then raises ``RuntimeError``, naming the reason. A graph
 replays the launches of the steps it recorded: settings the solver keeps on
@@ -362,7 +362,7 @@ Model Inputs
   bodies through, or leaves every body to another solver with
   ``integrate_with_external_rigid_solver=True``. PRISMATIC, REVOLUTE, BALL,
   FIXED, and D6 joints are bilateral constraints, at most 64 rows per
-  articulation, the damper and friction rows below included; DISTANCE and ROD joints, and
+  articulation, the axis rows below included; DISTANCE and ROD joints, and
   joints that lock more directions of a set of connected bodies than the
   bodies have, as kinematic loops do, raise ``NotImplementedError``. A D6
   joint with two free angular axes ``a0`` and ``a1`` turns as Newton composes
@@ -375,31 +375,23 @@ Model Inputs
   tumbling body loses a little energy rather than gaining it. FBA does not
   write ``State.joint_q`` and
   ``State.joint_qd``: :func:`~newton.eval_ik` computes them from the bodies.
-- **Joint limits, damping and drives**: the free axis of a REVOLUTE or PRISMATIC joint
-  takes its limits, :attr:`~newton.Model.joint_limit_lower` and
-  :attr:`~newton.Model.joint_limit_upper`, as hard unilateral rows, solved with
-  the rigid contacts: a limit's row joins a step when the axis starts it, or
-  ends the step's free flight, within 0.02 rad (2 mm for a prismatic axis) plus
-  the free flight's motion of the limit. A revolute axis measures its angle
-  from the middle of its range and needs both limits: one finite limit raises
-  ``NotImplementedError``. FBA knows the angle up to whole turns, so it leaves
-  out, with a warning, the limits of a range of a full turn or more, such as
-  the ``+-2 pi`` of many arm descriptions. Every
-  free axis of a joint, also of BALL and D6 joints, takes its passive damping
+- **Joint limits, damping and drives**: every free axis of a joint, also of
+  BALL and D6 joints, with passive damping, a drive, armature or joint
+  friction, and the free axis of a REVOLUTE or PRISMATIC joint with limits,
+  takes one row in the articulation's joint system on the axis's motion over
+  the step, whose force is the axis's total force. Its passive damping
   :attr:`~newton.Model.joint_damping` (the ``damping`` of
-  :class:`~newton.ModelBuilder.JointDofConfig`, MJCF's ``damping``) as a soft
-  row in the articulation's joint system, the backward Euler step of the force
-  ``-c q_dot``: it slows the axis by the factor ``1 / (1 + c dt / I)`` per step
-  for an axis of effective inertia ``I``. An angular axis's rate is the
-  relative angular velocity along it in the parent's joint frame, or the
-  child's for the second axis of a D6 joint with two angular axes, and its
-  motion over a step that of the relative rotation's increment. A free axis
-  with a drive, :attr:`~newton.Model.joint_target_ke` or
-  :attr:`~newton.Model.joint_target_kd`, or with armature,
-  :attr:`~newton.Model.joint_armature`, takes them into the same soft row:
-  the backward Euler step of the force
-  ``ke (q* - q) + kd (q_dot* - q_dot) - c q_dot - I_a q_ddot`` at the step's
-  end, toward the control's :attr:`~newton.Control.joint_target_q` and
+  :class:`~newton.ModelBuilder.JointDofConfig`, MJCF's ``damping``) enters as
+  the backward Euler step of the force ``-c q_dot``: it slows the axis by the
+  factor ``1 / (1 + c dt / I)`` per step for an axis of effective inertia
+  ``I``. An angular axis's rate is the relative angular velocity along it in
+  the parent's joint frame, or the child's for the second axis of a D6 joint
+  with two angular axes, and its motion over a step that of the relative
+  rotation's increment. A drive, :attr:`~newton.Model.joint_target_ke` or
+  :attr:`~newton.Model.joint_target_kd`, and armature,
+  :attr:`~newton.Model.joint_armature`, join the same force: the backward Euler
+  step of ``ke (q* - q) + kd (q_dot* - q_dot) - c q_dot - I_a q_ddot`` at the
+  step's end, toward the control's :attr:`~newton.Control.joint_target_q` and
   :attr:`~newton.Control.joint_target_qd` (the model's without a control). As
   in :class:`~newton.solvers.SolverFeatherstone`, the gains act whatever the
   DOF's :attr:`~newton.Model.joint_target_mode`. A position drive needs an
@@ -408,25 +400,32 @@ Model Inputs
   :class:`~newton.solvers.SolverSemiImplicit` does; a position gain on a BALL
   joint or on the angular axes of a D6 joint with several raises
   ``NotImplementedError`` at the first step, while velocity drives, damping and
-  armature act on every free axis. :attr:`~newton.Control.joint_f` adds each
-  DOF's generalized force to the bodies as
-  :class:`~newton.solvers.SolverSemiImplicit` applies it, and a FREE joint's
-  wrench to its child. A driven axis whose
-  :attr:`~newton.Model.joint_effort_limit` is below ``1e6`` (the builder's
-  default) bounds its drive's force ``ke (q* - q) + kd (q_dot* - q_dot)`` to
-  ``[-F, F]``, as MuJoCo's ``actfrcrange`` does, while its damping and armature
-  stay unbounded; a free axis with :attr:`~newton.Model.joint_friction` ``F``
-  takes a row of its own on its motion, which holds the axis still with a force
-  within ``[-F, F]`` and lets it slide against ``F`` beyond, as MuJoCo's
-  ``frictionloss`` does. Both rows follow a box law in each Newton step: the
-  step of a row alone predicts its bounded force, and a row whose prediction
-  passes a bound takes its law at the bound, a compliance and target motion
-  that land its force there, in the articulation's joint system (factored again
-  where a row changes sides) and in the contact solve when contacts touch the
-  articulation. FBA ignores :attr:`~newton.Model.joint_velocity_limit`, with a
-  warning where an articulation it integrates sets it. Joints at the default
-  infinite limits, zero damping, armature and friction and no drive take no
-  such rows. Limits need the full operator.
+  armature act on every free axis. An
+  :attr:`~newton.Model.joint_effort_limit` below ``1e6`` (the builder's
+  default) bounds the drive's force ``ke (q* - q) + kd (q_dot* - q_dot)`` to
+  ``[-E, E]``, as MuJoCo's ``actfrcrange`` does, while the damping and armature
+  stay unbounded; :attr:`~newton.Model.joint_friction` ``F`` holds the axis
+  still with a force within ``F`` of the others' and lets it slide against
+  ``F`` beyond, as MuJoCo's ``frictionloss`` does; and the limits,
+  :attr:`~newton.Model.joint_limit_lower` and
+  :attr:`~newton.Model.joint_limit_upper`, hold the axis within them with any
+  force that pushes it inside, as hard limits. The axis's force is then a
+  monotone, piecewise linear function of its motion; at each Newton step, the
+  row takes the piece that a step of the row alone reaches, as a compliance and
+  a target motion, in the joint system (factored again in the blocks whose
+  compliance changes) and in the contact solve when contacts touch the
+  articulation, so that a step of saturated drives, sticking or sliding
+  friction and reached limits lands on the law. A revolute axis measures its
+  angle from the middle of its range and needs both limits: one finite limit
+  raises ``NotImplementedError``. FBA knows the angle up to whole turns, so it
+  leaves out, with a warning, the limits of a range of a full turn or more,
+  such as the ``+-2 pi`` of many arm descriptions.
+  :attr:`~newton.Control.joint_f` adds each DOF's generalized force to the
+  bodies as :class:`~newton.solvers.SolverSemiImplicit` applies it, and a FREE
+  joint's wrench to its child. FBA ignores
+  :attr:`~newton.Model.joint_velocity_limit`, with a warning where an
+  articulation it integrates sets it. Joints at the default infinite limits,
+  zero damping, armature and friction and no drive take no such rows.
 - **Mimic joints**: a mimic joint (:attr:`~newton.Model.joint_mimic_joint`
   and :attr:`~newton.Model.joint_mimic_coeffs`) holds each coordinate at
   ``c0 + c1`` times its leader's, as a hard row: a pair of rows on the

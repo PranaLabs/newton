@@ -209,29 +209,26 @@ class SolverFBA(TendonStateMixin, SolverBase):
     per locked direction; a D6 joint with two free angular axes holds the angle
     between the first axis in the parent's joint frame and the second in the
     child's, as Newton composes its rotation. A kinematic body takes part at
-    the pose its velocity reaches by the step's end. The free axis of a
-    revolute or prismatic joint takes its limits, ``Model.joint_limit_lower``
-    and ``Model.joint_limit_upper``, as hard unilateral rows solved with the
-    rigid contacts, each joining a step when the axis comes near the limit; a
-    revolute axis needs both limits, and those of a full turn or more are left
-    out with a warning. Every free axis of a joint takes its passive damping
-    ``Model.joint_damping``, its drive (``Model.joint_target_ke`` and
-    ``Model.joint_target_kd`` toward the control's ``joint_target_q`` and
-    ``joint_target_qd``) and its armature ``Model.joint_armature`` as a soft
-    row in the joint system, the backward Euler step of the force
-    ``ke (q* - q) + kd (q_dot* - q_dot) - c q_dot - I_a q_ddot``, where an
-    angular axis's rate is the relative angular velocity along it in the
-    parent's joint frame (the child's for the second axis of a two-axis D6
-    joint); a position drive needs a linear axis or the angular axis of a joint
-    with one. ``Control.joint_f`` adds the joints' generalized forces to their
-    bodies. A mimic joint (``Model.joint_mimic_joint``) holds each coordinate
-    at ``c0 + c1`` times its leader's by a hard row on both joints' axes. An
-    effort limit ``Model.joint_effort_limit`` below 1e6 bounds a drive's force
-    (its damping and armature stay unbounded), and joint friction
-    ``Model.joint_friction`` adds a row on the axis's motion whose force it
-    bounds, both by a box law in each Newton step. The limits' stiffness and
-    damping (``joint_limit_ke``, ``joint_limit_kd``) and the velocity limits are
-    not read, nor are the limits of ball and D6 joints.
+    the pose its velocity reaches by the step's end. Every free axis with
+    passive damping ``Model.joint_damping``, a drive (``Model.joint_target_ke``
+    and ``Model.joint_target_kd`` toward the control's ``joint_target_q`` and
+    ``joint_target_qd``), armature ``Model.joint_armature``, joint friction
+    ``Model.joint_friction``, or, on a revolute or prismatic joint, limits
+    ``Model.joint_limit_lower`` and ``Model.joint_limit_upper``, takes one row in
+    the joint system whose force is the axis's: the backward Euler step of
+    ``ke (q* - q) + kd (q_dot* - q_dot) - c q_dot - I_a q_ddot``, the drive's
+    part bounded by ``Model.joint_effort_limit`` below 1e6, the dry friction and
+    the hard limits, where an angular axis's rate is the relative angular
+    velocity along it in the parent's joint frame (the child's for the second
+    axis of a two-axis D6 joint); each Newton step linearizes the piece of that
+    law the row's own step reaches. A position drive needs a linear axis or the
+    angular axis of a joint with one; a revolute axis needs both limits, and
+    those of a full turn or more are left out with a warning.
+    ``Control.joint_f`` adds the joints' generalized forces to their bodies. A
+    mimic joint (``Model.joint_mimic_joint``) holds each coordinate at
+    ``c0 + c1`` times its leader's by a hard row on both joints' axes. The
+    limits' stiffness and damping (``joint_limit_ke``, ``joint_limit_kd``) and
+    the velocity limits are not read, nor are the limits of ball and D6 joints.
 
     Notes:
         - Float32 ``particle_q`` output: the interior linear solver
@@ -621,9 +618,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
         self._deformable_world_rows = self._rigid_world_rows = None
         self._constraint_world_h = np.empty(0, dtype=np.int32)
         self._joint_world_h = np.empty(0, dtype=np.int32)
-        # The joints' limit candidates (none without finite limits on revolute and prismatic axes), the step's limit
-        # rows, and whether the joints have damper rows.
-        self._limits, self._rc_limits, self._limit_ws, self._joint_dampers = None, 0, None, False
+        # Whether the joints have axis rows.
+        self._joint_dampers = False
         self._rc_mimic = None  # the mimic pairs among the rows of the step's rigid contact solve
         # The capacity path of the contacts (_capacity_contacts_capable): whether the step takes it, the capacity its
         # buffers are reserved for, and its sort's keys and values.
@@ -1245,11 +1241,11 @@ class SolverFBA(TendonStateMixin, SolverBase):
 
     def _setup_joints(self) -> None:
         """Collect the joint rows on the integrated bodies and their Newton system."""
-        from .joints import BilateralSystem, build_joint_limits, build_joint_rows  # noqa: PLC0415
+        from .joints import BilateralSystem, build_joint_rows  # noqa: PLC0415
 
         device, slot = self._device, self._body_slot_h
         self._joint_rows = build_joint_rows(self.model, slot, device)
-        self._limits, self._limit_ws, self._joint_dampers = None, None, False
+        self._joint_dampers = False
         if self._joint_rows is None:
             return
         R = int(self._joint_rows.block_start[-1])
@@ -1260,12 +1256,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         # The soft rows' target motion over the step (joint_soft_row_kernel), zero on the other rows.
         self._joint_row_target_d = wp.zeros(R, dtype=wp.float64, device=device)
         self._warn_unapplied_dof_properties()
-        self._limits = build_joint_limits(self.model, self._joint_rows, slot, device)
-        if self._limits is not None:
-            if not self.friction or self.nsn_schur_mode != "full":
-                raise NotImplementedError("joint limits need friction=True and nsn_schur_mode='full'")
-            self._limit_near_d = wp.zeros(self._limits.slot.shape[0], dtype=wp.int32, device=device)
-        # -1 for every body: the step-start poses of the damper rows and limits come from the state's body_q.
+        # -1 for every body: the step-start poses of the axis rows come from the state's body_q.
         self._no_slot_d = wp.full(self.model.body_count, -1, dtype=wp.int32, device=device)
         # Independent block of each joint row and of each slot it touches.
         rows = self._joint_rows
@@ -1404,17 +1395,17 @@ class SolverFBA(TendonStateMixin, SolverBase):
                     dim=self._joint_residual_d.shape[0],
                     inputs=[
                         *(rows.row_joint, rows.row_angular, rows.row_kind, rows.row_dir, rows.row_dof, rows.row_coord),
-                        *(rows.row_box, rows.parent, rows.child, rows.X_pj, rows.X_cj, state_in.body_q),
-                        *(state_in.body_qd, model.body_com, model.joint_damping, model.joint_armature),
-                        *(model.joint_target_ke, model.joint_target_kd),
+                        *(rows.row_law, rows.row_limited, rows.parent, rows.child, rows.X_pj, rows.X_cj),
+                        *(state_in.body_q, state_in.body_qd, model.body_com, model.joint_damping),
+                        *(model.joint_armature, model.joint_target_ke, model.joint_target_kd),
                         model.joint_target_q if target_q is None else target_q,
                         model.joint_target_qd if target_qd is None else target_qd,
-                        wp.float64(dt),
+                        *(model.joint_limit_lower, model.joint_limit_upper, wp.float64(dt)),
                     ],
-                    outputs=[self._joint_system.compliance, self._joint_row_target_d, self._joint_system.box_terms],
+                    outputs=[self._joint_system.compliance, self._joint_row_target_d, self._joint_system.law_terms],
                     device=self._device,
                 )
-            self._joint_system.factor(self._joint_row_slot_d, self._joint_row_jac_d)
+            self._joint_system.factor(self._joint_row_slot_d, self._joint_row_jac_d, model.joint_friction)
             self._joint_force_d.zero_()
         return True
 
@@ -1466,31 +1457,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
             slots = np.concatenate(
                 [slots, np.where(tb >= 0, self._body_slot_h[np.maximum(tb, 0)], -1).astype(np.int32)]
             )
-        # Joint limit rows follow the tendons, as frictionless contacts of their own Jacobian: the limits of revolute
-        # and prismatic axes that come near them in the step.
-        m_l, lim = 0, self._limits
-        if lim is not None:
-            from .joints import joint_limit_near_kernel  # noqa: PLC0415
-
-            rows = self._joint_rows
-            wp.launch(
-                joint_limit_near_kernel,
-                dim=lim.slot.shape[0],
-                inputs=[
-                    *(lim.joint, lim.angular, lim.axis, lim.bound, lim.sign, lim.center, lim.margin),
-                    *(rows.parent, rows.child, rows.X_pj, rows.X_cj, self._body_slot_d, self._no_slot_d),
-                    *(self._rigid_x_live_d, self._rigid_q_live_d, state_in.body_q, self._joint_body_q_d),
-                    model.body_com,
-                ],
-                outputs=[self._limit_near_d],
-                device=device,
-            )
-            self._rc_limit_rows_h = np.flatnonzero(self._limit_near_d.numpy()).astype(np.int32)
-            m_l = len(self._rc_limit_rows_h)
-            if m_l:
-                self._rc_limit_rows_d = wp.array(self._rc_limit_rows_h, dtype=wp.int32, device=device)
-                slots = np.concatenate([slots, lim.slot[self._rc_limit_rows_h]])
-        self._rc_limits = m_l
         # Particle constraint rows on integrated bodies join the body rows, and so do all deformable rows with them.
         attach = self._constraint_rows is not None and self._constraint_body_h is not None
         if model.particle_count > 0 and self._contact_count > 0:
@@ -1505,7 +1471,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         self._two_way, self._rc_counts, self._rc_n = m_s > 0 or attach, (m_s, m_r), 0
         self._rc_tendons = m_t
         self._rc_padded, self._rc_n_pad, self._rc_n_b = None, 0, 0
-        if m_s + m_r + m_t + m_l == 0 and not attach:
+        if m_s + m_r + m_t == 0 and not attach:
             return
         if not self.friction or self.nsn_schur_mode != "full":
             raise NotImplementedError(
@@ -1529,7 +1495,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         n_b = self._rc_n_b = (
             0 if self._constraint_rows is None or not (m_s or attach) else self._constraint_rows[0].shape[0]
         )
-        n_s, n_c = 3 * m_s, 3 * (m_r + m_t + m_l)
+        n_s, n_c = 3 * m_s, 3 * (m_r + m_t)
         n = self._rc_n = n_s + n_c + joint_rows.size + n_b
         # Rows of rigid contacts and joint rows keep their storage across steps, the contacts padded to their
         # capacity with inert rows and the joint rows to all joint rows, so that the NSN step's graph replays from
@@ -1547,7 +1513,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 if getattr(self, "_rc_storage", None) is None or self._rc_storage.joint_rows != R:
                     self._rc_storage = RigidRowStorage(device, R)
                 storage = self._rc_storage
-                storage.reserve(m_r + m_t + m_l)
+                storage.reserve(m_r + m_t)
                 storage.begin()
                 if R:
                     storage.select_joint_rows(joint_rows)
@@ -1573,8 +1539,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
             self._rc_row_slot_d = wp.full((n, 2), -1, dtype=wp.int32, device=device)
             self._rc_row_jac_d = wp.zeros((n, 2), dtype=wp.spatial_vectord, device=device)
             self._rc_pene0_d = wp.zeros(n, dtype=wp.float64, device=device)
-            self._rc_mu_d = wp.zeros(m_s + m_r + m_t + m_l, dtype=wp.float64, device=device)
-            soft = (wp.zeros(m_s + m_r + m_t + m_l, dtype=wp.float64, device=device) for _ in range(3))
+            self._rc_mu_d = wp.zeros(m_s + m_r + m_t, dtype=wp.float64, device=device)
+            soft = (wp.zeros(m_s + m_r + m_t, dtype=wp.float64, device=device) for _ in range(3))
             self._rc_soft = (
                 tuple(soft) if self.rigid_contact_time > 0.0 or self._tendon_soft_any else self._nsn_soft_off
             )
@@ -1746,22 +1712,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 outputs=list(ends),
                 device=device,
             )
-        if m_l:
-            from .joints import joint_limit_jacobian_kernel  # noqa: PLC0415
-
-            rows = self._joint_rows
-            wp.launch(
-                joint_limit_jacobian_kernel,
-                dim=m_l,
-                inputs=[
-                    *(self._rc_limit_rows_d, lim.joint, lim.angular, lim.axis, lim.sign),
-                    *(rows.parent, rows.child, rows.X_pj, rows.X_cj, self._body_slot_d),
-                    *(self._rigid_x_prev_d, self._rigid_q_pin_d, self._joint_body_q_d, model.body_com),
-                    n_s + 3 * (m_r + m_t),
-                ],
-                outputs=[self._rc_row_slot_d, self._rc_row_jac_d],
-                device=device,
-            )
         if joint_rows.size:
             wp.launch(
                 select_rows_kernel,
@@ -1817,20 +1767,17 @@ class SolverFBA(TendonStateMixin, SolverBase):
             rigid_group = rigid + model.world_count * (self._two_way_world_h[rigid] == 0)
             joint_world = self._joint_world_h[joint_rows]
             joint_group = joint_world + model.world_count * (self._two_way_world_h[joint_world] == 0)
-            limit_world = lim.world[self._rc_limit_rows_h] if m_l else np.empty(0, int)
-            limit_group = limit_world + model.world_count * (self._two_way_world_h[limit_world] == 0)
             worlds = np.concatenate(
                 [
                     np.repeat(soft, 3),
                     np.repeat(rigid_group, 3),
-                    np.repeat(limit_group, 3),
                     joint_group,
                     self._constraint_world_h[:n_b],
                 ]
             )
             self._rigid_world_rows = group_world_rows(worlds, device)
             soft_scale = (self._regularized_world_h[soft] | self._two_way_world_h[soft].astype(bool)) if m_s else []
-            scale = 1.0 + self.contact_regularization * np.r_[soft_scale, np.ones(m_r + m_t + m_l)]
+            scale = 1.0 + self.contact_regularization * np.r_[soft_scale, np.ones(m_r + m_t)]
             self._rigid_contact_scale = wp.array(scale, dtype=wp.float64, device=device)
 
     def _shape_body_host(self) -> np.ndarray:
@@ -2059,15 +2006,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
             first = 3 * (self._rc_counts[0] + self._rc_counts[1])
             wp.copy(self._rc_lam_d, self._tendon_ws[0], dest_offset=first, count=3 * m_t)
             wp.copy(self._rc_omega_d, self._tendon_ws[1], dest_offset=first, count=3 * m_t)
-        m_l = self._rc_limits
-        if m_l and self._rc_n and self._limit_ws is not None:
-            from .joints import joint_limit_carry_kernel  # noqa: PLC0415
-
-            # The limits carry their rows' values over by limit: from zero for a limit absent from the last step.
-            first = 3 * (self._rc_counts[0] + self._rc_counts[1] + m_t)
-            for src, dst in zip(self._limit_ws, (self._rc_lam_d, self._rc_omega_d), strict=True):
-                inputs = [self._rc_limit_rows_d, src, 0, 1, first]
-                wp.launch(joint_limit_carry_kernel, m_l, inputs=inputs, outputs=[dst], device=device)
 
     def _store_tendon_tension(self) -> None:
         """Keep each tendon's tension at the end of the step, for the next step's friction coefficient."""
@@ -2114,22 +2052,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 )
             wp.copy(self._tendon_ws[0], self._rc_lam_d, src_offset=first, count=3 * m_t)
             wp.copy(self._tendon_ws[1], self._rc_omega_d, src_offset=first, count=3 * m_t)
-        if self._limits is not None:
-            from .joints import joint_limit_carry_kernel  # noqa: PLC0415
-
-            # Each limit's rows, by limit: zero for those absent from this step.
-            if self._limit_ws is None:
-                count = 3 * self._limits.slot.shape[0]
-                self._limit_ws = tuple(wp.zeros(count, dtype=wp.float64, device=self._device) for _ in range(2))
-            else:
-                for a in self._limit_ws:
-                    a.zero_()
-            m_l = self._rc_limits
-            if m_l and self._rc_n:
-                first = 3 * (self._rc_counts[0] + self._rc_counts[1] + m_t)
-                for src, dst in zip((self._rc_lam_d, self._rc_omega_d), self._limit_ws, strict=True):
-                    inputs = [self._rc_limit_rows_d, src, first, 0, 0]
-                    wp.launch(joint_limit_carry_kernel, m_l, inputs=inputs, outputs=[dst], device=self._device)
 
     def _two_way_pattern(self, n: int, n_s: int, soft_tail: int) -> tuple:
         """CSR pattern of the two-way ``W`` of ``nsn_sparse_storage``: rows couple where their deformable rows'
@@ -2267,14 +2189,14 @@ class SolverFBA(TendonStateMixin, SolverBase):
 
         rc, device, n, n_pad = self._rigid_contacts, self._device, self._rc_n, self._rc_n_pad
         (m_s, m_r), joint_rows, n_b = self._rc_counts, self._rc_joint_rows_d, self._rc_n_b
-        m_t, m_l = self._rc_tendons, self._rc_limits
-        n_s, n_c, n_j, j0 = 3 * m_s, 3 * m_s + 3 * (m_r + m_t + m_l), len(self._rc_joint_rows_h), self._rc_joint_offset
+        m_t = self._rc_tendons
+        n_s, n_c, n_j, j0 = 3 * m_s, 3 * m_s + 3 * (m_r + m_t), len(self._rc_joint_rows_h), self._rc_joint_offset
         if n_b and self._constraint_lengths:
             self._point_length_rows(self._x_cur)
             self._linear_solver.update_row_directions(self._constraint_rows[2], n_s)
             self._compose_rigid_delassus()
         live = [self._rigid_x_live_d, self._rigid_q_live_d]
-        if n_j and self._joint_system.box_rows.shape[0] and self._rc_bilateral_compliance is not None:
+        if n_j and self._joint_system.law_rows.shape[0] and self._rc_bilateral_compliance is not None:
             # The joint rows' compliance of this Newton step, which the box rows' laws set.
             inputs = [self._joint_system.compliance, joint_rows, 0]
             outputs = [self._rc_bilateral_compliance]
@@ -2316,21 +2238,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 inputs=[
                     *(body, target, middle, rest, mu, *self._tendon_ends, self._body_slot_d),
                     *(self._rigid_x_live_d, self._rigid_turn_d, n_s + 3 * m_r),
-                ],
-                outputs=[self._rc_value_d],
-                device=device,
-            )
-        if m_l:
-            from .joints import joint_limit_gap_kernel  # noqa: PLC0415
-
-            lim, rows = self._limits, self._joint_rows
-            wp.launch(
-                joint_limit_gap_kernel,
-                dim=m_l,
-                inputs=[
-                    *(self._rc_limit_rows_d, lim.joint, lim.angular, lim.axis, lim.bound, lim.sign, lim.center),
-                    *(rows.parent, rows.child, rows.X_pj, rows.X_cj, self._body_slot_d),
-                    *(*live, self._joint_body_q_d, self.model.body_com, n_s + 3 * (m_r + m_t)),
                 ],
                 outputs=[self._rc_value_d],
                 device=device,
@@ -2584,14 +2491,13 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 inputs = [system.mimic_rows, system.mimic_coeffs, 0, 1]
                 outputs = [self._joint_residual_d]
                 wp.launch(mimic_combine_kernel, system.mimic_rows.shape[0], inputs, outputs, device=self._device)
-            # The box rows' laws for this Newton step, from their forces and motions.
+            # The axis rows' laws for this Newton step, from their forces and motions.
             model = self.model
-            box = (model.joint_effort_limit, model.joint_friction)
-            system.box_law(self._joint_residual_d, self._joint_row_target_d, self._joint_force_d, *box)
+            laws = (model.joint_effort_limit, model.joint_friction)
+            system.axis_law(self._joint_residual_d, self._joint_row_target_d, self._joint_force_d, *laws)
             system.update(self._joint_residual_d, self._joint_force_d)
         force = self._solve_rigid_contacts(state_in, dt) if self._rc_n else None
         if self._joint_rows is not None:
-            self._joint_system.clamp_friction(self._joint_force_d, self.model.joint_friction)
             self._joint_system.apply_force(self._joint_row_jac_d, self._joint_force_d, b, self._rigid_b_iter_d)
             b = self._rigid_b_iter_d
         if force is not None:
@@ -3148,8 +3054,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         """Why a step of ``dt`` with ``contacts`` cannot be recorded into the caller's graph, or ``None``.
 
         A step records into a graph when it neither reads the device nor allocates: the system must be set up for
-        ``dt`` by an earlier step, and the step must have no contacts, contact or constraint rows and no joint
-        limits, whose counts are read back to the host to size the step's work.
+        ``dt`` by an earlier step, and the step must not read its contacts' counts back to the host to size its work.
         """
         if contacts is not None and self._integrates_bodies():
             return "steps with contacts on the bodies that SolverFBA integrates read their counts back to the host"
@@ -3183,8 +3088,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
         if self._integrates_bodies():
             if self._rigid_dt is None or abs(self._rigid_dt - dt) > 1e-12:
                 return f"the bodies' system is set up for dt={dt} by a step outside the graph; take one first"
-            if self._limits is not None:
-                return "joint limits select their rows on the host"
             if self._model_tendon_groups is not None:
                 return "tendon rows are set up on the host at each step"
         return None
@@ -5157,13 +5060,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
                         [ws.bilateral_lam, ws.bilateral_omega],
                         device=device,
                     )
-                if self._limit_ws is not None:
-                    # The three rows of each joint limit, in the world of the limit's child.
-                    world = wp.array(np.repeat(self._limits.world, 3), dtype=wp.int32, device=device)
-                    inputs = [world, world_mask]
-                    wp.launch(
-                        clear_bilateral_worlds_kernel, world.shape[0], inputs, list(self._limit_ws), device=device
-                    )
             if self._spring_indices_d is not None:
                 from .kernels import clear_spring_state_kernel  # noqa: PLC0415
 
@@ -5179,7 +5075,6 @@ class SolverFBA(TendonStateMixin, SolverBase):
             self._anchor_step_d.fill_(-2)
         if self._warm_start is not None:
             self._warm_start.clear()
-        self._limit_ws = None
 
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         """Rebuild and factor the system matrices at the next step.

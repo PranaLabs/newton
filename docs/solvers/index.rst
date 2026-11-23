@@ -241,9 +241,9 @@ The maximal-coordinate solvers (:class:`~newton.solvers.SolverSemiImplicit`,
 enforce joints as pairwise body constraints but do not use the articulation kinematic-tree structure.
 :class:`~newton.solvers.SolverVBD` supports a subset of joint types through maximal-coordinate
 constraints, with unified compliant ALM by default and a deprecated legacy AVBD path.
-:class:`~newton.solvers.SolverFBA` enforces joints as bilateral maximal-coordinate constraints, the limits of
-revolute and prismatic joints as unilateral rows, the drives, damping and armature of free axes as soft rows, and
-the effort limits of drives and joint friction as rows whose force a box bounds.
+:class:`~newton.solvers.SolverFBA` enforces joints as bilateral maximal-coordinate constraints, and the drives,
+damping, armature, effort limits, friction and limits of each free axis as one row whose force follows the axis's
+piecewise linear law.
 :class:`~newton.solvers.SolverStyle3D` and :class:`~newton.solvers.SolverImplicitMPM` do not support joints.
 
 **Joint types**
@@ -418,11 +418,12 @@ the effort limits of drives and joint friction as rows whose force a box bounds.
      - |no|
 
 | :sup:`2` Not enforced for BALL joints in SemiImplicit.
-| :sup:`14` FBA enforces the limits of REVOLUTE and PRISMATIC joints as hard unilateral rows (a revolute joint
-  needs both limits; it leaves out a range of a full turn or more) and ignores those of BALL and D6 joints.
+| :sup:`14` FBA holds the limits of REVOLUTE and PRISMATIC joints as hard limits in the law of the axis's row (a
+  revolute joint needs both limits; it leaves out a range of a full turn or more) and ignores those of BALL and D6
+  joints.
 | :sup:`18` FBA bounds a drive's force ``ke (q* - q) + kd (q_dot* - q_dot)``, not its damping or armature, by an
-  effort limit below ``1e6``, and holds each free axis with joint friction by a row whose force the friction bounds,
-  both by a box law in each Newton step of the joint rows.
+  effort limit below ``1e6``, and holds each free axis with joint friction still within the friction force, both in
+  the law of the axis's row, which each Newton step linearizes at the piece the row's own step reaches.
 
 **Actuation and control**
 
