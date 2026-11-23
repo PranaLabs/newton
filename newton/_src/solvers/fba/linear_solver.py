@@ -1242,18 +1242,24 @@ def factorize_and_sparse_inverse(
     return FactorizedSystem(S=S, Dinv=1.0 / d, perm_r=perm_r, invperm_r=order.astype(np.int32))
 
 
-@wp.kernel
-def gather_vec3d_kernel(src: wp.array[wp.vec3], perm: wp.array[wp.int32], dst: wp.array[wp.vec3d]):
-    """``dst[i] = src[perm[i]]`` in float64."""
-    i = wp.tid()
-    dst[i] = wp.vec3d(src[perm[i]])
+@wp.func
+def _as_vec3d(v: wp.vec3) -> wp.vec3d:
+    return wp.vec3d(v)
 
 
-@wp.kernel
-def scatter_vec3_kernel(src: wp.array[wp.vec3d], perm: wp.array[wp.int32], dst: wp.array[wp.vec3]):
-    """``dst[i] = src[perm[i]]`` in float32."""
-    i = wp.tid()
-    dst[i] = wp.vec3(src[perm[i]])
+@wp.func
+def _as_vec3d(v: wp.vec3d) -> wp.vec3d:
+    return v
+
+
+@wp.func
+def _store_vec3(y: wp.array[wp.vec3], i: int, v: wp.vec3d):
+    y[i] = wp.vec3(v)
+
+
+@wp.func
+def _store_vec3(y: wp.array[wp.vec3d], i: int, v: wp.vec3d):
+    y[i] = v
 
 
 @wp.kernel
@@ -1261,23 +1267,41 @@ def csr_mv_vec3_kernel(
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],
     values: wp.array[wp.float64],
-    x: wp.array[wp.vec3d],
+    x: wp.array[Any],
     scale: wp.array[wp.float64],
-    y: wp.array[wp.vec3d],
+    rows: wp.array[wp.int32],
+    y: wp.array[Any],
 ):
-    """``y[i] = scale[i] sum_k values[k] x[columns[k]]`` over row ``i`` of a CSR matrix of scalars, for three
-    right-hand sides at once, so that the matrix is read once for all three; ``scale`` empty for none. A block of
-    threads sums a row, each lane every ``block_dim``-th entry, as :func:`warp.sparse.bsr_mv` sums the long rows of
-    the sparse inverse with tiles."""
-    row, lane = wp.tid()
+    """``y[i] = scale[r] sum_k values[k] x[columns[k]]`` over row ``r = rows[i]`` of a CSR matrix of scalars (``r = i``
+    for an empty ``rows``), for three right-hand sides at once, so that the matrix is read once for all three;
+    ``scale`` empty for none. ``x`` and ``y`` hold ``wp.vec3`` or ``wp.vec3d``, the sums float64. A block of threads
+    sums a row, each lane every ``block_dim``-th entry, as :func:`warp.sparse.bsr_mv` sums the long rows of the sparse
+    inverse with tiles."""
+    i, lane = wp.tid()
+    row = i
+    if rows.shape[0] > 0:
+        row = rows[i]
     s = wp.vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
     for k in range(offsets[row] + lane, offsets[row + 1], wp.block_dim()):
-        s += values[k] * x[columns[k]]
+        s += values[k] * _as_vec3d(x[columns[k]])
     total = wp.tile_sum(wp.tile(s, preserve_type=True))[0]
     if lane == 0:
         if scale.shape[0] > 0:
             total = scale[row] * total
-        y[row] = total
+        _store_vec3(y, i, total)
+
+
+# The two concrete overloads that :meth:`FBALinearSolver.solve` launches: a launch of the generic kernel resolves its
+# overload from its arguments at every call, which costs several times the launch itself.
+csr_mv_vec3_in_kernel = wp.overload(csr_mv_vec3_kernel, {"x": wp.array[wp.vec3], "y": wp.array[wp.vec3d]})
+csr_mv_vec3_out_kernel = wp.overload(csr_mv_vec3_kernel, {"x": wp.array[wp.vec3d], "y": wp.array[wp.vec3]})
+
+
+@wp.kernel
+def permute_columns_kernel(invperm: wp.array[wp.int32], columns: wp.array[wp.int32]):
+    """``columns[k] = invperm[columns[k]]``: the product with the matrix then reads its input unpermuted."""
+    k = wp.tid()
+    columns[k] = invperm[columns[k]]
 
 
 def _csc_to_bsr_1x1(M: CscMatrix, device, transpose: bool = False):
@@ -1306,7 +1330,10 @@ class FBALinearSolver:
 
     Implements ``A⁻¹ b = P_cᵀ · Sᵀ · D⁻¹ · S · P_r · b`` where ``S`` is the
     sparse lower-triangular inverse and ``P_r`` is the row permutation from
-    :func:`factorize_and_sparse_inverse`.
+    :func:`factorize_and_sparse_inverse`. The stored ``S`` holds ``S P_r``, its
+    columns renumbered through the permutation, so that its product reads ``b``
+    in place; the product with ``Sᵀ`` writes its row ``perm[i]`` to row ``i`` of
+    ``x``.
 
     Args:
         factor: Output of :func:`factorize_and_sparse_inverse`.
@@ -1331,22 +1358,25 @@ class FBALinearSolver:
         self.W_sparse = None
         self._W_pattern = None
 
-        # Build 1x1 BSR matrices from the sparse factors.
+        # Build 1x1 BSR matrices from the sparse factors: S P_r, its columns renumbered in their order within each
+        # row, and Sᵀ.
         self._S_bsr = _csc_to_bsr_1x1(factor.S, self.device)
         self._ST_bsr = _csc_to_bsr_1x1(factor.S, self.device, transpose=True)
         self._Dinv = wp.array(factor.Dinv.astype(np.float64), dtype=wp.float64, device=self.device)
         self._perm = wp.array(factor.perm_r.astype(np.int32), dtype=wp.int32, device=self.device)
         self._invperm = wp.array(factor.invperm_r.astype(np.int32), dtype=wp.int32, device=self.device)
+        S_columns = self._S_bsr.columns[: self._S_bsr.nnz_sync()]
+        wp.launch(permute_columns_kernel, S_columns.shape[0], [self._invperm], [S_columns], device=self.device)
 
         # Scalar scratch buffers, reused across components to avoid allocation.
         self._b_scalar = wp.empty(n, dtype=wp.float64, device=self.device)
-        self._b_perm = wp.empty(n, dtype=wp.float64, device=self.device)
         self._Sb = wp.empty(n, dtype=wp.float64, device=self.device)
         self._DSb = wp.empty(n, dtype=wp.float64, device=self.device)
         self._SDSb = wp.empty(n, dtype=wp.float64, device=self.device)
         self._x_scalar = wp.empty(n, dtype=wp.float64, device=self.device)
-        self._b_vec, self._y_vec, self._z_vec = (wp.empty(n, dtype=wp.vec3d, device=self.device) for _ in range(3))
+        self._y_vec = wp.empty(n, dtype=wp.vec3d, device=self.device)
         self._no_scale = wp.empty(0, dtype=wp.float64, device=self.device)
+        self._no_rows = wp.empty(0, dtype=wp.int32, device=self.device)
         self._factor_keys = tuple(self.__dict__)
 
     def schur_view(self) -> FBALinearSolver:
@@ -1369,12 +1399,14 @@ class FBALinearSolver:
         dev = self.device
         block = 64 if dev.is_cuda else 1
         S, ST = self._S_bsr, self._ST_bsr
-        wp.launch(gather_vec3d_kernel, dim=n, inputs=[b, self._invperm], outputs=[self._b_vec], device=dev)
-        inputs = [S.offsets, S.columns, S.values, self._b_vec, self._Dinv]
-        wp.launch_tiled(csr_mv_vec3_kernel, dim=[n], inputs=inputs, outputs=[self._y_vec], block_dim=block, device=dev)
-        inputs = [ST.offsets, ST.columns, ST.values, self._y_vec, self._no_scale]
-        wp.launch_tiled(csr_mv_vec3_kernel, dim=[n], inputs=inputs, outputs=[self._z_vec], block_dim=block, device=dev)
-        wp.launch(scatter_vec3_kernel, dim=n, inputs=[self._z_vec, self._perm], outputs=[x], device=dev)
+        # y = D⁻¹ S P_r b, reading b in place through the renumbered columns, then x = P_rᵀ Sᵀ y, row perm[i] of the
+        # product into row i: two launches.
+        inputs = [S.offsets, S.columns, S.values, b, self._Dinv, self._no_rows]
+        wp.launch_tiled(
+            csr_mv_vec3_in_kernel, dim=[n], inputs=inputs, outputs=[self._y_vec], block_dim=block, device=dev
+        )
+        inputs = [ST.offsets, ST.columns, ST.values, self._y_vec, self._no_scale, self._perm]
+        wp.launch_tiled(csr_mv_vec3_out_kernel, dim=[n], inputs=inputs, outputs=[x], block_dim=block, device=dev)
 
     def solve_scalar(self, b: wp.array[wp.float64], x: wp.array[wp.float64]) -> None:
         """Compute ``x = A⁻¹ · b`` for one scalar right-hand side.
@@ -1385,14 +1417,13 @@ class FBALinearSolver:
         """
         n = self.n
         dev = self.device
-        # A⁻¹ b = P_r⁻¹ · Sᵀ · D⁻¹ · S · P_r · b: gather by invperm, two SpMVs
-        # around the diagonal scale, then gather by perm.
-        wp.launch(apply_permutation_scalar_kernel, dim=n, inputs=[b, self._invperm], outputs=[self._b_perm], device=dev)
+        # A⁻¹ b = P_r⁻¹ · Sᵀ · D⁻¹ · S · P_r · b: two SpMVs around the diagonal scale, the stored S P_r reading b
+        # in place, then gather by perm.
         # Row i of S lists the descendants of i in the elimination tree, so the rows near the root span the
         # system and one thread per row serializes them; Warp picks tiles by the mean row length only, and
         # uses them only on CUDA.
         tile = 64 if dev.is_cuda else 0
-        wps.bsr_mv(self._S_bsr, self._b_perm, self._Sb, tile_size=tile)
+        wps.bsr_mv(self._S_bsr, b, self._Sb, tile_size=tile)
         wp.launch(scale_by_diag_kernel, dim=n, inputs=[self._Sb, self._Dinv], outputs=[self._DSb], device=dev)
         wps.bsr_mv(self._ST_bsr, self._DSb, self._SDSb, tile_size=tile)
         wp.launch(apply_permutation_scalar_kernel, dim=n, inputs=[self._SDSb, self._perm], outputs=[x], device=dev)
