@@ -1,0 +1,1 @@
+Record the block preconditioner of `SolverFBA`'s dense PCR solves, the joint rows' Cholesky solve of an articulation that contacts touch, into the PCR iteration's CUDA graph, which such solves ran without: `cloth_on_boxes_fba` steps in 11.8 ms per frame instead of 22.7.
