@@ -20,8 +20,8 @@ repos:
     hooks:
       - id: check-added-large-files
         args: [--maxkb=500]
-        # The meshes, states and textures of the claw machine example.
-        exclude: ^newton/examples/assets/claw_machine_urban/.*\.(npz|usdc|png)$
+        # The meshes, states and textures of the claw machine example, and the README's top clip.
+        exclude: ^(newton/examples/assets/claw_machine_urban/.*\.(npz|usdc|png)|docs/images/readme/fba_examples\.webp)$
       - id: check-case-conflict
       - id: check-illegal-windows-names
       - id: check-json

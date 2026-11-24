@@ -10,7 +10,7 @@ volumetric soft bodies with robust frictional contact, after the paper
 (2026-05-14); everything outside `SolverFBA` and its examples is upstream Newton.
 
 <p align="center">
-  <img width="960" src="https://github.com/PranaLabs/newton/releases/download/fba-readme-media/fba_examples.gif" alt="SolverFBA examples">
+  <img width="960" src="docs/images/readme/fba_examples.webp" alt="SolverFBA examples">
   <br>
   <sub>Clockwise from top left: <code>cloth_dual_franka_fba</code> (1.65x speed), <code>shirt_fold_fba</code> (3.75x),
   <code>pneunet_gripper_fba</code> (1.1x), <code>cloth_on_knives_fba</code> (0.5x). Rendered with Newton's OpenGL viewer.</sub>
@@ -115,17 +115,17 @@ OpenGL viewer; they play at real time or faster, the longer examples sped up to 
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/cloth/example_cloth_dual_franka_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/cloth_dual_franka_fba.webp" alt="Cloth Dual Franka FBA">
+        <img width="320" src="docs/images/readme/cloth_dual_franka_fba.webp" alt="Cloth Dual Franka FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/cloth/example_shirt_fold_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/shirt_fold_fba.webp" alt="Shirt Fold FBA">
+        <img width="320" src="docs/images/readme/shirt_fold_fba.webp" alt="Shirt Fold FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/softbody/example_softbody_franka_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/softbody_franka_fba.webp" alt="Softbody Franka FBA">
+        <img width="320" src="docs/images/readme/softbody_franka_fba.webp" alt="Softbody Franka FBA">
       </a>
     </td>
   </tr>
@@ -146,17 +146,17 @@ OpenGL viewer; they play at real time or faster, the longer examples sped up to 
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/softbody/example_pneunet_gripper_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/pneunet_gripper_fba.webp" alt="PneuNet Gripper FBA">
+        <img width="320" src="docs/images/readme/pneunet_gripper_fba.webp" alt="PneuNet Gripper FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/softbody/example_cable_gripper_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/cable_gripper_fba.webp" alt="Cable Gripper FBA">
+        <img width="320" src="docs/images/readme/cable_gripper_fba.webp" alt="Cable Gripper FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/softbody/example_claw_machine_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/claw_machine_fba.webp" alt="Claw Machine FBA">
+        <img width="320" src="docs/images/readme/claw_machine_fba.webp" alt="Claw Machine FBA">
       </a>
     </td>
   </tr>
@@ -180,17 +180,17 @@ OpenGL viewer; they play at real time or faster, the longer examples sped up to 
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/cloth/example_stretching_cloth_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/stretching_cloth_fba.webp" alt="Stretching Cloth FBA">
+        <img width="320" src="docs/images/readme/stretching_cloth_fba.webp" alt="Stretching Cloth FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/cloth/example_shirt_pins_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/shirt_pins_fba.webp" alt="Shirt Pins FBA">
+        <img width="320" src="docs/images/readme/shirt_pins_fba.webp" alt="Shirt Pins FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/multiphysics/example_cloth_on_knives_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/cloth_on_knives_fba.webp" alt="Cloth on Knives FBA">
+        <img width="320" src="docs/images/readme/cloth_on_knives_fba.webp" alt="Cloth on Knives FBA">
       </a>
     </td>
   </tr>
@@ -211,7 +211,7 @@ OpenGL viewer; they play at real time or faster, the longer examples sped up to 
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/multiphysics/example_cloth_on_boxes_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/cloth_on_boxes_fba.webp" alt="Cloth on Boxes FBA">
+        <img width="320" src="docs/images/readme/cloth_on_boxes_fba.webp" alt="Cloth on Boxes FBA">
       </a>
     </td>
     <td align="center" width="33%">
@@ -235,17 +235,17 @@ OpenGL viewer; they play at real time or faster, the longer examples sped up to 
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/contacts/example_convex_pile_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/convex_pile_fba.webp" alt="Convex Pile FBA">
+        <img width="320" src="docs/images/readme/convex_pile_fba.webp" alt="Convex Pile FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/contacts/example_convex_hulls_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/convex_hulls_fba.webp" alt="Convex Hulls FBA">
+        <img width="320" src="docs/images/readme/convex_hulls_fba.webp" alt="Convex Hulls FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/contacts/example_nonconvex_pile_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/nonconvex_pile_fba.webp" alt="Nonconvex Pile FBA">
+        <img width="320" src="docs/images/readme/nonconvex_pile_fba.webp" alt="Nonconvex Pile FBA">
       </a>
     </td>
   </tr>
@@ -266,7 +266,7 @@ OpenGL viewer; they play at real time or faster, the longer examples sped up to 
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/contacts/example_chain_net_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/chain_net_fba.webp" alt="Chain Net FBA">
+        <img width="320" src="docs/images/readme/chain_net_fba.webp" alt="Chain Net FBA">
       </a>
     </td>
     <td align="center" width="33%">
@@ -290,17 +290,17 @@ OpenGL viewer; they play at real time or faster, the longer examples sped up to 
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/softbody/example_twisting_bar_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/twisting_bar_fba.webp" alt="Twisting Bar FBA">
+        <img width="320" src="docs/images/readme/twisting_bar_fba.webp" alt="Twisting Bar FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/softbody/example_squeezing_ball_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/squeezing_ball_fba.webp" alt="Squeezing Ball FBA">
+        <img width="320" src="docs/images/readme/squeezing_ball_fba.webp" alt="Squeezing Ball FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/softbody/example_softbody_cantilever_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/softbody_cantilever_fba.webp" alt="Softbody Cantilever FBA">
+        <img width="320" src="docs/images/readme/softbody_cantilever_fba.webp" alt="Softbody Cantilever FBA">
       </a>
     </td>
   </tr>
@@ -321,17 +321,17 @@ OpenGL viewer; they play at real time or faster, the longer examples sped up to 
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/softbody/example_bunny_ears_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/bunny_ears_fba.webp" alt="Bunny Ears FBA">
+        <img width="320" src="docs/images/readme/bunny_ears_fba.webp" alt="Bunny Ears FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/cable/example_particle_rods_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/particle_rods_fba.webp" alt="Particle Rods FBA">
+        <img width="320" src="docs/images/readme/particle_rods_fba.webp" alt="Particle Rods FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/cable/example_hemp_rope_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/hemp_rope_fba.webp" alt="Hemp Rope FBA">
+        <img width="320" src="docs/images/readme/hemp_rope_fba.webp" alt="Hemp Rope FBA">
       </a>
     </td>
   </tr>
@@ -352,17 +352,17 @@ OpenGL viewer; they play at real time or faster, the longer examples sped up to 
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/cable/example_desk_cables_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/desk_cables_fba.webp" alt="Desk Cables FBA">
+        <img width="320" src="docs/images/readme/desk_cables_fba.webp" alt="Desk Cables FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/cable/example_elastic_cords_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/elastic_cords_fba.webp" alt="Elastic Cords FBA">
+        <img width="320" src="docs/images/readme/elastic_cords_fba.webp" alt="Elastic Cords FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/cable/example_rod_gripper_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/rod_gripper_fba.webp" alt="Rod Gripper FBA">
+        <img width="320" src="docs/images/readme/rod_gripper_fba.webp" alt="Rod Gripper FBA">
       </a>
     </td>
   </tr>
@@ -383,7 +383,7 @@ OpenGL viewer; they play at real time or faster, the longer examples sped up to 
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/cable/example_rope_on_knives_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/rope_on_knives_fba.webp" alt="Rope on Knives FBA">
+        <img width="320" src="docs/images/readme/rope_on_knives_fba.webp" alt="Rope on Knives FBA">
       </a>
     </td>
     <td align="center" width="33%">
@@ -407,17 +407,17 @@ OpenGL viewer; they play at real time or faster, the longer examples sped up to 
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/multiphysics/example_shishi_odoshi_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media-2026-11-24/shishi_odoshi_fba.webp" alt="Shishi-odoshi FBA">
+        <img width="320" src="docs/images/readme/shishi_odoshi_fba.webp" alt="Shishi-odoshi FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/multiphysics/example_water_wheel_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media-2026-11-24/water_wheel_fba.webp" alt="Water Wheel FBA">
+        <img width="320" src="docs/images/readme/water_wheel_fba.webp" alt="Water Wheel FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/multiphysics/example_sand_castle_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/sand_castle_fba.webp" alt="Sand Castle FBA">
+        <img width="320" src="docs/images/readme/sand_castle_fba.webp" alt="Sand Castle FBA">
       </a>
     </td>
   </tr>
@@ -438,12 +438,12 @@ OpenGL viewer; they play at real time or faster, the longer examples sped up to 
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/multiphysics/example_batter_mixer_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/batter_mixer_fba.webp" alt="Batter Mixer FBA">
+        <img width="320" src="docs/images/readme/batter_mixer_fba.webp" alt="Batter Mixer FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/multiphysics/example_meat_cutter_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/meat_cutter_fba.webp" alt="Meat Cutter FBA">
+        <img width="320" src="docs/images/readme/meat_cutter_fba.webp" alt="Meat Cutter FBA">
       </a>
     </td>
     <td align="center" width="33%">
