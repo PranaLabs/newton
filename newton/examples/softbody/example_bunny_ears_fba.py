@@ -79,20 +79,36 @@ class Example:
             (16, lifted, "OPEN AGAIN"),
             (18, lifted, "SETTLE"),
         ]
+        # The rows' targets of each substep of a frame, which the steps read, also those recorded into a CUDA graph.
+        self.targets = wp.zeros((self.sim_substeps, 3 * len(self.pins.indices)), dtype=wp.float64)
+        self.graph = None
         self.triangles = self.model.tri_indices.flatten()
         self.viewer.set_model(self.model)
         self.viewer.show_triangles = False
         self.viewer.show_particles = False
         self.viewer.set_camera(pos=wp.vec3(-1.5, 1.5, 1.95), pitch=-8.0, yaw=-53.0)
 
-    def step(self):
-        for _ in range(self.sim_substeps):
-            centers = keyframed_handles(self.sim_time + self.sim_dt, self.keys)
-            self.pins.apply(self.solver, centers)
+    def simulate(self):
+        """The frame's substeps, each stepping ``state_0`` in place to the handles' targets in :attr:`targets`."""
+        for k in range(self.sim_substeps):
+            self.pins.apply(self.solver, targets=self.targets[k])
             self.state_0.clear_forces()
-            self.solver.step(self.state_0, self.state_1, None, None, self.sim_dt)
-            self.state_0, self.state_1 = self.state_1, self.state_0
-            self.sim_time += self.sim_dt
+            self.solver.step(self.state_0, self.state_0, None, None, self.sim_dt)
+
+    def step(self):
+        times = self.sim_time + self.sim_dt * np.arange(1, self.sim_substeps + 1)
+        self.targets.assign(np.stack([self.pins.targets_at(keyframed_handles(t, self.keys)) for t in times]))
+        if self.graph is not None:
+            wp.capture_launch(self.graph)
+        else:
+            self.simulate()
+            if wp.get_device().is_cuda:
+                # The first frame, outside the graph, sets the solver up; the following frames replay its steps.
+                with wp.ScopedCapture() as capture:
+                    self.simulate()
+                self.graph = capture.graph
+        self.sim_time += self.frame_dt
+        self.pins.move(keyframed_handles(self.sim_time, self.keys))
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)

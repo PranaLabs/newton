@@ -2423,6 +2423,59 @@ class TestGraphCapture(unittest.TestCase):
         self.assertTrue(gc.isenabled())
         self.assertTrue(np.isfinite(s0.particle_q.numpy()).all())
 
+    def test_particle_constraint_rows_replay_from_a_graph(self):
+        """Hold two corners of a falling cloth at points by particle constraint rows whose targets move each step,
+        set from a device array inside the graph, and reach the same states, bit for bit, as eager steps that set them
+        from the host, with the full and the lite operator."""
+        dt, n = 1.0 / 120.0, 30
+        corners = np.array([0, 12], dtype=np.int32)
+        particles = np.repeat(corners, 3)[:, None]
+        coefficients = np.ones((6, 1))
+        directions = np.tile(np.eye(3), (2, 1))
+        for mode in ("full", "lite"):
+            with self.subTest(mode=mode):
+                results = []
+                for graph in (False, True):
+                    builder = newton.ModelBuilder()
+                    builder.add_cloth_grid(
+                        pos=wp.vec3(0.0, 0.0, 1.0), rot=wp.quat_identity(), vel=wp.vec3(0.0), dim_x=12, dim_y=12,
+                        cell_x=0.02, cell_y=0.02, mass=0.01, tri_ke=1e3, tri_ka=1e3, edge_ke=1e-4,
+                    )  # fmt: skip
+                    model = builder.finalize()
+                    solver = SolverFBA(model, iterations=5, nsn_schur_mode=mode)
+                    rest = model.particle_q.numpy()[corners].astype(np.float64)
+
+                    def targets(k, rest=rest):
+                        return (rest + np.array([0.002 * k, 0.0, 0.001 * k])).reshape(-1)
+
+                    s0, s1 = model.state(), model.state()
+                    solver.set_particle_constraints(particles, coefficients, targets(0), directions=directions)
+                    solver.step(s0, s1, None, None, dt)
+                    s0, s1 = s1, s0
+                    if graph:
+                        device_targets = wp.zeros(6, dtype=wp.float64)
+                        graphs = []
+                        for a, b in ((s0, s1), (s1, s0)):
+                            with wp.ScopedCapture() as capture:
+                                solver.set_particle_constraints(
+                                    particles, coefficients, device_targets, directions=directions
+                                )
+                                solver.step(a, b, None, None, dt)
+                            graphs.append(capture.graph)
+                        for k in range(1, n):
+                            device_targets.assign(targets(k))
+                            wp.capture_launch(graphs[(k - 1) % 2])
+                        final = s1 if (n - 1) % 2 else s0
+                    else:
+                        for k in range(1, n):
+                            solver.set_particle_constraints(particles, coefficients, targets(k), directions=directions)
+                            solver.step(s0, s1, None, None, dt)
+                            s0, s1 = s1, s0
+                        final = s0
+                    results.append(final.particle_q.numpy())
+                np.testing.assert_allclose(results[0][corners], targets(n - 1).reshape(2, 3), atol=1e-4)
+                np.testing.assert_array_equal(results[0], results[1])
+
     def test_recorded_steps_report_dropped_contacts(self):
         """Report the contacts that steps recorded into a graph drop, past the buffers of a pipeline that holds 100
         of the cloth's contacts on the box, once, outside the graph; with buffers that hold them all, report none."""

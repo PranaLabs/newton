@@ -39,12 +39,22 @@ class PinHandles:
         self.points = wp.array(self.positions, dtype=wp.vec3)
         self.trail = []
 
-    def apply(self, solver, centers):
+    def targets_at(self, centers):
+        """The rows' targets [m] for the handles at ``centers``: each particle at its rest offset from its handle."""
+        return (np.asarray(centers)[self.which] + self.offsets).reshape(-1)
+
+    def move(self, centers):
+        """Place the handles at ``centers`` for rendering and :meth:`error`, without setting the solver's rows."""
         self.positions = np.asarray(centers)
         self.targets = self.positions[self.which] + self.offsets
-        solver.set_particle_constraints(
-            self.particles, self.coefficients, self.targets.reshape(-1), directions=self.directions
-        )
+
+    def apply(self, solver, centers=None, targets=None):
+        """Hold the particles at their offsets from the handles at ``centers``, or at ``targets``, a device array
+        of the rows' targets, which a CUDA graph capture records."""
+        if centers is not None:
+            self.move(centers)
+            targets = self.targets.reshape(-1)
+        solver.set_particle_constraints(self.particles, self.coefficients, targets, directions=self.directions)
 
     def render(self, viewer, radius):
         self.points.assign(self.positions.astype(np.float32))
