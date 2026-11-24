@@ -3102,6 +3102,12 @@ _INERT_KEY = wp.constant(wp.int64(9223372036854775807))
 
 
 @wp.kernel
+def contact_peak_kernel(count: wp.array[wp.int32], slot: int, peak: wp.array[wp.int32]):
+    """``peak[slot] = max(peak[slot], count[0])``: the most contacts a collision pipeline found in a step."""
+    wp.atomic_max(peak, slot, count[0])
+
+
+@wp.kernel
 def capacity_contact_keys_kernel(
     count: wp.array[wp.int32],
     particle: wp.array[wp.int32],

@@ -5,6 +5,7 @@ import gc
 import math
 import sys
 import unittest
+import warnings
 
 import numpy as np
 import warp as wp
@@ -2337,7 +2338,7 @@ class TestGraphCapture(unittest.TestCase):
                     np.testing.assert_array_equal(eager, replayed)
 
     @staticmethod
-    def _cloth_on_box(device=None):
+    def _cloth_on_box(device=None, **pipeline_args):
         """A lite cloth of 20 x 20 cells, its first particle held, over a box and the ground, and its contacts."""
         builder = newton.ModelBuilder()
         builder.add_shape_box(-1, xform=wp.transform((0.0, 0.0, 0.1), wp.quat_identity()), hx=0.15, hy=0.15, hz=0.1)
@@ -2349,7 +2350,7 @@ class TestGraphCapture(unittest.TestCase):
         builder.particle_mass[0] = 0.0
         model = builder.finalize(device=device)
         solver = SolverFBA(model, iterations=5, nsn_schur_mode="lite", nsn_linear_iterations=10)
-        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.01)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.01, **pipeline_args)
         return model, solver, pipeline, pipeline.contacts()
 
     def test_lite_contacts_replay_from_a_graph(self):
@@ -2421,6 +2422,39 @@ class TestGraphCapture(unittest.TestCase):
         self.assertEqual(inside, [])
         self.assertTrue(gc.isenabled())
         self.assertTrue(np.isfinite(s0.particle_q.numpy()).all())
+
+    def test_recorded_steps_report_dropped_contacts(self):
+        """Report the contacts that steps recorded into a graph drop, past the buffers of a pipeline that holds 100
+        of the cloth's contacts on the box, once, outside the graph; with buffers that hold them all, report none."""
+        dt = 1.0 / 120.0
+        for capacity in (100, None):
+            with self.subTest(capacity=capacity):
+                args = {} if capacity is None else {"soft_contact_max": capacity}
+                model, solver, pipeline, contacts = self._cloth_on_box(**args)
+                s0, s1 = model.state(), model.state()
+                with warnings.catch_warnings():
+                    # The eager step warns about the contacts it drops by itself.
+                    warnings.simplefilter("ignore")
+                    pipeline.collide(s0, contacts)
+                    solver.step(s0, s1, None, contacts, dt)
+                s0, s1 = s1, s0
+                self.assertEqual(solver.dropped_contacts(), 0)
+                with wp.ScopedCapture() as capture:
+                    pipeline.collide(s0, contacts)
+                    solver.step(s0, s1, None, contacts, dt)
+                    pipeline.collide(s1, contacts)
+                    solver.step(s1, s0, None, contacts, dt)
+                for _ in range(30):
+                    wp.capture_launch(capture.graph)
+                found = int(contacts.soft_contact_count.numpy()[0])
+                if capacity is None:
+                    self.assertEqual(solver.dropped_contacts(), 0)
+                    continue
+                self.assertGreater(found, capacity)
+                with self.assertWarnsRegex(newton.exceptions.NewtonWarning, "dropped up to"):
+                    dropped = solver.dropped_contacts()
+                self.assertGreaterEqual(dropped, found - capacity)
+                self.assertEqual(solver.dropped_contacts(), 0)
 
     def test_capture_names_what_blocks_it(self):
         """Refuse to record a step whose system is not set up for its dt, and one with contacts, naming why."""

@@ -205,7 +205,10 @@ which reserves the buffers of their capacity. Such a step takes every slot of
 the contact buffer as a contact row, those past the stored count and those of
 held particles inert, sorted on the device, and gives every particle the
 per-particle Newton step; a particle with more than four contacts keeps its
-multipliers there. Self, face and rod contacts, particle constraint rows and
+multipliers there. A full contact buffer drops the contacts past it silently
+in such a step, which reads nothing back:
+:meth:`~newton.solvers.SolverFBA.dropped_contacts`, called outside the graph,
+reports the most contacts a recorded step dropped since its last call. Self, face and rod contacts, particle constraint rows and
 particle-body attachments, ``contact_warmstart``, ``friction_anchors``,
 ``nsn_lite_accumulate``, the full operator, several worlds, joint limits,
 tendons and contacts on the bodies FBA integrates keep a step out of graphs:
