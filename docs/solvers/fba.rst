@@ -218,11 +218,25 @@ that of the size rather than of the buffer. A step drops the active contacts
 past 2048, and a full contact buffer the contacts past it, silently, as it
 reads nothing back: :meth:`~newton.solvers.SolverFBA.dropped_contacts`, called
 outside the graph, reports the most contacts a recorded step dropped since its
-last call. Self, face and rod contacts, particle constraint rows with
-contacts, particle-body attachments, ``contact_warmstart``, ``friction_anchors``,
-``nsn_lite_accumulate``, the full operator with ``nsn_sparse_storage``,
-several worlds, tendons and contacts on the bodies FBA integrates keep a step out of graphs:
-during a capture it then raises ``RuntimeError``, naming the reason. A graph
+last call. Rigid contacts record too, after a step with the same contacts
+outside the graph, in a model without particles, in one world, with
+``nsn_sparse_storage``, a fixed count of at most 25 ``nsn_linear_iterations``,
+and neither tendons nor mimic joints: every slot of the rigid contact buffer
+becomes a contact's three rows, those past the step's contacts inert, the joint
+rows of the articulations that contacts touch are selected on the device, and
+the pattern of ``W`` takes a storage of 32 blocks per slot beside those of the
+joint rows, so that the recorded steps match those outside a graph bit for bit,
+``contact_warmstart`` and ``rigid_contact_bin`` included. Their cost grows with
+the buffer rather than with the contacts: with a ``rigid_contact_max`` far
+above the contacts that the steps find, recorded steps run slower than steps
+outside a graph. A step whose pattern outgrows its storage drops its last
+contacts, which ``dropped_contacts`` reports. Self, face and rod contacts,
+particle constraint rows with contacts, particle-body attachments, several
+worlds, model tendons, and with particle contacts ``contact_warmstart``,
+``friction_anchors``, ``nsn_lite_accumulate``, the full operator with
+``nsn_sparse_storage`` and contacts on the bodies FBA integrates keep a step
+out of graphs: during a capture it then raises ``RuntimeError``, naming the
+reason. A graph
 replays the launches of the steps it recorded: settings the solver keeps on
 the host, such as :meth:`~newton.solvers.SolverFBA.set_pin_targets`,
 :meth:`~newton.solvers.SolverFBA.set_particle_constraints` and

@@ -148,6 +148,46 @@ def pattern_from_groups(
     return offsets, columns, nnz
 
 
+def pattern_from_groups_capacity(
+    row_groups: wp.array2d[wp.int32],
+    group_offsets: wp.array[wp.int32],
+    group_rows: wp.array[wp.int32],
+    storage: CsrStorage | Block3Storage,
+    counts: wp.array[wp.int32],
+    cut: wp.array[wp.int32],
+    per: int,
+    contacts: int,
+    table: wp.array[wp.int32],
+    peak: wp.array[wp.int32],
+    peak_slot: int,
+) -> tuple[wp.array, wp.array, int]:
+    """:func:`pattern_from_groups` into the entries the ``storage`` holds, reading nothing back, for rows that lead
+    with ``contacts`` contacts of ``per`` rows each.
+
+    When the pattern outgrows the storage, the contacts from the first that :func:`pattern_fit_kernel` cuts on leave
+    it, as rows and as columns: their count in ``table[0]`` drops to the cut, ``cut[0]`` holds it, and ``peak`` keeps
+    the most contacts cut, as :meth:`SolverFBA.dropped_contacts` reports them. The caller makes the cut contacts
+    inert. Returns ``(offsets, columns, capacity)``, the storage's arrays.
+    """
+    from .kernels import group_pattern_cut_kernel, pattern_fit_kernel  # noqa: PLC0415
+
+    n, device = row_groups.shape[0], row_groups.device
+    if storage.n != n:
+        raise ValueError(f"a storage of {storage.n} rows cannot hold a pattern of {n} rows")
+    offsets, columns, capacity = storage.offsets, storage.columns, storage.capacity
+    inputs = [row_groups, group_offsets, group_rows, offsets]
+    rows = per * contacts
+    cut.fill_(contacts)
+    wp.launch(group_pattern_cut_kernel, n, [*inputs, 0, cut, per, rows], [counts, columns], device=device)
+    wp.utils.array_scan(counts, offsets[1:], inclusive=True)
+    outputs = [table, cut, peak]
+    wp.launch(pattern_fit_kernel, 1, [offsets, n, per, contacts, capacity, peak_slot], outputs, device=device)
+    wp.launch(group_pattern_cut_kernel, n, [*inputs, 0, cut, per, rows], [counts, columns], device=device)
+    wp.utils.array_scan(counts, offsets[1:], inclusive=True)
+    wp.launch(group_pattern_cut_kernel, n, [*inputs, 1, cut, per, rows], [counts, columns], device=device)
+    return offsets, columns, capacity
+
+
 class CsrStorage:
     """Storage of :func:`csr_without_zeros` for matrices of ``n`` rows, kept across calls and grown with their
     entries.

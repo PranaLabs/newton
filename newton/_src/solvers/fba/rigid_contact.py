@@ -53,10 +53,16 @@ class RigidContacts:
     """World contact normal from side 0 to side 1, shape [count]."""
     mu: wp.array[wp.float64]
     """Friction coefficient, the mean of both shapes', shape [count]."""
+    table: wp.array | None = None
+    """With ``capacity``: the contact count in ``table[0]``, then each contact's slots and shapes in ``table[1 + 4 c
+    : 5 + 4 c]``, -1 past the count, on the device."""
+    capacity: int = 0
+    """The contacts of the capacity form, whose ``slot`` and ``shape`` stay on the device (in ``table``): every slot
+    of the pipeline's buffer, the contacts past the count inert, on no body."""
 
     @property
     def count(self) -> int:
-        return self.slot.shape[0]
+        return self.capacity if self.slot is None else self.slot.shape[0]
 
 
 _DROPPED_PAIR = wp.constant(wp.int64(0x7FFFFFFFFFFFFFFF))
@@ -84,6 +90,7 @@ def _rigid_contact_keys_kernel(
     body_slot: wp.array[wp.int32],
     body_com: wp.array[wp.vec3],
     shape_count: wp.int64,
+    stored: wp.array[wp.int32],
     # outputs
     pair_key: wp.array[wp.int64],
     anchor_key: wp.array2d[wp.float64],
@@ -91,13 +98,14 @@ def _rigid_contact_keys_kernel(
     table: wp.array[wp.int32],
 ):
     """The sort keys of each emitted contact: its shape pair, or a key past every pair for a contact the solver
-    drops, and the side-0 anchor relative to the COM; counts the kept contacts in ``table[0]``."""
+    drops or a slot past the ``stored`` count, and the side-0 anchor relative to the COM; counts the kept contacts in
+    ``table[0]``."""
     c = wp.tid()
     order[c] = c
     s0, s1 = shape0[c], shape1[c]
     b0, b1 = _lookup(shape_body, s0), _lookup(shape_body, s1)
     slot0, slot1 = _lookup(body_slot, b0), _lookup(body_slot, b1)
-    keep = s0 >= 0 and s1 >= 0 and b0 != b1 and (slot0 >= 0 or slot1 >= 0)
+    keep = c < stored[0] and s0 >= 0 and s1 >= 0 and b0 != b1 and (slot0 >= 0 or slot1 >= 0)
     a = wp.vec3d(point0[c]) + wp.vec3d(offset0[c])
     if b0 >= 0:
         a -= wp.vec3d(body_com[b0])
@@ -291,6 +299,111 @@ def _contact_bin_compact_kernel(
         kept_table[0] = dest[i] + keep[i]
 
 
+@wp.func
+def _inert_contact(
+    i: int,
+    table: wp.array[wp.int32],
+    body: wp.array2d[wp.int32],
+    anchor: wp.array2d[wp.vec3],
+    normal: wp.array[wp.vec3],
+    mu: wp.array[wp.float64],
+):
+    """Contact ``i`` of the capacity form inert: on no body, with no friction and an upward normal."""
+    for k in range(2):
+        body[i, k] = -1
+        anchor[i, k] = wp.vec3(0.0, 0.0, 0.0)
+    normal[i] = wp.vec3(0.0, 0.0, 1.0)
+    mu[i] = wp.float64(0.0)
+    for j in range(4):
+        table[1 + 4 * i + j] = -1
+
+
+@wp.kernel
+def _inert_contacts_kernel(
+    # outputs
+    table: wp.array[wp.int32],
+    body: wp.array2d[wp.int32],
+    anchor: wp.array2d[wp.vec3],
+    normal: wp.array[wp.vec3],
+    mu: wp.array[wp.float64],
+):
+    """The contacts past the count in ``table[0]`` inert (:func:`_inert_contact`)."""
+    i = wp.tid()
+    if i >= table[0]:
+        _inert_contact(i, table, body, anchor, normal, mu)
+
+
+@wp.kernel
+def cut_contacts_kernel(
+    cut: wp.array[wp.int32],
+    # outputs
+    table: wp.array[wp.int32],
+    body: wp.array2d[wp.int32],
+    anchor: wp.array2d[wp.vec3],
+    normal: wp.array[wp.vec3],
+    mu: wp.array[wp.float64],
+    row_slot: wp.array2d[wp.int32],
+    row_jac: wp.array2d[wp.spatial_vectord],
+):
+    """The contacts from ``cut[0]`` on inert (:func:`_inert_contact`), their rows on no body."""
+    i = wp.tid()
+    if i < cut[0]:
+        return
+    _inert_contact(i, table, body, anchor, normal, mu)
+    for k in range(3):
+        for side in range(2):
+            row_slot[3 * i + k, side] = -1
+            row_jac[3 * i + k, side] = wp.spatial_vectord()
+
+
+@wp.kernel
+def touched_blocks_kernel(
+    table: wp.array[wp.int32],
+    slot_block: wp.array[wp.int32],
+    # outputs
+    touched: wp.array[wp.int32],
+):
+    """Flag the articulation blocks of the bodies that the contacts in ``table`` touch."""
+    i = wp.tid()
+    if i >= table[0]:
+        return
+    for k in range(2):
+        s = table[1 + 4 * i + k]
+        if s >= 0:
+            b = slot_block[s]
+            if b >= 0:
+                touched[b] = 1
+
+
+@wp.kernel
+def joint_row_flags_kernel(
+    row_block: wp.array[wp.int32],
+    touched: wp.array[wp.int32],
+    # outputs
+    flags: wp.array[wp.int32],
+):
+    """Flag the joint rows of the touched blocks."""
+    r = wp.tid()
+    b = row_block[r]
+    flag = wp.int32(0)
+    if b >= 0:
+        flag = touched[b]
+    flags[r] = flag
+
+
+@wp.kernel
+def select_flagged_kernel(
+    flags: wp.array[wp.int32],
+    position: wp.array[wp.int32],
+    # outputs
+    select: wp.array[wp.int32],
+):
+    """The flagged rows in their order at the front of ``select``, from their exclusive scan ``position``."""
+    r = wp.tid()
+    if flags[r] != 0:
+        select[position[r]] = r
+
+
 class RigidContactGather:
     """Device buffers of :func:`gather_rigid_contacts`, kept across steps and grown with the contact count."""
 
@@ -396,6 +509,7 @@ def gather_rigid_contacts(
     friction_max: bool = False,
     bin_size: float = 0.0,
     body_q: wp.array | None = None,
+    capacity: bool = False,
 ) -> RigidContacts | None:
     """Collect the rigid contacts that touch a body the solver integrates.
 
@@ -423,11 +537,18 @@ def gather_rigid_contacts(
             coefficients rather than their mean.
         bin_size: The cell size [m] of the reduction by bins, 0 for none.
         body_q: The body poses at which the reduction measures the contacts' depths (with a ``bin_size``).
+        capacity: Collect into the capacity form (:attr:`RigidContacts.capacity`), every slot of the pipeline's
+            buffer, reading nothing back: the kept contacts first, in their order, the others inert after them, their
+            count on the device.
 
     Returns:
-        The contacts, or ``None`` if no contact touches an integrated body.
+        The contacts, or ``None`` if no contact touches an integrated body (or the buffer holds none, with
+        ``capacity``).
     """
-    n = stored_contact_count(contacts.rigid_contact_count, contacts.rigid_contact_shape0.shape[0], "rigid")
+    if capacity:
+        n = contacts.rigid_contact_shape0.shape[0]
+    else:
+        n = stored_contact_count(contacts.rigid_contact_count, contacts.rigid_contact_shape0.shape[0], "rigid")
     if n == 0:
         return None
     if buffers is None:
@@ -450,6 +571,7 @@ def gather_rigid_contacts(
             body_slot,
             model.body_com,
             wp.int64(max(model.shape_count, 1)),
+            c.rigid_contact_count,
         ],
         outputs=[B.pair_key, B.anchor_key, B.order, B.table],
         device=device,
@@ -502,6 +624,10 @@ def gather_rigid_contacts(
             device=device,
         )
         arrays = (B.kept_table, B.kept_body, B.kept_anchor, B.kept_normal, B.kept_mu)
+    if capacity:
+        wp.launch(_inert_contacts_kernel, n, inputs=[], outputs=list(arrays), device=device)
+        body, anchor, normal, mu = (a[:n] for a in arrays[1:])
+        return RigidContacts(None, None, body, anchor, normal, mu, table=arrays[0], capacity=n)
     table = host_head(arrays[0], 1 + 4 * n)
     m = int(table[0])
     if m == 0:
@@ -1008,8 +1134,11 @@ def rigid_contact_soft_kernel(
     """Rigid contact ``c``'s soft-contact entries at ``offset + c``: its relative compliance ``eps``, its damping
     weight ``beta`` and its normal gap at the step start ``n · (a1⁰ - a0⁰)`` [m], clamped at zero from above. The
     damper acts in penetration only: a contact that the collision pipeline reports before the bodies touch, within
-    its detection gap, would otherwise brake their approach with ``beta`` times that gap before they meet."""
+    its detection gap, would otherwise brake their approach with ``beta`` times that gap before they meet. An inert
+    contact of the capacity form, on no body, keeps its zero entries."""
     c = wp.tid()
+    if body[c, 0] < 0 and body[c, 1] < 0:
+        return
     n = wp.vec3d(normal[c])
     start0, _live0, _t0 = _side_anchor(
         body[c, 0], wp.vec3d(anchor[c, 0]), body_slot, slot_x, slot_q, slot_x0, body_q0, body_qd0, body_com, dt

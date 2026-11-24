@@ -2571,6 +2571,131 @@ class TestGraphCapture(unittest.TestCase):
                 self.assertGreaterEqual(dropped, found - capacity)
                 self.assertEqual(solver.dropped_contacts(), 0)
 
+    @staticmethod
+    def _rigid_scene(device=None, hinged=True, **solver_args):
+        """Two chains of three hinged links on the ground and a box dropped on them, or without ``hinged`` four boxes
+        dropped on each other: rigid contacts alone, with the sparse storage, ten fixed PCR iterations and the warm
+        start; and their contacts."""
+        cfg = newton.ModelBuilder.ShapeConfig(mu=0.5)
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane(cfg=cfg)
+        if hinged:
+            for c in range(2):
+                joints, parent = [], -1
+                for k in range(3):
+                    link = builder.add_link(xform=wp.transform((0.25 * k, 0.3 * c, 0.05)))
+                    builder.add_shape_box(link, hx=0.12, hy=0.05, hz=0.05, cfg=cfg)
+                    if parent < 0:
+                        joints.append(builder.add_joint_free(link))
+                    else:
+                        joints.append(
+                            builder.add_joint_revolute(
+                                parent, link, axis=(0.0, 1.0, 0.0), parent_xform=wp.transform((0.125, 0.0, 0.0)),
+                                child_xform=wp.transform((-0.125, 0.0, 0.0)),
+                            )
+                        )  # fmt: skip
+                    parent = link
+                builder.add_articulation(joints)
+            box = builder.add_body(xform=wp.transform((0.25, 0.15, 0.4), wp.quat_rpy(0.1, 0.2, 0.0)))
+            builder.add_shape_box(box, hx=0.08, hy=0.08, hz=0.08, cfg=cfg)
+        else:
+            for i in range(4):
+                xform = wp.transform((0.02 * i, 0.0, 0.11 + 0.21 * i), wp.quat_rpy(0.05 * i, 0.03, 0.0))
+                builder.add_shape_box(builder.add_body(xform=xform), hx=0.1, hy=0.1, hz=0.1, cfg=cfg)
+        model = builder.finalize(device=device)
+        args = {"iterations": 5, "nsn_sparse_storage": True, "nsn_linear_iterations": 10, "contact_warmstart": True}
+        solver = SolverFBA(model, **{**args, **solver_args})
+        pipeline = newton.CollisionPipeline(model)
+        return model, solver, pipeline, pipeline.contacts()
+
+    def _rigid_runs(self, runs, steps=20):
+        """The body poses after a step outside a graph and ``steps`` pairs of steps of :meth:`_rigid_scene`, for each
+        run of ``runs``: ``"count"`` eager, ``"capacity"`` eager through the capacity path, ``"graph"`` recorded, and
+        ``"capacity graph"`` recorded after a first step through the capacity path."""
+        dt, results = 0.01, []
+        for run in runs:
+            model, solver, pipeline, contacts = self._rigid_scene()
+            solver._force_rigid_capacity = run in ("capacity", "capacity graph")
+            s0, s1 = model.state(), model.state()
+            pipeline.collide(s0, contacts)
+            solver.step(s0, s1, None, contacts, dt)
+            s0, s1 = s1, s0
+
+            def two_steps(s0=s0, s1=s1, solver=solver, pipeline=pipeline, contacts=contacts):
+                pipeline.collide(s0, contacts)
+                solver.step(s0, s1, None, contacts, dt)
+                pipeline.collide(s1, contacts)
+                solver.step(s1, s0, None, contacts, dt)
+
+            if run.endswith("graph"):
+                with wp.ScopedCapture() as capture:
+                    two_steps()
+                for _ in range(steps):
+                    wp.capture_launch(capture.graph)
+            else:
+                for _ in range(steps):
+                    two_steps()
+            results.append(s0.body_q.numpy())
+        return solver, results
+
+    def test_rigid_contacts_replay_from_a_graph(self):
+        """Record the collision and two steps of hinged chains and a box with rigid contacts alone into a graph,
+        after a step outside it, and reach the same poses, bit for bit, as the same steps taken eagerly through the
+        stored contacts or through the capacity path that the graph takes: the contacts' and the joint rows' warm
+        start carries over from the step outside the graph and from step to step."""
+        solver, (count, capacity, graph) = self._rigid_runs(("count", "capacity", "graph"))
+        np.testing.assert_array_equal(count, capacity)
+        np.testing.assert_array_equal(capacity, graph)
+        self.assertGreater(float(graph[-1, 2]), 0.075)
+        self.assertEqual(solver.dropped_contacts(), 0)
+
+    def test_rigid_contacts_past_the_storage_are_reported(self):
+        """Cut the rigid contacts whose rows' entries of W outgrow the storage that steps recorded into a graph hold,
+        here a few blocks: the steps keep the leading contacts that fit, alike in the graph and eagerly, and
+        :meth:`SolverFBA.dropped_contacts` reports the others."""
+        reserve = SolverFBA._reserve_rigid_capacity
+
+        def small(solver, contacts):
+            reserve(solver, contacts)
+            storage = solver._rcc.storage
+            if solver._rcc.blocked:
+                storage.blocks.capacity = 24
+            else:
+                storage.csr.capacity = 200
+
+        with mock.patch.object(SolverFBA, "_reserve_rigid_capacity", small):
+            solver, (capacity, graph) = self._rigid_runs(("capacity", "capacity graph"), steps=10)
+        np.testing.assert_array_equal(capacity, graph)
+        self.assertTrue(np.isfinite(graph).all())
+        with self.assertWarnsRegex(newton.exceptions.NewtonWarning, "outgrew"):
+            self.assertGreater(solver.dropped_contacts(), 0)
+
+    def test_rigid_capture_names_what_blocks_it(self):
+        """Refuse to record a step of rigid contacts before a step with them outside the graph, and one whose model
+        has particles, naming why."""
+        model, solver, pipeline, contacts = self._rigid_scene()
+        s0, s1 = model.state(), model.state()
+        solver.step(s0, s1, None, None, 0.01)
+        pipeline.collide(s1, contacts)
+        with self.assertRaisesRegex(RuntimeError, "outside the graph first"):
+            with wp.ScopedCapture():
+                solver.step(s1, s0, None, contacts, 0.01)
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        body = builder.add_body(xform=wp.transform((0.0, 0.0, 0.1), wp.quat_identity()))
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        builder.add_particle(pos=(0.5, 0.0, 0.5), vel=(0.0, 0.0, 0.0), mass=0.01)
+        model = builder.finalize()
+        solver = SolverFBA(model, nsn_sparse_storage=True, nsn_linear_iterations=10)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        s0, s1 = model.state(), model.state()
+        pipeline.collide(s0, contacts)
+        solver.step(s0, s1, None, contacts, 0.01)
+        with self.assertRaisesRegex(RuntimeError, "without particles"):
+            with wp.ScopedCapture():
+                solver.step(s1, s0, None, contacts, 0.01)
+
     def test_capture_names_what_blocks_it(self):
         """Refuse to record a step whose system is not set up for its dt, and one with contacts, naming why."""
         model = self._scene("cloth", ground=True)
@@ -2589,6 +2714,30 @@ class TestGraphCapture(unittest.TestCase):
 
 class TestCapacityContacts(unittest.TestCase):
     """The capacity path of the contacts, which steps recorded into a graph take, on every device."""
+
+    def test_rigid_capacity_path_matches_the_count_path(self):
+        """Step four boxes dropped on each other, and hinged chains with a box dropped on them, with rigid contacts
+        alone, through the capacity path (every slot of the rigid contact buffer three rows, the joint rows of the
+        articulations that contacts touch selected on the device) and through the stored contacts, with and without
+        the reduction by bins, alike bit for bit."""
+        dt = 0.01
+        for hinged, size in ((False, 0.0), (True, 0.0), (True, 0.05)):
+            with self.subTest(hinged=hinged, rigid_contact_bin=size):
+                results = []
+                for capacity in (False, True):
+                    model, solver, pipeline, contacts = TestGraphCapture._rigid_scene(
+                        hinged=hinged, rigid_contact_bin=size
+                    )
+                    solver._force_rigid_capacity = capacity
+                    s0, s1 = model.state(), model.state()
+                    for _ in range(40):
+                        pipeline.collide(s0, contacts)
+                        solver.step(s0, s1, None, contacts, dt)
+                        s0, s1 = s1, s0
+                    self.assertEqual(solver._rc_capacity_active, capacity)
+                    results.append(s0.body_q.numpy())
+                np.testing.assert_array_equal(results[0], results[1])
+                self.assertTrue(np.isfinite(results[1]).all())
 
     def test_full_capacity_path_matches_the_count_path(self):
         """Step a cloth with the full operator falling onto a box and the ground, a held particle among its contacts,

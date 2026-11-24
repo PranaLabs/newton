@@ -3989,6 +3989,98 @@ def group_pattern_kernel(
     counts[r] = count
 
 
+@wp.kernel
+def group_pattern_cut_kernel(
+    row_groups: wp.array2d[wp.int32],  # (n, G) the groups of each row, -1 where unused
+    group_offsets: wp.array[wp.int32],  # (groups + 1,)
+    group_rows: wp.array[wp.int32],  # the rows of each group, ascending
+    offsets: wp.array[wp.int32],  # (n + 1,) where each row's columns start, with ``fill``
+    fill: int,
+    cut: wp.array[wp.int32],  # the first contact cut
+    per: int,  # rows per contact
+    contact_rows: int,  # the rows of the contacts, which lead
+    # outputs
+    counts: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+):
+    """:func:`group_pattern_kernel` without the rows of the contacts from ``cut[0]`` on, as rows and as columns, and
+    with ``fill`` writing no column past ``columns``."""
+    r = wp.tid()
+    lo = per * cut[0]
+    if r >= lo and r < contact_rows:
+        counts[r] = 0
+        return
+    head = _vec_row_groups()
+    end = _vec_row_groups()
+    lists = int(0)
+    for g in range(row_groups.shape[1]):
+        group = row_groups[r, g]
+        if group >= 0:
+            head[lists] = group_offsets[group]
+            end[lists] = group_offsets[group + 1]
+            lists += 1
+    count = int(0)
+    k = int(0)
+    if fill:
+        k = offsets[r]
+    while True:
+        best = wp.int32(2147483647)
+        for i in range(lists):
+            if head[i] < end[i]:
+                best = wp.min(best, group_rows[head[i]])
+        if best == wp.int32(2147483647):
+            break
+        for i in range(lists):
+            if head[i] < end[i]:
+                if group_rows[head[i]] == best:
+                    head[i] = head[i] + 1
+        if best >= lo and best < contact_rows:
+            continue
+        if fill and k < columns.shape[0]:
+            columns[k] = best
+        k += 1
+        count += 1
+    counts[r] = count
+
+
+@wp.kernel
+def pattern_fit_kernel(
+    offsets: wp.array[wp.int32],
+    n: int,
+    per: int,
+    contacts: int,
+    capacity: int,
+    peak_slot: int,
+    # outputs
+    table: wp.array[wp.int32],
+    cut: wp.array[wp.int32],
+    peak: wp.array[wp.int32],
+):
+    """The first contact to cut so that the pattern of ``offsets`` fits ``capacity`` entries: none (``contacts``)
+    when it fits, else the most leading contacts whose entries, with every entry of the rows after the contacts',
+    fit, which bounds the entries left once the contacts after them leave the rows and the columns. The active
+    contacts in ``table[0]`` lose the cut ones, whose count ``peak[peak_slot]`` keeps at its most. One thread."""
+    tail = offsets[n] - offsets[per * contacts]
+    c = contacts
+    if offsets[n] > capacity:
+        lo = int(0)
+        hi = contacts
+        if offsets[0] + tail > capacity:
+            hi = 0
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if offsets[per * mid] + tail <= capacity:
+                lo = mid
+            else:
+                hi = mid - 1
+        c = lo
+    cut[0] = c
+    active = table[0]
+    if active > c:
+        wp.atomic_max(peak, peak_slot, active - c)
+        table[0] = c
+
+
 @wp.func
 def csr_row_of(offsets: wp.array[wp.int32], k: int) -> int:
     """The row of entry ``k`` of a CSR matrix with row ``offsets``: the last row that starts at or before it."""
