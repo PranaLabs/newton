@@ -53,7 +53,7 @@ class RigidContacts:
     """World contact normal from side 0 to side 1, shape [count]."""
     mu: wp.array[wp.float64]
     """Friction coefficient, the mean of both shapes', shape [count]."""
-    table: wp.array[wp.int32] | None = None
+    table: wp.array | None = None
     """With ``capacity``: the contact count in ``table[0]``, then each contact's slots and shapes in ``table[1 + 4 c
     : 5 + 4 c]``, -1 past the count, on the device."""
     capacity: int = 0
