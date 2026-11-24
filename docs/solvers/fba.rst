@@ -566,12 +566,16 @@ Contacts
   lite operator's self contacts. On CUDA the capped iterations of a system of
   at most 512 rows in 3x3 blocks, such as the rigid contacts of a few bodies
   with the joint rows of at most eight articulations, run in one launch, one
-  block of threads for the whole solve: it adds its sums in another order than
-  the iterations of larger systems, so that the same rows padded past 512
-  give results that differ by rounding.
+  block of threads for the whole solve, and so do those of a sparse system of
+  at most 512 rows that hold at most 64 entries on average, such as the
+  contacts of a few rods with ``nsn_sparse_storage=True``, and those of a dense
+  system of at most 128 active rows, such as the contacts of a step recorded
+  into a graph with the full operator: the launch adds its sums in another
+  order than the iterations of larger systems, so that the same rows padded
+  past those sizes give results that differ by rounding.
 - ``contact_regularization`` (default ``0.01``) is the relative
   regularization ``gamma`` of the contact rows in the Newton steps that
-  involve bodies FBA integrates, face contacts or self contacts: such a step
+  involve bodies FBA integrates, face contacts, self contacts or rod contacts: such a step
   solves with ``A_cc + gamma diag(A_cc)``. Contacts and joints that close a
   loop, such as a hinged plank leaning on a box that rests on the ground,
   make the Newton matrix nearly singular, and an unregularized step answers a

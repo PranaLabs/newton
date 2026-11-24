@@ -67,6 +67,7 @@ Performance notes:
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 import warp as wp
@@ -813,15 +814,20 @@ def _fused_pcr_direction_kernel(
 # of its block preconditioner: every block takes a dense solve at each iteration.
 _SMALL_ROWS = 512
 _SMALL_JOINT_BLOCKS = 8
+# The most rows that one block's dense iteration takes (:meth:`NSNPCRSolver._small_dense`): its product by the dense
+# matrix runs on one multiprocessor, which beyond some 128 rows falls behind the launches' product on all of them.
+_SMALL_DENSE_ROWS = 128
 _SMALL_KERNELS = {}
 
 
-def _small_pcr_kernel(tile: int):
-    """The whole fixed-count iteration of :meth:`NSNPCRSolver._fused_single` for a factored matrix of 3x3 blocks in one
-    block of threads, one row per thread, with the joint rows' block solves of ``tile``-row Cholesky factors as its
-    block preconditioner: one launch for the whole solve instead of a dozen per iteration."""
-    if tile in _SMALL_KERNELS:
-        return _SMALL_KERNELS[tile]
+def _small_pcr_kernel(tile: int, blocked: bool = True):
+    """The whole fixed-count iteration of :meth:`NSNPCRSolver._fused_single` for a factored matrix of 3x3 blocks, or of
+    scalar entries without ``blocked``, in one block of threads, one row per thread, with the joint rows' block solves
+    of ``tile``-row Cholesky factors as its block preconditioner: one launch for the whole solve instead of a dozen
+    per iteration."""
+    key = (tile, blocked)
+    if key in _SMALL_KERNELS:
+        return _SMALL_KERNELS[key]
 
     @wp.func
     def precondition(
@@ -854,34 +860,56 @@ def _small_pcr_kernel(tile: int):
         """The sums of every thread's three values at once, in every thread."""
         return wp.tile_extract(wp.tile_sum(wp.tile(v, preserve_type=True)), 0)
 
-    @wp.func
-    def product(
-        offsets: wp.array[wp.int32],
-        columns: wp.array[wp.int32],
-        values: wp.array[wp.mat33d],
-        sw: wp.float64,
-        row: int,
-        active: bool,
-    ) -> wp.float64:
-        """Row ``row`` of ``W sw``, ``sw`` one value per thread."""
-        sw_t = wp.tile(sw)
-        y = wp.float64(0.0)
-        if active:
-            block = row // 3
-            a = row - 3 * block
-            for k in range(offsets[block], offsets[block + 1]):
-                c = 3 * columns[k]
-                m = values[k]
-                y += m[a, 0] * wp.tile_extract(sw_t, c)
-                y += m[a, 1] * wp.tile_extract(sw_t, c + 1)
-                y += m[a, 2] * wp.tile_extract(sw_t, c + 2)
-        return y
+    if blocked:
 
+        @wp.func
+        def product(
+            offsets: wp.array[wp.int32],
+            columns: wp.array[wp.int32],
+            values: wp.array[wp.mat33d],
+            sw: wp.float64,
+            row: int,
+            active: bool,
+        ) -> wp.float64:
+            """Row ``row`` of ``W sw``, ``sw`` one value per thread."""
+            sw_t = wp.tile(sw)
+            y = wp.float64(0.0)
+            if active:
+                block = row // 3
+                a = row - 3 * block
+                for k in range(offsets[block], offsets[block + 1]):
+                    c = 3 * columns[k]
+                    m = values[k]
+                    y += m[a, 0] * wp.tile_extract(sw_t, c)
+                    y += m[a, 1] * wp.tile_extract(sw_t, c + 1)
+                    y += m[a, 2] * wp.tile_extract(sw_t, c + 2)
+            return y
+
+    else:
+
+        @wp.func
+        def product(
+            offsets: wp.array[wp.int32],
+            columns: wp.array[wp.int32],
+            values: wp.array[wp.float64],
+            sw: wp.float64,
+            row: int,
+            active: bool,
+        ) -> wp.float64:
+            """Row ``row`` of ``W sw`` for scalar entries, summed in column order as :func:`csr_mv_kernel` sums."""
+            sw_t = wp.tile(sw)
+            y = wp.float64(0.0)
+            if active:
+                for k in range(offsets[row], offsets[row + 1]):
+                    y += values[k] * wp.tile_extract(sw_t, columns[k])
+            return y
+
+    # The entries' type, 3x3 blocks or scalars, is that of ``product``: the kernel takes it from ``values``.
     @wp.kernel(module="unique", enable_backward=False)
     def kernel(
         offsets: wp.array[wp.int32],
         columns: wp.array[wp.int32],
-        values: wp.array[wp.mat33d],
+        values: wp.array[Any],
         scale: wp.array[wp.float64],
         shift: wp.array[wp.float64],
         diag: wp.array[wp.float64],
@@ -948,8 +976,113 @@ def _small_pcr_kernel(tile: int):
         if active:
             x_out[i] = x
 
-    _SMALL_KERNELS[tile] = kernel
+    _SMALL_KERNELS[key] = kernel
     return kernel
+
+
+@wp.func
+def _block_total(v: wp.float64) -> wp.float64:
+    """The sum of every thread's ``v`` in a block of threads, in every thread."""
+    return wp.tile_extract(wp.tile_sum(wp.tile(v)), 0)
+
+
+@wp.func
+def _block_totals(v: wp.vec3d) -> wp.vec3d:
+    """The sums of every thread's three values at once in a block of threads, in every thread."""
+    return wp.tile_extract(wp.tile_sum(wp.tile(v, preserve_type=True)), 0)
+
+
+@wp.func
+def _dense_row_product(A: wp.array2d[wp.float64], v: wp.float64, row: int, m: int) -> wp.float64:
+    """Row ``row`` of ``A v`` over the leading ``m`` rows and columns, ``v`` one value per thread, summed in column
+    order; 0 past them."""
+    v_t = wp.tile(v)
+    y = wp.float64(0.0)
+    if row < m:
+        for j in range(m):
+            y += A[row, j] * wp.tile_extract(v_t, j)
+    return y
+
+
+@wp.kernel(enable_backward=False)
+def _small_dense_pcr_kernel(
+    A: wp.array2d[wp.float64],
+    b: wp.array[wp.float64],
+    n: int,
+    active: wp.array[wp.int32],
+    rows_per: int,
+    max_iter: int,
+    eta: wp.float64,
+    block: int,
+    # outputs
+    x_out: wp.array[wp.float64],
+):
+    """The whole fixed-count iteration of :meth:`NSNPCRSolver._fused_dense` in one block of ``block`` threads, one
+    row per thread, on the leading ``rows_per * active[0]`` rows (all ``n`` for an empty ``active``), at most
+    ``block``, whose solution the other rows, inert rows of the identity and a zero right-hand side, leave unchanged:
+    they keep ``x = 0``."""
+    _, i = wp.tid()
+    m = n
+    if active.shape[0] > 0:
+        m = wp.min(rows_per * active[0], n)
+    zero = wp.float64(0.0)
+    dg = zero
+    bi = zero
+    if i < m:
+        dg = A[i, i]
+        bi = b[i]
+    pre = zero
+    if dg != zero:
+        pre = wp.float64(1.0) / dg
+    x = zero
+    r = bi
+    s = pre * r
+    d = s
+    q = _dense_row_product(A, d, i, m)
+    rho = _block_total(s * q)
+    stopped = bool(False)
+    for _ in range(max_iter):
+        h = pre * q
+        sums = _block_totals(wp.vec3d(q * h, d * q, d * dg * d))
+        den = sums[0]
+        curvature = sums[1]
+        chart = sums[2]
+        if not stopped:
+            if not (den > zero and curvature > eta * chart):
+                stopped = True
+        alpha = zero
+        if not stopped:
+            alpha = rho / den
+        x = x + alpha * d
+        r = r - alpha * q
+        s = s - alpha * h
+        h = _dense_row_product(A, s, i, m)
+        rho_new = _block_total(s * h)
+        beta = zero
+        if rho != zero:
+            beta = rho_new / rho
+        d = beta * d + s
+        q = beta * q + h
+        rho = rho_new
+    if i < n:
+        x_out[i] = x
+    k = i + block
+    while k < n:
+        x_out[k] = zero
+        k += block
+
+
+@wp.kernel
+def _small_dense_switch_kernel(
+    active: wp.array[wp.int32],
+    rows_per: int,
+    n: int,
+    most: int,
+    # outputs
+    flag: wp.array[wp.int32],
+):
+    """1 when the leading ``rows_per * active[0]`` rows of a system of ``n`` are at most ``most``, else 0."""
+    flag[0] = wp.where(wp.min(rows_per * active[0], n) <= most, 1, 0)
 
 
 @wp.kernel
@@ -1288,6 +1421,14 @@ class NSNPCRSolver:
             wp.zeros(self.max_n, dtype=wp.int32, device=device),
         )
         self._small_no_factor = wp.zeros((1, 8, 8), dtype=wp.float64, device=device)
+        # Whether a dense system's active rows take the single block (_fused_dense), read by a conditional node.
+        self._small_dense_flag = wp.zeros(1, dtype=wp.int32, device=device)
+        # The factors of an unscaled matrix, ``scale = 1`` and ``shift = 0``.
+        rows = min(self.max_n, _SMALL_ROWS)
+        self._small_unit = (
+            wp.ones(rows, dtype=wp.float64, device=device),
+            wp.zeros(rows, dtype=wp.float64, device=device),
+        )
         # The fused iteration of independent worlds: each world's double-buffered ``rho``, ``b . b`` and stop flag.
         self._world_fused_rho = wp.zeros((2, capacity), dtype=wp.float64, device=device)
         self._world_fused_b2 = wp.zeros(capacity, dtype=wp.float64, device=device)
@@ -1399,6 +1540,7 @@ class NSNPCRSolver:
         x_out: wp.array[wp.float64],
         block_precond: Callable[[wp.array, wp.array], None] | None = None,
         fixed_sums: bool = False,
+        active_rows: tuple[wp.array, int] | None = None,
     ) -> tuple[int, float | None]:
         """Solve ``A @ x = b`` with Jacobi-preconditioned conjugate residual.
 
@@ -1418,6 +1560,10 @@ class NSNPCRSolver:
             fixed_sums: For a solve of at most ``check_every`` iterations, take the dot products as per-block tile sums
                 added in block order, which allocate nothing, as a CUDA graph's conditional node needs, in place of
                 ``wp.utils.array_inner``: the sums differ by rounding.
+            active_rows: With ``fixed_sums``, ``(count, per)``: the leading ``per * count[0]`` rows, a count on the
+                device, hold the system, and the others are rows of the identity with a zero right-hand side, as the
+                inert rows of a CUDA graph's contact buffer. When they are at most 128, the iterations take them
+                alone in one block of threads (:meth:`_small_dense`), chosen by a conditional node on the count.
 
         Returns:
             A ``(iterations_taken, final_rho)`` tuple where ``iterations_taken``
@@ -1455,7 +1601,7 @@ class NSNPCRSolver:
         unchecked = max_iter <= self.check_every
         self._fixed_sums = fixed_sums and unchecked
         if self._fixed_sums and self.fuses_single(n):
-            return self._fused_dense(A, b, x_out, block_precond), None
+            return self._fused_dense(A, b, x_out, block_precond, active_rows), None
         tile_k = int(_PCR_TILE_K)
         n_pad = ((n + tile_k - 1) // tile_k) * tile_k
 
@@ -1845,14 +1991,42 @@ class NSNPCRSolver:
         return max_iter
 
     def _fused_dense(
-        self, A: wp.array2d[wp.float64], b: wp.array[wp.float64], x_out: wp.array[wp.float64], block_precond
+        self,
+        A: wp.array2d[wp.float64],
+        b: wp.array[wp.float64],
+        x_out: wp.array[wp.float64],
+        block_precond,
+        active_rows: tuple[wp.array, int] | None = None,
     ):
         """:meth:`solve` of a fixed iteration count with ``fixed_sums``, as :meth:`_fused_single` runs a sparse
         matrix: five launches per iteration, six with a block preconditioner besides its own, that read nothing from
         the device, in place of some twenty. The dot products reduce in blocks of rows that every block sums alike,
         so that the run is deterministic; the product by ``A`` takes one block of threads per row
         (:func:`_matvec_tiled_kernel`). Sums run in another order than the iteration of :meth:`_pcr_iter_eager`, so
-        results differ by rounding. Returns the iterations taken."""
+        results differ by rounding. Without a block preconditioner, a system of at most :data:`_SMALL_DENSE_ROWS` rows
+        takes :meth:`_small_dense` instead, and so does a larger one whose ``active_rows`` are as few, by a conditional
+        node on their count. Returns the iterations taken."""
+        n = int(b.shape[0])
+        max_iter = min(self.max_iter, n)
+        if self.small_single and block_precond is None:
+            if n <= _SMALL_DENSE_ROWS:
+                return self._small_dense(A, b, x_out, max_iter, active_rows)
+            if active_rows is not None:
+                count, per = active_rows
+                inputs = [count, int(per), n, _SMALL_DENSE_ROWS]
+                wp.launch(_small_dense_switch_kernel, 1, inputs, [self._small_dense_flag], device=self.device)
+                wp.capture_if(
+                    self._small_dense_flag,
+                    on_true=lambda: self._small_dense(A, b, x_out, max_iter, active_rows),
+                    on_false=lambda: self._fused_dense_launches(A, b, x_out, None),
+                )
+                return max_iter
+        return self._fused_dense_launches(A, b, x_out, block_precond)
+
+    def _fused_dense_launches(
+        self, A: wp.array2d[wp.float64], b: wp.array[wp.float64], x_out: wp.array[wp.float64], block_precond
+    ) -> int:
+        """The launches of :meth:`_fused_dense`, five per iteration. Returns the iterations taken."""
         n = int(b.shape[0])
         nb = (n + _FUSED_BLOCK - 1) // _FUSED_BLOCK
         max_iter = min(self.max_iter, n)
@@ -1909,11 +2083,40 @@ class NSNPCRSolver:
         wp.copy(x_out, x, count=n)
         return max_iter
 
+    def _small_dense(
+        self,
+        A: wp.array2d[wp.float64],
+        b: wp.array[wp.float64],
+        x_out: wp.array[wp.float64],
+        max_iter: int,
+        active_rows: tuple[wp.array, int] | None,
+    ) -> int:
+        """:meth:`_fused_dense` in one launch: one block of :data:`_SMALL_DENSE_ROWS` threads, one row per thread,
+        takes every iteration (:func:`_small_dense_pcr_kernel`), on the leading rows that ``active_rows`` counts
+        alone, at most as many as the threads. Its sums reduce in one tile, in another order than the iteration's
+        blocks, so that results differ by rounding."""
+        n, device = int(b.shape[0]), self.device
+        if active_rows is None:
+            active, per = wp.empty(0, dtype=wp.int32, device=device), 1
+        else:
+            active, per = active_rows
+        inputs = [A, b, n, active, int(per), max_iter, self._eta, _SMALL_DENSE_ROWS]
+        wp.launch_tiled(
+            _small_dense_pcr_kernel, dim=[1], inputs=inputs, outputs=[x_out], block_dim=_SMALL_DENSE_ROWS, device=device
+        )
+        return max_iter
+
     def _takes_small(self, W_bsr, n: int, block_precond, factors) -> bool:
-        """Whether :meth:`_fused_single` runs its iteration in one block of threads (:meth:`_small_single`): a factored
-        matrix of 3x3 blocks of at most :data:`_SMALL_ROWS` rows, without a block preconditioner or with joint rows'
-        block solves (:class:`~newton._src.solvers.fba.joints.JointRowsPrecond`) of a few articulations."""
-        if not self.small_single or factors is None or not getattr(W_bsr, "block3", False) or n > _SMALL_ROWS:
+        """Whether :meth:`_fused_single` runs its iteration in one block of threads (:meth:`_small_single`): a system
+        of at most :data:`_SMALL_ROWS` rows, of a factored matrix of 3x3 blocks or of a scalar matrix, factored or not,
+        whose rows hold at most :data:`_LONG_ROW` entries on average, without a block preconditioner or with joint rows'
+        block solves (:class:`~newton._src.solvers.fba.joints.JointRowsPrecond`) of a few articulations. Longer rows
+        take the iteration of several launches, whose tiled product reads a row with a block of threads, where the
+        single block reads it with one thread."""
+        blocked = getattr(W_bsr, "block3", False)
+        if not self.small_single or (blocked and factors is None) or n > _SMALL_ROWS:
+            return False
+        if not blocked and int(W_bsr.nnz) > _LONG_ROW * n:
             return False
         if block_precond is None:
             return True
@@ -1923,8 +2126,13 @@ class NSNPCRSolver:
     def _small_single(self, W_bsr, b, x_out, block_precond, factors, max_iter: int) -> int:
         """:meth:`_fused_single` in one launch: one block of threads, one row per thread, takes every iteration
         (:func:`_small_pcr_kernel`). Its sums reduce in one tile, in another order than the iteration's blocks, so
-        that results differ by rounding."""
+        that results differ by rounding. An unscaled matrix takes the factors 1 and 0, which leave its products
+        unchanged."""
         n, device = int(b.shape[0]), self.device
+        blocked = getattr(W_bsr, "block3", False)
+        if factors is None:
+            wp.launch(csr_diag_kernel, n, [W_bsr.offsets, W_bsr.columns, W_bsr.values], [self._diag], device=device)
+            factors = (self._small_unit[0][:n], self._small_unit[1][:n], self._diag[:n])
         scale, shift, diag = factors
         place_block, place_local = self._small_places
         place_block.fill_(-1)
@@ -1940,9 +2148,8 @@ class NSNPCRSolver:
         block_dim = 256 if n <= 256 else _SMALL_ROWS
         inputs = [W_bsr.offsets, W_bsr.columns, W_bsr.values, scale, shift, diag, b, n, max_iter, self._eta, L]
         inputs += [blocks, place_block, place_local]
-        wp.launch_tiled(
-            _small_pcr_kernel(tile), dim=[1], inputs=inputs, outputs=[x_out], block_dim=block_dim, device=device
-        )
+        kernel = _small_pcr_kernel(tile, blocked)
+        wp.launch_tiled(kernel, dim=[1], inputs=inputs, outputs=[x_out], block_dim=block_dim, device=device)
         return max_iter
 
     def _solve_worlds_fused(self, W_bsr, b: wp.array[wp.float64], x_out: wp.array[wp.float64]) -> int:

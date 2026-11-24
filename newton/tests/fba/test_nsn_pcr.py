@@ -457,6 +457,53 @@ class TestPCRFusedSparse(_PCRTestCase):
             out.append(x.numpy())
         np.testing.assert_allclose(out[1], out[0], rtol=1.0e-10, atol=1.0e-12 * np.abs(out[0]).max())
 
+    def test_single_block_iterations_match_the_launches(self):
+        """Take the ten iterations of a small scalar system of short rows, factored and formed, in one block of threads
+        (``NSNPCRSolver._small_single``) as the iteration of several launches takes them, to rounding, and keep
+        ``x = 0`` for a zero right-hand side; a system of long rows takes the launches."""
+        import warp.sparse as wps  # noqa: PLC0415
+
+        rng = np.random.default_rng(14)
+        for n, density in ((300, 0.02), (240, 0.6)):
+            S = np.where(rng.random((n, n)) < density, rng.standard_normal((n, n)), 0.0)
+            S = S + S.T
+            np.fill_diagonal(S, 0.0)
+            W = S + np.diag(np.abs(S).sum(axis=1) + rng.uniform(0.5, 2.0, n))
+            c = rng.uniform(0.2, 1.5, n)
+            c[::7] = 0.0
+            e = rng.uniform(0.0, 2.0, n) + (c == 0.0)
+            A = c[:, None] * W * c[None, :] + np.diag(e)
+            rows, cols = np.nonzero(W)
+            index = [wp.array(a, dtype=wp.int32, device=self.device) for a in (rows, cols)]
+            matrices = [
+                wps.bsr_from_triplets(n, n, *index, wp.array(M[rows, cols], dtype=wp.float64, device=self.device))
+                for M in (W, A)
+            ]
+            for factored, rhs in ((True, rng.standard_normal(n)), (False, rng.standard_normal(n)), (True, np.zeros(n))):
+                with self.subTest(n=n, factored=factored, zero=not rhs.any()):
+                    out = []
+                    for single in (False, True):
+                        solver = NSNPCRSolver(max_n=n, device=self.device, tol=1.0e-10, max_iter=10)
+                        solver.small_single = single
+                        x = wp.zeros(n, dtype=wp.float64, device=self.device)
+                        b = wp.array(rhs, dtype=wp.float64, device=self.device)
+                        spy = unittest.mock.patch.object(
+                            NSNPCRSolver, "_small_single", autospec=True, side_effect=NSNPCRSolver._small_single
+                        )
+                        with spy as small:
+                            if factored:
+                                factors = [
+                                    wp.array(a, dtype=wp.float64, device=self.device) for a in (c, e, np.diag(A))
+                                ]
+                                solver.solve_sparse_scaled(matrices[0], *factors, b, x)
+                            else:
+                                solver.solve_sparse_fused(matrices[1], b, x)
+                        self.assertEqual(small.call_count, int(single and density < 0.2))
+                        out.append(x.numpy())
+                    if not rhs.any():
+                        np.testing.assert_array_equal(out[1], 0.0)
+                    np.testing.assert_allclose(out[1], out[0], rtol=1.0e-10, atol=1.0e-12 * np.abs(out[0]).max())
+
     def test_checked_runs_take_solve_sparse(self):
         """Run ``solve_sparse`` itself when the iteration cap exceeds its convergence check interval."""
         A = self._sparse_spd(300, seed=6)
@@ -536,6 +583,46 @@ class TestPCRFusedDense(_PCRTestCase):
         replayed.zero_()
         wp.capture_launch(capture.graph)
         np.testing.assert_array_equal(replayed.numpy(), eager.numpy())
+
+    def test_single_block_iterations_on_the_active_rows(self):
+        """Take the ten iterations of a small dense system in one block of threads (``NSNPCRSolver._small_dense``) as
+        the launches take them, to rounding: of 120 rows, and of a bucket of 192 rows whose leading 39 rows, the
+        three rows of 13 active contacts counted on the device, hold the system and whose other rows are inert rows
+        of the identity, which keep ``x = 0``; with 150 active rows the bucket takes the launches. A graph replays
+        them on the count it reads at its launch."""
+        rng = np.random.default_rng(15)
+        for n, m in ((120, 120), (192, 39), (192, 150)):
+            A = np.eye(n)
+            A[:m, :m] = _make_spd(m, seed=16)
+            b = np.zeros(n)
+            b[:m] = rng.standard_normal(m)
+            matrix = wp.array2d(A, dtype=wp.float64, device=self.device)
+            rhs = wp.array(b, dtype=wp.float64, device=self.device)
+            active = wp.array([m // 3], dtype=wp.int32, device=self.device)
+            out = []
+            for single, rows in ((False, None), (True, None), (True, (active, 3))):
+                with self.subTest(n=n, single=single, active=rows is not None):
+                    solver = NSNPCRSolver(max_n=n, device=self.device, tol=1.0e-10, max_iter=10)
+                    solver.small_single = single
+                    x = wp.full(n, 1.0, dtype=wp.float64, device=self.device)
+                    with unittest.mock.patch.object(solver, "_small_dense", wraps=solver._small_dense) as small:
+                        solver.solve(matrix, rhs, x, fixed_sums=True, active_rows=rows)
+                    self.assertEqual(small.call_count, int(single and (n <= 128 or (rows is not None and m <= 128))))
+                    out.append(x.numpy())
+                    np.testing.assert_array_equal(out[-1][m:], 0.0)
+                    np.testing.assert_allclose(out[-1], out[0], rtol=1.0e-12, atol=1.0e-14 * np.abs(out[0]).max())
+        # The graph reads the count at each launch: 10 active contacts take the leading 30 rows.
+        solver = NSNPCRSolver(max_n=192, device=self.device, tol=1.0e-10, max_iter=10)
+        replayed = wp.zeros(192, dtype=wp.float64, device=self.device)
+        with wp.ScopedCapture(device=self.device) as capture:
+            solver.solve(matrix, rhs, replayed, fixed_sums=True, active_rows=(active, 3))
+        active.fill_(10)
+        wp.capture_launch(capture.graph)
+        eager = wp.zeros(192, dtype=wp.float64, device=self.device)
+        solver.solve(matrix, rhs, eager, fixed_sums=True, active_rows=(active, 3))
+        np.testing.assert_array_equal(replayed.numpy(), eager.numpy())
+        np.testing.assert_array_equal(eager.numpy()[30:], 0.0)
+        self.assertTrue(np.abs(eager.numpy()[:30]).max() > 0.0)
 
 
 class TestPCRReuse(_PCRTestCase):
