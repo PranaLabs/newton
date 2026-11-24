@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -2184,6 +2185,138 @@ class FBALinearSolver:
         self._isodof_row_offsets_d, self._isodof_row_indices_d = self._cap_offsets, self._cap_row_indices
         self._isodof_unique_d, self._n_isodofs = self._cap_unique, self.n
         self._isodof_max_rows = int(_MAX_ROWS_PER_PARTICLE)
+
+    def reserve_schur_capacity(self, num_contacts: int, sizes: list[int]) -> None:
+        """Allocate the buffers of the full operator's capacity path for a contact buffer of ``num_contacts`` slots, of
+        which a step takes at most the first ``sizes[-1]``, so that a graph capture of it allocates nothing: the three
+        rows of each slot and their particle CSR, the contacted particles' ranks and columns of ``S``
+        (:meth:`prepare_schur_capacity`), and for each size of ``sizes`` its ``Wi`` and dense ``W``
+        (:meth:`build_schur_capacity`)."""
+        from .kernels import _WI_TILE_K, _WI_TILE_M  # noqa: PLC0415
+
+        C, N, dev = int(num_contacts), self.n, self.device
+        tile_m, tile_k = int(_WI_TILE_M), int(_WI_TILE_K)
+
+        def columns(c):
+            return max(((min(c, N) + tile_m - 1) // tile_m) * tile_m, tile_m)
+
+        key = (C, tuple(sizes))
+        if getattr(self, "_fc_key", None) == key:
+            return
+        self._fc_key, rows = key, 3 * C
+        n_pad = ((N + tile_k - 1) // tile_k) * tile_k
+        self._fc = SimpleNamespace(
+            row_particle=wp.zeros(rows, dtype=wp.int32, device=dev),
+            row_alpha=wp.zeros(rows, dtype=wp.float32, device=dev),
+            row_dir=wp.zeros(rows, dtype=wp.vec3, device=dev),
+            row_indices=wp.array(np.arange(rows, dtype=np.int32), dtype=wp.int32, device=dev),
+            counts=wp.zeros(N + 1, dtype=wp.int32, device=dev),
+            offsets=wp.zeros(N + 1, dtype=wp.int32, device=dev),
+            flags=wp.zeros(N, dtype=wp.int32, device=dev),
+            rank=wp.zeros(N, dtype=wp.int32, device=dev),
+            count=wp.zeros(1, dtype=wp.int32, device=dev),
+            isodof_perm=wp.zeros(columns(sizes[-1]), dtype=wp.int32, device=dev),
+            S_iso=wp.zeros((n_pad, columns(sizes[-1])), dtype=wp.float64, device=dev),
+            unique=wp.array(np.arange(N, dtype=np.int32), dtype=wp.int32, device=dev),
+            no_dirs=wp.empty(0, dtype=wp.vec3, device=dev),
+            Wi={size: wp.zeros((columns(size), columns(size)), dtype=wp.float64, device=dev) for size in sizes},
+            W={size: wp.zeros((3 * size, 3 * size), dtype=wp.float64, device=dev) for size in sizes},
+        )
+        total = getattr(self, "_row_total", 0)
+        self._row_total = max(total, 3 * sizes[-1])
+        self.reserve_lambda_correction()
+        self._row_total = total
+
+    def prepare_schur_capacity(
+        self,
+        num_contacts: int,
+        limit: int,
+        j_indices: wp.array,
+        j_normals: wp.array,
+        j_alpha: wp.array,
+        j_tangent1: wp.array,
+        j_tangent2: wp.array,
+        j_record: wp.array,
+    ) -> None:
+        """The parts of the full operator's capacity path that hold for every size, for a contact buffer of
+        ``num_contacts`` slots whose active contacts (record >= 0) lie first, sorted by particle, of which the step
+        takes the first ``limit``: the three rows of each slot, their particle CSR, the contacted particles flagged and
+        ranked by a scan, ascending as :func:`numpy.unique` ranks them, and the columns of ``S`` they select. Scans
+        allocate, so this runs outside a graph's conditional nodes; :meth:`reserve_schur_capacity` sizes the
+        buffers."""
+        from .kernels import (  # noqa: PLC0415
+            capacity_isodofs_kernel,
+            capacity_particle_flags_kernel,
+            lite_capacity_rows_kernel,
+            lite_row_dirs_kernel,
+        )
+
+        C, dev, fc = int(num_contacts), self.device, self._fc
+        rows = 3 * C
+        wp.launch(lite_capacity_rows_kernel, rows, [j_indices, j_alpha], [fc.row_particle, fc.row_alpha], device=dev)
+        inputs = [j_normals, j_tangent1, j_tangent2, fc.no_dirs, 3, rows]
+        wp.launch(lite_row_dirs_kernel, rows, inputs, [fc.row_dir], device=dev)
+        fc.flags.zero_()
+        fc.counts.zero_()
+        inputs = [j_record, j_indices, int(limit)]
+        wp.launch(capacity_particle_flags_kernel, C, inputs, [fc.flags, fc.counts], device=dev)
+        wp.utils.array_scan(fc.counts, fc.offsets, inclusive=False)
+        wp.utils.array_scan(fc.flags, fc.rank, inclusive=False)
+        wp.launch(
+            capacity_isodofs_kernel, self.n, [fc.flags, fc.rank, self._perm], [fc.count, fc.isodof_perm], device=dev
+        )
+
+    def use_schur_capacity(self, size: int) -> None:
+        """Make the first ``size`` slots' rows of the capacity path, and their ``W`` as :meth:`build_schur_capacity`
+        last built it, those that the NSN step and :meth:`apply_lambda_correction_combined` read."""
+        from .kernels import _MAX_ROWS_PER_PARTICLE  # noqa: PLC0415
+
+        fc, rows = self._fc, 3 * int(size)
+        self._row_particle_d, self._row_alpha_d, self._row_dir_d = (
+            fc.row_particle[:rows],
+            fc.row_alpha[:rows],
+            fc.row_dir[:rows],
+        )
+        self._row_total, self._row_slots = rows, None
+        self._isodof_row_offsets_d, self._isodof_row_indices_d = fc.offsets, fc.row_indices[:rows]
+        self._isodof_unique_d, self._n_isodofs = fc.unique, self.n
+        self._isodof_max_rows = int(_MAX_ROWS_PER_PARTICLE)
+        self._isodof_rank_d, self._Wi_v = fc.rank, fc.Wi[size]
+        self._W_device_d, self._W_device_active_rows = fc.W[size], rows
+
+    def build_schur_capacity(self, size: int, j_record: wp.array) -> None:
+        """The dense frictional ``W = J A⁻¹ Jᵀ`` of :meth:`build_schur_complement` on the device alone, for the rows of
+        the first ``size`` slots that :meth:`prepare_schur_capacity` laid out: the contacted particles' columns of
+        ``S`` densified and ``Wi`` multiplied over the tiles of their count alone, each entry to the sums of the host
+        path, and ``W`` composed, the rows of an inert slot those of the identity. It allocates nothing, so that it
+        runs in a graph's conditional node; :meth:`use_schur_capacity` then points the solve at it."""
+        from .kernels import (  # noqa: PLC0415
+            _WI_TILE_M,
+            _WI_TILE_N,
+            _WI_TILE_THREADS,
+            compose_W_capacity_kernel,
+            compute_wi_capacity_kernel,
+            densify_S_iso_capacity_kernel,
+        )
+
+        dev, fc, rows = self.device, self._fc, 3 * int(size)
+        Wi = fc.Wi[size]
+        k_cap = Wi.shape[0]
+        S_iso = fc.S_iso[:, :k_cap]
+        S_iso.zero_()
+        inputs = [self._ST_bsr.offsets, self._ST_bsr.columns, self._ST_bsr.values, self._Dinv, fc.isodof_perm]
+        wp.launch(densify_S_iso_capacity_kernel, k_cap, [*inputs, fc.count], [S_iso], device=dev)
+        wp.launch_tiled(
+            compute_wi_capacity_kernel,
+            dim=(k_cap // int(_WI_TILE_M), k_cap // int(_WI_TILE_N)),
+            inputs=[S_iso, fc.count, S_iso.shape[0]],
+            outputs=[Wi],
+            block_dim=_WI_TILE_THREADS,
+            device=dev,
+        )
+        inputs = [fc.row_particle, fc.row_dir, fc.row_alpha, j_record, fc.rank, Wi]
+        wp.launch(compose_W_capacity_kernel, (rows, rows), inputs, [fc.W[size]], device=dev)
+        self.use_schur_capacity(size)
 
     def build_schur_lite_triplets(self, total_rows: int, cols_d: wp.array, vals_d: wp.array) -> wps.BsrMatrix:
         """``W = H (dt^2 M^-1) H^T`` from the triplets of ``H``, rows of 1 x 3 blocks over the particles in four

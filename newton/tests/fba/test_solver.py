@@ -6,6 +6,7 @@ import math
 import sys
 import unittest
 import warnings
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -2339,8 +2340,9 @@ class TestGraphCapture(unittest.TestCase):
                     np.testing.assert_array_equal(eager, replayed)
 
     @staticmethod
-    def _cloth_on_box(device=None, **pipeline_args):
-        """A lite cloth of 20 x 20 cells, its first particle held, over a box and the ground, and its contacts."""
+    def _cloth_on_box(device=None, mode="lite", **pipeline_args):
+        """A cloth of 20 x 20 cells, its first particle held, over a box and the ground, and its contacts, with the
+        lite operator or, with ``mode="full"``, the full one."""
         builder = newton.ModelBuilder()
         builder.add_shape_box(-1, xform=wp.transform((0.0, 0.0, 0.1), wp.quat_identity()), hx=0.15, hy=0.15, hz=0.1)
         builder.add_ground_plane()
@@ -2350,7 +2352,7 @@ class TestGraphCapture(unittest.TestCase):
         )  # fmt: skip
         builder.particle_mass[0] = 0.0
         model = builder.finalize(device=device)
-        solver = SolverFBA(model, iterations=5, nsn_schur_mode="lite", nsn_linear_iterations=10)
+        solver = SolverFBA(model, iterations=5, nsn_schur_mode=mode, nsn_linear_iterations=10)
         pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.01, **pipeline_args)
         return model, solver, pipeline, pipeline.contacts()
 
@@ -2423,6 +2425,65 @@ class TestGraphCapture(unittest.TestCase):
         self.assertEqual(inside, [])
         self.assertTrue(gc.isenabled())
         self.assertTrue(np.isfinite(s0.particle_q.numpy()).all())
+
+    def test_full_contacts_replay_from_a_graph(self):
+        """Record the collision and two steps of a cloth with the full operator falling onto a box into a graph, after
+        a step outside it, and reach the same states, bit for bit, as the same steps taken eagerly through the
+        capacity path, and to rounding as those through the stored contacts alone."""
+        dt = 1.0 / 120.0
+        results = []
+        for run in ("count", "capacity", "graph"):
+            model, solver, pipeline, contacts = self._cloth_on_box(mode="full", soft_contact_max=400)
+            s0, s1 = model.state(), model.state()
+            pipeline.collide(s0, contacts)
+            solver.step(s0, s1, None, contacts, dt)
+            s0, s1 = s1, s0
+            if run == "capacity":
+                # The path of the steps recorded into a graph, taken without one.
+                solver._recording = lambda: True
+
+            def two_steps(s0=s0, s1=s1, solver=solver, pipeline=pipeline, contacts=contacts):
+                pipeline.collide(s0, contacts)
+                solver.step(s0, s1, None, contacts, dt)
+                pipeline.collide(s1, contacts)
+                solver.step(s1, s0, None, contacts, dt)
+
+            if run == "graph":
+                with wp.ScopedCapture() as capture:
+                    two_steps()
+                for _ in range(40):
+                    wp.capture_launch(capture.graph)
+            else:
+                for _ in range(40):
+                    two_steps()
+            results.append(s0.particle_q.numpy())
+        self.assertGreater(float(results[0][:, 2].max()), 0.0)
+        np.testing.assert_array_equal(results[1], results[2])
+        np.testing.assert_allclose(results[0], results[2], rtol=0.0, atol=1.0e-6)
+
+    def test_full_contacts_past_the_largest_size_are_reported(self):
+        """Report the active contacts that steps with the full operator recorded into a graph drop past their largest
+        size, here 128 of the cloth's contacts on the box."""
+        from newton._src.solvers.fba import solver_fba  # noqa: PLC0415
+
+        dt = 1.0 / 120.0
+        with mock.patch.object(solver_fba, "_CAPACITY_LARGEST", 128):
+            model, solver, pipeline, contacts = self._cloth_on_box(mode="full", soft_contact_max=400)
+            s0, s1 = model.state(), model.state()
+            for _ in range(20):
+                pipeline.collide(s0, contacts)
+                solver.step(s0, s1, None, contacts, dt)
+                s0, s1 = s1, s0
+            self.assertEqual(solver._capacity_sizes, [64, 128])
+            with wp.ScopedCapture() as capture:
+                pipeline.collide(s0, contacts)
+                solver.step(s0, s1, None, contacts, dt)
+            wp.capture_launch(capture.graph)
+        active = int(solver._capacity_active_d.numpy()[0])
+        self.assertGreater(active, 128)
+        with self.assertWarnsRegex(newton.exceptions.NewtonWarning, "beyond the 128"):
+            self.assertEqual(solver.dropped_contacts(), active - 128)
+        self.assertTrue(np.isfinite(s1.particle_q.numpy()).all())
 
     def test_particle_constraint_rows_replay_from_a_graph(self):
         """Hold two corners of a falling cloth at points by particle constraint rows whose targets move each step,
@@ -2528,6 +2589,28 @@ class TestGraphCapture(unittest.TestCase):
 
 class TestCapacityContacts(unittest.TestCase):
     """The capacity path of the contacts, which steps recorded into a graph take, on every device."""
+
+    def test_full_capacity_path_matches_the_count_path(self):
+        """Step a cloth with the full operator falling onto a box and the ground, a held particle among its contacts,
+        through the capacity path, every slot of a buffer of 400 contacts three rows of a dense W built on the device,
+        and through the stored contacts alone, alike to rounding."""
+        dt, results = 1.0 / 120.0, []
+        for capacity in (False, True):
+            model, solver, pipeline, contacts = TestGraphCapture._cloth_on_box(mode="full", soft_contact_max=400)
+            s0, s1 = model.state(), model.state()
+            for k in range(80):
+                if capacity and k == 1:
+                    # The steps recorded into a graph take the capacity path; this takes it without a graph.
+                    solver._recording = lambda: True
+                pipeline.collide(s0, contacts)
+                solver.step(s0, s1, None, contacts, dt)
+                s0, s1 = s1, s0
+            if capacity:
+                self.assertEqual(solver._contact_count, contacts.soft_contact_particle.shape[0])
+                self.assertLess(int(contacts.soft_contact_count.numpy()[0]), solver._contact_count)
+            results.append(s0.particle_q.numpy())
+        self.assertGreater(float(results[0][:, 2].max()), 0.0)
+        np.testing.assert_allclose(results[0], results[1], rtol=0.0, atol=1.0e-6)
 
     def test_capacity_path_matches_the_count_path(self):
         """Step a lite cloth falling onto a box and the ground, a held particle among its contacts, through the

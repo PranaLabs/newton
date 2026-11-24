@@ -255,6 +255,44 @@ def _precond_from_bsr_diag_kernel(
         precond[i] = wp.float64(1.0) / d
 
 
+_DOT_BLOCK = wp.constant(256)
+"""Rows per block of the dot products of :meth:`NSNPCRSolver.solve` with ``fixed_sums``."""
+
+
+@wp.kernel
+def _dot_partials_kernel(
+    a: wp.array[wp.float64],
+    b: wp.array[wp.float64],
+    n: int,
+    # outputs
+    partials: wp.array[wp.float64],
+):
+    """The sum of ``a[i] b[i]`` over each block of :data:`_DOT_BLOCK` rows of the first ``n``, one block of threads
+    each, by a tile reduction."""
+    block, lane = wp.tid()
+    i = block * _DOT_BLOCK + lane
+    v = wp.float64(0.0)
+    if i < n:
+        v = a[i] * b[i]
+    total = wp.tile_sum(wp.tile(v))[0]
+    if lane == 0:
+        partials[block] = total
+
+
+@wp.kernel
+def _dot_finish_kernel(
+    partials: wp.array[wp.float64],
+    blocks: int,
+    # outputs
+    out: wp.array[wp.float64],
+):
+    """The sum of the blocks' partial sums, in block order."""
+    total = wp.float64(0.0)
+    for k in range(blocks):
+        total += partials[k]
+    out[0] = total
+
+
 @wp.kernel
 def _matvec_tiled_kernel(
     A: wp.array2d[wp.float64],
@@ -1072,6 +1110,10 @@ class NSNPCRSolver:
         # we don't retry on every call.
         self._pcr_graph_cache: dict[int, wp.Graph | None] = {}
         self._block_precond = None
+        # The dot products of solves with ``fixed_sums``: per-block partial sums, so that they allocate nothing.
+        self._fixed_sums = False
+        self._dot_partials = wp.zeros((self.max_n + int(_DOT_BLOCK) - 1) // int(_DOT_BLOCK), dtype=wp.float64,
+                                      device=device)  # fmt: skip
         self.world_rows = None
         self._world_scalars = None
 
@@ -1165,6 +1207,7 @@ class NSNPCRSolver:
         b: wp.array[wp.float64],
         x_out: wp.array[wp.float64],
         block_precond: Callable[[wp.array, wp.array], None] | None = None,
+        fixed_sums: bool = False,
     ) -> tuple[int, float | None]:
         """Solve ``A @ x = b`` with Jacobi-preconditioned conjugate residual.
 
@@ -1180,6 +1223,9 @@ class NSNPCRSolver:
                 the bilateral rows. A partial of a bound method records into
                 the iteration's CUDA graph with the other launches; another
                 callable runs the iterations eagerly.
+            fixed_sums: For a solve of at most ``check_every`` iterations, take the dot products as per-block tile sums
+                added in block order, which allocate nothing, as a CUDA graph's conditional node needs, in place of
+                ``wp.utils.array_inner``: the sums differ by rounding.
 
         Returns:
             A ``(iterations_taken, final_rho)`` tuple where ``iterations_taken``
@@ -1215,6 +1261,7 @@ class NSNPCRSolver:
         # A capped solve of at most one check block runs its iterations without reading back: the iterations past
         # convergence, and those of a zero right-hand side, leave the iterate unchanged.
         unchecked = max_iter <= self.check_every
+        self._fixed_sums = fixed_sums and unchecked
         tile_k = int(_PCR_TILE_K)
         n_pad = ((n + tile_k - 1) // tile_k) * tile_k
 
@@ -1258,7 +1305,7 @@ class NSNPCRSolver:
             block_dim=_PCR_BLOCK_DIM,
             device=device,
         )
-        wp.utils.array_inner(self._s, self._q, out=self._rho_d, count=n)
+        self._inner(self._s, self._q, self._rho_d, n)
         self._stopped_d.zero_()
         tol_sq = self.tol * self.tol * dot_b
         r_norm_sq = dot_b
@@ -1351,6 +1398,7 @@ class NSNPCRSolver:
         Raises:
             ValueError: when shapes are inconsistent.
         """
+        self._fixed_sums = False
         import warp.sparse as wps  # noqa: PLC0415
 
         n = int(b.shape[0])
@@ -1683,14 +1731,14 @@ class NSNPCRSolver:
         wp.launch(_apply_precond_kernel, dim=n, inputs=[self._q, self._precond], outputs=[self._h], device=device)
         if self._block_precond is not None:
             self._block_precond(self._q, self._h)
-        wp.utils.array_inner(self._q, self._h, out=self._den_d, count=n)
+        self._inner(self._q, self._h, self._den_d, n)
         # Chart curvature of p: pᵀ A p against pᵀ diag(A) p.
         if W_bsr is None:
             wp.launch(_diag_scale_kernel, dim=n, inputs=[A, self._d], outputs=[self._dd], device=device)
         else:
             wp.launch(_apply_precond_kernel, dim=n, inputs=[self._d, diag], outputs=[self._dd], device=device)
-        wp.utils.array_inner(self._d, self._q, out=self._curvature_d, count=n)
-        wp.utils.array_inner(self._d, self._dd, out=self._chart_norm_d, count=n)
+        self._inner(self._d, self._q, self._curvature_d, n)
+        self._inner(self._d, self._dd, self._chart_norm_d, n)
         wp.launch(
             _protected_alpha_kernel,
             dim=1,
@@ -1722,7 +1770,7 @@ class NSNPCRSolver:
 
             wps.bsr_mv(W_bsr, self._s[:n], self._h[:n])
         wp.launch(_copy_scalar_kernel, dim=1, inputs=[self._rho_d], outputs=[self._rho_old_d], device=device)
-        wp.utils.array_inner(self._s, self._h, out=self._rho_d, count=n)
+        self._inner(self._s, self._h, self._rho_d, n)
         wp.launch(
             _div_scalar_kernel,
             dim=1,
@@ -1733,6 +1781,23 @@ class NSNPCRSolver:
         # p = z + beta p, q = t + beta q.
         wp.launch(_scal_add_arr_kernel, dim=n, inputs=[self._beta_d, self._s], outputs=[self._d], device=device)
         wp.launch(_scal_add_arr_kernel, dim=n, inputs=[self._beta_d, self._h], outputs=[self._q], device=device)
+
+    def _inner(self, a: wp.array, b: wp.array, out: wp.array, n: int) -> None:
+        """``out[0] = a[:n] . b[:n]``: by ``wp.utils.array_inner``, or with ``fixed_sums`` on CUDA by per-block tile
+        sums added in block order, which allocate nothing (CUDA graph conditional bodies take no allocations)."""
+        if not self._fixed_sums or not wp.get_device(self.device).is_cuda:
+            wp.utils.array_inner(a, b, out=out, count=n)
+            return
+        blocks = (n + int(_DOT_BLOCK) - 1) // int(_DOT_BLOCK)
+        wp.launch_tiled(
+            _dot_partials_kernel,
+            dim=blocks,
+            inputs=[a, b, n],
+            outputs=[self._dot_partials],
+            block_dim=int(_DOT_BLOCK),
+            device=self.device,
+        )
+        wp.launch(_dot_finish_kernel, 1, [self._dot_partials, blocks], [out], device=self.device)
 
     def _get_or_build_pcr_iter_graph(
         self,
@@ -1773,7 +1838,7 @@ class NSNPCRSolver:
         # Cache hash combines ``n`` (drives launch dims + n_pad) and the
         # matrix data pointer and strides: a reallocated buffer can return
         # at the same address with a different row pitch.
-        key = (n, a_ptr, tuple(A.strides), precond_key)
+        key = (n, a_ptr, tuple(A.strides), precond_key, self._fixed_sums)
         if wp.get_device(device).is_capturing:
             # Inside another capture the iterations record into it; a capture here would fail and stick.
             return None

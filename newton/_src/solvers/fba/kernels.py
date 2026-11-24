@@ -2247,6 +2247,141 @@ def compute_wi_tiled_kernel(
 
 
 @wp.kernel
+def capacity_particle_flags_kernel(
+    record: wp.array[wp.int32],
+    particle: wp.array[wp.int32],
+    limit: int,
+    # outputs
+    flags: wp.array[wp.int32],
+    counts: wp.array[wp.int32],
+):
+    """Flag the particle of each active contact (record >= 0) among the first ``limit`` slots of a contact buffer,
+    and count its three rows on the particle."""
+    c = wp.tid()
+    if c < limit and record[c] >= 0:
+        flags[particle[c]] = 1
+        wp.atomic_add(counts, particle[c], 3)
+
+
+@wp.kernel
+def capacity_isodofs_kernel(
+    flags: wp.array[wp.int32],
+    rank: wp.array[wp.int32],
+    perm: wp.array[wp.int32],
+    # outputs
+    count: wp.array[wp.int32],
+    isodof_perm: wp.array[wp.int32],
+):
+    """The column of ``S`` of each flagged particle ``p`` at its rank, ``isodof_perm[rank[p]] = perm[p]``, the ranks
+    (``rank``, the exclusive scan of ``flags``) ascending with the particles as :func:`numpy.unique` orders them, and
+    their count in ``count[0]``."""
+    p = wp.tid()
+    if flags[p] != 0:
+        isodof_perm[rank[p]] = perm[p]
+    if p == flags.shape[0] - 1:
+        count[0] = rank[p] + flags[p]
+
+
+@wp.kernel
+def densify_S_iso_capacity_kernel(
+    ST_offsets: wp.array[wp.int32],
+    ST_columns: wp.array[wp.int32],
+    ST_values: wp.array[wp.float64],
+    D_inv: wp.array[wp.float64],
+    isodof_perm: wp.array[wp.int32],
+    count: wp.array[wp.int32],
+    # outputs
+    S_iso_scaled: wp.array2d[wp.float64],
+):
+    """:func:`densify_S_iso_scaled_kernel` for the first ``count[0]`` columns of a launch over a capacity."""
+    a = wp.tid()
+    if a >= count[0]:
+        return
+    ip = isodof_perm[a]
+    for p in range(ST_offsets[ip], ST_offsets[ip + 1]):
+        i = ST_columns[p]
+        S_iso_scaled[i, a] = wp.sqrt(D_inv[i]) * ST_values[p]
+
+
+@wp.kernel
+def compute_wi_capacity_kernel(
+    S_iso_scaled: wp.array2d[wp.float64],
+    count: wp.array[wp.int32],
+    N_pad: int,
+    # outputs
+    Wi: wp.array2d[wp.float64],
+):
+    """:func:`compute_wi_tiled_kernel` over a capacity's tiles: the tiles of the first ``count[0]`` rows and columns,
+    each to the same sums as there; the others are skipped."""
+    tile_i, tile_j = wp.tid()
+    k = count[0]
+    if tile_i * _WI_TILE_M < k and tile_j * _WI_TILE_N < k:
+        acc = wp.tile_zeros(shape=(_WI_TILE_M, _WI_TILE_N), dtype=wp.float64)
+        for k_tile in range(0, N_pad, _WI_TILE_K):
+            a = wp.tile_load(S_iso_scaled, shape=(_WI_TILE_K, _WI_TILE_M), offset=(k_tile, tile_i * _WI_TILE_M))
+            b = wp.tile_load(S_iso_scaled, shape=(_WI_TILE_K, _WI_TILE_N), offset=(k_tile, tile_j * _WI_TILE_N))
+            a_T = wp.tile_transpose(a)
+            wp.tile_matmul(a_T, b, acc)
+        wp.tile_store(Wi, acc, offset=(tile_i * _WI_TILE_M, tile_j * _WI_TILE_N))
+
+
+@wp.kernel
+def capacity_active_count_kernel(
+    record: wp.array[wp.int32],
+    # outputs
+    active: wp.array[wp.int32],
+):
+    """The count of active contacts (record >= 0) of a contact buffer whose active contacts lie first."""
+    c = wp.tid()
+    last = record.shape[0] - 1
+    if record[c] >= 0 and (c == last or record[wp.min(c + 1, last)] < 0):
+        active[0] = c + 1
+    if c == 0 and record[0] < 0:
+        active[0] = 0
+
+
+@wp.kernel
+def capacity_bucket_kernel(
+    active: wp.array[wp.int32],
+    sizes: wp.array[wp.int32],
+    # outputs
+    take: wp.array[wp.int32],
+):
+    """``take[b] = 1`` for the smallest size ``sizes[b]`` (ascending) that holds the ``active[0]`` active contacts, the
+    largest for more, and 0 for the others; 0 for all without active contacts."""
+    b = wp.tid()
+    m = active[0]
+    lower = 0
+    if b > 0:
+        lower = sizes[b - 1]
+    take[b] = wp.where(m > lower and (m <= sizes[b] or b == sizes.shape[0] - 1), 1, 0)
+
+
+@wp.kernel
+def compose_W_capacity_kernel(
+    contact_particle: wp.array[wp.int32],
+    contact_dir: wp.array[wp.vec3],
+    contact_alpha: wp.array[wp.float32],
+    record: wp.array[wp.int32],
+    isodof_rank: wp.array[wp.int32],
+    Wi: wp.array2d[wp.float64],
+    # outputs
+    W: wp.array2d[wp.float64],
+):
+    """:func:`compose_W_from_wi_kernel` for the three rows of each contact of a contact buffer's whole capacity: the
+    rows of an inert contact (record -1) take those of the identity, so that they couple to nothing."""
+    cp, c = wp.tid()
+    if record[cp // 3] < 0 or record[c // 3] < 0:
+        W[cp, c] = wp.where(cp == c, wp.float64(1.0), wp.float64(0.0))
+        return
+    r_cp = isodof_rank[contact_particle[cp]]
+    r_c = isodof_rank[contact_particle[c]]
+    alpha = wp.float64(contact_alpha[cp]) * wp.float64(contact_alpha[c])
+    dot = wp.float64(wp.dot(contact_dir[cp], contact_dir[c]))
+    W[cp, c] = alpha * dot * Wi[r_cp, r_c]
+
+
+@wp.kernel
 def compose_W_from_wi_kernel(
     contact_particle: wp.array[wp.int32],
     contact_dir: wp.array[wp.vec3],
