@@ -205,7 +205,7 @@ class Example:
         # The contact solves keep their Delassus matrix in sparse storage, whose NSN step replays from step to step.
         self.solver = SolverFBA(
             self.model,
-            iterations=10,
+            iterations=6,
             nsn_linear_iterations=10,
             nsn_sparse_storage=True,
             rod_contact=True,
