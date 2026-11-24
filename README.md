@@ -407,12 +407,12 @@ OpenGL viewer; they play at real time or faster, the longer examples sped up to 
   <tr>
     <td align="center" width="33%">
       <a href="newton/examples/multiphysics/example_shishi_odoshi_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/shishi_odoshi_fba.webp" alt="Shishi-odoshi FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media-2026-11-24/shishi_odoshi_fba.webp" alt="Shishi-odoshi FBA">
       </a>
     </td>
     <td align="center" width="33%">
       <a href="newton/examples/multiphysics/example_water_wheel_fba.py">
-        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media/water_wheel_fba.webp" alt="Water Wheel FBA">
+        <img width="320" src="https://github.com/PranaLabs/newton/releases/download/fba-gallery-media-2026-11-24/water_wheel_fba.webp" alt="Water Wheel FBA">
       </a>
     </td>
     <td align="center" width="33%">
