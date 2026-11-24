@@ -7,19 +7,18 @@
 # A shishi-odoshi: water from a spout fills the mouth of a bamboo tube on a
 # hinge until the water's weight tips it; the tube pours the water into a
 # basin, swings back and knocks its tail on a stone, and fills again. The
-# water is SolverImplicitMPM; the tube is a body that SolverFBA integrates,
+# water is SolverAPICWater; the tube is a body that SolverFBA integrates,
 # its hinge a revolute joint, resting on the stone and the basin's rim
-# through convex contacts. The two exchange impulses once per FBA step:
+# through convex contacts. The two exchange the water's pressure once per
+# step:
 #
-#   1. The FBA step applies the water's impulse of the previous step as a
-#      constant force on the tube.
-#   2. The MPM step sees the tube as a collider that turns about the hinge
-#      with the tube's moment of inertia, at its pose at the start of the
-#      step and with FBA's end velocity less the response to that impulse,
-#      so that MPM solves the water and the tube's response together. The
-#      collider impulses of the MPM step drive the next FBA step.
+#   1. The FBA step applies the water's impulse on the tube over the
+#      previous water step as a constant force.
+#   2. The water step sees the tube where the FBA step left it, the closed
+#      parts of the grid's faces moving with it.
 #
-# The tube starts nearly full, so that it first pours after about two seconds.
+# After the first frame, each frame's steps replay from one CUDA graph. The
+# tube starts nearly full, so that it first pours within a second.
 #
 # Command: python -m newton.examples shishi_odoshi_fba
 ###########################################################################
@@ -30,8 +29,7 @@ import warp as wp
 import newton
 import newton.examples
 from newton.examples.multiphysics import shishi_odoshi_fba_utils as geo
-from newton.examples.multiphysics.fba_mpm_coupling import HingeCoupling, ParticleSource, stream_layout
-from newton.solvers import SolverFBA, SolverImplicitMPM
+from newton.solvers import SolverAPICWater, SolverFBA
 
 WATER_DENSITY = 1000.0
 BAMBOO = (0.80, 0.66, 0.42)
@@ -39,7 +37,7 @@ STONE = (0.55, 0.47, 0.36)
 GRANITE = (0.34, 0.34, 0.36)
 WOOD = (0.36, 0.28, 0.20)
 WATER = (0.25, 0.52, 0.92)
-HIDDEN = (0.0, 0.0, -10.0)  # where the water particles wait before they leave the spout, and after they drain
+HIDDEN = (0.0, 0.0, -10.0)  # where the water particles wait before they leave the spout
 
 
 def convex_hull(points):
@@ -54,13 +52,14 @@ class Example:
         self.viewer = viewer
         self.fps = 30
         self.frame_dt = 1.0 / self.fps
-        self.sim_substeps = 32  # FBA steps per frame, each with one MPM step
+        self.sim_substeps = 10  # FBA steps per frame, each with one water step
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
 
-        # The rigid side: the tube on its hinge, resting on the stone and stopped by the basin's back rim.
+        # The rigid side: the tube on its hinge, resting on the stone and stopped by the basin's back rim. The ground,
+        # the basin and the stone hold the water too.
         builder = newton.ModelBuilder()
-        contact = newton.ModelBuilder.ShapeConfig(mu=0.0, density=0.0, gap=0.005, has_particle_collision=False)
+        contact = newton.ModelBuilder.ShapeConfig(mu=0.0, density=0.0, gap=0.005, has_particle_collision=True)
         visual = newton.ModelBuilder.ShapeConfig(density=0.0, has_shape_collision=False, has_particle_collision=False)
         builder.add_ground_plane(height=geo.GROUND_Z, cfg=contact, color=(0.16, 0.17, 0.15))
         boxes = geo.basin_boxes()
@@ -105,102 +104,46 @@ class Example:
         self.solver = SolverFBA(
             self.model, iterations=5, nsn_linear_iterations=10, nsn_sparse_storage=True, contact_warmstart=True
         )
-        self.pipeline = newton.CollisionPipeline(self.model)
+        # The tube's few contacts: a small buffer keeps the steps that replay from a graph cheap.
+        self.pipeline = newton.CollisionPipeline(self.model, rigid_contact_max=64)
         self.contacts = self.pipeline.contacts()
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
 
-        # The water side: particles 2.5 mm apart, two per 5 mm voxel edge, filling the mouth to below the brim, and
-        # the spout's stream of 17 mL/s, its particles waiting until they leave the pipe.
+        # The water side: particles 2.5 mm apart, two per 5 mm cell edge, filling the mouth to below the brim, and the
+        # spout's stream of 17 mL/s, which takes particles from a pool of inactive ones.
         voxel = 0.005
         spacing = 0.5 * voxel
+        flow = 17.0e-6
         prefill = geo.prefill_points(spacing, args.fill_level, np.random.default_rng(0))
-        along = np.array([np.cos(geo.SPOUT_SLOPE), 0.0, -np.sin(geo.SPOUT_SLOPE)])
-        layer, velocity, interval = stream_layout(along, spacing, 17.0e-6, 3)
-        pool = int(args.water_seconds / interval) * len(layer)
-        # A fixed grid around the water's reach, sized by two particles at its corners that the solver's setup sees.
-        self.domain_lo = np.array([-0.60, -0.20, geo.GROUND_Z - 0.02])
-        self.domain_hi = np.array([0.10, 0.20, 0.22])
-        positions = np.concatenate([prefill, np.tile(HIDDEN, (pool, 1)), [self.domain_lo, self.domain_hi]])
+        pool = int(args.water_seconds * flow / spacing**3)
+        positions = np.concatenate([prefill, np.tile(HIDDEN, (pool, 1))])
         count = len(positions)
-        active = int(newton.ParticleFlags.ACTIVE)
         water_builder = newton.ModelBuilder()
-        SolverImplicitMPM.register_custom_attributes(water_builder)
+        SolverAPICWater.register_custom_attributes(water_builder)
         water_builder.add_particles(
             pos=[tuple(p) for p in positions],
             vel=[(0.0, 0.0, 0.0)] * count,
             mass=[WATER_DENSITY * spacing**3] * count,
             radius=[0.5 * spacing] * count,
-            flags=[active] * len(prefill) + [0] * pool + [active] * 2,
+            flags=[int(newton.ParticleFlags.ACTIVE)] * len(prefill) + [0] * pool,
         )
         self.water_model = water_builder.finalize()
-        # Water: no friction and no yield stress (no shear strength), and pressure that holds in tension as in
-        # compression.
-        self.water_model.mpm.friction.fill_(0.0)
-        self.water_model.mpm.tensile_yield_ratio.fill_(1.0)
-        self.water_model.mpm.viscosity.fill_(0.0)
-        config = SolverImplicitMPM.Config()
-        config.voxel_size = voxel
-        config.grid_type = "fixed"
-        config.grid_padding = 2
-        config.max_active_cell_count = 1 << 14
-        config.max_iterations = 50
-        config.tolerance = 1.0e-4
-        # Piecewise-linear strain: with the default piecewise-constant one, a pool at rest compresses and the tube
-        # loses a quarter of its water's torque within 1.5 s, so it would never tip.
-        config.strain_basis = "P1d"
-        config.velocity_basis = "Q1"
-        config.collider_basis = "S2"
-        self.mpm = SolverImplicitMPM(self.water_model, config=config)
-
+        config = SolverAPICWater.Config(
+            voxel_size=voxel, domain_lo=(-0.60, -0.20, geo.GROUND_Z - 0.02), domain_hi=(0.10, 0.20, 0.22)
+        )
+        self.water = SolverAPICWater(self.water_model, config)
+        # The water meets the shapes that collide with particles: the ground, the basin, the stone and the tube.
+        self.water.setup_colliders(self.model)
+        along = np.array([np.cos(geo.SPOUT_SLOPE), 0.0, -np.sin(geo.SPOUT_SLOPE)])
+        origin = geo.SPOUT_END - 0.006 * np.array([np.sin(geo.SPOUT_SLOPE), 0.0, np.cos(geo.SPOUT_SLOPE)])
+        self.water.add_stream(origin, along, flow, side_count=3)
         self.water_state = self.water_model.state()
-        self.water_state.mpm.particle_Jp.fill_(1.0)
-        # The spout's stream, 3 x 3 particles across a little below the pipe's axis, takes the waiting particles;
-        # water leaves the scene 1 cm inside the grid's box.
-        self.source = ParticleSource(
-            self.mpm,
-            self.water_model,
-            self.water_state,
-            pool=np.arange(len(prefill), len(prefill) + pool),
-            origin=geo.SPOUT_END - 0.006 * np.array([np.sin(geo.SPOUT_SLOPE), 0.0, np.cos(geo.SPOUT_SLOPE)]),
-            layer=layer,
-            velocity=velocity,
-            interval=interval,
-            drain_lo=self.domain_lo + 0.01,
-            drain_hi=self.domain_hi - 0.01,
-            hidden=HIDDEN,
-            gravity=(0.0, 0.0, -9.81),
-        )
-        # The grid is sized: the corner particles leave, into the pool.
-        self.source.retire([count - 2, count - 1])
-
-        # The tube as MPM's collider: it turns about the hinge with the tube's moment of inertia about it. The ground,
-        # the basin and the stone are static colliders, each its own mesh, so that their signed distances combine as
-        # a union.
-        self.coupling = HingeCoupling(self.model, self.state_0, [(self.tube, (0.0, 0.0, 0.0), (0.0, 1.0, 0.0))])
-        self.coupling.attach(self.water_state)
-        self.water_state.body_f = wp.zeros_like(self.state_0.body_f)
-        static = [((0.0, 0.0, geo.GROUND_Z - 0.05), (2.0, 2.0, 0.05)), *boxes]
-        meshes = []
-        for center, half in static:
-            box = newton.Mesh.create_box(*half, duplicate_vertices=False, compute_normals=False, compute_uvs=False,
-                                         compute_inertia=False)  # fmt: skip
-            meshes.append((box.vertices + np.asarray(center, dtype=np.float32), box.indices))
-        meshes.append((stone.vertices + stone_center.astype(np.float32), stone.indices))
-        static_meshes = []
-        for mesh_points, indices in meshes:
-            points = wp.array(np.asarray(mesh_points, dtype=np.float32), dtype=wp.vec3)
-            static_meshes.append(wp.Mesh(points, wp.array(np.ravel(indices), dtype=int), wp.zeros_like(points)))
-        self.static_meshes = static_meshes  # the solver keeps the mesh ids only
-        self.mpm.setup_collider(
-            collider_meshes=[None, *static_meshes],
-            collider_body_ids=[self.tube] + [None] * len(static_meshes),
-            collider_friction=[0.0] * (1 + len(static_meshes)),
-            collider_projection_threshold=[0.25 * voxel] * (1 + len(static_meshes)),
-            model=self.model,
-            **self.coupling.setup_collider_args(),
-        )
+        # The water steps see the tube in state_0, which the FBA steps' results are copied into.
+        self.water_state.body_q = self.state_0.body_q
+        self.water_state.body_qd = self.state_0.body_qd
+        self.graph = None
 
         self.lowest_angle = float(geo.REST)
 
@@ -211,20 +154,25 @@ class Example:
         for _ in range(self.sim_substeps):
             # FBA: the tube under the water's impulse of the last step.
             self.state_0.clear_forces()
-            self.coupling.apply_impulses(self.state_0, self.sim_dt)
+            self.water.add_body_forces(self.state_0.body_f, self.sim_dt)
             self.pipeline.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
-            self.state_0, self.state_1 = self.state_1, self.state_0
-            # MPM: the water against the tube as it turned over the step.
-            self.coupling.update_colliders(self.state_0)
-            self.mpm.step(self.water_state, self.water_state, None, None, self.sim_dt)
-            self.mpm.project_outside(self.water_state, self.water_state, self.sim_dt)
-            self.coupling.collect_impulses(self.mpm, self.water_state)
-            self.source.drain()
+            wp.copy(self.state_0.body_q, self.state_1.body_q)
+            wp.copy(self.state_0.body_qd, self.state_1.body_qd)
+            # The water against the tube where the step left it.
+            self.water.step(self.water_state, self.water_state, None, None, self.sim_dt)
 
     def step(self):
-        self.source.emit(self.sim_time, self.frame_dt)
-        self.simulate()
+        if self.graph is not None:
+            wp.capture_launch(self.graph)
+        else:
+            self.simulate()
+            if wp.get_device().is_cuda and wp.is_mempool_enabled(wp.get_device()):
+                # The first frame, outside the graph, sets FBA up and reserves its contacts' buffers; the following
+                # frames replay its steps.
+                with wp.ScopedCapture() as capture:
+                    self.simulate()
+                self.graph = capture.graph
         self.sim_time += self.frame_dt
         q = self.state_0.body_q.numpy()[self.tube]
         self.lowest_angle = min(self.lowest_angle, 2.0 * float(np.arctan2(q[4], q[6])))
@@ -241,14 +189,18 @@ class Example:
         # The water tipped the tube onto the basin's rim.
         assert self.lowest_angle < geo.TILT + 0.1, f"the tube turned only to {np.degrees(self.lowest_angle):.1f} deg"
         q = self.water_state.particle_q.numpy()
-        active = self.source.active()
+        active = self.active()
         assert np.all(np.isfinite(q[active])), "non-finite water"
         x0, x1, y0, y1 = geo.BASIN_INNER
         in_basin = (q[:, 0] > x0) & (q[:, 0] < x1) & (q[:, 1] > y0) & (q[:, 1] < y1) & (q[:, 2] < -0.15) & active
         assert in_basin.sum() > 1000, f"only {in_basin.sum()} water particles reached the basin"
 
+    def active(self):
+        """Whether each water particle is in the water."""
+        return (self.water_model.particle_flags.numpy() & int(newton.ParticleFlags.ACTIVE)) != 0
+
     def render(self):
-        points = self.water_state.particle_q.numpy()[self.source.active()]
+        points = self.water_state.particle_q.numpy()[self.active()]
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
         if len(points):
@@ -267,6 +219,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--fill-level", type=float, default=0.076, help="World height [m] of the water the tube starts with."
     )
-    parser.add_argument("--water-seconds", type=float, default=40.0, help="Seconds of water the spout gives.")
+    parser.add_argument(
+        "--water-seconds", type=float, default=40.0, help="Seconds of water that the pool of particles holds."
+    )
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

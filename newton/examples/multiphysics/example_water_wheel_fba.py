@@ -11,10 +11,12 @@
 # passive damping (Model.joint_damping) is the wheel's load, so that it
 # settles at the speed where the water's torque meets the load's.
 #
-# The water is SolverImplicitMPM; the wheel is a body that SolverFBA
-# integrates. They exchange the water's impulse on the wheel once per FBA
-# step, MPM seeing the wheel as a collider that turns about its axle with
-# its moment of inertia about it (fba_mpm_coupling.HingeCoupling).
+# The water is SolverAPICWater; the wheel is a body that SolverFBA
+# integrates. They exchange the water's pressure once per step: the FBA
+# step applies the water's impulse on the wheel over the previous water
+# step as a constant force, and the water step sees the wheel where the
+# FBA step left it. After the first frame, each frame's steps replay from
+# one CUDA graph.
 #
 # Command: python -m newton.examples water_wheel_fba
 ###########################################################################
@@ -24,8 +26,7 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton.examples.multiphysics.fba_mpm_coupling import HingeCoupling, ParticleSource, stream_layout
-from newton.solvers import SolverFBA, SolverImplicitMPM
+from newton.solvers import SolverAPICWater, SolverFBA
 
 AXLE = np.array([0.0, 0.0, 0.30])  # [m], the wheel's axle runs along y through this point
 RADIUS = 0.12  # [m], the wheel's outer radius
@@ -47,7 +48,7 @@ WOOD = (0.55, 0.40, 0.25)
 DARK_WOOD = (0.36, 0.25, 0.15)
 GRANITE = (0.34, 0.34, 0.36)
 WATER = (0.25, 0.52, 0.92)
-HIDDEN = (0.0, 0.0, -10.0)  # where the water particles wait before they leave the pipe, and after they drain
+HIDDEN = (0.0, 0.0, -10.0)  # where the water particles wait before they leave the pipe
 
 
 def about_y(angle):
@@ -83,28 +84,22 @@ def trough_boxes():
     ]
 
 
-def box_mesh(center, rotation, half):
-    """A box as a closed warp mesh for the MPM colliders."""
-    box = newton.Mesh.create_box(*half, duplicate_vertices=False, compute_normals=False, compute_uvs=False,
-                                 compute_inertia=False)  # fmt: skip
-    points = np.array([wp.quat_rotate(rotation, wp.vec3(*p)) for p in box.vertices]) + np.asarray(center)
-    points = wp.array(points.astype(np.float32), dtype=wp.vec3)
-    return wp.Mesh(points, wp.array(np.asarray(box.indices).ravel(), dtype=int), wp.zeros_like(points))
-
-
 class Example:
     def __init__(self, viewer, args):
         self.viewer = viewer
         self.fps = 30
         self.frame_dt = 1.0 / self.fps
-        self.sim_substeps = 16  # FBA steps per frame, each with one MPM step
+        self.sim_substeps = 10  # FBA steps per frame, each with one water step
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
 
-        # The rigid side: the wheel on its axle, its load the joint's damping. The trough, the posts, the axle and
-        # the pipe are for show; the wheel touches nothing rigid.
+        # The rigid side: the wheel on its axle, its load the joint's damping. The posts, the axle and the pipe are
+        # for show, the trough holds the water alone; the wheel touches nothing rigid.
         builder = newton.ModelBuilder()
         visual = newton.ModelBuilder.ShapeConfig(density=0.0, has_shape_collision=False, has_particle_collision=False)
+        water_only = newton.ModelBuilder.ShapeConfig(
+            density=0.0, has_shape_collision=False, has_particle_collision=True
+        )
         wood = newton.ModelBuilder.ShapeConfig(
             mu=0.0, density=WOOD_DENSITY, has_shape_collision=False, has_particle_collision=True
         )
@@ -113,7 +108,7 @@ class Example:
         half_y = trough[0][2][1]
         for center, rotation, half in trough:
             builder.add_shape_box(-1, xform=wp.transform(center, rotation), hx=half[0], hy=half[1], hz=half[2],
-                                  cfg=visual, color=GRANITE)  # fmt: skip
+                                  cfg=water_only, color=GRANITE)  # fmt: skip
         for x in (-0.13, 0.27):
             top = trough_floor_z(x) - 0.005
             builder.add_shape_box(-1, xform=wp.transform((x, 0.0, 0.5 * top), wp.quat_identity()), hx=0.015,
@@ -162,75 +157,36 @@ class Example:
         self.state_1 = self.model.state()
         self.control = self.model.control()
 
-        # The water side: the pipe's stream, 4 x 4 particles 2.5 mm apart across, from a pool of particles that the
-        # water that leaves goes back to, in a grid around the wheel and the trough's upper end, sized by two
-        # particles at its corners that the solver's setup sees.
+        # The water side: the pipe's stream, 4 x 4 particles 2.5 mm apart across, from a pool of inactive particles
+        # that the water leaving the grid's box returns to, in a grid around the wheel and the trough's upper end.
         spacing = 0.5 * VOXEL
-        layer, velocity, interval = stream_layout(SPOUT_ALONG, spacing, FLOW, 4)
         pool = args.pool
-        self.domain_lo = AXLE + np.array([-RADIUS - 0.06, -0.5 * WIDTH - WALL - 0.03, -RADIUS - 0.12])
-        self.domain_hi = AXLE + np.array([RADIUS + 0.20, 0.5 * WIDTH + WALL + 0.03, RADIUS + 0.13])
-        positions = np.concatenate([np.tile(HIDDEN, (pool, 1)), [self.domain_lo, self.domain_hi]])
-        count = len(positions)
         water_builder = newton.ModelBuilder()
-        SolverImplicitMPM.register_custom_attributes(water_builder)
+        SolverAPICWater.register_custom_attributes(water_builder)
         water_builder.add_particles(
-            pos=[tuple(p) for p in positions],
-            vel=[(0.0, 0.0, 0.0)] * count,
-            mass=[WATER_DENSITY * spacing**3] * count,
-            radius=[0.5 * spacing] * count,
-            flags=[0] * pool + [int(newton.ParticleFlags.ACTIVE)] * 2,
+            pos=[HIDDEN] * pool,
+            vel=[(0.0, 0.0, 0.0)] * pool,
+            mass=[WATER_DENSITY * spacing**3] * pool,
+            radius=[0.5 * spacing] * pool,
+            flags=[0] * pool,
         )
         self.water_model = water_builder.finalize()
-        # Water: no friction and no yield stress, and pressure that holds in tension as in compression.
-        self.water_model.mpm.friction.fill_(0.0)
-        self.water_model.mpm.tensile_yield_ratio.fill_(1.0)
-        self.water_model.mpm.viscosity.fill_(0.0)
-        config = SolverImplicitMPM.Config()
-        config.voxel_size = VOXEL
-        config.grid_type = "fixed"
-        config.grid_padding = 2
-        config.max_active_cell_count = 1 << 14
-        config.max_iterations = 50
-        config.tolerance = 1.0e-4
-        config.strain_basis = "P1d"  # the default P0 lets water at rest compress
-        config.velocity_basis = "Q1"
-        config.collider_basis = "S2"
-        self.mpm = SolverImplicitMPM(self.water_model, config=config)
+        config = SolverAPICWater.Config(
+            voxel_size=VOXEL,
+            domain_lo=tuple(AXLE + np.array([-RADIUS - 0.06, -0.5 * WIDTH - WALL - 0.03, -RADIUS - 0.12])),
+            domain_hi=tuple(AXLE + np.array([RADIUS + 0.20, 0.5 * WIDTH + WALL + 0.03, RADIUS + 0.13])),
+        )
+        self.water = SolverAPICWater(self.water_model, config)
+        # The water meets the wheel and the trough, the shapes that collide with particles.
+        self.water.setup_colliders(self.model)
+        # The stream leaves the pipe a little below its axis.
+        origin = SPOUT_END - 0.006 * np.array([np.sin(SPOUT_SLOPE), 0.0, np.cos(SPOUT_SLOPE)])
+        self.water.add_stream(origin, SPOUT_ALONG, FLOW, side_count=4)
         self.water_state = self.water_model.state()
-        self.water_state.mpm.particle_Jp.fill_(1.0)
-        # The stream leaves the pipe a little below its axis; water leaves the scene 1 cm inside the grid's box.
-        self.source = ParticleSource(
-            self.mpm,
-            self.water_model,
-            self.water_state,
-            pool=np.arange(pool),
-            origin=SPOUT_END - 0.006 * np.array([np.sin(SPOUT_SLOPE), 0.0, np.cos(SPOUT_SLOPE)]),
-            layer=layer,
-            velocity=velocity,
-            interval=interval,
-            drain_lo=self.domain_lo + 0.01,
-            drain_hi=self.domain_hi - 0.01,
-            hidden=HIDDEN,
-            gravity=(0.0, 0.0, -9.81),
-        )
-        # The grid is sized: the corner particles leave, into the pool.
-        self.source.retire([count - 2, count - 1])
-
-        # The wheel as MPM's collider turns about its axle with its moment of inertia about it; the trough is static.
-        self.coupling = HingeCoupling(self.model, self.state_0, [(self.wheel, tuple(AXLE), (0.0, 1.0, 0.0))])
-        self.coupling.attach(self.water_state)
-        self.water_state.body_f = wp.zeros_like(self.state_0.body_f)
-        self.trough_meshes = [box_mesh(*box) for box in trough]  # the solver keeps the mesh ids only
-        colliders = 1 + len(self.trough_meshes)
-        self.mpm.setup_collider(
-            collider_meshes=[None, *self.trough_meshes],
-            collider_body_ids=[self.wheel] + [None] * len(self.trough_meshes),
-            collider_friction=[0.0] * colliders,
-            collider_projection_threshold=[0.25 * VOXEL] * colliders,
-            model=self.model,
-            **self.coupling.setup_collider_args(),
-        )
+        # The water steps see the wheel in state_0, which the FBA steps' results are copied into.
+        self.water_state.body_q = self.state_0.body_q
+        self.water_state.body_qd = self.state_0.body_qd
+        self.graph = None
         self.spin = []  # the wheel's angular velocity [rad/s] about +y at each frame
 
         self.viewer.set_model(self.model)
@@ -240,19 +196,23 @@ class Example:
         for _ in range(self.sim_substeps):
             # FBA: the wheel under the water's impulse of the last step and its load.
             self.state_0.clear_forces()
-            self.coupling.apply_impulses(self.state_0, self.sim_dt)
+            self.water.add_body_forces(self.state_0.body_f, self.sim_dt)
             self.solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
-            self.state_0, self.state_1 = self.state_1, self.state_0
-            # MPM: the water against the wheel as it turned over the step.
-            self.coupling.update_colliders(self.state_0)
-            self.mpm.step(self.water_state, self.water_state, None, None, self.sim_dt)
-            self.mpm.project_outside(self.water_state, self.water_state, self.sim_dt)
-            self.coupling.collect_impulses(self.mpm, self.water_state)
-            self.source.drain()
+            wp.copy(self.state_0.body_q, self.state_1.body_q)
+            wp.copy(self.state_0.body_qd, self.state_1.body_qd)
+            # The water against the wheel where the step left it.
+            self.water.step(self.water_state, self.water_state, None, None, self.sim_dt)
 
     def step(self):
-        self.source.emit(self.sim_time, self.frame_dt)
-        self.simulate()
+        if self.graph is not None:
+            wp.capture_launch(self.graph)
+        else:
+            self.simulate()
+            if wp.get_device().is_cuda and wp.is_mempool_enabled(wp.get_device()):
+                # The first frame, outside the graph, sets FBA up; the following frames replay its steps.
+                with wp.ScopedCapture() as capture:
+                    self.simulate()
+                self.graph = capture.graph
         self.sim_time += self.frame_dt
         self.spin.append(float(self.state_0.body_qd.numpy()[self.wheel][4]))
 
@@ -266,11 +226,15 @@ class Example:
         # The water past the top (+x) turns the wheel about +y, which lowers that side.
         spin = np.array(self.spin[-self.fps :])
         assert spin.mean() > 0.5, f"the wheel turns at {spin.mean():.3f} rad/s over the last second"
-        q = self.water_state.particle_q.numpy()[self.source.active()]
+        q = self.water_state.particle_q.numpy()[self.active()]
         assert np.all(np.isfinite(q)), "non-finite water"
 
+    def active(self):
+        """Whether each water particle is in the water."""
+        return (self.water_model.particle_flags.numpy() & int(newton.ParticleFlags.ACTIVE)) != 0
+
     def render(self):
-        points = self.water_state.particle_q.numpy()[self.source.active()]
+        points = self.water_state.particle_q.numpy()[self.active()]
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
         if len(points):
@@ -286,6 +250,6 @@ class Example:
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
     parser.add_argument("--load", type=float, default=0.01, help="Damping [N m s/rad] of the wheel's axle, its load.")
-    parser.add_argument("--pool", type=int, default=12000, help="Water particles that the pipe recycles.")
+    parser.add_argument("--pool", type=int, default=20000, help="Water particles that the pipe recycles.")
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

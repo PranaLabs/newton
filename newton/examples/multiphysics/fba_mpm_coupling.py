@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Coupling of hinged bodies that SolverFBA integrates to the material of SolverImplicitMPM, and a source of the
+"""Coupling of hinged bodies that SolverFBA integrates to the material of SolverImplicitMPM, and a drain of the
 material's particles, for the examples.
 
 The two solvers exchange the material's impulse on the bodies once per FBA step:
@@ -15,8 +15,7 @@ The two solvers exchange the material's impulse on the bodies once per FBA step:
 3. After the MPM step, :meth:`HingeCoupling.collect_impulses` sums the collider impulses on each body for the next
    FBA step.
 
-:class:`ParticleSource` lets particles join the material over time, as from a spout, and :class:`ParticleDrain` takes
-those that leave a box out of it, through the solver's public API.
+:class:`ParticleDrain` takes the particles that leave a box out of the material, through the solver's public API.
 """
 
 import numpy as np
@@ -240,25 +239,6 @@ def escaping_kernel(
         wp.atomic_add(count, 0, 1)
 
 
-@wp.kernel
-def restart_kernel(
-    particles: wp.array[wp.int64],
-    # outputs
-    qd_grad: wp.array[wp.mat33],
-    elastic_strain: wp.array[wp.mat33],
-    transform: wp.array[wp.mat33],
-    stress: wp.array[wp.mat33],
-    jp: wp.array[float],
-):
-    """Start the particles ``particles`` undeformed and with a uniform velocity, whatever they did before."""
-    i = particles[wp.tid()]
-    qd_grad[i] = wp.mat33(0.0)
-    elastic_strain[i] = wp.identity(n=3, dtype=float)
-    transform[i] = wp.identity(n=3, dtype=float)
-    stress[i] = wp.mat33(0.0)
-    jp[i] = 1.0
-
-
 class ParticleDrain:
     """Takes the SolverImplicitMPM particles that leave a box out of the material, through the solver's public API.
 
@@ -282,7 +262,6 @@ class ParticleDrain:
         self.hidden = np.asarray(hidden)
         self.flags = model.particle_flags.numpy()
         self.escaping = wp.zeros(1, dtype=int, device=model.device)
-        self.free = []  # the particles out of the material
 
     def active(self) -> np.ndarray:
         """Whether each particle is in the material."""
@@ -299,7 +278,6 @@ class ParticleDrain:
         q, qd = self.state.particle_q.numpy(), self.state.particle_qd.numpy()
         q[particles], qd[particles] = self.hidden, 0.0
         self.flags[particles] &= ~int(newton.ParticleFlags.ACTIVE)
-        self.free.extend(np.asarray(particles, dtype=np.int64).tolist())
         self._write(q, qd)
 
     def drain(self) -> None:
@@ -312,87 +290,3 @@ class ParticleDrain:
         q = self.state.particle_q.numpy()
         inside = np.all((q > self.drain_lo) & (q < self.drain_hi), axis=1) & np.all(np.isfinite(q), axis=1)
         self.retire(np.flatnonzero(self.active() & ~inside))
-
-
-class ParticleSource(ParticleDrain):
-    """A stream of SolverImplicitMPM particles that join the material, as from a spout, and leave it past a box.
-
-    The stream leaves ``origin`` in layers of the points ``layer`` (relative to ``origin``), one layer every
-    ``interval``, each particle placed and moving where its flight from its layer's point puts it when it joins, and
-    undeformed. It takes its particles from a pool of inactive ones, and the particles that leave the drain box
-    (:class:`ParticleDrain`) go back to the pool.
-
-    Args:
-        mpm: The material's solver.
-        model: The material's model.
-        state: The material's state.
-        pool: The inactive particles that the stream takes.
-        origin: The stream's origin [m].
-        layer: The points of a layer [m], relative to ``origin``, shape ``[count, 3]``.
-        velocity: The stream's velocity [m/s].
-        interval: The time between two layers [s].
-        drain_lo: The drain box's lower corner [m].
-        drain_hi: The drain box's upper corner [m].
-        hidden: Where the particles wait [m], before they join and after they leave.
-        gravity: The gravity [m/s^2] of the particles' flight from the stream's origin.
-    """
-
-    def __init__(self, mpm, model, state, pool, origin, layer, velocity, interval, drain_lo, drain_hi, hidden, gravity):
-        super().__init__(mpm, model, state, drain_lo, drain_hi, hidden)
-        self.free = list(np.asarray(pool, dtype=np.int64)[::-1])  # taken from the end
-        self.origin, self.layer = np.asarray(origin, dtype=np.float64), np.asarray(layer, dtype=np.float64)
-        self.velocity, self.interval = np.asarray(velocity, dtype=np.float64), float(interval)
-        self.gravity = np.asarray(gravity)
-        self.next_layer = 0
-        self.flowing = True
-
-    def emit(self, time: float, duration: float) -> None:
-        """Let the layers due before ``time + duration`` join, placed and moving as their flight from the stream's
-        origin puts them at ``time``. The stream stops when the pool runs out."""
-        times = []
-        while self.flowing and self.next_layer * self.interval < time + duration:
-            if len(self.free) < len(self.layer):
-                self.flowing = False
-                break
-            times.append(self.next_layer * self.interval)
-            self.next_layer += 1
-        if not times:
-            return
-        joining = np.array([self.free.pop() for _ in range(len(times) * len(self.layer))], dtype=np.int64)
-        tau = np.repeat(time - np.array(times), len(self.layer))[:, None]
-        q, qd = self.state.particle_q.numpy(), self.state.particle_qd.numpy()
-        start = self.origin + np.tile(self.layer, (len(times), 1))
-        q[joining] = start + self.velocity * tau + 0.5 * tau * tau * self.gravity
-        qd[joining] = self.velocity + tau * self.gravity
-        self.flags[joining] |= int(newton.ParticleFlags.ACTIVE)
-        mpm_state = self.state.mpm
-        wp.launch(
-            restart_kernel,
-            len(joining),
-            inputs=[wp.array(joining, dtype=wp.int64, device=self.model.device)],
-            outputs=[
-                *(mpm_state.particle_qd_grad, mpm_state.particle_elastic_strain, mpm_state.particle_transform),
-                *(mpm_state.particle_stress, mpm_state.particle_Jp),
-            ],
-        )
-        self._write(q, qd)
-
-
-def stream_layout(direction, spacing, flow, side_count):
-    """A square stream for :class:`ParticleSource`: layers of ``side_count`` x ``side_count`` points ``spacing`` apart
-    across ``direction``, the first half a spacing out along it, at the speed that carries ``flow`` [m^3/s].
-
-    Returns:
-        A layer's points relative to the stream's origin, the stream's velocity [m/s] and the time between layers [s].
-    """
-    along = np.asarray(direction, dtype=np.float64)
-    along /= np.linalg.norm(along)
-    side = np.cross(along, (0.0, 0.0, 1.0))
-    if np.linalg.norm(side) < 1.0e-6:
-        side = np.cross(along, (1.0, 0.0, 0.0))
-    side /= np.linalg.norm(side)
-    normal = np.cross(along, side)
-    speed = flow / (side_count * side_count * spacing**2)
-    offsets = (np.arange(side_count) - 0.5 * (side_count - 1)) * spacing
-    layer = np.array([0.5 * spacing * along + a * side + b * normal for a in offsets for b in offsets])
-    return layer, speed * along, spacing / speed

@@ -719,19 +719,22 @@ Examples
 - ``cloth_on_knives_fba``: cloth on notched blades with face contacts and light
   Rayleigh stiffness damping.
 - ``cloth_on_boxes_fba``: cloth on rigid bodies with joints.
-- ``shishi_odoshi_fba``: water of :class:`~newton.solvers.SolverImplicitMPM`
+- ``shishi_odoshi_fba``: water of :class:`~newton.solvers.SolverAPICWater`
   coupled to a body that FBA integrates: a spout fills a bamboo tube on a
   hinge until it tips, pours into a basin, swings back onto a stone and fills
-  again. The two solvers exchange the water's impulse on the tube once per FBA
-  step, MPM seeing the tube as a collider that turns about the hinge with its
-  moment of inertia.
+  again. Once per step FBA applies the water's impulse on the tube over the
+  last water step, and the water's step sees the tube where FBA left it; each
+  frame's steps replay from one CUDA graph.
 - ``water_wheel_fba``: an overshot water wheel through the same coupling: water
   from a pipe fills the buckets just past the wheel's top, and their weight
   turns the wheel against its axle's damping, its load, until the two torques
   meet.
 - ``sand_castle_fba``: a wrecking ball on a rod swings through a castle of damp
-  sand, MPM sand with friction and a small cohesion, through the same coupling;
-  the sand takes nearly half of the ball's energy.
+  sand, :class:`~newton.solvers.SolverImplicitMPM` sand with friction and a
+  small cohesion. The two solvers exchange the sand's impulse on the ball once
+  per FBA step, MPM seeing the ball as a collider that turns about the rod's
+  pivot with its moment of inertia; the sand takes nearly half of the ball's
+  energy.
 - ``batter_mixer_fba``: a mixer's paddle, turned by a motor's constant torque,
   stirs viscous batter that sticks to its bowl, through the same coupling. The
   batter's drag sets the paddle's speed, and the paddle marbles vanilla and

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Geometry of the ``shishi_odoshi_fba`` example: the bamboo tube as a signed distance field, its mass properties, a
-closed triangle mesh of it (surface nets) for the MPM collider and the viewer, convex parts for the rigid contacts,
+closed triangle mesh of it (surface nets) for the water's collider and the viewer, convex parts for the rigid contacts,
 and the static scenery (basin, stone, spout).
 
 Frame: z up, the hinge pin on the world y axis through the origin. The tube lies in the xz plane with its mouth at -x

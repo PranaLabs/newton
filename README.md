@@ -402,7 +402,7 @@ OpenGL viewer; they play at real time or faster, the longer examples sped up to 
     </td>
   </tr>
   <tr>
-    <td colspan="3"><h3>MPM Coupling</h3></td>
+    <td colspan="3"><h3>Water and MPM Coupling</h3></td>
   </tr>
   <tr>
     <td align="center" width="33%">
@@ -424,11 +424,11 @@ OpenGL viewer; they play at real time or faster, the longer examples sped up to 
   <tr>
     <td align="center" width="33%">
       <code>python -m newton.examples shishi_odoshi_fba</code><br>
-      <sub>MPM water fills a hinged bamboo tube until it tips, pours into a basin and knocks back on a stone</sub>
+      <sub>Water fills a hinged bamboo tube until it tips, pours into a basin and knocks back on a stone</sub>
     </td>
     <td align="center" width="33%">
       <code>python -m newton.examples water_wheel_fba</code><br>
-      <sub>MPM water from a bamboo pipe fills the buckets of an overshot wheel and turns it against its load</sub>
+      <sub>Water from a bamboo pipe fills the buckets of an overshot wheel and turns it against its load</sub>
     </td>
     <td align="center" width="33%">
       <code>python -m newton.examples sand_castle_fba</code><br>
@@ -495,14 +495,16 @@ per wall-clock time; contacts are the mean count per frame.
 | `elastic_cords_fba` | 251 particles | 1/50 s | 33.1 | 0.60x |
 | `rod_gripper_fba` | 102 particles, 3 bodies | 1/50 s | 18.0 | 1.11x |
 | `rope_on_knives_fba` | 58 particles | 1/50 s | 9.0 | 2.21x |
-| `shishi_odoshi_fba` | up to 59,014 water particles (MPM), 1 body | 1/30 s | 475.1 | 0.07x |
-| `water_wheel_fba` | up to 12,002 water particles (MPM), 1 body | 1/30 s | 217.8 | 0.15x |
+| `shishi_odoshi_fba` | up to 59,017 water particles, 1 body | 1/30 s | 21.7 | 1.53x |
+| `water_wheel_fba` | up to 20,000 water particles, 1 body | 1/30 s | 9.1 | 3.66x |
 | `sand_castle_fba` | 44,125 sand particles (MPM), 1 body | 1/30 s | 142.5 | 0.23x |
 | `batter_mixer_fba` | 56,194 batter particles (MPM), 1 body | 1/30 s | 208.4 | 0.16x |
 | `meat_cutter_fba` | 55,202 meat particles (MPM), 1 body | 1/30 s | 468.1 | 0.07x |
 
-The MPM examples couple an MPM grid of 5 mm voxels (7.5 mm for the sand, 4 mm for the meat) with `SolverFBA` once per
-step, 16 steps per frame (32 for the shishi-odoshi); the water flows in over the demo, up to the capacity of its pool.
+The water examples (measured on 2026-11-24) couple `SolverAPICWater` on a grid of 5 mm cells with `SolverFBA` once per
+step, 10 steps per frame, each frame replayed from one CUDA graph; the water flows in over the demo, up to the capacity of
+its pool. The MPM examples couple an MPM grid of 5 mm voxels (7.5 mm for the sand, 4 mm for the meat) with `SolverFBA`
+once per step, 16 steps per frame.
 
 ### Example Options
 
