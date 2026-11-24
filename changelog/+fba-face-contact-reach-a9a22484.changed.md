@@ -1,0 +1,1 @@
+Speed up the face contacts of `SolverFBA` on meshes: each iteration of a triangle's deepest point looks for the closest point of the mesh within the reach that the triangle's vertices bound, which finds the same point sooner; `cloth_on_knives_fba` takes 27.4 ms per frame in place of 28.2 ms, with the same contacts.
