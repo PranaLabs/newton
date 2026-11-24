@@ -1053,6 +1053,9 @@ class SolverFBA(TendonStateMixin, SolverBase):
         self._edge_norm_d = None
         self._pin_indices_d = self._inactive_d = self._zero_mass_d = None
         self._pinned_h = self._pinned_d = None
+        # The shapes on the bodies the solver integrates (_build_rigid_system), whose contacts with held particles
+        # stay, as they push the body: a mask on the host, or None, and 1 for each shape on the device.
+        self._pushed_shapes_h, self._pushed_shapes_d = None, wp.empty(0, dtype=wp.int32, device=model.device)
         # Springs, ADMM stretch elements (filled by _setup_pd_system): their particles, rest lengths, stiffnesses and
         # penalties, their duals, splits and last directions kept across steps, and the flag of a step's first local
         # step.
@@ -1241,6 +1244,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
             self._clear_warm_start()
         self._rigid_linear_solver = None
         self._joint_rows = None
+        self._pushed_shapes_h, self._pushed_shapes_d = None, wp.empty(0, dtype=wp.int32, device=self._device)
         model = self.model
         if self.integrate_with_external_rigid_solver or model.body_count == 0:
             return
@@ -1266,6 +1270,11 @@ class SolverFBA(TendonStateMixin, SolverBase):
         self._body_slot_h = np.full(model.body_count, -1, dtype=np.int32)
         self._body_slot_h[bodies] = np.arange(m)
         self._body_slot_d = wp.array(self._body_slot_h, dtype=wp.int32, device=device)
+        shape_body = self._shape_body_host()
+        pushed = (shape_body >= 0) & (self._body_slot_h[np.maximum(shape_body, 0)] >= 0)
+        if pushed.any():
+            self._pushed_shapes_h = pushed
+            self._pushed_shapes_d = wp.array(pushed.astype(np.int32), dtype=wp.int32, device=device)
         self._setup_joints()
 
     def _setup_joints(self) -> None:
@@ -3916,8 +3925,10 @@ class SolverFBA(TendonStateMixin, SolverBase):
             contact_peak_kernel, 1, [contacts.soft_contact_count, _PEAK_SOFT], [self._contact_peak_d], device=device
         )
         pinned = self._pinned_d if self._pinned_d is not None else wp.empty(0, dtype=wp.int32, device=device)
+        pushed = self._pushed_shapes_d
         inputs = [contacts.soft_contact_count, contacts.soft_contact_particle, contacts.soft_contact_shape]
-        wp.launch(capacity_contact_keys_kernel, C, [*inputs, model.shape_count, pinned], [keys, order], device=device)
+        inputs_keys = [*inputs, model.shape_count, pinned, pushed]
+        wp.launch(capacity_contact_keys_kernel, C, inputs_keys, [keys, order], device=device)
         count = C
         minima = self._capacity_minima
         if minima is not None:
@@ -3925,7 +3936,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
             # its contact, by normal and anchor among them, as the host path orders them.
             alarm = 0.0 if self.face_contact_gap is None else self.face_contact_gap
             self._face_query.capacity_minima(model, src.particle_q, src.body_q, contacts, alarm, *minima)
-            inputs += [model.shape_count, pinned, minima[0]]
+            inputs += [model.shape_count, pinned, pushed, minima[0]]
             wp.launch(capacity_minima_keys_kernel, 3 * C, inputs, [keys, order], device=device)
             count = 4 * C
         wp.utils.radix_sort_pairs(keys, order, count)
@@ -3956,6 +3967,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 src.body_q,
                 contacts,
                 pinned,
+                pushed,
                 self.face_contact_edge_radius,
                 self.face_contact_gap,
                 face.first,
@@ -6406,12 +6418,15 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 M = len(particle_h)
             # A row on held particles alone, such as a particle contact of a pinned particle, cannot move them: its
             # Delassus entry is zero for the lite operator and the inverse pin stiffness for the full one, so its
-            # multiplier would grow until it moved a pinned particle off its target. Such rows are dropped.
+            # multiplier would grow until it moved a pinned particle off its target. Such rows are dropped, but those
+            # with the shapes of the bodies the solver integrates, which they push.
             if M and self._pinned_h is not None:
                 keep = (alpha_h != 0.0) & ~self._pinned_h[particle_h]
                 if extra is not None:
                     free = (extra[0] >= 0) & (extra[1] != 0.0) & ~self._pinned_h[np.maximum(extra[0], 0)]
                     keep |= free.any(axis=1)
+                if self._pushed_shapes_h is not None:
+                    keep |= (shape_h >= 0) & self._pushed_shapes_h[np.maximum(shape_h, 0)]
                 if not keep.all():
                     shape_contacts = int(keep[:shape_contacts].sum())
                     particle_h, alpha_h, shape_h = particle_h[keep], alpha_h[keep], shape_h[keep]
@@ -6619,7 +6634,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         pinned = self._pinned_d if self._pinned_d is not None else wp.empty(0, dtype=wp.int32, device=device)
         held = wp.zeros(1, dtype=wp.int32, device=device)
         inputs = [contacts.soft_contact_particle, contacts.soft_contact_shape, self.model.shape_count, pinned]
-        wp.launch(soft_contact_keys_kernel, Ms, inputs, [keys, order, held], device=device)
+        wp.launch(soft_contact_keys_kernel, Ms, [*inputs, self._pushed_shapes_d], [keys, order, held], device=device)
         wp.utils.radix_sort_pairs(keys, order, Ms)
         # The contacts of held particles, sorted last, are dropped: the host path explains why.
         if self._pinned_d is not None:
