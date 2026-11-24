@@ -1177,7 +1177,9 @@ class NSNPCRSolver:
             block_precond: Optional ``f(v, out)`` that overwrites rows of the
                 Jacobi product ``out = P v`` with an exact block solve, such
                 as the joint rows' Cholesky factor, a block preconditioner of
-                the bilateral rows. It runs eagerly, without the CUDA graph.
+                the bilateral rows. A partial of a bound method records into
+                the iteration's CUDA graph with the other launches; another
+                callable runs the iterations eagerly.
 
         Returns:
             A ``(iterations_taken, final_rho)`` tuple where ``iterations_taken``
@@ -1275,7 +1277,7 @@ class NSNPCRSolver:
         # ``cuGraphLaunch`` on the device side instead of ~10 individual
         # ``wp.launch`` dispatches, so the Python+driver per-launch overhead
         # drops from ~30-50 us/iter to ~2 us/iter at n ~ 600..1500.
-        graph = None if block_precond is not None else self._get_or_build_pcr_iter_graph(A, n, n_pad, device)
+        graph = self._get_or_build_pcr_iter_graph(A, n, n_pad, device, block_precond)
 
         if unchecked:
             for _ in range(max_iter):
@@ -1738,14 +1740,17 @@ class NSNPCRSolver:
         n: int,
         n_pad: int,
         device: wp.Device | str,
+        block_precond: Callable[[wp.array, wp.array], None] | None = None,
     ) -> wp.Graph | None:
         """Look up (or capture on first miss) the single-PCR-iter CUDA graph.
 
-        The graph is keyed by ``(n, A.ptr, A.strides)``: ``n`` controls the
-        launch dimensions, and the pointer and strides control which matrix
-        block the captured matvec reads from.  When any of them changes
-        between solve calls we re-capture; PCR is called repeatedly with the same matrix view
-        within a Newton step so amortised capture overhead is near zero.
+        The graph is keyed by ``(n, A.ptr, A.strides)`` and the block preconditioner: ``n`` controls the launch
+        dimensions, and the pointer and strides control which matrix block the captured matvec reads from. A block
+        preconditioner, a partial of a bound method such as the joint rows' solve, records its launches into the
+        graph too, keyed by the identities of its owner and arguments, which the cache keeps alive; another
+        callable runs the iterations eagerly. When any of them changes between solve calls we re-capture; PCR is
+        called repeatedly with the same matrix view and preconditioner within a Newton step so amortised capture
+        overhead is near zero.
 
         Returns ``None`` if capture is impossible on the active device
         (e.g.  CPU device) so callers fall through to the eager loop.
@@ -1754,12 +1759,21 @@ class NSNPCRSolver:
         dev_obj = wp.get_device(device) if isinstance(device, str) else device
         if not dev_obj.is_cuda:
             return None
+        precond_key, precond_objects = None, ()
+        if block_precond is not None:
+            func = getattr(block_precond, "func", None)
+            owner = getattr(func, "__self__", None)
+            if owner is None or getattr(block_precond, "keywords", None):
+                return None
+            precond_objects = (owner, *block_precond.args)
+            precond_key = (id(owner), getattr(func, "__name__", ""))
+            precond_key += tuple(id(a) if isinstance(a, wp.array) else a for a in block_precond.args)
 
         a_ptr = int(A.__cuda_array_interface__["data"][0])
         # Cache hash combines ``n`` (drives launch dims + n_pad) and the
         # matrix data pointer and strides: a reallocated buffer can return
         # at the same address with a different row pitch.
-        key = (n, a_ptr, tuple(A.strides))
+        key = (n, a_ptr, tuple(A.strides), precond_key)
         if wp.get_device(device).is_capturing:
             # Inside another capture the iterations record into it; a capture here would fail and stick.
             return None
@@ -1768,13 +1782,16 @@ class NSNPCRSolver:
             # Capture lazily. Failures are sticky: we cache ``None`` so
             # we don't retry capture every solve once it has failed (e.g.
             # if some kernel inside the iter body issues an implicit host
-            # allocation that traps the capture).
+            # allocation that traps the capture). The preconditioner's objects stay alive with the graph, so that
+            # no new object takes one of their identities.
             try:
                 with scoped_capture(device) as cap:
                     self._pcr_iter_eager(A, n, n_pad, device)
                 self._pcr_graph_cache = {key: cap.graph}
+                self._pcr_graph_objects = precond_objects
                 return cap.graph
             except RuntimeError:
                 self._pcr_graph_cache = {key: None}
+                self._pcr_graph_objects = precond_objects
                 return None
         return cached
