@@ -654,7 +654,9 @@ Contacts
   on the other layer for a vertex-face self contact or on a static shape, so
   its friction rows pull back the slip that a step's solve leaves instead of
   letting it add up. With the lite operator, that slip lets stacked cloth
-  layers creep apart over seconds. The anchors work with either operator,
+  layers creep apart over seconds; with the full operator, a cloth resting
+  on a surface gathers in-plane stress from it until its contacts slide,
+  after some hundred steps, sooner on some processors. The anchors work with either operator,
   self-contact groups, rod contacts and ``shape_particle_radius_override``;
   edge-edge, vertex-vertex and rod contacts, face contacts, contacts with
   shapes on bodies, and the contacts of a world whose particles touch a body
