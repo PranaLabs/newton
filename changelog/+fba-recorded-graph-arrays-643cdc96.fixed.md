@@ -1,0 +1,1 @@
+Keep the arrays of a `SolverFBA` step recorded into a CUDA graph while the solver lives: a later step outside the graph that replaced the solver's buffers, such as one of another time step or with more contacts than the recorded capacity, freed arrays the graph still launched with. The solver now warns once that such a graph should be recorded again.

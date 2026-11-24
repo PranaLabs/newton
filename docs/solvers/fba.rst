@@ -257,7 +257,14 @@ their targets, so that a graph's steps follow targets the caller writes to that
 array between its launches. Outside a capture a step captures and replays its own
 local-global iterations. A step recorded into a graph, and the solver's own
 captures, run with Python's garbage collector paused, so that no collection
-frees arrays of unreachable reference cycles inside the capture. FBA runs
+frees arrays of unreachable reference cycles inside the capture. The solver
+keeps the arrays of a step recorded into a graph while it lives: a later step
+outside the graph that replaces its buffers, such as one of another ``dt`` or
+with more contacts than the recorded step's capacity, frees none of them, so
+the graph still replays safely, but it no longer shares the new buffers nor
+the state they carry from step to step; the solver then warns once with
+:class:`~newton.exceptions.NewtonWarning` that the graph should be recorded
+again. FBA runs
 on the CPU and on CUDA devices. A step may write its output into its input
 state.
 

@@ -22,7 +22,7 @@ from ...geometry import ParticleFlags
 from ...sim import BodyFlags, Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
 from ..solver import SolverBase
 from ..tendon_state import TendonStateMixin
-from .capture import gc_paused, scoped_capture
+from .capture import gc_paused, reachable_arrays, scoped_capture
 from .joints import JointRowsPrecond
 from .kernels import host_head, stored_contact_count
 
@@ -805,6 +805,10 @@ class SolverFBA(TendonStateMixin, SolverBase):
         # ``_outer_capture`` makes the NSN step record its launches into that capture rather than capture or replay
         # its own graph.
         self._rigid_iter_graph, self._rigid_iter_count, self._outer_capture = None, 0, False
+        # The arrays of the steps recorded into the caller's graphs, kept while the solver lives (step), and
+        # whether a step replaced buffers since (_note_new_buffers) and the solver warned about it.
+        self._recorded_arrays: dict[int, wp.array] = {}
+        self._new_buffers = self._recorded_warned = False
         self.rigid_iteration_graph = bool(rigid_iteration_graph)
         if not (rigid_contact_time >= 0.0 and rigid_contact_damping >= 0.0):
             raise ValueError("rigid_contact_time and rigid_contact_damping must be >= 0")
@@ -1238,6 +1242,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         from .rigid import RigidBlockSolver  # noqa: PLC0415
 
         self._rigid_dt = dt
+        self._note_new_buffers()
         self._rigid_body_flags_h = self.model.body_flags.numpy().copy() if self.model.body_count else None
         if self._warm_start is not None:
             # The multipliers are forces divided by dt^2: those of another dt do not carry over.
@@ -1905,6 +1910,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         key = (C, tuple(sizes), R, id(self._linear_solver))
         if getattr(self, "_tw", None) is not None and self._tw.key == key:
             return
+        self._note_new_buffers()
         if getattr(self, "_rc_gather", None) is None:
             self._rc_gather = RigidContactGather(device)
         self._rc_gather.reserve(C)
@@ -2186,6 +2192,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         from .warm_start import ContactWarmStart  # noqa: PLC0415
 
         C, device = contacts.rigid_contact_shape0.shape[0], self._device
+        self._note_new_buffers()
         if getattr(self, "_rc_gather", None) is None:
             self._rc_gather = RigidContactGather(device)
         self._rc_gather.reserve(C)
@@ -3423,6 +3430,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
 
     def _setup_pd_system(self, dt: float) -> None:
         """Build / rebuild the PD Hessian, factor it, and upload device data."""
+        self._note_new_buffers()
         self._update_materials()
         from .linear_solver import (  # noqa: PLC0415
             FBALinearSolver,
@@ -3704,11 +3712,32 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 if self._swapped_rows is not None:
                     self._swap_rows(self._swapped_rows)
                 self._capacity_step = False
+            if capturing:
+                # The caller's graph launches with this step's arrays: they are kept while the solver lives, so that a
+                # later step outside the graph that replaces buffers frees none of them.
+                self._recorded_arrays.update(reachable_arrays(self))
+                self._new_buffers = self._recorded_warned = False
             if not self._recording() and self._capacity_contacts_capable(contacts):
                 # A later step with these contacts may record into a graph: its buffers are allocated now.
                 self._reserve_capacity(contacts)
                 if self._two_way_capacity_capable(contacts):
                     self._reserve_two_way_capacity(contacts)
+        if self._new_buffers:
+            self._new_buffers = False
+            if self._recorded_arrays and not self._recorded_warned:
+                self._recorded_warned = True
+                warnings.warn(
+                    "SolverFBA replaced buffers after a step was recorded into a CUDA graph: the graph keeps the "
+                    "arrays it recorded and replays safely, but no longer shares the solver's buffers or the state "
+                    "they carry from step to step; record it again",
+                    NewtonWarning,
+                    stacklevel=2,
+                )
+
+    def _note_new_buffers(self) -> None:
+        """Note that the step allocates buffers in place of the solver's: after a step recorded into the caller's
+        graph, :meth:`step` warns that the graph no longer shares them."""
+        self._new_buffers = True
 
     def _recording(self) -> bool:
         """Whether launches are being recorded into a graph, the solver's own (``_outer_capture``) or the caller's:
@@ -3848,6 +3877,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         key = (C, rows, tuple(sizes), face, minima, id(self._linear_solver))
         if getattr(self, "_capacity_key", None) == key:
             return
+        self._note_new_buffers()
         self._capacity_key = key
         self._capacity_rows = rows
         self._ensure_contact_buffers(rows)
@@ -6067,6 +6097,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         """Size the per-contact friction anchor buffers to ``count`` contacts, keeping the step before's anchors."""
         if count <= self._anchor_cap:
             return
+        self._note_new_buffers()
         cap, device = max(int(count * 1.5), 64), self._device
         previous = None
         if self._anchor_cap:
@@ -6181,6 +6212,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         """Lazily allocate per-step contact buffers sized to ``max_contacts``."""
         if hasattr(self, "_contact_buf_max") and self._contact_buf_max >= max_contacts:
             return
+        self._note_new_buffers()
         device = self._device
         # Half again as many as needed, so that a climbing contact count, as of settling cloth, reallocates the
         # buffers, and recaptures the graphs that hold them, at a few steps rather than at every step.
@@ -6829,6 +6861,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         size = self._bsr_lam.size if hasattr(self, "_bsr_lam") else 0
         if size >= n_rows:
             return
+        self._note_new_buffers()
         # Grow with 1.5x headroom so a contact count that ramps up does not reallocate every step.
         cap = max(n_rows, 48) if size == 0 else max(int(n_rows * 1.5), 2 * size)
         for name in "omega_lam w_omega_lam penetration compliance h rhs dlam precond lam omega w_diag".split():
@@ -6917,6 +6950,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
             self._acc_d = wp.zeros(N, dtype=wp.vec3, device=device)
             self._acc_free = wp.zeros(N, dtype=wp.vec3, device=device)
         if self._acc_omega_lam is None or self._acc_omega_lam.shape[0] < n_rows:
+            self._note_new_buffers()
             self._acc_omega_lam = wp.zeros(2 * n_rows, dtype=wp.float64, device=device)
             self._acc_w = wp.zeros(2 * n_rows, dtype=wp.float64, device=device)
 
@@ -6992,6 +7026,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
 
         existing = getattr(self, "_pcr_solver", None)
         if existing is None or existing.max_n < max_n:
+            self._note_new_buffers()
             if existing is not None:
                 max_n = max(max_n, int(1.5 * existing.max_n))
             self._pcr_solver = NSNPCRSolver(
@@ -7027,6 +7062,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         existing_2d = bool(getattr(self, "_nsn_inner_has_2d", False))
         if existing_n >= n_rows and (existing_2d or not alloc_2d):
             return
+        self._note_new_buffers()
         # ``max`` against the current capacity ensures monotonic growth and avoids shrinking after a transient
         # contact-count spike.
         if alloc_2d:
@@ -7331,6 +7367,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
     def _ensure_nsn_sparse_scratch(self, n_rows: int) -> None:
         """Allocate the vectors of the sparse NSN steps for ``n_rows`` rows."""
         if getattr(self, "_nsn_sparse_scratch", None) is None or self._nsn_sparse_scratch[0].shape[0] < n_rows:
+            self._note_new_buffers()
             cap = max(self._nsn_inner_n, n_rows)
             self._nsn_sparse_scratch = [wp.empty(cap, dtype=wp.float64, device=self._device) for _ in range(5)]
 

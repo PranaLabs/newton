@@ -2492,6 +2492,36 @@ class TestGraphCapture(unittest.TestCase):
         self.assertTrue(gc.isenabled())
         self.assertTrue(np.isfinite(s0.particle_q.numpy()).all())
 
+    def test_recorded_graph_keeps_its_arrays(self):
+        """Keep the arrays of a step recorded into the caller's graph when later steps outside it replace the solver's
+        buffers, here by factoring the system for another dt: the solver warns once that the graph no longer shares
+        its buffers, and the graph still replays on the arrays it recorded."""
+        dt = 1.0 / 120.0
+        model, solver, pipeline, contacts = self._cloth_on_box(mode="full", soft_contact_max=400)
+        s0, s1 = model.state(), model.state()
+        pipeline.collide(s0, contacts)
+        solver.step(s0, s1, None, contacts, dt)
+        with wp.ScopedCapture() as capture:
+            pipeline.collide(s1, contacts)
+            solver.step(s1, s0, None, contacts, dt)
+        recorded = dict(solver._recorded_arrays)
+        old = solver._capacity_active_d
+        self.assertIn(id(old), recorded)
+        factor = [a for a in vars(solver._linear_solver).values() if isinstance(a, wp.array)]
+        self.assertTrue(factor and all(id(a) in recorded for a in factor))
+        with self.assertWarnsRegex(newton.exceptions.NewtonWarning, "recorded into a CUDA graph") as caught:
+            for _ in range(2):
+                pipeline.collide(s0, contacts)
+                solver.step(s0, s1, None, contacts, 0.5 * dt)
+        self.assertEqual(sum("recorded into a CUDA graph" in str(w.message) for w in caught.warnings), 1)
+        self.assertIsNot(solver._capacity_active_d, old)
+        del old
+        gc.collect()
+        self.assertTrue(all(solver._recorded_arrays.get(key) is array for key, array in recorded.items()))
+        for _ in range(3):
+            wp.capture_launch(capture.graph)
+        self.assertTrue(np.isfinite(s0.particle_q.numpy()).all())
+
     def test_full_contacts_replay_from_a_graph(self):
         """Record the collision and two steps of a cloth with the full operator falling onto a box into a graph, after
         a step outside it, and reach the same states, bit for bit, as the same steps taken eagerly through the
