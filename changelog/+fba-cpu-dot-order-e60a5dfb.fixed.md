@@ -1,0 +1,1 @@
+Fix `SolverFBA` taking other sums for a world alone than for the same world among others on some CPUs, such as Linux on arm64: the PCR solves of a single system added their CPU dot products with `wp.utils.array_inner`, whose native reduction runs in an order of its own there, and those of several worlds in row order; both now add in row order.
