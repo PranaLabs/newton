@@ -405,6 +405,13 @@ def _div_scalar_kernel(
 
 
 @wp.kernel
+def _dense_diag_kernel(A: wp.array2d[wp.float64], diag: wp.array[wp.float64]):
+    """``diag = diag(A)``."""
+    i = wp.tid()
+    diag[i] = A[i, i]
+
+
+@wp.kernel
 def _diag_scale_kernel(
     A: wp.array2d[wp.float64],
     v: wp.array[wp.float64],
@@ -1437,6 +1444,8 @@ class NSNPCRSolver:
         # convergence, and those of a zero right-hand side, leave the iterate unchanged.
         unchecked = max_iter <= self.check_every
         self._fixed_sums = fixed_sums and unchecked
+        if self._fixed_sums and self.fuses_single(n):
+            return self._fused_dense(A, b, x_out, block_precond), None
         tile_k = int(_PCR_TILE_K)
         n_pad = ((n + tile_k - 1) // tile_k) * tile_k
 
@@ -1818,6 +1827,71 @@ class NSNPCRSolver:
             else:
                 inputs = [*matrix, s, n, h, prho]
                 wp.launch_tiled(_fused_pcr_mv_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
+            inputs = [prho, self._fused_rho, slot, n, s, h, d, q]
+            wp.launch_tiled(_fused_pcr_direction_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
+        wp.copy(x_out, x, count=n)
+        return max_iter
+
+    def _fused_dense(
+        self, A: wp.array2d[wp.float64], b: wp.array[wp.float64], x_out: wp.array[wp.float64], block_precond
+    ):
+        """:meth:`solve` of a fixed iteration count with ``fixed_sums``, as :meth:`_fused_single` runs a sparse
+        matrix: five launches per iteration, six with a block preconditioner besides its own, that read nothing from
+        the device, in place of some twenty. The dot products reduce in blocks of rows that every block sums alike,
+        so that the run is deterministic; the product by ``A`` takes one block of threads per row
+        (:func:`_matvec_tiled_kernel`). Sums run in another order than the iteration of :meth:`_pcr_iter_eager`, so
+        results differ by rounding. Returns the iterations taken."""
+        n = int(b.shape[0])
+        nb = (n + _FUSED_BLOCK - 1) // _FUSED_BLOCK
+        max_iter = min(self.max_iter, n)
+        device = self.device
+        n_pad = ((n + int(_PCR_TILE_K) - 1) // int(_PCR_TILE_K)) * int(_PCR_TILE_K)
+        pden, pcurv, pchart, prho = (self._fused_partials[k][:nb] for k in range(4))
+        x, r, s, d, q, h = (a[:n] for a in (self._x, self._r, self._s, self._d, self._q, self._h))
+        precond, diag = self._precond[:n], self._diag[:n]
+
+        def product(v, out):
+            wp.launch_tiled(
+                _matvec_tiled_kernel,
+                dim=n,
+                inputs=[A, v, n_pad],
+                outputs=[out],
+                block_dim=_PCR_BLOCK_DIM,
+                device=device,
+            )
+            wp.launch_tiled(
+                _fused_pcr_rho_kernel, dim=[nb], inputs=[s, out, prho], block_dim=_FUSED_BLOCK, device=device
+            )
+
+        x.zero_()
+        wp.launch(_dense_diag_kernel, n, [A], [diag], device=device)
+        wp.launch(_precond_from_bsr_diag_kernel, n, [diag], [precond], device=device)
+        wp.copy(r, b, count=n)
+        wp.launch(_apply_precond_kernel, n, [r, precond], [s], device=device)
+        if block_precond is not None:
+            block_precond(r, s)
+        wp.copy(d, s, count=n)
+        # q = A d and rho = s . q, with d = s.
+        product(d, q)
+        wp.launch(_dot_finish_kernel, 1, [prho, nb], [self._fused_rho[0:1]], device=device)
+        self._stopped_d.zero_()
+        for k in range(max_iter):
+            slot = k % 2
+            if block_precond is None:
+                inputs = [q, precond, d, diag, h, pden, pcurv, pchart]
+                wp.launch_tiled(_fused_pcr_dots_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
+            else:
+                wp.launch(_apply_precond_kernel, n, [q, precond], [h], device=device)
+                block_precond(q, h)
+                inputs = [q, h, d, diag, pden, pcurv, pchart]
+                wp.launch_tiled(
+                    _fused_pcr_dots_given_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device
+                )
+            inputs = [pden, pcurv, pchart, self._fused_rho, slot, self._eta, n, d, q, h, self._stopped_d, x, r, s]
+            inputs += [0, s, s]
+            wp.launch_tiled(_fused_pcr_step_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
+            # h = A s and the block sums of s . h.
+            product(s, h)
             inputs = [prho, self._fused_rho, slot, n, s, h, d, q]
             wp.launch_tiled(_fused_pcr_direction_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
         wp.copy(x_out, x, count=n)

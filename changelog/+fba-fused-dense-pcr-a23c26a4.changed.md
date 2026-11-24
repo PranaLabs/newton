@@ -1,0 +1,1 @@
+Run the dense PCR solves of `SolverFBA` steps recorded into CUDA graphs, of a fixed iteration count, in five launches per iteration in place of some twenty, as the sparse solves already run: `cloth_on_boxes_fba` takes 7.5 ms per frame in place of 8.3 ms on an RTX 5090. The sums of the iteration add in another order, so results differ by rounding.
