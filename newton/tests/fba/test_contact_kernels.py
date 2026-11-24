@@ -141,6 +141,7 @@ class TestAddContactThicknessKernel(unittest.TestCase):
         shape = wp.array([0, 0, -1], dtype=wp.int32)
         offset = wp.array([1.0, 2.0, 3.0], dtype=wp.float64)
         inputs = [particle, extra_particle, extra_alpha, 1, shape, radius, margin, wp.empty(1, dtype=wp.float32), 0]
+        inputs.append(wp.empty(0, dtype=wp.int32))
         wp.launch(K.add_contact_thickness_kernel, dim=3, inputs=inputs, outputs=[offset])
         np.testing.assert_allclose(offset.numpy(), [1.0025, 2.0025, 3.004], rtol=0.0, atol=1e-9)
 
@@ -156,8 +157,22 @@ class TestAddContactThicknessKernel(unittest.TestCase):
         offset = wp.array([1.0, 2.0, 3.0], dtype=wp.float64)
         shape_radius = wp.array([0.0002, -1.0], dtype=wp.float32)
         inputs = [particle, extra_particle, extra_alpha, 1, shape, radius, margin, shape_radius, 1]
+        inputs.append(wp.empty(0, dtype=wp.int32))
         wp.launch(K.add_contact_thickness_kernel, dim=3, inputs=inputs, outputs=[offset])
         np.testing.assert_allclose(offset.numpy(), [1.0007, 2.0007, 3.004], rtol=0.0, atol=1e-9)
+
+    def test_shape_rows(self):
+        """Keep the offsets of the rows from the shape rows' count on, the contacts between particles that follow
+        the shape contacts."""
+        radius = wp.array([0.001, 0.002], dtype=wp.float32)
+        particle = wp.array([0, 1, 1], dtype=wp.int32)
+        shape = wp.array([0, -1, -1], dtype=wp.int32)
+        offset = wp.array([1.0, 2.0, 3.0], dtype=wp.float64)
+        inputs = [particle, wp.empty((1, 1), dtype=wp.int32), wp.empty((1, 1), dtype=wp.float32), 0, shape, radius]
+        inputs += [wp.array([0.0005], dtype=wp.float32), wp.empty(1, dtype=wp.float32), 0]
+        inputs.append(wp.array([1], dtype=wp.int32))
+        wp.launch(K.add_contact_thickness_kernel, dim=3, inputs=inputs, outputs=[offset])
+        np.testing.assert_allclose(offset.numpy(), [1.0015, 2.0, 3.0], rtol=0.0, atol=1e-9)
 
     def test_equal_radii_stay_exact(self):
         """Give a face contact exactly the radius its particles share, whatever its weights."""
@@ -171,6 +186,7 @@ class TestAddContactThicknessKernel(unittest.TestCase):
             wp.zeros(1, dtype=wp.float32),
             wp.empty(1, dtype=wp.float32),
             0,
+            wp.empty(0, dtype=wp.int32),
         ]
         wp.launch(K.add_contact_thickness_kernel, dim=1, inputs=inputs, outputs=[offset])
         self.assertEqual(offset.numpy()[0], float(np.float32(0.01)))

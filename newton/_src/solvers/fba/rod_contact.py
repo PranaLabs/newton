@@ -12,7 +12,7 @@ import numpy as np
 import warp as wp
 
 from ...sim import Model
-from .kernels import host_head
+from .kernels import _INERT_KEY, capacity_key_count_kernel, host_head
 from .self_contact import _in_ring, iota_kernel
 
 wp.set_module_options({"enable_backward": False})
@@ -248,6 +248,104 @@ def gather_capsule_contacts_kernel(
     out_margin[k] = margin[i]
 
 
+@wp.kernel
+def inert_held_rod_contacts_kernel(
+    count: wp.array[wp.int32],
+    particles: wp.array2d[wp.int32],
+    alpha: wp.array2d[wp.float32],
+    pinned: wp.array[wp.int32],  # 1 for each particle the solver holds, or empty
+    # outputs
+    keys: wp.array[wp.int64],
+):
+    """The inert key for the slots past the contacts found and for the contacts whose particles of nonzero weight the
+    solver all holds, which the host path drops, so that they sort last."""
+    k = wp.tid()
+    if k >= count[0]:
+        keys[k] = _INERT_KEY
+        return
+    if pinned.shape[0] == 0:
+        return
+    free = bool(False)
+    for j in range(4):
+        p = particles[k, j]
+        if p >= 0 and alpha[k, j] != 0.0:
+            if pinned[p] == 0:
+                free = True
+    if not free:
+        keys[k] = _INERT_KEY
+
+
+@wp.kernel
+def capacity_rod_rows_kernel(
+    order: wp.array[wp.int32],
+    particles: wp.array2d[wp.int32],
+    alpha: wp.array2d[wp.float32],
+    normal: wp.array[wp.vec3],
+    margin: wp.array[wp.float32],
+    rod_count: wp.array[wp.int32],
+    first: wp.array[wp.int32],
+    limit: int,
+    # outputs
+    row_particle: wp.array[wp.int32],
+    row_normal: wp.array[wp.vec3],
+    row_alpha: wp.array[wp.float32],
+    row_shape: wp.array[wp.int32],
+    row_body_pos: wp.array[wp.vec3],
+    row_record: wp.array[wp.int32],
+    extra_particle: wp.array2d[wp.int32],  # (rows, 3)
+    extra_alpha: wp.array2d[wp.float32],
+):
+    """The contact rows of the ``rod_count[0]`` sorted contacts from row ``first[0]`` on, up to row ``limit``, as the
+    host path lays out rod contacts: their first particle and its weight, the others as the further particles, and
+    an anchor the contact's margin along its normal."""
+    k = wp.tid()
+    row = first[0] + k
+    if k >= rod_count[0] or row >= limit:
+        return
+    i = order[k]
+    n = normal[i]
+    row_particle[row] = particles[i, 0]
+    row_normal[row] = n
+    row_alpha[row] = alpha[i, 0]
+    row_shape[row] = -1
+    row_body_pos[row] = margin[i] * n
+    row_record[row] = -1
+    for j in range(3):
+        extra_particle[row, j] = particles[i, j + 1]
+        extra_alpha[row, j] = alpha[i, j + 1]
+
+
+@wp.kernel
+def capacity_rod_total_kernel(
+    rod_count: wp.array[wp.int32],
+    limit: int,
+    # outputs
+    active: wp.array[wp.int32],
+    first: wp.array[wp.int32],
+):
+    """The active contacts with the rod contacts after them, at most ``limit``, and the first rod contact's row."""
+    first[0] = active[0]
+    active[0] = wp.min(active[0] + rod_count[0], limit)
+
+
+@wp.kernel
+def capacity_rod_gain_kernel(
+    rod_count: wp.array[wp.int32],
+    gain: wp.float64,
+    reset: int,
+    # outputs
+    contact_gain: wp.array[wp.float64],
+):
+    """Each contact's gain of the diagonal of its rows: ``gain`` when the step found rod contacts, as the host path
+    regularizes the rows of steps with contacts on further particles, otherwise 1 with ``reset`` or the gain that the
+    face contacts set."""
+    c = wp.tid()
+    if rod_count[0] > 0:
+        contact_gain[c] = gain
+    elif reset != 0:
+        contact_gain[c] = wp.float64(1.0)
+
+
 def segment_rings(segments: np.ndarray, particle_count: int, rings: int) -> tuple[np.ndarray, np.ndarray]:
     """Sorted CSR of the particles within ``rings`` segments of each particle along the segments, the particle
     included."""
@@ -329,6 +427,48 @@ class RodContact:
         self.alpha = wp.empty((capacity, 4), dtype=wp.float32, device=self.device)
         self.normal = wp.empty(capacity, dtype=wp.vec3, device=self.device)
         self.margin = wp.empty(capacity, dtype=wp.float32, device=self.device)
+
+    def capacity(self) -> int:
+        """The contacts that :meth:`capacity_rows` takes, four per segment, as the first buffers of :meth:`detect`."""
+        return 4 * self.segments.shape[0]
+
+    def reserve_capacity(self, capacity: int) -> None:
+        """The buffers of :meth:`capacity_rows` for ``capacity`` contacts, so that a step recorded into a graph
+        allocates nothing."""
+        if self.particles.shape[0] != capacity:
+            self._allocate(capacity)
+        self.sorted_count = wp.zeros(1, dtype=wp.int32, device=self.device)
+        self.first = wp.zeros(1, dtype=wp.int32, device=self.device)
+
+    def capacity_rows(
+        self, q: wp.array, pinned: wp.array, active: wp.array, limit: int, rows: list, extra: list
+    ) -> None:
+        """The contacts at ``q`` found, sorted and laid out as contact rows on the device alone, nothing read back:
+        the contacts of :meth:`detect` in its order, those of held particles alone (``pinned``) and those past the
+        buffers of :meth:`reserve_capacity` dropped, written from row ``active[0]`` on, up to row ``limit``, into
+        ``rows`` (particle, normal, alpha, shape, body_pos, record) and ``extra`` (further particles and weights, three
+        per row); ``active[0]`` then counts them too and ``first[0]`` holds their first row. ``count`` keeps the
+        contacts found, past the buffers too."""
+        self._bounds(q)
+        self.bvh.refit()
+        n_segments, n_particles, capacity = self.segments.shape[0], q.shape[0], self.particles.shape[0]
+        self.count.zero_()
+        outputs = [self.count, self.keys, self.particles, self.alpha, self.normal, self.margin]
+        inputs = [q, self.world, self.segments, self.radius, self.owner, self.adjacent_offsets, self.adjacent]
+        inputs += [self.bvh.id, self.ring_offsets, self.ring, self.gap]
+        wp.launch(vertex_segment_contacts_kernel, n_particles, inputs, outputs, device=self.device)
+        inputs = [q, self.world, self.segments, self.radius, self.bvh.id, self.lower, self.upper]
+        inputs += [self.ring_offsets, self.ring, self.gap, wp.int64(n_particles * n_segments)]
+        wp.launch(segment_segment_contacts_kernel, n_segments, inputs, outputs, device=self.device)
+        inputs = [self.count, self.particles, self.alpha, pinned]
+        wp.launch(inert_held_rod_contacts_kernel, capacity, inputs, [self.keys], device=self.device)
+        wp.launch(iota_kernel, capacity, outputs=[self.order], device=self.device)
+        wp.utils.radix_sort_pairs(self.keys, self.order, capacity)
+        wp.launch(capacity_key_count_kernel, capacity, [self.keys[:capacity]], [self.sorted_count], device=self.device)
+        inputs = [self.order, self.particles, self.alpha, self.normal, self.margin, self.sorted_count, active, limit]
+        wp.launch(capacity_rod_rows_kernel, capacity, inputs, [*rows, *extra], device=self.device)
+        outputs = [active, self.first]
+        wp.launch(capacity_rod_total_kernel, 1, [self.sorted_count, limit], outputs, device=self.device)
 
     def detect(self, q: wp.array) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Particles and coefficients, shape ``(C, 4)`` with particle ``-1`` in unused slots, normals, shape

@@ -34,15 +34,17 @@ _PCR_CHECK_EVERY = 25
 """The PCR solver's iterations per convergence check: a solve of at most this many fixed iterations reads nothing
 back."""
 
-_PEAK_KINDS = ("soft", "full", "rigid", "rigid_rows")
+_PEAK_KINDS = ("soft", "full", "rigid", "rigid_rows", "rod")
 """The kinds of contacts whose most per step :meth:`SolverFBA.dropped_contacts` reports, by slot: those of the soft
 contact buffer, the active ones of a full-operator step recorded into a graph, which takes at most
-:data:`_CAPACITY_LARGEST` of them, those of the rigid contact buffer, and the rigid contacts that a step recorded into
-a graph cut because the entries of their rows in ``W`` outgrew its storage (:data:`_RIGID_PATTERN_BLOCKS`)."""
+:data:`_CAPACITY_LARGEST` of them, those of the rigid contact buffer, the rigid contacts that a step recorded into
+a graph cut because the entries of their rows in ``W`` outgrew its storage (:data:`_RIGID_PATTERN_BLOCKS`), and the
+rod contacts that such a step finds, of which it takes four per segment."""
 _PEAK_SOFT = 0
 _PEAK_FULL = 1
 _PEAK_RIGID = 2
 _PEAK_RIGID_ROWS = 3
+_PEAK_ROD = 4
 _RIGID_PATTERN_BLOCKS = 32
 """The 3x3 blocks of ``W`` per slot of the rigid contact buffer that a step of rigid contacts recorded into a graph
 holds, beside those of its joint rows: a contact's block row holds a block for each contact on its bodies."""
@@ -3774,11 +3776,11 @@ class SolverFBA(TendonStateMixin, SolverBase):
         if contacts is not None and self.model.particle_count and contacts.soft_contact_particle.shape[0]:
             if not self._capacity_contacts_capable(contacts):
                 return (
-                    "steps with contacts record into a graph only with friction=True, one world, particle-shape and "
-                    "face contacts alone (no self, rod or rod shape contacts, particle constraint rows, "
+                    "steps with contacts record into a graph only with friction=True, one world, particle-shape, "
+                    "face and rod contacts alone (no self or rod shape contacts, particle constraint rows, "
                     "contact_warmstart, friction_anchors or nsn_lite_accumulate) and nsn_schur_mode='lite' without "
-                    "face contacts, or 'full' with a dense W (nsn_sparse_storage=False) and nsn_linear_iterations at "
-                    "most 25; otherwise pass contacts=None"
+                    "face or rod contacts, or 'full' with a dense W (nsn_sparse_storage=False) and "
+                    "nsn_linear_iterations at most 25; otherwise pass contacts=None"
                 )
             if self._capacity_reserved != contacts.soft_contact_particle.shape[0]:
                 return (
@@ -3786,8 +3788,13 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 )
             if not wp.is_mempool_enabled(self._device):
                 return "the step's sort of the contacts needs the device's memory pool (wp.set_mempool_enabled)"
-        if self._self_contact is not None or self._rod_contact is not None:
-            return "self contacts and rod contacts are found on the host"
+        if self._self_contact is not None:
+            return "self contacts are found on the host"
+        if self._rod_contact is not None and not self._capacity_contacts_capable(contacts):
+            return (
+                "rod contacts record into a graph only beside a buffer of particle contacts, with the full operator, "
+                f"a dense W (nsn_sparse_storage=False) and nsn_linear_iterations at most {_PCR_CHECK_EVERY}"
+            )
         if self._segment_query is not None:
             return "rod shape contacts are found on the host"
         if self._face_query is not None and self.face_contact_gap is not None:
@@ -3846,7 +3853,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
             and self.friction
             and self.model.world_count == 1
             and self._self_contact is None
-            and self._rod_contact is None
+            and (self._rod_contact is None or full)
             and self._segment_query is None
             and (self._face_query is None or full)
             and self._constraint_rows is None
@@ -3867,6 +3874,10 @@ class SolverFBA(TendonStateMixin, SolverBase):
         minima = face and self._mesh_shapes
         keys = 4 * C if minima else C
         most = keys + (self.model.shape_count * self.model.tri_count if face else 0)
+        # The rod contacts follow the others, four per segment at most.
+        rod = full and self._rod_contact is not None
+        rod_capacity = self._rod_contact.capacity() if rod else 0
+        most += rod_capacity
         if self._two_way_capacity_capable(contacts):
             # The rigid contacts follow the deformable ones in the two-way steps' buckets.
             most += contacts.rigid_contact_shape0.shape[0]
@@ -3874,7 +3885,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         rows = max(C, sizes[-1])
         # Steps outside a graph reserve at every step; the buffers of the same capacity stay those of the graphs that
         # recorded them.
-        key = (C, rows, tuple(sizes), face, minima, id(self._linear_solver))
+        key = (C, rows, tuple(sizes), face, minima, rod_capacity, id(self._linear_solver))
         if getattr(self, "_capacity_key", None) == key:
             return
         self._note_new_buffers()
@@ -3897,7 +3908,9 @@ class SolverFBA(TendonStateMixin, SolverBase):
         if full:
             # The buckets of the full operator: a dense W of each size's rows, and the NSN step's matrices and the PCR
             # solver for the largest.
-            self._linear_solver.reserve_schur_capacity(rows, sizes, extra_width=2 if face else 0)
+            # Face contacts take two further particles, rod contacts three.
+            width = 3 if rod else (2 if face else 0)
+            self._linear_solver.reserve_schur_capacity(rows, sizes, extra_width=width)
             self._capacity_sizes = sizes
             self._capacity_sizes_d = wp.array(sizes, dtype=wp.int32, device=device)
             self._capacity_take_d = wp.zeros(len(sizes), dtype=wp.int32, device=device)
@@ -3906,6 +3919,17 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 self._nsn_mu_d = wp.zeros(max(rows, 16), dtype=wp.float64, device=device)
             self._ensure_nsn_inner_buffers(3 * sizes[-1], alloc_2d=True)
             self._contact_peak_capacity[_PEAK_FULL] = sizes[-1]
+            self._capacity_rod_extra = self._capacity_rod_gain = self._capacity_gain = None
+            if rod:
+                self._rod_contact.reserve_capacity(rod_capacity)
+                self._contact_peak_capacity[_PEAK_ROD] = rod_capacity
+                if not face:
+                    # The rod contacts' further particles and weights, and each contact's gain of its rows' diagonal.
+                    self._capacity_rod_extra = [
+                        wp.full((rows, 3), -1, dtype=wp.int32, device=device),
+                        wp.zeros((rows, 3), dtype=wp.float32, device=device),
+                    ]
+                    self._capacity_rod_gain = wp.ones(sizes[-1], dtype=wp.float64, device=device)
             self._capacity_face = None
             if face:
                 # The face contacts' further particles and weights, the active particle contacts that they follow,
@@ -3914,8 +3938,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 self._face_query.reserve_capacity(self.model)
                 self._capacity_face = SimpleNamespace(
                     extra=[
-                        wp.full((rows, 2), -1, dtype=wp.int32, device=device),
-                        wp.zeros((rows, 2), dtype=wp.float32, device=device),
+                        wp.full((rows, width), -1, dtype=wp.int32, device=device),
+                        wp.zeros((rows, width), dtype=wp.float32, device=device),
                     ],
                     first=wp.zeros(1, dtype=wp.int32, device=device),
                     gain=wp.ones(sizes[-1], dtype=wp.float64, device=device),
@@ -4009,6 +4033,29 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 face.gain,
             )
             self._contact_extra = face.extra
+        self._capacity_gain = None if face is None else face.gain
+        if self._rod_contact is not None and self.nsn_schur_mode == "full":
+            from .rod_contact import capacity_rod_gain_kernel  # noqa: PLC0415
+
+            # The rod contacts follow, as the host path orders them; with face contacts, in their further particles.
+            extra = face.extra if face is not None else self._capacity_rod_extra
+            if face is None:
+                extra[0].fill_(-1)
+                extra[1].zero_()
+            inputs = [self._rod_contact.count, _PEAK_ROD]
+            pinned_rows = self._pinned_d if self._pinned_d is not None else wp.empty(0, dtype=wp.int32, device=device)
+            rod = self._rod_contact
+            rod.capacity_rows(
+                src.particle_q, pinned_rows, self._capacity_active_d, self._capacity_sizes[-1], outputs, extra
+            )
+            wp.launch(contact_peak_kernel, 1, inputs, [self._contact_peak_d], device=device)
+            self._contact_extra = extra
+            # Steps with rod contacts regularize the rows, as the host path does those of contacts on further
+            # particles.
+            gain = face.gain if face is not None else self._capacity_rod_gain
+            inputs = [rod.sorted_count, wp.float64(1.0 + self.contact_regularization), int(face is None)]
+            wp.launch(capacity_rod_gain_kernel, gain.shape[0], inputs, [gain], device=device)
+            self._capacity_gain = gain
         if self.nsn_schur_mode == "full":
             # The active contacts' count picks the bucket of the step (_full_capacity_correction).
             from .kernels import capacity_bucket_kernel  # noqa: PLC0415
@@ -4047,9 +4094,9 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 ls.use_schur_capacity(size)
             self._launch_contact_residual(self._nsn_r_d)
             self._launch_contact_pene0(self._nsn_pene0_d)
-            # Face contacts act on particles that also carry particle contacts: steps that find them regularize the
-            # rows, as the host path does, each contact's gain set on the device.
-            face = self._capacity_face
+            # Face and rod contacts act on particles that also carry particle contacts: steps that find them
+            # regularize the rows, as the host path does, each contact's gain set on the device.
+            gain = self._capacity_gain
             self._solve_nsn_coulomb_gpu(
                 None,
                 None,
@@ -4066,8 +4113,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 skip_download=True,
                 m_contacts=size,
                 n_bilateral=0,
-                contact_scale=None if face is None else face.gain,
-                contact_regularization=0.0 if face is None else self.contact_regularization,
+                contact_scale=gain,
+                contact_regularization=0.0 if gain is None else self.contact_regularization,
             )
             self._deformable_contact_tail(ls, 3 * size)
         finally:
@@ -4106,6 +4153,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
                     )
                 elif kind == _PEAK_FULL:
                     name, reason = "soft", f"beyond the {capacity} that a step with the full operator takes"
+                elif kind == _PEAK_ROD:
+                    name, reason = "rod", f"beyond the {capacity}, four per segment, that such a step takes"
                 else:
                     name = "rigid"
                     reason = (
@@ -6562,6 +6611,9 @@ class SolverFBA(TendonStateMixin, SolverBase):
             inputs = [self._contact_particle_d, *extra, int(self._contact_extra is not None)]
             inputs += [self._contact_shape_d, model.particle_radius, model.shape_margin]
             inputs += [shape_radius, int(self._shape_radius_d is not None)]
+            # On the capacity path, the rod contacts follow the shape contacts from the row the device holds.
+            rod_rows = self._capacity_step and self._rod_contact is not None and self.nsn_schur_mode == "full"
+            inputs.append(self._rod_contact.first if rod_rows else wp.empty(0, dtype=wp.int32, device=device))
             wp.launch(add_contact_thickness_kernel, shape_contacts, inputs, [self._contact_offset_d], device=device)
         if self._capacity_step:
             from .kernels import inert_contact_offset_kernel  # noqa: PLC0415
