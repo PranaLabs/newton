@@ -3,7 +3,6 @@
 
 import gc
 import math
-import sys
 import unittest
 import warnings
 from unittest import mock
@@ -4990,10 +4989,11 @@ class TestContactForceObservable(unittest.TestCase):
     """CONTACT_F rows of a cloth resting on the ground."""
 
     def test_resting_cloth_weighs_on_the_ground(self):
-        """Report the cloth's weight on the ground, with torques about the origin, in the full and the lite solve."""
-        if sys.platform == "darwin" and not wp.get_device().is_cuda:
-            # On the macOS CPU the full solve leaves 7% of the weight as a horizontal contact force; the cause is open.
-            self.skipTest("the full solve's settled contact forces differ on the macOS CPU")
+        """Report the cloth's weight on the ground, with torques about the origin, in the full and the lite solve.
+
+        The full solve holds the cloth at the points its contacts press on (``friction_anchors``): without them, a
+        resting contact keeps the slip each step leaves, and the cloth gathers in-plane stress until it slides, after
+        some hundred steps, sooner on some processors (the macOS CPU at about 120 steps of 1/60 s)."""
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
         builder.add_ground_plane()
         builder.add_cloth_grid(
@@ -5013,7 +5013,8 @@ class TestContactForceObservable(unittest.TestCase):
         pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.05)
         contacts = pipeline.contacts()
         for mode in ("full", "lite"):
-            solver, s0, s1 = SolverFBA(model, nsn_schur_mode=mode), model.state(), model.state()
+            solver = SolverFBA(model, nsn_schur_mode=mode, friction_anchors=mode == "full")
+            s0, s1 = model.state(), model.state()
             observables = solver.observables({solver.ObservableKind.CONTACT_F}, contacts=contacts)
             for _ in range(120):
                 pipeline.collide(s0, contacts)
