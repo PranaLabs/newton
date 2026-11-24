@@ -28,7 +28,18 @@ wp.set_module_options({"enable_backward": False})
 
 @wp.func
 def shape_sdf(geo_type: int, scale: wp.vec3, mesh: wp.uint64, x: wp.vec3, edge_radius: float) -> wp.vec4:
+    """Signed distance [m] and its gradient at ``x`` in the shape frame (:func:`shape_sdf_within`)."""
+    return shape_sdf_within(geo_type, scale, mesh, x, edge_radius, 1.0e6)
+
+
+@wp.func
+def shape_sdf_within(
+    geo_type: int, scale: wp.vec3, mesh: wp.uint64, x: wp.vec3, edge_radius: float, reach: float
+) -> wp.vec4:
     """Signed distance [m] and its gradient at ``x`` in the shape frame; ``1e6`` for unsupported shapes.
+
+    A mesh's query looks for its closest point within ``reach`` [mesh units] of ``x`` first, which prunes its
+    bounding volumes sooner, and past it only if it finds none there.
 
     Box and cylinder edges are rounded by ``edge_radius``: inside a sharp edge the gradient jumps
     between the two faces, so a point that sinks into the edge would flip its normal. Barrel cylinders
@@ -38,7 +49,10 @@ def shape_sdf(geo_type: int, scale: wp.vec3, mesh: wp.uint64, x: wp.vec3, edge_r
     d = float(1.0e6)
     g = wp.vec3(0.0, 0.0, 1.0)
     if geo_type == GeoType.MESH or geo_type == GeoType.CONVEX_MESH:
-        q = wp.mesh_query_point_sign_normal(mesh, wp.cw_div(x, scale), 1.0e6)
+        local = wp.cw_div(x, scale)
+        q = wp.mesh_query_point_sign_normal(mesh, local, reach)
+        if not q.result and reach < 1.0e6:
+            q = wp.mesh_query_point_sign_normal(mesh, local, 1.0e6)
         if q.result:
             delta = x - wp.cw_mul(wp.mesh_eval_position(mesh, q.face, q.u, q.v), scale)
             d = q.sign * wp.length(delta)
@@ -116,8 +130,15 @@ def deepest_point(P: wp.mat33, geo: int, scale: wp.vec3, mesh: wp.uint64, r: flo
     )
     w = wp.vec3(0.0)
     w[min_index(d)] = 1.0
+    # The distance changes by at most the length moved, so no point of the triangle is farther from a mesh than its
+    # nearest vertex and the triangle's longest edge; in mesh units, divided by the least scale.
+    longest = wp.max(wp.length(P[1] - P[0]), wp.max(wp.length(P[2] - P[1]), wp.length(P[0] - P[2])))
+    least_scale = wp.min(scale[0], wp.min(scale[1], scale[2]))
+    reach = float(1.0e6)
+    if least_scale > 0.0:
+        reach = wp.min(reach, 1.001 * (wp.min(wp.abs(d)) + longest) / least_scale + 1.0e-6)
     for k in range(iterations):
-        sd = shape_sdf(geo, scale, mesh, w @ P, r)
+        sd = shape_sdf_within(geo, scale, mesh, w @ P, r, reach)
         # Step toward the vertex with the lowest directional derivative until the Frank-Wolfe gap closes.
         a = P @ wp.vec3(sd[1], sd[2], sd[3])
         j = min_index(a)
