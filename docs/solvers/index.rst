@@ -41,7 +41,7 @@ method details. For symptom-driven diagnosis and parameter tuning, start with
 Choosing a Solver
 -----------------
 
-MuJoCo, Kamino, VBD, and FBA currently have dedicated backend guides:
+MuJoCo, Kamino, VBD, FBA, and APIC water currently have dedicated backend guides:
 
 - :doc:`MuJoCo <mujoco>` — generalized-coordinate rigid-body simulation and
   MuJoCo or MJCF workflows.
@@ -51,6 +51,9 @@ MuJoCo, Kamino, VBD, and FBA currently have dedicated backend guides:
   bodies in a single VBD-based solver; experimental.
 - :doc:`FBA <fba>`: projective dynamics for cloth and soft bodies with
   non-penetrating frictional contact among them and rigid bodies;
+  experimental.
+- :doc:`APIC water <apic_water>`: incompressible water with a free surface,
+  particles on a grid with a cut-cell pressure solve, coupled to rigid bodies;
   experimental.
 
 The other solver backends are documented through their linked API references
@@ -84,6 +87,14 @@ Supported Features
      - Cloth
      - Soft bodies
      - Differentiable
+   * - :class:`~newton.solvers.SolverAPICWater`
+     - Pressure projection
+     - 🟨 :sup:`3` coupled
+     - ❌
+     - ✅ water
+     - ❌
+     - ❌
+     - ❌
    * - :class:`~newton.solvers.SolverFBA`
      - Implicit
      - ✅ maximal coordinates
@@ -169,6 +180,7 @@ Supported Features
   Set ``use_mujoco_contacts=False`` to use Newton's collision pipeline.
 | :sup:`2` ``basic`` means Newton includes several examples that use these solvers in diffsim workflows,
   see :ref:`Differentiability` for further details.
+| :sup:`3` The water's pressure acts on rigid bodies that another solver integrates; see :doc:`apic_water`.
 
 .. experimental::
     :class:`~newton.solvers.SolverSteel`'s public API and behavior may change without prior notice.
@@ -179,6 +191,10 @@ Supported Features
 
 .. experimental::
     :class:`~newton.solvers.SolverVBD`'s public API and behavior may change without prior notice.
+
+.. experimental::
+    :class:`~newton.solvers.SolverAPICWater`'s public API and behavior may change without prior notice.
+    It requires a CUDA device and one world.
 
 .. experimental::
     :class:`~newton.solvers.SolverFBA`'s public API and behavior may change without prior notice.
@@ -244,7 +260,8 @@ constraints, with unified compliant ALM by default and a deprecated legacy AVBD 
 :class:`~newton.solvers.SolverFBA` enforces joints as bilateral maximal-coordinate constraints, and the drives,
 damping, armature, effort limits, friction and limits of each free axis as one row whose force follows the axis's
 piecewise linear law.
-:class:`~newton.solvers.SolverStyle3D` and :class:`~newton.solvers.SolverImplicitMPM` do not support joints.
+:class:`~newton.solvers.SolverStyle3D`, :class:`~newton.solvers.SolverImplicitMPM` and
+:class:`~newton.solvers.SolverAPICWater` do not support joints.
 
 **Joint types**
 

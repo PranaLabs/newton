@@ -1,0 +1,1 @@
+Add `SolverAPICWater`: incompressible water with a free surface, APIC particles on a fixed MAC grid with a cut-cell pressure solve, colliders from a rigid model's shapes, the pressure's impulse on bodies for an explicit coupling to a rigid solver, streams of particles, and steps that record into CUDA graphs.
