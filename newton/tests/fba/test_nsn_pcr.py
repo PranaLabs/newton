@@ -467,6 +467,77 @@ class TestPCRFusedSparse(_PCRTestCase):
         self.assertLess(np.linalg.norm(b - A @ x) / np.linalg.norm(b), 1.0e-9)
 
 
+class TestPCRFusedDense(_PCRTestCase):
+    """The fused dense iterations that ``solve`` takes with ``fixed_sums`` against its launches one by one."""
+
+    def _both(self, A: np.ndarray, b: np.ndarray, max_iter: int, block_precond=None) -> list[tuple[np.ndarray, int]]:
+        """The solution and iteration count of ``solve`` without and with ``fixed_sums``, the fused iterations."""
+        n = len(b)
+        out = []
+        for fixed in (False, True):
+            solver = NSNPCRSolver(max_n=n, device=self.device, tol=1.0e-10, max_iter=max_iter)
+            calls = []
+            with unittest.mock.patch.object(solver, "_fused_dense", wraps=solver._fused_dense) as fused:
+                x = wp.zeros(n, dtype=wp.float64, device=self.device)
+                matrix = wp.array2d(A, dtype=wp.float64, device=self.device)
+                rhs = wp.array(b, dtype=wp.float64, device=self.device)
+                iters, rho = solver.solve(matrix, rhs, x, block_precond=block_precond, fixed_sums=fixed)
+                calls.append(fused.call_count)
+            self.assertEqual(calls[0], int(fixed))
+            self.assertIsNone(rho)
+            out.append((x.numpy(), iters))
+        return out
+
+    def test_fused_iterations_match_the_launches(self):
+        """Take the ten iterations of an NSN step on 1157 rows, five blocks of rows, as the launches one by one do,
+        to rounding, and keep ``x = 0`` for a zero right-hand side through the protected step."""
+        A = _make_spd(1157, seed=5)
+        b = np.random.default_rng(6).standard_normal(1157)
+        (x_ref, iters_ref), (x, iters) = self._both(A, b, max_iter=10)
+        self.assertEqual((iters, iters_ref), (10, 10))
+        np.testing.assert_allclose(x, x_ref, rtol=1.0e-12, atol=1.0e-14 * np.abs(x_ref).max())
+        (_, _), (x, _) = self._both(A, np.zeros(1157), max_iter=10)
+        np.testing.assert_array_equal(x, 0.0)
+
+    def test_fused_iterations_take_the_block_preconditioner(self):
+        """Take the ten iterations with an exact block preconditioner on the trailing rows, as joint rows have, as
+        the launches one by one do, to rounding."""
+        n, m = 600, 30
+        A = _make_spd(n, seed=8)
+        b = np.random.default_rng(9).standard_normal(n)
+        block_inv = wp.array(np.linalg.inv(A[n - m :, n - m :]), dtype=wp.float64, device=self.device)
+
+        @wp.kernel
+        def apply_block(inv: wp.array2d[wp.float64], v: wp.array[wp.float64], offset: int, out: wp.array[wp.float64]):
+            i = wp.tid()
+            acc = wp.float64(0.0)
+            for j in range(inv.shape[1]):
+                acc += inv[i, j] * v[offset + j]
+            out[offset + i] = acc
+
+        def block_precond(v, out):
+            wp.launch(apply_block, m, inputs=[block_inv, v, n - m], outputs=[out], device=self.device)
+
+        (x_ref, _), (x, iters) = self._both(A, b, max_iter=10, block_precond=block_precond)
+        self.assertEqual(iters, 10)
+        np.testing.assert_allclose(x, x_ref, rtol=1.0e-12, atol=1.0e-14 * np.abs(x_ref).max())
+
+    def test_fused_iterations_replay_from_a_graph(self):
+        """Record the fused iterations into a graph and replay them to the same solution, bit for bit."""
+        n = 700
+        A = wp.array2d(_make_spd(n, seed=11), dtype=wp.float64, device=self.device)
+        b = wp.array(np.random.default_rng(12).standard_normal(n), dtype=wp.float64, device=self.device)
+        solver = NSNPCRSolver(max_n=n, device=self.device, tol=1.0e-10, max_iter=10)
+        eager = wp.zeros(n, dtype=wp.float64, device=self.device)
+        solver.solve(A, b, eager, fixed_sums=True)
+        replayed = wp.zeros(n, dtype=wp.float64, device=self.device)
+        with wp.ScopedCapture(device=self.device) as capture:
+            solver.solve(A, b, replayed, fixed_sums=True)
+        replayed.zero_()
+        wp.capture_launch(capture.graph)
+        np.testing.assert_array_equal(replayed.numpy(), eager.numpy())
+
+
 class TestPCRReuse(_PCRTestCase):
     """Solver buffers persist across calls (NSN reuses the same solver)."""
 
