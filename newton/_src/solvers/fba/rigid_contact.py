@@ -404,6 +404,152 @@ def select_flagged_kernel(
         select[position[r]] = r
 
 
+@wp.kernel
+def two_way_count_kernel(
+    soft_active: wp.array[wp.int32],
+    rigid_table: wp.array[wp.int32],
+    limit: int,
+    # outputs
+    first: wp.array[wp.int32],
+    active: wp.array[wp.int32],
+    total: wp.array[wp.int32],
+):
+    """The contacts of a two-way step on the capacity path, at most ``limit``: the deformable ones of the step first,
+    their count in ``first[0]``, then the rigid ones (``rigid_table[0]``) up to ``active[0]``; ``total[0]`` counts
+    the contacts found."""
+    m_s = soft_active[0]
+    m_r = rigid_table[0]
+    first[0] = wp.min(m_s, limit)
+    active[0] = wp.min(m_s + m_r, limit)
+    total[0] = m_s + m_r
+
+
+@wp.kernel
+def soft_touched_blocks_kernel(
+    first: wp.array[wp.int32],
+    contact_shape: wp.array[wp.int32],
+    shape_body: wp.array[wp.int32],
+    body_slot: wp.array[wp.int32],
+    slot_block: wp.array[wp.int32],
+    # outputs
+    touched: wp.array[wp.int32],
+):
+    """Flag the articulation blocks of the integrated bodies that the first ``first[0]`` deformable contacts touch."""
+    c = wp.tid()
+    if c >= first[0]:
+        return
+    b = _particle_contact_body(c, contact_shape, shape_body)
+    if b >= 0:
+        s = body_slot[b]
+        if s >= 0:
+            k = slot_block[s]
+            if k >= 0:
+                touched[k] = 1
+
+
+@wp.kernel
+def place_rigid_rows_kernel(
+    first: wp.array[wp.int32],
+    active: wp.array[wp.int32],
+    src_slot: wp.array2d[wp.int32],
+    src_jac: wp.array2d[wp.spatial_vectord],
+    # outputs
+    row_slot: wp.array2d[wp.int32],
+    row_jac: wp.array2d[wp.spatial_vectord],
+):
+    """Copy the rows ``3 c + k`` of the rigid contacts to the rows ``3 (first[0] + c) + k`` of a two-way step's
+    contact rows, for the contacts below ``active[0]``, and make the rows past them inert; the deformable rows before
+    them stay."""
+    r = wp.tid()
+    f = first[0]
+    if r < 3 * f:
+        return
+    inert = r >= 3 * active[0]
+    for side in range(2):
+        if inert:
+            row_slot[r, side] = -1
+            row_jac[r, side] = wp.spatial_vectord()
+        else:
+            row_slot[r, side] = src_slot[r - 3 * f, side]
+            row_jac[r, side] = src_jac[r - 3 * f, side]
+
+
+@wp.kernel
+def place_rigid_values_kernel(
+    first: wp.array[wp.int32],
+    active: wp.array[wp.int32],
+    src: wp.array[wp.float64],
+    # outputs
+    dst: wp.array[wp.float64],
+):
+    """:func:`place_rigid_rows_kernel` for one value per row: zero past the contacts that the step takes."""
+    r = wp.tid()
+    f = first[0]
+    if r < 3 * f:
+        return
+    value = wp.float64(0.0)
+    if r < 3 * active[0]:
+        value = src[r - 3 * f]
+    dst[r] = value
+
+
+@wp.kernel
+def two_way_contact_values_kernel(
+    first: wp.array[wp.int32],
+    active: wp.array[wp.int32],
+    soft_mu: wp.array[wp.float64],
+    rigid_mu: wp.array[wp.float64],
+    offset_n: wp.array[wp.float64],
+    offset_t1: wp.array[wp.float64],
+    offset_t2: wp.array[wp.float64],
+    # outputs
+    mu: wp.array[wp.float64],
+    pene0: wp.array[wp.float64],
+):
+    """The friction coefficient of each contact of a two-way step on the capacity path and the anchor projections of
+    its rows: the deformable contacts' (:func:`kernels.build_coulomb_pene0_kernel`), none for the rigid ones, and for
+    the inert contacts past them a gap of 1e6 m, which keeps their multipliers at 0."""
+    c = wp.tid()
+    f = first[0]
+    if c < f:
+        mu[c] = soft_mu[c]
+        pene0[3 * c + 0] = offset_n[c]
+        pene0[3 * c + 1] = offset_t1[c]
+        pene0[3 * c + 2] = offset_t2[c]
+    elif c < active[0]:
+        mu[c] = rigid_mu[c - f]
+        pene0[3 * c + 0] = wp.float64(0.0)
+        pene0[3 * c + 1] = wp.float64(0.0)
+        pene0[3 * c + 2] = wp.float64(0.0)
+    else:
+        mu[c] = wp.float64(0.0)
+        pene0[3 * c + 0] = wp.float64(-1.0e6)
+        pene0[3 * c + 1] = wp.float64(0.0)
+        pene0[3 * c + 2] = wp.float64(0.0)
+
+
+@wp.kernel
+def place_joint_rows_kernel(
+    index: wp.array[wp.int32],
+    src_slot: wp.array2d[wp.int32],
+    src_jac: wp.array2d[wp.spatial_vectord],
+    offset: int,
+    # outputs
+    dst_slot: wp.array2d[wp.int32],
+    dst_jac: wp.array2d[wp.spatial_vectord],
+):
+    """:func:`joints.select_rows_kernel`, with the rows where ``index[k]`` is -1 inert."""
+    k = wp.tid()
+    i = index[k]
+    for side in range(2):
+        if i < 0:
+            dst_slot[offset + k, side] = -1
+            dst_jac[offset + k, side] = wp.spatial_vectord()
+        else:
+            dst_slot[offset + k, side] = src_slot[i, side]
+            dst_jac[offset + k, side] = src_jac[i, side]
+
+
 class RigidContactGather:
     """Device buffers of :func:`gather_rigid_contacts`, kept across steps and grown with the contact count."""
 

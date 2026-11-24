@@ -2226,25 +2226,34 @@ class FBALinearSolver:
         self._isodof_unique_d, self._n_isodofs = self._cap_unique, self.n
         self._isodof_max_rows = int(_MAX_ROWS_PER_PARTICLE)
 
-    def reserve_schur_capacity(self, num_contacts: int, sizes: list[int]) -> None:
+    def reserve_schur_capacity(self, num_contacts: int, sizes: list[int], extra_width: int = 0) -> None:
         """Allocate the buffers of the full operator's capacity path for a contact buffer of ``num_contacts`` slots, of
         which a step takes at most the first ``sizes[-1]``, so that a graph capture of it allocates nothing: the three
         rows of each slot and their particle CSR, the contacted particles' ranks and columns of ``S``
-        (:meth:`prepare_schur_capacity`), and for each size of ``sizes`` its ``Wi`` and dense ``W``
-        (:meth:`build_schur_capacity`)."""
+        (:meth:`prepare_schur_capacity`), and the ``Wi`` and dense ``W`` of each size of ``sizes``
+        (:meth:`build_schur_capacity`), views of one buffer each. With ``extra_width`` further particles per contact,
+        such as a face contact's, the rows' particles, their CSR and the slots' CSR take them, and ``Wi`` takes up to
+        ``extra_width + 1`` particles per contact."""
         from .kernels import _WI_TILE_K, _WI_TILE_M  # noqa: PLC0415
 
         C, N, dev = int(num_contacts), self.n, self.device
         tile_m, tile_k = int(_WI_TILE_M), int(_WI_TILE_K)
+        width = int(extra_width) + 1
 
         def columns(c):
-            return max(((min(c, N) + tile_m - 1) // tile_m) * tile_m, tile_m)
+            return max(((min(width * c, N) + tile_m - 1) // tile_m) * tile_m, tile_m)
 
-        key = (C, tuple(sizes))
+        key = (C, tuple(sizes), width)
         if getattr(self, "_fc_key", None) == key:
             return
-        self._fc_key, rows = key, 3 * C
+        self._fc_key, rows, limit = key, 3 * C, int(sizes[-1])
         n_pad = ((N + tile_k - 1) // tile_k) * tile_k
+        W_buffer = wp.zeros(9 * limit * limit, dtype=wp.float64, device=dev)
+        Wi_buffer = wp.zeros(columns(limit) ** 2, dtype=wp.float64, device=dev)
+
+        def view(buffer, n):
+            return wp.array(ptr=buffer.ptr, dtype=wp.float64, shape=(n, n), device=dev)
+
         self._fc = SimpleNamespace(
             row_particle=wp.zeros(rows, dtype=wp.int32, device=dev),
             row_alpha=wp.zeros(rows, dtype=wp.float32, device=dev),
@@ -2255,15 +2264,32 @@ class FBALinearSolver:
             flags=wp.zeros(N, dtype=wp.int32, device=dev),
             rank=wp.zeros(N, dtype=wp.int32, device=dev),
             count=wp.zeros(1, dtype=wp.int32, device=dev),
-            isodof_perm=wp.zeros(columns(sizes[-1]), dtype=wp.int32, device=dev),
-            S_iso=wp.zeros((n_pad, columns(sizes[-1])), dtype=wp.float64, device=dev),
+            isodof_perm=wp.zeros(columns(limit), dtype=wp.int32, device=dev),
+            S_iso=wp.zeros((n_pad, columns(limit)), dtype=wp.float64, device=dev),
             unique=wp.array(np.arange(N, dtype=np.int32), dtype=wp.int32, device=dev),
             no_dirs=wp.empty(0, dtype=wp.vec3, device=dev),
-            Wi={size: wp.zeros((columns(size), columns(size)), dtype=wp.float64, device=dev) for size in sizes},
-            W={size: wp.zeros((3 * size, 3 * size), dtype=wp.float64, device=dev) for size in sizes},
+            no_extra=wp.full((1, 1), -1, dtype=wp.int32, device=dev),
+            W_buffer=W_buffer,
+            Wi_buffer=Wi_buffer,
+            Wi={size: view(Wi_buffer, columns(size)) for size in sizes},
+            W={size: view(W_buffer, 3 * size) for size in sizes},
+            width=width,
+            limit=limit,
         )
+        if width > 1:
+            fc, extra = self._fc, width - 1
+            # The rows sort by particle for their CSR, and the further particles of their slots for theirs; radix
+            # sorts work in arrays twice the sorted length.
+            fc.row_keys = wp.zeros(6 * limit, dtype=wp.int32, device=dev)
+            fc.row_order = wp.zeros(6 * limit, dtype=wp.int32, device=dev)
+            fc.slot_keys = wp.zeros(6 * limit * extra, dtype=wp.int32, device=dev)
+            fc.slot_entries = wp.zeros(6 * limit * extra, dtype=wp.int32, device=dev)
+            fc.slot_counts = wp.zeros(N + 1, dtype=wp.int32, device=dev)
+            fc.slot_offsets = wp.zeros(N + 1, dtype=wp.int32, device=dev)
+            fc.slot_particle = wp.zeros((rows, width), dtype=wp.int32, device=dev)
+            fc.slot_alpha = wp.zeros((rows, width), dtype=wp.float32, device=dev)
         total = getattr(self, "_row_total", 0)
-        self._row_total = max(total, 3 * sizes[-1])
+        self._row_total = max(total, 3 * limit)
         self.reserve_lambda_correction()
         self._row_total = total
 
@@ -2276,35 +2302,61 @@ class FBALinearSolver:
         j_alpha: wp.array,
         j_tangent1: wp.array,
         j_tangent2: wp.array,
-        j_record: wp.array,
+        active: wp.array,
+        j_extra_indices: wp.array | None = None,
+        j_extra_alpha: wp.array | None = None,
     ) -> None:
         """The parts of the full operator's capacity path that hold for every size, for a contact buffer of
-        ``num_contacts`` slots whose active contacts (record >= 0) lie first, sorted by particle, of which the step
-        takes the first ``limit``: the three rows of each slot, their particle CSR, the contacted particles flagged and
-        ranked by a scan, ascending as :func:`numpy.unique` ranks them, and the columns of ``S`` they select. Scans
-        allocate, so this runs outside a graph's conditional nodes; :meth:`reserve_schur_capacity` sizes the
-        buffers."""
+        ``num_contacts`` slots whose ``active[0]`` active contacts lie first, of which the step takes the first
+        ``limit``: the three rows of each slot, their particle CSR, the contacted particles flagged and ranked by a
+        scan, ascending as :func:`numpy.unique` ranks them, and the columns of ``S`` they select. With further
+        particles per contact (``j_extra_indices``, ``-1`` when unused, and their coefficients), the rows' particle
+        CSR sorts the rows by their first particle, as the host path's stable sort orders them, and the slots' CSR
+        their further particles. Scans and sorts allocate, so this runs outside a graph's conditional nodes;
+        :meth:`reserve_schur_capacity` sizes the buffers."""
         from .kernels import (  # noqa: PLC0415
             capacity_isodofs_kernel,
             capacity_particle_flags_kernel,
+            capacity_row_keys_kernel,
+            capacity_slot_keys_kernel,
+            capacity_slot_rows_kernel,
             lite_capacity_rows_kernel,
             lite_row_dirs_kernel,
         )
 
         C, dev, fc = int(num_contacts), self.device, self._fc
-        rows = 3 * C
+        rows, has_extra = 3 * C, j_extra_indices is not None
         wp.launch(lite_capacity_rows_kernel, rows, [j_indices, j_alpha], [fc.row_particle, fc.row_alpha], device=dev)
         inputs = [j_normals, j_tangent1, j_tangent2, fc.no_dirs, 3, rows]
         wp.launch(lite_row_dirs_kernel, rows, inputs, [fc.row_dir], device=dev)
         fc.flags.zero_()
         fc.counts.zero_()
-        inputs = [j_record, j_indices, int(limit)]
-        wp.launch(capacity_particle_flags_kernel, C, inputs, [fc.flags, fc.counts], device=dev)
+        extra = j_extra_indices if has_extra else fc.no_extra
+        if has_extra:
+            fc.slot_counts.zero_()
+        inputs = [active, j_indices, extra, int(has_extra), int(limit)]
+        outputs = [fc.flags, fc.counts, fc.slot_counts if has_extra else fc.counts]
+        wp.launch(capacity_particle_flags_kernel, C, inputs, outputs, device=dev)
         wp.utils.array_scan(fc.counts, fc.offsets, inclusive=False)
         wp.utils.array_scan(fc.flags, fc.rank, inclusive=False)
         wp.launch(
             capacity_isodofs_kernel, self.n, [fc.flags, fc.rank, self._perm], [fc.count, fc.isodof_perm], device=dev
         )
+        fc.has_extra = has_extra
+        if not has_extra:
+            return
+        # The rows of face contacts follow those of the particle contacts, so the rows sort by particle for their CSR.
+        n_rows, inert = 3 * int(limit), self.n
+        inputs = [active, fc.row_particle, inert]
+        wp.launch(capacity_row_keys_kernel, n_rows, inputs, [fc.row_keys, fc.row_order], device=dev)
+        wp.utils.radix_sort_pairs(fc.row_keys, fc.row_order, n_rows)
+        n_slots = n_rows * j_extra_indices.shape[1]
+        inputs = [active, j_extra_indices, inert]
+        wp.launch(capacity_slot_keys_kernel, n_slots, inputs, [fc.slot_keys, fc.slot_entries], device=dev)
+        wp.utils.radix_sort_pairs(fc.slot_keys, fc.slot_entries, n_slots)
+        wp.utils.array_scan(fc.slot_counts, fc.slot_offsets, inclusive=False)
+        inputs = [fc.row_particle, fc.row_alpha, j_extra_indices, j_extra_alpha]
+        wp.launch(capacity_slot_rows_kernel, rows, inputs, [fc.slot_particle, fc.slot_alpha], device=dev)
 
     def use_schur_capacity(self, size: int) -> None:
         """Make the first ``size`` slots' rows of the capacity path, and their ``W`` as :meth:`build_schur_capacity`
@@ -2318,22 +2370,28 @@ class FBALinearSolver:
             fc.row_dir[:rows],
         )
         self._row_total, self._row_slots = rows, None
-        self._isodof_row_offsets_d, self._isodof_row_indices_d = fc.offsets, fc.row_indices[:rows]
+        indices = fc.row_indices
+        if getattr(fc, "has_extra", False):
+            indices = fc.row_order
+            self._row_slots = (fc.slot_particle[:rows], fc.slot_alpha[:rows], fc.slot_offsets, fc.slot_entries)
+        self._isodof_row_offsets_d, self._isodof_row_indices_d = fc.offsets, indices[:rows]
         self._isodof_unique_d, self._n_isodofs = fc.unique, self.n
         self._isodof_max_rows = int(_MAX_ROWS_PER_PARTICLE)
         self._isodof_rank_d, self._Wi_v = fc.rank, fc.Wi[size]
         self._W_device_d, self._W_device_active_rows = fc.W[size], rows
 
-    def build_schur_capacity(self, size: int, j_record: wp.array) -> None:
+    def build_schur_capacity(self, size: int, active: wp.array) -> None:
         """The dense frictional ``W = J A⁻¹ Jᵀ`` of :meth:`build_schur_complement` on the device alone, for the rows of
         the first ``size`` slots that :meth:`prepare_schur_capacity` laid out: the contacted particles' columns of
         ``S`` densified and ``Wi`` multiplied over the tiles of their count alone, each entry to the sums of the host
-        path, and ``W`` composed, the rows of an inert slot those of the identity. It allocates nothing, so that it
-        runs in a graph's conditional node; :meth:`use_schur_capacity` then points the solve at it."""
+        path, and ``W`` composed, the rows of the slots past the ``active[0]`` active ones those of the identity. It
+        allocates nothing, so that it runs in a graph's conditional node; :meth:`use_schur_capacity` then points the
+        solve at it."""
         from .kernels import (  # noqa: PLC0415
             _WI_TILE_M,
             _WI_TILE_N,
             _WI_TILE_THREADS,
+            add_slot_terms_capacity_kernel,
             compose_W_capacity_kernel,
             compute_wi_capacity_kernel,
             densify_S_iso_capacity_kernel,
@@ -2354,8 +2412,12 @@ class FBALinearSolver:
             block_dim=_WI_TILE_THREADS,
             device=dev,
         )
-        inputs = [fc.row_particle, fc.row_dir, fc.row_alpha, j_record, fc.rank, Wi]
+        inputs = [fc.row_particle, fc.row_dir, fc.row_alpha, active, fc.rank, Wi]
         wp.launch(compose_W_capacity_kernel, (rows, rows), inputs, [fc.W[size]], device=dev)
+        if getattr(fc, "has_extra", False):
+            # The terms of the rows' further particles, added as the host path adds them.
+            inputs = [fc.slot_particle, fc.slot_alpha, fc.row_dir, active, fc.rank, Wi]
+            wp.launch(add_slot_terms_capacity_kernel, (rows, rows), inputs, [fc.W[size]], device=dev)
         self.use_schur_capacity(size)
 
     def build_schur_lite_triplets(self, total_rows: int, cols_d: wp.array, vals_d: wp.array) -> wps.BsrMatrix:

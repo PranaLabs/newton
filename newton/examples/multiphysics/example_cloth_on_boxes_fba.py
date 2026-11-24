@@ -84,12 +84,12 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
+        self.graph = None
 
         self.viewer.set_model(self.model)
         self.viewer.set_camera(pos=wp.vec3(3.2, -2.6, 1.8), pitch=-18.0, yaw=140.0)
 
     def simulate(self):
-        # SolverFBA reads contacts back to the host every step, so the loop is not graph-captured.
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
@@ -98,7 +98,16 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        self.simulate()
+        if self.graph is not None:
+            wp.capture_launch(self.graph)
+        else:
+            self.simulate()
+            if wp.get_device().is_cuda and wp.is_mempool_enabled(wp.get_device()):
+                # The first frame, outside the graph, sets the solver up and reserves the buffers of its contacts;
+                # the following frames replay its steps, which find their contacts on the device.
+                with wp.ScopedCapture() as capture:
+                    self.simulate()
+                self.graph = capture.graph
         self.sim_time += self.frame_dt
 
     def test_post_step(self):

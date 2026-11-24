@@ -200,23 +200,31 @@ graph (:class:`warp.ScopedCapture`), collision included, when it reads
 nothing back to the host and allocates nothing: after a step of the same
 ``dt`` outside the graph, which sets up the system, a step without contacts,
 also with particle constraint rows after a step with the same rows outside
-the graph, which sets up their ``W``, and a step with particle-shape contacts alone with friction in one world,
-after a step with the same contacts outside the graph, which reserves the
+the graph, which sets up their ``W``, and a step with particle-shape contacts
+with friction in one world, after a step with the same contacts outside the graph, which reserves the
 buffers of their capacity: with the lite operator, or with the full operator
 and a dense ``W`` (``nsn_sparse_storage=False``) and a fixed count of at most
-25 ``nsn_linear_iterations``. Such a step takes every slot of the contact
-buffer as a contact row, those past the stored count and those of held
-particles inert, sorted on the device. With the lite operator it gives every
-particle the per-particle Newton step; a particle with more than four contacts
-keeps its multipliers there. With the full operator the step counts its
-active contacts on the device and takes, by a conditional node of the graph
-(``wp.capture_if``), the smallest of the sizes 64, 256 and 1024 contacts, and
-the buffer's capacity up to 2048, that holds them: it builds the dense ``W``
-of three rows per slot of that size on the device, the rows of inert slots
-those of the identity, and takes its NSN steps on them, so that its cost is
-that of the size rather than of the buffer. A step drops the active contacts
-past 2048, and a full contact buffer the contacts past it, silently, as it
-reads nothing back: :meth:`~newton.solvers.SolverFBA.dropped_contacts`, called
+25 ``nsn_linear_iterations``, its face contacts included. Such a step takes
+every slot of the contact buffer as a contact row, those past the stored count
+and those of held particles inert, sorted on the device. With the lite operator
+it gives every particle the per-particle Newton step; a particle with more than
+four contacts keeps its multipliers there. With the full operator the step
+finds its face contacts and the other distance minima of its particles beside
+meshes on the device too, in the order of the steps outside a graph, counts
+its active contacts on the device and takes, by a conditional node of the graph
+(``wp.capture_if``), the smallest of the sizes 64, 96, 128, 192, 256, 384, 512,
+768, 1024 and 1536 contacts, and the most its contacts can reach up to 2048,
+that holds them: it builds the dense ``W`` of three rows per slot of that size
+on the device, the rows of inert slots those of the identity, and takes its NSN
+steps on them, so that its cost is that of the size rather than of the buffer.
+Steps with deformable contacts on the bodies FBA integrates record so too, in
+one world, with hard rigid contacts (``rigid_contact_time=0``) and neither
+tendons, mimic joints, particle constraint rows, ``contact_warmstart`` nor
+``friction_anchors``: the rigid contacts follow the deformable ones in the same
+sizes, and the rows of the joints of the articulations that contacts touch,
+selected on the device, follow them. A step drops the active contacts past
+2048, and a full contact buffer the contacts past it, silently, as it reads
+nothing back: :meth:`~newton.solvers.SolverFBA.dropped_contacts`, called
 outside the graph, reports the most contacts a recorded step dropped since its
 last call. Rigid contacts record too, after a step with the same contacts
 outside the graph, in a model without particles, in one world, with
@@ -230,13 +238,14 @@ joint rows, so that the recorded steps match those outside a graph bit for bit,
 the buffer rather than with the contacts: with a ``rigid_contact_max`` far
 above the contacts that the steps find, recorded steps run slower than steps
 outside a graph. A step whose pattern outgrows its storage drops its last
-contacts, which ``dropped_contacts`` reports. Self, face and rod contacts,
-particle constraint rows with contacts, particle-body attachments, several
-worlds, model tendons, and with particle contacts ``contact_warmstart``,
-``friction_anchors``, ``nsn_lite_accumulate``, the full operator with
-``nsn_sparse_storage`` and contacts on the bodies FBA integrates keep a step
-out of graphs: during a capture it then raises ``RuntimeError``, naming the
-reason. A graph
+contacts, which ``dropped_contacts`` reports. Steps that are GPU-bound gain
+little from a graph, which saves host work, while the inert rows of a size add
+work on the device. Self and rod contacts, the contacts of rod segments with
+shapes, particle constraint rows with contacts, particle-body attachments,
+several worlds, model tendons, and with particle contacts
+``contact_warmstart``, ``friction_anchors``, ``nsn_lite_accumulate`` and the
+full operator with ``nsn_sparse_storage`` keep a step out of graphs: during a
+capture it then raises ``RuntimeError``, naming the reason. A graph
 replays the launches of the steps it recorded: settings the solver keeps on
 the host, such as :meth:`~newton.solvers.SolverFBA.set_pin_targets`,
 :meth:`~newton.solvers.SolverFBA.set_particle_constraints` and

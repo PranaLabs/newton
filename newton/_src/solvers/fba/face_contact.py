@@ -13,6 +13,8 @@ box and cylinder edges that ``edge_radius`` rounds, where the face contact's dis
 contact's.
 """
 
+from types import SimpleNamespace
+
 import numpy as np
 import warp as wp
 
@@ -90,6 +92,92 @@ def min_index(a: wp.vec3) -> int:
     return j
 
 
+@wp.func
+def shape_frame_triangle(
+    particle_q: wp.array[wp.vec3], tri_indices: wp.array2d[wp.int32], f: int, X_sw: wp.transform
+) -> wp.mat33:
+    """The vertices of triangle ``f`` in the shape frame, as rows."""
+    return wp.matrix_from_rows(
+        wp.transform_point(X_sw, particle_q[tri_indices[f, 0]]),
+        wp.transform_point(X_sw, particle_q[tri_indices[f, 1]]),
+        wp.transform_point(X_sw, particle_q[tri_indices[f, 2]]),
+    )
+
+
+@wp.func
+def deepest_point(P: wp.mat33, geo: int, scale: wp.vec3, mesh: wp.uint64, r: float, iterations: int):
+    """The Frank-Wolfe iteration of :func:`face_contact_kernel` over the triangle ``P`` (rows, shape frame): the
+    count of vertices it selects, the least signed distance of the vertices, the barycentric weights, the point
+    and its signed distance and gradient (:func:`shape_sdf`)."""
+    d = wp.vec3(
+        shape_sdf(geo, scale, mesh, P[0], r)[0],
+        shape_sdf(geo, scale, mesh, P[1], r)[0],
+        shape_sdf(geo, scale, mesh, P[2], r)[0],
+    )
+    w = wp.vec3(0.0)
+    w[min_index(d)] = 1.0
+    for k in range(iterations):
+        sd = shape_sdf(geo, scale, mesh, w @ P, r)
+        # Step toward the vertex with the lowest directional derivative until the Frank-Wolfe gap closes.
+        a = P @ wp.vec3(sd[1], sd[2], sd[3])
+        j = min_index(a)
+        if wp.dot(w, a) - a[j] <= 0.0:
+            break
+        step = 2.0 / float(k + 2)
+        w = (1.0 - step) * w
+        w[j] += step
+    selected = int(0)
+    for k in range(3):
+        if w[k] > 0.0:
+            selected += 1
+    x = w @ P
+    sd = shape_sdf(geo, scale, mesh, x, r)
+    return selected, wp.min(d), w, x, sd
+
+
+@wp.func
+def near_face(
+    f: int,
+    s: int,
+    particle_q: wp.array[wp.vec3],
+    tri_indices: wp.array2d[wp.int32],
+    particle_world: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[wp.int32],
+    shape_type: wp.array[wp.int32],
+    shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
+    shape_flags: wp.array[wp.int32],
+    shape_world: wp.array[wp.int32],
+    shape_lower: wp.array[wp.vec3],
+    shape_upper: wp.array[wp.vec3],
+    gap: float,
+    edge_radius: float,
+) -> bool:
+    """Whether triangle ``f`` may come within ``gap`` of shape ``s`` (:func:`near_face_kernel`)."""
+    world = shape_world[s]
+    # A local shape and a particle of another world do not touch; global particles touch every shape.
+    particle_world_f = particle_world[tri_indices[f, 0]]
+    if (shape_flags[s] & ShapeFlags.COLLIDE_PARTICLES) == 0 or (
+        world >= 0 and particle_world_f >= 0 and world != particle_world_f
+    ):
+        return False
+    X_ws = shape_transform[s]
+    if shape_body[s] >= 0:
+        X_ws = wp.transform_multiply(body_q[shape_body[s]], X_ws)
+    X_sw = wp.transform_inverse(X_ws)
+    a = wp.transform_point(X_sw, particle_q[tri_indices[f, 0]])
+    b = wp.transform_point(X_sw, particle_q[tri_indices[f, 1]])
+    c = wp.transform_point(X_sw, particle_q[tri_indices[f, 2]])
+    o = (a + b + c) / 3.0
+    radius = wp.max(wp.length(a - o), wp.max(wp.length(b - o), wp.length(c - o)))
+    if box_distance(shape_lower[s], shape_upper[s], o) - radius > gap:
+        return False
+    d = shape_sdf(shape_type[s], shape_scale[s], shape_source_ptr[s], o, edge_radius)[0]
+    return d - radius <= gap
+
+
 @wp.kernel
 def face_contact_kernel(
     particle_q: wp.array[wp.vec3],
@@ -122,37 +210,11 @@ def face_contact_kernel(
     X_ws = X_bs
     if shape_body[s] >= 0:
         X_ws = wp.transform_multiply(body_q[shape_body[s]], X_bs)
-    X_sw = wp.transform_inverse(X_ws)
-    P = wp.matrix_from_rows(
-        wp.transform_point(X_sw, particle_q[tri_indices[f, 0]]),
-        wp.transform_point(X_sw, particle_q[tri_indices[f, 1]]),
-        wp.transform_point(X_sw, particle_q[tri_indices[f, 2]]),
+    P = shape_frame_triangle(particle_q, tri_indices, f, wp.transform_inverse(X_ws))
+    selected, least, w, x, sd = deepest_point(
+        P, shape_type[s], shape_scale[s], shape_source_ptr[s], edge_radius, iterations
     )
-    geo, scale, mesh, r = shape_type[s], shape_scale[s], shape_source_ptr[s], edge_radius
-    d = wp.vec3(
-        shape_sdf(geo, scale, mesh, P[0], r)[0],
-        shape_sdf(geo, scale, mesh, P[1], r)[0],
-        shape_sdf(geo, scale, mesh, P[2], r)[0],
-    )
-    w = wp.vec3(0.0)
-    w[min_index(d)] = 1.0
-    for k in range(iterations):
-        sd = shape_sdf(geo, scale, mesh, w @ P, r)
-        # Step toward the vertex with the lowest directional derivative until the Frank-Wolfe gap closes.
-        a = P @ wp.vec3(sd[1], sd[2], sd[3])
-        j = min_index(a)
-        if wp.dot(w, a) - a[j] <= 0.0:
-            break
-        step = 2.0 / float(k + 2)
-        w = (1.0 - step) * w
-        w[j] += step
-    selected = int(0)
-    for k in range(3):
-        if w[k] > 0.0:
-            selected += 1
-    x = w @ P
-    sd = shape_sdf(geo, scale, mesh, x, r)
-    if selected < 2 or sd[0] >= wp.min(d):
+    if selected < 2 or sd[0] >= least:
         return
     n = wp.normalize(wp.vec3(sd[1], sd[2], sd[3]))
     idx = wp.atomic_add(count, 0, 1)
@@ -188,26 +250,25 @@ def near_face_kernel(
     centroid's distance minus the triangle's radius about the centroid. Triangles that far from the shape's
     collision bounds, ``shape_lower`` to ``shape_upper`` in the shape frame, skip the signed distance."""
     f, s = wp.tid()
-    world = shape_world[s]
-    # A local shape and a particle of another world do not touch; global particles touch every shape.
-    particle_world_f = particle_world[tri_indices[f, 0]]
-    if (shape_flags[s] & ShapeFlags.COLLIDE_PARTICLES) == 0 or (
-        world >= 0 and particle_world_f >= 0 and world != particle_world_f
+    if near_face(
+        f,
+        s,
+        particle_q,
+        tri_indices,
+        particle_world,
+        body_q,
+        shape_transform,
+        shape_body,
+        shape_type,
+        shape_scale,
+        shape_source_ptr,
+        shape_flags,
+        shape_world,
+        shape_lower,
+        shape_upper,
+        gap,
+        edge_radius,
     ):
-        return
-    X_ws = shape_transform[s]
-    if shape_body[s] >= 0:
-        X_ws = wp.transform_multiply(body_q[shape_body[s]], X_ws)
-    X_sw = wp.transform_inverse(X_ws)
-    a = wp.transform_point(X_sw, particle_q[tri_indices[f, 0]])
-    b = wp.transform_point(X_sw, particle_q[tri_indices[f, 1]])
-    c = wp.transform_point(X_sw, particle_q[tri_indices[f, 2]])
-    o = (a + b + c) / 3.0
-    radius = wp.max(wp.length(a - o), wp.max(wp.length(b - o), wp.length(c - o)))
-    if box_distance(shape_lower[s], shape_upper[s], o) - radius > gap:
-        return
-    d = shape_sdf(shape_type[s], shape_scale[s], shape_source_ptr[s], o, edge_radius)[0]
-    if d - radius <= gap:
         pair[wp.atomic_add(count, 0, 1)] = wp.int64(s) * wp.int64(tri_indices.shape[0]) + wp.int64(f)
 
 
@@ -224,6 +285,7 @@ def mesh_triangle(mesh_id: wp.uint64, t: int, scale: wp.vec3) -> wp.mat33:
 
 @wp.kernel
 def mesh_minima_kernel(
+    count: wp.array[wp.int32],  # the stored contacts of a contact buffer's whole capacity, or empty for all
     particle_q: wp.array[wp.vec3],
     particle_radius: wp.array[wp.float32],
     contact_particle: wp.array[wp.int32],
@@ -250,9 +312,13 @@ def mesh_minima_kernel(
     contact's closest point holds its particle against one side of a concave corner; these hold it against the
     others. Minima at vertices are left out. ``neighbors[neighbor_start[s] + t]`` lists the triangles across
     the edges ``ab``, ``ac`` and ``bc`` of triangle ``t`` of shape ``s``. ``body_pos`` and ``normal`` are as in
-    ``Contacts``; ``found`` marks the filled slots of each contact.
+    ``Contacts``; ``found`` marks the filled slots of each contact. Given ``count``, the contacts past ``count[0]``
+    and the sentinel ones (particle -1) have none.
     """
     c = wp.tid()
+    if count.shape[0] > 0:
+        if c >= count[0] or contact_particle[c] < 0:
+            return
     s = contact_shape[c]
     if s < 0 or shape_type[s] != GeoType.MESH:
         return
@@ -330,6 +396,291 @@ def _mesh_neighbors(model, device) -> tuple[wp.array, wp.array]:
     return wp.array(start, dtype=wp.int32, device=device), wp.array(table, dtype=wp.int32, device=device)
 
 
+def _edge_neighbors(tri: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The other triangle edges with the endpoints of each triangle edge: those of the edge of triangle ``t`` opposite
+    its vertex ``z``, at ``t * 3 + z``, are the entries ``start[t * 3 + z]`` to ``start[t * 3 + z + 1]`` of ``other``,
+    as ``triangle * 3 + vertex``."""
+    n = len(tri)
+    t, z = np.divmod(np.arange(3 * n), 3)
+    a, b = tri[t, (z + 1) % 3].astype(np.int64), tri[t, (z + 2) % 3].astype(np.int64)
+    key = np.minimum(a, b) * (int(tri.max(initial=0)) + 1) + np.maximum(a, b)
+    order = np.argsort(key, kind="stable")
+    first = np.flatnonzero(np.r_[True, key[order][1:] != key[order][:-1]])
+    size = np.diff(np.r_[first, 3 * n])
+    others = np.zeros(3 * n, dtype=np.int64)
+    others[order] = np.repeat(size - 1, size)
+    start = np.zeros(3 * n + 1, dtype=np.int32)
+    start[1:] = np.cumsum(others)
+    other = np.zeros(max(int(start[-1]), 1), dtype=np.int32)
+    pair = first[size == 2]
+    m0, m1 = order[pair], order[pair + 1]
+    other[start[m0]], other[start[m1]] = m1, m0
+    for g in np.flatnonzero(size > 2):
+        members = order[first[g] : first[g] + size[g]]
+        for m in members:
+            other[start[m] : start[m + 1]] = members[members != m]
+    return start, other
+
+
+@wp.kernel
+def mark_contact_faces_kernel(
+    count: wp.array[wp.int32],
+    contact_particle: wp.array[wp.int32],
+    contact_shape: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],  # (N + 1,) the incident triangles of each particle in ``incident``
+    incident: wp.array[wp.int32],
+    tri_count: int,
+    # outputs
+    flags: wp.array[wp.int32],  # (S * tri_count,)
+):
+    """Flag ``shape * tri_count + face`` for each triangle around the particle of each stored contact of a contact
+    buffer: the candidates of :meth:`FaceContactQuery.query` that the particle contacts give."""
+    c = wp.tid()
+    p = contact_particle[c]
+    if c >= count[0] or p < 0:
+        return
+    base = contact_shape[c] * tri_count
+    for k in range(offsets[p], offsets[p + 1]):
+        flags[base + incident[k]] = 1
+
+
+@wp.kernel
+def near_face_flags_kernel(
+    particle_q: wp.array[wp.vec3],
+    tri_indices: wp.array2d[wp.int32],
+    particle_world: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[wp.int32],
+    shape_type: wp.array[wp.int32],
+    shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
+    shape_flags: wp.array[wp.int32],
+    shape_world: wp.array[wp.int32],
+    shape_lower: wp.array[wp.vec3],
+    shape_upper: wp.array[wp.vec3],
+    gap: float,
+    edge_radius: float,
+    # outputs
+    flags: wp.array[wp.int32],
+):
+    """Flag the pairs of :func:`near_face_kernel` at ``shape * tri_count + face``."""
+    f, s = wp.tid()
+    if near_face(
+        f,
+        s,
+        particle_q,
+        tri_indices,
+        particle_world,
+        body_q,
+        shape_transform,
+        shape_body,
+        shape_type,
+        shape_scale,
+        shape_source_ptr,
+        shape_flags,
+        shape_world,
+        shape_lower,
+        shape_upper,
+        gap,
+        edge_radius,
+    ):
+        flags[s * tri_indices.shape[0] + f] = 1
+
+
+@wp.kernel
+def face_candidates_kernel(
+    flags: wp.array[wp.int32],
+    rank: wp.array[wp.int32],  # the exclusive scan of ``flags``
+    tri_count: int,
+    # outputs
+    count: wp.array[wp.int32],
+    cand_face: wp.array[wp.int32],
+    cand_shape: wp.array[wp.int32],
+):
+    """The flagged pairs at their ranks, ascending in ``shape * tri_count + face`` as :func:`numpy.unique` orders the
+    candidates of :meth:`FaceContactQuery.query`, and their count in ``count[0]``."""
+    i = wp.tid()
+    if flags[i] != 0:
+        cand_face[rank[i]] = i % tri_count
+        cand_shape[rank[i]] = i // tri_count
+    if i == flags.shape[0] - 1:
+        count[0] = rank[i] + flags[i]
+
+
+@wp.kernel
+def face_contact_capacity_kernel(
+    particle_q: wp.array[wp.vec3],
+    tri_indices: wp.array2d[wp.int32],
+    cand_face: wp.array[wp.int32],
+    cand_shape: wp.array[wp.int32],
+    count: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[wp.int32],
+    shape_type: wp.array[wp.int32],
+    shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
+    iterations: int,
+    edge_radius: float,
+    # outputs, at the candidate's index
+    emitted: wp.array[wp.int32],
+    bary: wp.array[wp.vec3],
+    depth: wp.array[wp.float32],
+    body_pos: wp.array[wp.vec3],
+    normal: wp.array[wp.vec3],
+):
+    """:func:`face_contact_kernel` for the first ``count[0]`` candidates of a launch over a capacity, each written at
+    its own index and marked in ``emitted``."""
+    i = wp.tid()
+    emitted[i] = 0
+    if i >= count[0]:
+        return
+    f = cand_face[i]
+    s = cand_shape[i]
+    X_bs = shape_transform[s]
+    X_ws = X_bs
+    if shape_body[s] >= 0:
+        X_ws = wp.transform_multiply(body_q[shape_body[s]], X_bs)
+    P = shape_frame_triangle(particle_q, tri_indices, f, wp.transform_inverse(X_ws))
+    selected, least, w, x, sd = deepest_point(
+        P, shape_type[s], shape_scale[s], shape_source_ptr[s], edge_radius, iterations
+    )
+    if selected < 2 or sd[0] >= least:
+        return
+    n = wp.normalize(wp.vec3(sd[1], sd[2], sd[3]))
+    emitted[i] = 1
+    bary[i] = w
+    depth[i] = sd[0]
+    body_pos[i] = wp.transform_point(X_bs, x - sd[0] * n)
+    normal[i] = wp.transform_vector(X_ws, n)
+
+
+@wp.func
+def first_zero(w: wp.vec3) -> int:
+    """The index of the first zero weight, -1 for none."""
+    z = int(-1)
+    for k in range(3):
+        if z < 0 and w[k] == 0.0:
+            z = k
+    return z
+
+
+@wp.kernel
+def face_edge_keep_kernel(
+    count: wp.array[wp.int32],
+    emitted: wp.array[wp.int32],
+    bary: wp.array[wp.vec3],
+    depth: wp.array[wp.float32],
+    cand_face: wp.array[wp.int32],
+    cand_shape: wp.array[wp.int32],
+    flags: wp.array[wp.int32],
+    rank: wp.array[wp.int32],
+    tri_indices: wp.array2d[wp.int32],
+    edge_start: wp.array[wp.int32],  # (3 tri_count + 1,) the other triangle edges with each edge's endpoints
+    edge_other: wp.array[wp.int32],  # triangle * 3 + the vertex opposite its edge
+    pinned: wp.array[wp.int32],  # 1 for each particle the solver holds, or empty
+    # outputs
+    found: wp.array[wp.int32],
+    keep: wp.array[wp.int32],
+):
+    """Keep each emitted face contact but an edge optimum that another triangle on the edge reaches deeper, or as deep
+    at a lower candidate, as :meth:`FaceContactQuery.query` keeps the deepest of each edge, then drop those whose
+    particles of nonzero weight the solver all holds, as :meth:`SolverFBA._ingest_contacts` drops them; ``found[0]``
+    counts the contacts kept before that."""
+    i = wp.tid()
+    keep[i] = 0
+    if i >= count[0] or emitted[i] == 0:
+        return
+    w = bary[i]
+    f = cand_face[i]
+    z = first_zero(w)
+    if z >= 0:
+        e = f * 3 + z
+        for q in range(edge_start[e], edge_start[e + 1]):
+            other = edge_other[q]
+            j = cand_shape[i] * tri_indices.shape[0] + other // 3
+            if flags[j] != 0:
+                r = rank[j]
+                if emitted[r] != 0 and first_zero(bary[r]) == other % 3:
+                    if depth[r] < depth[i] or (depth[r] == depth[i] and r < i):
+                        return
+    wp.atomic_add(found, 0, 1)
+    if pinned.shape[0] > 0:
+        free = int(0)
+        for k in range(3):
+            if w[k] != 0.0 and pinned[tri_indices[f, k]] == 0:
+                free = 1
+        if free == 0:
+            return
+    keep[i] = 1
+
+
+@wp.kernel
+def face_rows_kernel(
+    count: wp.array[wp.int32],
+    keep: wp.array[wp.int32],
+    position: wp.array[wp.int32],  # the exclusive scan of ``keep``
+    cand_face: wp.array[wp.int32],
+    cand_shape: wp.array[wp.int32],
+    bary: wp.array[wp.vec3],
+    body_pos: wp.array[wp.vec3],
+    normal: wp.array[wp.vec3],
+    tri_indices: wp.array2d[wp.int32],
+    first: wp.array[wp.int32],
+    limit: int,
+    # outputs: the contact rows
+    particle: wp.array[wp.int32],
+    contact_normal: wp.array[wp.vec3],
+    alpha: wp.array[wp.float32],
+    shape: wp.array[wp.int32],
+    contact_body_pos: wp.array[wp.vec3],
+    record: wp.array[wp.int32],
+    extra_particle: wp.array2d[wp.int32],
+    extra_alpha: wp.array2d[wp.float32],
+):
+    """Write each kept face contact into the contact rows from row ``first[0]`` on, in candidate order, up to row
+    ``limit``: its triangle's first particle at the first weight, the others in the extra slots, record -1."""
+    i = wp.tid()
+    if i >= count[0] or keep[i] == 0:
+        return
+    c = first[0] + position[i]
+    if c >= limit:
+        return
+    f = cand_face[i]
+    w = bary[i]
+    particle[c] = tri_indices[f, 0]
+    alpha[c] = w[0]
+    extra_particle[c, 0] = tri_indices[f, 1]
+    extra_particle[c, 1] = tri_indices[f, 2]
+    extra_alpha[c, 0] = w[1]
+    extra_alpha[c, 1] = w[2]
+    shape[c] = cand_shape[i]
+    contact_body_pos[c] = body_pos[i]
+    contact_normal[c] = normal[i]
+    record[c] = -1
+
+
+@wp.kernel
+def face_count_kernel(
+    first: wp.array[wp.int32],
+    position: wp.array[wp.int32],
+    keep: wp.array[wp.int32],
+    found: wp.array[wp.int32],
+    gain: wp.float64,
+    # outputs
+    active: wp.array[wp.int32],
+    contact_gain: wp.array[wp.float64],
+):
+    """The rows' total, ``first[0]`` plus the kept face contacts, in ``active[0]``, and each contact's gain of the
+    diagonal of its rows: ``gain`` when the step found face contacts, as the host path regularizes them, 1 otherwise."""
+    c = wp.tid()
+    last = keep.shape[0] - 1
+    if c == 0:
+        active[0] = first[0] + position[last] + keep[last]
+    contact_gain[c] = wp.where(found[0] > 0, gain, wp.float64(1.0))
+
+
 class FaceContactQuery:
     """Face contacts of the triangles around a step's particle contacts.
 
@@ -346,7 +697,9 @@ class FaceContactQuery:
         self.incident = (order // 3).astype(np.int64)
         self.tri_d = wp.array(self.tri, dtype=wp.int32, device=device)
         self.no_bodies = wp.empty(1, dtype=wp.transform, device=device)
+        self.no_count = wp.empty(0, dtype=wp.int32, device=device)
         self.device = device
+        self._cap = None
 
     def query(
         self,
@@ -448,7 +801,7 @@ class FaceContactQuery:
                 mesh_minima_kernel,
                 dim=m,
                 inputs=[
-                    *(particle_q, model.particle_radius, *contact, bodies),
+                    *(self.no_count, particle_q, model.particle_radius, *contact, bodies),
                     *(model.shape_transform, model.shape_body, model.shape_type, model.shape_scale),
                     *(model.shape_source_ptr, model.shape_margin, *self._mesh_neighbors, alarm),
                 ],
@@ -459,6 +812,132 @@ class FaceContactQuery:
         rows = np.nonzero(hit)[0]
         minima = np.asarray(particle)[rows], np.asarray(shape)[rows], out[0].numpy()[:m][hit], out[1].numpy()[:m][hit]
         return (*minima, rows)
+
+    def reserve_capacity(self, model) -> None:
+        """Allocate the buffers of :meth:`capacity_contacts` and :meth:`capacity_minima`, so that a graph capture of
+        them allocates nothing: one candidate slot per pair of a shape and a triangle."""
+        F, device = max(model.shape_count * len(self.tri), 1), self.device
+        if self._cap is not None and self._cap.flags.shape[0] == F:
+            return
+        if self._mesh_neighbors is None:
+            self._mesh_neighbors = _mesh_neighbors(model, device)
+        start, other = _edge_neighbors(self.tri)
+
+        def ints():
+            return wp.zeros(F, dtype=wp.int32, device=device)
+
+        self._cap = SimpleNamespace(
+            offsets=wp.array(self.offsets.astype(np.int32), dtype=wp.int32, device=device),
+            incident=wp.array(np.r_[self.incident, 0].astype(np.int32), dtype=wp.int32, device=device),
+            edge_start=wp.array(start, dtype=wp.int32, device=device),
+            edge_other=wp.array(other, dtype=wp.int32, device=device),
+            flags=ints(),
+            rank=ints(),
+            face=ints(),
+            shape=ints(),
+            emitted=ints(),
+            keep=ints(),
+            position=ints(),
+            count=wp.zeros(1, dtype=wp.int32, device=device),
+            found=wp.zeros(1, dtype=wp.int32, device=device),
+            bary=wp.zeros(F, dtype=wp.vec3, device=device),
+            depth=wp.zeros(F, dtype=wp.float32, device=device),
+            body_pos=wp.zeros(F, dtype=wp.vec3, device=device),
+            normal=wp.zeros(F, dtype=wp.vec3, device=device),
+        )
+
+    def capacity_minima(self, model, particle_q, body_q, contacts, alarm: float, found, body_pos, normal) -> None:
+        """:meth:`mesh_minima` on the device alone, for every slot of the contact buffer of ``contacts``: the minima of
+        slot ``c`` in row ``c`` of ``found``, ``body_pos`` and ``normal`` (shape ``(C, 3)``), those past the stored
+        count none."""
+        found.zero_()
+        bodies = self.no_bodies if body_q is None or not body_q.shape[0] else body_q
+        wp.launch(
+            mesh_minima_kernel,
+            dim=contacts.soft_contact_particle.shape[0],
+            inputs=[
+                *(contacts.soft_contact_count, particle_q, model.particle_radius, contacts.soft_contact_particle),
+                *(contacts.soft_contact_shape, contacts.soft_contact_body_pos, contacts.soft_contact_normal, bodies),
+                *(model.shape_transform, model.shape_body, model.shape_type, model.shape_scale),
+                *(model.shape_source_ptr, model.shape_margin, *self._mesh_neighbors, alarm),
+            ],
+            outputs=[found, body_pos, normal],
+            device=self.device,
+        )
+
+    def capacity_contacts(
+        self,
+        model,
+        particle_q,
+        body_q,
+        contacts,
+        pinned,
+        edge_radius: float,
+        gap: float | None,
+        first,
+        limit: int,
+        rows: list,
+        extra: list,
+        active,
+        gain: float,
+        contact_gain,
+        iterations: int = 128,
+    ) -> None:
+        """The face contacts of :meth:`query` on the device alone, nothing read back, for the particle contacts of the
+        whole capacity of ``contacts``: the candidates flagged and ranked by a scan, each one's optimum at its own
+        index, the deepest of each edge kept, and those on held particles alone (``pinned``) dropped. They are written,
+        in the order of :meth:`query`, into the contact rows ``rows`` (particle, normal, alpha, shape, body_pos,
+        record) and ``extra`` (particles and weights) from row ``first[0]`` on, up to row ``limit``; ``active[0]``
+        takes the rows' total, which may pass ``limit``, and ``contact_gain`` each contact's gain of its rows'
+        diagonal, ``gain`` when the step finds face contacts, 1 otherwise. :meth:`reserve_capacity` sizes the
+        buffers."""
+        cap, device = self._cap, self.device
+        n_tri, S, F = len(self.tri), model.shape_count, self._cap.flags.shape[0]
+        bodies = self.no_bodies if body_q is None or not body_q.shape[0] else body_q
+        cap.flags.zero_()
+        inputs = [contacts.soft_contact_count, contacts.soft_contact_particle, contacts.soft_contact_shape]
+        inputs += [cap.offsets, cap.incident, n_tri]
+        wp.launch(
+            mark_contact_faces_kernel, contacts.soft_contact_particle.shape[0], inputs, [cap.flags], device=device
+        )
+        if gap is not None and S:
+            wp.launch(
+                near_face_flags_kernel,
+                dim=(n_tri, S),
+                inputs=[
+                    *(particle_q, self.tri_d, model.particle_world, bodies),
+                    *(model.shape_transform, model.shape_body, model.shape_type, model.shape_scale),
+                    *(model.shape_source_ptr, model.shape_flags, model.shape_world),
+                    *(model.shape_collision_aabb_lower, model.shape_collision_aabb_upper, gap, edge_radius),
+                ],
+                outputs=[cap.flags],
+                device=device,
+            )
+        wp.utils.array_scan(cap.flags, cap.rank, inclusive=False)
+        wp.launch(
+            face_candidates_kernel, F, [cap.flags, cap.rank, n_tri], [cap.count, cap.face, cap.shape], device=device
+        )
+        wp.launch(
+            face_contact_capacity_kernel,
+            dim=F,
+            inputs=[
+                *(particle_q, self.tri_d, cap.face, cap.shape, cap.count, bodies),
+                *(model.shape_transform, model.shape_body, model.shape_type, model.shape_scale),
+                *(model.shape_source_ptr, iterations, edge_radius),
+            ],
+            outputs=[cap.emitted, cap.bary, cap.depth, cap.body_pos, cap.normal],
+            device=device,
+        )
+        cap.found.zero_()
+        inputs = [cap.count, cap.emitted, cap.bary, cap.depth, cap.face, cap.shape, cap.flags, cap.rank, self.tri_d]
+        inputs += [cap.edge_start, cap.edge_other, pinned]
+        wp.launch(face_edge_keep_kernel, F, inputs, [cap.found, cap.keep], device=device)
+        wp.utils.array_scan(cap.keep, cap.position, inclusive=False)
+        inputs = [cap.count, cap.keep, cap.position, cap.face, cap.shape, cap.bary, cap.body_pos, cap.normal]
+        inputs += [self.tri_d, first, int(limit)]
+        wp.launch(face_rows_kernel, F, inputs, [*rows, *extra], device=device)
+        inputs = [first, cap.position, cap.keep, cap.found, wp.float64(gain)]
+        wp.launch(face_count_kernel, contact_gain.shape[0], inputs, [active, contact_gain], device=device)
 
 
 @wp.kernel
@@ -595,7 +1074,9 @@ class SegmentContactQuery:
         self.seg = np.asarray(segments, dtype=np.int32).reshape(-1, 2)
         self.seg_d = wp.array(self.seg, dtype=wp.int32, device=device)
         self.no_bodies = wp.empty(1, dtype=wp.transform, device=device)
+        self.no_count = wp.empty(0, dtype=wp.int32, device=device)
         self.device = device
+        self._cap = None
 
     def query(self, model, particle_q, body_q, edge_radius: float, gap: float, iterations: int = 40):
         """Segment contacts as ``(segment, shape, weights (n, 2), body_pos, normal)`` arrays, ordered by shape and

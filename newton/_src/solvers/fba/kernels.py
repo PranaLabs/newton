@@ -2248,19 +2248,86 @@ def compute_wi_tiled_kernel(
 
 @wp.kernel
 def capacity_particle_flags_kernel(
-    record: wp.array[wp.int32],
+    active: wp.array[wp.int32],
     particle: wp.array[wp.int32],
+    extra_particle: wp.array2d[wp.int32],  # (C, K - 1) further particles of each contact, -1 when unused
+    has_extra: int,
     limit: int,
     # outputs
     flags: wp.array[wp.int32],
     counts: wp.array[wp.int32],
+    extra_counts: wp.array[wp.int32],
 ):
-    """Flag the particle of each active contact (record >= 0) among the first ``limit`` slots of a contact buffer,
-    and count its three rows on the particle."""
+    """Flag the particles of each of the ``active[0]`` active contacts among the first ``limit`` slots of a contact
+    buffer, and count its three rows on its first particle and, in ``extra_counts``, on its further ones."""
     c = wp.tid()
-    if c < limit and record[c] >= 0:
+    if c < limit and c < active[0]:
         flags[particle[c]] = 1
         wp.atomic_add(counts, particle[c], 3)
+        if has_extra:
+            for k in range(extra_particle.shape[1]):
+                p = extra_particle[c, k]
+                if p >= 0:
+                    flags[p] = 1
+                    wp.atomic_add(extra_counts, p, 3)
+
+
+@wp.kernel
+def capacity_row_keys_kernel(
+    active: wp.array[wp.int32],
+    row_particle: wp.array[wp.int32],
+    inert: int,
+    # outputs
+    keys: wp.array[wp.int32],
+    values: wp.array[wp.int32],
+):
+    """Keys that sort the rows of a contact buffer's first slots by their first particle, the rows of the slots past
+    the ``active[0]`` active ones last (``inert``), for the particle CSR of the rows."""
+    r = wp.tid()
+    values[r] = r
+    keys[r] = wp.where(r // 3 < active[0], row_particle[r], inert)
+
+
+@wp.kernel
+def capacity_slot_keys_kernel(
+    active: wp.array[wp.int32],
+    extra_particle: wp.array2d[wp.int32],
+    inert: int,
+    # outputs
+    keys: wp.array[wp.int32],
+    values: wp.array[wp.int32],
+):
+    """Keys that sort the further particles of the rows of a contact buffer's first slots by particle, as
+    ``row * K + slot``, ``slot`` from 1, with ``K - 1`` the width of ``extra_particle``; those of unused slots and of
+    the slots past the ``active[0]`` active ones last (``inert``)."""
+    t = wp.tid()
+    width = extra_particle.shape[1]
+    r = t // width
+    k = t - r * width
+    values[t] = r * (width + 1) + k + 1
+    p = int(-1)
+    if r // 3 < active[0]:
+        p = extra_particle[r // 3, k]
+    keys[t] = wp.where(p >= 0, p, inert)
+
+
+@wp.kernel
+def capacity_slot_rows_kernel(
+    row_particle: wp.array[wp.int32],
+    row_alpha: wp.array[wp.float32],
+    extra_particle: wp.array2d[wp.int32],
+    extra_alpha: wp.array2d[wp.float32],
+    # outputs
+    slot_particle: wp.array2d[wp.int32],
+    slot_alpha: wp.array2d[wp.float32],
+):
+    """The particles and coefficients of each row of a contact buffer's slots, its first particle's first."""
+    r = wp.tid()
+    slot_particle[r, 0] = row_particle[r]
+    slot_alpha[r, 0] = row_alpha[r]
+    for k in range(extra_particle.shape[1]):
+        slot_particle[r, k + 1] = extra_particle[r // 3, k]
+        slot_alpha[r, k + 1] = extra_alpha[r // 3, k]
 
 
 @wp.kernel
@@ -2362,16 +2429,18 @@ def compose_W_capacity_kernel(
     contact_particle: wp.array[wp.int32],
     contact_dir: wp.array[wp.vec3],
     contact_alpha: wp.array[wp.float32],
-    record: wp.array[wp.int32],
+    active: wp.array[wp.int32],
     isodof_rank: wp.array[wp.int32],
     Wi: wp.array2d[wp.float64],
     # outputs
     W: wp.array2d[wp.float64],
 ):
-    """:func:`compose_W_from_wi_kernel` for the three rows of each contact of a contact buffer's whole capacity: the
-    rows of an inert contact (record -1) take those of the identity, so that they couple to nothing."""
+    """:func:`compose_W_from_wi_kernel` for the three rows of each contact of a contact buffer's first slots: the rows
+    of an inert contact, past the ``active[0]`` active ones, take those of the identity, so that they couple to
+    nothing."""
     cp, c = wp.tid()
-    if record[cp // 3] < 0 or record[c // 3] < 0:
+    m = active[0]
+    if cp // 3 >= m or c // 3 >= m:
         W[cp, c] = wp.where(cp == c, wp.float64(1.0), wp.float64(0.0))
         return
     r_cp = isodof_rank[contact_particle[cp]]
@@ -2379,6 +2448,33 @@ def compose_W_capacity_kernel(
     alpha = wp.float64(contact_alpha[cp]) * wp.float64(contact_alpha[c])
     dot = wp.float64(wp.dot(contact_dir[cp], contact_dir[c]))
     W[cp, c] = alpha * dot * Wi[r_cp, r_c]
+
+
+@wp.kernel
+def add_slot_terms_capacity_kernel(
+    slot_particle: wp.array2d[wp.int32],  # (rows, K) particles of each row, -1 when unused
+    slot_alpha: wp.array2d[wp.float32],
+    contact_dir: wp.array[wp.vec3],
+    active: wp.array[wp.int32],
+    isodof_rank: wp.array[wp.int32],
+    Wi: wp.array2d[wp.float64],
+    W: wp.array2d[wp.float64],  # inout
+):
+    """:func:`add_slot_terms_W_kernel` on the rows of the ``active[0]`` active contacts of a contact buffer's first
+    slots, after :func:`compose_W_capacity_kernel`; the inert rows keep those of the identity."""
+    a, b = wp.tid()
+    m = active[0]
+    if a // 3 >= m or b // 3 >= m:
+        return
+    s = wp.float64(0.0)
+    for i in range(slot_particle.shape[1]):
+        pa = slot_particle[a, i]
+        for j in range(slot_particle.shape[1]):
+            pb = slot_particle[b, j]
+            if pa >= 0 and pb >= 0 and i + j > 0:
+                w = wp.float64(slot_alpha[a, i]) * wp.float64(slot_alpha[b, j])
+                s += w * Wi[isodof_rank[pa], isodof_rank[pb]]
+    W[a, b] = W[a, b] + wp.float64(wp.dot(contact_dir[a], contact_dir[b])) * s
 
 
 @wp.kernel
@@ -3279,6 +3375,7 @@ def capacity_contact_keys_kernel(
 def capacity_contact_rows_kernel(
     keys: wp.array[wp.int64],
     order: wp.array[wp.int32],
+    count: int,
     contact_particle: wp.array[wp.int32],
     contact_shape: wp.array[wp.int32],
     contact_body_pos: wp.array[wp.vec3],
@@ -3291,11 +3388,14 @@ def capacity_contact_rows_kernel(
     body_pos: wp.array[wp.vec3],
     record: wp.array[wp.int32],
 ):
-    """The contact rows in key order, the active contacts first; an inert row has particle and shape 0, coefficient
-    0 and record -1, so that it moves nothing (:func:`inert_contact_offset_kernel` also separates it)."""
+    """The contact rows in key order, the active contacts first; an inert row, past the ``count`` sorted keys or of
+    the inert key, has particle and shape 0, coefficient 0 and record -1, so that it moves nothing
+    (:func:`inert_contact_offset_kernel` also separates it)."""
     c = wp.tid()
-    i = order[c]
-    if keys[c] == _INERT_KEY:
+    i = int(0)
+    if c < count:
+        i = order[c]
+    if c >= count or keys[c] == _INERT_KEY:
         particle[c] = 0
         normal[c] = wp.vec3(0.0, 0.0, 1.0)
         alpha[c] = 0.0
@@ -3313,14 +3413,174 @@ def capacity_contact_rows_kernel(
 
 @wp.kernel
 def inert_contact_offset_kernel(
-    record: wp.array[wp.int32],
+    active: wp.array[wp.int32],
     # outputs
     offset: wp.array[wp.float64],
 ):
-    """Give each inert contact row (record -1) a gap of 1e6 m, so that its Newton step keeps its multipliers at 0."""
+    """Give each inert contact row, past the ``active[0]`` active ones, a gap of 1e6 m, so that its Newton step keeps
+    its multipliers at 0."""
     c = wp.tid()
-    if record[c] < 0:
+    if c >= active[0]:
         offset[c] = wp.float64(-1.0e6)
+
+
+@wp.kernel
+def capacity_minima_keys_kernel(
+    count: wp.array[wp.int32],
+    particle: wp.array[wp.int32],
+    shape: wp.array[wp.int32],
+    shape_count: int,
+    pinned: wp.array[wp.int32],  # 1 for each particle the solver holds, or empty
+    found: wp.array2d[wp.int32],  # (C, 3) the mesh minima of each contact slot (FaceContactQuery.capacity_minima)
+    # outputs, past the C keys of capacity_contact_keys_kernel
+    keys: wp.array[wp.int64],
+    values: wp.array[wp.int32],
+):
+    """The keys of :func:`capacity_contact_keys_kernel` for the mesh minima of each contact slot ``c``, at ``C + 3 c +
+    e``: the key of the slot's contact, so that a minimum sorts with it, and the largest key for an empty one."""
+    t = wp.tid()
+    C = found.shape[0]
+    c = t // 3
+    i = C + t
+    values[i] = i
+    p = particle[c]
+    inert = c >= count[0] or p < 0
+    if not inert:
+        inert = found[c, t - 3 * c] == 0
+    if not inert and pinned.shape[0] > 0:
+        inert = pinned[p] != 0
+    if inert:
+        keys[i] = _INERT_KEY
+    else:
+        keys[i] = wp.int64(p) * wp.int64(shape_count) + wp.int64(shape[c])
+
+
+@wp.func
+def _minimum_point(
+    i: int,
+    contact_normal: wp.array[wp.vec3],
+    contact_body_pos: wp.array[wp.vec3],
+    minima_normal: wp.array2d[wp.vec3],
+    minima_body_pos: wp.array2d[wp.vec3],
+):
+    """The normal and anchor of entry ``i`` of the sort of :func:`capacity_minima_keys_kernel`: a contact slot, or a
+    mesh minimum past them."""
+    C = minima_normal.shape[0]
+    if i < C:
+        return contact_normal[i], contact_body_pos[i]
+    return minima_normal[(i - C) // 3, (i - C) % 3], minima_body_pos[(i - C) // 3, (i - C) % 3]
+
+
+@wp.func
+def _contact_tie_less(a_n: wp.vec3, a_x: wp.vec3, b_n: wp.vec3, b_x: wp.vec3) -> bool:
+    """Whether a contact of a particle and shape precedes another of them: by normal, then anchor, each by x, y, z, as
+    the host path's lexicographic sort orders them."""
+    for k in range(3):
+        if a_n[k] != b_n[k]:
+            return a_n[k] < b_n[k]
+    for k in range(3):
+        if a_x[k] != b_x[k]:
+            return a_x[k] < b_x[k]
+    return False
+
+
+@wp.kernel
+def capacity_contact_ties_kernel(
+    keys: wp.array[wp.int64],
+    contact_normal: wp.array[wp.vec3],
+    contact_body_pos: wp.array[wp.vec3],
+    minima_normal: wp.array2d[wp.vec3],
+    minima_body_pos: wp.array2d[wp.vec3],
+    # inout
+    values: wp.array[wp.int32],
+):
+    """Order the contacts of each particle and shape, a run of equal keys after the radix sort, by their normals and
+    anchors (:func:`_contact_tie_less`), stably, as the host path orders a particle contact and its mesh minima."""
+    i = wp.tid()
+    key = keys[i]
+    if key == _INERT_KEY or (i > 0 and keys[i - 1] == key):
+        return
+    n = int(1)
+    while i + n < keys.shape[0] and keys[i + n] == key:
+        n += 1
+    for a in range(1, n):
+        v = values[i + a]
+        v_n, v_x = _minimum_point(v, contact_normal, contact_body_pos, minima_normal, minima_body_pos)
+        b = a
+        while b > 0:
+            u = values[i + b - 1]
+            u_n, u_x = _minimum_point(u, contact_normal, contact_body_pos, minima_normal, minima_body_pos)
+            if not _contact_tie_less(v_n, v_x, u_n, u_x):
+                break
+            values[i + b] = u
+            b -= 1
+        values[i + b] = v
+
+
+@wp.kernel
+def capacity_key_count_kernel(
+    keys: wp.array[wp.int64],
+    # outputs
+    count: wp.array[wp.int32],
+):
+    """The count of the sorted keys below the inert key, the active contacts of a sort that puts the inert ones last."""
+    c = wp.tid()
+    last = keys.shape[0] - 1
+    if keys[c] != _INERT_KEY and (c == last or keys[wp.min(c + 1, last)] == _INERT_KEY):
+        count[0] = c + 1
+    if c == 0 and keys[0] == _INERT_KEY:
+        count[0] = 0
+
+
+@wp.kernel
+def capacity_minima_rows_kernel(
+    keys: wp.array[wp.int64],
+    order: wp.array[wp.int32],
+    count: int,
+    contact_particle: wp.array[wp.int32],
+    contact_shape: wp.array[wp.int32],
+    contact_body_pos: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    minima_body_pos: wp.array2d[wp.vec3],
+    minima_normal: wp.array2d[wp.vec3],
+    # outputs
+    particle: wp.array[wp.int32],
+    normal: wp.array[wp.vec3],
+    alpha: wp.array[wp.float32],
+    shape: wp.array[wp.int32],
+    body_pos: wp.array[wp.vec3],
+    record: wp.array[wp.int32],
+):
+    """:func:`capacity_contact_rows_kernel` for a sort of the contact slots and their mesh minima: a minimum takes its
+    contact's particle, shape and record with its own anchor and normal."""
+    c = wp.tid()
+    i = int(0)
+    if c < count:
+        i = order[c]
+    C = minima_normal.shape[0]
+    if c >= count or keys[c] == _INERT_KEY:
+        particle[c] = 0
+        normal[c] = wp.vec3(0.0, 0.0, 1.0)
+        alpha[c] = 0.0
+        shape[c] = 0
+        body_pos[c] = wp.vec3(0.0)
+        record[c] = -1
+    elif i < C:
+        particle[c] = contact_particle[i]
+        normal[c] = contact_normal[i]
+        alpha[c] = 1.0
+        shape[c] = contact_shape[i]
+        body_pos[c] = contact_body_pos[i]
+        record[c] = i
+    else:
+        j = (i - C) // 3
+        e = (i - C) % 3
+        particle[c] = contact_particle[j]
+        normal[c] = minima_normal[j, e]
+        alpha[c] = 1.0
+        shape[c] = contact_shape[j]
+        body_pos[c] = minima_body_pos[j, e]
+        record[c] = j
 
 
 @wp.kernel
