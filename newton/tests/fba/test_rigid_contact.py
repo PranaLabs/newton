@@ -781,6 +781,52 @@ class TestSolverFBATwoWayContacts(unittest.TestCase):
         np.testing.assert_allclose(soft[:, 3:], np.cross(lever, soft[:, :3]), atol=1e-5)
         self.assertFalse(wrench[:rigid].any(), "rigid contacts are not exported")
 
+    def test_pinned_particles_hold_a_free_box(self):
+        """Hold a free box dropped onto a cloth patch whose particles are all pinned: the rows of the pinned particles'
+        contacts with the box push it, though they cannot move the particles, and it comes to rest on them, through the
+        host's rows, the device's (with self contacts) and the capacity path, with face contacts or without, while the
+        particles keep their pins."""
+        from newton.solvers import SolverFBA  # noqa: PLC0415
+
+        grid = {"dim_x": 4, "dim_y": 4, "cell_x": 0.1, "cell_y": 0.1, "tri_ke": 500.0, "tri_ka": 1.0e3, "edge_ke": 1.0}
+        host_rows = {}
+        for path, face in (("host", False), ("host", True), ("device", False), ("capacity", False), ("capacity", True)):
+            with self.subTest(path=path, face=face):
+                builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+                builder.add_ground_plane()
+                box = builder.add_body(xform=wp.transform((0.0, 0.0, 1.6), wp.quat_identity()))
+                cfg = newton.ModelBuilder.ShapeConfig(density=100.0)
+                builder.add_shape_box(box, hx=0.15, hy=0.15, hz=0.5, cfg=cfg)
+                builder.add_cloth_grid(
+                    pos=wp.vec3(-0.2, -0.2, 1.0), rot=wp.quat_identity(), vel=wp.vec3(0.0), mass=0.0,
+                    particle_radius=0.0, **grid,
+                )  # fmt: skip
+                model = builder.finalize()
+                self.assertFalse(model.particle_inv_mass.numpy().any())
+                solver = SolverFBA(
+                    model, iterations=10, nsn_linear_iterations=10, face_contacts=face,
+                    particle_enable_self_contact=path == "device",
+                )  # fmt: skip
+                s0, s1 = model.state(), model.state()
+                pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.11)
+                contacts = pipeline.contacts()
+                for k in range(120):
+                    if path == "capacity" and k == 1:
+                        # The steps recorded into a graph take the capacity path; this takes it without a graph.
+                        solver._recording = lambda: True
+                    pipeline.collide(s0, contacts)
+                    solver.step(s0, s1, None, contacts, 0.005)
+                    s0, s1 = s1, s0
+                self.assertTrue(solver._two_way)
+                if path == "capacity":
+                    self.assertTrue(solver._tw_active)
+                    self.assertEqual(int(solver._tw.active.numpy()[0]), host_rows[face])
+                else:
+                    host_rows[face] = solver._contact_count
+                    self.assertGreaterEqual(solver._contact_count, 25 + face)
+                np.testing.assert_allclose(s0.body_q.numpy()[0, :3], [0.0, 0.0, 1.5], atol=1e-4)
+                np.testing.assert_array_equal(s0.particle_q.numpy(), model.particle_q.numpy())
+
     def test_contact_forces_beside_a_box(self):
         """Report the same CONTACT_F rows for a cloth lying on the ground with or without a box resting beside it.
 

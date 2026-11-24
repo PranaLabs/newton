@@ -1,0 +1,1 @@
+Fix `SolverFBA` dropping the contacts of pinned particles with the bodies it integrates, which let a free body fall through a pinned cloth; such contacts now push the body, while the particles keep their pins.

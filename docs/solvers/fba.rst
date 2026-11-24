@@ -206,7 +206,7 @@ buffers of their capacity: with the lite operator, or with the full operator
 and a dense ``W`` (``nsn_sparse_storage=False``) and a fixed count of at most
 25 ``nsn_linear_iterations``, its face contacts included. Such a step takes
 every slot of the contact buffer as a contact row, those past the stored count
-and those of held particles inert, sorted on the device. With the lite operator
+and the dropped contacts of held particles inert, sorted on the device. With the lite operator
 it gives every particle the per-particle Newton step; a particle with more than
 four contacts keeps its multipliers there. With the full operator the step
 finds its face contacts and the other distance minima of its particles beside
@@ -364,8 +364,10 @@ Model Inputs
   :meth:`~newton.solvers.SolverFBA.set_pin_targets` sets them. Particles
   without the ``ACTIVE`` flag that have a mass hold where the input state has
   them. Contacts on held particles alone, such as a pinned particle's contact
-  with a shape, are dropped: they cannot move the particles, and pressing on
-  a pin would only move it off its target.
+  with a static shape, are dropped: they cannot move the particles, and
+  pressing on a pin would only move it off its target. Those with the shapes
+  of the bodies the solver integrates stay and push the bodies, so a free
+  body rests on a pinned cloth.
 - **Particle constraints**:
   :meth:`~newton.solvers.SolverFBA.set_particle_constraints` holds lengths or
   linear combinations of particle positions at targets, solved with the

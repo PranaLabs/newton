@@ -3306,26 +3306,40 @@ def bilateral_law_kernel(
         h[i] = pene0[i] - e * dt * dt * lam[i]
 
 
+@wp.func
+def held_contact(pinned: wp.array[wp.int32], pushed: wp.array[wp.int32], p: wp.int32, s: wp.int32) -> bool:
+    """Whether the contact of particle ``p`` with shape ``s`` is a row on a held particle alone, which the solver
+    drops: it holds ``p`` (``pinned``: 1 for each particle it holds, or empty) and ``s`` is not on a body it integrates
+    (``pushed``: 1 for each shape on such a body, or empty), which the row would push."""
+    if pinned.shape[0] == 0:
+        return False
+    if pinned[p] == 0:
+        return False
+    if s >= 0 and pushed.shape[0] > 0:
+        return pushed[s] == 0
+    return True
+
+
 @wp.kernel
 def soft_contact_keys_kernel(
     particle: wp.array[wp.int32],
     shape: wp.array[wp.int32],
     shape_count: int,
     pinned: wp.array[wp.int32],  # 1 for each particle the solver holds, or empty
+    pushed: wp.array[wp.int32],  # 1 for each shape on a body the solver integrates, or empty
     # outputs
     keys: wp.array[wp.int64],
     values: wp.array[wp.int32],
     held_count: wp.array[wp.int32],
 ):
     """Keys that sort the particle-shape contacts by particle and then shape, and their indices; the contacts of
-    held particles sort last, and ``held_count`` counts them."""
+    held particles (:func:`held_contact`) sort last, and ``held_count`` counts them."""
     i = wp.tid()
     p = particle[i]
     keys[i] = wp.int64(p) * wp.int64(shape_count) + wp.int64(shape[i])
-    if pinned.shape[0] > 0:
-        if pinned[p] != 0:
-            keys[i] = wp.int64(9223372036854775807)
-            wp.atomic_add(held_count, 0, 1)
+    if held_contact(pinned, pushed, p, shape[i]):
+        keys[i] = wp.int64(9223372036854775807)
+        wp.atomic_add(held_count, 0, 1)
     values[i] = i
 
 
@@ -3352,19 +3366,20 @@ def capacity_contact_keys_kernel(
     shape: wp.array[wp.int32],
     shape_count: int,
     pinned: wp.array[wp.int32],  # 1 for each particle the solver holds, or empty
+    pushed: wp.array[wp.int32],  # 1 for each shape on a body the solver integrates, or empty
     # outputs
     keys: wp.array[wp.int64],
     values: wp.array[wp.int32],
 ):
     """Keys that sort the particle-shape contacts of a contact buffer by particle and then shape, its whole capacity
-    at once: the slots past the stored count, sentinel slots and the contacts of held particles take the largest key
-    and sort last, as inert rows."""
+    at once: the slots past the stored count, sentinel slots and the contacts of held particles
+    (:func:`held_contact`) take the largest key and sort last, as inert rows."""
     i = wp.tid()
     values[i] = i
     p = particle[i]
     inert = i >= count[0] or p < 0
-    if not inert and pinned.shape[0] > 0:
-        inert = pinned[p] != 0
+    if not inert:
+        inert = held_contact(pinned, pushed, p, shape[i])
     if inert:
         keys[i] = _INERT_KEY
     else:
@@ -3431,6 +3446,7 @@ def capacity_minima_keys_kernel(
     shape: wp.array[wp.int32],
     shape_count: int,
     pinned: wp.array[wp.int32],  # 1 for each particle the solver holds, or empty
+    pushed: wp.array[wp.int32],  # 1 for each shape on a body the solver integrates, or empty
     found: wp.array2d[wp.int32],  # (C, 3) the mesh minima of each contact slot (FaceContactQuery.capacity_minima)
     # outputs, past the C keys of capacity_contact_keys_kernel
     keys: wp.array[wp.int64],
@@ -3447,8 +3463,8 @@ def capacity_minima_keys_kernel(
     inert = c >= count[0] or p < 0
     if not inert:
         inert = found[c, t - 3 * c] == 0
-    if not inert and pinned.shape[0] > 0:
-        inert = pinned[p] != 0
+    if not inert:
+        inert = held_contact(pinned, pushed, p, shape[c])
     if inert:
         keys[i] = _INERT_KEY
     else:

@@ -580,13 +580,15 @@ def face_edge_keep_kernel(
     edge_start: wp.array[wp.int32],  # (3 tri_count + 1,) the other triangle edges with each edge's endpoints
     edge_other: wp.array[wp.int32],  # triangle * 3 + the vertex opposite its edge
     pinned: wp.array[wp.int32],  # 1 for each particle the solver holds, or empty
+    pushed: wp.array[wp.int32],  # 1 for each shape on a body the solver integrates, or empty
     # outputs
     found: wp.array[wp.int32],
     keep: wp.array[wp.int32],
 ):
     """Keep each emitted face contact but an edge optimum that another triangle on the edge reaches deeper, or as deep
     at a lower candidate, as :meth:`FaceContactQuery.query` keeps the deepest of each edge, then drop those whose
-    particles of nonzero weight the solver all holds, as :meth:`SolverFBA._ingest_contacts` drops them; ``found[0]``
+    particles of nonzero weight the solver all holds, but on the shapes of the bodies it integrates (``pushed``), as
+    :meth:`SolverFBA._ingest_contacts` drops them; ``found[0]``
     counts the contacts kept before that."""
     i = wp.tid()
     keep[i] = 0
@@ -611,6 +613,9 @@ def face_edge_keep_kernel(
         for k in range(3):
             if w[k] != 0.0 and pinned[tri_indices[f, k]] == 0:
                 free = 1
+        # A row on held particles alone still pushes a body the solver integrates.
+        if free == 0 and pushed.shape[0] > 0:
+            free = pushed[cand_shape[i]]
         if free == 0:
             return
     keep[i] = 1
@@ -872,6 +877,7 @@ class FaceContactQuery:
         body_q,
         contacts,
         pinned,
+        pushed,
         edge_radius: float,
         gap: float | None,
         first,
@@ -885,7 +891,8 @@ class FaceContactQuery:
     ) -> None:
         """The face contacts of :meth:`query` on the device alone, nothing read back, for the particle contacts of the
         whole capacity of ``contacts``: the candidates flagged and ranked by a scan, each one's optimum at its own
-        index, the deepest of each edge kept, and those on held particles alone (``pinned``) dropped. They are written,
+        index, the deepest of each edge kept, and those on held particles alone (``pinned``) dropped but on the shapes of
+        integrated bodies (``pushed``). They are written,
         in the order of :meth:`query`, into the contact rows ``rows`` (particle, normal, alpha, shape, body_pos,
         record) and ``extra`` (particles and weights) from row ``first[0]`` on, up to row ``limit``; ``active[0]``
         takes the rows' total, which may pass ``limit``, and ``contact_gain`` each contact's gain of its rows'
@@ -930,7 +937,7 @@ class FaceContactQuery:
         )
         cap.found.zero_()
         inputs = [cap.count, cap.emitted, cap.bary, cap.depth, cap.face, cap.shape, cap.flags, cap.rank, self.tri_d]
-        inputs += [cap.edge_start, cap.edge_other, pinned]
+        inputs += [cap.edge_start, cap.edge_other, pinned, pushed]
         wp.launch(face_edge_keep_kernel, F, inputs, [cap.found, cap.keep], device=device)
         wp.utils.array_scan(cap.keep, cap.position, inclusive=False)
         inputs = [cap.count, cap.keep, cap.position, cap.face, cap.shape, cap.bary, cap.body_pos, cap.normal]
