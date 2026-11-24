@@ -220,8 +220,12 @@ class SolverFBA(TendonStateMixin, SolverBase):
     joint); a position drive needs a linear axis or the angular axis of a joint
     with one. ``Control.joint_f`` adds the joints' generalized forces to their
     bodies. A mimic joint (``Model.joint_mimic_joint``) holds each coordinate
-    at ``c0 + c1`` times its leader's by a hard row on both joints' axes. The limits' stiffness and damping (``joint_limit_ke``,
-    ``joint_limit_kd``), the effort and velocity limits and joint friction are
+    at ``c0 + c1`` times its leader's by a hard row on both joints' axes. An
+    effort limit ``Model.joint_effort_limit`` below 1e6 bounds a drive's force
+    (its damping and armature stay unbounded), and joint friction
+    ``Model.joint_friction`` adds a row on the axis's motion whose force it
+    bounds, both by a box law in each Newton step. The limits' stiffness and
+    damping (``joint_limit_ke``, ``joint_limit_kd``) and the velocity limits are
     not read, nor are the limits of ball and D6 joints.
 
     Notes:
@@ -1266,28 +1270,13 @@ class SolverFBA(TendonStateMixin, SolverBase):
         self._joint_force_d = wp.empty(R, dtype=wp.float64, device=device)
 
     def _warn_unapplied_dof_properties(self) -> None:
-        """Warn about the DOF properties of the integrated joints that FBA does not apply: the effort limits of
-        driven DOFs, joint friction and velocity limits."""
+        """Warn about the DOF properties of the integrated joints that FBA does not apply: velocity limits."""
         model, rows = self.model, self._joint_rows
         start, dim = model.joint_qd_start.numpy(), model.joint_dof_dim.numpy()
         dofs = np.concatenate([np.arange(start[j], start[j] + dim[j].sum()) for j in rows.joint_index])
-        if dofs.size == 0:
-            return
-
-        def values(name, default=0.0):
-            array = getattr(model, f"joint_{name}", None)
-            return np.full(dofs.size, default) if array is None else array.numpy()[dofs]
-
-        driven = (values("target_ke") > 0.0) | (values("target_kd") > 0.0)
-        unapplied = []
-        if (driven & (values("effort_limit", np.inf) < 1.0e6)).any():
-            unapplied.append("joint_effort_limit (drive forces are not limited)")
-        if (values("friction") > 0.0).any():
-            unapplied.append("joint_friction")
-        if (values("velocity_limit", np.inf) < 1.0e6).any():
-            unapplied.append("joint_velocity_limit")
-        if unapplied:
-            warnings.warn(f"SolverFBA does not apply {', '.join(unapplied)}", NewtonWarning, stacklevel=2)
+        limits = getattr(model, "joint_velocity_limit", None)
+        if dofs.size and limits is not None and (limits.numpy()[dofs] < 1.0e6).any():
+            warnings.warn("SolverFBA does not apply joint_velocity_limit", NewtonWarning, stacklevel=2)
 
     def _begin_rigid_step(self, state_in: State, state_out: State, dt: float, control: Control | None = None) -> bool:
         """Start the step of the integrated bodies at their free-flight solution.
@@ -1404,14 +1393,14 @@ class SolverFBA(TendonStateMixin, SolverBase):
                     dim=self._joint_residual_d.shape[0],
                     inputs=[
                         *(rows.row_joint, rows.row_angular, rows.row_kind, rows.row_dir, rows.row_dof, rows.row_coord),
-                        *(rows.parent, rows.child, rows.X_pj, rows.X_cj, state_in.body_q, state_in.body_qd),
-                        *(model.body_com, model.joint_damping, model.joint_armature),
+                        *(rows.row_box, rows.parent, rows.child, rows.X_pj, rows.X_cj, state_in.body_q),
+                        *(state_in.body_qd, model.body_com, model.joint_damping, model.joint_armature),
                         *(model.joint_target_ke, model.joint_target_kd),
                         model.joint_target_q if target_q is None else target_q,
                         model.joint_target_qd if target_qd is None else target_qd,
                         wp.float64(dt),
                     ],
-                    outputs=[self._joint_system.compliance, self._joint_row_target_d],
+                    outputs=[self._joint_system.compliance, self._joint_row_target_d, self._joint_system.box_terms],
                     device=self._device,
                 )
             self._joint_system.factor(self._joint_row_slot_d, self._joint_row_jac_d)
@@ -2274,6 +2263,11 @@ class SolverFBA(TendonStateMixin, SolverBase):
             self._linear_solver.update_row_directions(self._constraint_rows[2], n_s)
             self._compose_rigid_delassus()
         live = [self._rigid_x_live_d, self._rigid_q_live_d]
+        if n_j and self._joint_system.box_rows.shape[0] and self._rc_bilateral_compliance is not None:
+            # The joint rows' compliance of this Newton step, which the box rows' laws set.
+            inputs = [self._joint_system.compliance, joint_rows, 0]
+            outputs = [self._rc_bilateral_compliance]
+            wp.launch(gather_values_kernel, joint_rows.shape[0], inputs, outputs, device=device)
         if m_s:
             from .rigid_contact import particle_contact_body_residual_kernel  # noqa: PLC0415
 
@@ -2579,9 +2573,14 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 inputs = [system.mimic_rows, system.mimic_coeffs, 0, 1]
                 outputs = [self._joint_residual_d]
                 wp.launch(mimic_combine_kernel, system.mimic_rows.shape[0], inputs, outputs, device=self._device)
-            self._joint_system.update(self._joint_residual_d, self._joint_force_d)
+            # The box rows' laws for this Newton step, from their forces and motions.
+            model = self.model
+            box = (model.joint_effort_limit, model.joint_friction)
+            system.box_law(self._joint_residual_d, self._joint_row_target_d, self._joint_force_d, *box)
+            system.update(self._joint_residual_d, self._joint_force_d)
         force = self._solve_rigid_contacts(state_in, dt) if self._rc_n else None
         if self._joint_rows is not None:
+            self._joint_system.clamp_friction(self._joint_force_d, self.model.joint_friction)
             self._joint_system.apply_force(self._joint_row_jac_d, self._joint_force_d, b, self._rigid_b_iter_d)
             b = self._rigid_b_iter_d
         if force is not None:

@@ -38,10 +38,10 @@ held by other objects:
   solve, or rigid bodies come from another solver, such as an arm that
   :class:`~newton.solvers.SolverFeatherstone` integrates.
 
-Choose another solver for differentiable simulation and for articulations whose drives need effort limits, joint
-friction or actuators other than PD drives: FBA treats joints as bilateral constraints, with the limits of
-revolute and prismatic joints, passive damping, PD drives and armature, so integrate such an articulation with
-another solver and pass
+Choose another solver for differentiable simulation and for articulations whose drives need velocity limits or
+actuators other than PD drives: FBA treats joints as bilateral constraints, with the limits of revolute and
+prismatic joints, passive damping, PD drives bounded by effort limits, armature and joint friction, so integrate
+such an articulation with another solver and pass
 ``integrate_with_external_rigid_solver=True``. See the :ref:`Supported
 Features` matrix and the :ref:`Joint feature support` tables for a comparison
 with the other solvers. The solver builds on projective dynamics and a
@@ -354,7 +354,7 @@ Model Inputs
   bodies through, or leaves every body to another solver with
   ``integrate_with_external_rigid_solver=True``. PRISMATIC, REVOLUTE, BALL,
   FIXED, and D6 joints are bilateral constraints, at most 64 rows per
-  articulation, the damper rows below included; DISTANCE and ROD joints, and
+  articulation, the damper and friction rows below included; DISTANCE and ROD joints, and
   joints that lock more directions of a set of connected bodies than the
   bodies have, as kinematic loops do, raise ``NotImplementedError``. A D6
   joint with two free angular axes ``a0`` and ``a1`` turns as Newton composes
@@ -403,13 +403,22 @@ Model Inputs
   armature act on every free axis. :attr:`~newton.Control.joint_f` adds each
   DOF's generalized force to the bodies as
   :class:`~newton.solvers.SolverSemiImplicit` applies it, and a FREE joint's
-  wrench to its child. FBA does not limit the drive forces to
-  :attr:`~newton.Model.joint_effort_limit` and ignores
-  :attr:`~newton.Model.joint_friction` and
-  :attr:`~newton.Model.joint_velocity_limit`, with a warning where an
-  articulation it integrates sets them. Joints at the default infinite limits,
-  zero damping and armature and no drive take no such rows. Limits need the
-  full operator.
+  wrench to its child. A driven axis whose
+  :attr:`~newton.Model.joint_effort_limit` is below ``1e6`` (the builder's
+  default) bounds its drive's force ``ke (q* - q) + kd (q_dot* - q_dot)`` to
+  ``[-F, F]``, as MuJoCo's ``actfrcrange`` does, while its damping and armature
+  stay unbounded; a free axis with :attr:`~newton.Model.joint_friction` ``F``
+  takes a row of its own on its motion, which holds the axis still with a force
+  within ``[-F, F]`` and lets it slide against ``F`` beyond, as MuJoCo's
+  ``frictionloss`` does. Both rows follow a box law in each Newton step: the
+  step of a row alone predicts its bounded force, and a row whose prediction
+  passes a bound takes its law at the bound, a compliance and target motion
+  that land its force there, in the articulation's joint system (factored again
+  where a row changes sides) and in the contact solve when contacts touch the
+  articulation. FBA ignores :attr:`~newton.Model.joint_velocity_limit`, with a
+  warning where an articulation it integrates sets it. Joints at the default
+  infinite limits, zero damping, armature and friction and no drive take no
+  such rows. Limits need the full operator.
 - **Mimic joints**: a mimic joint (:attr:`~newton.Model.joint_mimic_joint`
   and :attr:`~newton.Model.joint_mimic_coeffs`) holds each coordinate at
   ``c0 + c1`` times its leader's, as a hard row: a pair of rows on the
@@ -457,8 +466,8 @@ Model Inputs
 
 FBA does not simulate equality constraints, the
 limits of BALL and D6 joints, the limit stiffness and damping
-``joint_limit_ke`` and ``joint_limit_kd`` (its limits are hard), the effort
-and velocity limits and the friction of joint DOFs, or the inputs of
+``joint_limit_ke`` and ``joint_limit_kd`` (its limits are hard), the
+velocity limits of joint DOFs, or the inputs of
 :class:`~newton.Control` other than ``tet_activations``, ``joint_f``,
 ``joint_target_q`` and ``joint_target_qd``, and it
 does not read the damping coefficients ``tri_kd``, ``edge_kd`` and ``k_damp``
