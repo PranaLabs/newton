@@ -71,6 +71,8 @@ from collections.abc import Callable
 import numpy as np
 import warp as wp
 
+from .capture import scoped_capture
+
 wp.set_module_options({"enable_backward": False})
 
 
@@ -1768,7 +1770,7 @@ class NSNPCRSolver:
             # if some kernel inside the iter body issues an implicit host
             # allocation that traps the capture).
             try:
-                with wp.ScopedCapture(device=device) as cap:
+                with scoped_capture(device) as cap:
                     self._pcr_iter_eager(A, n, n_pad, device)
                 self._pcr_graph_cache = {key: cap.graph}
                 return cap.graph

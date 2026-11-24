@@ -1,0 +1,1 @@
+Pause Python's garbage collector while `SolverFBA` captures its CUDA graphs and while it records a step into the caller's graph: a collection there freed the arrays of unreachable reference cycles inside the capture, after which the caller's graph failed to launch (`CUDA error 900`).

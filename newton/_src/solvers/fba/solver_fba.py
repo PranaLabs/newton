@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy as cp
 import functools
 import hashlib
@@ -21,6 +22,7 @@ from ...geometry import ParticleFlags
 from ...sim import BodyFlags, Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
 from ..solver import SolverBase
 from ..tendon_state import TendonStateMixin
+from .capture import gc_paused, scoped_capture
 from .kernels import host_head, stored_contact_count
 
 if TYPE_CHECKING:
@@ -2531,7 +2533,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
                     self._linear_solver.reserve_lambda_correction()
             self._outer_capture = True
             try:
-                with wp.ScopedCapture(device=self._device) as capture:
+                with scoped_capture(self._device) as capture:
                     self._rigid_iteration_eager(state_in, state_out, dt)
                 self._rigid_iter_graph = capture.graph
             except RuntimeError:
@@ -3104,24 +3106,28 @@ class SolverFBA(TendonStateMixin, SolverBase):
         """
         if not (math.isfinite(dt) and dt > 0.0):
             raise ValueError(f"SolverFBA.step needs a finite positive dt, got {dt}")
-        if wp.get_device(self._device).is_capturing:
-            blocker = self._capture_blocker(contacts, dt)
-            if blocker is not None:
-                raise RuntimeError(f"SolverFBA.step cannot be captured in a graph here: {blocker}")
-        if control is None:
-            # As SolverBase specifies, a step without control takes the model's.
-            control = self.model.control(clone_variables=False)
-        state_in = self._unaliased_input(state_in, state_out)
-        try:
-            self._step(state_in, state_out, control, contacts, dt, observables)
-        finally:
-            # A split step that raises with rows of a world selection in place returns the solver's own.
-            if self._swapped_rows is not None:
-                self._swap_rows(self._swapped_rows)
-            self._capacity_step = False
-        if not self._recording() and self._capacity_contacts_capable(contacts):
-            # A later step with these contacts may record into a graph: its buffers are allocated now.
-            self._reserve_capacity(contacts)
+        capturing = wp.get_device(self._device).is_capturing
+        # A step recorded into the caller's graph runs without garbage collection, which would free arrays inside the
+        # capture.
+        with gc_paused() if capturing else contextlib.nullcontext():
+            if capturing:
+                blocker = self._capture_blocker(contacts, dt)
+                if blocker is not None:
+                    raise RuntimeError(f"SolverFBA.step cannot be captured in a graph here: {blocker}")
+            if control is None:
+                # As SolverBase specifies, a step without control takes the model's.
+                control = self.model.control(clone_variables=False)
+            state_in = self._unaliased_input(state_in, state_out)
+            try:
+                self._step(state_in, state_out, control, contacts, dt, observables)
+            finally:
+                # A split step that raises with rows of a world selection in place returns the solver's own.
+                if self._swapped_rows is not None:
+                    self._swap_rows(self._swapped_rows)
+                self._capacity_step = False
+            if not self._recording() and self._capacity_contacts_capable(contacts):
+                # A later step with these contacts may record into a graph: its buffers are allocated now.
+                self._reserve_capacity(contacts)
 
     def _recording(self) -> bool:
         """Whether launches are being recorded into a graph, the solver's own (``_outer_capture``) or the caller's:
@@ -4134,7 +4140,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         """
         if self._lg_iter_graph is None:
             try:
-                with wp.ScopedCapture(device=self._device) as cap:
+                with scoped_capture(self._device) as cap:
                     self._run_pd_local_phase_eager(self.model.particle_count, dt)
                 self._lg_iter_graph = cap.graph
             except RuntimeError:
@@ -5930,7 +5936,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
             if self._held_rows is not None:
                 self._held_row_factor(ls)
             try:
-                with wp.ScopedCapture(device=self._device) as capture:
+                with scoped_capture(self._device) as capture:
                     self._lite_sparse_correction(M, n_b, dt)
                 self._lite_iter_graph = capture.graph
             except RuntimeError:
@@ -6484,7 +6490,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         cached = self._nsn_graph
         if cached is None or cached[0] != key:
             try:
-                with wp.ScopedCapture(device=device) as capture:
+                with scoped_capture(device) as capture:
                     run()
                 graph = capture.graph
             except RuntimeError:
