@@ -548,7 +548,12 @@ Contacts
   forces of a step's earlier
   iterations and models only their change, so that the iterations approach
   the forces whose exact motion closes the gaps and stacked layers keep their
-  margin at longer steps.
+  margin at longer steps. Its rows still take the inverse masses as their
+  response: a contact that presses a particle which stiff cloth ties to
+  particles held at points, as a finger pad beside a pinch, sees far less
+  motion than its row expects, and its force grows over many steps while the
+  particle stays inside the shape; ``cloth_dual_franka_fba`` keeps it off for
+  that reason.
 - ``nsn_linear_iterations`` caps the conjugate residual iterations of the
   linear solve in each Newton step. ``None`` (default) solves to a relative
   residual of ``1e-10``. A capped step is inexact, and the next local-global
