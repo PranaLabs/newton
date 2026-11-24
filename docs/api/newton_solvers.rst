@@ -36,6 +36,7 @@ https://newton-physics.github.io/newton/stable/solvers/index.html.
    :toctree: _generated
    :nosignatures:
 
+   SolverAPICWater
    SolverBase
    SolverFBA
    SolverFeatherstone

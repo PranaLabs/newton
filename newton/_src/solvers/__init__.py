@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from . import mujoco, style3d
+    from .apic_water import SolverAPICWater
     from .fba import SolverFBA
     from .featherstone import SolverFeatherstone
     from .implicit_mpm import SolverImplicitMPM
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
     from .xpbd import SolverXPBD
 
 __all__ = [
+    "SolverAPICWater",
     "SolverBase",
     "SolverFBA",
     "SolverFeatherstone",
@@ -39,6 +41,7 @@ __all__ = [
 # resolved on first attribute access (PEP 562) so that importing Newton does
 # not pay the import cost of every solver backend.
 _LAZY_IMPORTS: dict[str, tuple[str, str | None]] = {
+    "SolverAPICWater": (".apic_water", "SolverAPICWater"),
     "SolverBase": (".solver", "SolverBase"),
     "SolverFBA": (".fba", "SolverFBA"),
     "SolverFeatherstone": (".featherstone", "SolverFeatherstone"),
