@@ -1371,7 +1371,7 @@ class BilateralSystem:
         self,
         row_slot: wp.array2d[wp.int32],
         row_jac: wp.array2d[wp.spatial_vectord],
-        friction: wp.array[wp.float32] | None = None,
+        friction: wp.array | None = None,
     ) -> None:
         """Assemble ``W`` for this step's Jacobian, with the mimic pairs combined (:func:`combine_mimic_matrix`), and
         factor it with the soft rows' compliance on its diagonal, the axis rows' before their laws set it
