@@ -1,0 +1,1 @@
+Run the capped PCR iterations of `SolverFBA` on small systems in 3x3 blocks, at most 512 rows such as the rigid contacts of a few bodies with the joint rows of at most eight articulations, in one CUDA launch instead of a dozen per iteration: a step of a hinged body recorded into a CUDA graph takes 1.1 ms instead of 1.7 ms.

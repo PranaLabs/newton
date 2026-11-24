@@ -547,7 +547,12 @@ Contacts
   solve to the tolerance reads its residual back to the host every 25
   iterations and runs up to ``max(1000, 2 n)`` of them, which can cost a step
   many times a capped one's, above all with ``nsn_sparse_storage=True`` or the
-  lite operator's self contacts.
+  lite operator's self contacts. On CUDA the capped iterations of a system of
+  at most 512 rows in 3x3 blocks, such as the rigid contacts of a few bodies
+  with the joint rows of at most eight articulations, run in one launch, one
+  block of threads for the whole solve: it adds its sums in another order than
+  the iterations of larger systems, so that the same rows padded past 512
+  give results that differ by rounding.
 - ``contact_regularization`` (default ``0.01``) is the relative
   regularization ``gamma`` of the contact rows in the Newton steps that
   involve bodies FBA integrates, face contacts or self contacts: such a step

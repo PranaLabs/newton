@@ -23,6 +23,7 @@ from ...sim import BodyFlags, Contacts, Control, Model, ModelBuilder, ModelFlags
 from ..solver import SolverBase
 from ..tendon_state import TendonStateMixin
 from .capture import gc_paused, scoped_capture
+from .joints import JointRowsPrecond
 from .kernels import host_head, stored_contact_count
 
 if TYPE_CHECKING:
@@ -2135,9 +2136,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
             skip_download=True,
             m_contacts=size,
             n_bilateral=R,
-            block_precond=functools.partial(self._joint_system.solve_rows, tw.joint_select, contact_rows)
-            if R
-            else None,
+            block_precond=JointRowsPrecond(self._joint_system, tw.joint_select, contact_rows) if R else None,
             contact_regularization=self.contact_regularization,
             bilateral_compliance=tw.compliance if R and self._joint_dampers else None,
         )
@@ -2981,7 +2980,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
             m_contacts=j0 // 3,
             n_bilateral=n_pad - j0,
             # The joint rows' block of A_schur is their W: Cholesky-factored per articulation.
-            block_precond=functools.partial(self._joint_system.solve_rows, joint_rows, j0) if n_j else None,
+            block_precond=JointRowsPrecond(self._joint_system, joint_rows, j0) if n_j else None,
             contact_regularization=self.contact_regularization,
             soft_rows=self._rc_soft,
             bilateral_compliance=self._rc_bilateral_compliance,
@@ -7357,13 +7356,11 @@ class SolverFBA(TendonStateMixin, SolverBase):
         pcr = self._pcr_solver
         precond_key = None
         if block_precond is not None:
-            # The joint rows' solve: its system and rows.
-            func = getattr(block_precond, "func", None)
-            owner = getattr(func, "__self__", None)
-            if owner is None or getattr(block_precond, "keywords", None):
+            # The joint rows' solve (JointRowsPrecond): its system, rows and offset.
+            precond_key = getattr(block_precond, "graph_key", None)
+            if precond_key is None:
                 run()
                 return
-            precond_key = (id(owner), *(id(a) if isinstance(a, wp.array) else a for a in block_precond.args))
         if pcr.max_iter > pcr.check_every or not wp.get_device(device).is_cuda:
             run()
             return

@@ -1284,6 +1284,24 @@ def _tile_kernels(tile: int):
     return _TILE_KERNELS[tile]
 
 
+class JointRowsPrecond:
+    """The block solve of the joint rows ``rows`` placed from row ``offset`` of a solve, as a PCR's block
+    preconditioner ``block_precond(v, out)`` (:meth:`BilateralSystem.solve_rows`); the PCR solver's single-block
+    iteration reads its system, rows and offset."""
+
+    def __init__(self, system, rows: wp.array, offset: int):
+        self.system, self.rows, self.offset = system, rows, int(offset)
+
+    def __call__(self, v: wp.array, out: wp.array) -> None:
+        self.system.solve_rows(self.rows, self.offset, v, out)
+
+    @property
+    def graph_key(self) -> tuple:
+        """What keys a CUDA graph that records this solve: the identities of the system and the rows, and the
+        offset. The graph's cache keeps the preconditioner alive, so that no new object takes their identities."""
+        return (id(self.system), id(self.rows), self.offset)
+
+
 class BilateralSystem:
     """Newton system ``W df = -residual`` of the joint rows, ``W = J A⁻¹ Jᵀ``.
 

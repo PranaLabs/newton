@@ -792,6 +792,167 @@ def _fused_pcr_direction_kernel(
         rho_buf[1 - slot] = rho_new
 
 
+# The most rows that one block's iteration takes (:meth:`NSNPCRSolver._small_single`), and the most articulation blocks
+# of its block preconditioner: every block takes a dense solve at each iteration.
+_SMALL_ROWS = 512
+_SMALL_JOINT_BLOCKS = 8
+_SMALL_KERNELS = {}
+
+
+def _small_pcr_kernel(tile: int):
+    """The whole fixed-count iteration of :meth:`NSNPCRSolver._fused_single` for a factored matrix of 3x3 blocks in one
+    block of threads, one row per thread, with the joint rows' block solves of ``tile``-row Cholesky factors as its
+    block preconditioner: one launch for the whole solve instead of a dozen per iteration."""
+    if tile in _SMALL_KERNELS:
+        return _SMALL_KERNELS[tile]
+
+    @wp.func
+    def precondition(
+        v: wp.float64,
+        pre: wp.float64,
+        L: wp.array3d[wp.float64],
+        blocks: int,
+        my_block: int,
+        my_local: int,
+    ) -> wp.float64:
+        """The Jacobi product, and on the joint rows the solve of their block's ``W``."""
+        out = pre * v
+        for k in range(blocks):
+            rhs = wp.tile_zeros(shape=(tile,), dtype=wp.float64, storage="shared")
+            mine = my_block == k
+            wp.tile_scatter_masked(rhs, my_local, v, mine)
+            y = wp.tile_cholesky_solve(wp.tile_load(L[k], shape=(tile, tile)), rhs)
+            value = wp.tile_extract(y, my_local)
+            if mine:
+                out = value
+        return out
+
+    @wp.func
+    def total(v: wp.float64) -> wp.float64:
+        """The sum of every thread's ``v``, in every thread."""
+        return wp.tile_extract(wp.tile_sum(wp.tile(v)), 0)
+
+    @wp.func
+    def totals(v: wp.vec3d) -> wp.vec3d:
+        """The sums of every thread's three values at once, in every thread."""
+        return wp.tile_extract(wp.tile_sum(wp.tile(v, preserve_type=True)), 0)
+
+    @wp.func
+    def product(
+        offsets: wp.array[wp.int32],
+        columns: wp.array[wp.int32],
+        values: wp.array[wp.mat33d],
+        sw: wp.float64,
+        row: int,
+        active: bool,
+    ) -> wp.float64:
+        """Row ``row`` of ``W sw``, ``sw`` one value per thread."""
+        sw_t = wp.tile(sw)
+        y = wp.float64(0.0)
+        if active:
+            block = row // 3
+            a = row - 3 * block
+            for k in range(offsets[block], offsets[block + 1]):
+                c = 3 * columns[k]
+                m = values[k]
+                y += m[a, 0] * wp.tile_extract(sw_t, c)
+                y += m[a, 1] * wp.tile_extract(sw_t, c + 1)
+                y += m[a, 2] * wp.tile_extract(sw_t, c + 2)
+        return y
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def kernel(
+        offsets: wp.array[wp.int32],
+        columns: wp.array[wp.int32],
+        values: wp.array[wp.mat33d],
+        scale: wp.array[wp.float64],
+        shift: wp.array[wp.float64],
+        diag: wp.array[wp.float64],
+        b: wp.array[wp.float64],
+        n: int,
+        max_iter: int,
+        eta: wp.float64,
+        L: wp.array3d[wp.float64],
+        blocks: int,
+        row_block: wp.array[wp.int32],
+        row_local: wp.array[wp.int32],
+        # outputs
+        x_out: wp.array[wp.float64],
+    ):
+        _, i = wp.tid()
+        active = i < n
+        zero = wp.float64(0.0)
+        dg = zero
+        sc = zero
+        sh = zero
+        bi = zero
+        my_block = int(-1)
+        my_local = int(0)
+        if active:
+            dg = diag[i]
+            sc = scale[i]
+            sh = shift[i]
+            bi = b[i]
+            my_block = row_block[i]
+            my_local = wp.max(row_local[i], 0)
+        pre = zero
+        if dg != zero:
+            pre = wp.float64(1.0) / dg
+        x = zero
+        r = bi
+        s = precondition(r, pre, L, blocks, my_block, my_local)
+        d = s
+        q = sc * product(offsets, columns, values, sc * d, i, active) + sh * d
+        rho = total(s * q)
+        stopped = bool(False)
+        for _ in range(max_iter):
+            h = precondition(q, pre, L, blocks, my_block, my_local)
+            sums = totals(wp.vec3d(q * h, d * q, d * dg * d))
+            den = sums[0]
+            curvature = sums[1]
+            chart = sums[2]
+            if not stopped:
+                if not (den > zero and curvature > eta * chart):
+                    stopped = True
+            alpha = zero
+            if not stopped:
+                alpha = rho / den
+            x = x + alpha * d
+            r = r - alpha * q
+            s = s - alpha * h
+            h = sc * product(offsets, columns, values, sc * s, i, active) + sh * s
+            rho_new = total(s * h)
+            beta = zero
+            if rho != zero:
+                beta = rho_new / rho
+            d = beta * d + s
+            q = beta * q + h
+            rho = rho_new
+        if active:
+            x_out[i] = x
+
+    _SMALL_KERNELS[tile] = kernel
+    return kernel
+
+
+@wp.kernel
+def joint_row_places_kernel(
+    rows: wp.array[wp.int32],
+    row_block: wp.array[wp.int32],
+    row_local: wp.array[wp.int32],
+    offset: int,
+    # outputs
+    place_block: wp.array[wp.int32],
+    place_local: wp.array[wp.int32],
+):
+    """The articulation block and the row within it of each joint row ``rows[k]`` at row ``offset + k`` of a solve."""
+    k = wp.tid()
+    row = rows[k]
+    if row >= 0:
+        place_block[offset + k] = row_block[row]
+        place_local[offset + k] = row_local[row]
+
+
 # The fused iteration of independent worlds runs a grid of chunks of _FUSED_BLOCK rows: chunk c of world w is block
 # w * chunks + c and takes the world's rows offsets[w] + c * _FUSED_BLOCK + lane, through the stable row index. Each
 # block sums its world's chunk partials alike, so the worlds keep their own scalars and every block of a world agrees.
@@ -1038,6 +1199,12 @@ class NSNPCRSolver:
             refused.
     """
 
+    # Whether the fused iteration of a small factored system of 3x3 blocks runs in one block of threads
+    # (:meth:`_small_single`). Its sums add up in another order than the iteration of several launches, whose sums
+    # stay alike for any padding of the rows: comparisons bit for bit between paths that pad the same rows differently
+    # turn it off.
+    small_single = True
+
     def __init__(
         self,
         max_n: int,
@@ -1097,6 +1264,13 @@ class NSNPCRSolver:
         capacity = max(int(_FUSED_MAX_BLOCKS), self.max_n)
         self._fused_partials = wp.zeros((4, capacity), dtype=wp.float64, device=device)
         self._fused_rho = wp.zeros(2, dtype=wp.float64, device=device)
+        # The single-block iteration of small factored systems (_small_single): each row's articulation block and row
+        # in it, -1 off the joint rows, and a factor for runs without a block preconditioner.
+        self._small_places = (
+            wp.full(self.max_n, -1, dtype=wp.int32, device=device),
+            wp.zeros(self.max_n, dtype=wp.int32, device=device),
+        )
+        self._small_no_factor = wp.zeros((1, 8, 8), dtype=wp.float64, device=device)
         # The fused iteration of independent worlds: each world's double-buffered ``rho``, ``b . b`` and stop flag.
         self._world_fused_rho = wp.zeros((2, capacity), dtype=wp.float64, device=device)
         self._world_fused_b2 = wp.zeros(capacity, dtype=wp.float64, device=device)
@@ -1220,9 +1394,10 @@ class NSNPCRSolver:
             block_precond: Optional ``f(v, out)`` that overwrites rows of the
                 Jacobi product ``out = P v`` with an exact block solve, such
                 as the joint rows' Cholesky factor, a block preconditioner of
-                the bilateral rows. A partial of a bound method records into
-                the iteration's CUDA graph with the other launches; another
-                callable runs the iterations eagerly.
+                the bilateral rows. The joint rows' solve
+                (:class:`~newton._src.solvers.fba.joints.JointRowsPrecond`)
+                records into the iteration's CUDA graph with the other
+                launches; another callable runs the iterations eagerly.
             fixed_sums: For a solve of at most ``check_every`` iterations, take the dot products as per-block tile sums
                 added in block order, which allocate nothing, as a CUDA graph's conditional node needs, in place of
                 ``wp.utils.array_inner``: the sums differ by rounding.
@@ -1572,6 +1747,8 @@ class NSNPCRSolver:
         device = self.device
         if n <= 0 or n > self.max_n:
             raise ValueError(f"system size n={n} outside 1..{self.max_n}")
+        if self._takes_small(W_bsr, n, block_precond, factors):
+            return self._small_single(W_bsr, b, x_out, block_precond, factors, max_iter)
         pden, pcurv, pchart, prho = (self._fused_partials[k][:nb] for k in range(4))
         x, r, s, d, q, h, sw = (a[:n] for a in (self._x, self._r, self._s, self._d, self._q, self._h, self._sw))
         precond, diag = self._precond[:n], self._diag[:n]
@@ -1644,6 +1821,42 @@ class NSNPCRSolver:
             inputs = [prho, self._fused_rho, slot, n, s, h, d, q]
             wp.launch_tiled(_fused_pcr_direction_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
         wp.copy(x_out, x, count=n)
+        return max_iter
+
+    def _takes_small(self, W_bsr, n: int, block_precond, factors) -> bool:
+        """Whether :meth:`_fused_single` runs its iteration in one block of threads (:meth:`_small_single`): a factored
+        matrix of 3x3 blocks of at most :data:`_SMALL_ROWS` rows, without a block preconditioner or with joint rows'
+        block solves (:class:`~newton._src.solvers.fba.joints.JointRowsPrecond`) of a few articulations."""
+        if not self.small_single or factors is None or not getattr(W_bsr, "block3", False) or n > _SMALL_ROWS:
+            return False
+        if block_precond is None:
+            return True
+        system = getattr(block_precond, "system", None)
+        return system is not None and system.L.shape[0] <= _SMALL_JOINT_BLOCKS
+
+    def _small_single(self, W_bsr, b, x_out, block_precond, factors, max_iter: int) -> int:
+        """:meth:`_fused_single` in one launch: one block of threads, one row per thread, takes every iteration
+        (:func:`_small_pcr_kernel`). Its sums reduce in one tile, in another order than the iteration's blocks, so
+        that results differ by rounding."""
+        n, device = int(b.shape[0]), self.device
+        scale, shift, diag = factors
+        place_block, place_local = self._small_places
+        place_block.fill_(-1)
+        place_local.zero_()
+        if block_precond is None:
+            L, blocks, tile = self._small_no_factor, 0, 8
+        else:
+            system = block_precond.system
+            L, blocks, tile = system.L, int(system.L.shape[0]), int(system.tile)
+            rows = block_precond.rows
+            inputs = [rows, system.row_block, system.row_local, int(block_precond.offset)]
+            wp.launch(joint_row_places_kernel, rows.shape[0], inputs, [place_block, place_local], device=device)
+        block_dim = 256 if n <= 256 else _SMALL_ROWS
+        inputs = [W_bsr.offsets, W_bsr.columns, W_bsr.values, scale, shift, diag, b, n, max_iter, self._eta, L]
+        inputs += [blocks, place_block, place_local]
+        wp.launch_tiled(
+            _small_pcr_kernel(tile), dim=[1], inputs=inputs, outputs=[x_out], block_dim=block_dim, device=device
+        )
         return max_iter
 
     def _solve_worlds_fused(self, W_bsr, b: wp.array[wp.float64], x_out: wp.array[wp.float64]) -> int:
@@ -1810,9 +2023,9 @@ class NSNPCRSolver:
         """Look up (or capture on first miss) the single-PCR-iter CUDA graph.
 
         The graph is keyed by ``(n, A.ptr, A.strides)`` and the block preconditioner: ``n`` controls the launch
-        dimensions, and the pointer and strides control which matrix block the captured matvec reads from. A block
-        preconditioner, a partial of a bound method such as the joint rows' solve, records its launches into the
-        graph too, keyed by the identities of its owner and arguments, which the cache keeps alive; another
+        dimensions, and the pointer and strides control which matrix block the captured matvec reads from. The
+        joint rows' solve as block preconditioner (:class:`~newton._src.solvers.fba.joints.JointRowsPrecond`)
+        records its launches into the graph too, keyed by its ``graph_key``, and the cache keeps it alive; another
         callable runs the iterations eagerly. When any of them changes between solve calls we re-capture; PCR is
         called repeatedly with the same matrix view and preconditioner within a Newton step so amortised capture
         overhead is near zero.
@@ -1826,13 +2039,12 @@ class NSNPCRSolver:
             return None
         precond_key, precond_objects = None, ()
         if block_precond is not None:
-            func = getattr(block_precond, "func", None)
-            owner = getattr(func, "__self__", None)
-            if owner is None or getattr(block_precond, "keywords", None):
+            # The joint rows' solve (JointRowsPrecond) keys the graph by its graph_key; another callable runs the
+            # iterations eagerly.
+            precond_key = getattr(block_precond, "graph_key", None)
+            if precond_key is None:
                 return None
-            precond_objects = (owner, *block_precond.args)
-            precond_key = (id(owner), getattr(func, "__name__", ""))
-            precond_key += tuple(id(a) if isinstance(a, wp.array) else a for a in block_precond.args)
+            precond_objects = (block_precond,)
 
         a_ptr = int(A.__cuda_array_interface__["data"][0])
         # Cache hash combines ``n`` (drives launch dims + n_pad) and the
