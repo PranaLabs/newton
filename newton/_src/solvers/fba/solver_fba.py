@@ -668,6 +668,12 @@ class SolverFBA(TendonStateMixin, SolverBase):
         # Host copies of the step's contact rows for the Schur build, from the host contact path.
         self._contact_host_rows = self._contact_extra_h = None
         self._empty_contact_scale = wp.empty(0, dtype=wp.float64, device=model.device)
+        # The products by a dense W of the NSN steps without a tile mask or leading rows (compute_penetration_kernel).
+        self._nsn_all_rows = (
+            wp.empty((0, 0), dtype=wp.int32, device=model.device),
+            wp.empty(0, dtype=wp.int32, device=model.device),
+            1,
+        )
         self._deformable_contact_scale = self._rigid_contact_scale = self._empty_contact_scale
         self._nsn_contact_scale = self._empty_contact_scale
         self._lite_direct = None
@@ -4115,8 +4121,10 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 n_bilateral=0,
                 contact_scale=gain,
                 contact_regularization=0.0 if gain is None else self.contact_regularization,
-                # The bucket's rows past its active contacts' three rows each are inert.
+                # The bucket's rows past its active contacts' three rows each are inert, and its products take the
+                # tiles of W that hold nonzero entries alone.
                 active_rows=(self._capacity_active_d, 3),
+                W_mask=ls.capacity_mask(size),
             )
             self._deformable_contact_tail(ls, 3 * size)
         finally:
@@ -7312,6 +7320,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
                     n_rows_w,
                     n_rows_pad_w,
                     dt_w,
+                    *self._nsn_all_rows,
                 ],
                 outputs=[self._nsn_penetration_d],
                 block_dim=block_dim_nsn,
@@ -7365,6 +7374,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
                     n_rows_w,
                     n_rows_pad_w,
                     dt_w,
+                    *self._nsn_all_rows,
                 ],
                 outputs=[self._nsn_rhs_d],
                 block_dim=block_dim_nsn,
@@ -7653,6 +7663,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         soft_rows: tuple | None = None,
         bilateral_compliance: wp.array | None = None,
         active_rows: tuple | None = None,
+        W_mask: wp.array | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """GPU version of ``solve_nsn_coulomb`` (``newton/tests/fba/_reference.py``), the frictional NSN inner.
 
@@ -7721,8 +7732,11 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 bilateral rows.
             active_rows: ``(count, per)`` of a dense ``W`` whose rows past the
                 leading ``per * count[0]``, a count on the device, are inert, as
-                the buckets of the capacity path have them: the linear solve
-                takes the leading rows alone (``NSNPCRSolver.solve``).
+                the buckets of the capacity path have them: the products by
+                ``W`` and the linear solve take the leading rows alone.
+            W_mask: The 128-square tiles of a dense ``W`` that hold nonzero
+                entries (``FBALinearSolver.capacity_mask``), which the products
+                by ``W`` and by the Newton matrix take alone.
 
         Returns:
             ``(lam, omega, lam_apply)`` host fp64 arrays of shape ``(3M,)``.
@@ -7847,6 +7861,13 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 outputs=[self._nsn_precond_d],
                 device=device,
             )
+            # The products by W take the tiles of W_mask and the leading rows of active_rows alone.
+            mask, count, per = self._nsn_all_rows
+            if W_mask is not None:
+                mask = W_mask
+            if active_rows is not None:
+                count, per = active_rows[0], int(active_rows[1])
+            leading = (mask, count, per)
 
             for _ in range(int(max_iters)):
                 wp.launch_tiled(
@@ -7860,6 +7881,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
                         n_rows_w,
                         n_rows_pad_w,
                         dt_w,
+                        *leading,
                     ],
                     outputs=[self._nsn_penetration_d],
                     block_dim=block_dim_nsn,
@@ -7927,6 +7949,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
                         n_rows_w,
                         n_rows_pad_w,
                         dt_w,
+                        *leading,
                     ],
                     outputs=[self._nsn_rhs_d],
                     block_dim=block_dim_nsn,
@@ -7944,6 +7967,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
                     block_precond=block_precond,
                     fixed_sums=self._capacity_step,
                     active_rows=active_rows,
+                    mask=W_mask,
                 )
 
                 wp.launch(

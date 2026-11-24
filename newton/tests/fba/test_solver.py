@@ -3036,6 +3036,53 @@ class TestCapacityContacts(unittest.TestCase):
                         solver.step(s0, s1, None, contacts, dt)
                 self.assertGreater(compared, 3)
 
+    def test_full_capacity_products_skip_zero_tiles(self):
+        """Step three cloths dropped side by side onto the ground through the full operator's capacity path, their
+        rows in three blocks of a bucket's W: the products by W take the 128-square tiles that hold its active rows'
+        nonzero entries alone (FBALinearSolver.capacity_mask), bit for bit as products over the whole bucket."""
+
+        def run(masked):
+            builder = newton.ModelBuilder()
+            builder.add_ground_plane()
+            for k in range(3):
+                builder.add_cloth_grid(
+                    pos=wp.vec3(0.3 * k, 0.0, 0.05), rot=wp.quat_identity(), vel=wp.vec3(0.0), dim_x=8, dim_y=8,
+                    cell_x=0.02, cell_y=0.02, mass=0.01, tri_ke=1e3, tri_ka=1e3, edge_ke=1e-4, particle_radius=0.005,
+                )  # fmt: skip
+            model = builder.finalize()
+            solver = SolverFBA(model, iterations=5, nsn_schur_mode="full", nsn_linear_iterations=10)
+            pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.01, soft_contact_max=400)
+            contacts = pipeline.contacts()
+            s0, s1 = model.state(), model.state()
+            zero_tiles = active = 0
+            original = FBALinearSolver.capacity_mask
+
+            def capacity_mask(ls, size):
+                mask = original(ls, size)
+                return mask if masked else wp.empty((0, 0), dtype=wp.int32, device=mask.device)
+
+            with mock.patch.object(FBALinearSolver, "capacity_mask", capacity_mask):
+                for k in range(40):
+                    if k == 1:
+                        # The steps recorded into a graph take the capacity path; this takes it without a graph.
+                        solver._recording = lambda: True
+                    pipeline.collide(s0, contacts)
+                    solver.step(s0, s1, None, contacts, 1.0 / 120.0)
+                    s0, s1 = s1, s0
+                    if k:
+                        active = int(solver._capacity_active_d.numpy()[0])
+                        size = next(size for size in solver._capacity_sizes if size >= active)
+                        tiles = -(-3 * active // 128)
+                        zero_tiles = max(
+                            zero_tiles, int((original(solver._linear_solver, size).numpy()[:tiles, :tiles] == 0).sum())
+                        )
+            return s0.particle_q.numpy(), zero_tiles, active
+
+        (masked, zero_tiles, active), (whole, _, _) = run(True), run(False)
+        self.assertGreater(active, 200)
+        self.assertGreater(zero_tiles, 0)
+        np.testing.assert_array_equal(masked, whole)
+
     def test_capacity_path_matches_the_count_path(self):
         """Step a lite cloth falling onto a box and the ground, a held particle among its contacts, through the
         capacity path, every slot of the contact buffer a row, and through the stored contacts alone, bit for bit

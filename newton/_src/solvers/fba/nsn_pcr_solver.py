@@ -350,6 +350,105 @@ def _matvec_tiled_kernel(
 
 
 @wp.kernel
+def _matvec_masked_kernel(
+    A: wp.array2d[wp.float64],
+    x: wp.array[wp.float64],
+    mask: wp.array2d[wp.int32],
+    active: wp.array[wp.int32],
+    per: int,
+    s: wp.array[wp.float64],
+    out: wp.array[wp.float64],
+    sh: wp.array[wp.float64],
+):
+    """``out = A @ x`` with one block of ``TILE_K`` threads per row, and with a nonempty ``sh`` each row's
+    ``s[row] * out[row]``, on the leading ``per * active[0]`` rows and columns of ``A`` (all for an empty ``active``),
+    the other rows inert, whose products it sets to 0, and on the ``TILE_K``-square tiles that ``mask`` marks (all for
+    an empty ``mask``), the others holding only zeros. ``x`` is 0 on the inert rows. Each thread sums its lane of the
+    row's tiles and the block adds the sums once, where :func:`_matvec_tiled_kernel` adds each tile's: several times
+    faster for rows of several tiles, its sums in another order."""
+    row, lane = wp.tid()
+    n = A.shape[0]
+    m = n
+    if active.shape[0] > 0:
+        m = wp.min(per * active[0], n)
+    acc = wp.float64(0.0)
+    if row < m:
+        for k_tile in range(0, m, _PCR_TILE_K):
+            skip = bool(False)
+            if mask.shape[0] > 0:
+                skip = mask[row // _PCR_TILE_K, k_tile // _PCR_TILE_K] == 0
+            if not skip:
+                j = k_tile + lane
+                if j < m:
+                    acc += A[row, j] * x[j]
+    total = wp.tile_extract(wp.tile_sum(wp.tile(acc)), 0)
+    if lane == 0:
+        out[row] = total
+        if sh.shape[0] > 0:
+            sh[row] = s[row] * total
+
+
+@wp.kernel
+def _fused_pcr_turn_kernel(
+    sh: wp.array[wp.float64],
+    nb: int,
+    rho_buf: wp.array[wp.float64],
+    slot: int,
+    first: int,
+    n: int,
+    s: wp.array[wp.float64],
+    precond: wp.array[wp.float64],
+    diag: wp.array[wp.float64],
+    d: wp.array[wp.float64],
+    q: wp.array[wp.float64],
+    h: wp.array[wp.float64],
+    partial_den: wp.array[wp.float64],
+    partial_curvature: wp.array[wp.float64],
+    partial_chart: wp.array[wp.float64],
+):
+    """:func:`_fused_pcr_direction_kernel` of the previous iteration and :func:`_fused_pcr_dots_kernel` of this one in
+    one launch, with their sums: ``rho``, the ``nb`` block sums of the rows' terms ``sh = s h`` added in block order,
+    into ``rho_buf[slot]``, and, past the ``first`` iteration, ``beta = rho / rho_old``, ``d = beta d + s`` and
+    ``q = beta q + h``; then ``h = P q`` and the block sums of ``q . h``, ``d . q`` and ``d . diag(A) d`` from each
+    thread's row. Every block forms ``rho`` alike, for at most ``_SERIAL_BLOCKS`` blocks."""
+    b, lane = wp.tid()
+    rho_new = wp.float64(0.0)
+    for k in range(nb):
+        rho_new += wp.tile_extract(wp.tile_sum(wp.tile_load(sh, shape=(_FUSED_BLOCK,), offset=(k * _FUSED_BLOCK,))), 0)
+    i = b * _FUSED_BLOCK + lane
+    zero = wp.float64(0.0)
+    beta = zero
+    if first == 0:
+        rho = rho_buf[1 - slot]
+        if rho != zero:
+            beta = rho_new / rho
+    if b == 0 and lane == 0:
+        rho_buf[slot] = rho_new
+    q_i = zero
+    d_i = zero
+    g_i = zero
+    h_i = zero
+    if i < n:
+        q_i = q[i]
+        d_i = d[i]
+        if first == 0:
+            d_i = beta * d_i + s[i]
+            q_i = beta * q_i + h[i]
+            d[i] = d_i
+            q[i] = q_i
+        g_i = diag[i]
+        h_i = precond[i] * q_i
+        h[i] = h_i
+    den = wp.tile_sum(wp.tile(q_i * h_i))
+    curvature = wp.tile_sum(wp.tile(d_i * q_i))
+    chart = wp.tile_sum(wp.tile(d_i * (g_i * d_i)))
+    if lane == 0:
+        partial_den[b] = wp.tile_extract(den, 0)
+        partial_curvature[b] = wp.tile_extract(curvature, 0)
+        partial_chart[b] = wp.tile_extract(chart, 0)
+
+
+@wp.kernel
 def _apply_precond_kernel(
     r: wp.array[wp.float64],
     precond: wp.array[wp.float64],
@@ -1541,6 +1640,7 @@ class NSNPCRSolver:
         block_precond: Callable[[wp.array, wp.array], None] | None = None,
         fixed_sums: bool = False,
         active_rows: tuple[wp.array, int] | None = None,
+        mask: wp.array2d[wp.int32] | None = None,
     ) -> tuple[int, float | None]:
         """Solve ``A @ x = b`` with Jacobi-preconditioned conjugate residual.
 
@@ -1563,7 +1663,10 @@ class NSNPCRSolver:
             active_rows: With ``fixed_sums``, ``(count, per)``: the leading ``per * count[0]`` rows, a count on the
                 device, hold the system, and the others are rows of the identity with a zero right-hand side, as the
                 inert rows of a CUDA graph's contact buffer. When they are at most 128, the iterations take them
-                alone in one block of threads (:meth:`_small_dense`), chosen by a conditional node on the count.
+                alone in one block of threads (:meth:`_small_dense`), chosen by a conditional node on the count;
+                otherwise the products by ``A`` take them alone.
+            mask: With ``fixed_sums``, the 128-square tiles of ``A`` that hold nonzero entries, which its products
+                take alone, the others holding only zeros.
 
         Returns:
             A ``(iterations_taken, final_rho)`` tuple where ``iterations_taken``
@@ -1601,7 +1704,7 @@ class NSNPCRSolver:
         unchecked = max_iter <= self.check_every
         self._fixed_sums = fixed_sums and unchecked
         if self._fixed_sums and self.fuses_single(n):
-            return self._fused_dense(A, b, x_out, block_precond, active_rows), None
+            return self._fused_dense(A, b, x_out, block_precond, active_rows, mask), None
         tile_k = int(_PCR_TILE_K)
         n_pad = ((n + tile_k - 1) // tile_k) * tile_k
 
@@ -1997,15 +2100,17 @@ class NSNPCRSolver:
         x_out: wp.array[wp.float64],
         block_precond,
         active_rows: tuple[wp.array, int] | None = None,
+        mask: wp.array2d[wp.int32] | None = None,
     ):
         """:meth:`solve` of a fixed iteration count with ``fixed_sums``, as :meth:`_fused_single` runs a sparse
-        matrix: five launches per iteration, six with a block preconditioner besides its own, that read nothing from
-        the device, in place of some twenty. The dot products reduce in blocks of rows that every block sums alike,
-        so that the run is deterministic; the product by ``A`` takes one block of threads per row
-        (:func:`_matvec_tiled_kernel`). Sums run in another order than the iteration of :meth:`_pcr_iter_eager`, so
-        results differ by rounding. Without a block preconditioner, a system of at most :data:`_SMALL_DENSE_ROWS` rows
-        takes :meth:`_small_dense` instead, and so does a larger one whose ``active_rows`` are as few, by a conditional
-        node on their count. Returns the iterations taken."""
+        matrix, in launches that read nothing from the device: three per iteration without a block preconditioner
+        (:meth:`_fused_dense_turns`), five with one besides its own, in place of some twenty. The dot products reduce
+        in blocks of rows that every block sums alike, so that the run is deterministic; the product by ``A`` takes one
+        block of threads per row, on the leading ``active_rows`` and the tiles of ``mask`` alone. Sums run in another
+        order than the iteration of :meth:`_pcr_iter_eager`, so results differ by rounding. Without a block
+        preconditioner, a system of at most :data:`_SMALL_DENSE_ROWS` rows takes :meth:`_small_dense` instead, and so
+        does a larger one whose ``active_rows`` are as few, by a conditional node on their count. Returns the
+        iterations taken."""
         n = int(b.shape[0])
         max_iter = min(self.max_iter, n)
         if self.small_single and block_precond is None:
@@ -2018,15 +2123,23 @@ class NSNPCRSolver:
                 wp.capture_if(
                     self._small_dense_flag,
                     on_true=lambda: self._small_dense(A, b, x_out, max_iter, active_rows),
-                    on_false=lambda: self._fused_dense_launches(A, b, x_out, None),
+                    on_false=lambda: self._fused_dense_launches(A, b, x_out, None, active_rows, mask),
                 )
                 return max_iter
-        return self._fused_dense_launches(A, b, x_out, block_precond)
+        return self._fused_dense_launches(A, b, x_out, block_precond, active_rows, mask)
 
     def _fused_dense_launches(
-        self, A: wp.array2d[wp.float64], b: wp.array[wp.float64], x_out: wp.array[wp.float64], block_precond
+        self,
+        A: wp.array2d[wp.float64],
+        b: wp.array[wp.float64],
+        x_out: wp.array[wp.float64],
+        block_precond,
+        active_rows: tuple[wp.array, int] | None = None,
+        mask: wp.array2d[wp.int32] | None = None,
     ) -> int:
-        """The launches of :meth:`_fused_dense`, five per iteration. Returns the iterations taken."""
+        """The launches of :meth:`_fused_dense`: :meth:`_fused_dense_turns` without a block preconditioner, five per
+        iteration with one; with ``active_rows`` or ``mask``, the products by ``A`` take the leading rows and the
+        marked tiles alone (:func:`_matvec_masked_kernel`). Returns the iterations taken."""
         n = int(b.shape[0])
         nb = (n + _FUSED_BLOCK - 1) // _FUSED_BLOCK
         max_iter = min(self.max_iter, n)
@@ -2036,15 +2149,22 @@ class NSNPCRSolver:
         x, r, s, d, q, h = (a[:n] for a in (self._x, self._r, self._s, self._d, self._q, self._h))
         precond, diag = self._precond[:n], self._diag[:n]
 
+        masked = active_rows is not None or mask is not None
+        if masked:
+            count, per = active_rows if active_rows is not None else (wp.empty(0, dtype=wp.int32, device=device), 1)
+            tiles = mask if mask is not None else wp.empty((0, 0), dtype=wp.int32, device=device)
+
+        if block_precond is None and nb <= int(_SERIAL_BLOCKS):
+            return self._fused_dense_turns(A, b, x_out, active_rows, mask)
+
         def product(v, out):
-            wp.launch_tiled(
-                _matvec_tiled_kernel,
-                dim=n,
-                inputs=[A, v, n_pad],
-                outputs=[out],
-                block_dim=_PCR_BLOCK_DIM,
-                device=device,
-            )
+            if masked:
+                inputs, kernel, block = [A, v, tiles, count, int(per), s], _matvec_masked_kernel, int(_PCR_TILE_K)
+                outputs = [out, wp.empty(0, dtype=wp.float64, device=device)]
+            else:
+                inputs, kernel, block = [A, v, n_pad], _matvec_tiled_kernel, _PCR_BLOCK_DIM
+                outputs = [out]
+            wp.launch_tiled(kernel, dim=n, inputs=inputs, outputs=outputs, block_dim=block, device=device)
             wp.launch_tiled(
                 _fused_pcr_rho_kernel, dim=[nb], inputs=[s, out, prho], block_dim=_FUSED_BLOCK, device=device
             )
@@ -2080,6 +2200,61 @@ class NSNPCRSolver:
             product(s, h)
             inputs = [prho, self._fused_rho, slot, n, s, h, d, q]
             wp.launch_tiled(_fused_pcr_direction_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
+        wp.copy(x_out, x, count=n)
+        return max_iter
+
+    def _fused_dense_turns(
+        self,
+        A: wp.array2d[wp.float64],
+        b: wp.array[wp.float64],
+        x_out: wp.array[wp.float64],
+        active_rows: tuple[wp.array, int] | None,
+        mask: wp.array2d[wp.int32] | None,
+    ) -> int:
+        """:meth:`_fused_dense_launches` without a block preconditioner, for at most ``_SERIAL_BLOCKS`` blocks of
+        rows, in three launches per iteration (:func:`_fused_pcr_turn_kernel`, :func:`_fused_pcr_step_kernel` and
+        :func:`_matvec_masked_kernel`, whose product also writes each row's ``s h`` term), and without the last
+        iteration's product, which no step reads: the sums of the launches with that product, in their order, bit for
+        bit. Returns the iterations taken."""
+        n = int(b.shape[0])
+        nb = (n + _FUSED_BLOCK - 1) // _FUSED_BLOCK
+        max_iter = min(self.max_iter, n)
+        device = self.device
+        pden, pcurv, pchart = (self._fused_partials[k][:nb] for k in range(3))
+        x, r, s, d, q, h = (a[:n] for a in (self._x, self._r, self._s, self._d, self._q, self._h))
+        precond, diag, sh = self._precond[:n], self._diag[:n], self._sw[:n]
+        if active_rows is not None:
+            count, per = active_rows
+        else:
+            count, per = wp.empty(0, dtype=wp.int32, device=device), 1
+        tiles = mask if mask is not None else wp.empty((0, 0), dtype=wp.int32, device=device)
+
+        def product(v, out):
+            inputs = [A, v, tiles, count, int(per), s]
+            outputs = [out, sh]
+            wp.launch_tiled(
+                _matvec_masked_kernel, dim=n, inputs=inputs, outputs=outputs, block_dim=int(_PCR_TILE_K), device=device
+            )
+
+        x.zero_()
+        wp.launch(_dense_diag_kernel, n, [A], [diag], device=device)
+        wp.launch(_precond_from_bsr_diag_kernel, n, [diag], [precond], device=device)
+        wp.copy(r, b, count=n)
+        wp.launch(_apply_precond_kernel, n, [r, precond], [s], device=device)
+        wp.copy(d, s, count=n)
+        # q = A d and the rows' terms of rho = s . q, with d = s.
+        product(d, q)
+        self._stopped_d.zero_()
+        for k in range(max_iter):
+            slot = k % 2
+            inputs = [sh, nb, self._fused_rho, slot, int(k == 0), n, s, precond, diag, d, q, h, pden, pcurv, pchart]
+            wp.launch_tiled(_fused_pcr_turn_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
+            inputs = [pden, pcurv, pchart, self._fused_rho, slot, self._eta, n, d, q, h, self._stopped_d, x, r, s]
+            inputs += [0, s, s]
+            wp.launch_tiled(_fused_pcr_step_kernel, dim=[nb], inputs=inputs, block_dim=_FUSED_BLOCK, device=device)
+            if k + 1 < max_iter:
+                # h = A s and the rows' terms of s . h, which the next turn adds.
+                product(s, h)
         wp.copy(x_out, x, count=n)
         return max_iter
 
