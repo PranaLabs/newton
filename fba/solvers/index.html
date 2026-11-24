@@ -406,13 +406,6 @@ mermaid.initialize(
 window.addEventListener("load", load);
 window.runMermaid = runMermaid;</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'solvers/index';</script>
-    <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
-        DOCUMENTATION_OPTIONS.theme_switcher_json_url = 'https://newton-physics.github.io/newton/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'dev';
-        DOCUMENTATION_OPTIONS.show_version_warning_banner =
-            false;
-        </script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <script src="../_static/mermaid-nbsphinx.js?v=613f558e"></script>
     <link rel="index" title="Index" href="../genindex.html" />
@@ -710,6 +703,13 @@ window.runMermaid = runMermaid;</script>
 <li class=" ">
   <a class="nav-link dropdown-item nav-internal" href="fba.html">
     FBA
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="apic_water.html">
+    APIC Water
   </a>
 </li>
 
@@ -1122,6 +1122,13 @@ window.runMermaid = runMermaid;</script>
 
 
 <li class="nav-item ">
+  <a class="nav-link nav-internal" href="apic_water.html">
+    APIC Water
+  </a>
+</li>
+
+
+<li class="nav-item ">
   <a class="nav-link nav-internal" href="../api/newton.html">
     newton
   </a>
@@ -1324,6 +1331,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="kamino.html">Kamino</a></li>
 <li class="toctree-l1"><a class="reference internal" href="vbd.html">VBD</a></li>
 <li class="toctree-l1"><a class="reference internal" href="fba.html">FBA</a></li>
+<li class="toctree-l1"><a class="reference internal" href="apic_water.html">APIC Water</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="nav bd-sidenav">
@@ -1449,7 +1457,7 @@ method details. For symptom-driven diagnosis and parameter tuning, start with
 <a class="reference internal" href="../concepts/simulation_tuning.html#simulation-tuning"><span class="std std-ref">Simulation Tuning</span></a>.</p>
 <section id="choosing-a-solver">
 <h2>Choosing a Solver<a class="headerlink" href="#choosing-a-solver" title="Link to this heading">#</a></h2>
-<p>MuJoCo, Kamino, VBD, and FBA currently have dedicated backend guides:</p>
+<p>MuJoCo, Kamino, VBD, FBA, and APIC water currently have dedicated backend guides:</p>
 <ul class="simple">
 <li><p><a class="reference internal" href="mujoco.html"><span class="doc">MuJoCo</span></a> — generalized-coordinate rigid-body simulation and
 MuJoCo or MJCF workflows.</p></li>
@@ -1459,6 +1467,9 @@ and hard frictional contacts; experimental.</p></li>
 bodies in a single VBD-based solver; experimental.</p></li>
 <li><p><a class="reference internal" href="fba.html"><span class="doc">FBA</span></a>: projective dynamics for cloth and soft bodies with
 non-penetrating frictional contact among them and rigid bodies;
+experimental.</p></li>
+<li><p><a class="reference internal" href="apic_water.html"><span class="doc">APIC water</span></a>: incompressible water with a free surface,
+particles on a grid with a cut-cell pressure solve, coupled to rigid bodies;
 experimental.</p></li>
 </ul>
 <p>The other solver backends are documented through their linked API references
@@ -1488,7 +1499,16 @@ to narrow the choice, then follow the linked API documentation.</p>
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA" title="newton.solvers.SolverFBA"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverFBA</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater" title="newton.solvers.SolverAPICWater"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverAPICWater</span></code></a></p></td>
+<td><p>Pressure projection</p></td>
+<td><p>🟨 <sup>3</sup> coupled</p></td>
+<td><p>❌</p></td>
+<td><p>✅ water</p></td>
+<td><p>❌</p></td>
+<td><p>❌</p></td>
+<td><p>❌</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA" title="newton.solvers.SolverFBA"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverFBA</span></code></a></p></td>
 <td><p>Implicit</p></td>
 <td><p>✅ maximal coordinates</p></td>
 <td><p>🟨 <a class="reference internal" href="#joint-feature-support"><span class="std std-ref">bilateral joints only</span></a></p></td>
@@ -1497,7 +1517,7 @@ to narrow the choice, then follow the linked API documentation.</p>
 <td><p>✅</p></td>
 <td><p>❌</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverFeatherstone.html#newton.solvers.SolverFeatherstone" title="newton.solvers.SolverFeatherstone"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverFeatherstone</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverFeatherstone.html#newton.solvers.SolverFeatherstone" title="newton.solvers.SolverFeatherstone"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverFeatherstone</span></code></a></p></td>
 <td><p>Semi-implicit</p></td>
 <td><p>✅</p></td>
 <td><p>✅ generalized coordinates</p></td>
@@ -1506,7 +1526,7 @@ to narrow the choice, then follow the linked API documentation.</p>
 <td><p>✅</p></td>
 <td><p>🟨 basic <sup>2</sup></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverImplicitMPM.html#newton.solvers.SolverImplicitMPM" title="newton.solvers.SolverImplicitMPM"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverImplicitMPM</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverImplicitMPM.html#newton.solvers.SolverImplicitMPM" title="newton.solvers.SolverImplicitMPM"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverImplicitMPM</span></code></a></p></td>
 <td><p>Implicit</p></td>
 <td><p>❌</p></td>
 <td><p>❌</p></td>
@@ -1515,7 +1535,7 @@ to narrow the choice, then follow the linked API documentation.</p>
 <td><p>❌</p></td>
 <td><p>❌</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverKamino.html#newton.solvers.SolverKamino" title="newton.solvers.SolverKamino"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverKamino</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverKamino.html#newton.solvers.SolverKamino" title="newton.solvers.SolverKamino"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverKamino</span></code></a></p></td>
 <td><p>Semi-implicit: Euler, Moreau-Jean</p></td>
 <td><p>✅ maximal coordinates</p></td>
 <td><p>✅ maximal coordinates</p></td>
@@ -1524,7 +1544,7 @@ to narrow the choice, then follow the linked API documentation.</p>
 <td><p>❌</p></td>
 <td><p>❌</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverMuJoCo.html#newton.solvers.SolverMuJoCo" title="newton.solvers.SolverMuJoCo"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverMuJoCo</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverMuJoCo.html#newton.solvers.SolverMuJoCo" title="newton.solvers.SolverMuJoCo"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverMuJoCo</span></code></a></p></td>
 <td><p>Explicit, Semi-implicit, Implicit-in-velocity</p></td>
 <td><p>✅ <sup>1</sup></p></td>
 <td><p>✅ generalized coordinates</p></td>
@@ -1533,7 +1553,7 @@ to narrow the choice, then follow the linked API documentation.</p>
 <td><p>❌</p></td>
 <td><p>❌</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverSemiImplicit.html#newton.solvers.SolverSemiImplicit" title="newton.solvers.SolverSemiImplicit"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverSemiImplicit</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverSemiImplicit.html#newton.solvers.SolverSemiImplicit" title="newton.solvers.SolverSemiImplicit"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverSemiImplicit</span></code></a></p></td>
 <td><p>Semi-implicit</p></td>
 <td><p>✅</p></td>
 <td><p>✅ maximal coordinates</p></td>
@@ -1542,7 +1562,7 @@ to narrow the choice, then follow the linked API documentation.</p>
 <td><p>✅</p></td>
 <td><p>🟨 basic <sup>2</sup></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverSteel.html#newton.solvers.SolverSteel" title="newton.solvers.SolverSteel"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverSteel</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverSteel.html#newton.solvers.SolverSteel" title="newton.solvers.SolverSteel"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverSteel</span></code></a></p></td>
 <td><p>Semi-implicit, implicit drives</p></td>
 <td><p>✅</p></td>
 <td><p>✅ generalized coordinates</p></td>
@@ -1551,7 +1571,7 @@ to narrow the choice, then follow the linked API documentation.</p>
 <td><p>❌</p></td>
 <td><p>❌</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverStyle3D.html#newton.solvers.SolverStyle3D" title="newton.solvers.SolverStyle3D"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverStyle3D</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverStyle3D.html#newton.solvers.SolverStyle3D" title="newton.solvers.SolverStyle3D"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverStyle3D</span></code></a></p></td>
 <td><p>Implicit</p></td>
 <td><p>❌</p></td>
 <td><p>❌</p></td>
@@ -1560,7 +1580,7 @@ to narrow the choice, then follow the linked API documentation.</p>
 <td><p>❌</p></td>
 <td><p>❌</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverVBD.html#newton.solvers.SolverVBD" title="newton.solvers.SolverVBD"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverVBD</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverVBD.html#newton.solvers.SolverVBD" title="newton.solvers.SolverVBD"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverVBD</span></code></a></p></td>
 <td><p>Implicit</p></td>
 <td><p>✅</p></td>
 <td><p>🟨 <a class="reference internal" href="#joint-feature-support"><span class="std std-ref">limited joint support</span></a></p></td>
@@ -1569,7 +1589,7 @@ to narrow the choice, then follow the linked API documentation.</p>
 <td><p>✅</p></td>
 <td><p>❌</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverXPBD.html#newton.solvers.SolverXPBD" title="newton.solvers.SolverXPBD"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverXPBD</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverXPBD.html#newton.solvers.SolverXPBD" title="newton.solvers.SolverXPBD"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverXPBD</span></code></a></p></td>
 <td><p>Implicit</p></td>
 <td><p>✅</p></td>
 <td><p>✅ maximal coordinates</p></td>
@@ -1586,6 +1606,7 @@ to narrow the choice, then follow the linked API documentation.</p>
 Set <code class="docutils literal notranslate"><span class="pre">use_mujoco_contacts=False</span></code> to use Newton’s collision pipeline.</div>
 <div class="line"><sup>2</sup> <code class="docutils literal notranslate"><span class="pre">basic</span></code> means Newton includes several examples that use these solvers in diffsim workflows,
 see <a class="reference internal" href="#differentiability"><span class="std std-ref">Differentiability</span></a> for further details.</div>
+<div class="line"><sup>3</sup> The water’s pressure acts on rigid bodies that another solver integrates; see <a class="reference internal" href="apic_water.html"><span class="doc">APIC Water</span></a>.</div>
 </div>
 <div class="experimental admonition">
 <p class="admonition-title">Experimental</p>
@@ -1599,6 +1620,11 @@ Its default <code class="docutils literal notranslate"><span class="pre">solve_m
 <div class="experimental admonition">
 <p class="admonition-title">Experimental</p>
 <p><a class="reference internal" href="../api/_generated/newton.solvers.SolverVBD.html#newton.solvers.SolverVBD" title="newton.solvers.SolverVBD"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverVBD</span></code></a>’s public API and behavior may change without prior notice.</p>
+</div>
+<div class="experimental admonition">
+<p class="admonition-title">Experimental</p>
+<p><a class="reference internal" href="../api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater" title="newton.solvers.SolverAPICWater"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverAPICWater</span></code></a>’s public API and behavior may change without prior notice.
+It requires a CUDA device and one world.</p>
 </div>
 <div class="experimental admonition">
 <p class="admonition-title">Experimental</p>
@@ -1657,9 +1683,11 @@ The maximal-coordinate solvers (<a class="reference internal" href="../api/_gene
 enforce joints as pairwise body constraints but do not use the articulation kinematic-tree structure.
 <a class="reference internal" href="../api/_generated/newton.solvers.SolverVBD.html#newton.solvers.SolverVBD" title="newton.solvers.SolverVBD"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverVBD</span></code></a> supports a subset of joint types through maximal-coordinate
 constraints, with unified compliant ALM by default and a deprecated legacy AVBD path.
-<a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA" title="newton.solvers.SolverFBA"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverFBA</span></code></a> enforces joints as bilateral maximal-coordinate constraints, without limits or
-drives.
-<a class="reference internal" href="../api/_generated/newton.solvers.SolverStyle3D.html#newton.solvers.SolverStyle3D" title="newton.solvers.SolverStyle3D"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverStyle3D</span></code></a> and <a class="reference internal" href="../api/_generated/newton.solvers.SolverImplicitMPM.html#newton.solvers.SolverImplicitMPM" title="newton.solvers.SolverImplicitMPM"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverImplicitMPM</span></code></a> do not support joints.</p>
+<a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA" title="newton.solvers.SolverFBA"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverFBA</span></code></a> enforces joints as bilateral maximal-coordinate constraints, and the drives,
+damping, armature, effort limits, friction and limits of each free axis as one row whose force follows the axis’s
+piecewise linear law.
+<a class="reference internal" href="../api/_generated/newton.solvers.SolverStyle3D.html#newton.solvers.SolverStyle3D" title="newton.solvers.SolverStyle3D"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverStyle3D</span></code></a>, <a class="reference internal" href="../api/_generated/newton.solvers.SolverImplicitMPM.html#newton.solvers.SolverImplicitMPM" title="newton.solvers.SolverImplicitMPM"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverImplicitMPM</span></code></a> and
+<a class="reference internal" href="../api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater" title="newton.solvers.SolverAPICWater"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverAPICWater</span></code></a> do not support joints.</p>
 <p><strong>Joint types</strong></p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
@@ -1794,7 +1822,7 @@ drives.
 <td><p>✅</p></td>
 <td><p>❌</p></td>
 <td><p>✅</p></td>
-<td><p>❌</p></td>
+<td><p>✅</p></td>
 </tr>
 <tr class="row-even"><th class="stub"><p><a class="reference internal" href="../api/_generated/newton.Model.html#newton.Model.joint_friction" title="newton.Model.joint_friction"><code class="xref py py-attr docutils literal notranslate"><span class="pre">joint_friction</span></code></a></p></th>
 <td><p>❌</p></td>
@@ -1804,7 +1832,7 @@ drives.
 <td><p>✅</p></td>
 <td><p>❌</p></td>
 <td><p>✅</p></td>
-<td><p>❌</p></td>
+<td><p>✅ <sup>18</sup></p></td>
 </tr>
 <tr class="row-odd"><th class="stub"><p><a class="reference internal" href="../api/_generated/newton.Model.html#newton.Model.joint_limit_lower" title="newton.Model.joint_limit_lower"><code class="xref py py-attr docutils literal notranslate"><span class="pre">joint_limit_lower</span></code></a> / <a class="reference internal" href="../api/_generated/newton.Model.html#newton.Model.joint_limit_upper" title="newton.Model.joint_limit_upper"><code class="xref py py-attr docutils literal notranslate"><span class="pre">joint_limit_upper</span></code></a></p></th>
 <td><p>✅</p></td>
@@ -1814,7 +1842,7 @@ drives.
 <td><p>✅</p></td>
 <td><p>✅</p></td>
 <td><p>✅</p></td>
-<td><p>❌</p></td>
+<td><p>✅ <sup>14</sup></p></td>
 </tr>
 <tr class="row-even"><th class="stub"><p><a class="reference internal" href="../api/_generated/newton.Model.html#newton.Model.joint_limit_ke" title="newton.Model.joint_limit_ke"><code class="xref py py-attr docutils literal notranslate"><span class="pre">joint_limit_ke</span></code></a> / <a class="reference internal" href="../api/_generated/newton.Model.html#newton.Model.joint_limit_kd" title="newton.Model.joint_limit_kd"><code class="xref py py-attr docutils literal notranslate"><span class="pre">joint_limit_kd</span></code></a></p></th>
 <td><p>✅</p></td>
@@ -1834,7 +1862,7 @@ drives.
 <td><p>✅</p></td>
 <td><p>❌</p></td>
 <td><p>✅</p></td>
-<td><p>❌</p></td>
+<td><p>✅ <sup>18</sup></p></td>
 </tr>
 <tr class="row-even"><th class="stub"><p><a class="reference internal" href="../api/_generated/newton.Model.html#newton.Model.joint_velocity_limit" title="newton.Model.joint_velocity_limit"><code class="xref py py-attr docutils literal notranslate"><span class="pre">joint_velocity_limit</span></code></a></p></th>
 <td><p>❌</p></td>
@@ -1851,6 +1879,12 @@ drives.
 </div>
 <div class="line-block">
 <div class="line"><sup>2</sup> Not enforced for BALL joints in SemiImplicit.</div>
+<div class="line"><sup>14</sup> FBA holds the limits of REVOLUTE and PRISMATIC joints as hard limits in the law of the axis’s row (a
+revolute joint needs both limits; it leaves out a range of a full turn or more) and ignores those of BALL and D6
+joints.</div>
+<div class="line"><sup>18</sup> FBA bounds a drive’s force <code class="docutils literal notranslate"><span class="pre">ke</span> <span class="pre">(q*</span> <span class="pre">-</span> <span class="pre">q)</span> <span class="pre">+</span> <span class="pre">kd</span> <span class="pre">(q_dot*</span> <span class="pre">-</span> <span class="pre">q_dot)</span></code>, not its damping or armature, by an
+effort limit below <code class="docutils literal notranslate"><span class="pre">1e6</span></code>, and holds each free axis with joint friction still within the friction force, both in
+the law of the axis’s row, which each Newton step linearizes at the piece the row’s own step reaches.</div>
 </div>
 <p><strong>Actuation and control</strong></p>
 <div class="pst-scrollable-table-container"><table class="table">
@@ -1875,7 +1909,7 @@ drives.
 <td><p>✅</p></td>
 <td><p>✅ <sup>7</sup></p></td>
 <td><p>✅</p></td>
-<td><p>❌</p></td>
+<td><p>✅ <sup>15</sup></p></td>
 </tr>
 <tr class="row-odd"><th class="stub"><p><a class="reference internal" href="../api/_generated/newton.Model.html#newton.Model.joint_target_mode" title="newton.Model.joint_target_mode"><code class="xref py py-attr docutils literal notranslate"><span class="pre">joint_target_mode</span></code></a></p></th>
 <td><p>❌</p></td>
@@ -1895,7 +1929,7 @@ drives.
 <td><p>✅</p></td>
 <td><p>✅</p></td>
 <td><p>✅</p></td>
-<td><p>❌</p></td>
+<td><p>✅</p></td>
 </tr>
 </tbody>
 </table>
@@ -1933,7 +1967,7 @@ drives.
 <td><p>✅ <sup>6</sup></p></td>
 <td><p>✅ <sup>5</sup></p></td>
 <td><p>❌</p></td>
-<td><p>❌</p></td>
+<td><p>✅ <sup>17</sup></p></td>
 </tr>
 <tr class="row-even"><th class="stub"><p>Particle-body attachments</p></th>
 <td><p>❌</p></td>
@@ -1943,7 +1977,7 @@ drives.
 <td><p>❌</p></td>
 <td><p>✅ <sup>13</sup></p></td>
 <td><p>❌</p></td>
-<td><p>❌</p></td>
+<td><p>✅ <sup>16</sup></p></td>
 </tr>
 </tbody>
 </table>
@@ -1961,6 +1995,12 @@ drives.
 <div class="line"><sup>12</sup> With <code class="docutils literal notranslate"><span class="pre">solve_mode=&quot;matrix_free&quot;</span></code>, Steel enforces each mimic relationship within one articulation as one bilateral constraint row per follower coordinate; mimics of BALL, FREE, and DISTANCE joints and mimics across articulations are rejected. It also enforces loop-closing BALL joints as point constraints. <code class="docutils literal notranslate"><span class="pre">solve_mode=&quot;split&quot;</span></code> rejects mimic relationships and loop-closing joints; the propagation contact responses (<code class="docutils literal notranslate"><span class="pre">articulated_contact_response</span></code>) reject loop-closing joints and solve mimic rows iteratively.</div>
 <div class="line"><sup>13</sup> See <a class="reference internal" href="#particle-body-attachments"><span class="std std-ref">Particle-Body Attachments</span></a> for authoring and semantics. Attachments spanning two
 solvers are coupled by <a class="reference internal" href="../api/newton_solvers_experimental_coupled.html#newton.solvers.experimental.coupled.SolverCoupledADMM" title="newton.solvers.experimental.coupled.SolverCoupledADMM"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverCoupledADMM</span></code></a> instead.</div>
+<div class="line"><sup>15</sup> FBA takes the backward Euler step of each drive with the axis’s damping and armature. Position drives
+need a linear axis or the angular axis of a joint with one; an effort limit below <code class="docutils literal notranslate"><span class="pre">1e6</span></code> bounds the drive’s force.</div>
+<div class="line"><sup>16</sup> FBA solves attachments to the dynamic bodies it integrates as soft rows with the bodies’ contacts and
+joints, with the full contact operator in one world.</div>
+<div class="line"><sup>17</sup> FBA holds each follower coordinate by a hard row combined from rows on both joints’ axes, for PRISMATIC,
+REVOLUTE, and D6 joints with at most one angular axis.</div>
 </div>
 </section>
 <section id="particle-body-attachments">
@@ -1977,9 +2017,13 @@ The constraint is translational, similar to the positional part of a ball joint;
 a single particle has no orientation, so there is no angular counterpart. Forces
 are equal and opposite, including the torque about the body’s center of mass, and
 the path is independent of contact, so it stays active without penetration.</p>
+<p><a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA" title="newton.solvers.SolverFBA"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverFBA</span></code></a> solves an attachment to a dynamic body it
+integrates as three soft rows along the world axes, the backward Euler step of
+the same spring and damper, together with the body’s contacts and joints.</p>
 <p>Both endpoints must be integrated by the same solver, so
-<a class="reference internal" href="../api/_generated/newton.solvers.SolverVBD.html#newton.solvers.SolverVBD" title="newton.solvers.SolverVBD"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverVBD</span></code></a> rejects attachments when it is constructed
-with <code class="docutils literal notranslate"><span class="pre">integrate_with_external_rigid_solver=True</span></code>.</p>
+<a class="reference internal" href="../api/_generated/newton.solvers.SolverVBD.html#newton.solvers.SolverVBD" title="newton.solvers.SolverVBD"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverVBD</span></code></a> and <a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA" title="newton.solvers.SolverFBA"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverFBA</span></code></a>
+reject attachments when they are constructed with
+<code class="docutils literal notranslate"><span class="pre">integrate_with_external_rigid_solver=True</span></code>.</p>
 <p>When the endpoints belong to two different solvers in a coupled simulation,
 <a class="reference internal" href="../api/newton_solvers_experimental_coupled.html#newton.solvers.experimental.coupled.SolverCoupledADMM" title="newton.solvers.experimental.coupled.SolverCoupledADMM"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverCoupledADMM</span></code></a> turns the same
 model rows into cross-solver interface constraints; see <a class="reference internal" href="../concepts/coupling.html#admm-coupling"><span class="std std-ref">ADMM Coupling</span></a>.

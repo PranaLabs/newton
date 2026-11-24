@@ -48,13 +48,6 @@
     <script src="../_static/design-tabs.js?v=f930bc37"></script>
     <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'api/newton_solvers';</script>
-    <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
-        DOCUMENTATION_OPTIONS.theme_switcher_json_url = 'https://newton-physics.github.io/newton/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'dev';
-        DOCUMENTATION_OPTIONS.show_version_warning_banner =
-            false;
-        </script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <script src="../_static/mermaid-nbsphinx.js?v=613f558e"></script>
     <link rel="index" title="Index" href="../genindex.html" />
@@ -352,6 +345,13 @@
 <li class=" ">
   <a class="nav-link dropdown-item nav-internal" href="../solvers/fba.html">
     FBA
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../solvers/apic_water.html">
+    APIC Water
   </a>
 </li>
 
@@ -764,6 +764,13 @@
 
 
 <li class="nav-item ">
+  <a class="nav-link nav-internal" href="../solvers/apic_water.html">
+    APIC Water
+  </a>
+</li>
+
+
+<li class="nav-item ">
   <a class="nav-link nav-internal" href="newton.html">
     newton
   </a>
@@ -966,6 +973,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../solvers/kamino.html">Kamino</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../solvers/vbd.html">VBD</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../solvers/fba.html">FBA</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../solvers/apic_water.html">APIC Water</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="current nav bd-sidenav">
@@ -1072,37 +1080,40 @@ Installed-wheel users can use the stable hosted guide at
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverBase.html#newton.solvers.SolverBase" title="newton.solvers.SolverBase"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverBase</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater" title="newton.solvers.SolverAPICWater"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverAPICWater</span></code></a></p></td>
+<td><p>Incompressible water with a free surface, by APIC particles on a MAC grid with a cut-cell pressure solve.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverBase.html#newton.solvers.SolverBase" title="newton.solvers.SolverBase"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverBase</span></code></a></p></td>
 <td><p>Generic base class for solvers.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA" title="newton.solvers.SolverFBA"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverFBA</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA" title="newton.solvers.SolverFBA"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverFBA</span></code></a></p></td>
 <td><p>Fast But Accurate projective-dynamics solver for cloth, soft bodies and rigid bodies.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverFeatherstone.html#newton.solvers.SolverFeatherstone" title="newton.solvers.SolverFeatherstone"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverFeatherstone</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverFeatherstone.html#newton.solvers.SolverFeatherstone" title="newton.solvers.SolverFeatherstone"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverFeatherstone</span></code></a></p></td>
 <td><p>A semi-implicit integrator using symplectic Euler that operates on reduced (also called generalized) coordinates to simulate articulated rigid body dynamics based on Featherstone's composite rigid body algorithm (CRBA).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverImplicitMPM.html#newton.solvers.SolverImplicitMPM" title="newton.solvers.SolverImplicitMPM"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverImplicitMPM</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverImplicitMPM.html#newton.solvers.SolverImplicitMPM" title="newton.solvers.SolverImplicitMPM"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverImplicitMPM</span></code></a></p></td>
 <td><p>Implicit MPM solver for granular and elasto-plastic materials.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverKamino.html#newton.solvers.SolverKamino" title="newton.solvers.SolverKamino"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverKamino</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverKamino.html#newton.solvers.SolverKamino" title="newton.solvers.SolverKamino"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverKamino</span></code></a></p></td>
 <td><p>A physics solver for simulating constrained multi-body systems containing kinematic loops, under-/overactuation, joint-limits, hard frictional contacts and restitutive impacts.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverMuJoCo.html#newton.solvers.SolverMuJoCo" title="newton.solvers.SolverMuJoCo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverMuJoCo</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverMuJoCo.html#newton.solvers.SolverMuJoCo" title="newton.solvers.SolverMuJoCo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverMuJoCo</span></code></a></p></td>
 <td><p>This solver provides an interface to simulate physics using the <a class="reference external" href="https://github.com/google-deepmind/mujoco">MuJoCo</a> physics engine, optimized with GPU acceleration through <a class="reference external" href="https://github.com/google-deepmind/mujoco_warp">mujoco_warp</a>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverSemiImplicit.html#newton.solvers.SolverSemiImplicit" title="newton.solvers.SolverSemiImplicit"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverSemiImplicit</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverSemiImplicit.html#newton.solvers.SolverSemiImplicit" title="newton.solvers.SolverSemiImplicit"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverSemiImplicit</span></code></a></p></td>
 <td><p>A semi-implicit integrator using symplectic Euler.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverSteel.html#newton.solvers.SolverSteel" title="newton.solvers.SolverSteel"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverSteel</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverSteel.html#newton.solvers.SolverSteel" title="newton.solvers.SolverSteel"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverSteel</span></code></a></p></td>
 <td><p>Reduced-coordinate articulated dynamics with a projected Gauss-Seidel constraint solve.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverStyle3D.html#newton.solvers.SolverStyle3D" title="newton.solvers.SolverStyle3D"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverStyle3D</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverStyle3D.html#newton.solvers.SolverStyle3D" title="newton.solvers.SolverStyle3D"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverStyle3D</span></code></a></p></td>
 <td><p>Projective dynamics based cloth solver.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverVBD.html#newton.solvers.SolverVBD" title="newton.solvers.SolverVBD"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverVBD</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverVBD.html#newton.solvers.SolverVBD" title="newton.solvers.SolverVBD"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverVBD</span></code></a></p></td>
 <td><p>An implicit solver using Vertex Block Descent (VBD) for particles and Augmented VBD (AVBD) for rigid bodies.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverXPBD.html#newton.solvers.SolverXPBD" title="newton.solvers.SolverXPBD"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverXPBD</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="_generated/newton.solvers.SolverXPBD.html#newton.solvers.SolverXPBD" title="newton.solvers.SolverXPBD"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SolverXPBD</span></code></a></p></td>
 <td><p>An implicit integrator using eXtended Position-Based Dynamics (XPBD) for rigid and soft body simulation.</p></td>
 </tr>
 </tbody>

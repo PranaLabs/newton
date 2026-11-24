@@ -41,7 +41,7 @@ method details. For symptom-driven diagnosis and parameter tuning, start with
 Choosing a Solver
 -----------------
 
-MuJoCo, Kamino, VBD, and FBA currently have dedicated backend guides:
+MuJoCo, Kamino, VBD, FBA, and APIC water currently have dedicated backend guides:
 
 - :doc:`MuJoCo <mujoco>` — generalized-coordinate rigid-body simulation and
   MuJoCo or MJCF workflows.
@@ -51,6 +51,9 @@ MuJoCo, Kamino, VBD, and FBA currently have dedicated backend guides:
   bodies in a single VBD-based solver; experimental.
 - :doc:`FBA <fba>`: projective dynamics for cloth and soft bodies with
   non-penetrating frictional contact among them and rigid bodies;
+  experimental.
+- :doc:`APIC water <apic_water>`: incompressible water with a free surface,
+  particles on a grid with a cut-cell pressure solve, coupled to rigid bodies;
   experimental.
 
 The other solver backends are documented through their linked API references
@@ -84,6 +87,14 @@ Supported Features
      - Cloth
      - Soft bodies
      - Differentiable
+   * - :class:`~newton.solvers.SolverAPICWater`
+     - Pressure projection
+     - 🟨 :sup:`3` coupled
+     - ❌
+     - ✅ water
+     - ❌
+     - ❌
+     - ❌
    * - :class:`~newton.solvers.SolverFBA`
      - Implicit
      - ✅ maximal coordinates
@@ -169,6 +180,7 @@ Supported Features
   Set ``use_mujoco_contacts=False`` to use Newton's collision pipeline.
 | :sup:`2` ``basic`` means Newton includes several examples that use these solvers in diffsim workflows,
   see :ref:`Differentiability` for further details.
+| :sup:`3` The water's pressure acts on rigid bodies that another solver integrates; see :doc:`apic_water`.
 
 .. experimental::
     :class:`~newton.solvers.SolverSteel`'s public API and behavior may change without prior notice.
@@ -179,6 +191,10 @@ Supported Features
 
 .. experimental::
     :class:`~newton.solvers.SolverVBD`'s public API and behavior may change without prior notice.
+
+.. experimental::
+    :class:`~newton.solvers.SolverAPICWater`'s public API and behavior may change without prior notice.
+    It requires a CUDA device and one world.
 
 .. experimental::
     :class:`~newton.solvers.SolverFBA`'s public API and behavior may change without prior notice.
@@ -241,9 +257,11 @@ The maximal-coordinate solvers (:class:`~newton.solvers.SolverSemiImplicit`,
 enforce joints as pairwise body constraints but do not use the articulation kinematic-tree structure.
 :class:`~newton.solvers.SolverVBD` supports a subset of joint types through maximal-coordinate
 constraints, with unified compliant ALM by default and a deprecated legacy AVBD path.
-:class:`~newton.solvers.SolverFBA` enforces joints as bilateral maximal-coordinate constraints, without limits or
-drives.
-:class:`~newton.solvers.SolverStyle3D` and :class:`~newton.solvers.SolverImplicitMPM` do not support joints.
+:class:`~newton.solvers.SolverFBA` enforces joints as bilateral maximal-coordinate constraints, and the drives,
+damping, armature, effort limits, friction and limits of each free axis as one row whose force follows the axis's
+piecewise linear law.
+:class:`~newton.solvers.SolverStyle3D`, :class:`~newton.solvers.SolverImplicitMPM` and
+:class:`~newton.solvers.SolverAPICWater` do not support joints.
 
 **Joint types**
 
@@ -369,7 +387,7 @@ drives.
      - |yes|
      - |no|
      - |yes|
-     - |no|
+     - |yes|
    * - :attr:`~newton.Model.joint_friction`
      - |no|
      - |no|
@@ -378,7 +396,7 @@ drives.
      - |yes|
      - |no|
      - |yes|
-     - |no|
+     - |yes| :sup:`18`
    * - :attr:`~newton.Model.joint_limit_lower` / :attr:`~newton.Model.joint_limit_upper`
      - |yes|
      - |yes| :sup:`9`
@@ -387,7 +405,7 @@ drives.
      - |yes|
      - |yes|
      - |yes|
-     - |no|
+     - |yes| :sup:`14`
    * - :attr:`~newton.Model.joint_limit_ke` / :attr:`~newton.Model.joint_limit_kd`
      - |yes|
      - |no|
@@ -405,7 +423,7 @@ drives.
      - |yes|
      - |no|
      - |yes|
-     - |no|
+     - |yes| :sup:`18`
    * - :attr:`~newton.Model.joint_velocity_limit`
      - |no|
      - |yes| :sup:`11`
@@ -417,6 +435,12 @@ drives.
      - |no|
 
 | :sup:`2` Not enforced for BALL joints in SemiImplicit.
+| :sup:`14` FBA holds the limits of REVOLUTE and PRISMATIC joints as hard limits in the law of the axis's row (a
+  revolute joint needs both limits; it leaves out a range of a full turn or more) and ignores those of BALL and D6
+  joints.
+| :sup:`18` FBA bounds a drive's force ``ke (q* - q) + kd (q_dot* - q_dot)``, not its damping or armature, by an
+  effort limit below ``1e6``, and holds each free axis with joint friction still within the friction force, both in
+  the law of the axis's row, which each Newton step linearizes at the piece the row's own step reaches.
 
 **Actuation and control**
 
@@ -442,7 +466,7 @@ drives.
      - |yes|
      - |yes| :sup:`7`
      - |yes|
-     - |no|
+     - |yes| :sup:`15`
    * - :attr:`~newton.Model.joint_target_mode`
      - |no|
      - |no|
@@ -460,7 +484,7 @@ drives.
      - |yes|
      - |yes|
      - |yes|
-     - |no|
+     - |yes|
 
 **Constraints**
 
@@ -495,7 +519,7 @@ drives.
      - |yes| :sup:`6`
      - |yes| :sup:`5`
      - |no|
-     - |no|
+     - |yes| :sup:`17`
    * - Particle-body attachments
      - |no|
      - |no|
@@ -504,7 +528,7 @@ drives.
      - |no|
      - |yes| :sup:`13`
      - |no|
-     - |no|
+     - |yes| :sup:`16`
 
 | :sup:`3` Featherstone eliminates follower degrees of freedom from its reduced dynamics and transfers follower forces and inertia to the reference joint.
 | :sup:`4` SemiImplicit enforces joint-owned mimic relationships with penalty springs configured by ``joint_mimic_ke`` and ``joint_mimic_kd``.
@@ -518,6 +542,12 @@ drives.
 | :sup:`12` With ``solve_mode="matrix_free"``, Steel enforces each mimic relationship within one articulation as one bilateral constraint row per follower coordinate; mimics of BALL, FREE, and DISTANCE joints and mimics across articulations are rejected. It also enforces loop-closing BALL joints as point constraints. ``solve_mode="split"`` rejects mimic relationships and loop-closing joints; the propagation contact responses (``articulated_contact_response``) reject loop-closing joints and solve mimic rows iteratively.
 | :sup:`13` See :ref:`Particle-body attachments` for authoring and semantics. Attachments spanning two
   solvers are coupled by :class:`~newton.solvers.experimental.coupled.SolverCoupledADMM` instead.
+| :sup:`15` FBA takes the backward Euler step of each drive with the axis's damping and armature. Position drives
+  need a linear axis or the angular axis of a joint with one; an effort limit below ``1e6`` bounds the drive's force.
+| :sup:`16` FBA solves attachments to the dynamic bodies it integrates as soft rows with the bodies' contacts and
+  joints, with the full contact operator in one world.
+| :sup:`17` FBA holds each follower coordinate by a hard row combined from rows on both joints' axes, for PRISMATIC,
+  REVOLUTE, and D6 joints with at most one angular axis.
 
 .. _Particle-body attachments:
 
@@ -538,9 +568,14 @@ a single particle has no orientation, so there is no angular counterpart. Forces
 are equal and opposite, including the torque about the body's center of mass, and
 the path is independent of contact, so it stays active without penetration.
 
+:class:`~newton.solvers.SolverFBA` solves an attachment to a dynamic body it
+integrates as three soft rows along the world axes, the backward Euler step of
+the same spring and damper, together with the body's contacts and joints.
+
 Both endpoints must be integrated by the same solver, so
-:class:`~newton.solvers.SolverVBD` rejects attachments when it is constructed
-with ``integrate_with_external_rigid_solver=True``.
+:class:`~newton.solvers.SolverVBD` and :class:`~newton.solvers.SolverFBA`
+reject attachments when they are constructed with
+``integrate_with_external_rigid_solver=True``.
 
 When the endpoints belong to two different solvers in a coupled simulation,
 :class:`~newton.solvers.experimental.coupled.SolverCoupledADMM` turns the same

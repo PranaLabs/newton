@@ -1,0 +1,8 @@
+﻿newton.solvers.SolverAPICWater
+==============================
+
+.. autoclass:: newton.solvers.SolverAPICWater
+   :members:
+   :undoc-members:
+   :show-inheritance:
+   :member-order: groupwise

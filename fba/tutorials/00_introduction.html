@@ -51,13 +51,6 @@
     <script>window.MathJax = {"tex": {"inlineMath": [["$", "$"], ["\\(", "\\)"]], "processEscapes": true, "packages": {"[+]": ["amsmath", "amssymb", "amsfonts"]}, "displayMath": [["$$", "$$"], ["\\[", "\\]"]], "processEnvironments": true, "tags": "ams", "macros": {"RR": "{\\mathbb{R}}", "bold": ["{\\mathbf{#1}}", 1], "vec": ["{\\mathbf{#1}}", 1]}}, "options": {"ignoreHtmlClass": "annotation", "processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
     <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'tutorials/00_introduction';</script>
-    <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
-        DOCUMENTATION_OPTIONS.theme_switcher_json_url = 'https://newton-physics.github.io/newton/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'dev';
-        DOCUMENTATION_OPTIONS.show_version_warning_banner =
-            false;
-        </script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <script src="../_static/mermaid-nbsphinx.js?v=613f558e"></script>
     <link rel="index" title="Index" href="../genindex.html" />
@@ -355,6 +348,13 @@
 <li class=" ">
   <a class="nav-link dropdown-item nav-internal" href="../solvers/fba.html">
     FBA
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../solvers/apic_water.html">
+    APIC Water
   </a>
 </li>
 
@@ -771,6 +771,13 @@
 
 
 <li class="nav-item ">
+  <a class="nav-link nav-internal" href="../solvers/apic_water.html">
+    APIC Water
+  </a>
+</li>
+
+
+<li class="nav-item ">
   <a class="nav-link nav-internal" href="../api/newton.html">
     newton
   </a>
@@ -973,6 +980,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../solvers/kamino.html">Kamino</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../solvers/vbd.html">VBD</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../solvers/fba.html">FBA</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../solvers/apic_water.html">APIC Water</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="nav bd-sidenav">
@@ -1246,7 +1254,7 @@ Added 4 bodies with collision shapes
 </div>
 <div class="output_area docutils container">
 <div class="highlight"><pre>
-Module newton._src.geometry.inertia f6b4bd8 load on device &#39;cpu&#39; took 8.38 ms  (cached)
+Module newton._src.geometry.inertia f6b4bd8 load on device &#39;cpu&#39; took 0.96 ms  (cached)
 Added mesh body with 6102 vertices
 </pre></div></div>
 </div>
@@ -1279,8 +1287,8 @@ Added mesh body with 6102 vertices
 </div>
 <div class="output_area docutils container">
 <div class="highlight"><pre>
-Module validate_and_correct_inertia_kernel_1ff2ac62 6ad45b8 load on device &#39;cpu&#39; took 0.44 ms  (cached)
-Module newton._src.geometry.bvh f9dede2 load on device &#39;cpu&#39; took 0.59 ms  (cached)
+Module validate_and_correct_inertia_kernel_1ff2ac62 6ad45b8 load on device &#39;cpu&#39; took 0.13 ms  (cached)
+Module newton._src.geometry.bvh f9dede2 load on device &#39;cpu&#39; took 0.14 ms  (cached)
 Model finalized for device cpu:
   Bodies: 5
   Shapes: 7
@@ -1347,7 +1355,7 @@ State, Contacts and Control objects created
 </div>
 <div class="output_area docutils container">
 <div class="highlight"><pre>
-Module newton._src.solvers.solver 5e8bff5 load on device &#39;cpu&#39; took 1.22 ms  (cached)
+Module newton._src.solvers.solver 5e8bff5 load on device &#39;cpu&#39; took 1056.82 ms  (compiled)
 Solver created: SolverXPBD
 </pre></div></div>
 </div>
@@ -1444,17 +1452,17 @@ Simulation configured:
 </div>
 <div class="output_area docutils container">
 <div class="highlight"><pre>
-Module newton._src.sim.collide 1216036 load on device &#39;cpu&#39; took 0.48 ms  (cached)
-Module newton._src.geometry.broad_phase_nxn fb0ade4 load on device &#39;cpu&#39; took 0.47 ms  (cached)
-Module narrow_phase_primitive_write_contact_False_False_False 5109e14 load on device &#39;cpu&#39; took 0.47 ms  (cached)
-Module narrow_phase_gjk_mpr_True_False_write_contact_support_map_default 08b34ac load on device &#39;cpu&#39; took 1.26 ms  (cached)
-Module newton._src.geometry.narrow_phase f61f953 load on device &#39;cpu&#39; took 0.43 ms  (cached)
-Module newton._src.geometry.contact_reduction_global 36dd1d5 load on device &#39;cpu&#39; took 0.46 ms  (cached)
-Module newton._src.geometry.sdf_contact 310792f load on device &#39;cpu&#39; took 0.35 ms  (cached)
-Module narrow_phase_mesh_plane_write_contact_to_reducer_True d27dd4c load on device &#39;cpu&#39; took 0.34 ms  (cached)
-Module mesh_triangle_contacts_to_reducer_kernel_00644a25 7ebdbe1 load on device &#39;cpu&#39; took 1.07 ms  (cached)
-Module export_reduced_contacts_write_contact 2049828 load on device &#39;cpu&#39; took 0.38 ms  (cached)
-Module newton._src.solvers.xpbd.kernels 12b5d7c load on device &#39;cpu&#39; took 0.64 ms  (cached)
+Module newton._src.sim.collide 1216036 load on device &#39;cpu&#39; took 0.13 ms  (cached)
+Module newton._src.geometry.broad_phase_nxn fb0ade4 load on device &#39;cpu&#39; took 0.11 ms  (cached)
+Module narrow_phase_primitive_write_contact_False_False_False bd977c1 load on device &#39;cpu&#39; took 0.12 ms  (cached)
+Module narrow_phase_gjk_mpr_True_False_write_contact_support_map_default 08b34ac load on device &#39;cpu&#39; took 0.13 ms  (cached)
+Module newton._src.geometry.narrow_phase f61f953 load on device &#39;cpu&#39; took 0.12 ms  (cached)
+Module newton._src.geometry.contact_reduction_global 36dd1d5 load on device &#39;cpu&#39; took 0.11 ms  (cached)
+Module newton._src.geometry.sdf_contact 310792f load on device &#39;cpu&#39; took 0.11 ms  (cached)
+Module narrow_phase_mesh_plane_write_contact_to_reducer_True d27dd4c load on device &#39;cpu&#39; took 0.10 ms  (cached)
+Module mesh_triangle_contacts_to_reducer_kernel_00644a25 7ebdbe1 load on device &#39;cpu&#39; took 0.12 ms  (cached)
+Module export_reduced_contacts_write_contact 2049828 load on device &#39;cpu&#39; took 0.11 ms  (cached)
+Module newton._src.solvers.xpbd.kernels 12b5d7c load on device &#39;cpu&#39; took 3905.82 ms  (compiled)
 Graph captured for optimized execution
 </pre></div></div>
 </div>
@@ -1494,8 +1502,8 @@ Graph captured for optimized execution
 </div>
 <div class="output_area docutils container">
 <div class="highlight"><pre>
-Module newton._src.viewer.kernels ed7e7f3 load on device &#39;cpu&#39; took 2184.91 ms  (compiled)
-Module newton._src.geometry.raycast bea63c2 load on device &#39;cpu&#39; took 0.59 ms  (cached)
+Module newton._src.viewer.kernels ed7e7f3 load on device &#39;cpu&#39; took 0.19 ms  (cached)
+Module newton._src.geometry.raycast bea63c2 load on device &#39;cpu&#39; took 761.57 ms  (compiled)
 </pre></div></div>
 </div>
 </section>
@@ -1538,7 +1546,7 @@ Module newton._src.geometry.raycast bea63c2 load on device &#39;cpu&#39; took 0.
 </div>
 <div class="output_area docutils container">
 <div class="highlight"><pre>
-Module newton._src.viewer.viewer_viser_kernels 0bebe93 load on device &#39;cpu&#39; took 0.92 ms  (cached)
+Module newton._src.viewer.viewer_viser_kernels 0bebe93 load on device &#39;cpu&#39; took 86.71 ms  (compiled)
 
 Simulation complete! Total time: 8.33 seconds
 </pre></div></div>

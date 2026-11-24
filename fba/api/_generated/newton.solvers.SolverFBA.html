@@ -48,13 +48,6 @@
     <script src="../../_static/design-tabs.js?v=f930bc37"></script>
     <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'api/_generated/newton.solvers.SolverFBA';</script>
-    <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
-        DOCUMENTATION_OPTIONS.theme_switcher_json_url = 'https://newton-physics.github.io/newton/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'dev';
-        DOCUMENTATION_OPTIONS.show_version_warning_banner =
-            false;
-        </script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <script src="../../_static/mermaid-nbsphinx.js?v=613f558e"></script>
     <link rel="index" title="Index" href="../../genindex.html" />
@@ -352,6 +345,13 @@
 <li class=" ">
   <a class="nav-link dropdown-item nav-internal" href="../../solvers/fba.html">
     FBA
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../../solvers/apic_water.html">
+    APIC Water
   </a>
 </li>
 
@@ -768,6 +768,13 @@
 
 
 <li class="nav-item ">
+  <a class="nav-link nav-internal" href="../../solvers/apic_water.html">
+    APIC Water
+  </a>
+</li>
+
+
+<li class="nav-item ">
   <a class="nav-link nav-internal" href="../newton.html">
     newton
   </a>
@@ -970,6 +977,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../solvers/kamino.html">Kamino</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../solvers/vbd.html">VBD</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../solvers/fba.html">FBA</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../solvers/apic_water.html">APIC Water</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="current nav bd-sidenav">
@@ -1062,8 +1070,8 @@
 <h1>newton.solvers.SolverFBA<a class="headerlink" href="#newton-solvers-solverfba" title="Link to this heading">#</a></h1>
 <dl class="py class">
 <dt class="sig sig-object py" id="newton.solvers.SolverFBA">
-<em class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">newton.solvers.</span></span><span class="sig-name descname"><span class="pre">SolverFBA</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">iterations</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">10</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pin_stiffness</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1e12</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stretching_model</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'arap'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">friction</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">friction_anchors</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lambda_cap</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shape_angular_velocity</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shape_particle_radius_override</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nsn_schur_mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'full'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nsn_sparse_storage</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">integrate_with_external_rigid_solver</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">contact_regularization</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1.0e-2</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">face_contacts</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">face_contact_edge_radius</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">3.0e-3</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nsn_linear_iterations</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nsn_lite_accumulate</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">face_contact_gap</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_enable_self_contact</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'vertex_face'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_edge_edge</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_edge_edge_ratio</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.9</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_margin</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">2.0e-3</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_gap</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_topological_contact_filter_threshold</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">2</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_rest_shape_contact_exclusion_radius</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_group_ids</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_group_margins</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rayleigh_alpha</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rayleigh_beta</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rayleigh_corotated</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tet_activation_directions</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">contact_warmstart</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference external" href="https://github.com/newton-physics/newton/blob/main/newton/_src/solvers/fba/solver_fba.py#L62"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#newton.solvers.SolverFBA" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference internal" href="newton.solvers.SolverBase.html#newton.solvers.SolverBase" title="newton._src.solvers.solver.SolverBase"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverBase</span></code></a></p>
+<em class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">newton.solvers.</span></span><span class="sig-name descname"><span class="pre">SolverFBA</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">iterations</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">10</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pin_stiffness</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1e12</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stretching_model</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'arap'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">friction</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">friction_anchors</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shape_particle_radius_override</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nsn_schur_mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'full'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nsn_sparse_storage</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">integrate_with_external_rigid_solver</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">contact_regularization</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1.0e-2</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">face_contacts</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">face_contact_edge_radius</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">3.0e-3</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nsn_linear_iterations</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nsn_lite_accumulate</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">face_contact_gap</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_enable_self_contact</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'vertex_face'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_edge_edge</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_edge_edge_ratio</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.9</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_margin</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">2.0e-3</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_gap</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_topological_contact_filter_threshold</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">2</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_rest_shape_contact_exclusion_radius</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_group_ids</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_group_margins</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rod_contact</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rod_contact_gap</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rod_shape_contacts</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rod_shape_contact_gap</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rayleigh_alpha</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rayleigh_beta</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rayleigh_corotated</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tet_activation_directions</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">contact_warmstart</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rigid_contact_bin</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rigid_contact_friction</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'mean'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rigid_iteration_graph</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rigid_contact_time</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rigid_contact_damping</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1.0</span></span></em><span class="sig-paren">)</span><a class="reference external" href="https://github.com/newton-physics/newton/blob/main/newton/_src/solvers/fba/solver_fba.py#L117"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#newton.solvers.SolverFBA" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">TendonStateMixin</span></code>, <a class="reference internal" href="newton.solvers.SolverBase.html#newton.solvers.SolverBase" title="newton._src.solvers.solver.SolverBase"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverBase</span></code></a></p>
 <p>Fast But Accurate projective-dynamics solver for cloth, soft bodies and rigid bodies.</p>
 <div class="experimental admonition">
 <p class="admonition-title">Experimental</p>
@@ -1085,7 +1093,8 @@ on a mesh add to its contact’s row. Face contacts and self contacts
 have no rows in the contacts, and the rows of rigid contacts are zero.</p>
 <p>Implements a Projective Dynamics (PD) local-global iteration for cloth
 and tetrahedral soft bodies, with ARAP, corotational or Neo-Hookean
-stretching, isometric bending of cloth and soft pin constraints. The PD
+stretching, isometric bending of cloth, springs whose ADMM local steps
+converge to their implicit Euler step, and soft pin constraints. The PD
 Hessian is prefactored once (nested dissection ordering, multifrontal
 LDLᵀ); the sparse inverse <code class="docutils literal notranslate"><span class="pre">S</span> <span class="pre">=</span> <span class="pre">L⁻¹</span></code> is computed exactly on the
 elimination tree and uploaded to Warp BSR matrices. The runtime linear
@@ -1100,12 +1109,12 @@ takes no <code class="docutils literal notranslate"><span class="pre">k_lambda</
 <li><p><code class="docutils literal notranslate"><span class="pre">&quot;corotational&quot;</span></code> (corotational linear elasticity) solves in closed
 form on the singular values of <code class="docutils literal notranslate"><span class="pre">F</span></code>, 2x2 for cloth and 3x3 with
 Sherman-Morrison for tetrahedra. It takes each element’s <code class="docutils literal notranslate"><span class="pre">k_mu</span></code> and
-<code class="docutils literal notranslate"><span class="pre">k_lambda</span></code>, the first and second Lamé parameters [Pa].</p></li>
+<code class="docutils literal notranslate"><span class="pre">k_lambda</span></code>, the shear modulus and the first Lamé parameter [Pa].</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">&quot;neohookean&quot;</span></code> (Neo-Hookean hyperelasticity) runs L-BFGS with an
 Armijo cubic backtracking line search (memory 8, <code class="docutils literal notranslate"><span class="pre">c_1</span> <span class="pre">=</span> <span class="pre">1e-4</span></code>,
 tolerance <code class="docutils literal notranslate"><span class="pre">1e-6</span></code>, at most 50 iterations) on the singular values of
-<code class="docutils literal notranslate"><span class="pre">F</span></code>. It takes each element’s <code class="docutils literal notranslate"><span class="pre">k_mu</span></code> and <code class="docutils literal notranslate"><span class="pre">k_lambda</span></code>, the first and
-second Lamé parameters [Pa].</p></li>
+<code class="docutils literal notranslate"><span class="pre">F</span></code>. It takes each element’s <code class="docutils literal notranslate"><span class="pre">k_mu</span></code> and <code class="docutils literal notranslate"><span class="pre">k_lambda</span></code>, the shear
+modulus and the first Lamé parameter [Pa].</p></li>
 </ul>
 <p>Corotational and Neo-Hookean take the true Lamé parameters. Projective
 dynamics drops the dual variable of the local projection, so its fixed
@@ -1123,12 +1132,24 @@ weight of every element is <code class="docutils literal notranslate"><span clas
 adds the isometric bending energy of Bergou et al. (2006),
 <code class="docutils literal notranslate"><span class="pre">1/2</span> <span class="pre">*</span> <span class="pre">edge_ke</span> <span class="pre">*</span> <span class="pre">3</span> <span class="pre">/</span> <span class="pre">(A0</span> <span class="pre">+</span> <span class="pre">A1)</span> <span class="pre">*</span> <span class="pre">|sum_k</span> <span class="pre">q_k</span> <span class="pre">x_k|^2</span></code>, with the cotangent
 weights <code class="docutils literal notranslate"><span class="pre">q</span></code> of the edge’s two triangles and their rest areas <code class="docutils literal notranslate"><span class="pre">A0</span></code> and
-<code class="docutils literal notranslate"><span class="pre">A1</span></code>; <code class="docutils literal notranslate"><span class="pre">edge_rest_angle</span></code> sets its rest curvature. <code class="docutils literal notranslate"><span class="pre">edge_ke</span></code> is thus a
-bending modulus [N·m], and the bending energy of a given shape converges
-as the mesh is refined. <a class="reference internal" href="newton.solvers.SolverVBD.html#newton.solvers.SolverVBD" title="newton.solvers.SolverVBD"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverVBD</span></code></a> scales
-<code class="docutils literal notranslate"><span class="pre">edge_ke</span></code> by the edge length instead, <code class="docutils literal notranslate"><span class="pre">1/2</span> <span class="pre">*</span> <span class="pre">edge_ke</span> <span class="pre">*</span> <span class="pre">|e|</span> <span class="pre">*</span> <span class="pre">theta^2</span></code>
-for a dihedral angle <code class="docutils literal notranslate"><span class="pre">theta</span></code>: at small angles the same <code class="docutils literal notranslate"><span class="pre">edge_ke</span></code>
-bends an FBA cloth <code class="docutils literal notranslate"><span class="pre">3</span> <span class="pre">*</span> <span class="pre">|e|</span> <span class="pre">/</span> <span class="pre">(A0</span> <span class="pre">+</span> <span class="pre">A1)</span></code> times as stiffly.</p>
+<code class="docutils literal notranslate"><span class="pre">A1</span></code>; <code class="docutils literal notranslate"><span class="pre">edge_rest_angle</span></code> sets its rest curvature. As the mesh is
+refined, the bending energy of a given shape converges to that of a plate
+whose stiffness depends on the triangles. On equilateral triangles it is
+an isotropic plate of bending stiffness <code class="docutils literal notranslate"><span class="pre">D</span> <span class="pre">=</span> <span class="pre">3</span> <span class="pre">*</span> <span class="pre">edge_ke</span></code> [N·m] and
+Poisson’s ratio <code class="docutils literal notranslate"><span class="pre">-1/3</span></code>, with the energy density
+<code class="docutils literal notranslate"><span class="pre">D</span> <span class="pre">/</span> <span class="pre">2</span> <span class="pre">*</span> <span class="pre">((k1</span> <span class="pre">+</span> <span class="pre">k2)^2</span> <span class="pre">-</span> <span class="pre">8/3</span> <span class="pre">*</span> <span class="pre">k1</span> <span class="pre">*</span> <span class="pre">k2)</span></code> for the principal curvatures
+<code class="docutils literal notranslate"><span class="pre">k1</span></code> and <code class="docutils literal notranslate"><span class="pre">k2</span></code>: for a plate of stiffness <code class="docutils literal notranslate"><span class="pre">D</span></code> that bends mostly about
+one axis, as in folds, drape or a cantilever, pass <code class="docutils literal notranslate"><span class="pre">edge_ke</span> <span class="pre">=</span> <span class="pre">D</span> <span class="pre">/</span> <span class="pre">3</span></code>.
+On grids of right triangles, bending about an axis along the grid lines
+takes the same <code class="docutils literal notranslate"><span class="pre">3</span> <span class="pre">*</span> <span class="pre">edge_ke</span></code>, and bending about a diagonal axis is
+stiffer: 1.5 times with alternating diagonals, and with parallel
+diagonals, as <a class="reference internal" href="newton.ModelBuilder.html#newton.ModelBuilder.add_cloth_grid" title="newton.ModelBuilder.add_cloth_grid"><code class="xref py py-meth docutils literal notranslate"><span class="pre">add_cloth_grid()</span></code></a> makes them,
+3 times about an axis across the diagonals and not at all about one
+along them. <a class="reference internal" href="newton.solvers.SolverVBD.html#newton.solvers.SolverVBD" title="newton.solvers.SolverVBD"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverVBD</span></code></a> scales <code class="docutils literal notranslate"><span class="pre">edge_ke</span></code> by the
+edge length instead, <code class="docutils literal notranslate"><span class="pre">1/2</span> <span class="pre">*</span> <span class="pre">edge_ke</span> <span class="pre">*</span> <span class="pre">|e|</span> <span class="pre">*</span> <span class="pre">theta^2</span></code> for a dihedral
+angle <code class="docutils literal notranslate"><span class="pre">theta</span></code>: at small angles <code class="docutils literal notranslate"><span class="pre">|sum_k</span> <span class="pre">q_k</span> <span class="pre">x_k|</span></code> is <code class="docutils literal notranslate"><span class="pre">|e|</span> <span class="pre">*</span> <span class="pre">theta</span></code>,
+so the same <code class="docutils literal notranslate"><span class="pre">edge_ke</span></code> bends an FBA cloth <code class="docutils literal notranslate"><span class="pre">3</span> <span class="pre">*</span> <span class="pre">|e|</span> <span class="pre">/</span> <span class="pre">(A0</span> <span class="pre">+</span> <span class="pre">A1)</span></code> times
+as stiffly.</p>
 <p>Rayleigh damping, <code class="docutils literal notranslate"><span class="pre">rayleigh_alpha</span></code> and <code class="docutils literal notranslate"><span class="pre">rayleigh_beta</span></code>, applies the
 forces <code class="docutils literal notranslate"><span class="pre">-(alpha</span> <span class="pre">M</span> <span class="pre">+</span> <span class="pre">beta</span> <span class="pre">K)</span> <span class="pre">v</span></code> by implicit Euler, with <code class="docutils literal notranslate"><span class="pre">M</span></code> the
 particle masses and <code class="docutils literal notranslate"><span class="pre">K</span></code> the stretching and bending part of the PD
@@ -1154,6 +1175,30 @@ activated shape. Grown along a direction, <code class="docutils literal notransl
 projection of <code class="docutils literal notranslate"><span class="pre">F</span></code> in the solver’s metric, so the element’s forces are
 not those of an energy, though a free element still comes to rest at its
 grown shape.</p>
+<p>Joints between the bodies that SolverFBA integrates are bilateral rows, one
+per locked direction; a D6 joint with two free angular axes holds the angle
+between the first axis in the parent’s joint frame and the second in the
+child’s, as Newton composes its rotation. A kinematic body takes part at
+the pose its velocity reaches by the step’s end. Every free axis with
+passive damping <code class="docutils literal notranslate"><span class="pre">Model.joint_damping</span></code>, a drive (<code class="docutils literal notranslate"><span class="pre">Model.joint_target_ke</span></code>
+and <code class="docutils literal notranslate"><span class="pre">Model.joint_target_kd</span></code> toward the control’s <code class="docutils literal notranslate"><span class="pre">joint_target_q</span></code> and
+<code class="docutils literal notranslate"><span class="pre">joint_target_qd</span></code>), armature <code class="docutils literal notranslate"><span class="pre">Model.joint_armature</span></code>, joint friction
+<code class="docutils literal notranslate"><span class="pre">Model.joint_friction</span></code>, or, on a revolute or prismatic joint, limits
+<code class="docutils literal notranslate"><span class="pre">Model.joint_limit_lower</span></code> and <code class="docutils literal notranslate"><span class="pre">Model.joint_limit_upper</span></code>, takes one row in
+the joint system whose force is the axis’s: the backward Euler step of
+<code class="docutils literal notranslate"><span class="pre">ke</span> <span class="pre">(q*</span> <span class="pre">-</span> <span class="pre">q)</span> <span class="pre">+</span> <span class="pre">kd</span> <span class="pre">(q_dot*</span> <span class="pre">-</span> <span class="pre">q_dot)</span> <span class="pre">-</span> <span class="pre">c</span> <span class="pre">q_dot</span> <span class="pre">-</span> <span class="pre">I_a</span> <span class="pre">q_ddot</span></code>, the drive’s
+part bounded by <code class="docutils literal notranslate"><span class="pre">Model.joint_effort_limit</span></code> below 1e6, the dry friction and
+the hard limits, where an angular axis’s rate is the relative angular
+velocity along it in the parent’s joint frame (the child’s for the second
+axis of a two-axis D6 joint); each Newton step linearizes the piece of that
+law the row’s own step reaches. A position drive needs a linear axis or the
+angular axis of a joint with one; a revolute axis needs both limits, and
+those of a full turn or more are left out with a warning.
+<code class="docutils literal notranslate"><span class="pre">Control.joint_f</span></code> adds the joints’ generalized forces to their bodies. A
+mimic joint (<code class="docutils literal notranslate"><span class="pre">Model.joint_mimic_joint</span></code>) holds each coordinate at
+<code class="docutils literal notranslate"><span class="pre">c0</span> <span class="pre">+</span> <span class="pre">c1</span></code> times its leader’s by a hard row on both joints’ axes. The
+limits’ stiffness and damping (<code class="docutils literal notranslate"><span class="pre">joint_limit_ke</span></code>, <code class="docutils literal notranslate"><span class="pre">joint_limit_kd</span></code>) and
+the velocity limits are not read, nor are the limits of ball and D6 joints.</p>
 <p class="rubric">Notes</p>
 <ul class="simple">
 <li><p>Float32 <code class="docutils literal notranslate"><span class="pre">particle_q</span></code> output: the interior linear solver
@@ -1175,8 +1220,74 @@ solver, with a different sparse-matrix layout (ELL + PCG).</p>
 <dl class="field-list simple">
 </dl>
 <dl class="py method">
+<dt class="sig sig-object py" id="newton.solvers.SolverFBA.register_custom_attributes">
+<em class="property"><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">register_custom_attributes</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">builder</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#newton.solvers.SolverFBA.register_custom_attributes" title="Link to this definition">#</a></dt>
+<dd><p>Register the custom attributes of SolverFBA: the bending elements of particle rods and the friction and
+softness of tendons.</p>
+<p>Registers the custom frequency <code class="docutils literal notranslate"><span class="pre">fba:rod_bend</span></code>, one entry per bending element, with the attributes
+<code class="docutils literal notranslate"><span class="pre">fba:rod_bend_particles</span></code> (<code class="docutils literal notranslate"><span class="pre">vec3i</span></code>), the rod’s particles before, at and after the bend, and
+<code class="docutils literal notranslate"><span class="pre">fba:rod_bend_stiffness</span></code> (<code class="docutils literal notranslate"><span class="pre">float32</span></code>), the rod’s bending stiffness <code class="docutils literal notranslate"><span class="pre">EI</span></code> [N·m²]. The model holds them
+as <code class="docutils literal notranslate"><span class="pre">model.fba.rod_bend_particles</span></code> and <code class="docutils literal notranslate"><span class="pre">model.fba.rod_bend_stiffness</span></code>. <a class="reference internal" href="#newton.solvers.SolverFBA.add_particle_rod" title="newton.solvers.SolverFBA.add_particle_rod"><code class="xref py py-meth docutils literal notranslate"><span class="pre">add_particle_rod()</span></code></a>
+registers them itself.</p>
+<p>For the model’s tendons (<a class="reference internal" href="newton.ModelBuilder.html#newton.ModelBuilder.add_tendon" title="newton.ModelBuilder.add_tendon"><code class="xref py py-meth docutils literal notranslate"><span class="pre">add_tendon()</span></code></a>) it registers, per tendon guide,
+<code class="docutils literal notranslate"><span class="pre">fba:guide_friction_force</span></code> [N] (default 0), a friction force on the string running over the guide that
+does not grow with the load (a bearing’s seal drag, the string’s bending over a pulley); and per tendon
+<code class="docutils literal notranslate"><span class="pre">fba:tendon_time</span></code> [s] (default 0) and <code class="docutils literal notranslate"><span class="pre">fba:tendon_damping_ratio</span></code> (default 1), a spring and damper on the
+tendon’s length relative to its rows’ effective mass, as MuJoCo’s <code class="docutils literal notranslate"><span class="pre">solref</span></code> time constant and damping
+ratio, in place of its spans’ compliance and damping (a compatibility setting for scenes tuned in MuJoCo).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>builder</strong> (<a class="reference internal" href="newton.ModelBuilder.html#newton.ModelBuilder" title="newton._src.sim.builder.ModelBuilder"><em>ModelBuilder</em></a>) – Model builder to register the attributes on.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="newton.solvers.SolverFBA.add_particle_rod">
+<em class="property"><span class="k"><span class="pre">static</span></span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">add_particle_rod</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">builder</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">points</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">radius</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">youngs_modulus</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">density</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">mass</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bending_stiffness</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#newton.solvers.SolverFBA.add_particle_rod" title="Link to this definition">#</a></dt>
+<dd><p>Add an elastic rod of circular cross-section along a polyline, as particles that SolverFBA simulates.</p>
+<p>Each vertex becomes a particle of radius <code class="docutils literal notranslate"><span class="pre">radius</span></code> whose mass is the rod’s line density times half the
+length of its segments; each segment, a spring of stiffness <code class="docutils literal notranslate"><span class="pre">E</span> <span class="pre">pi</span> <span class="pre">r^2</span> <span class="pre">/</span> <span class="pre">l</span></code>, the rod’s axial stiffness
+over the segment’s rest length <code class="docutils literal notranslate"><span class="pre">l</span></code>; and each interior vertex, a bending element, an entry of
+<code class="docutils literal notranslate"><span class="pre">fba:rod_bend</span></code> (see <a class="reference internal" href="#newton.solvers.SolverFBA.register_custom_attributes" title="newton.solvers.SolverFBA.register_custom_attributes"><code class="xref py py-meth docutils literal notranslate"><span class="pre">register_custom_attributes()</span></code></a>), of energy:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">EI</span> <span class="o">/</span> <span class="p">(</span><span class="mi">2</span> <span class="n">v</span><span class="p">)</span> <span class="o">|</span><span class="p">(</span><span class="n">x_</span><span class="o">+</span> <span class="o">-</span> <span class="n">x</span><span class="p">)</span> <span class="o">/</span> <span class="n">l_</span><span class="o">+</span> <span class="o">-</span> <span class="p">(</span><span class="n">x</span> <span class="o">-</span> <span class="n">x_</span><span class="o">-</span><span class="p">)</span> <span class="o">/</span> <span class="n">l_</span><span class="o">-|^</span><span class="mi">2</span><span class="p">,</span>
+</pre></div>
+</div>
+<p>with <code class="docutils literal notranslate"><span class="pre">x_-</span></code>, <code class="docutils literal notranslate"><span class="pre">x</span></code> and <code class="docutils literal notranslate"><span class="pre">x_+</span></code> the vertex and its neighbors, <code class="docutils literal notranslate"><span class="pre">l_-</span></code> and <code class="docutils literal notranslate"><span class="pre">l_+</span></code> the rest lengths of its
+two segments and <code class="docutils literal notranslate"><span class="pre">v</span> <span class="pre">=</span> <span class="pre">(l_-</span> <span class="pre">+</span> <span class="pre">l_+)</span> <span class="pre">/</span> <span class="pre">2</span></code>: for small turns <code class="docutils literal notranslate"><span class="pre">phi</span></code> of the rod at the vertex,
+<code class="docutils literal notranslate"><span class="pre">EI</span> <span class="pre">/</span> <span class="pre">2</span> <span class="pre">kappa^2</span> <span class="pre">v</span></code> with the curvature <code class="docutils literal notranslate"><span class="pre">kappa</span> <span class="pre">=</span> <span class="pre">phi</span> <span class="pre">/</span> <span class="pre">v</span></code>. The rod is straight at rest, whatever the
+polyline, and has no twist. Rest lengths come from <code class="docutils literal notranslate"><span class="pre">points</span></code>. Contacts with shapes act at the particles,
+so a rod whose segments are longer than about twice its radius can pass thin shapes between its
+particles; rods collide with each other as chains of capsules with <code class="docutils literal notranslate"><span class="pre">rod_contact=True</span></code>.</p>
+<p>A particle rod is not the rod of <a class="reference internal" href="newton.ModelBuilder.html#newton.ModelBuilder.add_rod" title="newton.ModelBuilder.add_rod"><code class="xref py py-meth docutils literal notranslate"><span class="pre">add_rod()</span></code></a>, a chain of rigid capsules joined
+by rod joints. To hold an end, set its particles’ mass to zero, which pins them.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>builder</strong> (<a class="reference internal" href="newton.ModelBuilder.html#newton.ModelBuilder" title="newton.ModelBuilder"><em>ModelBuilder</em></a>) – Model builder to add the rod to.</p></li>
+<li><p><strong>points</strong> (<em>np.ndarray</em><em> | </em><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#list" title="(in Python v3.15)"><em>list</em></a>) – Vertices of the polyline [m], shape <code class="docutils literal notranslate"><span class="pre">(N,</span> <span class="pre">3)</span></code>, <code class="docutils literal notranslate"><span class="pre">N</span> <span class="pre">&gt;=</span> <span class="pre">2</span></code>.</p></li>
+<li><p><strong>radius</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a>) – Radius of the cross-section [m], also the particles’ contact radius.</p></li>
+<li><p><strong>youngs_modulus</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a>) – Young’s modulus <code class="docutils literal notranslate"><span class="pre">E</span></code> [Pa].</p></li>
+<li><p><strong>density</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a><em> | </em><em>None</em>) – Density [kg/m³] of the rod’s material, for the line density <code class="docutils literal notranslate"><span class="pre">density</span> <span class="pre">pi</span> <span class="pre">r^2</span></code>. Give
+exactly one of <code class="docutils literal notranslate"><span class="pre">density</span></code> and <code class="docutils literal notranslate"><span class="pre">mass</span></code>.</p></li>
+<li><p><strong>mass</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a><em> | </em><em>None</em>) – Total mass [kg] of the rod, spread evenly over its length.</p></li>
+<li><p><strong>bending_stiffness</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a><em> | </em><em>ArrayLike</em><em> | </em><em>None</em>) – Bending stiffness <code class="docutils literal notranslate"><span class="pre">EI</span></code> [N·m²], for the whole rod or one per interior vertex,
+shape <code class="docutils literal notranslate"><span class="pre">(N</span> <span class="pre">-</span> <span class="pre">2,)</span></code>, as a cable stiffens toward a plug; <code class="docutils literal notranslate"><span class="pre">E</span> <span class="pre">pi</span> <span class="pre">r^4</span> <span class="pre">/</span> <span class="pre">4</span></code>, that of a solid circular
+section, if <code class="docutils literal notranslate"><span class="pre">None</span></code>. A rope takes one far below that.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>The indices of the rod’s particles, in the order of <code class="docutils literal notranslate"><span class="pre">points</span></code>.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#list" title="(in Python v3.15)">list</a>[<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)">int</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="newton.solvers.SolverFBA.__init__">
-<span class="sig-name descname"><span class="pre">__init__</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">iterations</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">10</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pin_stiffness</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1e12</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stretching_model</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'arap'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">friction</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">friction_anchors</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lambda_cap</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shape_angular_velocity</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shape_particle_radius_override</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nsn_schur_mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'full'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nsn_sparse_storage</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">integrate_with_external_rigid_solver</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">contact_regularization</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1.0e-2</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">face_contacts</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">face_contact_edge_radius</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">3.0e-3</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nsn_linear_iterations</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nsn_lite_accumulate</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">face_contact_gap</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_enable_self_contact</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'vertex_face'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_edge_edge</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_edge_edge_ratio</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.9</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_margin</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">2.0e-3</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_gap</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_topological_contact_filter_threshold</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">2</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_rest_shape_contact_exclusion_radius</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_group_ids</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_group_margins</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rayleigh_alpha</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rayleigh_beta</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rayleigh_corotated</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tet_activation_directions</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">contact_warmstart</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#newton.solvers.SolverFBA.__init__" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">__init__</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">iterations</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">10</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pin_stiffness</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1e12</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stretching_model</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'arap'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">friction</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">friction_anchors</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shape_particle_radius_override</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nsn_schur_mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'full'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nsn_sparse_storage</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">integrate_with_external_rigid_solver</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">contact_regularization</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1.0e-2</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">face_contacts</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">face_contact_edge_radius</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">3.0e-3</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nsn_linear_iterations</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nsn_lite_accumulate</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">face_contact_gap</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_enable_self_contact</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'vertex_face'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_edge_edge</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_edge_edge_ratio</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.9</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_margin</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">2.0e-3</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_gap</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_topological_contact_filter_threshold</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">2</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_rest_shape_contact_exclusion_radius</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_group_ids</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">particle_self_contact_group_margins</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rod_contact</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rod_contact_gap</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rod_shape_contacts</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rod_shape_contact_gap</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rayleigh_alpha</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rayleigh_beta</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rayleigh_corotated</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tet_activation_directions</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">contact_warmstart</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rigid_contact_bin</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rigid_contact_friction</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'mean'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rigid_iteration_graph</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rigid_contact_time</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rigid_contact_damping</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1.0</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#newton.solvers.SolverFBA.__init__" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1200,28 +1311,18 @@ which lets stacked cloth layers creep apart over seconds. The
 friction cone still bounds the force: a contact pulled harder
 than <code class="docutils literal notranslate"><span class="pre">mu</span></code> times its normal force slides as without the
 point, which trails it by at most a quarter of the contact
-distance (the self-contact margin, or the particle radius plus
-the shape margin) and then moves to it; with a contact distance
-of zero it stays where it was set. A contact drops its
-point when it carries no normal force or acts on a particle
-that rows hold at a point. Vertex-vertex self contacts,
-contacts with shapes on bodies, face contacts, and the contacts
-of a step in which one touches a body that FBA integrates keep
-the step’s point. Needs <code class="docutils literal notranslate"><span class="pre">friction=True</span></code>.</p></li>
-<li><p><strong>lambda_cap</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a><em> | </em><em>None</em>) – Optional clamp on the magnitude of each contact
-row’s multiplier, in force units [N]. The multipliers are
-forces divided by <code class="docutils literal notranslate"><span class="pre">dt²</span></code>, so the clamp is divided by <code class="docutils literal notranslate"><span class="pre">dt²</span></code>
-at each NSN solve, and the tangent multipliers are clamped
-again into the cone of the capped normal one. A row applies
-its multiplier weighted by its Fischer-Burmeister weight in
-[0, 2], so its force can reach twice the cap. <code class="docutils literal notranslate"><span class="pre">None</span></code>
-disables clamping.</p></li>
-<li><p><strong>shape_angular_velocity</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#dict" title="(in Python v3.15)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a><em>] </em><em>| </em><em>None</em>) – Optional <code class="docutils literal notranslate"><span class="pre">{shape_index:</span> <span class="pre">ω}</span></code> mapping of
-angular speeds [rad/s], right-handed about each listed shape’s
-local +Z axis (Newton’s cylinder primitive axis). The surface
-velocity <code class="docutils literal notranslate"><span class="pre">ω</span> <span class="pre">·</span> <span class="pre">cross(axis_world,</span> <span class="pre">world_anchor</span> <span class="pre">-</span> <span class="pre">shape_center)</span></code>
-enters the residual of the friction rows; the shape geometry
-itself stays static. Defaults to no kinematic motion.</p></li>
+distance (the self-contact margin, that of the contact’s
+group with <code class="docutils literal notranslate"><span class="pre">particle_self_contact_group_ids</span></code>, or the
+particle radius, or the radius that
+<code class="docutils literal notranslate"><span class="pre">shape_particle_radius_override</span></code> gives against the shape,
+plus the shape margin) and then moves to it; with a contact
+distance of zero it stays where it was set. A contact drops
+its point when it carries no normal force or acts on a
+particle that rows hold at a point. Vertex-vertex and
+edge-edge self contacts, rod contacts, contacts with shapes on
+bodies, face contacts, and the contacts of a step in which one
+touches a body that FBA integrates keep the step’s point.
+Needs <code class="docutils literal notranslate"><span class="pre">friction=True</span></code>.</p></li>
 <li><p><strong>shape_particle_radius_override</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#dict" title="(in Python v3.15)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a><em>] </em><em>| </em><em>None</em>) – Optional <code class="docutils literal notranslate"><span class="pre">{shape_index:</span> <span class="pre">radius}</span></code>
 mapping of the contact thickness [m] of the particles against
 the listed shapes: their particle and face contacts stop this
@@ -1231,7 +1332,7 @@ a body whose particle radius holds it off the floor. A radius
 lies between 0 and the smallest particle radius, since the
 collision pipeline still finds the contacts at the particle
 radii. Other shapes and self contacts keep the particle
-radii. Not supported with <code class="docutils literal notranslate"><span class="pre">friction_anchors</span></code>.</p></li>
+radii.</p></li>
 <li><p><strong>nsn_schur_mode</strong> (<em>Literal</em><em>[</em><em>'full'</em><em>, </em><em>'lite'</em><em>]</em>) – Contact operator <code class="docutils literal notranslate"><span class="pre">W</span></code> of the NSN steps.
 <code class="docutils literal notranslate"><span class="pre">&quot;full&quot;</span></code> (default) builds <code class="docutils literal notranslate"><span class="pre">J</span> <span class="pre">A⁻¹</span> <span class="pre">Jᵀ</span></code> from the prefactored
 system matrix <code class="docutils literal notranslate"><span class="pre">A</span></code>. <code class="docutils literal notranslate"><span class="pre">&quot;lite&quot;</span></code> replaces <code class="docutils literal notranslate"><span class="pre">A⁻¹</span></code> by
@@ -1349,11 +1450,16 @@ edges are covered at any margin. Needs
 <code class="docutils literal notranslate"><span class="pre">particle_self_contact_mode=&quot;vertex_face&quot;</span></code>.</p></li>
 <li><p><strong>particle_self_contact_edge_edge_ratio</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a>) – An edge pair takes a
 contact only where its edges come nearer than this times the
-distance of its particles’ nearest triangles. Below 1, between
-flat layers the vertex-face contacts hold the edges apart, and
-only ridges, such as creases, bring edges that near; 1 also
-covers edges of layers whose vertex-face contacts barely hold
-them, at a few percent more contacts.</p></li>
+distance of its particles’ nearest triangles, so that it adds
+rows where the vertex-face contacts do not hold the edges
+apart, as at creases. Every edge pair of two flat layers lies
+exactly as near as its particles’ triangles, so a ratio of 1
+or more takes all of them, more than the vertex-face contacts
+of the layers; below 1, as the default 0.9, the vertex-face
+contacts alone hold flat layers apart. Folded cloth whose
+layers press on each other takes 1, which also covers edges
+that the vertex-face contacts barely hold, at a few percent
+more contacts where the layers are not flat.</p></li>
 <li><p><strong>particle_self_contact_margin</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a>) – Self-contact distance [m]: the
 distance at which a particle and a triangle or particle stop.</p></li>
 <li><p><strong>particle_self_contact_gap</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a><em> | </em><em>None</em>) – Additional detection distance [m]: self
@@ -1376,12 +1482,41 @@ apart, and of one group its margin from
 where it is 0 or without it. Needs
 <code class="docutils literal notranslate"><span class="pre">particle_enable_self_contact=True</span></code> with
 <code class="docutils literal notranslate"><span class="pre">particle_self_contact_mode=&quot;vertex_face&quot;</span></code>;
-not supported with <code class="docutils literal notranslate"><span class="pre">particle_self_contact_edge_edge</span></code> or
-<code class="docutils literal notranslate"><span class="pre">friction_anchors</span></code>.</p></li>
+not supported with <code class="docutils literal notranslate"><span class="pre">particle_self_contact_edge_edge</span></code>, nor
+with per-world margins of <a class="reference internal" href="#newton.solvers.SolverFBA.set_particle_self_contact" title="newton.solvers.SolverFBA.set_particle_self_contact"><code class="xref py py-meth docutils literal notranslate"><span class="pre">set_particle_self_contact()</span></code></a>.</p></li>
 <li><p><strong>particle_self_contact_group_margins</strong> (<em>ArrayLike</em><em> | </em><em>None</em>) – Self-contact margin [m]
 within each group of <code class="docutils literal notranslate"><span class="pre">particle_self_contact_group_ids</span></code>; 0
 lets the particles of a group pass through its triangles, and
 <code class="docutils literal notranslate"><span class="pre">None</span></code> those of every group.</p></li>
+<li><p><strong>rod_contact</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><em>bool</em></a>) – If <code class="docutils literal notranslate"><span class="pre">True</span></code>, the model’s springs, such as the
+segments of particle rods (see <a class="reference internal" href="#newton.solvers.SolverFBA.add_particle_rod" title="newton.solvers.SolverFBA.add_particle_rod"><code class="xref py py-meth docutils literal notranslate"><span class="pre">add_particle_rod()</span></code></a>),
+collide with each other as capsules around them, whose radius
+runs between their particles’ radii: a particle and a segment,
+or two segments where their closest points lie inside both,
+keep the sum of their radii apart, through contacts found once
+per step on its start positions and solved with the other
+contacts. Particles within as many segments of each other along
+the springs as the largest sum of two radii plus the gap spans
+at the shortest spring never collide, so that a straight rod
+does not touch itself. Needs <code class="docutils literal notranslate"><span class="pre">friction=True</span></code>; friction takes
+<code class="docutils literal notranslate"><span class="pre">model.particle_mu</span></code>.</p></li>
+<li><p><strong>rod_contact_gap</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a><em> | </em><em>None</em>) – Additional detection distance [m] of the rod
+contacts beyond the capsules’ surfaces, which bounds the
+relative motion of two segments per step that cannot pass a
+contact. <code class="docutils literal notranslate"><span class="pre">None</span></code> takes the largest particle radius.</p></li>
+<li><p><strong>rod_shape_contacts</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><em>bool</em></a>) – If <code class="docutils literal notranslate"><span class="pre">True</span></code>, the springs, such as the
+segments of particle rods, also collide with shapes as capsules
+whose radius runs between their particles’ radii: a segment
+takes a contact at its deepest point inside a shape when that
+point lies strictly between its particles and deeper than both,
+a row on its two particles with that point’s weights, as a face
+contact is on a triangle’s. A thin shape then cannot pass
+between two particles of a rod, and a rod slides over a curve
+without catching on its particles. Needs friction and the full
+operator.</p></li>
+<li><p><strong>rod_shape_contact_gap</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a><em> | </em><em>None</em>) – Detection distance [m] of the segment
+contacts beyond the capsules’ surfaces and the shape margins.
+<code class="docutils literal notranslate"><span class="pre">None</span></code> takes the largest particle radius of the springs.</p></li>
 <li><p><strong>rayleigh_alpha</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a><em> | </em><em>ArrayLike</em>) – Mass-proportional Rayleigh damping coefficient
 [1/s]: a particle of mass <code class="docutils literal notranslate"><span class="pre">m</span></code> moving at <code class="docutils literal notranslate"><span class="pre">v</span></code> feels the force
 <code class="docutils literal notranslate"><span class="pre">-alpha</span> <span class="pre">m</span> <span class="pre">v</span></code>. A scalar for every particle, or one value per
@@ -1405,9 +1540,13 @@ place of the rate of their deformation gradient, so that
 bulge flattens as fast as without damping, while stretch
 waves stay damped. The system matrix is unchanged; each
 iteration’s right-hand side turns the triangle’s stretch at
-the step’s start with its current rotation. Bending and
-tetrahedra keep the constant damping. Needs
-<code class="docutils literal notranslate"><span class="pre">stretching_model=&quot;arap&quot;</span></code> and a nonzero <code class="docutils literal notranslate"><span class="pre">rayleigh_beta</span></code>.</p></li>
+the step’s start with its current rotation. Springs, in the
+same way, damp their length rate alone, with <code class="docutils literal notranslate"><span class="pre">beta</span></code> times
+their stiffness, in their local steps, and leave the system
+matrix’s damping: a swinging chain of springs swings on,
+while its stretch waves die out. Bending and tetrahedra keep
+the constant damping. Needs <code class="docutils literal notranslate"><span class="pre">stretching_model=&quot;arap&quot;</span></code> and a
+nonzero <code class="docutils literal notranslate"><span class="pre">rayleigh_beta</span></code>.</p></li>
 <li><p><strong>tet_activation_directions</strong> (<em>ArrayLike</em><em> | </em><em>None</em>) – Direction of each tetrahedron’s growth
 in the rest frame, shape <code class="docutils literal notranslate"><span class="pre">(tet_count,</span> <span class="pre">3)</span></code>: an activation
 <code class="docutils literal notranslate"><span class="pre">a</span></code> stretches it by <code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">-</span> <span class="pre">a</span></code> along its direction alone,
@@ -1417,14 +1556,72 @@ or <code class="docutils literal notranslate"><span class="pre">None</span></cod
 <li><p><strong>contact_warmstart</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><em>bool</em></a>) – If <code class="docutils literal notranslate"><span class="pre">True</span></code>, each step’s contact NSN starts
 from the multipliers that the previous step ended with on the
 same rows rather than from zero: particle contacts matched by
-particle and shape, rigid contacts by shape pair and rank,
-joint rows by index, and the particle constraint rows while
-their world’s rows stay unchanged, with friction forces
+particle and shape, rigid contacts by shape pair and nearest
+anchors, joint rows by index, and the particle constraint rows
+while their world’s rows stay unchanged, with friction forces
 re-expressed in the new tangents. A resting or held object then starts each step
 at the contact forces that carry it, which a few iterations
 cannot build up from zero. Face and self contacts start from
 zero. Needs <code class="docutils literal notranslate"><span class="pre">friction=True</span></code> and <code class="docutils literal notranslate"><span class="pre">nsn_schur_mode=&quot;full&quot;</span></code>.</p></li>
+<li><p><strong>rigid_contact_bin</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a>) – If positive [m], keep only the deepest of the
+rigid contacts of a body pair in each cell of this size around
+the first body, per normal direction (26 directions), before
+they enter the solve: a pair of finely decomposed meshes emits
+thousands of contacts whose rows all couple through the two
+bodies. <code class="docutils literal notranslate"><span class="pre">0</span></code> keeps them all.</p></li>
+<li><p><strong>rigid_contact_friction</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.15)"><em>str</em></a>) – The friction coefficient of a rigid contact
+from its two shapes’ <code class="docutils literal notranslate"><span class="pre">shape_material_mu</span></code>: <code class="docutils literal notranslate"><span class="pre">&quot;mean&quot;</span></code>, their
+mean, or <code class="docutils literal notranslate"><span class="pre">&quot;max&quot;</span></code>, the larger, as MuJoCo combines them.</p></li>
+<li><p><strong>rigid_iteration_graph</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><em>bool</em></a>) – If <code class="docutils literal notranslate"><span class="pre">True</span></code>, a step whose rigid rows are
+built anew, such as one with particle rows on bodies, captures
+its first rigid local-global iteration, the contact NSN step
+included, in a CUDA graph and replays it at its other
+iterations, bit for bit the eager result, with fewer host
+launches. Steps whose rigid rows keep their padded storage
+replay the NSN step’s own graph across steps instead. Needs
+CUDA, <code class="docutils literal notranslate"><span class="pre">nsn_sparse_storage</span></code> and <code class="docutils literal notranslate"><span class="pre">nsn_linear_iterations</span></code> up
+to the linear solver’s check interval.</p></li>
+<li><p><strong>rigid_contact_time</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a>) – With a positive time constant <code class="docutils literal notranslate"><span class="pre">tau</span></code> [s],
+the normal rows of rigid contacts are soft: a spring and a
+damper in parallel (Kelvin-Voigt), of stiffness
+<code class="docutils literal notranslate"><span class="pre">m</span> <span class="pre">/</span> <span class="pre">tau²</span></code> and damping ratio <code class="docutils literal notranslate"><span class="pre">rigid_contact_damping</span></code> for
+the row’s effective mass <code class="docutils literal notranslate"><span class="pre">m</span></code>, that act while the row holds
+a force, so that a contact sinks <code class="docutils literal notranslate"><span class="pre">F</span> <span class="pre">tau²</span> <span class="pre">/</span> <span class="pre">m</span></code> under the
+force <code class="docutils literal notranslate"><span class="pre">F</span></code> and an impact spreads over a few steps instead of
+one. Their backward Euler step is the complementarity
+<code class="docutils literal notranslate"><span class="pre">0</span> <span class="pre">&lt;=</span> <span class="pre">lambda</span> <span class="pre">_|_</span> <span class="pre">g</span> <span class="pre">+</span> <span class="pre">eps</span> <span class="pre">b</span> <span class="pre">-</span> <span class="pre">beta</span> <span class="pre">g_start</span> <span class="pre">&gt;=</span> <span class="pre">0</span></code>, <code class="docutils literal notranslate"><span class="pre">b</span></code> the
+row’s force times <code class="docutils literal notranslate"><span class="pre">W_ii</span></code>, <code class="docutils literal notranslate"><span class="pre">g_start</span></code> its gap at the step
+start, <code class="docutils literal notranslate"><span class="pre">x</span> <span class="pre">=</span> <span class="pre">dt</span> <span class="pre">/</span> <span class="pre">tau</span></code>, <code class="docutils literal notranslate"><span class="pre">eps</span> <span class="pre">=</span> <span class="pre">1</span> <span class="pre">/</span> <span class="pre">(x²</span> <span class="pre">+</span> <span class="pre">2</span> <span class="pre">zeta</span> <span class="pre">x)</span></code> and
+<code class="docutils literal notranslate"><span class="pre">beta</span> <span class="pre">=</span> <span class="pre">2</span> <span class="pre">zeta</span> <span class="pre">/</span> <span class="pre">(x</span> <span class="pre">+</span> <span class="pre">2</span> <span class="pre">zeta)</span></code>. <code class="docutils literal notranslate"><span class="pre">0</span></code> keeps rigid contacts
+hard. The start gap counts only in penetration (above zero it
+is taken as zero), so that contacts reported before the bodies
+touch, within their detection gap, do not brake them. Particle
+contacts and tendon rows are not softened by it; tendons take
+the compliance and damping of their spans.</p></li>
+<li><p><strong>rigid_contact_damping</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a>) – The damping ratio <code class="docutils literal notranslate"><span class="pre">zeta</span></code> of soft rigid
+contacts (<code class="docutils literal notranslate"><span class="pre">1</span></code>, critical: no bounce).</p></li>
 </ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="newton.solvers.SolverFBA.dropped_contacts">
+<span class="sig-name descname"><span class="pre">dropped_contacts</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#newton.solvers.SolverFBA.dropped_contacts" title="Link to this definition">#</a></dt>
+<dd><p>The most contacts that a step recorded into a CUDA graph dropped since the last call, 0 for none, with a
+warning when there were any.</p>
+<p>A step recorded into a graph takes every slot of the contact buffers and reads nothing back, so it drops
+silently the contacts that a pipeline whose buffers fill finds past them, the soft contacts past the most that
+a full-operator step takes, and the rigid contacts past the most whose rows’ entries of <code class="docutils literal notranslate"><span class="pre">W</span></code> its storage
+holds; each recorded step keeps on the device the most of each, which this method reads, waiting for the
+device, and clears. Call it outside the graph, such as once per frame. A step outside a graph warns at once
+about the contacts it drops.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>The most contacts dropped in one step.</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)">int</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1434,9 +1631,16 @@ zero. Needs <code class="docutils literal notranslate"><span class="pre">frictio
 <span class="sig-name descname"><span class="pre">notify_model_changed</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">flags</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#newton.solvers.SolverFBA.notify_model_changed" title="Link to this definition">#</a></dt>
 <dd><p>Rebuild and factor the system matrices at the next step.</p>
 <p><code class="docutils literal notranslate"><span class="pre">ModelFlags.SHAPE_PROPERTIES</span></code> stands for changes of the particles and elements, whose masses,
-materials and rest shapes the factored system matrix holds; Newton has no flag of its own for them.
-<code class="docutils literal notranslate"><span class="pre">BODY_PROPERTIES</span></code>, <code class="docutils literal notranslate"><span class="pre">BODY_INERTIAL_PROPERTIES</span></code> and <code class="docutils literal notranslate"><span class="pre">JOINT_PROPERTIES</span></code> rebuild the system of the
-integrated bodies and their joint rows.</p>
+materials and rest shapes the factored system matrix holds; Newton has no flag of its own for them. The
+solver factors the matrix again only when those arrays changed, so that edits of shapes alone, such as of
+their friction, keep the factor and the solver’s warm start; edits of <code class="docutils literal notranslate"><span class="pre">edge_rest_angle</span></code> alone refresh the
+bending targets.
+<code class="docutils literal notranslate"><span class="pre">BODY_INERTIAL_PROPERTIES</span></code>, <code class="docutils literal notranslate"><span class="pre">JOINT_PROPERTIES</span></code>, <code class="docutils literal notranslate"><span class="pre">JOINT_DOF_PROPERTIES</span></code> and
+<code class="docutils literal notranslate"><span class="pre">JOINT_DOF_FORCE_PROPERTIES</span></code> (joint damping and limits) rebuild the system of the integrated bodies and their
+joint rows, and so does <code class="docutils literal notranslate"><span class="pre">BODY_PROPERTIES</span></code> when it changes which bodies are dynamic; body poses and
+velocities are read at every step. <code class="docutils literal notranslate"><span class="pre">TENDON_PROPERTIES</span></code> refreshes the tendons’ compliance, damping and FBA
+attributes; their rest lengths take effect at the next <a class="reference internal" href="#newton.solvers.SolverFBA.reset" title="newton.solvers.SolverFBA.reset"><code class="xref py py-meth docutils literal notranslate"><span class="pre">reset()</span></code></a>. <code class="docutils literal notranslate"><span class="pre">CONSTRAINT_PROPERTIES</span></code> takes the
+particle-body attachments’ stiffness, damping and enabled flags.</p>
 <dl class="field-list simple">
 </dl>
 </dd></dl>
@@ -1446,8 +1650,8 @@ integrated bodies and their joint rows.</p>
 <span class="sig-name descname"><span class="pre">reset</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">state</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">world_mask</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">flags</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#newton.solvers.SolverFBA.reset" title="Link to this definition">#</a></dt>
 <dd><p>Restore selected body and particle state and clear the selected worlds’ solver history.</p>
 <p>Requested fields are copied from the model defaults. Missing State arrays are skipped.
-With <code class="docutils literal notranslate"><span class="pre">flags=0</span></code>, the supplied physical state is preserved; friction anchors and warm-start
-multipliers are cleared regardless of flags. Bodies are left untouched when
+With <code class="docutils literal notranslate"><span class="pre">flags=0</span></code>, the supplied physical state is preserved; friction anchors, warm-start
+multipliers and the springs’ ADMM duals are cleared regardless of flags. Bodies are left untouched when
 <code class="docutils literal notranslate"><span class="pre">integrate_with_external_rigid_solver=True</span></code>.</p>
 <p>FBA uses maximal body coordinates, so <code class="docutils literal notranslate"><span class="pre">JOINT_Q</span></code> and <code class="docutils literal notranslate"><span class="pre">JOINT_QD</span></code> are ignored. To reset
 from joint coordinates, run <a class="reference internal" href="newton.eval_fk.html#newton.eval_fk" title="newton.eval_fk"><code class="xref py py-func docutils literal notranslate"><span class="pre">eval_fk()</span></code></a> after reset. Force flags are also ignored;
@@ -1484,7 +1688,7 @@ fingers instead of being pulled back to where it lay.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="newton.solvers.SolverFBA.set_particle_constraints">
-<span class="sig-name descname"><span class="pre">set_particle_constraints</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">particles</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">coefficients</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">targets</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">directions</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">exact</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#newton.solvers.SolverFBA.set_particle_constraints" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">set_particle_constraints</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">particles</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">coefficients</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">targets</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">directions</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">exact</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bodies</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">body_points</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#newton.solvers.SolverFBA.set_particle_constraints" title="Link to this definition">#</a></dt>
 <dd><p>Hold lengths or linear combinations of particle positions in the following steps.</p>
 <p>Row <code class="docutils literal notranslate"><span class="pre">r</span></code> combines <code class="docutils literal notranslate"><span class="pre">v_r</span> <span class="pre">=</span> <span class="pre">sum_k</span> <span class="pre">coefficients[r,</span> <span class="pre">k]</span> <span class="pre">*</span> <span class="pre">x[particles[r,</span> <span class="pre">k]]</span></code>. Without <code class="docutils literal notranslate"><span class="pre">directions</span></code>
 it holds the length <code class="docutils literal notranslate"><span class="pre">|v_r|</span> <span class="pre">==</span> <span class="pre">targets[r]</span></code>; with them, <code class="docutils literal notranslate"><span class="pre">dot(directions[r],</span> <span class="pre">v_r)</span> <span class="pre">==</span> <span class="pre">targets[r]</span></code>.
@@ -1492,7 +1696,8 @@ The rows are bilateral and solved with the contacts in each NSN step, so their m
 the forces that hold them. A length row acts along the direction of <code class="docutils literal notranslate"><span class="pre">v_r</span></code> at every iteration, so
 at tension <code class="docutils literal notranslate"><span class="pre">T</span></code> it keeps the transverse stiffness <code class="docutils literal notranslate"><span class="pre">T</span> <span class="pre">/</span> <span class="pre">|v_r|</span></code> of a taut segment; a direction
 fixed for the step drops it, and a body that chained rows compress beyond its buckling load then
-flutters. Unused slots have particle <code class="docutils literal notranslate"><span class="pre">-1</span></code>; slot 0 must be used. <code class="docutils literal notranslate"><span class="pre">None</span></code> removes the rows.</p>
+flutters. Unused slots have particle <code class="docutils literal notranslate"><span class="pre">-1</span></code>; slot 0 must be used. <code class="docutils literal notranslate"><span class="pre">None</span></code> removes the rows. The rows of the
+model’s particle-body attachments follow these rows and stay.</p>
 <p>With <code class="docutils literal notranslate"><span class="pre">nsn_schur_mode=&quot;lite&quot;</span></code> every row needs a direction and one particle. Three rows along
 independent directions hold a particle at a point, and its contacts then carry no force. These rows
 take their Newton step after the correction of the other rows, with the Cholesky factor of their own
@@ -1500,17 +1705,28 @@ Delassus matrix <code class="docutils literal notranslate"><span class="pre">J</
 iteration; at most 64 of them in each world. Other rows are solved with the particle’s contacts, which see its mass
 alone, <code class="docutils literal notranslate"><span class="pre">dt^2</span> <span class="pre">/</span> <span class="pre">m</span></code> in place of its block of <code class="docutils literal notranslate"><span class="pre">A^-1</span></code>, and lag their targets by the share of the stiffness
 in that block.</p>
+<p>A call with the rows in place, the same particles, coefficients, directions and bodies, writes the new
+targets into them alone, which keeps the rows’ <code class="docutils literal notranslate"><span class="pre">W</span></code> and their warm start; with <code class="docutils literal notranslate"><span class="pre">targets</span></code> a
+<a class="reference external" href="https://nvidia.github.io/warp/stable/api_reference/_generated/warp.array.html#warp.array" title="(in Warp v1.19.0)"><code class="xref py py-class docutils literal notranslate"><span class="pre">warp.array</span></code></a> on the solver’s device it does so by a launch, which a CUDA graph capture records.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>particles</strong> – Particle indices, shape <code class="docutils literal notranslate"><span class="pre">(R,</span> <span class="pre">K)</span></code>.</p></li>
 <li><p><strong>coefficients</strong> – Their coefficients, shape <code class="docutils literal notranslate"><span class="pre">(R,</span> <span class="pre">K)</span></code>.</p></li>
-<li><p><strong>targets</strong> – Row values [m], shape <code class="docutils literal notranslate"><span class="pre">(R,)</span></code>.</p></li>
+<li><p><strong>targets</strong> – Row values [m], shape <code class="docutils literal notranslate"><span class="pre">(R,)</span></code>, also a <a class="reference external" href="https://nvidia.github.io/warp/stable/api_reference/_generated/warp.array.html#warp.array" title="(in Warp v1.19.0)"><code class="xref py py-class docutils literal notranslate"><span class="pre">warp.array</span></code></a>.</p></li>
 <li><p><strong>directions</strong> – Row directions, shape <code class="docutils literal notranslate"><span class="pre">(R,</span> <span class="pre">3)</span></code>, or <code class="docutils literal notranslate"><span class="pre">None</span></code> for length rows.</p></li>
 <li><p><strong>exact</strong> – With <code class="docutils literal notranslate"><span class="pre">nsn_schur_mode=&quot;lite&quot;</span></code>, give every row the exact step of the rows that hold particles at
 points, also rows that hold a particle along one or two directions, whose contacts keep their
 forces: such rows then reach their targets in every iteration too. At most 64 rows per world. The full NSN
 solves every row with <code class="docutils literal notranslate"><span class="pre">A</span></code> already.</p></li>
+<li><p><strong>bodies</strong> – Body of each row, shape <code class="docutils literal notranslate"><span class="pre">(R,)</span></code>, <code class="docutils literal notranslate"><span class="pre">-1</span></code> for a row on particles alone. A row on body <code class="docutils literal notranslate"><span class="pre">b</span></code> holds
+<code class="docutils literal notranslate"><span class="pre">dot(d_r,</span> <span class="pre">v_r)</span> <span class="pre">-</span> <span class="pre">dot(d_r,</span> <span class="pre">X_b</span> <span class="pre">p_r)</span> <span class="pre">==</span> <span class="pre">targets[r]</span></code>, with <code class="docutils literal notranslate"><span class="pre">X_b</span></code> the body’s pose and <code class="docutils literal notranslate"><span class="pre">p_r</span></code> its
+point <code class="docutils literal notranslate"><span class="pre">body_points[r]</span></code> in the body frame: three rows along independent directions on one particle
+and target 0 tie the particle to that point of the body, as a rope tied to a rigid part. The rows are
+solved with the body’s rows, so the body takes their forces. The body must be one that SolverFBA
+integrates (dynamic, not left to an external rigid solver); the rows need <code class="docutils literal notranslate"><span class="pre">directions</span></code>, the full
+NSN and one world.</p></li>
+<li><p><strong>body_points</strong> – The rows’ points in their bodies’ frames [m], shape <code class="docutils literal notranslate"><span class="pre">(R,</span> <span class="pre">3)</span></code>.</p></li>
 </ul>
 </dd>
 </dl>
@@ -1520,9 +1736,12 @@ solves every row with <code class="docutils literal notranslate"><span class="pr
 <dt class="sig sig-object py" id="newton.solvers.SolverFBA.set_particle_self_contact">
 <span class="sig-name descname"><span class="pre">set_particle_self_contact</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">margin</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gap</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#newton.solvers.SolverFBA.set_particle_self_contact" title="Link to this definition">#</a></dt>
 <dd><p>Change the self-contact distance and detection gap for the following steps.</p>
-<p>A cloth dropped onto a surface needs a margin and gap that its layers cannot pass in one step; once it lies
-still, a thinner margin lets folded layers stack closer. Thinner than half the longest edge, vertex-face
-contacts need <code class="docutils literal notranslate"><span class="pre">particle_self_contact_edge_edge=True</span></code> to keep crossing edges apart.</p>
+<p>The margin is a contact thickness of the solver rather than of the material. A cloth dropped onto a surface
+needs a margin and gap that its layers cannot pass in one step, since the contacts are found once per step at
+its start, and, with <code class="docutils literal notranslate"><span class="pre">nsn_schur_mode=&quot;lite&quot;</span></code>, a margin deeper than the impact presses its contacts in; once
+it lies still, a thinner margin lets folded layers stack closer. Thinned over a second or so rather than at
+once, the margin lets the stacked layers settle instead of dropping together. Thinner than half the longest
+edge, vertex-face contacts need <code class="docutils literal notranslate"><span class="pre">particle_self_contact_edge_edge=True</span></code> to keep crossing edges apart.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1540,16 +1759,18 @@ for either parameter. Neither parameter is restored by <a class="reference inter
 <dl class="py method">
 <dt class="sig sig-object py" id="newton.solvers.SolverFBA.set_pin_targets">
 <span class="sig-name descname"><span class="pre">set_pin_targets</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">target_positions</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#newton.solvers.SolverFBA.set_pin_targets" title="Link to this definition">#</a></dt>
-<dd><p>Update reference positions for pinned particles (dynamic pin).</p>
-<p>For pinned particles (<code class="docutils literal notranslate"><span class="pre">inv_mass</span> <span class="pre">==</span> <span class="pre">0</span></code>), the soft Pin energy pulls them
-toward <code class="docutils literal notranslate"><span class="pre">target_positions[i]</span></code>; they start at their model positions.
-Inactive particles with mass hold where the input state has them
-instead. For free particles the value is unused but the array must
-cover all particles.</p>
+<dd><p>Set the targets of the pinned particles (<code class="docutils literal notranslate"><span class="pre">particle_inv_mass</span> <span class="pre">==</span> <span class="pre">0</span></code>) for the following steps.</p>
+<p>Until it is called, a pinned particle holds where the input state of each step has it, as Newton’s other
+solvers hold the particles they do not move, so writing <code class="docutils literal notranslate"><span class="pre">state.particle_q</span></code> moves it. Afterwards the pin
+energy pulls it to <code class="docutils literal notranslate"><span class="pre">target_positions[i]</span></code> within each step, which it ends at, and its velocity is its
+motion over the step; the targets persist across <a class="reference internal" href="#newton.solvers.SolverFBA.reset" title="newton.solvers.SolverFBA.reset"><code class="xref py py-meth docutils literal notranslate"><span class="pre">reset()</span></code></a>. Inactive particles with mass always hold
+where the input state has them. For free particles the value is unused but the array must cover all
+particles.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>target_positions</strong> (<a class="reference external" href="https://nvidia.github.io/warp/stable/api_reference/_generated/warp.array.html#warp.array" title="(in Warp v1.19.0)"><em>array</em></a><em> | </em><a class="reference external" href="https://numpy.org/doc/stable/reference/generated/numpy.ndarray.html#numpy.ndarray" title="(in NumPy v2.5)"><em>ndarray</em></a>) – Target positions [m], shape <code class="docutils literal notranslate"><span class="pre">[particle_count,</span> <span class="pre">3]</span></code>:
-a <a class="reference external" href="https://nvidia.github.io/warp/stable/api_reference/_generated/warp.array.html#warp.array" title="(in Warp v1.19.0)"><code class="xref py py-class docutils literal notranslate"><span class="pre">warp.array</span></code></a> of <code class="docutils literal notranslate"><span class="pre">wp.vec3</span></code> or a NumPy array.</p>
+<dd class="field-odd"><p><strong>target_positions</strong> (<a class="reference external" href="https://nvidia.github.io/warp/stable/api_reference/_generated/warp.array.html#warp.array" title="(in Warp v1.19.0)"><em>array</em></a><em> | </em><a class="reference external" href="https://numpy.org/doc/stable/reference/generated/numpy.ndarray.html#numpy.ndarray" title="(in NumPy v2.5)"><em>ndarray</em></a><em> | </em><em>None</em>) – Target positions [m], shape <code class="docutils literal notranslate"><span class="pre">[particle_count,</span> <span class="pre">3]</span></code>:
+a <a class="reference external" href="https://nvidia.github.io/warp/stable/api_reference/_generated/warp.array.html#warp.array" title="(in Warp v1.19.0)"><code class="xref py py-class docutils literal notranslate"><span class="pre">warp.array</span></code></a> of <code class="docutils literal notranslate"><span class="pre">wp.vec3</span></code> or a NumPy array, or <code class="docutils literal notranslate"><span class="pre">None</span></code> to have the pinned particles
+follow the input states again.</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1566,15 +1787,16 @@ velocities are read; <code class="docutils literal notranslate"><span class="pre
 external forces [N] and torques [N·m].</p></li>
 <li><p><strong>state_out</strong> (<a class="reference internal" href="newton.State.html#newton.State" title="newton.State"><em>newton.State</em></a>) – Output simulation state. Particle positions and
 velocities are written, and those of the bodies unless another
-solver integrates them; other fields are untouched.</p></li>
+solver integrates them; other fields are untouched. It may be
+<code class="docutils literal notranslate"><span class="pre">state_in</span></code> itself.</p></li>
 <li><p><strong>control</strong> (<a class="reference internal" href="newton.Control.html#newton.Control" title="newton._src.sim.control.Control"><em>Control</em></a><em> | </em><em>None</em>) – The step’s <code class="docutils literal notranslate"><span class="pre">tet_activations</span></code>, which grow or shrink the
-tetrahedra (see the class notes), or <code class="docutils literal notranslate"><span class="pre">None</span></code> to step without
-activations.</p></li>
+tetrahedra (see the class notes), or <code class="docutils literal notranslate"><span class="pre">None</span></code> for the model’s
+(<a class="reference internal" href="newton.Model.html#newton.Model.control" title="newton.Model.control"><code class="xref py py-meth docutils literal notranslate"><span class="pre">control()</span></code></a>).</p></li>
 <li><p><strong>contacts</strong> (<a class="reference internal" href="newton.Contacts.html#newton.Contacts" title="newton._src.sim.contacts.Contacts"><em>Contacts</em></a><em> | </em><em>None</em>) – The step’s contacts, detected on <code class="docutils literal notranslate"><span class="pre">state_in</span></code>, or <code class="docutils literal notranslate"><span class="pre">None</span></code>
 to step without them. With self contact on, the step still
 finds its self contacts.</p></li>
-<li><p><strong>dt</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a>) – Time step [s]. The first step and a change of <code class="docutils literal notranslate"><span class="pre">dt</span></code> factor the
-system again.</p></li>
+<li><p><strong>dt</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a>) – Time step [s], finite and positive. The first step and a change
+of <code class="docutils literal notranslate"><span class="pre">dt</span></code> factor the system again.</p></li>
 <li><p><strong>observables</strong> (<a class="reference internal" href="newton.solvers.SolverBase.html#newton.solvers.SolverBase.Observables" title="newton._src.solvers.solver.SolverBase.Observables"><em>Observables</em></a><em> | </em><em>None</em>) – Optional observables from <code class="xref py py-meth docutils literal notranslate"><span class="pre">observables()</span></code>; see the
 class notes for <a class="reference internal" href="newton.solvers.SolverBase.html#newton.solvers.SolverBase.ObservableKind.CONTACT_F" title="newton.solvers.SolverBase.ObservableKind.CONTACT_F"><code class="xref py py-attr docutils literal notranslate"><span class="pre">CONTACT_F</span></code></a>.</p></li>
 </ul>
@@ -1618,7 +1840,10 @@ Query <code class="xref py py-attr docutils literal notranslate"><span class="pr
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.solvers.SolverFBA"><code class="docutils literal notranslate"><span class="pre">SolverFBA</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.solvers.SolverFBA.register_custom_attributes"><code class="docutils literal notranslate"><span class="pre">register_custom_attributes()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.solvers.SolverFBA.add_particle_rod"><code class="docutils literal notranslate"><span class="pre">add_particle_rod()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.solvers.SolverFBA.__init__"><code class="docutils literal notranslate"><span class="pre">__init__()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.solvers.SolverFBA.dropped_contacts"><code class="docutils literal notranslate"><span class="pre">dropped_contacts()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.solvers.SolverFBA.notify_model_changed"><code class="docutils literal notranslate"><span class="pre">notify_model_changed()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.solvers.SolverFBA.reset"><code class="docutils literal notranslate"><span class="pre">reset()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#newton.solvers.SolverFBA.set_friction_anchor_exclusion"><code class="docutils literal notranslate"><span class="pre">set_friction_anchor_exclusion()</span></code></a></li>

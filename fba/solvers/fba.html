@@ -48,18 +48,11 @@
     <script src="../_static/design-tabs.js?v=f930bc37"></script>
     <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'solvers/fba';</script>
-    <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
-        DOCUMENTATION_OPTIONS.theme_switcher_json_url = 'https://newton-physics.github.io/newton/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'dev';
-        DOCUMENTATION_OPTIONS.show_version_warning_banner =
-            false;
-        </script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <script src="../_static/mermaid-nbsphinx.js?v=613f558e"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="newton" href="../api/newton.html" />
+    <link rel="next" title="APIC Water" href="apic_water.html" />
     <link rel="prev" title="VBD" href="vbd.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
@@ -352,6 +345,13 @@
 <li class=" current active">
   <a class="nav-link dropdown-item nav-internal" href="#" aria-current="page">
     FBA
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="apic_water.html">
+    APIC Water
   </a>
 </li>
 
@@ -768,6 +768,13 @@
 
 
 <li class="nav-item ">
+  <a class="nav-link nav-internal" href="apic_water.html">
+    APIC Water
+  </a>
+</li>
+
+
+<li class="nav-item ">
   <a class="nav-link nav-internal" href="../api/newton.html">
     newton
   </a>
@@ -970,6 +977,7 @@
 <li class="toctree-l1"><a class="reference internal" href="kamino.html">Kamino</a></li>
 <li class="toctree-l1"><a class="reference internal" href="vbd.html">VBD</a></li>
 <li class="toctree-l1 current active"><a aria-current="page" class="current reference internal" href="#">FBA</a></li>
+<li class="toctree-l1"><a class="reference internal" href="apic_water.html">APIC Water</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="nav bd-sidenav">
@@ -1087,9 +1095,10 @@ friction alone.</p></li>
 solve, or rigid bodies come from another solver, such as an arm that
 <a class="reference internal" href="../api/_generated/newton.solvers.SolverFeatherstone.html#newton.solvers.SolverFeatherstone" title="newton.solvers.SolverFeatherstone"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverFeatherstone</span></code></a> integrates.</p></li>
 </ul>
-<p>Choose another solver for differentiable simulation and for articulations that need joint limits, drives, or
-actuators: FBA treats joints as bilateral constraints only, so integrate such
-an articulation with another solver and pass
+<p>Choose another solver for differentiable simulation and for articulations whose drives need velocity limits or
+actuators other than PD drives: FBA treats joints as bilateral constraints, with the limits of revolute and
+prismatic joints, passive damping, PD drives bounded by effort limits, armature and joint friction, so integrate
+such an articulation with another solver and pass
 <code class="docutils literal notranslate"><span class="pre">integrate_with_external_rigid_solver=True</span></code>. See the <a class="reference internal" href="index.html#supported-features"><span class="std std-ref">Supported Features</span></a> matrix and the <a class="reference internal" href="index.html#joint-feature-support"><span class="std std-ref">Joint Feature Support</span></a> tables for a comparison
 with the other solvers. The solver builds on projective dynamics and a
 quadratic bending energy:</p>
@@ -1226,10 +1235,82 @@ particles, the elements and their materials, and the Rayleigh damping
 coefficients; the solver factors it again
 when the time step changes or after
 <a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.notify_model_changed" title="newton.solvers.SolverFBA.notify_model_changed"><code class="xref py py-meth docutils literal notranslate"><span class="pre">notify_model_changed()</span></code></a> with
-<code class="docutils literal notranslate"><span class="pre">SHAPE_PROPERTIES</span></code> or <code class="docutils literal notranslate"><span class="pre">BODY_INERTIAL_PROPERTIES</span></code>, and other changes to
-those arrays take effect only then. A step reads its contacts back to
-the host, so it cannot be captured in a CUDA graph; it captures and replays
-its own local-global iterations. FBA runs on the CPU and on CUDA devices.</p>
+<code class="docutils literal notranslate"><span class="pre">SHAPE_PROPERTIES</span></code> (Newton has no flag of its own for particles and
+elements) when those arrays changed, and other changes to them take effect
+only then. Edits of shapes alone, such as of their friction, keep the factor
+and the contact warm start, and edits of <code class="docutils literal notranslate"><span class="pre">edge_rest_angle</span></code> alone refresh the
+bending targets without factoring. A step records into the caller’s CUDA
+graph (<a class="reference external" href="https://nvidia.github.io/warp/stable/api_reference/_generated/warp.ScopedCapture.html#warp.ScopedCapture" title="(in Warp v1.19.0)"><code class="xref py py-class docutils literal notranslate"><span class="pre">warp.ScopedCapture</span></code></a>), collision included, when it reads
+nothing back to the host and allocates nothing: after a step of the same
+<code class="docutils literal notranslate"><span class="pre">dt</span></code> outside the graph, which sets up the system, a step without contacts,
+also with particle constraint rows after a step with the same rows outside
+the graph, which sets up their <code class="docutils literal notranslate"><span class="pre">W</span></code>, and a step with particle-shape contacts
+with friction in one world, after a step with the same contacts outside the graph, which reserves the
+buffers of their capacity: with the lite operator, or with the full operator
+and a dense <code class="docutils literal notranslate"><span class="pre">W</span></code> (<code class="docutils literal notranslate"><span class="pre">nsn_sparse_storage=False</span></code>) and a fixed count of at most
+25 <code class="docutils literal notranslate"><span class="pre">nsn_linear_iterations</span></code>, its face contacts included. Such a step takes
+every slot of the contact buffer as a contact row, those past the stored count
+and the dropped contacts of held particles inert, sorted on the device. With the lite operator
+it gives every particle the per-particle Newton step; a particle with more than
+four contacts keeps its multipliers there. With the full operator the step
+finds its face contacts and the other distance minima of its particles beside
+meshes on the device too, in the order of the steps outside a graph, counts
+its active contacts on the device and takes, by a conditional node of the graph
+(<code class="docutils literal notranslate"><span class="pre">wp.capture_if</span></code>), the smallest of the sizes 64, 96, 128, 192, 256, 384, 512,
+768, 1024 and 1536 contacts, and the most its contacts can reach up to 2048,
+that holds them: it builds the dense <code class="docutils literal notranslate"><span class="pre">W</span></code> of three rows per slot of that size
+on the device, the rows of inert slots those of the identity, and takes its NSN
+steps on them, so that its cost is that of the size rather than of the buffer.
+Steps with deformable contacts on the bodies FBA integrates record so too, in
+one world, with hard rigid contacts (<code class="docutils literal notranslate"><span class="pre">rigid_contact_time=0</span></code>) and neither
+tendons, mimic joints, particle constraint rows, <code class="docutils literal notranslate"><span class="pre">contact_warmstart</span></code> nor
+<code class="docutils literal notranslate"><span class="pre">friction_anchors</span></code>: the rigid contacts follow the deformable ones in the same
+sizes, and the rows of the joints of the articulations that contacts touch,
+selected on the device, follow them. A step drops the active contacts past
+2048, and a full contact buffer the contacts past it, silently, as it reads
+nothing back: <a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.dropped_contacts" title="newton.solvers.SolverFBA.dropped_contacts"><code class="xref py py-meth docutils literal notranslate"><span class="pre">dropped_contacts()</span></code></a>, called
+outside the graph, reports the most contacts a recorded step dropped since its
+last call. Rigid contacts record too, after a step with the same contacts
+outside the graph, in a model without particles, in one world, with
+<code class="docutils literal notranslate"><span class="pre">nsn_sparse_storage</span></code>, a fixed count of at most 25 <code class="docutils literal notranslate"><span class="pre">nsn_linear_iterations</span></code>,
+and neither tendons nor mimic joints: every slot of the rigid contact buffer
+becomes a contact’s three rows, those past the step’s contacts inert, the joint
+rows of the articulations that contacts touch are selected on the device, and
+the pattern of <code class="docutils literal notranslate"><span class="pre">W</span></code> takes a storage of 32 blocks per slot beside those of the
+joint rows, so that the recorded steps match those outside a graph bit for bit,
+<code class="docutils literal notranslate"><span class="pre">contact_warmstart</span></code> and <code class="docutils literal notranslate"><span class="pre">rigid_contact_bin</span></code> included. Their cost grows with
+the buffer rather than with the contacts: with a <code class="docutils literal notranslate"><span class="pre">rigid_contact_max</span></code> far
+above the contacts that the steps find, recorded steps run slower than steps
+outside a graph. A step whose pattern outgrows its storage drops its last
+contacts, which <code class="docutils literal notranslate"><span class="pre">dropped_contacts</span></code> reports. Steps that are GPU-bound gain
+little from a graph, which saves host work, while the inert rows of a size add
+work on the device. Self and rod contacts, the contacts of rod segments with
+shapes, particle constraint rows with contacts, particle-body attachments,
+several worlds, model tendons, and with particle contacts
+<code class="docutils literal notranslate"><span class="pre">contact_warmstart</span></code>, <code class="docutils literal notranslate"><span class="pre">friction_anchors</span></code>, <code class="docutils literal notranslate"><span class="pre">nsn_lite_accumulate</span></code> and the
+full operator with <code class="docutils literal notranslate"><span class="pre">nsn_sparse_storage</span></code> keep a step out of graphs: during a
+capture it then raises <code class="docutils literal notranslate"><span class="pre">RuntimeError</span></code>, naming the reason. A graph
+replays the launches of the steps it recorded: settings the solver keeps on
+the host, such as <a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.set_pin_targets" title="newton.solvers.SolverFBA.set_pin_targets"><code class="xref py py-meth docutils literal notranslate"><span class="pre">set_pin_targets()</span></code></a>,
+<a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.set_particle_constraints" title="newton.solvers.SolverFBA.set_particle_constraints"><code class="xref py py-meth docutils literal notranslate"><span class="pre">set_particle_constraints()</span></code></a> and
+<a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.notify_model_changed" title="newton.solvers.SolverFBA.notify_model_changed"><code class="xref py py-meth docutils literal notranslate"><span class="pre">notify_model_changed()</span></code></a>, reach the graphs
+recorded after them; called inside the capture with targets in a
+<a class="reference external" href="https://nvidia.github.io/warp/stable/api_reference/_generated/warp.array.html#warp.array" title="(in Warp v1.19.0)"><code class="xref py py-class docutils literal notranslate"><span class="pre">warp.array</span></code></a> on the solver’s device, <code class="docutils literal notranslate"><span class="pre">set_pin_targets</span></code> and
+<code class="docutils literal notranslate"><span class="pre">set_particle_constraints</span></code> with the rows already set record the copies of
+their targets, so that a graph’s steps follow targets the caller writes to that
+array between its launches. Outside a capture a step captures and replays its own
+local-global iterations. A step recorded into a graph, and the solver’s own
+captures, run with Python’s garbage collector paused, so that no collection
+frees arrays of unreachable reference cycles inside the capture. The solver
+keeps the arrays of a step recorded into a graph while it lives: a later step
+outside the graph that replaces its buffers, such as one of another <code class="docutils literal notranslate"><span class="pre">dt</span></code> or
+with more contacts than the recorded step’s capacity, frees none of them, so
+the graph still replays safely, but it no longer shares the new buffers nor
+the state they carry from step to step; the solver then warns once with
+<a class="reference internal" href="../api/_generated/newton.exceptions.NewtonWarning.html#newton.exceptions.NewtonWarning" title="newton.exceptions.NewtonWarning"><code class="xref py py-class docutils literal notranslate"><span class="pre">NewtonWarning</span></code></a> that the graph should be recorded
+again. FBA runs
+on the CPU and on CUDA devices. A step may write its output into its input
+state.</p>
 </section>
 </section>
 <section id="model-inputs">
@@ -1240,10 +1321,69 @@ its own local-global iterations. FBA runs on the CPU and on CUDA devices.</p>
 <code class="docutils literal notranslate"><span class="pre">&quot;neohookean&quot;</span></code> take the elements’ Lamé parameters; the
 <a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA" title="newton.solvers.SolverFBA"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverFBA</span></code></a> reference states how projective dynamics
 scales them. Interior edges add the isometric bending energy of Bergou et
-al. with <code class="docutils literal notranslate"><span class="pre">edge_ke</span></code> as a bending modulus [N·m] and <code class="docutils literal notranslate"><span class="pre">edge_rest_angle</span></code> as
-the rest angle. The same <code class="docutils literal notranslate"><span class="pre">edge_ke</span></code> bends an FBA cloth more stiffly than a
+al., with <code class="docutils literal notranslate"><span class="pre">edge_rest_angle</span></code> as the rest angle, its sign included: a hinge
+bent to the other side of its rest fold, or flat, bends back toward it. On
+equilateral triangles
+it is the energy of an isotropic plate of bending stiffness
+<code class="docutils literal notranslate"><span class="pre">3</span> <span class="pre">*</span> <span class="pre">edge_ke</span></code> [N·m] and Poisson’s ratio <code class="docutils literal notranslate"><span class="pre">-1/3</span></code>, so a plate of
+stiffness <code class="docutils literal notranslate"><span class="pre">D</span></code> that bends mostly about one axis takes <code class="docutils literal notranslate"><span class="pre">edge_ke</span> <span class="pre">=</span> <span class="pre">D</span> <span class="pre">/</span> <span class="pre">3</span></code>;
+on grids of right triangles, bending about a diagonal axis is stiffer, by
+the factors the <a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA" title="newton.solvers.SolverFBA"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverFBA</span></code></a> reference gives. The
+same <code class="docutils literal notranslate"><span class="pre">edge_ke</span></code> bends an FBA cloth more stiffly than a
 <a class="reference internal" href="../api/_generated/newton.solvers.SolverVBD.html#newton.solvers.SolverVBD" title="newton.solvers.SolverVBD"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverVBD</span></code></a> one, which scales it by the edge length.</p></li>
-<li><p><strong>Soft bodies</strong>: tetrahedra with the same stretching models.</p></li>
+<li><p><strong>Soft bodies</strong>: tetrahedra with the same stretching models.
+<code class="docutils literal notranslate"><span class="pre">&quot;corotational&quot;</span></code> and <code class="docutils literal notranslate"><span class="pre">&quot;neohookean&quot;</span></code> need a stable material, of positive
+bulk modulus (<code class="docutils literal notranslate"><span class="pre">k_lambda</span> <span class="pre">&gt;</span> <span class="pre">-k_mu</span></code> for triangles, <code class="docutils literal notranslate"><span class="pre">k_lambda</span> <span class="pre">&gt;</span> <span class="pre">-2</span> <span class="pre">k_mu</span> <span class="pre">/</span> <span class="pre">3</span></code>
+for tetrahedra); a Poisson’s ratio of 0, <code class="docutils literal notranslate"><span class="pre">k_lambda</span> <span class="pre">=</span> <span class="pre">0</span></code>, is fine.</p></li>
+<li><p><strong>Particles</strong> without elements fall, collide and rest on their own.</p></li>
+<li><p><strong>Springs</strong>: each spring of the model is a stretch element of energy
+<code class="docutils literal notranslate"><span class="pre">spring_stiffness</span> <span class="pre">/</span> <span class="pre">2</span> <span class="pre">(|x_b</span> <span class="pre">-</span> <span class="pre">x_a|</span> <span class="pre">-</span> <span class="pre">spring_rest_length)^2</span></code>. Its local
+step is an ADMM step: a scaled dual, kept from step to step, corrects the
+prox of the energy, so the iterations converge to the implicit Euler step
+of the springs and not to a softened one. The dual keeps its part along
+the spring, a tension, and the prox acts along the spring at its signed
+length with the dual, so a dual that pushes the particles apart harder
+than the penalty times the spring’s length shortens the target instead of
+turning the spring over. The element weighs
+<code class="docutils literal notranslate"><span class="pre">60</span> <span class="pre">m</span> <span class="pre">/</span> <span class="pre">dt^2</span></code> in the system matrix, <code class="docutils literal notranslate"><span class="pre">m</span></code> the mass of its lighter
+particle, which sets how fast the iterations converge, not where: springs
+far softer than it, whose oscillation the step resolves, converge slowly.
+Stiffer springs converge their own stretch at that rate, but a long chain
+of them carries stretch waves that span many particles, and a dual that
+lags its chain’s swing makes a taut rope shake. After the dual steps, each
+chain of springs, a path through particles of two springs, therefore
+solves its tensions with the tridiagonal response of its stretches through
+the particles’ inverse masses, and the compliance that the dual steps
+leave out: a rope of 80 springs between two pins settles at 10 iterations
+as at 100, and one step of a chain of 40 springs a hundred times stiffer
+than their penalty reaches the implicit Euler step in 10 iterations. Where
+a chain meets more springs, the particle’s inverse mass counts once for
+each of them, which keeps the solve below the exact one.
+<code class="docutils literal notranslate"><span class="pre">spring_damping</span></code> and <code class="docutils literal notranslate"><span class="pre">spring_control</span></code> are not read.</p></li>
+<li><p><strong>Particle rods</strong>: <a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.add_particle_rod" title="newton.solvers.SolverFBA.add_particle_rod"><code class="xref py py-meth docutils literal notranslate"><span class="pre">add_particle_rod()</span></code></a>
+lays an elastic rod of circular cross-section along a polyline: a particle
+per vertex, its mass lumped by length and the rod’s radius as its contact
+radius, a spring per segment of stiffness <code class="docutils literal notranslate"><span class="pre">E</span> <span class="pre">pi</span> <span class="pre">r^2</span> <span class="pre">/</span> <span class="pre">l</span></code>, and a bending
+element per interior vertex. A bending element is an entry of the custom
+frequency <code class="docutils literal notranslate"><span class="pre">fba:rod_bend</span></code> (see
+<a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.register_custom_attributes" title="newton.solvers.SolverFBA.register_custom_attributes"><code class="xref py py-meth docutils literal notranslate"><span class="pre">register_custom_attributes()</span></code></a>) of energy
+<code class="docutils literal notranslate"><span class="pre">EI</span> <span class="pre">/</span> <span class="pre">(2</span> <span class="pre">v)</span> <span class="pre">|(x_+</span> <span class="pre">-</span> <span class="pre">x)</span> <span class="pre">/</span> <span class="pre">l_+</span> <span class="pre">-</span> <span class="pre">(x</span> <span class="pre">-</span> <span class="pre">x_-)</span> <span class="pre">/</span> <span class="pre">l_-|^2</span></code>, with <code class="docutils literal notranslate"><span class="pre">l_-</span></code> and
+<code class="docutils literal notranslate"><span class="pre">l_+</span></code> the rest lengths of the vertex’s two segments and
+<code class="docutils literal notranslate"><span class="pre">v</span> <span class="pre">=</span> <span class="pre">(l_-</span> <span class="pre">+</span> <span class="pre">l_+)</span> <span class="pre">/</span> <span class="pre">2</span></code>: <code class="docutils literal notranslate"><span class="pre">EI</span> <span class="pre">/</span> <span class="pre">2</span> <span class="pre">kappa^2</span> <span class="pre">v</span></code> for small turns, straight at
+rest. It adds to the constant system matrix alone, and raises the penalty
+of the rod’s springs by <code class="docutils literal notranslate"><span class="pre">0.1</span> <span class="pre">EI</span> <span class="pre">/</span> <span class="pre">l^3</span></code>. In the matrix it also resists a
+difference of the stretches of its two springs with <code class="docutils literal notranslate"><span class="pre">EI</span> <span class="pre">/</span> <span class="pre">(v</span> <span class="pre">l_-</span> <span class="pre">l_+)</span></code>,
+far more than the penalty of a stiff rod’s short segments, so the tension
+solve of the rod’s springs counts it too: a pin moved through a stiff rod
+drags the rod along within 10 iterations. A 0.3 m rod of radius 5 mm
+clamped at one end sags under its weight to within 0.2% of the
+small-deflection sag of its discrete bending energy at <code class="docutils literal notranslate"><span class="pre">E</span> <span class="pre">=</span> <span class="pre">1e8</span></code> Pa.
+Rods carry no twist, and their contacts with shapes act at their
+particles, so segments longer than about twice the radius can pass thin
+shapes. With <code class="docutils literal notranslate"><span class="pre">rod_contact=True</span></code> the rods collide with each other and
+with themselves as chains of capsules (see below). These rods are
+particles, unlike the rigid capsule chains of
+<a class="reference internal" href="../api/_generated/newton.ModelBuilder.html#newton.ModelBuilder.add_rod" title="newton.ModelBuilder.add_rod"><code class="xref py py-meth docutils literal notranslate"><span class="pre">add_rod()</span></code></a>.</p></li>
 <li><p><strong>Activations</strong>: the control’s <code class="docutils literal notranslate"><span class="pre">tet_activations</span></code> grow each tetrahedron
 to <code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">-</span> <span class="pre">a</span></code> times its rest volume, so a negative activation inflates it
 and a positive one contracts it: isotropically, or along a direction per
@@ -1261,38 +1401,188 @@ matrix. Each coefficient is a scalar or one value per particle. <code class="doc
 measures every change of an element’s deformation gradient, rotations
 included, so <code class="docutils literal notranslate"><span class="pre">beta</span></code> damps the bending of a slender part far more than its
 bending stiffness alone suggests: in <code class="docutils literal notranslate"><span class="pre">softbody_cantilever_fba</span></code>,
-<code class="docutils literal notranslate"><span class="pre">rayleigh_beta=2e-5</span></code> brings a 2.4 m beam to rest within seconds. With
+<code class="docutils literal notranslate"><span class="pre">rayleigh_beta=2e-5</span></code> brings a 2.4 m beam to rest within seconds. A
+spring enters <code class="docutils literal notranslate"><span class="pre">K</span></code> with its stiffness along every direction, so <code class="docutils literal notranslate"><span class="pre">beta</span></code>
+also damps the swinging of a chain of springs. With
 <code class="docutils literal notranslate"><span class="pre">rayleigh_corotated=True</span></code>, <code class="docutils literal notranslate"><span class="pre">beta</span></code> damps the stretch rate of ARAP
-triangles instead and spares their rotation, so a released cloth flap falls
-as fast as without damping.</p></li>
+triangles and the length rate of springs instead and spares their rotation,
+so a released cloth flap falls as fast as without damping and a chain of
+springs swings on while its stretch waves die out.</p></li>
 <li><p><strong>Pins</strong>: particles with zero inverse mass follow their pin targets through
-a stiff spring of <code class="docutils literal notranslate"><span class="pre">pin_stiffness</span></code> [N/m]. The targets start at the model
-positions and move with <a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.set_pin_targets" title="newton.solvers.SolverFBA.set_pin_targets"><code class="xref py py-meth docutils literal notranslate"><span class="pre">set_pin_targets()</span></code></a>.
-Particles without the <code class="docutils literal notranslate"><span class="pre">ACTIVE</span></code> flag that have a mass hold where the input
-state has them.</p></li>
+a stiff spring of <code class="docutils literal notranslate"><span class="pre">pin_stiffness</span></code> [N/m] and end each step at them, with
+their motion over the step as their velocity. The targets are where the
+input state has the particles, as the other solvers hold the particles they
+do not move, so writing <code class="docutils literal notranslate"><span class="pre">state.particle_q</span></code> moves them, until
+<a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.set_pin_targets" title="newton.solvers.SolverFBA.set_pin_targets"><code class="xref py py-meth docutils literal notranslate"><span class="pre">set_pin_targets()</span></code></a> sets them. Particles
+without the <code class="docutils literal notranslate"><span class="pre">ACTIVE</span></code> flag that have a mass hold where the input state has
+them. Contacts on held particles alone, such as a pinned particle’s contact
+with a static shape, are dropped: they cannot move the particles, and
+pressing on a pin would only move it off its target. Those with the shapes
+of the bodies the solver integrates stay and push the bodies, so a free
+body rests on a pinned cloth.</p></li>
 <li><p><strong>Particle constraints</strong>:
 <a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.set_particle_constraints" title="newton.solvers.SolverFBA.set_particle_constraints"><code class="xref py py-meth docutils literal notranslate"><span class="pre">set_particle_constraints()</span></code></a> holds lengths or
 linear combinations of particle positions at targets, solved with the
 contacts. With the lite operator, the rows that hold particles at points,
 or all rows with <code class="docutils literal notranslate"><span class="pre">exact=True</span></code>, take one exact Newton step of their own.
 The <code class="docutils literal notranslate"><span class="pre">cable_gripper_fba</span></code> example builds the rows of cables through
-tetrahedral bodies.</p></li>
+tetrahedral bodies. With <code class="docutils literal notranslate"><span class="pre">bodies</span></code> and <code class="docutils literal notranslate"><span class="pre">body_points</span></code>, a row holds its
+combination of particle positions against a point of a body that FBA
+integrates and is solved with the body’s rows, so that the body takes the
+row’s force: three rows along independent directions with target zero tie a
+particle to that point, as a rope is tied to a rigid part. Such rows need
+<code class="docutils literal notranslate"><span class="pre">directions</span></code>, the full operator and one world.</p></li>
+<li><p><strong>Particle-body attachments</strong>: the model’s attachments
+(<a class="reference internal" href="../api/_generated/newton.ModelBuilder.html#newton.ModelBuilder.add_attachment_particle_body" title="newton.ModelBuilder.add_attachment_particle_body"><code class="xref py py-meth docutils literal notranslate"><span class="pre">add_attachment_particle_body()</span></code></a>) join these rows,
+three per attachment along the world axes after the rows of
+<code class="docutils literal notranslate"><span class="pre">set_particle_constraints</span></code>, as soft rows: each holds the backward Euler
+step of its spring <code class="docutils literal notranslate"><span class="pre">stiffness</span></code> and damper <code class="docutils literal notranslate"><span class="pre">damping</span></code> on the particle’s
+offset from the body point, <code class="docutils literal notranslate"><span class="pre">f</span> <span class="pre">=</span> <span class="pre">-k</span> <span class="pre">g</span> <span class="pre">-</span> <span class="pre">c</span> <span class="pre">(g</span> <span class="pre">-</span> <span class="pre">g0)</span> <span class="pre">/</span> <span class="pre">dt</span></code>, solved with the
+body’s contacts and joints, so that the forces are equal and opposite. They
+need dynamic bodies that FBA integrates, <code class="docutils literal notranslate"><span class="pre">friction=True</span></code>, the full
+operator and one world; as <a class="reference internal" href="../api/_generated/newton.solvers.SolverVBD.html#newton.solvers.SolverVBD" title="newton.solvers.SolverVBD"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverVBD</span></code></a> does, FBA
+rejects them with <code class="docutils literal notranslate"><span class="pre">integrate_with_external_rigid_solver=True</span></code>. Disabled
+attachments and those of zero stiffness and damping take no rows, and
+<code class="docutils literal notranslate"><span class="pre">ModelFlags.CONSTRAINT_PROPERTIES</span></code> takes edits of the three.</p></li>
 <li><p><strong>Rigid bodies</strong>: FBA integrates the dynamic bodies and passes kinematic
 bodies through, or leaves every body to another solver with
 <code class="docutils literal notranslate"><span class="pre">integrate_with_external_rigid_solver=True</span></code>. PRISMATIC, REVOLUTE, BALL,
 FIXED, and D6 joints are bilateral constraints, at most 64 rows per
-articulation; DISTANCE and ROD joints, and joints that lock more directions
-of a set of connected bodies than the bodies have, as kinematic loops do,
-raise <code class="docutils literal notranslate"><span class="pre">NotImplementedError</span></code>. A body turns by at most 0.5 rad per step.</p></li>
+articulation, the axis rows below included; DISTANCE and ROD joints, and
+joints that lock more directions of a set of connected bodies than the
+bodies have, as kinematic loops do, raise <code class="docutils literal notranslate"><span class="pre">NotImplementedError</span></code>. A D6
+joint with two free angular axes <code class="docutils literal notranslate"><span class="pre">a0</span></code> and <code class="docutils literal notranslate"><span class="pre">a1</span></code> turns as Newton composes
+it, <code class="docutils literal notranslate"><span class="pre">q(a0,</span> <span class="pre">q0)</span> <span class="pre">q(a1,</span> <span class="pre">q1)</span></code>: it holds the angle between <code class="docutils literal notranslate"><span class="pre">a0</span></code> in the
+parent’s joint frame and <code class="docutils literal notranslate"><span class="pre">a1</span></code> in the child’s, as a universal joint does.
+Joints hold a dynamic body to a kinematic one where the kinematic body’s
+prescribed velocity <code class="docutils literal notranslate"><span class="pre">body_qd</span></code> takes it by the step’s end. A step is
+linearized about a frame turned by at most 0.5 rad, and a body turns by at
+most 3 rad per step. The gyroscopic torque is integrated implicitly, so a
+tumbling body loses a little energy rather than gaining it. FBA does not
+write <code class="docutils literal notranslate"><span class="pre">State.joint_q</span></code> and
+<code class="docutils literal notranslate"><span class="pre">State.joint_qd</span></code>: <a class="reference internal" href="../api/_generated/newton.eval_ik.html#newton.eval_ik" title="newton.eval_ik"><code class="xref py py-func docutils literal notranslate"><span class="pre">eval_ik()</span></code></a> computes them from the bodies.</p></li>
+<li><p><strong>Joint limits, damping and drives</strong>: every free axis of a joint, also of
+BALL and D6 joints, with passive damping, a drive, armature or joint
+friction, and the free axis of a REVOLUTE or PRISMATIC joint with limits,
+takes one row in the articulation’s joint system on the axis’s motion over
+the step, whose force is the axis’s total force. Its passive damping
+<a class="reference internal" href="../api/_generated/newton.Model.html#newton.Model.joint_damping" title="newton.Model.joint_damping"><code class="xref py py-attr docutils literal notranslate"><span class="pre">joint_damping</span></code></a> (the <code class="docutils literal notranslate"><span class="pre">damping</span></code> of
+<a class="reference internal" href="../api/_generated/newton.ModelBuilder.html#newton.ModelBuilder.JointDofConfig" title="newton.ModelBuilder.JointDofConfig"><code class="xref py py-class docutils literal notranslate"><span class="pre">JointDofConfig</span></code></a>, MJCF’s <code class="docutils literal notranslate"><span class="pre">damping</span></code>) enters as
+the backward Euler step of the force <code class="docutils literal notranslate"><span class="pre">-c</span> <span class="pre">q_dot</span></code>: it slows the axis by the
+factor <code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">/</span> <span class="pre">(1</span> <span class="pre">+</span> <span class="pre">c</span> <span class="pre">dt</span> <span class="pre">/</span> <span class="pre">I)</span></code> per step for an axis of effective inertia
+<code class="docutils literal notranslate"><span class="pre">I</span></code>. An angular axis’s rate is the relative angular velocity along it in
+the parent’s joint frame, or the child’s for the second axis of a D6 joint
+with two angular axes, and its motion over a step that of the relative
+rotation’s increment. A drive, <a class="reference internal" href="../api/_generated/newton.Model.html#newton.Model.joint_target_ke" title="newton.Model.joint_target_ke"><code class="xref py py-attr docutils literal notranslate"><span class="pre">joint_target_ke</span></code></a> or
+<a class="reference internal" href="../api/_generated/newton.Model.html#newton.Model.joint_target_kd" title="newton.Model.joint_target_kd"><code class="xref py py-attr docutils literal notranslate"><span class="pre">joint_target_kd</span></code></a>, and armature,
+<a class="reference internal" href="../api/_generated/newton.Model.html#newton.Model.joint_armature" title="newton.Model.joint_armature"><code class="xref py py-attr docutils literal notranslate"><span class="pre">joint_armature</span></code></a>, join the same force: the backward Euler
+step of <code class="docutils literal notranslate"><span class="pre">ke</span> <span class="pre">(q*</span> <span class="pre">-</span> <span class="pre">q)</span> <span class="pre">+</span> <span class="pre">kd</span> <span class="pre">(q_dot*</span> <span class="pre">-</span> <span class="pre">q_dot)</span> <span class="pre">-</span> <span class="pre">c</span> <span class="pre">q_dot</span> <span class="pre">-</span> <span class="pre">I_a</span> <span class="pre">q_ddot</span></code> at the
+step’s end, toward the control’s <a class="reference internal" href="../api/_generated/newton.Control.html#newton.Control.joint_target_q" title="newton.Control.joint_target_q"><code class="xref py py-attr docutils literal notranslate"><span class="pre">joint_target_q</span></code></a> and
+<a class="reference internal" href="../api/_generated/newton.Control.html#newton.Control.joint_target_qd" title="newton.Control.joint_target_qd"><code class="xref py py-attr docutils literal notranslate"><span class="pre">joint_target_qd</span></code></a> (the model’s without a control). As
+in <a class="reference internal" href="../api/_generated/newton.solvers.SolverFeatherstone.html#newton.solvers.SolverFeatherstone" title="newton.solvers.SolverFeatherstone"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverFeatherstone</span></code></a>, the gains act whatever the
+DOF’s <a class="reference internal" href="../api/_generated/newton.Model.html#newton.Model.joint_target_mode" title="newton.Model.joint_target_mode"><code class="xref py py-attr docutils literal notranslate"><span class="pre">joint_target_mode</span></code></a>. A position drive needs an
+axis with one coordinate: a linear axis, or the angular axis of a joint with
+one, whose angle FBA measures in <code class="docutils literal notranslate"><span class="pre">(-pi,</span> <span class="pre">pi]</span></code> as
+<a class="reference internal" href="../api/_generated/newton.solvers.SolverSemiImplicit.html#newton.solvers.SolverSemiImplicit" title="newton.solvers.SolverSemiImplicit"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverSemiImplicit</span></code></a> does; a position gain on a BALL
+joint or on the angular axes of a D6 joint with several raises
+<code class="docutils literal notranslate"><span class="pre">NotImplementedError</span></code> at the first step, while velocity drives, damping and
+armature act on every free axis. An
+<a class="reference internal" href="../api/_generated/newton.Model.html#newton.Model.joint_effort_limit" title="newton.Model.joint_effort_limit"><code class="xref py py-attr docutils literal notranslate"><span class="pre">joint_effort_limit</span></code></a> below <code class="docutils literal notranslate"><span class="pre">1e6</span></code> (the builder’s
+default) bounds the drive’s force <code class="docutils literal notranslate"><span class="pre">ke</span> <span class="pre">(q*</span> <span class="pre">-</span> <span class="pre">q)</span> <span class="pre">+</span> <span class="pre">kd</span> <span class="pre">(q_dot*</span> <span class="pre">-</span> <span class="pre">q_dot)</span></code> to
+<code class="docutils literal notranslate"><span class="pre">[-E,</span> <span class="pre">E]</span></code>, as MuJoCo’s <code class="docutils literal notranslate"><span class="pre">actfrcrange</span></code> does, while the damping and armature
+stay unbounded; <a class="reference internal" href="../api/_generated/newton.Model.html#newton.Model.joint_friction" title="newton.Model.joint_friction"><code class="xref py py-attr docutils literal notranslate"><span class="pre">joint_friction</span></code></a> <code class="docutils literal notranslate"><span class="pre">F</span></code> holds the axis
+still with a force within <code class="docutils literal notranslate"><span class="pre">F</span></code> of the others’ and lets it slide against
+<code class="docutils literal notranslate"><span class="pre">F</span></code> beyond, as MuJoCo’s <code class="docutils literal notranslate"><span class="pre">frictionloss</span></code> does; and the limits,
+<a class="reference internal" href="../api/_generated/newton.Model.html#newton.Model.joint_limit_lower" title="newton.Model.joint_limit_lower"><code class="xref py py-attr docutils literal notranslate"><span class="pre">joint_limit_lower</span></code></a> and
+<a class="reference internal" href="../api/_generated/newton.Model.html#newton.Model.joint_limit_upper" title="newton.Model.joint_limit_upper"><code class="xref py py-attr docutils literal notranslate"><span class="pre">joint_limit_upper</span></code></a>, hold the axis within them with any
+force that pushes it inside, as hard limits. The axis’s force is then a
+monotone, piecewise linear function of its motion; at each Newton step, the
+row takes the piece that a step of the row alone reaches, as a compliance and
+a target motion, in the joint system (factored again in the blocks whose
+compliance changes) and in the contact solve when contacts touch the
+articulation, so that a step of saturated drives, sticking or sliding
+friction and reached limits lands on the law. A revolute axis measures its
+angle from the middle of its range and needs both limits: one finite limit
+raises <code class="docutils literal notranslate"><span class="pre">NotImplementedError</span></code>. FBA knows the angle up to whole turns, so it
+leaves out, with a warning, the limits of a range of a full turn or more,
+such as the <code class="docutils literal notranslate"><span class="pre">+-2</span> <span class="pre">pi</span></code> of many arm descriptions.
+<a class="reference internal" href="../api/_generated/newton.Control.html#newton.Control.joint_f" title="newton.Control.joint_f"><code class="xref py py-attr docutils literal notranslate"><span class="pre">joint_f</span></code></a> adds each DOF’s generalized force to the
+bodies as <a class="reference internal" href="../api/_generated/newton.solvers.SolverSemiImplicit.html#newton.solvers.SolverSemiImplicit" title="newton.solvers.SolverSemiImplicit"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverSemiImplicit</span></code></a> applies it, and a FREE
+joint’s wrench to its child. FBA ignores
+<a class="reference internal" href="../api/_generated/newton.Model.html#newton.Model.joint_velocity_limit" title="newton.Model.joint_velocity_limit"><code class="xref py py-attr docutils literal notranslate"><span class="pre">joint_velocity_limit</span></code></a>, with a warning where an
+articulation it integrates sets it. Joints at the default infinite limits,
+zero damping, armature and friction and no drive take no such rows.</p></li>
+<li><p><strong>Mimic joints</strong>: a mimic joint (<a class="reference internal" href="../api/_generated/newton.Model.html#newton.Model.joint_mimic_joint" title="newton.Model.joint_mimic_joint"><code class="xref py py-attr docutils literal notranslate"><span class="pre">joint_mimic_joint</span></code></a>
+and <a class="reference internal" href="../api/_generated/newton.Model.html#newton.Model.joint_mimic_coeffs" title="newton.Model.joint_mimic_coeffs"><code class="xref py py-attr docutils literal notranslate"><span class="pre">joint_mimic_coeffs</span></code></a>) holds each coordinate at
+<code class="docutils literal notranslate"><span class="pre">c0</span> <span class="pre">+</span> <span class="pre">c1</span></code> times its leader’s, as a hard row: a pair of rows on the
+follower’s and the leader’s axes, combined into one row in the
+articulation’s joint system, and in the contact solve when contacts touch
+the articulation, so that its force acts on both joints, equal and
+opposite. FBA holds mimics between PRISMATIC, REVOLUTE and D6 joints of the
+same axes, at most one of them angular, whose leader is a joint on bodies it
+integrates; it warns about mimics of other joint types and leaves them out,
+as the other solvers do. A revolute coordinate is its angle in
+<code class="docutils literal notranslate"><span class="pre">(-pi,</span> <span class="pre">pi]</span></code>. Mimic joints that contacts touch need
+<code class="docutils literal notranslate"><span class="pre">nsn_sparse_storage=False</span></code>.</p></li>
+<li><p><strong>Tendons</strong>: FBA simulates the model’s tendons
+(<a class="reference internal" href="../api/_generated/newton.ModelBuilder.html#newton.ModelBuilder.add_tendon" title="newton.ModelBuilder.add_tendon"><code class="xref py py-meth docutils literal notranslate"><span class="pre">add_tendon()</span></code></a>) and routes them itself with
+Newton’s routing of anchors, pinholes and rollers, the same as the other
+solvers’. Each tendon splits at its interior anchors into groups, and a group
+is one row on its total length: it holds <code class="docutils literal notranslate"><span class="pre">L</span> <span class="pre">&lt;=</span> <span class="pre">rest</span></code>, its rest length the
+group’s material (its spans and its rollers’ arcs), so that the material
+passes freely through pinholes and rollers, and its anchors take the force.
+The guides between a group’s anchors must be on bodies that FBA does not
+integrate (static or kinematic). A tendon pulls, never pushes, and takes no
+force while slack. Its row is a frictionless contact with the anchors’ bodies
+in the rigid Newton step, its Jacobian the directions from the anchors toward
+the next points of the path at the step’s start (the length’s derivative,
+since the path between them is fixed for the step), and its value measures
+the runs along those directions, so that it is linear within the step, as a
+contact’s normal gap is, also for an end that reaches its next point.
+Friction acts on the slide of the group’s first anchor along its run, solved
+with the contacts: the guides’ capstan coefficients <code class="docutils literal notranslate"><span class="pre">mu</span></code> give it a Coulomb
+bound of <code class="docutils literal notranslate"><span class="pre">min(1,</span> <span class="pre">sum</span> <span class="pre">mu</span> <span class="pre">theta)</span></code> times the tension, <code class="docutils literal notranslate"><span class="pre">theta</span></code> the guides’
+wrap angles at the step’s start (a linearized capstan), so that a slack
+tendon carries no friction and the first anchor’s tension stays nonnegative;
+a guide’s <code class="docutils literal notranslate"><span class="pre">fba:guide_friction_force</span></code> <code class="docutils literal notranslate"><span class="pre">F0</span></code> [N] adds a part that does not
+grow with the load, the bound <code class="docutils literal notranslate"><span class="pre">F0</span> <span class="pre">+</span> <span class="pre">mu</span> <span class="pre">T</span></code> at most <code class="docutils literal notranslate"><span class="pre">T</span></code>, within a step a
+coefficient from the previous step’s tension (<code class="docutils literal notranslate"><span class="pre">mu</span></code> alone after a step
+without tension, so that a string snapping taut is not held by the catch).
+The spans’ compliance and damping, summed over a group as Newton merges
+spans, make its row a spring and damper in parallel on the stretch of a taut
+string, so that a slack string pulls nothing and a caught load stops over a
+few steps; <code class="docutils literal notranslate"><span class="pre">fba:tendon_time</span></code> and <code class="docutils literal notranslate"><span class="pre">fba:tendon_damping_ratio</span></code> per tendon
+instead take them relative to the row’s effective mass, as MuJoCo’s
+<code class="docutils literal notranslate"><span class="pre">solref</span></code> does, for scenes tuned in MuJoCo.
+<a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.register_custom_attributes" title="newton.solvers.SolverFBA.register_custom_attributes"><code class="xref py py-meth docutils literal notranslate"><span class="pre">register_custom_attributes()</span></code></a> registers these
+attributes. Tendons need the full operator and one world.</p></li>
 </ul>
-<p>FBA does not simulate springs, equality constraints, mimic joints,
-particle-body attachments, joint limits, drives, armature, or joint friction, or
-the inputs of <a class="reference internal" href="../api/_generated/newton.Control.html#newton.Control" title="newton.Control"><code class="xref py py-class docutils literal notranslate"><span class="pre">Control</span></code></a>, and it does not read the damping
-coefficients <code class="docutils literal notranslate"><span class="pre">tri_kd</span></code>, <code class="docutils literal notranslate"><span class="pre">edge_kd</span></code> and <code class="docutils literal notranslate"><span class="pre">k_damp</span></code> of the elements.</p>
+<p>FBA does not simulate equality constraints, the
+limits of BALL and D6 joints, the limit stiffness and damping
+<code class="docutils literal notranslate"><span class="pre">joint_limit_ke</span></code> and <code class="docutils literal notranslate"><span class="pre">joint_limit_kd</span></code> (its limits are hard), the
+velocity limits of joint DOFs, or the inputs of
+<a class="reference internal" href="../api/_generated/newton.Control.html#newton.Control" title="newton.Control"><code class="xref py py-class docutils literal notranslate"><span class="pre">Control</span></code></a> other than <code class="docutils literal notranslate"><span class="pre">tet_activations</span></code>, <code class="docutils literal notranslate"><span class="pre">joint_f</span></code>,
+<code class="docutils literal notranslate"><span class="pre">joint_target_q</span></code> and <code class="docutils literal notranslate"><span class="pre">joint_target_qd</span></code>, and it
+does not read the damping coefficients <code class="docutils literal notranslate"><span class="pre">tri_kd</span></code>, <code class="docutils literal notranslate"><span class="pre">edge_kd</span></code> and <code class="docutils literal notranslate"><span class="pre">k_damp</span></code>
+of the elements.</p>
 </section>
 <section id="contacts">
 <h2>Contacts<a class="headerlink" href="#contacts" title="Link to this heading">#</a></h2>
 <ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">rigid_contact_time</span></code> makes the normal rows of rigid contacts soft: a
+spring and a damper in parallel (Kelvin-Voigt) of time constant <code class="docutils literal notranslate"><span class="pre">tau</span></code> and
+damping ratio <code class="docutils literal notranslate"><span class="pre">rigid_contact_damping</span></code>, acting while a row holds a force,
+for the row’s effective mass. A contact then sinks <code class="docutils literal notranslate"><span class="pre">F</span> <span class="pre">tau²</span> <span class="pre">/</span> <span class="pre">m</span></code> under a
+force <code class="docutils literal notranslate"><span class="pre">F</span></code>, and an impact of a heavy body on a light one spreads over a few
+steps instead of being settled in one, which a hard contact answers with a
+large rotation of the light body in that step. The backward Euler step of
+the pair is the complementarity <code class="docutils literal notranslate"><span class="pre">0</span> <span class="pre">&lt;=</span> <span class="pre">lambda</span> <span class="pre">_|_</span> <span class="pre">g</span> <span class="pre">+</span> <span class="pre">eps</span> <span class="pre">b</span> <span class="pre">-</span> <span class="pre">beta</span> <span class="pre">g_start</span>
+<span class="pre">&gt;=</span> <span class="pre">0</span></code> with <code class="docutils literal notranslate"><span class="pre">b</span></code> the row’s force times <code class="docutils literal notranslate"><span class="pre">W_ii</span></code>, <code class="docutils literal notranslate"><span class="pre">g_start</span></code> its gap at the
+step start, taken as zero above zero so that contacts reported within the
+detection gap do not brake bodies before they touch, <code class="docutils literal notranslate"><span class="pre">x</span> <span class="pre">=</span> <span class="pre">dt</span> <span class="pre">/</span> <span class="pre">tau</span></code>,
+<code class="docutils literal notranslate"><span class="pre">eps</span> <span class="pre">=</span> <span class="pre">1</span> <span class="pre">/</span> <span class="pre">(x²</span> <span class="pre">+</span> <span class="pre">2</span> <span class="pre">zeta</span> <span class="pre">x)</span></code> and <code class="docutils literal notranslate"><span class="pre">beta</span> <span class="pre">=</span> <span class="pre">2</span> <span class="pre">zeta</span> <span class="pre">/</span> <span class="pre">(x</span> <span class="pre">+</span> <span class="pre">2</span> <span class="pre">zeta)</span></code>; it adds
+<code class="docutils literal notranslate"><span class="pre">eps</span></code> to the row’s diagonal of the Newton matrix. The default <code class="docutils literal notranslate"><span class="pre">0</span></code> keeps rigid contacts hard; tendon and
+particle contact rows stay hard.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">nsn_schur_mode</span></code> selects the contact operator of the Newton steps.
 <code class="docutils literal notranslate"><span class="pre">&quot;full&quot;</span></code> (default) builds it from the factored system matrix. <code class="docutils literal notranslate"><span class="pre">&quot;lite&quot;</span></code>
 replaces the inverse system matrix by the inverse masses, which decouples
@@ -1303,20 +1593,80 @@ four contacts on a particle, <code class="docutils literal notranslate"><span cl
 forces of a step’s earlier
 iterations and models only their change, so that the iterations approach
 the forces whose exact motion closes the gaps and stacked layers keep their
-margin at longer steps.</p></li>
+margin at longer steps. Its rows still take the inverse masses as their
+response: a contact that presses a particle which stiff cloth ties to
+particles held at points, as a finger pad beside a pinch, sees far less
+motion than its row expects, and its force grows over many steps while the
+particle stays inside the shape; <code class="docutils literal notranslate"><span class="pre">cloth_dual_franka_fba</span></code> keeps it off for
+that reason.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">nsn_linear_iterations</span></code> caps the conjugate residual iterations of the
+linear solve in each Newton step. <code class="docutils literal notranslate"><span class="pre">None</span></code> (default) solves to a relative
+residual of <code class="docutils literal notranslate"><span class="pre">1e-10</span></code>. A capped step is inexact, and the next local-global
+iteration’s Newton step continues from it; most examples cap it at 10. A
+solve to the tolerance reads its residual back to the host every 25
+iterations and runs up to <code class="docutils literal notranslate"><span class="pre">max(1000,</span> <span class="pre">2</span> <span class="pre">n)</span></code> of them, which can cost a step
+many times a capped one’s, above all with <code class="docutils literal notranslate"><span class="pre">nsn_sparse_storage=True</span></code> or the
+lite operator’s self contacts. On CUDA the capped iterations of a system of
+at most 512 rows in 3x3 blocks, such as the rigid contacts of a few bodies
+with the joint rows of at most eight articulations, run in one launch, one
+block of threads for the whole solve: it adds its sums in another order than
+the iterations of larger systems, so that the same rows padded past 512
+give results that differ by rounding.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">contact_regularization</span></code> (default <code class="docutils literal notranslate"><span class="pre">0.01</span></code>) is the relative
+regularization <code class="docutils literal notranslate"><span class="pre">gamma</span></code> of the contact rows in the Newton steps that
+involve bodies FBA integrates, face contacts or self contacts: such a step
+solves with <code class="docutils literal notranslate"><span class="pre">A_cc</span> <span class="pre">+</span> <span class="pre">gamma</span> <span class="pre">diag(A_cc)</span></code>. Contacts and joints that close a
+loop, such as a hinged plank leaning on a box that rests on the ground,
+make the Newton matrix nearly singular, and an unregularized step answers a
+sub-micrometer inconsistency there with forces far above the bodies’
+weights. The term bounds the gain along contact directions by
+<code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">/</span> <span class="pre">gamma</span></code> and leaves the complementarity conditions unchanged. Steps
+with particle contacts alone are not regularized, nor is the sparse
+self-contact solve of the lite operator.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">face_contacts=True</span></code> adds a contact at the deepest point of a triangle
 inside a shape, so shape edges and corners cannot pass between the
 particles of coarse cloth, and holds particles in concave corners of
-meshes. It needs friction and the full operator.</p></li>
+meshes. It needs friction and the full operator. By default only the
+triangles next to particle contacts are tested, which misses a shape’s tip
+or edge poking into a triangle whose particles all lie beyond the reach of
+the particle contacts; <code class="docutils literal notranslate"><span class="pre">face_contact_gap</span></code> [m] tests every triangle within
+that distance of a shape instead. <code class="docutils literal notranslate"><span class="pre">face_contact_edge_radius</span></code> [m]
+(default 3 mm) rounds the edges of boxes and cylinders in the signed
+distance that the face contacts minimize, at most half of the shape’s
+smallest half extent, so that a triangle point that sinks into an edge does
+not flip its normal between the two faces; the segment contacts of
+<code class="docutils literal notranslate"><span class="pre">rod_shape_contacts</span></code> take the same rounding. It is a length, not a
+fraction of the shape, so scale it with the scene.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">particle_enable_self_contact=True</span></code> makes the triangles collide with each
-other, through vertex-face or vertex-vertex contacts. Vertex-face contacts
+other, through vertex-face or vertex-vertex contacts, as
+<code class="docutils literal notranslate"><span class="pre">particle_self_contact_mode</span></code> selects: <code class="docutils literal notranslate"><span class="pre">&quot;vertex_face&quot;</span></code> (default) keeps
+each particle <code class="docutils literal notranslate"><span class="pre">particle_self_contact_margin</span></code> [m] (default 2 mm) from its
+nearest triangle, and <code class="docutils literal notranslate"><span class="pre">&quot;vertex_vertex&quot;</span></code> keeps the particles that far from
+each other, which covers the surface only when the margin reaches the
+longest edge and leaves a bumpy contact surface. The contacts are found
+once per step, within the margin plus <code class="docutils literal notranslate"><span class="pre">particle_self_contact_gap</span></code> [m]
+(by default the margin), which bounds the relative motion over a step that
+cannot pass a contact. Particles within
+<code class="docutils literal notranslate"><span class="pre">particle_topological_contact_filter_threshold</span></code> mesh edges of each other
+(default 2) do not collide with each other or with the triangles that have
+such a particle, and <code class="docutils literal notranslate"><span class="pre">particle_rest_shape_contact_exclusion_radius</span></code> [m]
+excludes particles and triangles closer than that in <code class="docutils literal notranslate"><span class="pre">model.particle_q</span></code>,
+so that a fold closes only between parts that start apart; both mean what
+<a class="reference internal" href="../api/_generated/newton.solvers.SolverVBD.html#newton.solvers.SolverVBD" title="newton.solvers.SolverVBD"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverVBD</span></code></a>’s options of the same names mean.
+Vertex-face contacts
 keep crossing edges apart when the margin reaches half of the longest edge;
 <code class="docutils literal notranslate"><span class="pre">particle_self_contact_edge_edge=True</span></code> adds edge-edge contacts at creases
 for thinner margins, <code class="docutils literal notranslate"><span class="pre">particle_self_contact_edge_edge_ratio</span></code> sets how near
-their edges must come compared with their particles’ nearest triangles, and
+their edges must come compared with their particles’ nearest triangles
+(below 1 by default, since every edge pair of two flat layers lies exactly
+as near as its particles’ triangles; folded layers that press on each
+other take 1, at a few percent more contacts), and
 <a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.set_particle_self_contact" title="newton.solvers.SolverFBA.set_particle_self_contact"><code class="xref py py-meth docutils literal notranslate"><span class="pre">set_particle_self_contact()</span></code></a> changes the
 margin between steps, so that a dropped cloth can land with a thick margin
-and fold with a thin one. Pass a scalar to set all worlds, or arrays of shape
+and fold with a thin one: the margin is the solver’s contact thickness, not
+the cloth’s, and fast layers need a thicker one, since the contacts are
+found once per step and the lite operator lets an impact press them in.
+Pass a scalar to set all worlds, or arrays of shape
 <code class="docutils literal notranslate"><span class="pre">(model.world_count</span> <span class="pre">+</span> <span class="pre">1,)</span></code> to set <code class="docutils literal notranslate"><span class="pre">margin</span></code> and <code class="docutils literal notranslate"><span class="pre">gap</span></code> independently per
 world, with the last entry for global particles. Per-world values require
 self-contact groups to be disabled and persist across solver resets; the
@@ -1325,18 +1675,54 @@ shirt example restores the selected episodes’ landing margins itself.
 particle a group, such as one per body of a pile: the particles and
 triangles of two groups keep the margin apart, and those of one group the
 group’s margin from <code class="docutils literal notranslate"><span class="pre">particle_self_contact_group_margins</span></code>, or do not
-collide.</p></li>
+collide. Groups do not combine with edge-edge contacts or per-world margins.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">rod_contact=True</span></code> makes the model’s springs, such as the segments of
+particle rods, collide with each other as capsules whose radius runs
+between their particles’ radii. A particle takes a contact with each
+segment whose capsule its sphere comes within <code class="docutils literal notranslate"><span class="pre">rod_contact_gap</span></code> of, two
+particles take one where each is the closest point of every segment at the
+other, and two segments take one on their four particles where their
+closest points lie inside both and they are not nearly parallel. Each
+contact keeps the sum of the radii at its points and acts along the
+direction between them at the step’s start, so a rod draped over another
+sits a little higher at a vertex, where its capsules meet at an angle.
+Particles within as many segments of each other along the springs as the
+largest sum of two radii plus the gap spans at the shortest spring do not
+collide, so that a straight rod never touches itself. The contacts are found
+on the host each step and take <code class="docutils literal notranslate"><span class="pre">model.particle_mu</span></code> as friction.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">rod_shape_contacts=True</span></code> makes the springs also collide with shapes as
+capsules: a segment takes a contact at its deepest point inside a shape
+when that point lies strictly between its particles and deeper than both,
+a row on its two particles with that point’s weights, as a face contact is
+on a triangle’s. A shape thinner than the gap between two particles’ spheres
+then cannot pass between them, and a rod slides over a curve without
+catching on its particles. <code class="docutils literal notranslate"><span class="pre">rod_shape_contact_gap</span></code> sets the detection
+distance. It needs friction and the full operator. In the
+<code class="docutils literal notranslate"><span class="pre">rope_on_knives_fba</span></code> example, a rope rests on blades thinner than the gaps
+between its particles’ spheres.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">friction_anchors=True</span></code> keeps the point a contact presses on across steps,
-on the other layer for a self contact or on a static shape, so its friction
-rows pull back the slip that a step’s solve leaves instead of letting it add
-up. With the lite operator, that slip lets stacked cloth layers creep apart
-over seconds. <a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.set_friction_anchor_exclusion" title="newton.solvers.SolverFBA.set_friction_anchor_exclusion"><code class="xref py py-meth docutils literal notranslate"><span class="pre">set_friction_anchor_exclusion()</span></code></a>
-frees chosen particles of their anchors, so that a grasp can gather cloth.</p></li>
+on the other layer for a vertex-face self contact or on a static shape, so
+its friction rows pull back the slip that a step’s solve leaves instead of
+letting it add up. With the lite operator, that slip lets stacked cloth
+layers creep apart over seconds; with the full operator, a cloth resting
+on a surface gathers in-plane stress from it until its contacts slide,
+after some hundred steps, sooner on some processors. The anchors work with either operator,
+self-contact groups, rod contacts and <code class="docutils literal notranslate"><span class="pre">shape_particle_radius_override</span></code>;
+edge-edge, vertex-vertex and rod contacts, face contacts, contacts with
+shapes on bodies, and the contacts of a world whose particles touch a body
+that FBA integrates in the step keep the step’s point.
+<a class="reference internal" href="../api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.set_friction_anchor_exclusion" title="newton.solvers.SolverFBA.set_friction_anchor_exclusion"><code class="xref py py-meth docutils literal notranslate"><span class="pre">set_friction_anchor_exclusion()</span></code></a> frees
+chosen particles of their anchors, so that a grasp can gather cloth.</p></li>
 <li><p>Rigid contacts between shapes on bodies that FBA integrates need
 <code class="docutils literal notranslate"><span class="pre">friction=True</span></code> and the full operator.</p></li>
 <li><p>A contact on a body that FBA integrates acts at the contact point of the
 step start, which moves with the body to first order in its rotation over
 the step, so a ball keeps rolling at its speed on flat ground.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">rigid_contact_bin</span></code> [m], if positive, keeps only the deepest rigid
+contact of a body pair in each cell of that size around the first body and
+each of 26 normal directions before the solve, so that two finely
+decomposed meshes do not bring thousands of contacts whose rows all couple
+through the two bodies. <code class="docutils literal notranslate"><span class="pre">0</span></code> (default) keeps every contact.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">contact_warmstart=True</span></code> starts each step’s contact multipliers from the
 previous step’s on the same contacts and constraints rather than from zero,
 so that a resting or held object starts its step at the forces that carry
@@ -1351,9 +1737,26 @@ matrix of the full operator’s steps in CSR form without their zero entries,
 such as those between separate bodies, which saves most of their memory and
 work for many contacts on many bodies, as in a pile of soft bodies. It
 needs friction and the full operator.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">rigid_iteration_graph=True</span></code> runs the rigid local-global iterations of a
+step whose rows are built anew, such as one with particle contacts on
+bodies, from a CUDA graph captured at the step’s first iteration, bit for
+bit the eager result with fewer launches from the host. Steps whose rigid
+rows keep their padded storage replay the contact step’s own graph across
+steps instead. It needs CUDA, <code class="docutils literal notranslate"><span class="pre">nsn_sparse_storage=True</span></code> and a capped
+<code class="docutils literal notranslate"><span class="pre">nsn_linear_iterations</span></code> of at most 25, whose iterations read nothing back,
+and leaves eager the steps with length rows of particle constraints, whose
+directions are set on the host.</p></li>
 <li><p>The friction coefficient of a particle contact is its shape’s <code class="docutils literal notranslate"><span class="pre">mu</span></code>,
 <code class="docutils literal notranslate"><span class="pre">model.particle_mu</span></code> for self contacts, and the mean of the two shapes’
-<code class="docutils literal notranslate"><span class="pre">mu</span></code> for rigid contacts.</p></li>
+<code class="docutils literal notranslate"><span class="pre">mu</span></code> for rigid contacts, or the larger of the two with
+<code class="docutils literal notranslate"><span class="pre">rigid_contact_friction=&quot;max&quot;</span></code>, as MuJoCo combines them.</p></li>
+<li><p>A particle contact’s friction holds the particle to its shape’s surface
+velocity, <code class="docutils literal notranslate"><span class="pre">Contacts.soft_contact_body_vel</span></code>, which the collision pipeline
+reports for conveyors and animated meshes; rigid contacts do not read
+<code class="docutils literal notranslate"><span class="pre">Contacts.rigid_contact_surface_velocity</span></code>. Face and rod-segment contacts
+take barrel cylinders’ bulge, read the shapes’ <code class="docutils literal notranslate"><span class="pre">COLLIDE_PARTICLES</span></code> flags
+at each step, and let particles of no world touch every shape, as Newton’s
+particle contacts do.</p></li>
 <li><p><a class="reference internal" href="../api/_generated/newton.solvers.SolverBase.html#newton.solvers.SolverBase.ObservableKind.CONTACT_F" title="newton.solvers.SolverBase.ObservableKind.CONTACT_F"><code class="xref py py-attr docutils literal notranslate"><span class="pre">CONTACT_F</span></code></a> reports the
 force of each particle contact on its shape’s body; see
 <a class="reference internal" href="../concepts/solver_observables.html#solver-observables"><span class="std std-ref">Solver Observables</span></a>.</p></li>
@@ -1376,11 +1779,67 @@ load; in Newton’s shared cloth tests the folds of a curved cloth settle
 <li><p><code class="docutils literal notranslate"><span class="pre">cloth_on_knives_fba</span></code>: cloth on notched blades with face contacts and light
 Rayleigh stiffness damping.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">cloth_on_boxes_fba</span></code>: cloth on rigid bodies with joints.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">shishi_odoshi_fba</span></code>: water of <a class="reference internal" href="../api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater" title="newton.solvers.SolverAPICWater"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverAPICWater</span></code></a>
+coupled to a body that FBA integrates: a spout fills a bamboo tube on a
+hinge until it tips, pours into a basin, swings back onto a stone and fills
+again. Once per step FBA applies the water’s impulse on the tube over the
+last water step, and the water’s step sees the tube where FBA left it; each
+frame’s steps replay from one CUDA graph.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">water_wheel_fba</span></code>: an overshot water wheel through the same coupling: water
+from a pipe fills the buckets just past the wheel’s top, and their weight
+turns the wheel against its axle’s damping, its load, until the two torques
+meet.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">sand_castle_fba</span></code>: a wrecking ball on a rod swings through a castle of damp
+sand, <a class="reference internal" href="../api/_generated/newton.solvers.SolverImplicitMPM.html#newton.solvers.SolverImplicitMPM" title="newton.solvers.SolverImplicitMPM"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverImplicitMPM</span></code></a> sand with friction and a
+small cohesion. The two solvers exchange the sand’s impulse on the ball once
+per FBA step, MPM seeing the ball as a collider that turns about the rod’s
+pivot with its moment of inertia; the sand takes nearly half of the ball’s
+energy.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">batter_mixer_fba</span></code>: a mixer’s paddle, turned by a motor’s constant torque,
+stirs viscous batter that sticks to its bowl, through the same coupling. The
+batter’s drag sets the paddle’s speed, and the paddle marbles vanilla and
+chocolate batter.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">meat_cutter_fba</span></code>: a lever cutter, pressed down by a hand and lifted back,
+cuts a slab of pork belly in two through the same coupling. The meat’s
+layers of lean, fat and skin are elastic MPM solids that yield past their
+own strengths.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">convex_pile_fba</span></code>: a thousand rigid bodies of eight convex shapes drop
+into an open box and settle in a pile.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">convex_hulls_fba</span></code>: convex hull colliders: a stack of five cubes, and cubes
+dropped into a U of three hulls on one body and into a concave U decomposed
+into convex hulls by CoACD.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">nonconvex_pile_fba</span></code>: a thousand rigid bodies of eight non-convex shapes,
+CoACD-decomposed meshes and compounds of boxes, drop into an open box and
+settle in a pile.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">chain_net_fba</span></code>: a net of 1,080 interlocked steel chain links, after the
+huge chain net of Affine Body Dynamics (Lan et al. 2022, Fig. 13), its rim
+fixed, falls into a bowl and swings back; each link collides as 14 capsules,
+and <code class="docutils literal notranslate"><span class="pre">--size</span></code> sets the links per side of its grid.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">twisting_bar_fba</span></code>, <code class="docutils literal notranslate"><span class="pre">squeezing_ball_fba</span></code>: a soft bar twisted by its
 pinned ends and a soft ball dragged by spinning cylinders.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">softbody_franka_fba</span></code>: a Franka arm integrated by
 <a class="reference internal" href="../api/_generated/newton.solvers.SolverFeatherstone.html#newton.solvers.SolverFeatherstone" title="newton.solvers.SolverFeatherstone"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverFeatherstone</span></code></a> picks up a soft ball.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">cable_gripper_fba</span></code>: soft fingers curled by cables lift a box.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">particle_rods_fba</span></code>: particle rods: three ropes of rising bending stiffness
+swing down over a bar from a pinned end, a rod clamped in a block sags and
+swings, and a coil of rope drops onto the ground.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">hemp_rope_fba</span></code>: a 3 m, 12 mm hemp rope lowered by a circling hand coils
+onto the floor, its segments colliding as capsules.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">desk_cables_fba</span></code>: an HDMI cable, a USB-C cable and a power cord at a
+laptop, with stiff, heavier plugs; a hand carries the HDMI cable across the
+desk over the USB-C cable.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">elastic_cords_fba</span></code>: a bungee cord and an elastic cord stretch by a fifth
+as their balls swing down from the level, beside a polyester rope that holds
+its length.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">rod_gripper_fba</span></code>: a rigid gripper picks up a rope by its middle and lays
+it down elsewhere, holding it by the friction of its pads
+(<code class="docutils literal notranslate"><span class="pre">--grasp</span> <span class="pre">friction</span></code>) or by particle constraint rows at the particles
+between them (<code class="docutils literal notranslate"><span class="pre">--grasp</span> <span class="pre">pins</span></code>).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">rope_on_knives_fba</span></code>: an 8 mm rope with its particles 12.5 mm apart drops
+onto five steel blades 1 mm thick and comes to rest across their edges by
+its segment contacts (<code class="docutils literal notranslate"><span class="pre">rod_shape_contacts=True</span></code>). With
+<code class="docutils literal notranslate"><span class="pre">--no-segment-contacts</span></code>, the blades pass between its particles and the
+rope falls through them to the floor.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">cloth_dual_franka_fba</span></code>: two Franka arms integrated by
 <a class="reference internal" href="../api/_generated/newton.solvers.SolverFeatherstone.html#newton.solvers.SolverFeatherstone" title="newton.solvers.SolverFeatherstone"><code class="xref py py-class docutils literal notranslate"><span class="pre">SolverFeatherstone</span></code></a> pinch the corners of a square
 towel and fold it twice into a square, with light Rayleigh mass damping.
@@ -1396,8 +1855,8 @@ world’s arm joint targets a fixed bias, drawn once per world and joint from
 <code class="docutils literal notranslate"><span class="pre">U(-A,</span> <span class="pre">A)</span></code> with seed 42, clipped to the joint limits; it leaves the
 fingers, the timing, the initial pose and the IK state unchanged.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">shirt_pins_fba</span></code>, <code class="docutils literal notranslate"><span class="pre">bunny_ears_fba</span></code>: two handles move a T-shirt by its
-shoulders, with self-contact and light Rayleigh stiffness damping, and a
-soft bunny by its ears.</p></li>
+shoulders, with self-contact, the lite operator accumulating its contact
+forces and light Rayleigh stiffness damping, and a soft bunny by its ears.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">shirt_fold_fba</span></code>: two Franka arms fold a dropped T-shirt, its sides in and
 its hem up, their fingers squeezing the cloth into a bulge that they hold,
 at two steps per frame with the lite operator accumulating its contact

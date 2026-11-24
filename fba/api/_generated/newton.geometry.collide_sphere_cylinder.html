@@ -48,13 +48,6 @@
     <script src="../../_static/design-tabs.js?v=f930bc37"></script>
     <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'api/_generated/newton.geometry.collide_sphere_cylinder';</script>
-    <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
-        DOCUMENTATION_OPTIONS.theme_switcher_json_url = 'https://newton-physics.github.io/newton/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'dev';
-        DOCUMENTATION_OPTIONS.show_version_warning_banner =
-            false;
-        </script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <script src="../../_static/mermaid-nbsphinx.js?v=613f558e"></script>
     <link rel="index" title="Index" href="../../genindex.html" />
@@ -352,6 +345,13 @@
 <li class=" ">
   <a class="nav-link dropdown-item nav-internal" href="../../solvers/fba.html">
     FBA
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../../solvers/apic_water.html">
+    APIC Water
   </a>
 </li>
 
@@ -768,6 +768,13 @@
 
 
 <li class="nav-item ">
+  <a class="nav-link nav-internal" href="../../solvers/apic_water.html">
+    APIC Water
+  </a>
+</li>
+
+
+<li class="nav-item ">
   <a class="nav-link nav-internal" href="../newton.html">
     newton
   </a>
@@ -970,6 +977,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../solvers/kamino.html">Kamino</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../solvers/vbd.html">VBD</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../solvers/fba.html">FBA</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../solvers/apic_water.html">APIC Water</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="current nav bd-sidenav">
@@ -1062,7 +1070,7 @@
 <h1>newton.geometry.collide_sphere_cylinder<a class="headerlink" href="#newton-geometry-collide-sphere-cylinder" title="Link to this heading">#</a></h1>
 <dl class="py function">
 <dt class="sig sig-object py" id="newton.geometry.collide_sphere_cylinder">
-<span class="sig-prename descclassname"><span class="pre">newton.geometry.</span></span><span class="sig-name descname"><span class="pre">collide_sphere_cylinder</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">sphere_pos</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sphere_radius</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cylinder_pos</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cylinder_axis</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cylinder_radius</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cylinder_half_height</span></span></em><span class="sig-paren">)</span><a class="reference external" href="https://github.com/newton-physics/newton/blob/main/newton/_src/geometry/collision_primitive.py#L461"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#newton.geometry.collide_sphere_cylinder" title="Link to this definition">#</a></dt>
+<span class="sig-prename descclassname"><span class="pre">newton.geometry.</span></span><span class="sig-name descname"><span class="pre">collide_sphere_cylinder</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">sphere_pos</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sphere_radius</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cylinder_pos</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cylinder_axis</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cylinder_radius</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cylinder_half_height</span></span></em><span class="sig-paren">)</span><a class="reference external" href="https://github.com/newton-physics/newton/blob/main/newton/_src/geometry/collision_primitive.py#L580"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#newton.geometry.collide_sphere_cylinder" title="Link to this definition">#</a></dt>
 <dd><p>Core contact geometry calculation for sphere-cylinder collision.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>

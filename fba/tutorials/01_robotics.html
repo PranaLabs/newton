@@ -51,13 +51,6 @@
     <script>window.MathJax = {"tex": {"inlineMath": [["$", "$"], ["\\(", "\\)"]], "processEscapes": true, "packages": {"[+]": ["amsmath", "amssymb", "amsfonts"]}, "displayMath": [["$$", "$$"], ["\\[", "\\]"]], "processEnvironments": true, "tags": "ams", "macros": {"RR": "{\\mathbb{R}}", "bold": ["{\\mathbf{#1}}", 1], "vec": ["{\\mathbf{#1}}", 1]}}, "options": {"ignoreHtmlClass": "annotation", "processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
     <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'tutorials/01_robotics';</script>
-    <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
-        DOCUMENTATION_OPTIONS.theme_switcher_json_url = 'https://newton-physics.github.io/newton/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'dev';
-        DOCUMENTATION_OPTIONS.show_version_warning_banner =
-            false;
-        </script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <script src="../_static/mermaid-nbsphinx.js?v=613f558e"></script>
     <link rel="index" title="Index" href="../genindex.html" />
@@ -355,6 +348,13 @@
 <li class=" ">
   <a class="nav-link dropdown-item nav-internal" href="../solvers/fba.html">
     FBA
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="../solvers/apic_water.html">
+    APIC Water
   </a>
 </li>
 
@@ -771,6 +771,13 @@
 
 
 <li class="nav-item ">
+  <a class="nav-link nav-internal" href="../solvers/apic_water.html">
+    APIC Water
+  </a>
+</li>
+
+
+<li class="nav-item ">
   <a class="nav-link nav-internal" href="../api/newton.html">
     newton
   </a>
@@ -973,6 +980,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../solvers/kamino.html">Kamino</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../solvers/vbd.html">VBD</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../solvers/fba.html">FBA</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../solvers/apic_water.html">APIC Water</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="nav bd-sidenav">
@@ -1172,7 +1180,7 @@
 <div class="prompt empty docutils container">
 </div>
 <div class="output_area rendered_html docutils container">
-<pre id="mermaid-858fbf71913f425d8ae6f870c0c8ecce" class="mermaid" style="width: 50%;">
+<pre id="mermaid-f011834a15224ba78d859da91c007c98" class="mermaid" style="width: 50%;">
 flowchart TD
     K[&quot;Write @wp.kernel in Python&quot;]
     L[&quot;First wp.launch(..., device=&#x27;cuda&#x27;)&quot;]
@@ -1230,7 +1238,7 @@ flowchart TD
 <div class="prompt empty docutils container">
 </div>
 <div class="output_area rendered_html docutils container">
-<pre id="mermaid-20061fbb8ba7434788b6801a5735167f" class="mermaid" style="width: 100%;">
+<pre id="mermaid-2953342f0b914153a704bbb63b5eca3e" class="mermaid" style="width: 100%;">
 flowchart LR
     subgraph Input[&quot;Input Data&quot;]
         M[newton.Model]
@@ -1503,7 +1511,7 @@ Graph captured - simulation work is now replayed from a single graph
 </div>
 <div class="output_area docutils container">
 <div class="highlight"><pre>
-without_graph_capture took 930.21 ms
+without_graph_capture took 868.08 ms
 </pre></div></div>
 </div>
 <div class="nbinput docutils container">
@@ -1522,7 +1530,7 @@ without_graph_capture took 930.21 ms
 </div>
 <div class="output_area docutils container">
 <div class="highlight"><pre>
-with_graph_capture took 143.79 ms
+with_graph_capture took 111.81 ms
 </pre></div></div>
 </div>
 </section>
@@ -2010,7 +2018,7 @@ success on Franka and 99.996% on H1, with lower batch solve times than the liste
 <div class="prompt empty docutils container">
 </div>
 <div class="output_area rendered_html docutils container">
-<pre id="mermaid-d1a55f74852e45d58ece7fe140826c53" class="mermaid" style="width: 100%;">
+<pre id="mermaid-36c7b31480bd4bbd8b6336f333e47ee2" class="mermaid" style="width: 100%;">
 flowchart TD
 
     IKS[IKSolver]

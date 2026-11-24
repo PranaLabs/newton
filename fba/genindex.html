@@ -406,13 +406,6 @@ mermaid.initialize(
 window.addEventListener("load", load);
 window.runMermaid = runMermaid;</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'genindex';</script>
-    <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.22.0';
-        DOCUMENTATION_OPTIONS.theme_switcher_json_url = 'https://newton-physics.github.io/newton/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'dev';
-        DOCUMENTATION_OPTIONS.show_version_warning_banner =
-            false;
-        </script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <script src="_static/mermaid-nbsphinx.js?v=613f558e"></script>
     <link rel="index" title="Index" href="#" />
@@ -708,6 +701,13 @@ window.runMermaid = runMermaid;</script>
 <li class=" ">
   <a class="nav-link dropdown-item nav-internal" href="solvers/fba.html">
     FBA
+  </a>
+</li>
+
+
+<li class=" ">
+  <a class="nav-link dropdown-item nav-internal" href="solvers/apic_water.html">
+    APIC Water
   </a>
 </li>
 
@@ -1122,6 +1122,13 @@ window.runMermaid = runMermaid;</script>
 
 
 <li class="nav-item ">
+  <a class="nav-link nav-internal" href="solvers/apic_water.html">
+    APIC Water
+  </a>
+</li>
+
+
+<li class="nav-item ">
   <a class="nav-link nav-internal" href="api/newton.html">
     newton
   </a>
@@ -1459,6 +1466,8 @@ window.runMermaid = runMermaid;</script>
             <dt><a href="api/newton_solvers_mujoco.html#newton.solvers.mujoco.TendonWrapGeom.__init__">(newton.solvers.mujoco.TendonWrapGeom method)</a></dt>
             <dt><a href="api/newton_solvers_mujoco.html#newton.solvers.mujoco.TendonWrapPulley.__init__">(newton.solvers.mujoco.TendonWrapPulley method)</a></dt>
             <dt><a href="api/newton_solvers_mujoco.html#newton.solvers.mujoco.TendonWrapSite.__init__">(newton.solvers.mujoco.TendonWrapSite method)</a></dt>
+            <dt><a href="api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater.__init__">(newton.solvers.SolverAPICWater method)</a></dt>
+            <dt><a href="api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater.Config.__init__">(newton.solvers.SolverAPICWater.Config method)</a></dt>
             <dt><a href="api/_generated/newton.solvers.SolverBase.html#newton.solvers.SolverBase.__init__">(newton.solvers.SolverBase method)</a></dt>
             <dt><a href="api/_generated/newton.solvers.SolverBase.html#newton.solvers.SolverBase.Observables.__init__">(newton.solvers.SolverBase.Observables method)</a></dt>
             <dt><a href="api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.__init__">(newton.solvers.SolverFBA method)</a></dt>
@@ -1612,6 +1621,9 @@ window.runMermaid = runMermaid;</script>
           <a href="api/_generated/newton.ModelBuilder.html#newton.ModelBuilder.add_body">add_body() (newton.ModelBuilder method)</a>
         </dt>
         <dt>
+          <a href="api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater.add_body_forces">add_body_forces() (newton.solvers.SolverAPICWater method)</a>
+        </dt>
+        <dt>
           <a href="api/newton_solvers_experimental_coupled.html#newton.solvers.experimental.coupled.ModelView.add_body_lumped_inertia">add_body_lumped_inertia() (newton.solvers.experimental.coupled.ModelView method)</a>
         </dt>
         <dt>
@@ -1724,6 +1736,9 @@ window.runMermaid = runMermaid;</script>
           <a href="api/newton_solvers_experimental_coupled.html#newton.solvers.experimental.coupled.ModelView.add_particle_lumped_mass">add_particle_lumped_mass() (newton.solvers.experimental.coupled.ModelView method)</a>
         </dt>
         <dt>
+          <a href="api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.add_particle_rod">add_particle_rod() (newton.solvers.SolverFBA static method)</a>
+        </dt>
+        <dt>
           <a href="api/_generated/newton.ModelBuilder.html#newton.ModelBuilder.add_particles">add_particles() (newton.ModelBuilder method)</a>
         </dt>
         <dt>
@@ -1784,6 +1799,9 @@ window.runMermaid = runMermaid;</script>
           <a href="api/_generated/newton.ModelBuilder.html#newton.ModelBuilder.add_spring">add_spring() (newton.ModelBuilder method)</a>
         </dt>
         <dt>
+          <a href="api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater.add_stream">add_stream() (newton.solvers.SolverAPICWater method)</a>
+        </dt>
+        <dt>
           <a href="api/_generated/newton.ModelBuilder.html#newton.ModelBuilder.add_tendon">add_tendon() (newton.ModelBuilder method)</a>
         </dt>
         <dt>
@@ -1795,13 +1813,13 @@ window.runMermaid = runMermaid;</script>
         <dt>
           <a href="api/_generated/newton.ModelBuilder.html#newton.ModelBuilder.add_tetrahedron">add_tetrahedron() (newton.ModelBuilder method)</a>
         </dt>
-        <dt>
-          <a href="api/_generated/newton.utils.EventTracer.html#newton.utils.EventTracer.add_trace">add_trace() (newton.utils.EventTracer method)</a>
-        </dt>
       </dl>
     </td>
     <td style="width: 33%; vertical-align: top;">
       <dl>
+        <dt>
+          <a href="api/_generated/newton.utils.EventTracer.html#newton.utils.EventTracer.add_trace">add_trace() (newton.utils.EventTracer method)</a>
+        </dt>
         <dt>
           <a href="api/_generated/newton.ModelBuilder.html#newton.ModelBuilder.add_triangle">add_triangle() (newton.ModelBuilder method)</a>
         </dt>
@@ -2274,6 +2292,9 @@ window.runMermaid = runMermaid;</script>
         </dd>
         <dt>
           <a href="api/_generated/newton.solvers.SolverMuJoCo.html#newton.solvers.SolverMuJoCo.body_free_qd_start">body_free_qd_start (newton.solvers.SolverMuJoCo attribute)</a>
+        </dt>
+        <dt>
+          <a href="api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater.body_impulse">body_impulse (newton.solvers.SolverAPICWater property)</a>
         </dt>
         <dt>
           <a href="api/_generated/newton.Model.html#newton.Model.body_inertia">body_inertia (newton.Model attribute)</a>
@@ -3721,6 +3742,7 @@ window.runMermaid = runMermaid;</script>
         </dt>
         <dd>
           <dl>
+            <dt><a href="api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater.Config.density">(newton.solvers.SolverAPICWater.Config attribute)</a></dt>
             <dt><a href="api/_generated/newton.TetMesh.html#newton.TetMesh.density">(newton.TetMesh property)</a></dt>
           </dl>
         </dd>
@@ -3746,10 +3768,6 @@ window.runMermaid = runMermaid;</script>
             <dt><a href="api/_generated/newton.controllers.ControllerDifferentialIKModelFree.html#newton.controllers.ControllerDifferentialIKModelFree.Inputs.desired_tool_pose_world">(newton.controllers.ControllerDifferentialIKModelFree.Inputs attribute)</a></dt>
           </dl>
         </dd>
-      </dl>
-    </td>
-    <td style="width: 33%; vertical-align: top;">
-      <dl>
         <dt>
           <a href="api/_generated/newton.controllers.ControllerOperationalSpace.html#newton.controllers.ControllerOperationalSpace.Inputs.desired_twist_operational">desired_twist_operational (newton.controllers.ControllerOperationalSpace.Inputs attribute)</a>
         </dt>
@@ -3758,6 +3776,10 @@ window.runMermaid = runMermaid;</script>
             <dt><a href="api/_generated/newton.controllers.ControllerOperationalSpaceModelFree.html#newton.controllers.ControllerOperationalSpaceModelFree.Inputs.desired_twist_operational">(newton.controllers.ControllerOperationalSpaceModelFree.Inputs attribute)</a></dt>
           </dl>
         </dd>
+      </dl>
+    </td>
+    <td style="width: 33%; vertical-align: top;">
+      <dl>
         <dt>
           <a href="api/_generated/newton.controllers.ControllerOperationalSpace.html#newton.controllers.ControllerOperationalSpace.Inputs.desired_wrench_world">desired_wrench_world (newton.controllers.ControllerOperationalSpace.Inputs attribute)</a>
         </dt>
@@ -3818,6 +3840,12 @@ window.runMermaid = runMermaid;</script>
           <a href="api/_generated/newton.JointType.html#newton.JointType.dof_count">dof_count() (newton.JointType method)</a>
         </dt>
         <dt>
+          <a href="api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater.Config.domain_hi">domain_hi (newton.solvers.SolverAPICWater.Config attribute)</a>
+        </dt>
+        <dt>
+          <a href="api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater.Config.domain_lo">domain_lo (newton.solvers.SolverAPICWater.Config attribute)</a>
+        </dt>
+        <dt>
           <a href="api/_generated/newton.solvers.SolverSteel.html#newton.solvers.SolverSteel.double_buffer">double_buffer (newton.solvers.SolverSteel attribute)</a>
         </dt>
         <dt>
@@ -3875,6 +3903,12 @@ window.runMermaid = runMermaid;</script>
         </dt>
         <dt>
           <a href="api/_generated/newton.actuators.DrivePID.html#newton.actuators.DrivePID.evaluate_force">DrivePID.evaluate_force() (in module newton.actuators)</a>
+        </dt>
+        <dt>
+          <a href="api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.dropped_contacts">dropped_contacts() (newton.solvers.SolverFBA method)</a>
+        </dt>
+        <dt>
+          <a href="api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater.dropped_fluid_cells">dropped_fluid_cells() (newton.solvers.SolverAPICWater method)</a>
         </dt>
         <dt>
           <a href="api/_generated/newton.ModelBuilder.html#newton.ModelBuilder.CustomAttribute.dtype">dtype (newton.ModelBuilder.CustomAttribute attribute)</a>
@@ -4197,6 +4231,9 @@ window.runMermaid = runMermaid;</script>
             <dt><a href="api/_generated/newton.solvers.SolverImplicitMPM.html#newton.solvers.SolverImplicitMPM.extract_particle_surface">(newton.solvers.SolverImplicitMPM method)</a></dt>
           </dl>
         </dd>
+        <dt>
+          <a href="api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater.Config.extrapolation_layers">extrapolation_layers (newton.solvers.SolverAPICWater.Config attribute)</a>
+        </dt>
       </dl>
     </td>
   </tr>
@@ -5908,6 +5945,9 @@ window.runMermaid = runMermaid;</script>
           <a href="api/_generated/newton.actuators.SchemaNames.html#newton.actuators.SchemaNames.MAX_EFFORT_CLAMPING">MAX_EFFORT_CLAMPING (newton.actuators.SchemaNames attribute)</a>
         </dt>
         <dt>
+          <a href="api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater.Config.max_fluid_cells">max_fluid_cells (newton.solvers.SolverAPICWater.Config attribute)</a>
+        </dt>
+        <dt>
           <a href="api/_generated/newton.Mesh.html#newton.Mesh.MAX_HULL_VERTICES">MAX_HULL_VERTICES (newton.Mesh attribute)</a>
         </dt>
         <dt>
@@ -6026,13 +6066,13 @@ window.runMermaid = runMermaid;</script>
         <dt>
           <a href="api/_generated/newton.ModelBuilder.html#newton.ModelBuilder.CustomAttribute.mjcf_attribute_name">mjcf_attribute_name (newton.ModelBuilder.CustomAttribute attribute)</a>
         </dt>
-        <dt>
-          <a href="api/_generated/newton.ModelBuilder.html#newton.ModelBuilder.CustomAttribute.mjcf_value_transformer">mjcf_value_transformer (newton.ModelBuilder.CustomAttribute attribute)</a>
-        </dt>
       </dl>
     </td>
     <td style="width: 33%; vertical-align: top;">
       <dl>
+        <dt>
+          <a href="api/_generated/newton.ModelBuilder.html#newton.ModelBuilder.CustomAttribute.mjcf_value_transformer">mjcf_value_transformer (newton.ModelBuilder.CustomAttribute attribute)</a>
+        </dt>
         <dt>
           <a href="api/newton_solvers_experimental_coupled.html#newton.solvers.experimental.coupled.SolverCoupledProxy.Proxy.mode">mode (newton.solvers.experimental.coupled.SolverCoupledProxy.Proxy attribute)</a>
         </dt>
@@ -6447,6 +6487,7 @@ window.runMermaid = runMermaid;</script>
           <dl>
             <dt><a href="api/newton_solvers_experimental_coupled.html#newton.solvers.experimental.coupled.SolverCoupledADMM.notify_model_changed">(newton.solvers.experimental.coupled.SolverCoupledADMM method)</a></dt>
             <dt><a href="api/newton_solvers_experimental_coupled.html#newton.solvers.experimental.coupled.SolverCoupledProxy.notify_model_changed">(newton.solvers.experimental.coupled.SolverCoupledProxy method)</a></dt>
+            <dt><a href="api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater.notify_model_changed">(newton.solvers.SolverAPICWater method)</a></dt>
             <dt><a href="api/_generated/newton.solvers.SolverBase.html#newton.solvers.SolverBase.notify_model_changed">(newton.solvers.SolverBase method)</a></dt>
             <dt><a href="api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.notify_model_changed">(newton.solvers.SolverFBA method)</a></dt>
             <dt><a href="api/_generated/newton.solvers.SolverFeatherstone.html#newton.solvers.SolverFeatherstone.notify_model_changed">(newton.solvers.SolverFeatherstone method)</a></dt>
@@ -6897,6 +6938,9 @@ window.runMermaid = runMermaid;</script>
           <a href="api/_generated/newton.geometry.HydroelasticSDF.html#newton.geometry.HydroelasticSDF.Config.pressure_func">pressure_func (newton.geometry.HydroelasticSDF.Config attribute)</a>
         </dt>
         <dt>
+          <a href="api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater.Config.pressure_iterations">pressure_iterations (newton.solvers.SolverAPICWater.Config attribute)</a>
+        </dt>
+        <dt>
           <a href="api/_generated/newton.usd.PrimType.html#newton.usd.PrimType">PrimType (class in newton.usd)</a>
         </dt>
         <dt>
@@ -7082,7 +7126,9 @@ window.runMermaid = runMermaid;</script>
         <dd>
           <dl>
             <dt><a href="api/newton_solvers_experimental_coupled.html#newton.solvers.experimental.coupled.SolverCoupledADMM.register_custom_attributes">(newton.solvers.experimental.coupled.SolverCoupledADMM class method)</a></dt>
+            <dt><a href="api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater.register_custom_attributes">(newton.solvers.SolverAPICWater class method)</a></dt>
             <dt><a href="api/_generated/newton.solvers.SolverBase.html#newton.solvers.SolverBase.register_custom_attributes">(newton.solvers.SolverBase class method)</a></dt>
+            <dt><a href="api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.register_custom_attributes">(newton.solvers.SolverFBA class method)</a></dt>
             <dt><a href="api/_generated/newton.solvers.SolverImplicitMPM.html#newton.solvers.SolverImplicitMPM.register_custom_attributes">(newton.solvers.SolverImplicitMPM class method)</a></dt>
             <dt><a href="api/_generated/newton.solvers.SolverKamino.html#newton.solvers.SolverKamino.register_custom_attributes">(newton.solvers.SolverKamino static method)</a></dt>
             <dt><a href="api/_generated/newton.solvers.SolverKamino.html#newton.solvers.SolverKamino.Config.register_custom_attributes">(newton.solvers.SolverKamino.Config static method)</a></dt>
@@ -7553,6 +7599,9 @@ window.runMermaid = runMermaid;</script>
           <a href="api/_generated/newton.solvers.SolverImplicitMPM.html#newton.solvers.SolverImplicitMPM.Config.separate_worlds">separate_worlds (newton.solvers.SolverImplicitMPM.Config attribute)</a>
         </dt>
         <dt>
+          <a href="api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater.Config.separation">separation (newton.solvers.SolverAPICWater.Config attribute)</a>
+        </dt>
+        <dt>
           <a href="api/_generated/newton.viewer.ViewerViser.html#newton.viewer.ViewerViser.server">server (newton.viewer.ViewerViser property)</a>
         </dt>
         <dt>
@@ -7716,6 +7765,9 @@ window.runMermaid = runMermaid;</script>
         </dd>
         <dt>
           <a href="api/_generated/newton.solvers.SolverImplicitMPM.html#newton.solvers.SolverImplicitMPM.setup_collider">setup_collider() (newton.solvers.SolverImplicitMPM method)</a>
+        </dt>
+        <dt>
+          <a href="api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater.setup_colliders">setup_colliders() (newton.solvers.SolverAPICWater method)</a>
         </dt>
         <dt>
           <a href="api/_generated/newton.Gaussian.html#newton.Gaussian.sh_coeffs">sh_coeffs (newton.Gaussian property)</a>
@@ -8016,10 +8068,6 @@ window.runMermaid = runMermaid;</script>
         <dt>
           <a href="api/newton_solvers_experimental_coupled.html#newton.solvers.experimental.coupled.SolverCoupled.Entry.shapes">shapes (newton.solvers.experimental.coupled.SolverCoupled.Entry attribute)</a>
         </dt>
-      </dl>
-    </td>
-    <td style="width: 33%; vertical-align: top;">
-      <dl>
         <dt>
           <a href="api/_generated/newton.actuators.ClampingBase.html#newton.actuators.ClampingBase.SHARED_PARAMS">SHARED_PARAMS (newton.actuators.ClampingBase attribute)</a>
         </dt>
@@ -8032,6 +8080,10 @@ window.runMermaid = runMermaid;</script>
             <dt><a href="api/_generated/newton.actuators.DriveNeuralMLP.html#newton.actuators.DriveNeuralMLP.SHARED_PARAMS">(newton.actuators.DriveNeuralMLP attribute)</a></dt>
           </dl>
         </dd>
+      </dl>
+    </td>
+    <td style="width: 33%; vertical-align: top;">
+      <dl>
         <dt>
           <a href="api/_generated/newton.solvers.SolverVBD.html#newton.solvers.SolverVBD.JointSlot.SHEAR">SHEAR (newton.solvers.SolverVBD.JointSlot attribute)</a>
         </dt>
@@ -8211,6 +8263,12 @@ window.runMermaid = runMermaid;</script>
             <dt><a href="api/_generated/newton.sensors.SensorIMU.html#newton.sensors.SensorIMU.solver_observable_kinds">(newton.sensors.SensorIMU attribute)</a></dt>
           </dl>
         </dd>
+        <dt>
+          <a href="api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater">SolverAPICWater (class in newton.solvers)</a>
+        </dt>
+        <dt>
+          <a href="api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater.Config">SolverAPICWater.Config (class in newton.solvers)</a>
+        </dt>
         <dt>
           <a href="api/_generated/newton.solvers.SolverBase.html#newton.solvers.SolverBase">SolverBase (class in newton.solvers)</a>
         </dt>
@@ -8482,6 +8540,7 @@ window.runMermaid = runMermaid;</script>
             <dt><a href="api/_generated/newton.ik.IKOptimizerLM.html#newton.ik.IKOptimizerLM.step">(newton.ik.IKOptimizerLM method)</a></dt>
             <dt><a href="api/_generated/newton.ik.IKSolver.html#newton.ik.IKSolver.step">(newton.ik.IKSolver method)</a></dt>
             <dt><a href="api/newton_solvers_experimental_coupled.html#newton.solvers.experimental.coupled.SolverCoupled.step">(newton.solvers.experimental.coupled.SolverCoupled method)</a></dt>
+            <dt><a href="api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater.step">(newton.solvers.SolverAPICWater method)</a></dt>
             <dt><a href="api/_generated/newton.solvers.SolverBase.html#newton.solvers.SolverBase.step">(newton.solvers.SolverBase method)</a></dt>
             <dt><a href="api/_generated/newton.solvers.SolverFBA.html#newton.solvers.SolverFBA.step">(newton.solvers.SolverFBA method)</a></dt>
             <dt><a href="api/_generated/newton.solvers.SolverFeatherstone.html#newton.solvers.SolverFeatherstone.step">(newton.solvers.SolverFeatherstone method)</a></dt>
@@ -9340,13 +9399,13 @@ window.runMermaid = runMermaid;</script>
         <dt>
           <a href="api/_generated/newton.ModelBuilder.html#newton.ModelBuilder.JointDofConfig.velocity_limit">velocity_limit (newton.ModelBuilder.JointDofConfig attribute)</a>
         </dt>
+        <dt>
+          <a href="api/_generated/newton.solvers.SolverSteel.html#newton.solvers.SolverSteel.velocity_limit_activation_fraction">velocity_limit_activation_fraction (newton.solvers.SolverSteel attribute)</a>
+        </dt>
       </dl>
     </td>
     <td style="width: 33%; vertical-align: top;">
       <dl>
-        <dt>
-          <a href="api/_generated/newton.solvers.SolverSteel.html#newton.solvers.SolverSteel.velocity_limit_activation_fraction">velocity_limit_activation_fraction (newton.solvers.SolverSteel attribute)</a>
-        </dt>
         <dt>
           <a href="api/_generated/newton.solvers.SolverSteel.html#newton.solvers.SolverSteel.velocity_limits_fused">velocity_limits_fused (newton.solvers.SolverSteel property)</a>
         </dt>
@@ -9410,6 +9469,9 @@ window.runMermaid = runMermaid;</script>
           <a href="api/_generated/newton.geometry.ParticleSurface.html#newton.geometry.ParticleSurface.SparseField.volume">volume (newton.geometry.ParticleSurface.SparseField attribute)</a>
         </dt>
         <dt>
+          <a href="api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater.Config.volume_correction">volume_correction (newton.solvers.SolverAPICWater.Config attribute)</a>
+        </dt>
+        <dt>
           <a href="api/_generated/newton.ModelBuilder.html#newton.ModelBuilder.volume_label">volume_label (newton.ModelBuilder attribute)</a>
         </dt>
         <dt>
@@ -9423,6 +9485,7 @@ window.runMermaid = runMermaid;</script>
         </dt>
         <dd>
           <dl>
+            <dt><a href="api/_generated/newton.solvers.SolverAPICWater.html#newton.solvers.SolverAPICWater.Config.voxel_size">(newton.solvers.SolverAPICWater.Config attribute)</a></dt>
             <dt><a href="api/_generated/newton.solvers.SolverImplicitMPM.html#newton.solvers.SolverImplicitMPM.voxel_size">(newton.solvers.SolverImplicitMPM property)</a></dt>
             <dt><a href="api/_generated/newton.solvers.SolverImplicitMPM.html#newton.solvers.SolverImplicitMPM.Config.voxel_size">(newton.solvers.SolverImplicitMPM.Config attribute)</a></dt>
           </dl>
