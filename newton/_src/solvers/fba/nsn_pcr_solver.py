@@ -102,6 +102,16 @@ def _world_dot_kernel(
 
 
 @wp.kernel
+def _serial_dot_kernel(a: wp.array[wp.float64], b: wp.array[wp.float64], n: int, out: wp.array[wp.float64]):
+    """``out[0] = a[:n] . b[:n]``, added in row order by one thread: the order of :func:`_world_dot_kernel` on the
+    CPU, whatever the order of the native reduction of ``wp.utils.array_inner`` on the machine."""
+    total = wp.float64(0.0)
+    for i in range(n):
+        total += a[i] * b[i]
+    out[0] = total
+
+
+@wp.kernel
 def _world_dense_mv_kernel(
     A: wp.array2d[wp.float64],
     x: wp.array[wp.float64],
@@ -1458,7 +1468,8 @@ class NSNPCRSolver:
         # accumulator at the typical n ~ 600..1500 sizes.
         dot_b = 0.0
         if not unchecked:
-            dot_b = float(wp.utils.array_inner(b, b, count=n))
+            self._dot(b, b, self._r_norm_d, n)
+            dot_b = float(self._r_norm_d.numpy()[0])
             if dot_b == 0.0:
                 wp.copy(x_out, self._x, count=n)
                 return (0, 0.0)
@@ -1537,7 +1548,7 @@ class NSNPCRSolver:
                     self._pcr_iter_eager(A, n, n_pad, device)
                     nb_iter += 1
 
-            wp.utils.array_inner(self._r, self._r, out=self._r_norm_d, count=n)
+            self._dot(self._r, self._r, self._r_norm_d, n)
             r_norm_sq = float(self._r_norm_d.numpy()[0])
             if self._stopped_d.numpy()[0] != 0.0:
                 break
@@ -1607,7 +1618,8 @@ class NSNPCRSolver:
 
         # ----- Early exit if b == 0 -------------------------------------
         if not unchecked:
-            dot_b = float(wp.utils.array_inner(b, b, count=n))
+            self._dot(b, b, self._r_norm_d, n)
+            dot_b = float(self._r_norm_d.numpy()[0])
             if dot_b == 0.0:
                 wp.copy(x_out, self._x, count=n)
                 return 0
@@ -1632,7 +1644,7 @@ class NSNPCRSolver:
             block_precond(self._r, self._s)
         wp.copy(self._d, self._s, count=n)
         wps.bsr_mv(W_bsr, self._d[:n], self._q[:n])
-        wp.utils.array_inner(self._s, self._q, out=self._rho_d, count=n)
+        self._dot(self._s, self._q, self._rho_d, n)
         self._stopped_d.zero_()
         if unchecked:
             for _ in range(max_iter):
@@ -1649,7 +1661,7 @@ class NSNPCRSolver:
             while nb_iter < block_end:
                 self._pcr_iter_eager(None, n, n, device, W_bsr=W_bsr, diag=diag_blocks)
                 nb_iter += 1
-            wp.utils.array_inner(self._r, self._r, out=self._r_norm_d, count=n)
+            self._dot(self._r, self._r, self._r_norm_d, n)
             r_norm_sq = float(self._r_norm_d.numpy()[0])
             if self._stopped_d.numpy()[0] != 0.0:
                 break
@@ -2073,7 +2085,7 @@ class NSNPCRSolver:
         """``out[0] = a[:n] . b[:n]``: by ``wp.utils.array_inner``, or with ``fixed_sums`` on CUDA by per-block tile
         sums added in block order, which allocate nothing (CUDA graph conditional bodies take no allocations)."""
         if not self._fixed_sums or not wp.get_device(self.device).is_cuda:
-            wp.utils.array_inner(a, b, out=out, count=n)
+            self._dot(a, b, out, n)
             return
         blocks = (n + int(_DOT_BLOCK) - 1) // int(_DOT_BLOCK)
         wp.launch_tiled(
@@ -2085,6 +2097,15 @@ class NSNPCRSolver:
             device=self.device,
         )
         wp.launch(_dot_finish_kernel, 1, [self._dot_partials, blocks], [out], device=self.device)
+
+    def _dot(self, a: wp.array, b: wp.array, out: wp.array, n: int) -> None:
+        """``out[0] = a[:n] . b[:n]``: on the CPU in row order (:func:`_serial_dot_kernel`), as the solves of several
+        worlds add each world's (:func:`_world_dot_kernel`), so that a world alone and among others take the same
+        sums on every machine; on CUDA by ``wp.utils.array_inner``."""
+        if wp.get_device(self.device).is_cpu:
+            wp.launch(_serial_dot_kernel, 1, [a, b, n], [out], device=self.device)
+        else:
+            wp.utils.array_inner(a, b, out=out, count=n)
 
     def _get_or_build_pcr_iter_graph(
         self,
