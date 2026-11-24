@@ -2269,8 +2269,8 @@ class TestGraphCapture(unittest.TestCase):
     @staticmethod
     def _scene(kind, ground=False):
         """A contact-free scene: a pinned cloth, a pinned soft body, a three-link arm with drives and damping, or
-        (``"bounded arm"``) the arm with an effort limit on its drive and friction on its other joints, and with
-        ``ground`` a ground plane."""
+        (``"bounded arm"``) the arm with an effort limit on its drive, friction on its other joints and limits on the
+        last, and with ``ground`` a ground plane."""
         builder = newton.ModelBuilder()
         if ground:
             builder.add_ground_plane()
@@ -2307,6 +2307,7 @@ class TestGraphCapture(unittest.TestCase):
             if kind == "bounded arm":
                 builder.joint_effort_limit[0] = 5.0
                 builder.joint_friction[1:3] = [0.05, 0.05]
+                builder.joint_limit_lower[2], builder.joint_limit_upper[2] = -0.2, 0.2
         return builder.finalize()
 
     def test_contact_free_steps_replay_from_a_graph(self):

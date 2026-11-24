@@ -457,19 +457,18 @@ class TestSolverFBAJointLimits(unittest.TestCase):
     """SolverFBA enforces the limits and the passive damping of revolute and prismatic joints."""
 
     def _run(self, model, h, steps, **solver_args):
-        """Each step's body poses and velocities, ``[step, body, 7 or 6]``, and its count of limit rows."""
+        """Each step's body poses and velocities, ``[step, body, 7 or 6]``, and the solver."""
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
         solver = SolverFBA(model, iterations=5, **solver_args)
         s0, s1 = model.state(), model.state()
-        q, qd, limit_rows = [], [], []
+        q, qd = [], []
         for _ in range(steps):
             solver.step(s0, s1, None, None, h)
             s0, s1 = s1, s0
             q.append(s0.body_q.numpy().astype(np.float64))
             qd.append(s0.body_qd.numpy().astype(np.float64))
-            limit_rows.append(solver._rc_limits)
-        return np.array(q), np.array(qd), limit_rows
+        return np.array(q), np.array(qd), solver
 
     @staticmethod
     def _pendulum(builder, lower, upper, damping=0.0):
@@ -487,17 +486,18 @@ class TestSolverFBAJointLimits(unittest.TestCase):
         builder.add_articulation([joint])
 
     def test_revolute_limit_stops_the_pendulum(self):
-        """Stop a pendulum released horizontally at its lower limit and hold it there, with its two limit rows
-        present only near the limits."""
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
-        self._pendulum(builder, -0.5, 0.5)
-        q, qd, limit_rows = self._run(builder.finalize(), 0.005, 200)
-        angle = np.arctan2(q[:, 0, 1], q[:, 0, 0])
-        self.assertGreater(angle.min(), -0.5 - 1e-3)
-        self.assertAlmostEqual(angle[-1], -0.5, delta=1e-4)
-        self.assertLess(abs(qd[-1, 0, 5]), 1e-3)
-        # Released at 0.5 rad from either limit, it starts without limit rows; it ends with the lower one.
-        self.assertEqual((limit_rows[0], limit_rows[-1]), (0, 1))
+        """Stop a pendulum released horizontally at its lower limit and hold it there, its limits held by the law of
+        its axis's one row, with the full and the lite operator and without friction."""
+        for args in ({}, {"nsn_schur_mode": "lite"}, {"friction": False}):
+            with self.subTest(**args):
+                builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+                self._pendulum(builder, -0.5, 0.5)
+                q, qd, solver = self._run(builder.finalize(), 0.005, 200, **args)
+                angle = np.arctan2(q[:, 0, 1], q[:, 0, 0])
+                self.assertGreater(angle.min(), -0.5 - 1e-3)
+                self.assertAlmostEqual(angle[-1], -0.5, delta=1e-4)
+                self.assertLess(abs(qd[-1, 0, 5]), 1e-3)
+                self.assertEqual(solver._joint_system.law_rows.shape[0], 1)
 
     def test_friction_holds_the_pendulum_at_its_limit(self):
         """Hold a pendulum that gravity pushes into its lower limit there, with joint friction on the axis of the
@@ -534,7 +534,7 @@ class TestSolverFBAJointLimits(unittest.TestCase):
 
     def test_damping_matches_implicit_euler(self):
         """Slow a free spin and a free slide of unit inertia with damping ``c`` by ``1 / (1 + c dt)`` per step,
-        alone in the joint system and, near a limit, with the limit's row in the contact solve."""
+        without limits and starting next to a lower limit, which the law of the axis's row holds with the damping."""
         dt, n = 0.01, 40
         for kind, c, lower in (("revolute", 0.5, -1.0e10), ("revolute", 5.0, -1.0e10), ("prismatic", 2.0, -1.0e10),
                                ("revolute", 2.0, -0.01), ("prismatic", 2.0, -0.001)):  # fmt: skip
@@ -551,13 +551,10 @@ class TestSolverFBAJointLimits(unittest.TestCase):
                 qd0 = model.body_qd.numpy()
                 qd0[0, lane] = 1.0
                 model.body_qd.assign(qd0)
-                _q, qd, limit_rows = self._run(model, dt, n)
+                _q, qd, solver = self._run(model, dt, n)
                 expected = (1.0 / (1.0 + c * dt)) ** np.arange(1, n + 1)
                 np.testing.assert_allclose(qd[:, 0, lane], expected, rtol=1e-5)
-                # Starting next to its lower limit, the axis takes its row for its first steps, which moves the joint
-                # rows into the contact solve, the damper among them; moving away, it drops the row.
-                near = lower > -1.0
-                self.assertEqual((limit_rows[0], limit_rows[-1]), (int(near), 0))
+                self.assertEqual(solver._joint_system.law_rows.shape[0], int(lower > -1.0))
 
     def test_ball_and_d6_damping_match_implicit_euler(self):
         """Damp each free axis of a ball and a D6 joint by its own coefficient: a free body of unit inertia on a ball
@@ -628,7 +625,7 @@ class TestSolverFBAJointLimits(unittest.TestCase):
         np.testing.assert_allclose(angle, [-0.5, -0.3], atol=1e-4)
 
     def test_default_joints_take_no_limit_or_damper_rows(self):
-        """Give joints at the default infinite limits and zero damping no limit candidates and no damper rows."""
+        """Give joints at the default infinite limits and zero damping no axis rows."""
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
         builder = newton.ModelBuilder()
@@ -636,7 +633,7 @@ class TestSolverFBAJointLimits(unittest.TestCase):
         model = builder.finalize()
         solver = SolverFBA(model, iterations=5)
         solver.step(model.state(), model.state(), None, None, 0.01)
-        self.assertIsNone(solver._limits)
+        self.assertEqual(solver._joint_system.law_rows.shape[0], 0)
         self.assertFalse(solver._joint_dampers)
         self.assertEqual(solver._joint_system.compliance.shape[0], 0)
 
@@ -681,7 +678,7 @@ class TestSolverFBAJointState(unittest.TestCase):
         expected = rate * (1.0 - (1.0 / (1.0 + c * dt)) ** n)
         self.assertAlmostEqual(float(s0.body_qd.numpy()[1, 5]), expected, delta=1e-3 * rate)
 
-    def test_reset_clears_the_limit_warm_start(self):
+    def test_reset_clears_the_limit_state(self):
         """Step a pendulum resting on its lower limit with the contact warm start, reset it, and step it as a fresh
         solver does."""
         from newton.solvers import SolverFBA  # noqa: PLC0415
@@ -837,10 +834,12 @@ def _implicit_euler(n, dt, inertia, ke=0.0, kd=0.0, c=0.0, armature=0.0, q_targe
 
 
 def _box_euler(n, dt, inertia, ke=0.0, kd=0.0, c=0.0, armature=0.0, q_target=0.0, qd_target=0.0, force=0.0, **box):
-    """Coordinates and rates of an axis as :func:`_implicit_euler`, its drive's force bounded by ``box["effort"]`` and
-    a dry friction of ``box["friction"]`` on it: each step's end rate ``w`` holds ``h(w) + f = 0`` for the axis's
-    other forces ``h`` less its inertial force and a friction force ``f`` within ``[-F, F]`` that opposes ``w``."""
+    """Coordinates and rates of an axis as :func:`_implicit_euler`, its drive's force bounded by ``box["effort"]``, a
+    dry friction of ``box["friction"]`` on it and the limits ``box["lower"]`` and ``box["upper"]``: each step's end
+    rate ``w`` holds ``h(w) + f = 0`` for the axis's other forces ``h`` less its inertial force and a friction force
+    ``f`` within ``[-F, F]`` that opposes ``w``, unless that passes a limit, which then holds the axis at it."""
     effort, friction = box.get("effort", np.inf), box.get("friction", 0.0)
+    lower, upper = box.get("lower", -np.inf), box.get("upper", np.inf)
     q = v = 0.0
     m = inertia + armature
     out = []
@@ -862,6 +861,7 @@ def _box_euler(n, dt, inertia, ke=0.0, kd=0.0, c=0.0, armature=0.0, q_target=0.0
                 else:
                     lo, hi = (lo, mid) if s > 0 else (mid, hi)
             w = 0.5 * (lo + hi)
+        w = min(max(w, (lower - q) / dt), (upper - q) / dt)
         v = w
         q += dt * v
         out.append((q, v))
@@ -872,12 +872,17 @@ class TestSolverFBAJointDrives(unittest.TestCase):
     """SolverFBA's joint drives, armature and generalized joint forces (``Control.joint_f``)."""
 
     @staticmethod
-    def _axis_model(kind, lower=-1.0e10, upper=1.0e10, **dof):
+    def _axis_model(kind, lower=-1.0e10, upper=1.0e10, wall=False, **dof):
         """A unit body on a revolute joint about z through its COM or a prismatic joint along z, without gravity, its
         DOF's ``target_ke``, ``target_kd``, ``damping``, ``armature``, ``friction`` and ``effort_limit`` set from
-        ``dof``."""
+        ``dof``. With ``wall``, a sphere on the body touches a static wall beside the axis, which neither its turn nor
+        its slide moves it toward: a contact on the body without force, which joins its joint rows to the contact
+        solve."""
         builder = newton.ModelBuilder()
         link = _link(builder)
+        if wall:
+            builder.add_shape_sphere(link, radius=0.1, cfg=newton.ModelBuilder.ShapeConfig(density=0.0))
+            builder.add_shape_box(-1, xform=wp.transform((-0.6, 0.0, 0.0)), hx=0.5, hy=1.0, hz=1.0)
         add = builder.add_joint_revolute if kind == "revolute" else builder.add_joint_prismatic
         builder.add_articulation([add(-1, link, axis=(0.0, 0.0, 1.0), limit_lower=lower, limit_upper=upper)])
         model = builder.finalize()
@@ -890,20 +895,27 @@ class TestSolverFBAJointDrives(unittest.TestCase):
     @staticmethod
     def _run(model, dt, n, targets=None, joint_f=None):
         """Each step's body poses and velocities, ``[step, 7 or 6]`` of body 0, with ``targets`` as
-        ``{step: (q*, q_dot*)}`` set on the control from that step on, and a constant ``joint_f``."""
+        ``{step: (q*, q_dot*)}`` set on the control from that step on, and a constant ``joint_f``; a model with
+        shapes takes its contacts at each step and asserts that the contact solve holds its joint rows."""
         from newton.solvers import SolverFBA  # noqa: PLC0415
 
         solver = SolverFBA(model, iterations=5)
         control = model.control()
         if joint_f is not None:
             control.joint_f.assign(np.asarray(joint_f, dtype=np.float32))
+        pipeline = newton.CollisionPipeline(model) if model.shape_count else None
+        contacts = None if pipeline is None else pipeline.contacts()
         s0, s1 = model.state(), model.state()
         q, qd = [], []
         for k in range(n):
             if targets and k in targets:
                 control.joint_target_q.assign(np.atleast_1d(np.float32(targets[k][0])))
                 control.joint_target_qd.assign(np.atleast_1d(np.float32(targets[k][1])))
-            solver.step(s0, s1, control, None, dt)
+            if pipeline is not None:
+                pipeline.collide(s0, contacts)
+            solver.step(s0, s1, control, contacts, dt)
+            if pipeline is not None:
+                assert len(solver._rc_joint_rows_h), "the contact solve takes no joint rows"
             s0, s1 = s1, s0
             q.append(s0.body_q.numpy()[0].astype(np.float64))
             qd.append(s0.body_qd.numpy()[0].astype(np.float64))
@@ -951,16 +963,16 @@ class TestSolverFBAJointDrives(unittest.TestCase):
         """Bound the drive force of an axis of unit inertia by its effort limit, its damping and armature unbounded,
         step for step as the backward Euler step with the drive's force clamped: a position drive that saturates
         on its way to a far target and on its way back from the overshoot, a velocity drive that saturates until
-        it nears its target rate, alone in the joint system and, next to a limit, with the joint rows in the
-        contact solve; the default effort limit leaves the drive unbounded."""
+        it nears its target rate, alone in the joint system and, with a contact on the body, with the joint rows in
+        the contact solve; the default effort limit leaves the drive unbounded."""
         dt, n = 0.01, 300
         cases = (
             ("revolute", {}, {"target_ke": 50.0, "target_kd": 5.0, "effort_limit": 2.0}, (1.0, 0.0)),
             ("revolute", {}, {"target_ke": 50.0, "target_kd": 5.0, "damping": 1.0, "armature": 0.5,
                               "effort_limit": 2.0}, (1.0, 0.0)),
             ("prismatic", {}, {"target_kd": 10.0, "effort_limit": 1.0}, (0.0, 2.0)),
-            ("revolute", {"lower": -0.01, "upper": 2.0}, {"target_ke": 50.0, "target_kd": 5.0, "effort_limit": 2.0},
-             (1.0, 0.0)),
+            ("revolute", {"wall": True}, {"target_ke": 50.0, "target_kd": 5.0, "effort_limit": 2.0}, (1.0, 0.0)),
+            ("prismatic", {"wall": True}, {"target_kd": 10.0, "effort_limit": 1.0}, (0.0, 2.0)),
             ("revolute", {}, {"target_ke": 50.0, "target_kd": 5.0, "effort_limit": 1.0e6}, (1.0, 0.0)),
         )  # fmt: skip
         for kind, limits, dof, target in cases:
@@ -985,16 +997,16 @@ class TestSolverFBAJointDrives(unittest.TestCase):
         """Hold an axis of unit inertia still against a generalized force below its joint friction and slide it
         under one above, then hold a driven axis short of its target where the drive's force falls below the
         friction, each step for step as the backward Euler step with dry friction, alone in the joint system and,
-        next to a limit, with the joint rows in the contact solve."""
+        with a contact on the body, with the joint rows in the contact solve."""
         dt, n = 0.01, 200
         cases = (
             ("revolute", {}, {"friction": 1.0}, None, 0.5),
             ("revolute", {}, {"friction": 0.2}, None, 0.5),
             ("prismatic", {}, {"friction": 0.3, "damping": 2.0}, None, -1.0),
             ("revolute", {}, {"friction": 1.0, "target_ke": 20.0, "target_kd": 4.0}, (0.6, 0.0), 0.0),
-            ("revolute", {"lower": -0.01, "upper": 2.0}, {"friction": 0.2}, None, 0.5),
-            ("revolute", {"lower": -0.01, "upper": 2.0}, {"friction": 1.0, "target_ke": 20.0, "target_kd": 4.0},
-             (0.6, 0.0), 0.0),
+            ("revolute", {"wall": True}, {"friction": 0.2}, None, 0.5),
+            ("prismatic", {"wall": True}, {"friction": 1.0}, None, 0.5),
+            ("revolute", {"wall": True}, {"friction": 1.0, "target_ke": 20.0, "target_kd": 4.0}, (0.6, 0.0), 0.0),
         )  # fmt: skip
         for kind, limits, dof, target, force in cases:
             with self.subTest(kind=kind, limits=limits, force=force, **dof):
@@ -1013,6 +1025,24 @@ class TestSolverFBAJointDrives(unittest.TestCase):
                 )
                 np.testing.assert_allclose(coordinate, expected[:, 0], rtol=1e-4, atol=1e-6)
                 np.testing.assert_allclose(rate, expected[:, 1], rtol=1e-4, atol=1e-6)
+
+    def test_limits_with_drives_and_friction(self):
+        """Stop an axis of unit inertia at its limit while a drive bounded by its effort limit pushes it there, with
+        and without friction, step for step as the backward Euler step with the axis held within its limits, alone in
+        the joint system and, with a contact on the body, with the joint rows in the contact solve."""
+        dt, n = 0.01, 200
+        for kind, friction, wall in itertools.product(("revolute", "prismatic"), (0.0, 0.5), (False, True)):
+            with self.subTest(kind=kind, friction=friction, wall=wall):
+                dof = {"target_ke": 50.0, "target_kd": 5.0, "effort_limit": 2.0, "friction": friction}
+                model = self._axis_model(kind, lower=-0.2, upper=0.3, wall=wall, **dof)
+                q, qd = self._run(model, dt, n, targets={0: (1.0, 0.0)})
+                coordinate, rate = self._coordinate(kind, q, qd)
+                expected = _box_euler(
+                    n, dt, 1.0, ke=50.0, kd=5.0, q_target=1.0, effort=2.0, friction=friction, upper=0.3
+                )
+                np.testing.assert_allclose(coordinate, expected[:, 0], rtol=1e-4, atol=1e-6)
+                np.testing.assert_allclose(rate, expected[:, 1], rtol=1e-4, atol=1e-5)
+                self.assertAlmostEqual(coordinate[-1], 0.3, delta=1e-6)
 
     def test_joint_forces_accelerate_the_axes(self):
         """Accelerate an axis of unit inertia with armature 0.5 by a constant generalized force, as the backward

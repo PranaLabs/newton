@@ -9,18 +9,17 @@ the complement of its free angular axes locks the relative rotation. Directions
 are expressed in the joint frame carried by the parent body.
 
 Each free axis with passive damping (``Model.joint_damping``), a drive
-(``Model.joint_target_ke`` or ``Model.joint_target_kd``) or armature
-(``Model.joint_armature``) adds a soft row on the axis's motion over the step,
-the backward Euler step of their forces, and each finite limit of the free axis
-of a revolute or prismatic joint (``Model.joint_limit_lower`` and
-``Model.joint_limit_upper``) a candidate for a unilateral limit row, which
-joins the step's rigid contact rows when the axis comes near the limit.
-
-Two kinds of rows hold a force within a box, by a box law in each Newton step
-(:func:`joint_box_law_kernel`): the soft row of a driven axis whose effort limit
-(``Model.joint_effort_limit``) is below 1e6 bounds its drive's force, and each
-free axis with joint friction (``Model.joint_friction``) adds a row on its
-motion whose force the friction bounds.
+(``Model.joint_target_ke`` or ``Model.joint_target_kd``), armature
+(``Model.joint_armature``), joint friction (``Model.joint_friction``) or, on a
+revolute or prismatic joint, finite limits (``Model.joint_limit_lower`` and
+``Model.joint_limit_upper``) adds one row on the axis's motion over the step,
+whose force is the axis's total force: the backward Euler step of the drive,
+damping and armature forces, the drive bounded by its effort limit
+(``Model.joint_effort_limit``) when below 1e6, the dry friction, and the
+limits' forces. The relation between the row's motion and force is monotone and
+piecewise linear: a row with an effort limit, friction or limits takes, at each
+Newton step, the piece that one step of the row alone would reach
+(:func:`joint_axis_law_kernel`).
 
 A mimic joint (``Model.joint_mimic_joint``) holds each coordinate at ``c0 + c1``
 times its leader's, as a pair of rows on the two axes, the follower's and the
@@ -64,19 +63,22 @@ ROW_MIMIC = wp.constant(4)
 """A row on the coordinate of a free axis, half of a mimic pair: the follower's row, combined with its leader's, holds
 the follower's coordinate at ``c0 + c1`` times the leader's."""
 
-BOX_NONE = wp.constant(0)
-"""A row without a box law."""
-BOX_EFFORT = wp.constant(1)
-"""A soft row whose drive force ``ke (q* - q) + kd (q_dot* - q_dot)`` the DOF's effort limit bounds; its damping and
-armature stay unbounded."""
-BOX_FRICTION = wp.constant(2)
-"""A row on the motion along a free axis that holds it still, with the force the DOF's friction bounds."""
-BOX_FREEZE = wp.constant(1.0e6)
-"""Compliance of a row held at the bound of its box, relative to its ``W_ii`` plus its compliance off the bound: a
-Newton step lands its force on the bound."""
-FRICTION_STICK = wp.constant(1.0e-4)
-"""Compliance of a friction row that holds its axis, relative to its ``W_ii``: next to a limit row on the same axis,
-the two rows' system stays nonsingular."""
+LAW_SOFT = wp.constant(0)
+"""A row whose compliance and target motion hold for the step (:func:`joint_soft_row_kernel`)."""
+LAW_AXIS = wp.constant(1)
+"""The row of a free axis whose force law has several pieces: a drive bounded by its effort limit, joint friction or
+limits. :func:`joint_axis_law_kernel` linearizes it at each Newton step."""
+LAW_FREEZE = wp.constant(1.0e6)
+"""Compliance, relative to ``W_ii``, of an axis row whose force does not change with its motion on its piece, such as
+a drive at its effort limit or a sliding friction: a Newton step lands the force on its value up to the step's own
+motion over this compliance."""
+LAW_HOLD = wp.constant(1.0e-4)
+"""Compliance, relative to ``W_ii``, of an axis row held at a motion, by static friction or at a limit: it regularizes
+the Newton step alone, the row's target motion following its force."""
+LAW_FAR = wp.constant(1.0e30)
+"""The motion bound [rad or m] of an axis without that limit."""
+_FINITE_LIMIT = wp.constant(0.5 * MAXVAL)
+"""Limits beyond this magnitude [rad or m] are absent."""
 EFFORT_UNLIMITED = 1.0e6
 """Effort limits at or above this value, the builder's default, leave a drive unbounded."""
 
@@ -124,8 +126,10 @@ class JointRows:
     row_coord: wp.array[wp.int32]
     """Model coordinate of each soft row's position target, -1 for the other rows and for axes without a position
     drive, shape [row_count]."""
-    row_box: wp.array[wp.int32]
-    """:data:`BOX_NONE`, :data:`BOX_EFFORT` or :data:`BOX_FRICTION` per row, shape [row_count]."""
+    row_law: wp.array[wp.int32]
+    """:data:`LAW_SOFT` or :data:`LAW_AXIS` per row, shape [row_count]."""
+    row_limited: wp.array[wp.int32]
+    """1 for the axis row of a revolute or prismatic joint with limits, which its law holds, shape [row_count]."""
     mimic_rows: np.ndarray
     """The follower's and the leader's row of each mimic pair, shape [pair_count, 2]."""
     mimic_coeffs: np.ndarray
@@ -234,34 +238,51 @@ def build_joint_rows(model: Model, body_slot: np.ndarray, device) -> JointRows |
     effort = per_dof(getattr(model, "joint_effort_limit", None))
     if getattr(model, "joint_effort_limit", None) is None:
         effort[:] = EFFORT_UNLIMITED
+    lower, upper = model.joint_limit_lower.numpy(), model.joint_limit_upper.numpy()
     zero = np.zeros(3)
     # (block, local joint index, angular, direction, kind, damping, second axis, dof, coordinate, mimic pair and side,
-    # box law)
+    # law, limited)
     rows = []
+    turns = []
     for k, j in enumerate(joints):
         n_lin, n_ang = dof_dim[j]
         axes = np.array(axis[qd_start[j] : qd_start[j] + n_lin + n_ang], dtype=np.float64)
         block = find(max(pslot[j], cslot[j]))
-        rows += [(block, k, 0, d, ROW_LOCKED, 0.0, zero, -1, -1, -1, BOX_NONE) for d in locked_directions(axes[:n_lin])]
+        rows += [
+            (block, k, 0, d, ROW_LOCKED, 0.0, zero, -1, -1, -1, LAW_SOFT, 0) for d in locked_directions(axes[:n_lin])
+        ]
         kinds = [ROW_DAMPER] * (n_lin + n_ang)
         if n_ang == 2:
             # The rotation q(a0, q0) q(a1, q1) keeps the angle between a0 in the parent's joint frame and a1 in the
             # child's, and turns about a1 in the child's frame; the axes as Newton orthonormalizes them.
             axes[n_lin:] = hooke_axes(axes[n_lin], axes[n_lin + 1])
-            rows.append((block, k, 1, axes[n_lin], ROW_HOOKE, 0.0, axes[n_lin + 1], -1, -1, -1, BOX_NONE))
+            rows.append((block, k, 1, axes[n_lin], ROW_HOOKE, 0.0, axes[n_lin + 1], -1, -1, -1, LAW_SOFT, 0))
             kinds[n_lin + 1] = ROW_DAMPER_CHILD
         else:
             rows += [
-                (block, k, 1, d, ROW_LOCKED, 0.0, zero, -1, -1, -1, BOX_NONE) for d in locked_directions(axes[n_lin:])
+                (block, k, 1, d, ROW_LOCKED, 0.0, zero, -1, -1, -1, LAW_SOFT, 0)
+                for d in locked_directions(axes[n_lin:])
             ]
-        # Each free axis takes its passive damping, drive and armature as a soft row, the drive bounded by an effort
-        # limit, and its friction as a row of its own.
+        # Each free axis takes its passive damping, drive, armature, friction and limits as one row.
         for i in range(n_lin + n_ang):
             dof = qd_start[j] + i
             d = axes[i] / np.linalg.norm(axes[i])
-            if friction[dof] > 0.0:
-                rows.append((block, k, int(i >= n_lin), d, kinds[i], 0.0, zero, dof, -1, -1, BOX_FRICTION))
-            if max(damping[dof], armature[dof], target_ke[dof], target_kd[dof]) <= 0.0:
+            limited = 0
+            if jtype[j] in _AXIS_JOINTS:
+                lo, hi = float(lower[dof]), float(upper[dof])
+                has_lo, has_hi = lo > -0.5 * MAXVAL, hi < 0.5 * MAXVAL
+                if has_lo and has_hi and lo > hi:
+                    raise ValueError(f"joint {j} has a lower limit {lo} above its upper limit {hi}")
+                if jtype[j] == JointType.REVOLUTE and has_lo != has_hi:
+                    raise NotImplementedError(
+                        f"SolverFBA limits revolute joints with both limits finite; joint {j} has limits ({lo}, {hi})"
+                    )
+                if jtype[j] == JointType.REVOLUTE and has_lo and hi - lo >= 2.0 * np.pi:
+                    # An angle known up to whole turns lies within such a range at every turn.
+                    turns.append(int(j))
+                else:
+                    limited = int(has_lo or has_hi)
+            if max(damping[dof], armature[dof], target_ke[dof], target_kd[dof], friction[dof], limited) <= 0.0:
                 continue
             coord = -1
             if target_ke[dof] > 0.0:
@@ -271,9 +292,11 @@ def build_joint_rows(model: Model, body_slot: np.ndarray, device) -> JointRows |
                         f"{n_ang} and a position gain on DOF {dof}"
                     )
                 coord = q_start[j] + i
-            driven = max(target_ke[dof], target_kd[dof]) > 0.0
-            box = BOX_EFFORT if driven and effort[dof] < EFFORT_UNLIMITED else BOX_NONE
-            rows.append((block, k, int(i >= n_lin), d, kinds[i], float(damping[dof]), zero, dof, coord, -1, box))
+            bounded = max(target_ke[dof], target_kd[dof]) > 0.0 and effort[dof] < EFFORT_UNLIMITED
+            law = LAW_AXIS if bounded or friction[dof] > 0.0 or limited else LAW_SOFT
+            rows.append(
+                (block, k, int(i >= n_lin), d, kinds[i], float(damping[dof]), zero, dof, coord, -1, law, limited)
+            )
     # Each coordinate of a mimic joint takes a pair of rows: the follower's axis and the leader's.
     pair_coeffs = []
     for j, lead, c0, c1 in mimics:
@@ -290,9 +313,29 @@ def build_joint_rows(model: Model, body_slot: np.ndarray, device) -> JointRows |
             for side, joint in enumerate((j, lead)):
                 d = axis[qd_start[joint] + i] / np.linalg.norm(axis[qd_start[joint] + i])
                 rows.append(
-                    (block, local[joint], int(i >= n_lin), d, ROW_MIMIC, 0.0, zero, -1, -1, 2 * pair + side, BOX_NONE)
+                    (
+                        block,
+                        local[joint],
+                        int(i >= n_lin),
+                        d,
+                        ROW_MIMIC,
+                        0.0,
+                        zero,
+                        -1,
+                        -1,
+                        2 * pair + side,
+                        LAW_SOFT,
+                        0,
+                    )
                 )
             pair_coeffs.append((c0, c1))
+    if turns:
+        warnings.warn(
+            f"SolverFBA does not enforce the limits of revolute joints {turns}, whose ranges span a full turn or more: "
+            "it knows their angles up to whole turns",
+            NewtonWarning,
+            stacklevel=2,
+        )
     if not rows:
         return None
     rows.sort(key=lambda r: r[0])
@@ -301,7 +344,7 @@ def build_joint_rows(model: Model, body_slot: np.ndarray, device) -> JointRows |
     slots = np.array([find(i) for i in range(len(root))])
     # A mimic pair locks one direction, its follower's row; the leader's row is inert.
     locked = np.array([r[4] in (ROW_LOCKED, ROW_HOOKE) or (r[4] == ROW_MIMIC and r[9] % 2 == 0) for r in rows])
-    # The soft rows: the dampers and the friction rows, which take a compliance on W's diagonal.
+    # The soft rows: the axis rows, which take a compliance on W's diagonal.
     soft = np.array([r[4] in (ROW_DAMPER, ROW_DAMPER_CHILD) for r in rows])
     mimic_rows = np.zeros((len(pair_coeffs), 2), dtype=np.int32)
     for index, r in enumerate(rows):
@@ -335,131 +378,12 @@ def build_joint_rows(model: Model, body_slot: np.ndarray, device) -> JointRows |
         row_soft=soft,
         row_dof=wp.array([r[7] for r in rows], dtype=wp.int32, device=device),
         row_coord=wp.array([r[8] for r in rows], dtype=wp.int32, device=device),
-        row_box=wp.array([r[10] for r in rows], dtype=wp.int32, device=device),
+        row_law=wp.array([r[10] for r in rows], dtype=wp.int32, device=device),
+        row_limited=wp.array([r[11] for r in rows], dtype=wp.int32, device=device),
         block_start=block_start,
         joint_index=joints.astype(np.int32),
         mimic_rows=mimic_rows,
         mimic_coeffs=np.array(pair_coeffs, dtype=np.float64).reshape(-1, 2),
-    )
-
-
-LIMIT_MARGIN_ANGULAR = 0.02
-"""Distance [rad] from a revolute limit within which, beyond the step's own motion, its row joins a step."""
-LIMIT_MARGIN_LINEAR = 0.002
-"""Distance [m] from a prismatic limit within which, beyond the step's own motion, its row joins a step."""
-
-
-@dataclass
-class JointLimits:
-    """Limit candidates of the free axes of revolute and prismatic joints, one per finite limit.
-
-    Each limit is a unilateral row ``g >= 0``: ``g = q - lower`` for a lower limit (``sign = 1``) and
-    ``g = upper - q`` for an upper one (``sign = -1``), with ``q`` the axis coordinate of
-    :func:`axis_coordinate`. A revolute coordinate is measured about the middle of its range, ``center``, so that the
-    angle wraps on the far side of the range from the limits.
-    """
-
-    joint: wp.array[wp.int32]
-    """Joint of each limit, an index into the per-joint arrays of :class:`JointRows`, shape [limit_count]."""
-    angular: wp.array[wp.int32]
-    """1 for a revolute limit, 0 for a prismatic one, shape [limit_count]."""
-    axis: wp.array[wp.vec3]
-    """Unit free axis in the joint frame, shape [limit_count]."""
-    bound: wp.array[wp.float64]
-    """Limit [rad or m], shape [limit_count]."""
-    sign: wp.array[wp.float64]
-    """1 for a lower limit, -1 for an upper one, shape [limit_count]."""
-    center: wp.array[wp.float64]
-    """Middle of a revolute axis's range [rad], 0 for a prismatic one, shape [limit_count]."""
-    margin: wp.array[wp.float64]
-    """:data:`LIMIT_MARGIN_ANGULAR` or :data:`LIMIT_MARGIN_LINEAR` per limit, shape [limit_count]."""
-    slot: np.ndarray
-    """Parent and child slots of each limit, -1 for a body that the solver does not integrate, shape
-    [limit_count, 2]."""
-    world: np.ndarray
-    """World of each limit's child body, shape [limit_count]."""
-
-
-def build_joint_limits(model: Model, rows: JointRows, body_slot: np.ndarray, device) -> JointLimits | None:
-    """Collect the finite limits of the free axes of the revolute and prismatic joints of ``rows``.
-
-    Args:
-        model: The Newton model.
-        rows: The joint rows on the integrated bodies.
-        body_slot: Rigid DOF slot per model body, -1 for bodies the solver does not integrate.
-        device: Warp device for the limit arrays.
-
-    Returns:
-        The limits, or ``None`` if no such axis has a finite limit.
-
-    Revolute limits whose range spans a full turn or more, such as the +-2 pi of many arm descriptions, are left out
-    with a :class:`~newton.exceptions.NewtonWarning`: the axis's angle is known up to whole turns only, and lies within such a
-    range at every turn.
-
-    Raises:
-        NotImplementedError: If a revolute axis has a single finite limit: its angle is known up to whole turns only.
-        ValueError: If an axis's lower limit exceeds its upper one.
-    """
-    jtype, qd_start, axis = model.joint_type.numpy(), model.joint_qd_start.numpy(), model.joint_axis.numpy()
-    lower, upper = model.joint_limit_lower.numpy(), model.joint_limit_upper.numpy()
-    parent, child = rows.parent.numpy(), rows.child.numpy()
-    world = model.body_world.numpy()
-    limits = []  # (joint, angular, axis, bound, sign, center, margin)
-    turns = []
-    for k, j in enumerate(rows.joint_index):
-        if jtype[j] not in _AXIS_JOINTS:
-            continue
-        dof = qd_start[j]
-        lo, hi = float(lower[dof]), float(upper[dof])
-        has_lo, has_hi = lo > -0.5 * MAXVAL, hi < 0.5 * MAXVAL
-        if not (has_lo or has_hi):
-            continue
-        if has_lo and has_hi and lo > hi:
-            raise ValueError(f"joint {j} has a lower limit {lo} above its upper limit {hi}")
-        angular = int(jtype[j] == JointType.REVOLUTE)
-        center, margin = 0.0, LIMIT_MARGIN_LINEAR
-        if angular:
-            if not (has_lo and has_hi):
-                raise NotImplementedError(
-                    f"SolverFBA limits revolute joints with both limits finite; joint {j} has limits ({lo}, {hi})"
-                )
-            if hi - lo >= 2.0 * np.pi:
-                # An angle known up to whole turns lies within such a range at every turn.
-                turns.append(int(j))
-                continue
-            center, margin = 0.5 * (lo + hi), LIMIT_MARGIN_ANGULAR
-        a = np.asarray(axis[dof], dtype=np.float64)
-        a = a / np.linalg.norm(a)
-        if has_lo:
-            limits.append((k, angular, a, lo, 1.0, center, margin))
-        if has_hi:
-            limits.append((k, angular, a, hi, -1.0, center, margin))
-    if turns:
-        warnings.warn(
-            f"SolverFBA does not enforce the limits of revolute joints {turns}, whose ranges span a full turn or more: "
-            "it knows their angles up to whole turns",
-            NewtonWarning,
-            stacklevel=2,
-        )
-    if not limits:
-        return None
-    k = np.array([lim[0] for lim in limits])
-    p, c = parent[k], child[k]
-    slot = np.stack([np.where(p >= 0, body_slot[np.maximum(p, 0)], -1), body_slot[c]], axis=1).astype(np.int32)
-
-    def column(i, dtype):
-        return wp.array(np.array([lim[i] for lim in limits]), dtype=dtype, device=device)
-
-    return JointLimits(
-        joint=column(0, wp.int32),
-        angular=column(1, wp.int32),
-        axis=column(2, wp.vec3),
-        bound=column(3, wp.float64),
-        sign=column(4, wp.float64),
-        center=column(5, wp.float64),
-        margin=column(6, wp.float64),
-        slot=slot,
-        world=world[c].astype(np.int32),
     )
 
 
@@ -746,7 +670,8 @@ def joint_soft_row_kernel(
     row_dir: wp.array[wp.vec3],
     row_dof: wp.array[wp.int32],
     row_coord: wp.array[wp.int32],
-    row_box: wp.array[wp.int32],
+    row_law: wp.array[wp.int32],
+    row_limited: wp.array[wp.int32],
     joint_parent: wp.array[wp.int32],
     joint_child: wp.array[wp.int32],
     X_pj: wp.array[wp.transform],
@@ -760,13 +685,15 @@ def joint_soft_row_kernel(
     joint_target_kd: wp.array[wp.float32],
     joint_target_q: wp.array[wp.float32],
     joint_target_qd: wp.array[wp.float32],
+    joint_limit_lower: wp.array[wp.float32],
+    joint_limit_upper: wp.array[wp.float32],
     dt: wp.float64,
     # outputs
     compliance: wp.array[wp.float64],
     target: wp.array[wp.float64],
     terms: wp.array2d[wp.float64],
 ):
-    """Each soft row's compliance and target motion over a step of ``dt`` from the poses and velocities at the
+    """Each axis row's compliance and target motion over a step of ``dt`` from the poses and velocities at the
     step's start, 0 for the other rows.
 
     An axis of coordinate ``q`` takes the drive force ``ke (q* - q) + kd (q_dot* - q_dot)``, the passive damping
@@ -779,21 +706,23 @@ def joint_soft_row_kernel(
     velocity along it (along the child's frame axis for an axis the child carries), or the anchor offset along a
     linear axis and its rate in the parent's joint frame.
 
-    A row of :data:`BOX_EFFORT` also keeps its drive's part ``b_a - k_a g`` (``k_a = ke + kd / dt``,
-    ``b_a = ke (q* - q0) + kd q_dot*``) and the rest ``b_p - k_p g`` in ``terms[r] = (k_a, b_a, k_p, b_p, C, g*)``
-    for :func:`joint_box_law_kernel`; a friction row (:data:`BOX_FRICTION`) takes its compliance and target there.
+    A row of :data:`LAW_AXIS` also keeps, for :func:`joint_axis_law_kernel`, ``terms[r] = (k_a, b_a, k_p, b_p, C,
+    g*, g_lo, g_up)``: its drive's part ``b_a - k_a g`` (``k_a = ke + kd / dt``, ``b_a = ke (q* - q0) + kd q_dot*``),
+    the rest ``b_p - k_p g``, and the motions ``lower - q0`` and ``upper - q0`` at which it meets its limits
+    (``∓LAW_FAR`` without them), a revolute angle measured about the middle of its range.
     """
     r = wp.tid()
-    if not _is_damper(row_kind[r]) or row_box[r] == BOX_FRICTION:
+    if not _is_damper(row_kind[r]):
         compliance[r] = wp.float64(0.0)
         target[r] = wp.float64(0.0)
         return
     dof = row_dof[r]
+    law = row_law[r] == LAW_AXIS
     c = wp.float64(joint_damping[dof])
     arm = wp.float64(joint_armature[dof])
     ke = wp.float64(joint_target_ke[dof])
     kd = wp.float64(joint_target_kd[dof])
-    if ke == wp.float64(0.0) and arm == wp.float64(0.0) and kd == wp.float64(0.0):
+    if ke == wp.float64(0.0) and arm == wp.float64(0.0) and kd == wp.float64(0.0) and not law:
         # A damper alone, or a row whose coefficients were all zeroed, which then takes no force.
         compliance[r] = wp.where(c > wp.float64(0.0), dt / c, wp.float64(1.0e30))
         target[r] = wp.float64(0.0)
@@ -840,15 +769,35 @@ def joint_soft_row_kernel(
         force += position_term
         drive += position_term
     stiffness = ke * dt * dt + (kd + c) * dt + arm
-    compliance[r] = dt * dt / stiffness
-    target[r] = force * dt * dt / stiffness
-    if row_box[r] == BOX_EFFORT:
+    if stiffness > wp.float64(0.0):
+        compliance[r] = dt * dt / stiffness
+        target[r] = force * dt * dt / stiffness
+    else:
+        # An axis with friction or limits alone: no force off them.
+        compliance[r] = wp.float64(1.0e30)
+        target[r] = wp.float64(0.0)
+    if law:
         terms[r, 0] = ke + kd / dt
         terms[r, 1] = drive
         terms[r, 2] = c / dt + arm / (dt * dt)
         terms[r, 3] = arm * rate / dt
         terms[r, 4] = compliance[r]
         terms[r, 5] = target[r]
+        lo = wp.float64(-LAW_FAR)
+        hi = wp.float64(LAW_FAR)
+        if row_limited[r] != 0:
+            lower = wp.float64(joint_limit_lower[dof])
+            upper = wp.float64(joint_limit_upper[dof])
+            q = axis_coordinate(row_angular[r], b, xa, qa, xc, qc, X_pj[j], X_cj[j])
+            if row_angular[r] == 1:
+                middle = wp.float64(0.5) * (lower + upper)
+                q = middle + wrap_angle(q - middle)
+            if lower > -wp.float64(_FINITE_LIMIT):
+                lo = lower - q
+            if upper < wp.float64(_FINITE_LIMIT):
+                hi = upper - q
+        terms[r, 6] = lo
+        terms[r, 7] = hi
 
 
 @wp.kernel
@@ -1000,182 +949,6 @@ def joint_wrench_kernel(
     wp.atomic_add(body_f, c, wp.spatial_vector(f, tau + wp.cross(r_c, f)))
 
 
-@wp.func
-def limit_gap(
-    k: int,
-    joint: wp.array[wp.int32],
-    angular: wp.array[wp.int32],
-    axis: wp.array[wp.vec3],
-    bound: wp.array[wp.float64],
-    sign: wp.array[wp.float64],
-    center: wp.array[wp.float64],
-    joint_parent: wp.array[wp.int32],
-    joint_child: wp.array[wp.int32],
-    X_pj: wp.array[wp.transform],
-    X_cj: wp.array[wp.transform],
-    body_slot: wp.array[wp.int32],
-    slot_x: wp.array[wp.vec3d],
-    slot_q: wp.array[wp.quatd],
-    body_q: wp.array[wp.transform],
-    body_com: wp.array[wp.vec3],
-) -> wp.float64:
-    """Gap ``g`` of limit ``k`` at the given poses: ``sign (q - bound)``, a revolute angle measured from the middle of
-    its range."""
-    j = joint[k]
-    xa, qa = _com_frame(joint_parent[j], body_slot, slot_x, slot_q, body_q, body_com)
-    xc, qc = _com_frame(joint_child[j], body_slot, slot_x, slot_q, body_q, body_com)
-    q = axis_coordinate(angular[k], wp.vec3d(axis[k]), xa, qa, xc, qc, X_pj[j], X_cj[j])
-    if angular[k] == 1:
-        q = center[k] + wrap_angle(q - center[k])
-    return sign[k] * (q - bound[k])
-
-
-@wp.kernel
-def joint_limit_near_kernel(
-    joint: wp.array[wp.int32],
-    angular: wp.array[wp.int32],
-    axis: wp.array[wp.vec3],
-    bound: wp.array[wp.float64],
-    sign: wp.array[wp.float64],
-    center: wp.array[wp.float64],
-    margin: wp.array[wp.float64],
-    joint_parent: wp.array[wp.int32],
-    joint_child: wp.array[wp.int32],
-    X_pj: wp.array[wp.transform],
-    X_cj: wp.array[wp.transform],
-    body_slot: wp.array[wp.int32],
-    no_slot: wp.array[wp.int32],
-    slot_x: wp.array[wp.vec3d],
-    slot_q: wp.array[wp.quatd],
-    body_q: wp.array[wp.transform],
-    body_q_end: wp.array[wp.transform],
-    body_com: wp.array[wp.vec3],
-    # outputs
-    near: wp.array[wp.int32],
-):
-    """1 for each limit whose row joins the step, else 0: one whose gap at the step start (``body_q``, read for every
-    body through ``no_slot``, -1 per body) or after the step's free flight (``slot_x``, ``slot_q``, and the other
-    bodies at their step-end poses ``body_q_end``) falls within its margin plus the free flight's change of the
-    gap."""
-    k = wp.tid()
-    g0 = limit_gap(
-        k, joint, angular, axis, bound, sign, center, joint_parent, joint_child, X_pj, X_cj, no_slot,
-        slot_x, slot_q, body_q, body_com,
-    )  # fmt: skip
-    g1 = limit_gap(
-        k, joint, angular, axis, bound, sign, center, joint_parent, joint_child, X_pj, X_cj, body_slot,
-        slot_x, slot_q, body_q_end, body_com,
-    )  # fmt: skip
-    near[k] = wp.where(wp.min(g0, g1) < margin[k] + wp.abs(g1 - g0), 1, 0)
-
-
-@wp.kernel
-def joint_limit_jacobian_kernel(
-    rows: wp.array[wp.int32],
-    joint: wp.array[wp.int32],
-    angular: wp.array[wp.int32],
-    axis: wp.array[wp.vec3],
-    sign: wp.array[wp.float64],
-    joint_parent: wp.array[wp.int32],
-    joint_child: wp.array[wp.int32],
-    X_pj: wp.array[wp.transform],
-    X_cj: wp.array[wp.transform],
-    body_slot: wp.array[wp.int32],
-    slot_x: wp.array[wp.vec3d],
-    slot_q: wp.array[wp.quatd],
-    body_q: wp.array[wp.transform],
-    body_com: wp.array[wp.vec3],
-    row_offset: int,
-    # outputs
-    row_slot: wp.array2d[wp.int32],
-    row_jac: wp.array2d[wp.spatial_vectord],
-):
-    """Row ``row_offset + 3i`` of the step's limit ``rows[i]`` at the pinned frame: ``sign`` times the derivative of
-    its axis coordinate, the rows of :func:`joint_jacobian_kernel` along the free axis (a damper row's for a
-    revolute axis). Its other two rows stay inert, as a frictionless contact's, with no slot and zero
-    coefficients."""
-    i = wp.tid()
-    k = rows[i]
-    j = joint[k]
-    a = joint_parent[j]
-    c = joint_child[j]
-    _xa, qa = _com_frame(a, body_slot, slot_x, slot_q, body_q, body_com)
-    _xc, qc = _com_frame(c, body_slot, slot_x, slot_q, body_q, body_com)
-    q_ja = qa * wp.quatd(wp.transform_get_rotation(X_pj[j]))
-    d = wp.quat_rotate(q_ja, wp.vec3d(axis[k])) * sign[k]
-    lin = wp.vec3d(0.0, 0.0, 0.0)
-    ang_a = -d
-    ang_c = d
-    if angular[k] == 0:
-        lin = d
-        ang_a = -wp.cross(wp.quat_rotate(qa, wp.vec3d(wp.transform_get_translation(X_pj[j]))), lin)
-        ang_c = wp.cross(wp.quat_rotate(qc, wp.vec3d(wp.transform_get_translation(X_cj[j]))), lin)
-    r = row_offset + 3 * i
-    sa = -1
-    if a >= 0:
-        sa = body_slot[a]
-    row_slot[r, 0] = sa
-    row_slot[r, 1] = body_slot[c]
-    row_jac[r, 0] = slot_coefficients(-wp.quat_rotate_inv(qa, lin), wp.quat_rotate_inv(qa, ang_a))
-    row_jac[r, 1] = slot_coefficients(wp.quat_rotate_inv(qc, lin), wp.quat_rotate_inv(qc, ang_c))
-
-
-@wp.kernel
-def joint_limit_gap_kernel(
-    rows: wp.array[wp.int32],
-    joint: wp.array[wp.int32],
-    angular: wp.array[wp.int32],
-    axis: wp.array[wp.vec3],
-    bound: wp.array[wp.float64],
-    sign: wp.array[wp.float64],
-    center: wp.array[wp.float64],
-    joint_parent: wp.array[wp.int32],
-    joint_child: wp.array[wp.int32],
-    X_pj: wp.array[wp.transform],
-    X_cj: wp.array[wp.transform],
-    body_slot: wp.array[wp.int32],
-    slot_x: wp.array[wp.vec3d],
-    slot_q: wp.array[wp.quatd],
-    body_q: wp.array[wp.transform],
-    body_com: wp.array[wp.vec3],
-    row_offset: int,
-    # outputs
-    value: wp.array[wp.float64],
-):
-    """Row values of the step's limit ``rows[i]`` at the live pose: its gap (:func:`limit_gap`), then the inert
-    rows' zeros."""
-    i = wp.tid()
-    r = row_offset + 3 * i
-    value[r] = limit_gap(
-        rows[i], joint, angular, axis, bound, sign, center, joint_parent, joint_child, X_pj, X_cj, body_slot,
-        slot_x, slot_q, body_q, body_com,
-    )  # fmt: skip
-    value[r + 1] = wp.float64(0.0)
-    value[r + 2] = wp.float64(0.0)
-
-
-@wp.kernel
-def joint_limit_carry_kernel(
-    rows: wp.array[wp.int32],
-    src: wp.array[wp.float64],
-    src_offset: int,
-    to_rows: int,
-    dst_offset: int,
-    # outputs
-    dst: wp.array[wp.float64],
-):
-    """Carry the three NSN values of each step limit ``rows[i]`` between the step's rows (from ``src_offset + 3i``)
-    and their per-limit slots (``3 rows[i]``): into the step's rows (from ``dst_offset + 3i``) for ``to_rows``,
-    else out of them."""
-    i = wp.tid()
-    k = rows[i]
-    for lane in range(3):
-        if to_rows == 1:
-            dst[dst_offset + 3 * i + lane] = src[3 * k + lane]
-        else:
-            dst[3 * k + lane] = src[src_offset + 3 * i + lane]
-
-
 @wp.kernel
 def bilateral_delassus_kernel(
     block_start: wp.array[wp.int32],
@@ -1211,37 +984,64 @@ def bilateral_diagonal_kernel(
     diagonal: wp.array2d[wp.float64],
 ):
     """Each row's compliance at its place in its block's diagonal, the soft rows' (:func:`joint_soft_row_kernel`)
-    and the box rows' (:func:`joint_box_law_kernel`); none without soft rows (an empty ``compliance``)."""
+    and the axis rows' (:func:`joint_axis_law_kernel`); none without soft rows (an empty ``compliance``)."""
     r = wp.tid()
     if compliance.shape[0] > 0:
         diagonal[row_block[r], row_local[r]] = compliance[r]
 
 
 @wp.kernel
-def joint_box_start_kernel(
-    box_rows: wp.array[wp.int32],
-    row_box: wp.array[wp.int32],
+def joint_law_start_kernel(
+    law_rows: wp.array[wp.int32],
+    row_dof: wp.array[wp.int32],
     row_block: wp.array[wp.int32],
     row_local: wp.array[wp.int32],
     W: wp.array3d[wp.float64],
+    terms: wp.array2d[wp.float64],
+    friction: wp.array[wp.float32],
     # outputs
     compliance: wp.array[wp.float64],
-    state: wp.array[wp.int32],
 ):
-    """Start each box row ``box_rows[i]`` of a step off its bounds: a friction row holding its axis, at the
-    compliance :data:`FRICTION_STICK` times its ``W_ii`` and no target motion (:func:`joint_soft_row_kernel`'s), a
-    drive at the compliance and target of :func:`joint_soft_row_kernel`."""
+    """The compliance of each axis row ``law_rows[i]`` at the step's first factor, before its law
+    (:func:`joint_axis_law_kernel`) sets it: held, :data:`LAW_HOLD` times its ``W_ii``, with friction; its drive's,
+    damping's and armature's, ``terms[r, 4]``, with these; else :data:`LAW_FREEZE` times ``W_ii``, no force."""
     i = wp.tid()
-    r = box_rows[i]
-    state[r] = 0
-    if row_box[r] == BOX_FRICTION:
-        compliance[r] = wp.float64(FRICTION_STICK) * W[row_block[r], row_local[r], row_local[r]]
+    r = law_rows[i]
+    d = W[row_block[r], row_local[r], row_local[r]]
+    if friction[row_dof[r]] > wp.float32(0.0):
+        compliance[r] = wp.float64(LAW_HOLD) * d
+    elif terms[r, 0] + terms[r, 2] > wp.float64(0.0):
+        compliance[r] = terms[r, 4]
+    else:
+        compliance[r] = wp.float64(LAW_FREEZE) * d
+
+
+@wp.func
+def _axis_piece(g: wp.float64, k_a: wp.float64, b_a: wp.float64, effort: wp.float64, k_p: wp.float64,
+                b_p: wp.float64, friction: wp.float64):  # fmt: skip
+    """The linear piece ``f = alpha - beta g`` of an axis's force law about the motion ``g`` off its jumps: the drive
+    ``b_a - k_a g`` within ``[-effort, effort]``, the rest ``b_p - k_p g``, and the friction ``-friction sign(g)``.
+    Returns ``(alpha, beta)``."""
+    alpha = b_p
+    beta = k_p
+    drive = b_a - k_a * g
+    if drive > effort:
+        alpha += effort
+    elif drive < -effort:
+        alpha -= effort
+    else:
+        alpha += b_a
+        beta += k_a
+    if g < wp.float64(0.0):
+        alpha += friction
+    elif g > wp.float64(0.0):
+        alpha -= friction
+    return alpha, beta
 
 
 @wp.kernel
-def joint_box_law_kernel(
-    box_rows: wp.array[wp.int32],
-    row_box: wp.array[wp.int32],
+def joint_axis_law_kernel(
+    law_rows: wp.array[wp.int32],
     row_dof: wp.array[wp.int32],
     row_block: wp.array[wp.int32],
     row_local: wp.array[wp.int32],
@@ -1254,85 +1054,137 @@ def joint_box_law_kernel(
     compliance: wp.array[wp.float64],
     target: wp.array[wp.float64],
     residual: wp.array[wp.float64],
-    state: wp.array[wp.int32],
     diagonal: wp.array2d[wp.float64],
     refactor: wp.array[wp.int32],
 ):
-    """The box law of each box row ``box_rows[i]`` for a Newton step from its force ``f`` and its axis's motion ``g``
-    since the step's start (its ``residual`` plus ``target``): the row's compliance ``c`` and target motion ``g*``,
-    which its ``residual`` then measures against, so that the step solves ``W df + c df = -(g - g* + c f)``.
+    """The law of each axis row ``law_rows[i]`` for a Newton step: the piece of its force law that one step of the
+    row alone reaches, linearized as the row's compliance and target motion, which its ``residual`` then measures
+    against, so that the step solves ``W df + c df = -(g - g* + c f)``.
 
-    With ``d = W_ii``, one step of the row alone predicts its bounded force ``y`` off the bounds: a friction row's
-    ``f - g / (d + C)`` (``C = FRICTION_STICK d``), a drive's ``b_a - k_a g'`` at the motion
-    ``g' = g - d (g - g0* + C0 f) / (d + C0)`` (``terms = (k_a, b_a, k_p, b_p, C0, g0*)`` of
-    :func:`joint_soft_row_kernel`). Within ``[-F, F]`` the row keeps its law off the bound: a friction row holds its
-    axis (``c = C``, ``g* = C f``, so that the step drives ``g`` to zero, ``C`` regularizing only the step), a drive
-    its soft row (``C0``, ``g0*``). Past ``s F`` (``s = ±1``) the row takes its law at the bound, the force
-    ``s F + b_p - k_p g`` (``b_p = k_p = 0`` for friction): ``c = 1 / k`` with ``k = max(k_p, 1 / (BOX_FREEZE (d + C)))``
-    and ``g* = g + (s F + b_p - k_p g) / k``, so that the step lands the force on ``s F + b_p - k_p g`` up to the
-    step's own motion over ``BOX_FREEZE (d + C)``. A row whose side changes marks its block for
-    :meth:`BilateralSystem.refactor`."""
+    The row's force ``f`` and its axis's motion ``g`` since the step's start (its ``residual`` plus ``target``)
+    relate by a monotone decreasing law (:func:`joint_soft_row_kernel`'s ``terms``): the drive ``b_a - k_a g``
+    within the effort limit ``[-E, E]``, the damping and armature ``b_p - k_p g``, the friction ``-F sign(g)``, which
+    holds the axis at ``g = 0`` with a force within ``F`` of the rest, and the limits, which hold ``g`` within
+    ``[g_lo, g_up]`` with any force pushing it inside. One step of the row alone moves along ``g' = g + d (f' - f)``
+    (``d = W_ii``); where that line meets the law, the row takes the law's piece there: a linear piece
+    ``f = alpha - beta g``, as the compliance ``1 / k`` and the target ``g + (alpha - beta g) / k``, with ``k`` at
+    least ``1 / (LAW_FREEZE d)`` (the drive's own soft row where it is within its limit without friction), or a hold
+    at a motion ``p`` (static friction, a limit), as the compliance ``c = LAW_HOLD d`` and the target ``p + c f``.
+    A row whose compliance changes marks its block for :meth:`BilateralSystem.refactor`."""
     i = wp.tid()
-    r = box_rows[i]
+    r = law_rows[i]
     k = row_block[r]
     local = row_local[r]
     d = W[k, local, local]
     old_target = target[r]
-    motion = residual[r] + old_target
+    g = residual[r] + old_target
     f = force[r]
-    side = 0
-    soft = wp.float64(0.0)
-    offset = wp.float64(0.0)
-    passive = wp.float64(0.0)
+    dof = row_dof[r]
+    k_a = terms[r, 0]
+    b_a = terms[r, 1]
+    k_p = terms[r, 2]
+    b_p = terms[r, 3]
+    lo = terms[r, 6]
+    hi = terms[r, 7]
+    effort = wp.float64(LAW_FAR)
+    if k_a > wp.float64(0.0) and wp.float64(effort_limit[dof]) < wp.float64(EFFORT_UNLIMITED):
+        effort = wp.float64(effort_limit[dof])
+    fr = wp.float64(friction[dof])
+    # The law's breakpoints within (lo, hi), ascending: the drive's saturations and, with friction, g = 0.
+    p0 = wp.float64(LAW_FAR)
+    p1 = wp.float64(LAW_FAR)
+    p2 = wp.float64(LAW_FAR)
+    if k_a > wp.float64(0.0) and effort < wp.float64(LAW_FAR):
+        p0 = (b_a - effort) / k_a
+        p2 = (b_a + effort) / k_a
+    if fr > wp.float64(0.0):
+        p1 = wp.float64(0.0)
+    if p1 < p0:
+        t = p0
+        p0 = p1
+        p1 = t
+    if p2 < p1:
+        t = p1
+        p1 = p2
+        p2 = t
+    if p1 < p0:
+        t = p0
+        p0 = p1
+        p1 = t
+    # Scan the law's segments from lo up: the line g' = g + d (f' - f), along which the step of the row alone moves,
+    # rises across the decreasing law once.
+    hold = 0
+    point = wp.float64(0.0)
+    alpha = wp.float64(0.0)
+    beta = wp.float64(0.0)
+    found = 0
+    started = 0
+    x = lo
+    for n in range(4):
+        if found == 0:
+            y = hi
+            if n == 0:
+                y = wp.min(p0, hi)
+            elif n == 1:
+                y = wp.min(p1, hi)
+            elif n == 2:
+                y = wp.min(p2, hi)
+            if y > x:
+                # The segment (x, y) is one linear piece: its coefficients from a motion inside it.
+                probe = wp.float64(0.5) * (x + y)
+                if x <= -wp.float64(LAW_FAR):
+                    probe = wp.where(y >= wp.float64(LAW_FAR), wp.float64(0.0), y - wp.float64(1.0))
+                elif y >= wp.float64(LAW_FAR):
+                    probe = x + wp.float64(1.0)
+                a1, b1 = _axis_piece(probe, k_a, b_a, effort, k_p, b_p, fr)
+                if started == 0 and x > -wp.float64(LAW_FAR):
+                    # At the lower limit, which pushes up with any force: the line meets it there if it lies above
+                    # the law just past it.
+                    if f + (x - g) / d >= a1 - b1 * x:
+                        hold = 1
+                        point = x
+                        found = 1
+                started = 1
+                if found == 0:
+                    root = (d * (a1 - f) + g) / (d * b1 + wp.float64(1.0))
+                    if root <= y or y >= wp.float64(LAW_FAR):
+                        alpha = a1
+                        beta = b1
+                        found = 1
+                    elif y >= hi:
+                        # Past the last piece below the upper limit, which pushes down with any force.
+                        hold = 1
+                        point = hi
+                        found = 1
+                    elif fr > wp.float64(0.0) and y == wp.float64(0.0):
+                        # The friction's jump at g = 0: the line meets it unless it lies below the law just past it.
+                        a2, _b2 = _axis_piece(wp.float64(1.0e-300), k_a, b_a, effort, k_p, b_p, fr)
+                        if f - g / d >= a2:
+                            hold = 1
+                            point = wp.float64(0.0)
+                            found = 1
+                x = y
     c = wp.float64(0.0)
     goal = wp.float64(0.0)
-    if row_box[r] == BOX_FRICTION:
-        bound = wp.float64(friction[row_dof[r]])
-        soft = wp.float64(FRICTION_STICK) * d
-        y = f - motion / (d + soft)
-        c = soft
-        goal = soft * f
+    if hold == 1:
+        c = wp.float64(LAW_HOLD) * d
+        goal = point + c * f
     else:
-        bound = wp.float64(effort_limit[row_dof[r]])
-        soft = terms[r, 4]
-        c = soft
-        goal = terms[r, 5]
-        y = terms[r, 1] - terms[r, 0] * (motion - d * (motion - goal + soft * f) / (d + soft))
-        passive = terms[r, 2]
-        offset = terms[r, 3]
-    if y > bound:
-        side = 1
-    elif y < -bound:
-        side = -1
-    if side != 0:
-        stiffness = wp.max(passive, wp.float64(1.0) / (wp.float64(BOX_FREEZE) * (d + soft)))
-        c = wp.float64(1.0) / stiffness
-        goal = motion + (wp.float64(side) * bound + offset - passive * motion) / stiffness
+        if fr == wp.float64(0.0) and beta == k_a + k_p and alpha == b_a + b_p and beta > wp.float64(0.0):
+            # The drive within its limit, without friction: the row's own soft law.
+            c = terms[r, 4]
+            goal = terms[r, 5]
+        else:
+            stiffness = wp.max(beta, wp.float64(1.0) / (wp.float64(LAW_FREEZE) * d))
+            c = wp.float64(1.0) / stiffness
+            goal = g + (alpha - beta * g) / stiffness
+    if c != compliance[r]:
+        refactor[k] = 1
     compliance[r] = c
     diagonal[k, local] = c
     if goal != old_target:
         target[r] = goal
-        residual[r] = motion - goal
-    if side != state[r]:
-        state[r] = side
-        refactor[k] = 1
-
-
-@wp.kernel
-def joint_friction_clamp_kernel(
-    box_rows: wp.array[wp.int32],
-    row_box: wp.array[wp.int32],
-    row_dof: wp.array[wp.int32],
-    friction: wp.array[wp.float32],
-    # outputs
-    force: wp.array[wp.float64],
-):
-    """Clamp the force of each friction row among ``box_rows`` to its box ``[-F, F]``."""
-    i = wp.tid()
-    r = box_rows[i]
-    if row_box[r] == BOX_FRICTION:
-        bound = wp.float64(friction[row_dof[r]])
-        force[r] = wp.clamp(force[r], -bound, bound)
+        residual[r] = g - goal
 
 
 @wp.kernel
@@ -1442,10 +1294,11 @@ class BilateralSystem:
     A soft row holds its axis's motion ``g`` and force ``f`` at
     ``g - g* + C f = 0``, the backward Euler step of its damper, drive and
     armature (:func:`joint_soft_row_kernel`), so its diagonal of ``W`` gains
-    the compliance ``C`` and its residual the term ``C f``. A box row (a drive
-    with an effort limit, a friction row) takes its compliance and target motion
-    from its box law at each Newton step (:meth:`box_law`), and the blocks whose
-    box rows change sides are factored again.
+    the compliance ``C`` and its residual the term ``C f``. An axis row of
+    :data:`LAW_AXIS` (an effort limit, joint friction, limits) takes its
+    compliance and target motion from its law at each Newton step
+    (:meth:`axis_law`), and the blocks whose compliance changes are factored
+    again.
     """
 
     def __init__(self, rows: JointRows, body_slot: np.ndarray, slot_inv_mass: wp.array, device):
@@ -1478,16 +1331,15 @@ class BilateralSystem:
         # without soft rows. It joins W's diagonal at the factor, from ``diagonal``.
         self.compliance = wp.zeros(R if bool(rows.row_soft.any()) else 0, dtype=wp.float64, device=device)
         self.diagonal = wp.zeros_like(self.rhs)
-        # The blocks the next factor takes: all of them at the step's start, those whose box rows changed sides at a
+        # The blocks the next factor takes: all of them at the step's start, those whose axis rows changed pieces at a
         # Newton step.
         self.refactor_blocks = wp.zeros(n_blocks, dtype=wp.int32, device=device)
-        # The box rows: their law, model DOF, side of their box (-1, 0, 1) and drive terms (joint_soft_row_kernel).
-        self.row_box, self.row_dof = rows.row_box, rows.row_dof
-        box = rows.row_box.numpy()
-        self.box_rows = wp.array(np.flatnonzero(box != BOX_NONE).astype(np.int32), dtype=wp.int32, device=device)
-        self.has_friction = bool((box == BOX_FRICTION).any())
-        self.box_state = wp.zeros(R if self.box_rows.shape[0] else 0, dtype=wp.int32, device=device)
-        self.box_terms = wp.zeros((R if (box == BOX_EFFORT).any() else 0, 6), dtype=wp.float64, device=device)
+        # The axis rows of LAW_AXIS, whose law sets their compliance at each Newton step, their model DOFs, and their
+        # terms (joint_soft_row_kernel).
+        self.row_dof = rows.row_dof
+        law = rows.row_law.numpy()
+        self.law_rows = wp.array(np.flatnonzero(law == LAW_AXIS).astype(np.int32), dtype=wp.int32, device=device)
+        self.law_terms = wp.zeros((R if self.law_rows.shape[0] else 0, 8), dtype=wp.float64, device=device)
         # The mimic pairs: their rows, coefficients, block and rows within it.
         pairs = np.asarray(rows.mimic_rows, dtype=np.int32).reshape(-1, 2)
         self.mimic_rows = wp.array(pairs, dtype=wp.int32, device=device)
@@ -1497,10 +1349,15 @@ class BilateralSystem:
             (pairs - rows.block_start[row_block[pairs]]).astype(np.int32), dtype=wp.int32, device=device
         )
 
-    def factor(self, row_slot: wp.array2d[wp.int32], row_jac: wp.array2d[wp.spatial_vectord]) -> None:
+    def factor(
+        self,
+        row_slot: wp.array2d[wp.int32],
+        row_jac: wp.array2d[wp.spatial_vectord],
+        friction: wp.array | None = None,
+    ) -> None:
         """Assemble ``W`` for this step's Jacobian, with the mimic pairs combined (:func:`combine_mimic_matrix`), and
-        factor it with the soft rows' compliance on its diagonal, the box rows off their bounds
-        (:func:`joint_box_start_kernel`)."""
+        factor it with the soft rows' compliance on its diagonal, the axis rows' before their laws set it
+        (:func:`joint_law_start_kernel`, from the DOFs' ``friction``)."""
         wp.launch(
             bilateral_delassus_kernel,
             dim=self.W.shape,
@@ -1509,11 +1366,10 @@ class BilateralSystem:
             device=self.device,
         )
         combine_mimic_matrix(self.W, self.mimic_block, self.mimic_local, self.mimic_coeffs, self.device)
-        n_box = self.box_rows.shape[0]
-        if n_box:
-            inputs = [self.box_rows, self.row_box, self.row_block, self.row_local, self.W]
-            outputs = [self.compliance, self.box_state]
-            wp.launch(joint_box_start_kernel, n_box, inputs, outputs, device=self.device)
+        n_law = self.law_rows.shape[0]
+        if n_law:
+            inputs = [self.law_rows, self.row_dof, self.row_block, self.row_local, self.W, self.law_terms, friction]
+            wp.launch(joint_law_start_kernel, n_law, inputs, [self.compliance], device=self.device)
         R = self.row_block.shape[0]
         inputs = [self.row_block, self.row_local, self.compliance]
         wp.launch(bilateral_diagonal_kernel, R, inputs, [self.diagonal], device=self.device)
@@ -1531,7 +1387,7 @@ class BilateralSystem:
             device=self.device,
         )
 
-    def box_law(
+    def axis_law(
         self,
         residual: wp.array[wp.float64],
         target: wp.array[wp.float64],
@@ -1539,23 +1395,17 @@ class BilateralSystem:
         effort_limit: wp.array[wp.float32],
         friction: wp.array[wp.float32],
     ) -> None:
-        """Set the box rows' compliance and target motion for a Newton step from their forces ``force`` and the
-        ``residual`` of their target motion ``target``, both updated, by :func:`joint_box_law_kernel`, and factor the
-        blocks whose box rows changed sides again."""
-        n_box = self.box_rows.shape[0]
-        if not n_box:
+        """Set the axis rows' compliance and target motion for a Newton step from their forces ``force`` and the
+        ``residual`` of their target motion ``target``, both updated, by :func:`joint_axis_law_kernel`, and factor the
+        blocks whose compliance changed again."""
+        n_law = self.law_rows.shape[0]
+        if not n_law:
             return
-        inputs = [self.box_rows, self.row_box, self.row_dof, self.row_block, self.row_local, self.W, self.box_terms]
+        inputs = [self.law_rows, self.row_dof, self.row_block, self.row_local, self.W, self.law_terms]
         inputs += [effort_limit, friction, force]
-        outputs = [self.compliance, target, residual, self.box_state, self.diagonal, self.refactor_blocks]
-        wp.launch(joint_box_law_kernel, n_box, inputs, outputs, device=self.device)
+        outputs = [self.compliance, target, residual, self.diagonal, self.refactor_blocks]
+        wp.launch(joint_axis_law_kernel, n_law, inputs, outputs, device=self.device)
         self.refactor()
-
-    def clamp_friction(self, force: wp.array[wp.float64], friction: wp.array[wp.float32]) -> None:
-        """Clamp the friction rows' forces ``force`` to their boxes."""
-        if self.has_friction:
-            inputs = [self.box_rows, self.row_box, self.row_dof, friction]
-            wp.launch(joint_friction_clamp_kernel, self.box_rows.shape[0], inputs, [force], device=self.device)
 
     def update(self, residual: wp.array[wp.float64], force: wp.array[wp.float64]) -> None:
         """Newton step on the rows: ``force += W⁻¹ (-residual)``, the soft rows' term included, from the residual with
