@@ -3824,15 +3824,13 @@ class SolverFBA(TendonStateMixin, SolverBase):
         return None
 
     def _integrates_bodies(self) -> bool:
-        """Whether SolverFBA integrates any of the model's bodies, from the body slots of the rigid system when it is
-        set up, so that nothing is read back from the device."""
+        """Whether SolverFBA integrates any of the model's bodies, from the body flags that the rigid system's setup
+        read when it is set up, also when it found no dynamic body, so that nothing is read back from the device."""
         model = self.model
         if not model.body_count or self.integrate_with_external_rigid_solver:
             return False
-        slots = getattr(self, "_body_slot_h", None)
-        if slots is not None and self._rigid_dt is not None:
-            return bool((slots >= 0).any())
-        return bool((model.body_flags.numpy() & int(BodyFlags.DYNAMIC)).any())
+        flags = self._rigid_body_flags_h if self._rigid_dt is not None else model.body_flags.numpy()
+        return bool((flags & int(BodyFlags.DYNAMIC)).any())
 
     def _capacity_contacts_capable(self, contacts: Contacts | None) -> bool:
         """Whether a step's particle contacts can take the capacity path, which records into a graph: every slot of
