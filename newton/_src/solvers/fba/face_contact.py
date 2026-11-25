@@ -968,6 +968,51 @@ class FaceContactQuery:
         wp.launch(face_count_kernel, contact_gain.shape[0], inputs, [active, contact_gain], device=device)
 
 
+@wp.func
+def near_segment(
+    e: int,
+    s: int,
+    particle_q: wp.array[wp.vec3],
+    segments: wp.array2d[wp.int32],
+    particle_radius: wp.array[wp.float32],
+    particle_world: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[wp.int32],
+    shape_type: wp.array[wp.int32],
+    shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
+    shape_flags: wp.array[wp.int32],
+    shape_world: wp.array[wp.int32],
+    shape_margin: wp.array[wp.float32],
+    shape_lower: wp.array[wp.vec3],
+    shape_upper: wp.array[wp.vec3],
+    gap: float,
+    edge_radius: float,
+) -> bool:
+    """Whether segment ``e``, a capsule of its particles' radius, may come within ``gap`` of shape ``s``: no point of
+    the segment is closer than its midpoint's distance minus half its length. Shapes without ``COLLIDE_PARTICLES`` at
+    the step are skipped, and segments that far from a shape's collision bounds skip the signed distance."""
+    world = shape_world[s]
+    i, j = segments[e, 0], segments[e, 1]
+    if (shape_flags[s] & ShapeFlags.COLLIDE_PARTICLES) == 0 or (
+        world >= 0 and particle_world[i] >= 0 and world != particle_world[i]
+    ):
+        return False
+    X_ws = shape_transform[s]
+    if shape_body[s] >= 0:
+        X_ws = wp.transform_multiply(body_q[shape_body[s]], X_ws)
+    X_sw = wp.transform_inverse(X_ws)
+    a = wp.transform_point(X_sw, particle_q[i])
+    b = wp.transform_point(X_sw, particle_q[j])
+    o = 0.5 * (a + b)
+    reach = wp.max(particle_radius[i], particle_radius[j]) + shape_margin[s] + gap
+    if box_distance(shape_lower[s], shape_upper[s], o) - 0.5 * wp.length(b - a) > reach:
+        return False
+    d = shape_sdf(shape_type[s], shape_scale[s], shape_source_ptr[s], o, edge_radius)[0]
+    return d - 0.5 * wp.length(b - a) <= reach
+
+
 @wp.kernel
 def near_segment_kernel(
     particle_q: wp.array[wp.vec3],
@@ -991,31 +1036,135 @@ def near_segment_kernel(
     count: wp.array[wp.int32],
     pair: wp.array[wp.int64],
 ):
-    """``shape * segment_count + segment`` of each pair whose segment, a capsule of its particles' radius, may come
-    within ``gap`` of the shape: no point of the segment is closer than its midpoint's distance minus half its
-    length. The shapes are ``shapes``; those without ``COLLIDE_PARTICLES`` at the step are skipped, and segments that
-    far from a shape's collision bounds skip the signed distance."""
+    """``shape * segment_count + segment`` of each pair of :func:`near_segment`; the shapes are ``shapes``."""
     e, k = wp.tid()
     s = shapes[k]
-    world = shape_world[s]
-    i, j = segments[e, 0], segments[e, 1]
-    if (shape_flags[s] & ShapeFlags.COLLIDE_PARTICLES) == 0 or (
-        world >= 0 and particle_world[i] >= 0 and world != particle_world[i]
+    if near_segment(
+        e,
+        s,
+        particle_q,
+        segments,
+        particle_radius,
+        particle_world,
+        body_q,
+        shape_transform,
+        shape_body,
+        shape_type,
+        shape_scale,
+        shape_source_ptr,
+        shape_flags,
+        shape_world,
+        shape_margin,
+        shape_lower,
+        shape_upper,
+        gap,
+        edge_radius,
     ):
-        return
-    X_ws = shape_transform[s]
-    if shape_body[s] >= 0:
-        X_ws = wp.transform_multiply(body_q[shape_body[s]], X_ws)
-    X_sw = wp.transform_inverse(X_ws)
-    a = wp.transform_point(X_sw, particle_q[i])
-    b = wp.transform_point(X_sw, particle_q[j])
-    o = 0.5 * (a + b)
-    reach = wp.max(particle_radius[i], particle_radius[j]) + shape_margin[s] + gap
-    if box_distance(shape_lower[s], shape_upper[s], o) - 0.5 * wp.length(b - a) > reach:
-        return
-    d = shape_sdf(shape_type[s], shape_scale[s], shape_source_ptr[s], o, edge_radius)[0]
-    if d - 0.5 * wp.length(b - a) <= reach:
         pair[wp.atomic_add(count, 0, 1)] = wp.int64(s) * wp.int64(segments.shape[0]) + wp.int64(e)
+
+
+@wp.kernel
+def near_segment_flags_kernel(
+    particle_q: wp.array[wp.vec3],
+    segments: wp.array2d[wp.int32],
+    particle_radius: wp.array[wp.float32],
+    particle_world: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[wp.int32],
+    shape_type: wp.array[wp.int32],
+    shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
+    shape_flags: wp.array[wp.int32],
+    shape_world: wp.array[wp.int32],
+    shape_margin: wp.array[wp.float32],
+    shape_lower: wp.array[wp.vec3],
+    shape_upper: wp.array[wp.vec3],
+    gap: float,
+    edge_radius: float,
+    # outputs
+    flags: wp.array[wp.int32],
+):
+    """Flag the pairs of :func:`near_segment` at ``shape * segment_count + segment``, over all shapes."""
+    e, s = wp.tid()
+    if near_segment(
+        e,
+        s,
+        particle_q,
+        segments,
+        particle_radius,
+        particle_world,
+        body_q,
+        shape_transform,
+        shape_body,
+        shape_type,
+        shape_scale,
+        shape_source_ptr,
+        shape_flags,
+        shape_world,
+        shape_margin,
+        shape_lower,
+        shape_upper,
+        gap,
+        edge_radius,
+    ):
+        flags[s * segments.shape[0] + e] = 1
+
+
+@wp.func
+def segment_contact(
+    e: int,
+    s: int,
+    particle_q: wp.array[wp.vec3],
+    segments: wp.array2d[wp.int32],
+    particle_radius: wp.array[wp.float32],
+    body_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[wp.int32],
+    shape_type: wp.array[wp.int32],
+    shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
+    shape_margin: wp.array[wp.float32],
+    gap: float,
+    iterations: int,
+    edge_radius: float,
+):
+    """The deepest point of segment ``e`` in shape ``s``: 1 if it lies strictly inside the segment, deeper than both
+    of its particles and within the capsule radius plus the shape margin plus ``gap`` of the shape, else 0, then its
+    weight ``t``, its depth, the closest surface point in the body frame, as ``Contacts.soft_contact_body_pos``, and
+    the normal. The point is ``(1 - t) a + t b`` at the root of the signed distance's derivative along the segment,
+    found by bisection."""
+    X_bs = shape_transform[s]
+    X_ws = X_bs
+    if shape_body[s] >= 0:
+        X_ws = wp.transform_multiply(body_q[shape_body[s]], X_bs)
+    X_sw = wp.transform_inverse(X_ws)
+    a = wp.transform_point(X_sw, particle_q[segments[e, 0]])
+    b = wp.transform_point(X_sw, particle_q[segments[e, 1]])
+    geo, scale, mesh, r = shape_type[s], shape_scale[s], shape_source_ptr[s], edge_radius
+    ab = b - a
+    sa = shape_sdf(geo, scale, mesh, a, r)
+    sb = shape_sdf(geo, scale, mesh, b, r)
+    # The distance falls into the segment from both ends only if its derivative is negative at a and positive at b.
+    if wp.dot(wp.vec3(sa[1], sa[2], sa[3]), ab) >= 0.0 or wp.dot(wp.vec3(sb[1], sb[2], sb[3]), ab) <= 0.0:
+        return 0, 0.0, 0.0, wp.vec3(0.0), wp.vec3(0.0)
+    lo = float(0.0)
+    hi = float(1.0)
+    for _ in range(iterations):
+        t = 0.5 * (lo + hi)
+        g = shape_sdf(geo, scale, mesh, a + t * ab, r)
+        if wp.dot(wp.vec3(g[1], g[2], g[3]), ab) < 0.0:
+            lo = t
+        else:
+            hi = t
+    t = 0.5 * (lo + hi)
+    x = a + t * ab
+    sd = shape_sdf(geo, scale, mesh, x, r)
+    radius = (1.0 - t) * particle_radius[segments[e, 0]] + t * particle_radius[segments[e, 1]]
+    if sd[0] >= wp.min(sa[0], sb[0]) or sd[0] > radius + shape_margin[s] + gap:
+        return 0, 0.0, 0.0, wp.vec3(0.0), wp.vec3(0.0)
+    n = wp.normalize(wp.vec3(sd[1], sd[2], sd[3]))
+    return 1, t, sd[0], wp.transform_point(X_bs, x - sd[0] * n), wp.transform_vector(X_ws, n)
 
 
 @wp.kernel
@@ -1042,51 +1191,173 @@ def segment_contact_kernel(
     body_pos: wp.array[wp.vec3],
     normal: wp.array[wp.vec3],
 ):
-    """Deepest point of each candidate ``(segment, shape)`` pair, emitted if it lies strictly inside the segment,
-    deeper than both of its particles and within the capsule radius plus the shape margin plus ``gap`` of the shape.
-    The point is ``(1 - t) a + t b`` at the root of the signed distance's derivative along the segment, found by
-    bisection; ``weight`` is ``t``. ``body_pos`` is the closest surface point in the body frame, as
-    ``Contacts.soft_contact_body_pos``.
-    """
+    """The contact of :func:`segment_contact` of each candidate ``(segment, shape)`` pair that has one, emitted with
+    the candidate's index ``pair`` and its weight ``t`` in ``weight``."""
     k = wp.tid()
-    e = pair_segment[k]
-    s = pair_shape[k]
-    X_bs = shape_transform[s]
-    X_ws = X_bs
-    if shape_body[s] >= 0:
-        X_ws = wp.transform_multiply(body_q[shape_body[s]], X_bs)
-    X_sw = wp.transform_inverse(X_ws)
-    a = wp.transform_point(X_sw, particle_q[segments[e, 0]])
-    b = wp.transform_point(X_sw, particle_q[segments[e, 1]])
-    geo, scale, mesh, r = shape_type[s], shape_scale[s], shape_source_ptr[s], edge_radius
-    ab = b - a
-    sa = shape_sdf(geo, scale, mesh, a, r)
-    sb = shape_sdf(geo, scale, mesh, b, r)
-    # The distance falls into the segment from both ends only if its derivative is negative at a and positive at b.
-    if wp.dot(wp.vec3(sa[1], sa[2], sa[3]), ab) >= 0.0 or wp.dot(wp.vec3(sb[1], sb[2], sb[3]), ab) <= 0.0:
+    emitted, t, d, x, n = segment_contact(
+        pair_segment[k],
+        pair_shape[k],
+        particle_q,
+        segments,
+        particle_radius,
+        body_q,
+        shape_transform,
+        shape_body,
+        shape_type,
+        shape_scale,
+        shape_source_ptr,
+        shape_margin,
+        gap,
+        iterations,
+        edge_radius,
+    )
+    if emitted == 0:
         return
-    lo = float(0.0)
-    hi = float(1.0)
-    for _ in range(iterations):
-        t = 0.5 * (lo + hi)
-        g = shape_sdf(geo, scale, mesh, a + t * ab, r)
-        if wp.dot(wp.vec3(g[1], g[2], g[3]), ab) < 0.0:
-            lo = t
-        else:
-            hi = t
-    t = 0.5 * (lo + hi)
-    x = a + t * ab
-    sd = shape_sdf(geo, scale, mesh, x, r)
-    radius = (1.0 - t) * particle_radius[segments[e, 0]] + t * particle_radius[segments[e, 1]]
-    if sd[0] >= wp.min(sa[0], sb[0]) or sd[0] > radius + shape_margin[s] + gap:
-        return
-    n = wp.normalize(wp.vec3(sd[1], sd[2], sd[3]))
     idx = wp.atomic_add(count, 0, 1)
     pair[idx] = k
     weight[idx] = t
-    depth[idx] = sd[0]
-    body_pos[idx] = wp.transform_point(X_bs, x - sd[0] * n)
-    normal[idx] = wp.transform_vector(X_ws, n)
+    depth[idx] = d
+    body_pos[idx] = x
+    normal[idx] = n
+
+
+@wp.kernel
+def segment_contact_capacity_kernel(
+    particle_q: wp.array[wp.vec3],
+    segments: wp.array2d[wp.int32],
+    particle_radius: wp.array[wp.float32],
+    cand_segment: wp.array[wp.int32],
+    cand_shape: wp.array[wp.int32],
+    count: wp.array[wp.int32],
+    body_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[wp.int32],
+    shape_type: wp.array[wp.int32],
+    shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
+    shape_margin: wp.array[wp.float32],
+    gap: float,
+    iterations: int,
+    edge_radius: float,
+    pinned: wp.array[wp.int32],  # 1 for each particle the solver holds, or empty
+    pushed: wp.array[wp.int32],  # 1 for each shape on a body the solver integrates, or empty
+    # outputs, at the candidate's index
+    found: wp.array[wp.int32],
+    keep: wp.array[wp.int32],
+    weight: wp.array[wp.float32],
+    body_pos: wp.array[wp.vec3],
+    normal: wp.array[wp.vec3],
+):
+    """:func:`segment_contact_kernel` for the first ``count[0]`` candidates of a launch over a capacity, each contact
+    written at its candidate's index and marked in ``keep``, but those whose particles of nonzero weight the solver
+    all holds, unless on the shape of a body it integrates (``pushed``), as :meth:`SolverFBA._ingest_contacts` drops
+    them; ``found[0]`` counts the contacts kept."""
+    i = wp.tid()
+    keep[i] = 0
+    if i >= count[0]:
+        return
+    e = cand_segment[i]
+    s = cand_shape[i]
+    emitted, t, _depth, x, n = segment_contact(
+        e,
+        s,
+        particle_q,
+        segments,
+        particle_radius,
+        body_q,
+        shape_transform,
+        shape_body,
+        shape_type,
+        shape_scale,
+        shape_source_ptr,
+        shape_margin,
+        gap,
+        iterations,
+        edge_radius,
+    )
+    if emitted == 0:
+        return
+    if pinned.shape[0] > 0:
+        free = int(0)
+        if 1.0 - t != 0.0 and pinned[segments[e, 0]] == 0:
+            free = 1
+        if t != 0.0 and pinned[segments[e, 1]] == 0:
+            free = 1
+        # A row on held particles alone still pushes a body the solver integrates.
+        if free == 0 and pushed.shape[0] > 0:
+            free = pushed[s]
+        if free == 0:
+            return
+    wp.atomic_add(found, 0, 1)
+    keep[i] = 1
+    weight[i] = t
+    body_pos[i] = x
+    normal[i] = n
+
+
+@wp.kernel
+def segment_rows_kernel(
+    count: wp.array[wp.int32],
+    keep: wp.array[wp.int32],
+    position: wp.array[wp.int32],  # the exclusive scan of ``keep``
+    cand_segment: wp.array[wp.int32],
+    cand_shape: wp.array[wp.int32],
+    weight: wp.array[wp.float32],
+    body_pos: wp.array[wp.vec3],
+    normal: wp.array[wp.vec3],
+    segments: wp.array2d[wp.int32],
+    first: wp.array[wp.int32],
+    limit: int,
+    # outputs: the contact rows
+    particle: wp.array[wp.int32],
+    contact_normal: wp.array[wp.vec3],
+    alpha: wp.array[wp.float32],
+    shape: wp.array[wp.int32],
+    contact_body_pos: wp.array[wp.vec3],
+    record: wp.array[wp.int32],
+    extra_particle: wp.array2d[wp.int32],
+    extra_alpha: wp.array2d[wp.float32],
+):
+    """Write each kept segment contact into the contact rows from row ``first[0]`` on, in candidate order, up to row
+    ``limit``: the segment's first particle at weight ``1 - t``, its second in the first extra slot at ``t``, record
+    -1."""
+    i = wp.tid()
+    if i >= count[0] or keep[i] == 0:
+        return
+    c = first[0] + position[i]
+    if c >= limit:
+        return
+    e = cand_segment[i]
+    t = weight[i]
+    particle[c] = segments[e, 0]
+    alpha[c] = 1.0 - t
+    extra_particle[c, 0] = segments[e, 1]
+    extra_alpha[c, 0] = t
+    shape[c] = cand_shape[i]
+    contact_body_pos[c] = body_pos[i]
+    contact_normal[c] = normal[i]
+    record[c] = -1
+
+
+@wp.kernel
+def segment_count_kernel(
+    position: wp.array[wp.int32],
+    keep: wp.array[wp.int32],
+    found: wp.array[wp.int32],
+    gain: wp.float64,
+    # outputs
+    active: wp.array[wp.int32],
+    contact_gain: wp.array[wp.float64],
+):
+    """The rows' total in ``active[0]``, which held the rows before the segment contacts, with the kept segment
+    contacts after them, and each contact's gain of the diagonal of its rows set to ``gain`` when the step kept segment
+    contacts, as the host path regularizes the rows of steps with contacts on further particles."""
+    c = wp.tid()
+    last = keep.shape[0] - 1
+    if c == 0:
+        active[0] = active[0] + position[last] + keep[last]
+    if found[0] > 0:
+        contact_gain[c] = gain
 
 
 class SegmentContactQuery:
@@ -1162,3 +1433,95 @@ class SegmentContactQuery:
         pair, t, _depth, body_pos, normal = (host_head(a, m)[order] for a in out)
         weights = np.stack([1.0 - t, t], axis=1).astype(np.float32)
         return cand_seg[pair], cand_shape[pair], weights, body_pos, normal
+
+    def capacity(self, model) -> int:
+        """The most segment contacts of a step: one per pair of a shape and a segment."""
+        return model.shape_count * len(self.seg)
+
+    def reserve_capacity(self, model) -> None:
+        """Allocate the buffers of :meth:`capacity_contacts`, so that a graph capture of it allocates nothing: one
+        candidate slot per pair of a shape and a segment."""
+        F, device = max(self.capacity(model), 1), self.device
+        if self._cap is not None and self._cap.flags.shape[0] == F:
+            return
+
+        def ints():
+            return wp.zeros(F, dtype=wp.int32, device=device)
+
+        self._cap = SimpleNamespace(
+            flags=ints(),
+            rank=ints(),
+            segment=ints(),
+            shape=ints(),
+            keep=ints(),
+            position=ints(),
+            count=wp.zeros(1, dtype=wp.int32, device=device),
+            found=wp.zeros(1, dtype=wp.int32, device=device),
+            weight=wp.zeros(F, dtype=wp.float32, device=device),
+            body_pos=wp.zeros(F, dtype=wp.vec3, device=device),
+            normal=wp.zeros(F, dtype=wp.vec3, device=device),
+        )
+
+    def capacity_contacts(
+        self,
+        model,
+        particle_q,
+        body_q,
+        pinned,
+        pushed,
+        edge_radius: float,
+        gap: float,
+        limit: int,
+        rows: list,
+        extra: list,
+        active,
+        gain: float,
+        contact_gain,
+        iterations: int = 40,
+    ) -> None:
+        """The segment contacts of :meth:`query` on the device alone, nothing read back: the candidates flagged and
+        ranked by a scan, each one's contact at its own index, and those on held particles alone (``pinned``) dropped
+        but on the shapes of integrated bodies (``pushed``). They are written, in the order of :meth:`query`, into the
+        contact rows ``rows`` (particle, normal, alpha, shape, body_pos, record) and ``extra`` (particles and weights)
+        from row ``active[0]`` on, up to row ``limit``; ``active[0]`` then counts them too, which may pass ``limit``,
+        and ``contact_gain`` takes ``gain`` for each contact when the step keeps segment contacts.
+        :meth:`reserve_capacity` sizes the buffers."""
+        cap, device = self._cap, self.device
+        n_seg, S, F = len(self.seg), model.shape_count, self._cap.flags.shape[0]
+        bodies = self.no_bodies if body_q is None or not body_q.shape[0] else body_q
+        cap.flags.zero_()
+        if n_seg and S:
+            wp.launch(
+                near_segment_flags_kernel,
+                dim=(n_seg, S),
+                inputs=[
+                    *(particle_q, self.seg_d, model.particle_radius, model.particle_world, bodies),
+                    *(model.shape_transform, model.shape_body, model.shape_type, model.shape_scale),
+                    *(model.shape_source_ptr, model.shape_flags, model.shape_world, model.shape_margin),
+                    *(model.shape_collision_aabb_lower, model.shape_collision_aabb_upper, gap, edge_radius),
+                ],
+                outputs=[cap.flags],
+                device=device,
+            )
+        wp.utils.array_scan(cap.flags, cap.rank, inclusive=False)
+        # The flagged pairs at their ranks, as face_candidates_kernel ranks the pairs of a shape and a triangle.
+        inputs = [cap.flags, cap.rank, max(n_seg, 1)]
+        wp.launch(face_candidates_kernel, F, inputs, [cap.count, cap.segment, cap.shape], device=device)
+        cap.found.zero_()
+        wp.launch(
+            segment_contact_capacity_kernel,
+            dim=F,
+            inputs=[
+                *(particle_q, self.seg_d, model.particle_radius, cap.segment, cap.shape, cap.count, bodies),
+                *(model.shape_transform, model.shape_body, model.shape_type, model.shape_scale),
+                *(model.shape_source_ptr, model.shape_margin, gap, iterations, edge_radius, pinned, pushed),
+            ],
+            outputs=[cap.found, cap.keep, cap.weight, cap.body_pos, cap.normal],
+            device=device,
+        )
+        wp.utils.array_scan(cap.keep, cap.position, inclusive=False)
+        inputs = [cap.count, cap.keep, cap.position, cap.segment, cap.shape, cap.weight, cap.body_pos, cap.normal]
+        inputs += [self.seg_d, active, int(limit)]
+        wp.launch(segment_rows_kernel, F, inputs, [*rows, *extra], device=device)
+        inputs = [cap.position, cap.keep, cap.found, wp.float64(gain)]
+        wp.launch(segment_count_kernel, contact_gain.shape[0], inputs, [active, contact_gain], device=device)

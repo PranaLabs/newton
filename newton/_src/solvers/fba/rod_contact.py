@@ -332,18 +332,15 @@ def capacity_rod_total_kernel(
 def capacity_rod_gain_kernel(
     rod_count: wp.array[wp.int32],
     gain: wp.float64,
-    reset: int,
     # outputs
     contact_gain: wp.array[wp.float64],
 ):
     """Each contact's gain of the diagonal of its rows: ``gain`` when the step found rod contacts, as the host path
-    regularizes the rows of steps with contacts on further particles, otherwise 1 with ``reset`` or the gain that the
-    face contacts set."""
+    regularizes the rows of steps with contacts on further particles, otherwise the gain that the other contacts
+    set."""
     c = wp.tid()
     if rod_count[0] > 0:
         contact_gain[c] = gain
-    elif reset != 0:
-        contact_gain[c] = wp.float64(1.0)
 
 
 def segment_rings(segments: np.ndarray, particle_count: int, rings: int) -> tuple[np.ndarray, np.ndarray]:
