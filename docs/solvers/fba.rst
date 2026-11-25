@@ -204,14 +204,15 @@ the graph, which sets up their ``W``, and a step with particle-shape contacts
 with friction in one world, after a step with the same contacts outside the graph, which reserves the
 buffers of their capacity: with the lite operator, or with the full operator
 and a dense ``W`` (``nsn_sparse_storage=False``) and a fixed count of at most
-25 ``nsn_linear_iterations``, its face contacts and rod contacts included. Such a step takes
+25 ``nsn_linear_iterations``, its face contacts, the contacts of its rod segments with shapes and its rod contacts
+included. Such a step takes
 every slot of the contact buffer as a contact row, those past the stored count
 and the dropped contacts of held particles inert, sorted on the device. With the lite operator
 it gives every particle the per-particle Newton step; a particle with more than
 four contacts keeps its multipliers there. With the full operator the step
 finds its face contacts and the other distance minima of its particles beside
-meshes on the device too, and its rod contacts, at most four per segment, in
-the order of the steps outside a graph, counts
+meshes on the device too, and the contacts of its rod segments with shapes and its rod contacts, at most four per
+segment, in the order of the steps outside a graph, counts
 its active contacts on the device and takes, by a conditional node of the graph
 (``wp.capture_if``), the smallest of the sizes 64, 96, 128, 192, 256, 384, 512,
 768, 1024 and 1536 contacts, and the most its contacts can reach up to 2048,
@@ -241,9 +242,8 @@ above the contacts that the steps find, recorded steps run slower than steps
 outside a graph. A step whose pattern outgrows its storage drops its last
 contacts, which ``dropped_contacts`` reports. Steps that are GPU-bound gain
 little from a graph, which saves host work, while the inert rows of a size add
-work on the device. Self contacts, rod contacts with the lite operator or
-``nsn_sparse_storage``, the contacts of rod segments with
-shapes, particle constraint rows with contacts, particle-body attachments,
+work on the device. Self contacts, rod contacts with the lite operator, rod contacts and the contacts of rod segments
+with shapes in ``nsn_sparse_storage``, particle constraint rows with contacts, particle-body attachments,
 several worlds, model tendons, and with particle contacts
 ``contact_warmstart``, ``friction_anchors``, ``nsn_lite_accumulate`` and the
 full operator with ``nsn_sparse_storage`` keep a step out of graphs: during a

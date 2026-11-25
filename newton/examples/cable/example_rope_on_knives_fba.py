@@ -101,13 +101,18 @@ class Example:
         # Ten LG iterations per 10 ms step, at most ten conjugate residual iterations per contact solve, and light
         # Rayleigh damping: mass-proportional 0.2/s, and corotated stiffness damping of 1 ms that damps the rope's
         # stretch and bending rates but not its swing. The segments find their contacts with the blades 1 cm out,
-        # beyond the 9 mm that the rope falls in its last step before it lands. The contact solves keep their
-        # Delassus matrix in sparse storage, whose NSN step replays from step to step.
+        # beyond the 9 mm that the rope falls in its last step before it lands.
+        # On a CUDA device with its memory pool the frames replay from a CUDA graph, and the contact solves keep a
+        # dense Delassus matrix over the contact buffer, which records into it; stepped one by one, they keep it in
+        # sparse storage, whose NSN step replays from step to step.
+        device = wp.get_device()
+        self.use_graph = device.is_cuda and wp.is_mempool_enabled(device)
+        self.graph = None
         self.solver = SolverFBA(
             self.model,
             iterations=10,
             nsn_linear_iterations=10,
-            nsn_sparse_storage=True,
+            nsn_sparse_storage=not self.use_graph,
             rod_shape_contacts=self.segment_contacts,
             rod_shape_contact_gap=0.01,
             rayleigh_alpha=0.2,
@@ -133,7 +138,6 @@ class Example:
         self.viewer.set_camera(pos=wp.vec3(-0.3, -0.52, 0.34), pitch=-20.0, yaw=60.0)
 
     def simulate(self):
-        # SolverFBA reads the contact count back to the host every step, so the loop is not graph-captured.
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
@@ -142,7 +146,16 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        self.simulate()
+        if self.graph is not None:
+            wp.capture_launch(self.graph)
+        else:
+            self.simulate()
+            if self.use_graph:
+                # The first frame, outside the graph, sets the solver up and reserves the buffers of its contacts;
+                # the following frames replay its steps, which find their contacts on the device.
+                with wp.ScopedCapture() as capture:
+                    self.simulate()
+                self.graph = capture.graph
         self.sim_time += self.frame_dt
 
     def rope_height_at(self, x_blade):
