@@ -572,7 +572,10 @@ Contacts
   system of at most 128 active rows, such as the contacts of a step recorded
   into a graph with the full operator: the launch adds its sums in another
   order than the iterations of larger systems, so that the same rows padded
-  past those sizes give results that differ by rounding.
+  past those sizes give results that differ by rounding. The products by the
+  dense ``W`` of a step recorded into a graph take its active rows and the
+  128-square tiles of their nonzero entries alone, such as the blocks of each
+  rod or cloth that its contacts touch.
 - ``contact_regularization`` (default ``0.01``) is the relative
   regularization ``gamma`` of the contact rows in the Newton steps that
   involve bodies FBA integrates, face contacts, self contacts or rod contacts: such a step

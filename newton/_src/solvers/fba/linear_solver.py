@@ -2234,7 +2234,7 @@ class FBALinearSolver:
         (:meth:`build_schur_capacity`), views of one buffer each. With ``extra_width`` further particles per contact,
         such as a face contact's, the rows' particles, their CSR and the slots' CSR take them, and ``Wi`` takes up to
         ``extra_width + 1`` particles per contact."""
-        from .kernels import _WI_TILE_K, _WI_TILE_M  # noqa: PLC0415
+        from .kernels import _NSN_MATVEC_TILE_K, _WI_TILE_K, _WI_TILE_M  # noqa: PLC0415
 
         C, N, dev = int(num_contacts), self.n, self.device
         tile_m, tile_k = int(_WI_TILE_M), int(_WI_TILE_K)
@@ -2253,6 +2253,9 @@ class FBALinearSolver:
 
         def view(buffer, n):
             return wp.array(ptr=buffer.ptr, dtype=wp.float64, shape=(n, n), device=dev)
+
+        def tiles(n):
+            return (n + int(_NSN_MATVEC_TILE_K) - 1) // int(_NSN_MATVEC_TILE_K)
 
         self._fc = SimpleNamespace(
             row_particle=wp.zeros(rows, dtype=wp.int32, device=dev),
@@ -2273,6 +2276,8 @@ class FBALinearSolver:
             Wi_buffer=Wi_buffer,
             Wi={size: view(Wi_buffer, columns(size)) for size in sizes},
             W={size: view(W_buffer, 3 * size) for size in sizes},
+            # The nonzero 128-square tiles of each size's W, which the NSN step's products take alone.
+            mask={size: wp.zeros((tiles(3 * size), tiles(3 * size)), dtype=wp.int32, device=dev) for size in sizes},
             width=width,
             limit=limit,
         )
@@ -2380,6 +2385,11 @@ class FBALinearSolver:
         self._isodof_rank_d, self._Wi_v = fc.rank, fc.Wi[size]
         self._W_device_d, self._W_device_active_rows = fc.W[size], rows
 
+    def capacity_mask(self, size: int) -> wp.array2d[wp.int32]:
+        """The 128-square tiles of the capacity path's ``W`` of ``size`` slots that hold nonzero entries of its active
+        rows, as :meth:`build_schur_capacity` last marked them: the others hold only zeros."""
+        return self._fc.mask[size]
+
     def build_schur_capacity(self, size: int, active: wp.array) -> None:
         """The dense frictional ``W = J A⁻¹ Jᵀ`` of :meth:`build_schur_complement` on the device alone, for the rows of
         the first ``size`` slots that :meth:`prepare_schur_capacity` laid out: the contacted particles' columns of
@@ -2412,12 +2422,14 @@ class FBALinearSolver:
             block_dim=_WI_TILE_THREADS,
             device=dev,
         )
+        mask = fc.mask[size]
+        mask.zero_()
         inputs = [fc.row_particle, fc.row_dir, fc.row_alpha, active, fc.rank, Wi]
-        wp.launch(compose_W_capacity_kernel, (rows, rows), inputs, [fc.W[size]], device=dev)
+        wp.launch(compose_W_capacity_kernel, (rows, rows), inputs, [fc.W[size], mask], device=dev)
         if getattr(fc, "has_extra", False):
             # The terms of the rows' further particles, added as the host path adds them.
             inputs = [fc.slot_particle, fc.slot_alpha, fc.row_dir, active, fc.rank, Wi]
-            wp.launch(add_slot_terms_capacity_kernel, (rows, rows), inputs, [fc.W[size]], device=dev)
+            wp.launch(add_slot_terms_capacity_kernel, (rows, rows), inputs, [fc.W[size], mask], device=dev)
         self.use_schur_capacity(size)
 
     def build_schur_lite_triplets(self, total_rows: int, cols_d: wp.array, vals_d: wp.array) -> wps.BsrMatrix:

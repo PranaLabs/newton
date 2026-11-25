@@ -2434,10 +2434,12 @@ def compose_W_capacity_kernel(
     Wi: wp.array2d[wp.float64],
     # outputs
     W: wp.array2d[wp.float64],
+    mask: wp.array2d[wp.int32],  # (tiles, tiles), zeroed: 1 for the tiles of nonzero entries of the active rows
 ):
     """:func:`compose_W_from_wi_kernel` for the three rows of each contact of a contact buffer's first slots: the rows
     of an inert contact, past the ``active[0]`` active ones, take those of the identity, so that they couple to
-    nothing."""
+    nothing. ``mask`` marks the ``_NSN_MATVEC_TILE_K``-square tiles that hold the active rows' nonzero entries, which
+    the products by ``W`` take alone."""
     cp, c = wp.tid()
     m = active[0]
     if cp // 3 >= m or c // 3 >= m:
@@ -2447,7 +2449,10 @@ def compose_W_capacity_kernel(
     r_c = isodof_rank[contact_particle[c]]
     alpha = wp.float64(contact_alpha[cp]) * wp.float64(contact_alpha[c])
     dot = wp.float64(wp.dot(contact_dir[cp], contact_dir[c]))
-    W[cp, c] = alpha * dot * Wi[r_cp, r_c]
+    value = alpha * dot * Wi[r_cp, r_c]
+    W[cp, c] = value
+    if value != wp.float64(0.0):
+        mask[cp // _NSN_MATVEC_TILE_K, c // _NSN_MATVEC_TILE_K] = 1
 
 
 @wp.kernel
@@ -2459,9 +2464,11 @@ def add_slot_terms_capacity_kernel(
     isodof_rank: wp.array[wp.int32],
     Wi: wp.array2d[wp.float64],
     W: wp.array2d[wp.float64],  # inout
+    mask: wp.array2d[wp.int32],  # inout, the nonzero tiles of compose_W_capacity_kernel
 ):
     """:func:`add_slot_terms_W_kernel` on the rows of the ``active[0]`` active contacts of a contact buffer's first
-    slots, after :func:`compose_W_capacity_kernel`; the inert rows keep those of the identity."""
+    slots, after :func:`compose_W_capacity_kernel`; the inert rows keep those of the identity, and ``mask`` marks the
+    tiles that the terms make nonzero."""
     a, b = wp.tid()
     m = active[0]
     if a // 3 >= m or b // 3 >= m:
@@ -2474,7 +2481,10 @@ def add_slot_terms_capacity_kernel(
             if pa >= 0 and pb >= 0 and i + j > 0:
                 w = wp.float64(slot_alpha[a, i]) * wp.float64(slot_alpha[b, j])
                 s += w * Wi[isodof_rank[pa], isodof_rank[pb]]
-    W[a, b] = W[a, b] + wp.float64(wp.dot(contact_dir[a], contact_dir[b])) * s
+    value = W[a, b] + wp.float64(wp.dot(contact_dir[a], contact_dir[b])) * s
+    W[a, b] = value
+    if value != wp.float64(0.0):
+        mask[a // _NSN_MATVEC_TILE_K, b // _NSN_MATVEC_TILE_K] = 1
 
 
 @wp.kernel
@@ -3066,6 +3076,25 @@ _NSN_MATVEC_TILE_K = wp.constant(128)
 _NSN_MATVEC_BLOCK_DIM = 128
 
 
+@wp.func
+def leading_rows(n: int, active: wp.array[wp.int32], per: int) -> int:
+    """The leading rows of ``n`` that hold a system: ``per * active[0]`` of them, at most ``n``, or all ``n`` for an
+    empty ``active``."""
+    m = n
+    if active.shape[0] > 0:
+        m = wp.min(per * active[0], n)
+    return m
+
+
+@wp.func
+def tile_skipped(mask: wp.array2d[wp.int32], row: int, column: int) -> bool:
+    """Whether the ``_NSN_MATVEC_TILE_K``-square tile of a matrix at ``row`` and ``column`` holds only zeros, as
+    ``mask`` marks the others; no tile is skipped without a mask."""
+    if mask.shape[0] == 0:
+        return False
+    return mask[row // _NSN_MATVEC_TILE_K, column // _NSN_MATVEC_TILE_K] == 0
+
+
 @wp.kernel
 def compute_penetration_kernel(
     r: wp.array[wp.float64],
@@ -3075,6 +3104,9 @@ def compute_penetration_kernel(
     n_rows: wp.int32,
     n_rows_pad: wp.int32,
     dt: wp.float64,
+    mask: wp.array2d[wp.int32],
+    active: wp.array[wp.int32],
+    per: int,
     penetration: wp.array[wp.float64],
 ):
     """Compute ``penetration = -r + dt² · W · (ω · λ)``.
@@ -3099,11 +3131,20 @@ def compute_penetration_kernel(
             to this so the partial last tile reduces through the same
             ``tile_sum`` path; bounds-checked ``tile_load`` zero-pads OOB.
         dt: Timestep.
+        mask: Tiles of ``W`` that hold nonzero entries, ``_NSN_MATVEC_TILE_K`` square, which the product takes
+            alone, or empty for all.
+        active: With ``per``, the leading ``per * active[0]`` rows that hold the system, whose products skip the
+            other columns and which the other rows, inert, skip; empty for all ``n_rows``.
+        per: Rows per entry of ``active``.
         penetration: Output penetration, shape ``[n_rows]``.
     """
     i = wp.tid()
     wol = wp.float64(0.0)
-    for k_tile in range(0, n_rows_pad, _NSN_MATVEC_TILE_K):
+    m = leading_rows(n_rows, active, per)
+    m_pad = wp.where(i < m, ((m + _NSN_MATVEC_TILE_K - 1) // _NSN_MATVEC_TILE_K) * _NSN_MATVEC_TILE_K, 0)
+    for k_tile in range(0, wp.min(m_pad, n_rows_pad), _NSN_MATVEC_TILE_K):
+        if tile_skipped(mask, i, k_tile):
+            continue
         w_row = wp.tile_load(W[i], shape=(_NSN_MATVEC_TILE_K,), offset=(k_tile,))
         o_tile = wp.tile_load(omega, shape=(_NSN_MATVEC_TILE_K,), offset=(k_tile,))
         l_tile = wp.tile_load(lam, shape=(_NSN_MATVEC_TILE_K,), offset=(k_tile,))
@@ -3131,6 +3172,9 @@ def compute_nsn_rhs_kernel(
     n_rows: wp.int32,
     n_rows_pad: wp.int32,
     dt: wp.float64,
+    mask: wp.array2d[wp.int32],
+    active: wp.array[wp.int32],
+    per: int,
     rhs: wp.array[wp.float64],
 ):
     """Compute the NSN inner right-hand side ``rhs = (1/dt²) · (h - ω · J·x_corrected)``.
@@ -3155,11 +3199,20 @@ def compute_nsn_rhs_kernel(
         n_rows_pad: ``ceil(n_rows / TILE_K) * TILE_K``. See
             :func:`compute_penetration_kernel`.
         dt: Timestep.
+        mask: Tiles of ``W`` that hold nonzero entries, ``_NSN_MATVEC_TILE_K`` square, which the product takes
+            alone, or empty for all.
+        active: With ``per``, the leading ``per * active[0]`` rows that hold the system, whose products skip the
+            other columns and which the other rows, inert, skip; empty for all ``n_rows``.
+        per: Rows per entry of ``active``.
         rhs: Output NSN RHS, shape ``[n_rows]``.
     """
     i = wp.tid()
     wol = wp.float64(0.0)
-    for k_tile in range(0, n_rows_pad, _NSN_MATVEC_TILE_K):
+    m = leading_rows(n_rows, active, per)
+    m_pad = wp.where(i < m, ((m + _NSN_MATVEC_TILE_K - 1) // _NSN_MATVEC_TILE_K) * _NSN_MATVEC_TILE_K, 0)
+    for k_tile in range(0, wp.min(m_pad, n_rows_pad), _NSN_MATVEC_TILE_K):
+        if tile_skipped(mask, i, k_tile):
+            continue
         w_row = wp.tile_load(W[i], shape=(_NSN_MATVEC_TILE_K,), offset=(k_tile,))
         o_tile = wp.tile_load(omega, shape=(_NSN_MATVEC_TILE_K,), offset=(k_tile,))
         l_tile = wp.tile_load(lam, shape=(_NSN_MATVEC_TILE_K,), offset=(k_tile,))
