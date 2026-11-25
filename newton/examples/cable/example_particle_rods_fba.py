@@ -144,12 +144,17 @@ class Example:
         # and light Rayleigh damping: mass-proportional
         # 0.5/s, and corotated stiffness damping of 2 ms on the rods' stretch and bending rates, which leaves their
         # swing alone.
-        # The contact solves keep their Delassus matrix in sparse storage, whose NSN step replays from step to step.
+        # On a CUDA device with its memory pool the frames replay from a CUDA graph, and the contact solves keep a
+        # dense Delassus matrix over the contact buffer, which records into it; stepped one by one, they keep it in
+        # sparse storage, whose NSN step replays from step to step.
+        device = wp.get_device()
+        self.use_graph = device.is_cuda and wp.is_mempool_enabled(device)
+        self.graph = None
         self.solver = SolverFBA(
             self.model,
             iterations=10,
             nsn_linear_iterations=10,
-            nsn_sparse_storage=True,
+            nsn_sparse_storage=not self.use_graph,
             rayleigh_alpha=0.5,
             rayleigh_beta=2.0e-3,
             rayleigh_corotated=True,
@@ -181,7 +186,6 @@ class Example:
         self.viewer.set_camera(pos=wp.vec3(-0.65, -1.7, 1.25), pitch=-17.0, yaw=64.0)
 
     def simulate(self):
-        # SolverFBA reads the contact count back to the host every step, so the loop is not graph-captured.
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
@@ -190,7 +194,16 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        self.simulate()
+        if self.graph is not None:
+            wp.capture_launch(self.graph)
+        else:
+            self.simulate()
+            if self.use_graph:
+                # The first frame, outside the graph, sets the solver up and reserves the buffers of its contacts;
+                # the following frames replay its steps, which find their contacts on the device.
+                with wp.ScopedCapture() as capture:
+                    self.simulate()
+                self.graph = capture.graph
         self.sim_time += self.frame_dt
 
     def test_post_step(self):

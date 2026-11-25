@@ -2372,11 +2372,13 @@ class TestGraphCapture(unittest.TestCase):
                     np.testing.assert_array_equal(eager, replayed)
 
     @staticmethod
-    def _cloth_on_box(device=None, mode="lite", face=False, **pipeline_args):
+    def _cloth_on_box(device=None, mode="lite", face=False, kinematic=False, **pipeline_args):
         """A cloth of 20 x 20 cells, its first particle held, over a box and the ground, and its contacts, with the
-        lite operator or, with ``mode="full"``, the full one, and with ``face`` the face contacts of the box edges."""
+        lite operator or, with ``mode="full"``, the full one, and with ``face`` the face contacts of the box edges.
+        With ``kinematic`` the box is the shape of a kinematic body, which SolverFBA does not integrate."""
         builder = newton.ModelBuilder()
-        builder.add_shape_box(-1, xform=wp.transform((0.0, 0.0, 0.1), wp.quat_identity()), hx=0.15, hy=0.15, hz=0.1)
+        body = builder.add_body(mass=0.0, is_kinematic=True) if kinematic else -1
+        builder.add_shape_box(body, xform=wp.transform((0.0, 0.0, 0.1), wp.quat_identity()), hx=0.15, hy=0.15, hz=0.1)
         builder.add_ground_plane()
         builder.add_cloth_grid(
             pos=wp.vec3(-0.2, -0.2, 0.25), rot=wp.quat_identity(), vel=wp.vec3(0.0), dim_x=20, dim_y=20,
@@ -2553,6 +2555,44 @@ class TestGraphCapture(unittest.TestCase):
                     two_steps()
             results.append(s0.particle_q.numpy())
         self.assertGreater(float(results[0][:, 2].max()), 0.0)
+        np.testing.assert_array_equal(results[1], results[2])
+        np.testing.assert_allclose(results[0], results[2], rtol=0.0, atol=1.0e-6)
+
+    def test_kinematic_body_contacts_replay_from_a_graph(self):
+        """Record the collision and two steps of a cloth falling onto a box on a kinematic body, which slides under it,
+        into a graph after a step outside it, and reach the same states, bit for bit, as the same steps taken eagerly
+        through the capacity path, and to rounding as those through the stored contacts alone: SolverFBA integrates
+        none of the bodies and reads none of their flags back from the device."""
+        dt = 1.0 / 120.0
+        results = []
+        for run in ("count", "capacity", "graph"):
+            model, solver, pipeline, contacts = self._cloth_on_box(mode="full", kinematic=True, soft_contact_max=400)
+            s0, s1 = model.state(), model.state()
+            for state in (s0, s1):
+                state.body_qd.assign([[0.2, 0.0, 0.0, 0.0, 0.0, 0.0]])
+            pipeline.collide(s0, contacts)
+            solver.step(s0, s1, None, contacts, dt)
+            s0, s1 = s1, s0
+            if run == "capacity":
+                solver._recording = lambda: True
+
+            def two_steps(s0=s0, s1=s1, solver=solver, pipeline=pipeline, contacts=contacts):
+                pipeline.collide(s0, contacts)
+                solver.step(s0, s1, None, contacts, dt)
+                pipeline.collide(s1, contacts)
+                solver.step(s1, s0, None, contacts, dt)
+
+            if run == "graph":
+                with wp.ScopedCapture() as capture:
+                    two_steps()
+                for _ in range(40):
+                    wp.capture_launch(capture.graph)
+            else:
+                for _ in range(40):
+                    two_steps()
+            results.append(s0.particle_q.numpy())
+        # Part of the cloth lies on the box, whose velocity enters its contacts' friction.
+        self.assertGreater(int((results[2][:, 2] > 0.19).sum()), 10)
         np.testing.assert_array_equal(results[1], results[2])
         np.testing.assert_allclose(results[0], results[2], rtol=0.0, atol=1.0e-6)
 

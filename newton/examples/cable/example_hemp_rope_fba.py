@@ -115,15 +115,20 @@ class Example:
         self.model = builder.finalize()
         self.model.particle_mu = ROPE_MU
 
-        # Ten LG iterations per 10 ms step, at most ten conjugate residual iterations per contact solve, the rope's
+        # Six LG iterations per 10 ms step, at most ten conjugate residual iterations per contact solve, the rope's
         # segments colliding as capsules, and light Rayleigh damping: mass-proportional 0.2/s, and corotated
         # stiffness damping of 1 ms that damps the rope's stretch and bending rates but not its swing.
-        # The contact solves keep their Delassus matrix in sparse storage, whose NSN step replays from step to step.
+        # On a CUDA device with its memory pool the frames replay from a CUDA graph, and the contact solves keep a
+        # dense Delassus matrix over the contact buffer, which records into it; stepped one by one, they keep it in
+        # sparse storage, whose NSN step replays from step to step.
+        device = wp.get_device()
+        self.use_graph = device.is_cuda and wp.is_mempool_enabled(device)
+        self.graph = None
         self.solver = SolverFBA(
             self.model,
             iterations=6,
             nsn_linear_iterations=10,
-            nsn_sparse_storage=True,
+            nsn_sparse_storage=not self.use_graph,
             rod_contact=True,
             rayleigh_alpha=0.2,
             rayleigh_beta=1.0e-3,
@@ -132,7 +137,10 @@ class Example:
         self.pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=0.01)
         self.contacts = self.pipeline.contacts()
         self.state_0, self.state_1 = self.model.state(), self.model.state()
-        self.pin_targets = self.model.particle_q.numpy()
+        # The pinned particle's targets: the hand's position at the end of each substep of a frame, written to the
+        # device before the frame and copied into the solver's targets at the substep, as a graph replays them.
+        self.pin_targets = wp.clone(self.model.particle_q)
+        self.hand_path = wp.zeros(self.sim_substeps, dtype=wp.vec3)
 
         # The rope's tube: rings of TUBE_SIDES + 1 points, quads between consecutive rings, and texture
         # coordinates: around the rope, and along it one texture height per lay length.
@@ -164,9 +172,8 @@ class Example:
         return np.array([CIRCLE_RADIUS * np.cos(phase), CIRCLE_RADIUS * np.sin(phase), z])
 
     def simulate(self):
-        # SolverFBA reads the contact count back to the host every step, so the loop is not graph-captured.
         for k in range(self.sim_substeps):
-            self.pin_targets[self.rope[0]] = self.hand(self.sim_time + (k + 1) * self.sim_dt)
+            wp.copy(self.pin_targets, self.hand_path, dest_offset=self.rope[0], src_offset=k, count=1)
             self.solver.set_pin_targets(self.pin_targets)
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
@@ -175,7 +182,18 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        self.simulate()
+        path = [self.hand(self.sim_time + (k + 1) * self.sim_dt) for k in range(self.sim_substeps)]
+        self.hand_path.assign(np.asarray(path, dtype=np.float32))
+        if self.graph is not None:
+            wp.capture_launch(self.graph)
+        else:
+            self.simulate()
+            if self.use_graph:
+                # The first frame, outside the graph, sets the solver up and reserves the buffers of its contacts;
+                # the following frames replay its steps, which find their contacts on the device.
+                with wp.ScopedCapture() as capture:
+                    self.simulate()
+                self.graph = capture.graph
         self.sim_time += self.frame_dt
 
     def test_post_step(self):

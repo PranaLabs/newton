@@ -199,15 +199,20 @@ class Example:
         self.model = builder.finalize()
         self.model.particle_mu = 0.5
 
-        # Ten LG iterations per step, the cords' segments colliding as capsules, and Rayleigh damping:
+        # Six LG iterations per step, the cords' segments colliding as capsules, and Rayleigh damping:
         # mass-proportional 0.05/s, and corotated stiffness damping per cord, the rubber's and the rope's, of the
         # cords' stretch and bending rates.
-        # The contact solves keep their Delassus matrix in sparse storage, whose NSN step replays from step to step.
+        # On a CUDA device with its memory pool the frames replay from a CUDA graph, and the contact solves keep a
+        # dense Delassus matrix over the contact buffer, which records into it; stepped one by one, they keep it in
+        # sparse storage, whose NSN step replays from step to step.
+        device = wp.get_device()
+        self.use_graph = device.is_cuda and wp.is_mempool_enabled(device)
+        self.graph = None
         self.solver = SolverFBA(
             self.model,
             iterations=6,
             nsn_linear_iterations=10,
-            nsn_sparse_storage=True,
+            nsn_sparse_storage=not self.use_graph,
             rod_contact=True,
             rayleigh_alpha=0.05,
             rayleigh_beta=np.asarray(beta),
@@ -254,7 +259,6 @@ class Example:
         self.viewer.set_camera(pos=wp.vec3(-1.3, -0.55, 1.2), pitch=-2.0, yaw=22.0)
 
     def simulate(self):
-        # SolverFBA reads the contact count back to the host every step, so the loop is not graph-captured.
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
@@ -263,7 +267,16 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        self.simulate()
+        if self.graph is not None:
+            wp.capture_launch(self.graph)
+        else:
+            self.simulate()
+            if self.use_graph:
+                # The first frame, outside the graph, sets the solver up and reserves the buffers of its contacts;
+                # the following frames replay its steps, which find their contacts on the device.
+                with wp.ScopedCapture() as capture:
+                    self.simulate()
+                self.graph = capture.graph
         self.sim_time += self.frame_dt
 
     def cord_lengths(self, x):

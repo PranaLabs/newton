@@ -1,0 +1,1 @@
+Replay each frame of the `particle_rods_fba`, `hemp_rope_fba`, `desk_cables_fba` and `elastic_cords_fba` examples from one CUDA graph on a CUDA device with its memory pool, with a dense `W` of the contact capacity; the hands' targets reach the graph through device arrays written before each frame.
