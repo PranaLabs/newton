@@ -4115,6 +4115,8 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 n_bilateral=0,
                 contact_scale=gain,
                 contact_regularization=0.0 if gain is None else self.contact_regularization,
+                # The bucket's rows past its active contacts' three rows each are inert.
+                active_rows=(self._capacity_active_d, 3),
             )
             self._deformable_contact_tail(ls, 3 * size)
         finally:
@@ -7650,6 +7652,7 @@ class SolverFBA(TendonStateMixin, SolverBase):
         contact_regularization: float = 0.0,
         soft_rows: tuple | None = None,
         bilateral_compliance: wp.array | None = None,
+        active_rows: tuple | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """GPU version of ``solve_nsn_coulomb`` (``newton/tests/fba/_reference.py``), the frictional NSN inner.
 
@@ -7716,6 +7719,10 @@ class SolverFBA(TendonStateMixin, SolverBase):
             bilateral_compliance: Compliance [m/N] of each bilateral row, the
                 soft rows of :func:`bilateral_law_kernel`, or ``None`` for hard
                 bilateral rows.
+            active_rows: ``(count, per)`` of a dense ``W`` whose rows past the
+                leading ``per * count[0]``, a count on the device, are inert, as
+                the buckets of the capacity path have them: the linear solve
+                takes the leading rows alone (``NSNPCRSolver.solve``).
 
         Returns:
             ``(lam, omega, lam_apply)`` host fp64 arrays of shape ``(3M,)``.
@@ -7931,7 +7938,12 @@ class SolverFBA(TendonStateMixin, SolverBase):
                 dlam_view = self._nsn_dlam_d[:n_rows]
                 # The capacity path's dot products allocate nothing: they run in a graph's conditional nodes.
                 self._pcr_solver.solve(
-                    a_view, rhs_view, dlam_view, block_precond=block_precond, fixed_sums=self._capacity_step
+                    a_view,
+                    rhs_view,
+                    dlam_view,
+                    block_precond=block_precond,
+                    fixed_sums=self._capacity_step,
+                    active_rows=active_rows,
                 )
 
                 wp.launch(
