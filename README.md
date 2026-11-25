@@ -466,40 +466,40 @@ OpenGL viewer; they play at real time or faster, the longer examples sped up to 
 ### Performance
 
 Mean time per frame of each example over its demo, as long as its clip above, after 10 warm-up frames, without
-rendering (`--viewer null`), on one NVIDIA GeForce RTX 5090, with this branch's code as of 2026-11-24. Real time is the simulated time
+rendering (`--viewer null`), on one NVIDIA GeForce RTX 5090, with this branch's code as of 2026-11-25. Real time is the simulated time
 per wall-clock time; contacts are the mean count per frame.
 
 | Example | Scene | Frame | ms per frame | Real time |
 | --- | --- | ---: | ---: | ---: |
 | `cloth_dual_franka_fba` | 1,681 particles, 3,200 triangles, 18 bodies | 1/60 s | 12.6 | 1.32x |
-| `shirt_fold_fba` | 6,480 particles, 12,748 triangles, 18 bodies | 1/60 s | 16.5 | 1.01x |
+| `shirt_fold_fba` | 6,480 particles, 12,748 triangles, 18 bodies | 1/60 s | 16.6 | 1.01x |
 | `softbody_franka_fba` | 2,197 particles, 1,728 triangles, 10,368 tetrahedra, 9 bodies | 1/60 s | 20.3 | 0.82x |
 | `pneunet_gripper_fba` | 7,363 particles, 9,612 triangles, 27,395 tetrahedra, 1 body | 1/100 s | 39.9 | 0.25x |
-| `cable_gripper_fba` | 1,050 particles, 1,408 triangles, 3,200 tetrahedra, 1 body | 1/100 s | 25.4 | 0.39x |
-| `claw_machine_fba` | 87,982 particles, 131,566 triangles, 305,339 tetrahedra, 10 bodies | 1/30 s | 421.9 | 0.08x |
+| `cable_gripper_fba` | 1,050 particles, 1,408 triangles, 3,200 tetrahedra, 1 body | 1/100 s | 25.5 | 0.39x |
+| `claw_machine_fba` | 87,982 particles, 131,566 triangles, 305,339 tetrahedra, 10 bodies | 1/30 s | 422.6 | 0.08x |
 | `stretching_cloth_fba` | 20,201 particles, 40,000 triangles | 1/100 s | 3.7 | 2.70x |
-| `shirt_pins_fba` | 7,931 particles, 15,650 triangles | 1/60 s | 12.4 | 1.34x |
-| `cloth_on_knives_fba` | 5,101 particles, 10,000 triangles | 1/100 s | 27.4 | 0.36x |
-| `cloth_on_boxes_fba` | 289 particles, 512 triangles, 3 bodies | 1/60 s | 7.5 | 2.23x |
+| `shirt_pins_fba` | 7,931 particles, 15,650 triangles | 1/60 s | 12.5 | 1.33x |
+| `cloth_on_knives_fba` | 5,101 particles, 10,000 triangles | 1/100 s | 27.4 | 0.37x |
+| `cloth_on_boxes_fba` | 289 particles, 512 triangles, 3 bodies | 1/60 s | 7.5 | 2.22x |
 | `convex_pile_fba` | 1,000 bodies, 6,310 contacts | 1/50 s | 6.8 | 2.94x |
-| `convex_hulls_fba` | 9 bodies, 50 contacts | 1/50 s | 3.6 | 5.58x |
-| `nonconvex_pile_fba` | 1,000 bodies, 18,360 contacts | 1/50 s | 15.6 | 1.28x |
-| `chain_net_fba` | 1,008 bodies, 7,500 contacts | 1/50 s | 14.1 | 1.42x |
-| `twisting_bar_fba` | 11,340 particles, 5,780 triangles, 58,956 tetrahedra | 1/100 s | 6.4 | 1.56x |
-| `squeezing_ball_fba` | 6,859 particles, 3,888 triangles, 34,992 tetrahedra, 4 bodies | 1/100 s | 23.1 | 0.43x |
+| `convex_hulls_fba` | 9 bodies, 50 contacts | 1/50 s | 3.6 | 5.55x |
+| `nonconvex_pile_fba` | 1,000 bodies, 18,360 contacts | 1/50 s | 16.0 | 1.25x |
+| `chain_net_fba` | 1,008 bodies, 7,500 contacts | 1/50 s | 14.1 | 1.41x |
+| `twisting_bar_fba` | 11,340 particles, 5,780 triangles, 58,956 tetrahedra | 1/100 s | 6.4 | 1.55x |
+| `squeezing_ball_fba` | 6,859 particles, 3,888 triangles, 34,992 tetrahedra, 4 bodies | 1/100 s | 23.0 | 0.43x |
 | `softbody_cantilever_fba` | 10,584 particles, 6,760 triangles, 43,940 tetrahedra | 1/50 s | 8.0 | 2.50x |
 | `bunny_ears_fba` | 4,155 particles, 5,294 triangles, 15,844 tetrahedra | 1/60 s | 1.9 | 8.57x |
-| `particle_rods_fba` | 395 particles | 1/50 s | 10.3 | 1.95x |
-| `hemp_rope_fba` | 251 particles | 1/50 s | 7.2 | 2.79x |
-| `desk_cables_fba` | 533 particles | 1/50 s | 7.7 | 2.61x |
-| `elastic_cords_fba` | 251 particles | 1/50 s | 23.8 | 0.84x |
-| `rod_gripper_fba` | 102 particles, 3 bodies | 1/50 s | 17.8 | 1.13x |
-| `rope_on_knives_fba` | 58 particles | 1/50 s | 9.0 | 2.22x |
-| `shishi_odoshi_fba` | up to 59,016 water particles, 1 body | 1/30 s | 22.6 | 1.47x |
-| `water_wheel_fba` | up to 20,000 water particles, 1 body | 1/30 s | 9.2 | 3.63x |
-| `sand_castle_fba` | 44,125 sand particles (MPM), 1 body | 1/30 s | 141.7 | 0.24x |
-| `batter_mixer_fba` | 56,194 batter particles (MPM), 1 body | 1/30 s | 208.2 | 0.16x |
-| `meat_cutter_fba` | 55,202 meat particles (MPM), 1 body | 1/30 s | 418.7 | 0.08x |
+| `particle_rods_fba` | 395 particles | 1/50 s | 7.4 | 2.70x |
+| `hemp_rope_fba` | 251 particles | 1/50 s | 3.8 | 5.23x |
+| `desk_cables_fba` | 533 particles | 1/50 s | 5.6 | 3.58x |
+| `elastic_cords_fba` | 251 particles | 1/50 s | 14.1 | 1.42x |
+| `rod_gripper_fba` | 102 particles, 3 bodies | 1/50 s | 14.0 | 1.42x |
+| `rope_on_knives_fba` | 58 particles | 1/50 s | 3.6 | 5.49x |
+| `shishi_odoshi_fba` | up to 59,016 water particles, 1 body | 1/30 s | 21.6 | 1.54x |
+| `water_wheel_fba` | up to 20,000 water particles, 1 body | 1/30 s | 9.2 | 3.62x |
+| `sand_castle_fba` | 44,125 sand particles (MPM), 1 body | 1/30 s | 143.2 | 0.23x |
+| `batter_mixer_fba` | 56,194 batter particles (MPM), 1 body | 1/30 s | 209.9 | 0.16x |
+| `meat_cutter_fba` | 55,202 meat particles (MPM), 1 body | 1/30 s | 419.5 | 0.08x |
 
 The water examples couple `SolverAPICWater` on a grid of 5 mm cells with `SolverFBA` once per step, 10 steps per
 frame, each frame replayed from one CUDA graph; the water flows in over the demo, up to the capacity of its pool. The
