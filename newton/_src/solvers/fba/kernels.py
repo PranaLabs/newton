@@ -5499,6 +5499,7 @@ def add_contact_thickness_kernel(
     shape_margin: wp.array[wp.float32],
     shape_radius: wp.array[wp.float32],  # (S,) the particle radius against each shape, negative for none
     has_shape_radius: int,
+    shape_rows: wp.array[wp.int32],  # (1,) the rows of shape contacts, or empty for all
     offset: wp.array[wp.float64],  # (M,) inout
 ):
     """Move each shape contact's plane out by the particle radius plus the shape margin.
@@ -5506,9 +5507,13 @@ def add_contact_thickness_kernel(
     A face contact interpolates the radii of its particles at its barycentric weights, as the first particle's
     radius plus the weighted differences of the others, so that equal radii stay exact. With ``has_shape_radius``, a
     nonnegative ``shape_radius`` of the contact's shape replaces the particle radius. A contact without a shape
-    (``shape < 0``) has no margin.
+    (``shape < 0``) has no margin. With ``shape_rows``, the rows from ``shape_rows[0]`` on, the contacts between
+    particles that follow the shape contacts, keep their offsets.
     """
     c = wp.tid()
+    if shape_rows.shape[0] > 0:
+        if c >= shape_rows[0]:
+            return
     radius0 = particle_radius[particle[c]]
     radius = radius0
     if has_extra:

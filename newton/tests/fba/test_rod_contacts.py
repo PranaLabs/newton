@@ -12,6 +12,8 @@ import newton
 from newton._src.solvers.fba.rod_contact import RodContact
 from newton.solvers import SolverFBA
 
+ROD_CAPACITY_ATOL = 1.0e-6
+
 
 def _rod(builder, start, end, segments, radius, young=1.0e7, bending_stiffness=None):
     """A particle rod of ``segments`` equal segments from ``start`` to ``end``."""
@@ -177,6 +179,110 @@ class TestRodContactSimulation(unittest.TestCase):
             SolverFBA(model, rod_contact=True, friction=False)
         with self.assertRaisesRegex(ValueError, "rod_contact_gap must be >= 0"):
             SolverFBA(model, rod_contact=True, rod_contact_gap=-1.0)
+
+
+def _crossed_rods(face=False):
+    """A thick rod dropped across a thin rod pinned at both ends, over the ground, with rod contacts on the full
+    operator; with ``face``, beside a triangle on a pyramid's tip, which only the face contacts find."""
+    from newton.tests.fba.test_face_contact import _add_triangle_over_tip, _pyramid_mesh  # noqa: PLC0415
+
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    x = 0.0
+    if face:
+        _add_triangle_over_tip(builder, radius=3e-3)
+        builder.add_shape_mesh(-1, mesh=_pyramid_mesh(), cfg=newton.ModelBuilder.ShapeConfig(mu=0.6))
+        x = 0.5
+    thin = _rod(builder, (x - 0.1, 0.0, 0.1), (x + 0.1, 0.0, 0.1), 20, 0.003, young=1.0e9)
+    builder.particle_mass[thin[0]] = 0.0
+    builder.particle_mass[thin[-1]] = 0.0
+    _rod(builder, (x + 0.025, -0.1, 0.12), (x + 0.025, 0.1, 0.12), 20, 0.008, bending_stiffness=1.0e-4)
+    model = builder.finalize()
+    options = {"face_contacts": True, "face_contact_gap": 0.01} if face else {}
+    solver = SolverFBA(model, iterations=10, nsn_linear_iterations=10, rayleigh_alpha=2.0, rod_contact=True, **options)
+    pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.01)
+    return model, solver, pipeline, pipeline.contacts(), options
+
+
+class TestRodContactCapacity(unittest.TestCase):
+    """Rod contacts on the full operator's capacity path, which steps recorded into a graph take: found, sorted and
+    laid out on the device, on every device."""
+
+    def test_capacity_path_matches_the_count_path(self):
+        """Step the thick rod onto the pinned thin one with two solvers from the same states, one through the
+        capacity path and one through the host's rows, with the same rows, the rod contacts after the particle
+        contacts and, beside a triangle on a pyramid's tip, after its face contacts, and alike to rounding: bit for
+        bit on the CPU. Each step starts both from the host path's state, and each solver keeps its own springs'
+        duals, which carry over steps."""
+        dt = 0.005
+        for face in (False, True):
+            with self.subTest(face=face):
+                model, host, pipeline, contacts, options = _crossed_rods(face)
+                capacity = SolverFBA(
+                    model, iterations=10, nsn_linear_iterations=10, rayleigh_alpha=2.0, rod_contact=True, **options
+                )
+                s0, s1, s2 = model.state(), model.state(), model.state()
+                rods = faces = 0
+                worst = 0.0
+                for k in range(60):
+                    pipeline.collide(s0, contacts)
+                    host.step(s0, s1, None, contacts, dt)
+                    if k == 1:
+                        # The steps recorded into a graph take the capacity path; this takes it without a graph.
+                        capacity._recording = lambda: True
+                    capacity.step(s0, s2, None, contacts, dt)
+                    if k:
+                        self.assertEqual(int(capacity._capacity_active_d.numpy()[0]), host._contact_count)
+                        first = int(capacity._rod_contact.first.numpy()[0])
+                        found = int(capacity._rod_contact.sorted_count.numpy()[0])
+                        rods += found > 0
+                        if face:
+                            faces += found > 0 and first > int(capacity._capacity_face.first.numpy()[0])
+                    worst = max(worst, float(np.abs(s2.particle_q.numpy() - s1.particle_q.numpy()).max()))
+                    s0, s1 = s1, s0
+                self.assertGreater(rods, 40)
+                if face:
+                    self.assertGreater(faces, 10)
+                if wp.get_device(model.device).is_cpu:
+                    self.assertEqual(worst, 0.0)
+                self.assertLess(worst, ROD_CAPACITY_ATOL)
+                self.assertEqual(capacity.dropped_contacts(), 0)
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "graphs record on CUDA devices")
+class TestRodContactGraphs(unittest.TestCase):
+    """Steps of rod contacts recorded into a CUDA graph."""
+
+    def test_rod_contacts_replay_from_a_graph(self):
+        """Record the collision and two steps of the rods into a graph after a step outside it, replay it, and reach
+        the states of the same steps taken through the capacity path without a graph, bit for bit."""
+        dt, results = 0.005, []
+        for graph in (False, True):
+            model, solver, pipeline, contacts, _ = _crossed_rods()
+            s0, s1 = model.state(), model.state()
+            pipeline.collide(s0, contacts)
+            solver.step(s0, s1, None, contacts, dt)
+            s0, s1 = s1, s0
+            if not graph:
+                solver._recording = lambda: True
+
+            def two_steps(s0=s0, s1=s1, solver=solver, pipeline=pipeline, contacts=contacts):
+                pipeline.collide(s0, contacts)
+                solver.step(s0, s1, None, contacts, dt)
+                pipeline.collide(s1, contacts)
+                solver.step(s1, s0, None, contacts, dt)
+
+            if graph:
+                with wp.ScopedCapture() as capture:
+                    two_steps()
+                for _ in range(30):
+                    wp.capture_launch(capture.graph)
+            else:
+                for _ in range(30):
+                    two_steps()
+            results.append(s0.particle_q.numpy())
+        self.assertGreater(float(np.abs(results[0] - results[0][0]).max()), 0.0)
+        np.testing.assert_array_equal(results[1], results[0])
 
 
 if __name__ == "__main__":
